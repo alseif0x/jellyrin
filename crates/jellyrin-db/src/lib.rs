@@ -411,6 +411,26 @@ impl Database {
         Ok(())
     }
 
+    pub async fn revoke_device(&self, id: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM active_playback_sessions
+            WHERE session_id IN (
+                SELECT access_token FROM devices WHERE access_token = ?1 OR device_id = ?1
+            )
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("DELETE FROM devices WHERE access_token = ?1 OR device_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn device_sessions(&self) -> anyhow::Result<Vec<DeviceSession>> {
         let rows = sqlx::query_as::<_, DeviceSessionRow>(
             r#"

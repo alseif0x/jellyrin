@@ -96,8 +96,8 @@ pub fn router(state: AppState) -> Router {
         .route("/devices/options", get(device_options))
         .route("/Devices/Options", post(admin_no_content))
         .route("/devices/options", post(admin_no_content))
-        .route("/Devices", delete(admin_no_content))
-        .route("/devices", delete(admin_no_content))
+        .route("/Devices", delete(delete_device))
+        .route("/devices", delete(delete_device))
         .route("/Session/Sessions", get(session_sessions))
         .route("/session/sessions", get(session_sessions))
         .route("/Sessions", get(session_sessions))
@@ -671,6 +671,30 @@ async fn device_options() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "CustomName": null
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteDeviceQuery {
+    #[serde(alias = "Id", alias = "id")]
+    id: Option<String>,
+}
+
+async fn delete_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<DeleteDeviceQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    if let Some(id) = query
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        state.db.revoke_device(id).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn system_configuration(
@@ -3987,6 +4011,134 @@ mod tests {
         assert_eq!(preserved_config["ServerName"], "Jellyrin Admin QA");
         assert_eq!(preserved_config["UICulture"], "es-ES");
         assert_eq!(preserved_config["EnableRemoteAccess"], false);
+    }
+
+    #[tokio::test]
+    async fn device_delete_revokes_existing_session() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Delete Test", DeviceId="delete-device", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let token = login["AccessToken"].as_str().unwrap();
+        assert_eq!(login["SessionInfo"]["DeviceId"], "delete-device");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions.as_array().unwrap().len(), 1);
+        assert_eq!(sessions[0]["DeviceId"], "delete-device");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/devices?Id=delete-device")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/devices?Id=delete-device")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions_after_delete: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions_after_delete.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Info")
+                    .header("X-Emby-Token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Devices")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
