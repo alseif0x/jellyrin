@@ -115,6 +115,8 @@ pub fn router(state: AppState) -> Router {
         .route("/items", get(items_result))
         .route("/Items/Latest", get(latest_items))
         .route("/items/latest", get(latest_items))
+        .route("/Items/{item_id}", get(item_detail))
+        .route("/items/{item_id}", get(item_detail))
         .route("/Items/{item_id}/Images/{image_type}", get(placeholder_png))
         .route("/items/{item_id}/images/{image_type}", get(placeholder_png))
         .route("/Users/{user_id}/Images/{image_type}", get(placeholder_png))
@@ -579,24 +581,50 @@ async fn user_views_result(
     Ok(Json(query_result(items)))
 }
 
-async fn items_result(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
-    let items = state
-        .db
-        .media_items()
-        .await?
+#[derive(Debug, Deserialize, Default)]
+struct ItemsQuery {
+    #[serde(alias = "UserId")]
+    _user_id: Option<String>,
+    #[serde(alias = "ParentId")]
+    parent_id: Option<String>,
+    #[serde(alias = "IncludeItemTypes")]
+    include_item_types: Option<String>,
+    #[serde(alias = "Recursive")]
+    _recursive: Option<bool>,
+    #[serde(alias = "StartIndex")]
+    start_index: Option<usize>,
+    #[serde(alias = "Limit")]
+    limit: Option<usize>,
+    #[serde(alias = "SortBy")]
+    sort_by: Option<String>,
+    #[serde(alias = "SortOrder")]
+    sort_order: Option<String>,
+    #[serde(alias = "Fields")]
+    _fields: Option<String>,
+}
+
+async fn items_result(
+    State(state): State<AppState>,
+    Query(query): Query<ItemsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let filtered_items = filtered_media_items(state.db.media_items().await?, &query);
+    let total_record_count = filtered_items.len();
+    let items = paged_media_items(filtered_items, &query)
         .iter()
         .map(media_item_to_json)
         .collect::<Vec<_>>();
-    Ok(Json(query_result(items)))
+    Ok(Json(query_result_with_total(items, total_record_count)))
 }
 
 async fn latest_items(
     State(state): State<AppState>,
+    Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let limit = query.limit.unwrap_or(20).min(100) as i64;
     Ok(Json(
         state
             .db
-            .latest_media_items(20)
+            .latest_media_items(limit)
             .await?
             .iter()
             .map(media_item_to_json)
@@ -604,16 +632,108 @@ async fn latest_items(
     ))
 }
 
+async fn item_detail(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    let item = state
+        .db
+        .media_items()
+        .await?
+        .into_iter()
+        .find(|item| item.id == requested_id)
+        .ok_or_else(|| ApiError::not_found("Item not found"))?;
+    Ok(Json(media_item_to_json(&item)))
+}
+
 async fn empty_items_result() -> Json<serde_json::Value> {
     Json(query_result(Vec::new()))
 }
 
 fn query_result(items: Vec<serde_json::Value>) -> serde_json::Value {
+    let total_record_count = items.len();
+    query_result_with_total(items, total_record_count)
+}
+
+fn query_result_with_total(
+    items: Vec<serde_json::Value>,
+    total_record_count: usize,
+) -> serde_json::Value {
     serde_json::json!({
-        "TotalRecordCount": items.len(),
+        "TotalRecordCount": total_record_count,
         "StartIndex": 0,
         "Items": items,
     })
+}
+
+fn filtered_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaItem> {
+    let parent_id = query
+        .parent_id
+        .as_deref()
+        .and_then(|parent_id| parse_jellyfin_uuid(parent_id).ok());
+    let include_types = query.include_item_types.as_deref().map(|types| {
+        types
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+
+    let mut items = items
+        .into_iter()
+        .filter(|item| parent_id.is_none_or(|parent_id| item.virtual_folder_id == parent_id))
+        .filter(|item| {
+            include_types.as_ref().is_none_or(|types| {
+                let item_type = media_item_type(item).to_ascii_lowercase();
+                types.iter().any(|allowed| allowed == &item_type)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let sort_by = query.sort_by.as_deref().unwrap_or("SortName");
+    if sort_by.eq_ignore_ascii_case("DateCreated") {
+        items.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    } else {
+        items.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    }
+    if query
+        .sort_order
+        .as_deref()
+        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"))
+    {
+        items.reverse();
+    }
+
+    items
+}
+
+fn paged_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaItem> {
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    items.into_iter().skip(start_index).take(limit).collect()
+}
+
+fn parse_jellyfin_uuid(value: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(value)
+        .or_else(|_| Uuid::parse_str(&hyphenate_uuid(value)))
+        .map_err(|_| ApiError::bad_request("Invalid item id"))
+}
+
+fn hyphenate_uuid(value: &str) -> String {
+    if value.len() == 32 {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &value[0..8],
+            &value[8..12],
+            &value[12..16],
+            &value[16..20],
+            &value[20..32]
+        )
+    } else {
+        value.to_string()
+    }
 }
 
 fn user_view_to_json(folder: &VirtualFolder) -> serde_json::Value {
@@ -648,14 +768,7 @@ fn user_view_to_json(folder: &VirtualFolder) -> serde_json::Value {
 }
 
 fn media_item_to_json(item: &MediaItem) -> serde_json::Value {
-    let item_type = match (item.media_type.as_str(), item.collection_type.as_deref()) {
-        ("Video", Some("movies")) => "Movie",
-        ("Video", _) => "Video",
-        ("Audio", _) => "Audio",
-        ("Photo", _) => "Photo",
-        ("Book", _) => "Book",
-        _ => "BaseItem",
-    };
+    let item_type = media_item_type(item);
     serde_json::json!({
         "Name": item.name,
         "ServerId": null,
@@ -683,6 +796,17 @@ fn media_item_to_json(item: &MediaItem) -> serde_json::Value {
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
     })
+}
+
+fn media_item_type(item: &MediaItem) -> &'static str {
+    match (item.media_type.as_str(), item.collection_type.as_deref()) {
+        ("Video", Some("movies")) => "Movie",
+        ("Video", _) => "Video",
+        ("Audio", _) => "Audio",
+        ("Photo", _) => "Photo",
+        ("Book", _) => "Book",
+        _ => "BaseItem",
+    }
 }
 
 async fn display_preferences() -> Json<serde_json::Value> {
@@ -1018,6 +1142,13 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            error: anyhow::anyhow!(message.into()),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             error: anyhow::anyhow!(message.into()),
         }
     }
@@ -1488,6 +1619,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Items")
@@ -1504,6 +1636,42 @@ mod tests {
         assert_eq!(result["Items"][0]["Name"], "Example Movie");
         assert_eq!(result["Items"][0]["Type"], "Movie");
         assert_eq!(result["Items"][0]["Path"], movie.to_string_lossy().as_ref());
+        let item_id = result["Items"][0]["Id"].as_str().unwrap();
+        let parent_id = result["Items"][0]["ParentId"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/items?ParentId={parent_id}&IncludeItemTypes=Movie&StartIndex=0&Limit=1&SortBy=SortName"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered["TotalRecordCount"], 1);
+        assert_eq!(filtered["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["Items"][0]["Name"], "Example Movie");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(detail["Id"], item_id);
+        assert_eq!(detail["Name"], "Example Movie");
     }
 
     #[tokio::test]
