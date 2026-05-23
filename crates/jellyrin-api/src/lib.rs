@@ -331,10 +331,22 @@ pub fn router(state: AppState) -> Router {
             "/users/{user_id}/playeditems/{item_id}",
             delete(mark_item_unplayed),
         )
-        .route("/Items/{item_id}/Images/{image_type}", get(placeholder_png))
-        .route("/items/{item_id}/images/{image_type}", get(placeholder_png))
-        .route("/Users/{user_id}/Images/{image_type}", get(placeholder_png))
-        .route("/users/{user_id}/images/{image_type}", get(placeholder_png))
+        .route(
+            "/Items/{item_id}/Images/{image_type}",
+            get(item_placeholder_image),
+        )
+        .route(
+            "/items/{item_id}/images/{image_type}",
+            get(item_placeholder_image),
+        )
+        .route(
+            "/Users/{user_id}/Images/{image_type}",
+            get(user_placeholder_image),
+        )
+        .route(
+            "/users/{user_id}/images/{image_type}",
+            get(user_placeholder_image),
+        )
         .route("/Shows/NextUp", get(authenticated_empty_items))
         .route("/shows/nextup", get(authenticated_empty_items))
         .route("/Shows/Upcoming", get(authenticated_empty_items))
@@ -2624,7 +2636,31 @@ async fn bitrate_test(Query(query): Query<BitrateQuery>) -> impl IntoResponse {
     )
 }
 
-async fn placeholder_png() -> impl IntoResponse {
+async fn item_placeholder_image(
+    State(state): State<AppState>,
+    Path((item_id, _image_type)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    Ok(placeholder_png_response())
+}
+
+async fn user_placeholder_image(
+    State(state): State<AppState>,
+    Path((user_id, _image_type)): Path<(Uuid, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    if !state
+        .db
+        .users()
+        .await?
+        .into_iter()
+        .any(|user| user.id == user_id)
+    {
+        return Err(ApiError::not_found("User not found"));
+    }
+    Ok(placeholder_png_response())
+}
+
+fn placeholder_png_response() -> axum::response::Response {
     const TRANSPARENT_PNG: &[u8] = &[
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
         0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1,
@@ -2634,6 +2670,28 @@ async fn placeholder_png() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "image/png")],
         TRANSPARENT_PNG.to_vec(),
     )
+        .into_response()
+}
+
+async fn media_item_or_folder_by_id(db: &Database, item_id: &str) -> Result<(), ApiError> {
+    let requested_id = parse_jellyfin_uuid(item_id)?;
+    if db
+        .media_items()
+        .await?
+        .into_iter()
+        .any(|item| item.id == requested_id)
+    {
+        return Ok(());
+    }
+    if db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .any(|folder| folder.id == requested_id)
+    {
+        return Ok(());
+    }
+    Err(ApiError::not_found("Item not found"))
 }
 
 async fn websocket(
@@ -4021,11 +4079,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
-        );
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -4360,6 +4414,127 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let item_images: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(item_images.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{parent_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/not-a-valid-id/Images/Primary")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/00000000-0000-0000-0000-000000000000/Images/Primary")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/00000000-0000-0000-0000-000000000000/Images/Primary")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
