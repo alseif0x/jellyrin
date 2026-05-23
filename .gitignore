@@ -1,0 +1,12 @@
+/target/
+/.env
+/data/
+/config/
+/cache/
+/logs/
+/node_modules/
+/playwright-report/
+/test-results/
+*.db
+*.db-shm
+*.db-wal

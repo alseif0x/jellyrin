@@ -1,0 +1,17 @@
+[package]
+name = "jellyrin-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+jellyrin-api = { path = "../jellyrin-api" }
+jellyrin-db = { path = "../jellyrin-db" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,21 @@
+[Unit]
+Description=Jellyrin Rust development server
+After=network.target
+
+[Service]
+Type=simple
+User=cdmonio
+WorkingDirectory=/home/cdmonio/projects/jellyrin/project/jellyrin
+Environment=RUST_LOG=jellyrin=info,tower_http=info
+ExecStart=/home/cdmonio/projects/jellyrin/project/jellyrin/target/debug/jellyrin-server \
+  --port 8097 \
+  --data-dir /home/cdmonio/projects/jellyrin/project/jellyrin/var/data \
+  --config-dir /home/cdmonio/projects/jellyrin/project/jellyrin/var/config \
+  --cache-dir /home/cdmonio/projects/jellyrin/project/jellyrin/var/cache \
+  --log-dir /home/cdmonio/projects/jellyrin/project/jellyrin/var/log \
+  --web-dir /home/cdmonio/dev/jellyfin-web/dist
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
