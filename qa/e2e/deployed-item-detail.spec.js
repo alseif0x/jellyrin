@@ -7,13 +7,27 @@ test('deployed server opens scanned movie detail without frontend request failur
   test.skip(!adminUser || !adminPassword, 'Requires JELLYRIN_E2E_ADMIN_USER and JELLYRIN_E2E_ADMIN_PASSWORD');
 
   const publicInfo = await (await request.get('/System/Info/Public')).json();
-  const itemsResponse = await request.get('/Items?IncludeItemTypes=Movie&Limit=1');
+  const authResponse = await request.post('/Users/AuthenticateByName', {
+    headers: {
+      Authorization: 'MediaBrowser Client="Jellyfin Web", Device="Playwright", DeviceId="deployed-item-detail", Version="dev"',
+    },
+    data: { Username: adminUser, Pw: adminPassword },
+  });
+  expect(authResponse.ok()).toBeTruthy();
+  const auth = await authResponse.json();
+
+  const itemsResponse = await request.get(`/Items?UserId=${auth.User.Id}&IncludeItemTypes=Movie&StartIndex=0&Limit=1`, {
+    headers: { 'X-Emby-Token': auth.AccessToken },
+  });
   expect(itemsResponse.ok()).toBeTruthy();
   const items = await itemsResponse.json();
   expect(items.TotalRecordCount).toBeGreaterThan(0);
+  expect(items.StartIndex).toBe(0);
   const movie = items.Items[0];
 
-  const detailResponse = await request.get(`/Items/${movie.Id}`);
+  const detailResponse = await request.get(`/Items/${movie.Id}`, {
+    headers: { 'X-Emby-Token': auth.AccessToken },
+  });
   expect(detailResponse.ok()).toBeTruthy();
   const detail = await detailResponse.json();
   expect(detail.Name).toBe(movie.Name);
