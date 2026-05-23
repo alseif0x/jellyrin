@@ -212,6 +212,62 @@ impl Database {
         Ok(())
     }
 
+    pub async fn display_preferences(
+        &self,
+        user_id: Uuid,
+        client: &str,
+        id: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query_as::<_, DisplayPreferencesRow>(
+            r#"
+            SELECT payload_json
+            FROM display_preferences
+            WHERE user_id = ?1 AND client = ?2 AND id = ?3
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(client)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            serde_json::from_str(&row.payload_json).context("invalid display preferences")
+        })
+        .transpose()
+    }
+
+    pub async fn update_display_preferences(
+        &self,
+        user_id: Uuid,
+        client: &str,
+        id: &str,
+        payload: Value,
+    ) -> anyhow::Result<()> {
+        self.user_by_id(user_id).await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let payload_json = serde_json::to_string(&payload)?;
+        sqlx::query(
+            r#"
+            INSERT INTO display_preferences (
+                id, user_id, client, payload_json, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(id, user_id, client) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(user_id.to_string())
+        .bind(client)
+        .bind(payload_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn complete_startup_wizard(&self) -> anyhow::Result<()> {
         sqlx::query(
             r#"
@@ -1513,6 +1569,11 @@ struct BrandingConfigRow {
     login_disclaimer: Option<String>,
     custom_css: Option<String>,
     splashscreen_enabled: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct DisplayPreferencesRow {
+    payload_json: String,
 }
 
 impl Default for BrandingConfig {

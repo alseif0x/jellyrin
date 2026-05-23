@@ -253,6 +253,14 @@ pub fn router(state: AppState) -> Router {
         .route("/environment/validatepath", post(environment_validate_path))
         .route("/DisplayPreferences/usersettings", get(display_preferences))
         .route("/displaypreferences/usersettings", get(display_preferences))
+        .route(
+            "/DisplayPreferences/usersettings",
+            post(update_display_preferences),
+        )
+        .route(
+            "/displaypreferences/usersettings",
+            post(update_display_preferences),
+        )
         .route("/System/Endpoint", get(system_endpoint))
         .route("/system/endpoint", get(system_endpoint))
         .route("/Playback/BitrateTest", get(bitrate_test))
@@ -2815,9 +2823,85 @@ fn media_item_type(item: &MediaItem) -> &'static str {
     }
 }
 
-async fn display_preferences() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "Id": "usersettings",
+#[derive(Debug, Deserialize)]
+struct DisplayPreferencesQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "UserId")]
+    user_id: Option<String>,
+    #[serde(alias = "Client")]
+    client: Option<String>,
+}
+
+async fn display_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DisplayPreferencesQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user =
+        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user_id = match query.user_id.as_deref() {
+        Some(user_id) => resolve_user_id(user_id)?,
+        None => auth_user.id,
+    };
+    ensure_user_access(&auth_user, user_id)?;
+    let client = display_preferences_client(query.client.as_deref());
+    let preferences = state
+        .db
+        .display_preferences(user_id, &client, "usersettings")
+        .await?
+        .unwrap_or_else(|| default_display_preferences("usersettings"));
+    Ok(Json(preferences))
+}
+
+async fn update_display_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DisplayPreferencesQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let auth_user =
+        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user_id = match query.user_id.as_deref() {
+        Some(user_id) => resolve_user_id(user_id)?,
+        None => auth_user.id,
+    };
+    ensure_user_access(&auth_user, user_id)?;
+    let client = display_preferences_client(query.client.as_deref());
+    let preferences = normalize_display_preferences_payload(payload, "usersettings")?;
+    state
+        .db
+        .update_display_preferences(user_id, &client, "usersettings", preferences)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn display_preferences_client(client: Option<&str>) -> String {
+    client
+        .filter(|client| !client.trim().is_empty())
+        .unwrap_or("emby")
+        .to_string()
+}
+
+fn normalize_display_preferences_payload(
+    payload: serde_json::Value,
+    id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let mut preferences = match payload {
+        serde_json::Value::Object(map) => serde_json::Value::Object(map),
+        _ => {
+            return Err(ApiError::bad_request(
+                "Display preferences body must be an object",
+            ));
+        }
+    };
+    preferences["Id"] = serde_json::Value::String(id.to_string());
+    Ok(preferences)
+}
+
+fn default_display_preferences(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "Id": id,
         "ViewType": "",
         "SortBy": "SortName",
         "IndexBy": "",
@@ -2825,7 +2909,7 @@ async fn display_preferences() -> Json<serde_json::Value> {
         "PrimaryImageHeight": 0,
         "PrimaryImageWidth": 0,
         "CustomPrefs": {}
-    }))
+    })
 }
 
 async fn system_endpoint() -> Json<serde_json::Value> {
@@ -4374,6 +4458,120 @@ mod tests {
         assert_eq!(branding["LoginDisclaimer"], Value::Null);
         assert_eq!(branding["CustomCss"], "body { color: rgb(1, 2, 3); }");
         assert_eq!(branding["SplashscreenEnabled"], false);
+    }
+
+    #[tokio::test]
+    async fn display_preferences_round_trip_per_user_and_client() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let endpoint = format!(
+            "/DisplayPreferences/usersettings?UserId={}&Client=emby",
+            user.id
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&endpoint)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&endpoint)
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(defaults["Id"], "usersettings");
+        assert_eq!(defaults["SortBy"], "SortName");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&endpoint)
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "ignored-client-id",
+                            "ViewType": "Poster",
+                            "SortBy": "DateCreated,SortName",
+                            "IndexBy": "SortName",
+                            "RememberIndexing": true,
+                            "PrimaryImageHeight": 320,
+                            "PrimaryImageWidth": 213,
+                            "CustomPrefs": { "landing-livetv": "false" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&endpoint)
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let preferences: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preferences["Id"], "usersettings");
+        assert_eq!(preferences["ViewType"], "Poster");
+        assert_eq!(preferences["SortBy"], "DateCreated,SortName");
+        assert_eq!(preferences["RememberIndexing"], true);
+        assert_eq!(preferences["CustomPrefs"]["landing-livetv"], "false");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/displaypreferences/usersettings?UserId={}&Client=other",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let other_client: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(other_client["SortBy"], "SortName");
     }
 
     #[tokio::test]
