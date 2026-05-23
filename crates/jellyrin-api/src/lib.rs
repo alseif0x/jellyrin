@@ -95,11 +95,21 @@ pub fn router(state: AppState) -> Router {
             get(dashboard_configuration_pages),
         )
         .route(
+            "/web/ConfigurationPages",
+            get(dashboard_configuration_pages),
+        )
+        .route(
             "/dashboard/web/configurationpages",
             get(dashboard_configuration_pages),
         )
+        .route(
+            "/web/configurationpages",
+            get(dashboard_configuration_pages),
+        )
         .route("/Dashboard/web/ConfigurationPage", get(empty_text))
+        .route("/web/ConfigurationPage", get(empty_text))
         .route("/dashboard/web/configurationpage", get(empty_text))
+        .route("/web/configurationpage", get(empty_text))
         .route("/Devices", get(devices))
         .route("/devices", get(devices))
         .route("/Devices/Info", get(device_info))
@@ -1241,8 +1251,13 @@ async fn default_metadata_options() -> Json<serde_json::Value> {
     }))
 }
 
-async fn dashboard_configuration_pages() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
+async fn dashboard_configuration_pages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(Vec::new()))
 }
 
 fn empty_result() -> serde_json::Value {
@@ -4160,7 +4175,10 @@ mod tests {
             "/System/Configuration/MetadataOptions/Default",
             "/System/Configuration/branding",
             "/Dashboard/web/ConfigurationPages",
+            "/web/ConfigurationPages?enableInMainMenu=true",
+            "/web/configurationpages?enableInMainMenu=true",
             "/Dashboard/web/ConfigurationPage?name=home.html",
+            "/web/ConfigurationPage?name=home.html",
             "/Devices",
             "/Devices/Info?Id=test-device",
             "/Devices/Options?Id=test-device",
@@ -4214,6 +4232,18 @@ mod tests {
         assert_eq!(config["ServerName"], "Jellyrin");
         assert_eq!(config["EnableRemoteAccess"], false);
         assert_eq!(config["ContentTypes"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/ConfigurationPages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
             .clone()
