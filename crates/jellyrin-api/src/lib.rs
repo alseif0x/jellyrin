@@ -62,8 +62,8 @@ pub fn router(state: AppState) -> Router {
         .route("/system/activitylog/entries", get(activity_log_entries))
         .route("/System/Configuration", get(system_configuration))
         .route("/system/configuration", get(system_configuration))
-        .route("/System/Configuration", post(admin_no_content))
-        .route("/system/configuration", post(admin_no_content))
+        .route("/System/Configuration", post(update_system_configuration))
+        .route("/system/configuration", post(update_system_configuration))
         .route(
             "/System/Configuration/MetadataOptions/Default",
             get(default_metadata_options),
@@ -673,15 +673,77 @@ async fn device_options() -> Json<serde_json::Value> {
     }))
 }
 
-async fn system_configuration() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "ServerName": "Jellyrin",
-        "UICulture": "en-US",
-        "MetadataCountryCode": "US",
-        "PreferredMetadataLanguage": "en",
-        "EnableRemoteAccess": false,
+async fn system_configuration(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(system_configuration_json(
+        state.db.startup_config().await?,
+        state.db.server_state().await?.startup_wizard_completed,
+    )))
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemConfigurationUpdate {
+    #[serde(alias = "ServerName")]
+    server_name: Option<String>,
+    #[serde(rename = "UICulture", alias = "uiCulture")]
+    ui_culture: Option<String>,
+    #[serde(alias = "MetadataCountryCode")]
+    metadata_country_code: Option<String>,
+    #[serde(alias = "PreferredMetadataLanguage")]
+    preferred_metadata_language: Option<String>,
+    #[serde(alias = "EnableRemoteAccess")]
+    enable_remote_access: Option<bool>,
+}
+
+async fn update_system_configuration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<SystemConfigurationUpdate>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let current = state.db.startup_config().await?;
+    state
+        .db
+        .update_startup_config(StartupConfig {
+            server_name: non_empty_or_current(payload.server_name, current.server_name),
+            ui_culture: non_empty_or_current(payload.ui_culture, current.ui_culture),
+            metadata_country_code: non_empty_or_current(
+                payload.metadata_country_code,
+                current.metadata_country_code,
+            ),
+            preferred_metadata_language: non_empty_or_current(
+                payload.preferred_metadata_language,
+                current.preferred_metadata_language,
+            ),
+            enable_remote_access: payload
+                .enable_remote_access
+                .unwrap_or(current.enable_remote_access),
+        })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn non_empty_or_current(update: Option<String>, current: String) -> String {
+    update
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(current)
+}
+
+fn system_configuration_json(
+    config: StartupConfig,
+    startup_wizard_completed: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ServerName": config.server_name,
+        "UICulture": config.ui_culture,
+        "MetadataCountryCode": config.metadata_country_code,
+        "PreferredMetadataLanguage": config.preferred_metadata_language,
+        "EnableRemoteAccess": config.enable_remote_access,
         "EnableUPnP": false,
-        "IsStartupWizardCompleted": true,
+        "IsStartupWizardCompleted": startup_wizard_completed,
         "LibraryMonitorDelay": 60,
         "EnableRealtimeMonitor": false,
         "EnableCaseSensitiveItemIds": true,
@@ -696,7 +758,7 @@ async fn system_configuration() -> Json<serde_json::Value> {
         "RemoteClientBitrateLimit": 0,
         "LogFileRetentionDays": 3,
         "RunAtStartup": false
-    }))
+    })
 }
 
 async fn named_configuration(Path(key): Path<String>) -> Json<serde_json::Value> {
@@ -3757,6 +3819,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn system_configuration_post_persists_startup_config() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ServerName": "Jellyrin Admin QA",
+                            "UICulture": "es-ES",
+                            "MetadataCountryCode": "ES",
+                            "PreferredMetadataLanguage": "es",
+                            "EnableRemoteAccess": true,
+                            "UnknownJellyfinWebSetting": "ignored",
+                            "MetadataOptions": [{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }],
+                            "ContentTypes": [{ "Name": "Movies", "Value": "movies" }],
+                            "PathSubstitutions": [{ "From": "/mnt/a", "To": "/mnt/b" }],
+                            "PluginRepositories": [{ "Name": "Example", "Url": "https://example.invalid" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ServerName": "Jellyrin Admin QA",
+                            "UICulture": "es-ES",
+                            "MetadataCountryCode": "ES",
+                            "PreferredMetadataLanguage": "es",
+                            "EnableRemoteAccess": true,
+                            "UnknownJellyfinWebSetting": "ignored",
+                            "MetadataOptions": [{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }],
+                            "ContentTypes": [{ "Name": "Movies", "Value": "movies" }],
+                            "PathSubstitutions": [{ "From": "/mnt/a", "To": "/mnt/b" }],
+                            "PluginRepositories": [{ "Name": "Example", "Url": "https://example.invalid" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/system/configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_config["ServerName"], "Jellyrin Admin QA");
+        assert_eq!(updated_config["UICulture"], "es-ES");
+        assert_eq!(updated_config["MetadataCountryCode"], "ES");
+        assert_eq!(updated_config["PreferredMetadataLanguage"], "es");
+        assert_eq!(updated_config["EnableRemoteAccess"], true);
+        assert_eq!(updated_config["IsStartupWizardCompleted"], false);
+        assert_eq!(
+            updated_config["MetadataOptions"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(updated_config["ContentTypes"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            updated_config["PathSubstitutions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            updated_config["PluginRepositories"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let persisted_config = db.startup_config().await.unwrap();
+        assert_eq!(persisted_config.server_name, "Jellyrin Admin QA");
+        assert_eq!(persisted_config.ui_culture, "es-ES");
+        assert_eq!(persisted_config.metadata_country_code, "ES");
+        assert_eq!(persisted_config.preferred_metadata_language, "es");
+        assert!(persisted_config.enable_remote_access);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ServerName": " " }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "EnableRemoteAccess": false }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let preserved_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preserved_config["ServerName"], "Jellyrin Admin QA");
+        assert_eq!(preserved_config["UICulture"], "es-ES");
+        assert_eq!(preserved_config["EnableRemoteAccess"], false);
     }
 
     #[tokio::test]
