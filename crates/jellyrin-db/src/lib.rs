@@ -471,6 +471,41 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn device_session_by_id(&self, id: &str) -> anyhow::Result<Option<DeviceSession>> {
+        let row = sqlx::query_as::<_, DeviceSessionRow>(
+            r#"
+            SELECT devices.access_token, devices.user_id, users.name AS user_name,
+                   devices.device_id, devices.device_name, devices.client, devices.version,
+                   devices.last_activity_at
+            FROM devices
+            INNER JOIN users ON users.id = devices.user_id
+            WHERE users.is_disabled = 0 AND (devices.access_token = ?1 OR devices.device_id = ?1)
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn update_device_name(&self, id: &str, name: &str) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            UPDATE devices
+            SET device_name = ?1, last_activity_at = ?2
+            WHERE access_token = ?3 OR device_id = ?3
+            "#,
+        )
+        .bind(name)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn upsert_active_playback_session(
         &self,
         session_id: &str,

@@ -100,8 +100,8 @@ pub fn router(state: AppState) -> Router {
         .route("/devices/info", get(device_info))
         .route("/Devices/Options", get(device_options))
         .route("/devices/options", get(device_options))
-        .route("/Devices/Options", post(admin_no_content))
-        .route("/devices/options", post(admin_no_content))
+        .route("/Devices/Options", post(update_device_options))
+        .route("/devices/options", post(update_device_options))
         .route("/Devices", delete(delete_device))
         .route("/devices", delete(delete_device))
         .route("/Session/Sessions", get(session_sessions))
@@ -673,10 +673,64 @@ async fn device_info() -> Json<serde_json::Value> {
     }))
 }
 
-async fn device_options() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "CustomName": null
-    }))
+#[derive(Debug, Deserialize)]
+struct DeviceOptionsQuery {
+    #[serde(alias = "Id", alias = "id")]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceOptionsUpdate {
+    #[serde(alias = "CustomName")]
+    custom_name: Option<String>,
+}
+
+async fn device_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<DeviceOptionsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let custom_name = if let Some(id) = trimmed_optional(query.id) {
+        state
+            .db
+            .device_session_by_id(&id)
+            .await?
+            .map(|session| session.device_name)
+    } else {
+        None
+    };
+    Ok(Json(serde_json::json!({
+        "CustomName": custom_name
+    })))
+}
+
+async fn update_device_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<DeviceOptionsQuery>,
+    Json(payload): Json<DeviceOptionsUpdate>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let Some(id) = trimmed_optional(query.id) else {
+        return Err(ApiError::bad_request("Device id is required"));
+    };
+    let Some(custom_name) = trimmed_optional(payload.custom_name) else {
+        return Err(ApiError::bad_request("CustomName is required"));
+    };
+    if state.db.device_session_by_id(&id).await?.is_none() {
+        return Err(ApiError::not_found("Device not found"));
+    }
+    state.db.update_device_name(&id, &custom_name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn trimmed_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3797,11 +3851,7 @@ mod tests {
         assert_eq!(live_tv_channels["TotalRecordCount"], 0);
         assert_eq!(live_tv_channels["Items"].as_array().unwrap().len(), 0);
 
-        for endpoint in [
-            "/System/Configuration",
-            "/System/Configuration/Branding",
-            "/Devices/Options",
-        ] {
+        for endpoint in ["/System/Configuration", "/System/Configuration/Branding"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -3831,6 +3881,35 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Devices/Options")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Devices/Options")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         for endpoint in [
             "/System/Configuration/metadata",
@@ -4190,6 +4269,152 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn device_options_round_trip_custom_name() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Original Device", DeviceId="options-device", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Devices/Options?Id=options-device")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Devices/Options?Id=options-device")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let options: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(options["CustomName"], "Original Device");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/devices/options?Id=options-device")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "CustomName": "Living Room TV" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions[0]["DeviceName"], "Living Room TV");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/devices/options?Id=options-device")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_options: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_options["CustomName"], "Living Room TV");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Devices/Options?Id=missing-device")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "CustomName": "Missing Device" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Devices/Options")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
