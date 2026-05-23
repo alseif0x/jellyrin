@@ -1456,12 +1456,6 @@ struct ItemsQuery {
     _exclude_location_types: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct LatestItemsQuery {
-    #[serde(alias = "Limit")]
-    limit: Option<usize>,
-}
-
 async fn items_result(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1534,41 +1528,82 @@ async fn user_items_result(
 async fn item_counts(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<ItemsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(item_counts_json(&state.db.media_items().await?)))
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+    let filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        requested_user_id,
+        &state.db,
+    )
+    .await?;
+    Ok(Json(item_counts_json(&filtered_items)))
 }
 
 async fn user_item_counts(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(auth_query): Query<AuthQuery>,
     Path(user_id): Path<String>,
+    Query(query): Query<ItemsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    Ok(Json(item_counts_json(&state.db.media_items().await?)))
+    let filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    Ok(Json(item_counts_json(&filtered_items)))
 }
 
 async fn latest_items(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
-    Query(query): Query<LatestItemsQuery>,
+    Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let limit = query.limit.unwrap_or(20).min(100) as i64;
+    let mut filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        requested_user_id,
+        &state.db,
+    )
+    .await?;
+    filtered_items.sort_by(|left, right| {
+        compare_media_items(
+            right,
+            left,
+            &[SortField::DateLastMediaAdded, SortField::SortName],
+        )
+    });
+    let limit = query.limit.unwrap_or(20).min(100);
     Ok(Json(
-        state
-            .db
-            .latest_media_items(limit)
-            .await?
-            .iter()
-            .map(|item| media_item_to_json(item, &server_id))
-            .collect(),
+        items_to_json(
+            &state.db,
+            filtered_items.into_iter().take(limit).collect(),
+            &server_id,
+            requested_user_id,
+        )
+        .await?,
     ))
 }
 
@@ -1577,22 +1612,36 @@ async fn user_latest_items(
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path(user_id): Path<String>,
-    Query(query): Query<LatestItemsQuery>,
+    Query(query): Query<ItemsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let limit = query.limit.unwrap_or(20).min(100) as i64;
+    let mut filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    filtered_items.sort_by(|left, right| {
+        compare_media_items(
+            right,
+            left,
+            &[SortField::DateLastMediaAdded, SortField::SortName],
+        )
+    });
+    let limit = query.limit.unwrap_or(20).min(100);
     Ok(Json(
-        state
-            .db
-            .latest_media_items(limit)
-            .await?
-            .iter()
-            .map(|item| media_item_to_json(item, &server_id))
-            .collect(),
+        items_to_json(
+            &state.db,
+            filtered_items.into_iter().take(limit).collect(),
+            &server_id,
+            Some(requested_user_id),
+        )
+        .await?,
     ))
 }
 
@@ -4044,6 +4093,61 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
+                        "/Items/Counts?ParentId={parent_id}&IncludeItemTypes=Movie"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_counts["MovieCount"], 1);
+        assert_eq!(filtered_counts["ItemCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/Counts?SearchTerm=missing-title")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let empty_counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(empty_counts["MovieCount"], 0);
+        assert_eq!(empty_counts["ItemCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Latest?ParentId={parent_id}&IncludeItemTypes=Movie&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(latest.as_array().unwrap().len(), 1);
+        assert_eq!(latest[0]["Name"], "Example Movie");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
                         "/items?ParentId={parent_id}&IncludeItemTypes=Movie&StartIndex=0&Limit=1&SortBy=SortName"
                     ))
                     .header("X-Emby-Token", &api_key)
@@ -4501,6 +4605,45 @@ mod tests {
         let user_context_items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(user_context_items["TotalRecordCount"], 1);
         assert_eq!(user_context_items["Items"][0]["UserData"]["Played"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Users/{user_id}/Items/Counts?IncludeItemTypes=Movie&Filters=IsPlayed"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_played_counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_played_counts["MovieCount"], 1);
+        assert_eq!(user_played_counts["ItemCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Users/{user_id}/Items/Latest?IncludeItemTypes=Movie&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_latest.as_array().unwrap().len(), 1);
+        assert_eq!(user_latest[0]["Id"], item_id);
+        assert_eq!(user_latest[0]["UserData"]["Played"], true);
 
         let response = app
             .clone()
