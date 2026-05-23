@@ -157,6 +157,8 @@ pub fn router(state: AppState) -> Router {
         .route("/Startup/Complete", post(post_startup_complete))
         .route("/Users/Public", get(get_public_users))
         .route("/users/public", get(get_public_users))
+        .route("/Users", get(get_users))
+        .route("/users", get(get_users))
         .route("/Users/AuthenticateByName", post(authenticate_by_name))
         .route("/Users/authenticatebyname", post(authenticate_by_name))
         .route("/users/authenticatebyname", post(authenticate_by_name))
@@ -518,6 +520,22 @@ async fn post_startup_complete(State(state): State<AppState>) -> Result<StatusCo
 }
 
 async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
+    let server = state.db.server_state().await?;
+    let users = state.db.users().await?;
+    Ok(Json(
+        users
+            .iter()
+            .map(|user| user_to_dto(user, server.server_id))
+            .collect(),
+    ))
+}
+
+async fn get_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<UserDto>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let server = state.db.server_state().await?;
     let users = state.db.users().await?;
     Ok(Json(
@@ -6561,7 +6579,12 @@ mod tests {
     #[tokio::test]
     async fn public_users_lists_all_configured_users() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        db.update_first_user("admin".to_string(), "admin-secret")
+        let admin = db
+            .update_first_user("admin".to_string(), "admin-secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "test-key")
             .await
             .unwrap();
         db.upsert_admin_user("jellyrin-e2e-admin", "e2e-secret")
@@ -6574,6 +6597,7 @@ mod tests {
         });
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Users/Public")
@@ -6593,5 +6617,42 @@ mod tests {
                 .iter()
                 .any(|user| user["Name"] == "jellyrin-e2e-admin")
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for endpoint in ["/Users", "/users"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let users: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(users.as_array().unwrap().len(), 2);
+            assert!(
+                users
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|user| user["Policy"]["IsAdministrator"] == true)
+            );
+        }
     }
 }
