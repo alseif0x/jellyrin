@@ -646,8 +646,20 @@ async fn session_sessions(
     ))
 }
 
-async fn devices() -> Json<serde_json::Value> {
-    Json(empty_result())
+async fn devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let items = state
+        .db
+        .device_sessions()
+        .await?
+        .iter()
+        .map(device_to_json)
+        .collect::<Vec<serde_json::Value>>();
+    Ok(Json(query_result(items)))
 }
 
 async fn installed_plugins() -> Json<Vec<serde_json::Value>> {
@@ -674,8 +686,27 @@ async fn plugin_manifest(Path(plugin_id): Path<String>) -> Json<serde_json::Valu
     }))
 }
 
-async fn device_info() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+async fn device_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<DeviceOptionsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let device = match trimmed_optional(query.id) {
+        Some(id) => state.db.device_session_by_id(&id).await?,
+        None => None,
+    };
+    Ok(Json(
+        device
+            .as_ref()
+            .map(device_to_json)
+            .unwrap_or_else(empty_device_info_json),
+    ))
+}
+
+fn empty_device_info_json() -> serde_json::Value {
+    serde_json::json!({
         "Name": null,
         "Id": null,
         "LastUserName": null,
@@ -684,7 +715,20 @@ async fn device_info() -> Json<serde_json::Value> {
         "LastUserId": null,
         "DateLastActivity": null,
         "Capabilities": null
-    }))
+    })
+}
+
+fn device_to_json(device: &DeviceSession) -> serde_json::Value {
+    serde_json::json!({
+        "Name": device.device_name,
+        "Id": device.device_id,
+        "LastUserName": device.user_name,
+        "AppName": device.client,
+        "AppVersion": device.version,
+        "LastUserId": device.user_id,
+        "DateLastActivity": format_time_for_json(device.last_activity_at),
+        "Capabilities": null
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -4700,6 +4744,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn devices_list_and_info_return_persisted_sessions() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Admin Browser", DeviceId="admin-browser", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Devices")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let devices: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(devices["TotalRecordCount"], 1);
+        assert_eq!(devices["Items"][0]["Id"], "admin-browser");
+        assert_eq!(devices["Items"][0]["Name"], "Admin Browser");
+        assert_eq!(devices["Items"][0]["AppName"], "Jellyfin Web");
+        assert_eq!(devices["Items"][0]["LastUserName"], "admin");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/devices/info?Id=admin-browser")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["Id"], "admin-browser");
+        assert_eq!(info["Name"], "Admin Browser");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Devices/Info?Id=missing-device")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let missing_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(missing_info["Id"], Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Devices?Id=admin-browser")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Devices")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let devices_after_delete: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(devices_after_delete["TotalRecordCount"], 0);
     }
 
     #[tokio::test]
