@@ -4,6 +4,7 @@
 /config/
 /cache/
 /logs/
+/var/
 /node_modules/
 /playwright-report/
 /test-results/
