@@ -69,6 +69,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/capabilities/full", post(no_content))
         .route("/QuickConnect/Enabled", get(quick_connect_enabled))
         .route("/quickconnect/enabled", get(quick_connect_enabled))
+        .route("/SyncPlay/List", get(empty_json_array))
+        .route("/syncplay/list", get(empty_json_array))
         .route("/Branding/Configuration", get(branding_configuration))
         .route("/branding/configuration", get(branding_configuration))
         .route("/Branding/Css", get(empty_text))
@@ -245,8 +247,13 @@ async fn post_startup_complete(State(state): State<AppState>) -> Result<StatusCo
 
 async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
     let server = state.db.server_state().await?;
-    let user = state.db.first_user().await?;
-    Ok(Json(vec![user_to_dto(&user, server.server_id)]))
+    let users = state.db.users().await?;
+    Ok(Json(
+        users
+            .iter()
+            .map(|user| user_to_dto(user, server.server_id))
+            .collect(),
+    ))
 }
 
 async fn authenticate_by_name(
@@ -324,6 +331,10 @@ async fn no_content() -> StatusCode {
 
 async fn quick_connect_enabled() -> Json<bool> {
     Json(false)
+}
+
+async fn empty_json_array() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
 }
 
 async fn branding_configuration() -> Json<serde_json::Value> {
@@ -1416,6 +1427,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/SyncPlay/List")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let syncplay: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(syncplay.as_array().unwrap().len(), 0);
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/items/00000000-0000-0000-0000-000000000000/images/Primary")
@@ -1478,5 +1504,42 @@ mod tests {
         assert_eq!(result["Items"][0]["Name"], "Example Movie");
         assert_eq!(result["Items"][0]["Type"], "Movie");
         assert_eq!(result["Items"][0]["Path"], movie.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn public_users_lists_all_configured_users() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_first_user("admin".to_string(), "admin-secret")
+            .await
+            .unwrap();
+        db.upsert_admin_user("jellyrin-e2e-admin", "e2e-secret")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/Public")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let users: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(users.as_array().unwrap().len(), 2);
+        assert!(
+            users
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|user| user["Name"] == "jellyrin-e2e-admin")
+        );
     }
 }

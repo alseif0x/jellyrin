@@ -3,6 +3,9 @@ const { test, expect } = require('@playwright/test');
 test('deployed server login page loads without spinner deadlock', async ({ page, request, baseURL }) => {
   test.skip(process.env.JELLYRIN_E2E_DEPLOYED !== '1', 'Only runs against an already deployed server');
 
+  const adminUser = process.env.JELLYRIN_E2E_ADMIN_USER;
+  test.skip(!adminUser, 'Requires JELLYRIN_E2E_ADMIN_USER');
+
   const publicInfoResponse = await request.get('/System/Info/Public');
   expect(publicInfoResponse.ok()).toBeTruthy();
   const publicInfo = await publicInfoResponse.json();
@@ -11,7 +14,7 @@ test('deployed server login page loads without spinner deadlock', async ({ page,
   const usersResponse = await request.get('/users/public');
   expect(usersResponse.ok()).toBeTruthy();
   const users = await usersResponse.json();
-  expect(users.some(user => user.Name === 'admin')).toBe(true);
+  expect(users.some(user => user.Name === adminUser)).toBe(true);
 
   const loginUrl = `${baseURL}/web/#/login?serverid=${publicInfo.Id}&url=%2Fhome`;
   await page.goto(loginUrl);
@@ -21,7 +24,9 @@ test('deployed server login page loads without spinner deadlock', async ({ page,
 
 test('deployed server authenticates and reaches empty home cleanly', async ({ page, request, baseURL }) => {
   test.skip(process.env.JELLYRIN_E2E_DEPLOYED !== '1', 'Only runs against an already deployed server');
-  test.skip(!process.env.JELLYRIN_E2E_ADMIN_PASSWORD, 'Requires JELLYRIN_E2E_ADMIN_PASSWORD');
+  const adminUser = process.env.JELLYRIN_E2E_ADMIN_USER;
+  const adminPassword = process.env.JELLYRIN_E2E_ADMIN_PASSWORD;
+  test.skip(!adminUser || !adminPassword, 'Requires JELLYRIN_E2E_ADMIN_USER and JELLYRIN_E2E_ADMIN_PASSWORD');
 
   const publicInfo = await (await request.get('/System/Info/Public')).json();
   const failedResponses = [];
@@ -33,8 +38,8 @@ test('deployed server authenticates and reaches empty home cleanly', async ({ pa
 
   await page.goto(`${baseURL}/web/#/login?serverid=${publicInfo.Id}&url=%2Fhome`);
   await page.getByRole('button', { name: 'Manual Login' }).click();
-  await page.locator('#txtManualName').fill(process.env.JELLYRIN_E2E_ADMIN_USER || 'admin');
-  await page.locator('#txtManualPassword').fill(process.env.JELLYRIN_E2E_ADMIN_PASSWORD);
+  await page.locator('#txtManualName').fill(adminUser);
+  await page.locator('#txtManualPassword').fill(adminPassword);
 
   const authResponse = page.waitForResponse(response =>
     response.url().toLowerCase().includes('/users/authenticatebyname') && response.status() === 200

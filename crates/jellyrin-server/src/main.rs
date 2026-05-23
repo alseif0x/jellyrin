@@ -36,6 +36,12 @@ struct Args {
 
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
+
+    #[arg(long, env = "JELLYRIN_E2E_ADMIN_USER")]
+    e2e_admin_user: Option<String>,
+
+    #[arg(long, env = "JELLYRIN_E2E_ADMIN_PASSWORD")]
+    e2e_admin_password: Option<String>,
 }
 
 #[tokio::main]
@@ -45,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     prepare_dirs(&args).await?;
 
-    let database_url = args.database_url.unwrap_or_else(|| {
+    let database_url = args.database_url.clone().unwrap_or_else(|| {
         format!(
             "sqlite://{}?mode=rwc",
             args.data_dir.join("jellyrin.db").to_string_lossy()
@@ -53,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let db = Database::connect(&database_url).await?;
+    bootstrap_e2e_admin(&db, &args).await?;
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .context("invalid bind address")?;
@@ -85,6 +92,25 @@ fn init_tracing() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+async fn bootstrap_e2e_admin(db: &Database, args: &Args) -> anyhow::Result<()> {
+    match (&args.e2e_admin_user, &args.e2e_admin_password) {
+        (Some(user), Some(password)) => {
+            db.upsert_admin_user(user, password)
+                .await
+                .context("failed to bootstrap E2E admin user")?;
+            tracing::warn!(user = %user, "bootstrapped E2E admin user from environment");
+        }
+        (None, None) => {}
+        _ => {
+            tracing::warn!(
+                "ignoring incomplete E2E admin bootstrap environment; both user and password are required"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn prepare_dirs(args: &Args) -> anyhow::Result<()> {

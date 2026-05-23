@@ -155,6 +155,68 @@ impl Database {
         }
     }
 
+    pub async fn users(&self) -> anyhow::Result<Vec<User>> {
+        let rows = sqlx::query_as::<_, UserRow>(
+            r#"
+            SELECT id, name, is_administrator, is_disabled, created_at, updated_at
+            FROM users
+            ORDER BY name COLLATE NOCASE
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_admin_user(&self, name: &str, password: &str) -> anyhow::Result<User> {
+        let trimmed_name = name.trim();
+        anyhow::ensure!(
+            !trimmed_name.is_empty(),
+            "admin user name must not be empty"
+        );
+        anyhow::ensure!(!password.is_empty(), "admin password must not be empty");
+
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let existing = self.optional_user_by_name(trimmed_name).await?;
+        let id = existing.as_ref().map_or_else(Uuid::new_v4, |user| user.id);
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, name, is_administrator, is_disabled, created_at, updated_at)
+            VALUES (?1, ?2, 1, 0, ?3, ?3)
+            ON CONFLICT(name) DO UPDATE SET
+                is_administrator = 1,
+                is_disabled = 0,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(trimmed_name)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        let password_hash = hash_password(password)?;
+        sqlx::query(
+            r#"
+            INSERT INTO user_passwords (user_id, algorithm, password_hash, updated_at)
+            VALUES (?1, 'argon2id', ?2, ?3)
+            ON CONFLICT(user_id) DO UPDATE SET
+                algorithm = excluded.algorithm,
+                password_hash = excluded.password_hash,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(password_hash)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.user_by_id(id).await
+    }
+
     pub async fn update_first_user(&self, name: String, password: &str) -> anyhow::Result<User> {
         let user = self.first_user().await?;
         let now = format_time(OffsetDateTime::now_utc())?;
@@ -575,6 +637,12 @@ impl Database {
     }
 
     async fn user_by_name(&self, username: &str) -> anyhow::Result<User> {
+        self.optional_user_by_name(username)
+            .await?
+            .context("user not found")
+    }
+
+    async fn optional_user_by_name(&self, username: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, name, is_administrator, is_disabled, created_at, updated_at
@@ -584,10 +652,9 @@ impl Database {
         )
         .bind(username)
         .fetch_optional(&self.pool)
-        .await?
-        .context("user not found")?;
+        .await?;
 
-        row.try_into()
+        row.map(TryInto::try_into).transpose()
     }
 
     async fn user_by_id(&self, user_id: Uuid) -> anyhow::Result<User> {
@@ -1040,5 +1107,39 @@ mod tests {
         assert_eq!(items[0].path, movie.to_string_lossy());
         assert_eq!(items[0].media_type, "Video");
         assert_eq!(items[0].collection_type.as_deref(), Some("movies"));
+    }
+
+    #[tokio::test]
+    async fn upsert_admin_user_creates_separate_login_account() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_first_user("admin".to_string(), "admin-secret")
+            .await
+            .unwrap();
+
+        let user = db
+            .upsert_admin_user("jellyrin-e2e-admin", "e2e-secret")
+            .await
+            .unwrap();
+        assert_eq!(user.name, "jellyrin-e2e-admin");
+        assert!(user.is_administrator);
+        assert!(!user.is_disabled);
+
+        let (auth_user, _) = db
+            .authenticate_user_by_name(
+                "jellyrin-e2e-admin",
+                "e2e-secret",
+                "e2e-device",
+                "E2E Device",
+                "Jellyrin E2E",
+                "dev",
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth_user.id, user.id);
+
+        let users = db.users().await.unwrap();
+        assert_eq!(users.len(), 2);
+        assert!(users.iter().any(|user| user.name == "admin"));
+        assert!(users.iter().any(|user| user.name == "jellyrin-e2e-admin"));
     }
 }
