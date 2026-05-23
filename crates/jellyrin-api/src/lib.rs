@@ -859,12 +859,52 @@ async fn ping() -> &'static str {
     "Jellyfin Server"
 }
 
-async fn system_storage() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "ProgramDataPath": null,
-        "WebPath": null,
-        "Items": []
-    }))
+async fn system_storage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let temp_dir = std::env::temp_dir();
+    let libraries = state
+        .db
+        .virtual_folders()
+        .await?
+        .iter()
+        .map(|folder| {
+            serde_json::json!({
+                "Id": folder.id,
+                "Name": folder.name,
+                "Folders": folder
+                    .locations
+                    .iter()
+                    .map(|path| folder_storage_json(PathBuf::from(path)))
+                    .collect::<Vec<serde_json::Value>>()
+            })
+        })
+        .collect::<Vec<serde_json::Value>>();
+
+    Ok(Json(serde_json::json!({
+        "ProgramDataFolder": folder_storage_json(current_dir.clone()),
+        "WebFolder": folder_storage_json(state.web_dir),
+        "ImageCacheFolder": folder_storage_json(temp_dir.join("jellyrin").join("images")),
+        "CacheFolder": folder_storage_json(temp_dir.join("jellyrin").join("cache")),
+        "LogFolder": folder_storage_json(current_dir.join("logs")),
+        "InternalMetadataFolder": folder_storage_json(current_dir.join("metadata")),
+        "TranscodingTempFolder": folder_storage_json(temp_dir.join("jellyrin").join("transcodes")),
+        "Libraries": libraries
+    })))
+}
+
+fn folder_storage_json(path: PathBuf) -> serde_json::Value {
+    serde_json::json!({
+        "Path": path.to_string_lossy(),
+        "FreeSpace": null,
+        "UsedSpace": null,
+        "StorageType": null,
+        "DeviceId": null
+    })
 }
 
 async fn activity_log_entries() -> Json<serde_json::Value> {
@@ -4161,6 +4201,17 @@ mod tests {
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let storage_path = storage_root.path().join("movies");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        let storage_folder = db
+            .upsert_virtual_folder(
+                "Storage Movies",
+                Some("movies"),
+                vec![storage_path.to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -4232,6 +4283,46 @@ mod tests {
         assert_eq!(config["ServerName"], "Jellyrin");
         assert_eq!(config["EnableRemoteAccess"], false);
         assert_eq!(config["ContentTypes"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Info/Storage")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Info/Storage")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let storage: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !storage["ProgramDataFolder"]["Path"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(storage["WebFolder"]["Path"], ".");
+        assert_eq!(storage["Libraries"][0]["Id"], storage_folder.id.to_string());
+        assert_eq!(storage["Libraries"][0]["Name"], "Storage Movies");
+        assert_eq!(
+            storage["Libraries"][0]["Folders"][0]["Path"],
+            storage_path.to_string_lossy().to_string()
+        );
 
         let response = app
             .clone()
