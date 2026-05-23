@@ -182,8 +182,10 @@ test('fresh install completes the Jellyfin web startup wizard and loads a scanne
   await libraryLink.click();
   await page.waitForLoadState('networkidle');
 
-  await page.goto(`/web/#/details?id=${movie.Id}`);
-  await expect(page.getByText('Example Movie', { exact: true }).first()).toBeVisible({ timeout: 20_000 });
+  const movieLink = page.locator(`a[href*="details?id=${movie.Id}"]`).last();
+  await expect(movieLink).toBeVisible({ timeout: 20_000 });
+  await movieLink.click();
+  await expect(page).toHaveURL(new RegExp(`details\\?id=${movie.Id}`));
   await page.waitForLoadState('networkidle');
 
   expect(failedResponses).toEqual([]);

@@ -257,39 +257,45 @@ pub fn router(state: AppState) -> Router {
         .route("/items/filters", get(item_filters))
         .route("/Items/{item_id}/Ancestors", get(item_ancestors))
         .route("/items/{item_id}/ancestors", get(item_ancestors))
-        .route("/Items/{item_id}/Similar", get(authenticated_empty_items))
-        .route("/items/{item_id}/similar", get(authenticated_empty_items))
+        .route(
+            "/Items/{item_id}/Similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/items/{item_id}/similar",
+            get(authenticated_item_empty_items),
+        )
         .route(
             "/Items/{item_id}/Images",
-            get(authenticated_empty_json_array),
+            get(authenticated_item_empty_json_array),
         )
         .route(
             "/items/{item_id}/images",
-            get(authenticated_empty_json_array),
+            get(authenticated_item_empty_json_array),
         )
         .route(
             "/Items/{item_id}/ThemeMedia",
-            get(authenticated_theme_media),
+            get(authenticated_item_theme_media),
         )
         .route(
             "/items/{item_id}/thememedia",
-            get(authenticated_theme_media),
+            get(authenticated_item_theme_media),
         )
         .route(
             "/Items/{item_id}/ThemeSongs",
-            get(authenticated_theme_items),
+            get(authenticated_item_theme_items),
         )
         .route(
             "/items/{item_id}/themesongs",
-            get(authenticated_theme_items),
+            get(authenticated_item_theme_items),
         )
         .route(
             "/Items/{item_id}/ThemeVideos",
-            get(authenticated_theme_items),
+            get(authenticated_item_theme_items),
         )
         .route(
             "/items/{item_id}/themevideos",
-            get(authenticated_theme_items),
+            get(authenticated_item_theme_items),
         )
         .route("/Items/{item_id}/PlaybackInfo", get(item_playback_info))
         .route("/items/{item_id}/playbackinfo", get(item_playback_info))
@@ -1946,6 +1952,17 @@ async fn authenticated_empty_items(
     Ok(empty_items_result().await)
 }
 
+async fn authenticated_item_empty_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    Ok(empty_items_result().await)
+}
+
 async fn authenticated_empty_json_array(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1955,12 +1972,25 @@ async fn authenticated_empty_json_array(
     Ok(empty_json_array().await)
 }
 
-async fn authenticated_theme_media(
+async fn authenticated_item_empty_json_array(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    Ok(empty_json_array().await)
+}
+
+async fn authenticated_item_theme_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
     Ok(Json(serde_json::json!({
         "ThemeVideosResult": query_result(Vec::new()),
         "ThemeSongsResult": query_result(Vec::new()),
@@ -1968,12 +1998,14 @@ async fn authenticated_theme_media(
     })))
 }
 
-async fn authenticated_theme_items(
+async fn authenticated_item_theme_items(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
     Ok(empty_items_result().await)
 }
 
@@ -4242,6 +4274,24 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/Persons")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let persons: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(persons["StartIndex"], 0);
+        assert_eq!(persons["TotalRecordCount"], 0);
+        assert_eq!(persons["Items"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Movies/Recommendations")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -4294,6 +4344,82 @@ mod tests {
         assert_eq!(detail["People"].as_array().unwrap().len(), 0);
         assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
         assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/Images"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let item_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(item_images.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/ThemeMedia"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let theme_media: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(theme_media["ThemeVideosResult"]["TotalRecordCount"], 0);
+        assert_eq!(
+            theme_media["ThemeSongsResult"]["Items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(theme_media["SoundtrackSongsResult"]["StartIndex"], 0);
+
+        for endpoint in [
+            format!("/Items/{item_id}/ThemeSongs"),
+            format!("/Items/{item_id}/ThemeVideos"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let theme_items: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(theme_items["TotalRecordCount"], 0);
+            assert_eq!(theme_items["StartIndex"], 0);
+            assert_eq!(theme_items["Items"].as_array().unwrap().len(), 0);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/00000000-0000-0000-0000-000000000000/ThemeSongs")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
