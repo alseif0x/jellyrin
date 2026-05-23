@@ -195,10 +195,16 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/playing/progress", post(report_playback_progress))
         .route("/Sessions/Playing/Stopped", post(report_playback_stopped))
         .route("/sessions/playing/stopped", post(report_playback_stopped))
-        .route("/Sessions/Capabilities", post(no_content))
-        .route("/Sessions/Capabilities/Full", post(no_content))
-        .route("/sessions/capabilities", post(no_content))
-        .route("/sessions/capabilities/full", post(no_content))
+        .route("/Sessions/Capabilities", post(update_session_capabilities))
+        .route(
+            "/Sessions/Capabilities/Full",
+            post(update_session_capabilities),
+        )
+        .route("/sessions/capabilities", post(update_session_capabilities))
+        .route(
+            "/sessions/capabilities/full",
+            post(update_session_capabilities),
+        )
         .route("/QuickConnect/Enabled", get(quick_connect_enabled))
         .route("/quickconnect/enabled", get(quick_connect_enabled))
         .route("/SyncPlay/List", get(empty_json_array))
@@ -732,6 +738,113 @@ async fn logout(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_session_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionCapabilitiesQuery>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let (_, token) = require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let capabilities = normalize_session_capabilities(body.map(|Json(value)| value), &query)?;
+    state
+        .db
+        .update_device_capabilities(&token.access_token, capabilities)
+        .await
+        .map_err(|_| ApiError::not_found("Device session not found"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionCapabilitiesQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "PlayableMediaTypes", alias = "playableMediaTypes")]
+    playable_media_types: Option<String>,
+    #[serde(alias = "SupportedCommands", alias = "supportedCommands")]
+    supported_commands: Option<String>,
+    #[serde(alias = "SupportsRemoteControl", alias = "supportsRemoteControl")]
+    supports_remote_control: Option<bool>,
+    #[serde(alias = "SupportsMediaControl", alias = "supportsMediaControl")]
+    supports_media_control: Option<bool>,
+    #[serde(
+        alias = "SupportsPersistentIdentifier",
+        alias = "supportsPersistentIdentifier"
+    )]
+    supports_persistent_identifier: Option<bool>,
+    #[serde(alias = "SupportsSync", alias = "supportsSync")]
+    supports_sync: Option<bool>,
+}
+
+fn normalize_session_capabilities(
+    payload: Option<serde_json::Value>,
+    query: &SessionCapabilitiesQuery,
+) -> Result<serde_json::Value, ApiError> {
+    let mut object = match payload {
+        Some(serde_json::Value::Object(object)) => object,
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "Session capabilities body must be an object",
+            ));
+        }
+        None => serde_json::Map::new(),
+    };
+    let serde_json::Value::Object(defaults) = default_session_capabilities() else {
+        unreachable!("default session capabilities must be an object");
+    };
+    for (key, value) in defaults {
+        object.entry(key).or_insert(value);
+    }
+    if let Some(values) = query.playable_media_types.as_deref() {
+        object.insert(
+            "PlayableMediaTypes".to_string(),
+            serde_json::Value::Array(parse_capability_list(values)),
+        );
+    }
+    if let Some(values) = query.supported_commands.as_deref() {
+        object.insert(
+            "SupportedCommands".to_string(),
+            serde_json::Value::Array(parse_capability_list(values)),
+        );
+    }
+    if let Some(value) = query.supports_remote_control {
+        object.insert(
+            "SupportsRemoteControl".to_string(),
+            serde_json::json!(value),
+        );
+    }
+    if let Some(value) = query.supports_media_control {
+        object.insert("SupportsMediaControl".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = query.supports_persistent_identifier {
+        object.insert(
+            "SupportsPersistentIdentifier".to_string(),
+            serde_json::json!(value),
+        );
+    }
+    if let Some(value) = query.supports_sync {
+        object.insert("SupportsSync".to_string(), serde_json::json!(value));
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+fn parse_capability_list(values: &str) -> Vec<serde_json::Value> {
+    values
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| serde_json::Value::String(value.to_string()))
+        .collect()
+}
+
+fn default_session_capabilities() -> serde_json::Value {
+    serde_json::json!({
+        "PlayableMediaTypes": [],
+        "SupportedCommands": [],
+        "SupportsRemoteControl": false,
+        "SupportsMediaControl": false
+    })
+}
+
 async fn ping() -> &'static str {
     "Jellyfin Server"
 }
@@ -862,7 +975,7 @@ fn device_to_json(device: &DeviceSession) -> serde_json::Value {
         "AppVersion": device.version,
         "LastUserId": device.user_id,
         "DateLastActivity": format_time_for_json(device.last_activity_at),
-        "Capabilities": null
+        "Capabilities": device.capabilities.clone()
     })
 }
 
@@ -1138,10 +1251,6 @@ fn empty_result() -> serde_json::Value {
         "TotalRecordCount": 0,
         "StartIndex": 0
     })
-}
-
-async fn no_content() -> StatusCode {
-    StatusCode::NO_CONTENT
 }
 
 async fn empty_object() -> Json<serde_json::Value> {
@@ -3363,6 +3472,7 @@ fn session_to_json(
     active_playback: Option<&ActivePlaybackSession>,
     server_id: &str,
 ) -> serde_json::Value {
+    let capabilities = session.capabilities.as_ref();
     serde_json::json!({
         "Id": session.access_token,
         "UserId": session.user_id,
@@ -3373,13 +3483,29 @@ fn session_to_json(
         "DeviceId": session.device_id,
         "ApplicationVersion": session.version,
         "IsActive": true,
-        "SupportsRemoteControl": false,
-        "PlayableMediaTypes": [],
-        "SupportedCommands": [],
+        "SupportsRemoteControl": capability_bool(capabilities, "SupportsRemoteControl")
+            || capability_bool(capabilities, "SupportsMediaControl"),
+        "PlayableMediaTypes": capability_array(capabilities, "PlayableMediaTypes"),
+        "SupportedCommands": capability_array(capabilities, "SupportedCommands"),
         "NowPlayingItem": active_playback.map(|playback| media_item_to_json(&playback.item, server_id)),
         "PlayState": active_playback.map(active_playback_state_json),
         "NowViewingItem": null,
     })
+}
+
+fn capability_bool(capabilities: Option<&serde_json::Value>, key: &str) -> bool {
+    capabilities
+        .and_then(|capabilities| capabilities.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn capability_array(capabilities: Option<&serde_json::Value>, key: &str) -> serde_json::Value {
+    capabilities
+        .and_then(|capabilities| capabilities.get(key))
+        .filter(|value| value.is_array())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
 }
 
 fn active_playback_state_json(playback: &ActivePlaybackSession) -> serde_json::Value {
@@ -5016,6 +5142,215 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let devices_after_delete: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(devices_after_delete["TotalRecordCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn session_capabilities_round_trip_to_sessions_and_devices() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Capable Browser", DeviceId="capable-device", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let token = login["AccessToken"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Capabilities/Full")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Capabilities/Full")
+                    .header("X-Emby-Token", token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "PlayableMediaTypes": ["Audio", "Video"],
+                            "SupportedCommands": ["DisplayContent", "Play", "Seek"],
+                            "SupportsRemoteControl": true,
+                            "SupportsMediaControl": true,
+                            "SupportsPersistentIdentifier": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions[0]["DeviceId"], "capable-device");
+        assert_eq!(sessions[0]["SupportsRemoteControl"], true);
+        assert_eq!(sessions[0]["PlayableMediaTypes"], json!(["Audio", "Video"]));
+        assert_eq!(
+            sessions[0]["SupportedCommands"],
+            json!(["DisplayContent", "Play", "Seek"])
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Devices/Info?Id=capable-device")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let device: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(device["Capabilities"]["SupportsPersistentIdentifier"], true);
+        assert_eq!(
+            device["Capabilities"]["SupportedCommands"],
+            json!(["DisplayContent", "Play", "Seek"])
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sessions/capabilities")
+                    .header("X-Emby-Token", token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("[]"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn session_capabilities_query_params_round_trip() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Query Capable", DeviceId="query-capable", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let token = login["AccessToken"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sessions/capabilities?playableMediaTypes=Video,Audio&supportedCommands=DisplayMessage,GoHome&supportsMediaControl=true&supportsPersistentIdentifier=false")
+                    .header("X-Emby-Token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions[0]["DeviceId"], "query-capable");
+        assert_eq!(sessions[0]["SupportsRemoteControl"], true);
+        assert_eq!(sessions[0]["PlayableMediaTypes"], json!(["Video", "Audio"]));
+        assert_eq!(
+            sessions[0]["SupportedCommands"],
+            json!(["DisplayMessage", "GoHome"])
+        );
     }
 
     #[tokio::test]

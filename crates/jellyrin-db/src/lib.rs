@@ -45,6 +45,7 @@ pub struct DeviceSession {
     pub client: String,
     pub version: String,
     pub last_activity_at: OffsetDateTime,
+    pub capabilities: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -583,7 +584,7 @@ impl Database {
             r#"
             SELECT devices.access_token, devices.user_id, users.name AS user_name,
                    devices.device_id, devices.device_name, devices.client, devices.version,
-                   devices.last_activity_at
+                   devices.last_activity_at, devices.capabilities_json
             FROM devices
             INNER JOIN users ON users.id = devices.user_id
             WHERE users.is_disabled = 0
@@ -604,7 +605,7 @@ impl Database {
             r#"
             SELECT devices.access_token, devices.user_id, users.name AS user_name,
                    devices.device_id, devices.device_name, devices.client, devices.version,
-                   devices.last_activity_at
+                   devices.last_activity_at, devices.capabilities_json
             FROM devices
             INNER JOIN users ON users.id = devices.user_id
             WHERE users.is_disabled = 0 AND devices.user_id = ?1
@@ -623,7 +624,7 @@ impl Database {
             r#"
             SELECT devices.access_token, devices.user_id, users.name AS user_name,
                    devices.device_id, devices.device_name, devices.client, devices.version,
-                   devices.last_activity_at
+                   devices.last_activity_at, devices.capabilities_json
             FROM devices
             INNER JOIN users ON users.id = devices.user_id
             WHERE users.is_disabled = 0 AND (devices.access_token = ?1 OR devices.device_id = ?1)
@@ -650,6 +651,29 @@ impl Database {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn update_device_capabilities(
+        &self,
+        access_token: &str,
+        capabilities: Value,
+    ) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let capabilities_json = serde_json::to_string(&capabilities)?;
+        let result = sqlx::query(
+            r#"
+            UPDATE devices
+            SET capabilities_json = ?1, last_activity_at = ?2
+            WHERE access_token = ?3
+            "#,
+        )
+        .bind(capabilities_json)
+        .bind(now)
+        .bind(access_token)
+        .execute(&self.pool)
+        .await?;
+        anyhow::ensure!(result.rows_affected() > 0, "device not found");
         Ok(())
     }
 
@@ -1705,6 +1729,7 @@ struct DeviceSessionRow {
     client: String,
     version: String,
     last_activity_at: String,
+    capabilities_json: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1964,6 +1989,10 @@ impl TryFrom<DeviceSessionRow> for DeviceSession {
             client: row.client,
             version: row.version,
             last_activity_at: parse_time(&row.last_activity_at)?,
+            capabilities: row
+                .capabilities_json
+                .map(|value| serde_json::from_str(&value).context("invalid device capabilities"))
+                .transpose()?,
         })
     }
 }
