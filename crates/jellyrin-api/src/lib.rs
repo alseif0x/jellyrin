@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     fs,
     path::{Path as FsPath, PathBuf},
@@ -1417,8 +1418,16 @@ struct ItemsQuery {
     is_played: Option<bool>,
     #[serde(alias = "IsFolder")]
     is_folder: Option<bool>,
+    #[serde(alias = "Filters")]
+    filters: Option<String>,
+    #[serde(alias = "NameStartsWith")]
+    name_starts_with: Option<String>,
+    #[serde(alias = "NameStartsWithOrGreater")]
+    name_starts_with_or_greater: Option<String>,
+    #[serde(alias = "NameLessThan")]
+    name_less_than: Option<String>,
     #[serde(alias = "Recursive")]
-    _recursive: Option<bool>,
+    _recursive: Option<String>,
     #[serde(alias = "StartIndex")]
     start_index: Option<usize>,
     #[serde(alias = "Limit")]
@@ -1429,6 +1438,22 @@ struct ItemsQuery {
     sort_order: Option<String>,
     #[serde(alias = "Fields")]
     _fields: Option<String>,
+    #[serde(alias = "ImageTypeLimit")]
+    _image_type_limit: Option<String>,
+    #[serde(alias = "EnableImages")]
+    _enable_images: Option<String>,
+    #[serde(alias = "EnableUserData")]
+    _enable_user_data: Option<String>,
+    #[serde(alias = "CollapseBoxSetItems")]
+    _collapse_box_set_items: Option<String>,
+    #[serde(alias = "ImageTypes")]
+    _image_types: Option<String>,
+    #[serde(alias = "EnableImageTypes")]
+    _enable_image_types: Option<String>,
+    #[serde(alias = "EnableTotalRecordCount")]
+    _enable_total_record_count: Option<String>,
+    #[serde(alias = "ExcludeLocationTypes")]
+    _exclude_location_types: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1959,12 +1984,23 @@ async fn filtered_media_items(
     let include_types = csv_lowercase(query.include_item_types.as_deref());
     let exclude_types = csv_lowercase(query.exclude_item_types.as_deref());
     let media_types = csv_lowercase(query.media_types.as_deref());
+    let filters = csv_lowercase(query.filters.as_deref());
     let search_term = query
         .search_term
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
+    let name_starts_with = normalized_prefix(query.name_starts_with.as_deref());
+    let name_starts_with_or_greater =
+        normalized_prefix(query.name_starts_with_or_greater.as_deref());
+    let name_less_than = normalized_prefix(query.name_less_than.as_deref());
+    let is_folder_filter = query
+        .is_folder
+        .or_else(|| filters.as_deref().and_then(folder_filter_value));
+    let is_played_filter = query
+        .is_played
+        .or_else(|| filters.as_deref().and_then(played_filter_value));
 
     let mut items = items
         .into_iter()
@@ -1988,15 +2024,30 @@ async fn filtered_media_items(
                 types.iter().any(|allowed| allowed == &media_type)
             })
         })
-        .filter(|_| query.is_folder.is_none_or(|is_folder| !is_folder))
+        .filter(|_| is_folder_filter.is_none_or(|is_folder| !is_folder))
         .filter(|item| {
             search_term
                 .as_ref()
                 .is_none_or(|term| item.name.to_ascii_lowercase().contains(term))
         })
+        .filter(|item| {
+            name_starts_with
+                .as_ref()
+                .is_none_or(|prefix| item.name.to_ascii_lowercase().starts_with(prefix))
+        })
+        .filter(|item| {
+            name_starts_with_or_greater
+                .as_ref()
+                .is_none_or(|prefix| item.name.to_ascii_lowercase().as_str() >= prefix.as_str())
+        })
+        .filter(|item| {
+            name_less_than
+                .as_ref()
+                .is_none_or(|prefix| item.name.to_ascii_lowercase().as_str() < prefix.as_str())
+        })
         .collect::<Vec<_>>();
 
-    if let Some(is_played) = query.is_played {
+    if let Some(is_played) = is_played_filter {
         let Some(user_id) = user_id else {
             items.clear();
             return Ok(items);
@@ -2014,18 +2065,15 @@ async fn filtered_media_items(
         items = filtered;
     }
 
-    let sort_by = query.sort_by.as_deref().unwrap_or("SortName");
-    if sort_by.eq_ignore_ascii_case("DateCreated") {
-        items.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-    } else {
-        items.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
-    }
+    let sort_fields = sort_fields(query.sort_by.as_deref());
     if query
         .sort_order
         .as_deref()
         .is_some_and(|order| order.eq_ignore_ascii_case("Descending"))
     {
-        items.reverse();
+        items.sort_by(|left, right| compare_media_items(right, left, &sort_fields));
+    } else {
+        items.sort_by(|left, right| compare_media_items(left, right, &sort_fields));
     }
 
     Ok(items)
@@ -2071,6 +2119,74 @@ fn csv_lowercase(value: Option<&str>) -> Option<Vec<String>> {
     } else {
         Some(values)
     }
+}
+
+fn normalized_prefix(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn folder_filter_value(filters: &[String]) -> Option<bool> {
+    if filters.iter().any(|filter| filter == "isfolder") {
+        Some(true)
+    } else if filters.iter().any(|filter| filter == "isnotfolder") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn played_filter_value(filters: &[String]) -> Option<bool> {
+    if filters.iter().any(|filter| filter == "isplayed") {
+        Some(true)
+    } else if filters.iter().any(|filter| filter == "isunplayed") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SortField {
+    SortName,
+    DateCreated,
+    DateLastMediaAdded,
+}
+
+fn sort_fields(sort_by: Option<&str>) -> Vec<SortField> {
+    let fields = sort_by
+        .unwrap_or("SortName")
+        .split(',')
+        .filter_map(|field| match field.trim().to_ascii_lowercase().as_str() {
+            "sortname" | "name" => Some(SortField::SortName),
+            "datecreated" => Some(SortField::DateCreated),
+            "datelastmediaadded" => Some(SortField::DateLastMediaAdded),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if fields.is_empty() {
+        vec![SortField::SortName]
+    } else {
+        fields
+    }
+}
+
+fn compare_media_items(left: &MediaItem, right: &MediaItem, fields: &[SortField]) -> Ordering {
+    fields
+        .iter()
+        .map(|field| match field {
+            SortField::SortName => left
+                .name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase()),
+            SortField::DateCreated => left.created_at.cmp(&right.created_at),
+            SortField::DateLastMediaAdded => left.updated_at.cmp(&right.updated_at),
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or_else(|| left.id.cmp(&right.id))
 }
 
 fn parse_uuid_list(value: &str) -> Result<Vec<Uuid>, ApiError> {
@@ -4631,6 +4747,75 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let folders_only: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(folders_only["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?Filters=IsNotFolder&NameStartsWith=Sec&ImageTypeLimit=1&EnableImages=true&EnableUserData=true&CollapseBoxSetItems=false")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prefixed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prefixed["TotalRecordCount"], 1);
+        assert_eq!(prefixed["Items"][0]["Id"], second_item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?Filters=IsFolder")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_folders: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_folders["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Users/{user_id}/Items?Filters=IsUnplayed&NameStartsWith=Sec"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let unplayed_filter_alias: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unplayed_filter_alias["TotalRecordCount"], 1);
+        assert_eq!(unplayed_filter_alias["Items"][0]["Id"], second_item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?NameStartsWithOrGreater=Second&NameLessThan=Third&SortBy=DateCreated,SortName&SortOrder=Descending&Fields=PrimaryImageAspectRatio,MediaSources&ImageTypes=Primary&EnableTotalRecordCount=true")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let name_window: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(name_window["TotalRecordCount"], 1);
+        assert_eq!(name_window["Items"][0]["Id"], second_item_id);
 
         let response = app
             .clone()
