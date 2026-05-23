@@ -66,6 +66,14 @@ pub struct BrandingConfig {
     pub splashscreen_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemConfigurationPayloads {
+    pub content_types: Value,
+    pub metadata_options: Value,
+    pub path_substitutions: Value,
+    pub plugin_repositories: Value,
+}
+
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let pool = SqlitePoolOptions::new()
@@ -170,6 +178,54 @@ impl Database {
         let mut config = self.startup_config().await?;
         config.enable_remote_access = enabled;
         self.update_startup_config(config).await
+    }
+
+    pub async fn system_configuration_payloads(
+        &self,
+    ) -> anyhow::Result<SystemConfigurationPayloads> {
+        let row = sqlx::query_as::<_, SystemConfigurationPayloadsRow>(
+            r#"
+            SELECT content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json
+            FROM system_configuration_payloads
+            WHERE id = 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => row.try_into(),
+            None => Ok(SystemConfigurationPayloads::default()),
+        }
+    }
+
+    pub async fn update_system_configuration_payloads(
+        &self,
+        payloads: SystemConfigurationPayloads,
+    ) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO system_configuration_payloads (
+                id, content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json, updated_at
+            )
+            VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+                content_types_json = excluded.content_types_json,
+                metadata_options_json = excluded.metadata_options_json,
+                path_substitutions_json = excluded.path_substitutions_json,
+                plugin_repositories_json = excluded.plugin_repositories_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(serde_json::to_string(&payloads.content_types)?)
+        .bind(serde_json::to_string(&payloads.metadata_options)?)
+        .bind(serde_json::to_string(&payloads.path_substitutions)?)
+        .bind(serde_json::to_string(&payloads.plugin_repositories)?)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn branding_config(&self) -> anyhow::Result<BrandingConfig> {
@@ -1658,6 +1714,38 @@ impl Default for BrandingConfig {
     }
 }
 
+impl Default for SystemConfigurationPayloads {
+    fn default() -> Self {
+        Self {
+            content_types: Value::Array(Vec::new()),
+            metadata_options: Value::Array(Vec::new()),
+            path_substitutions: Value::Array(Vec::new()),
+            plugin_repositories: Value::Array(Vec::new()),
+        }
+    }
+}
+
+impl TryFrom<SystemConfigurationPayloadsRow> for SystemConfigurationPayloads {
+    type Error = anyhow::Error;
+
+    fn try_from(row: SystemConfigurationPayloadsRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            content_types: array_payload(&row.content_types_json)?,
+            metadata_options: array_payload(&row.metadata_options_json)?,
+            path_substitutions: array_payload(&row.path_substitutions_json)?,
+            plugin_repositories: array_payload(&row.plugin_repositories_json)?,
+        })
+    }
+}
+
+fn array_payload(raw: &str) -> anyhow::Result<Value> {
+    let value: Value = serde_json::from_str(raw).context("invalid system configuration payload")?;
+    match value {
+        Value::Array(_) => Ok(value),
+        _ => Ok(Value::Array(Vec::new())),
+    }
+}
+
 impl TryFrom<BrandingConfigRow> for BrandingConfig {
     type Error = anyhow::Error;
 
@@ -1730,6 +1818,14 @@ struct DeviceSessionRow {
     version: String,
     last_activity_at: String,
     capabilities_json: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SystemConfigurationPayloadsRow {
+    content_types_json: String,
+    metadata_options_json: String,
+    path_substitutions_json: String,
+    plugin_repositories_json: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -2110,7 +2206,7 @@ fn normalized_locations(locations: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{Database, SystemConfigurationPayloads};
     use serde_json::json;
     use time::Duration;
 
@@ -2161,6 +2257,54 @@ mod tests {
 
         db.revoke_token(&token.access_token).await.unwrap();
         assert!(db.user_by_token(&token.access_token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn system_configuration_payloads_round_trip_arrays() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        let defaults = db.system_configuration_payloads().await.unwrap();
+        assert_eq!(defaults.content_types, json!([]));
+        assert_eq!(defaults.metadata_options, json!([]));
+        assert_eq!(defaults.path_substitutions, json!([]));
+        assert_eq!(defaults.plugin_repositories, json!([]));
+
+        db.update_system_configuration_payloads(SystemConfigurationPayloads {
+            content_types: json!([{ "Name": "Movies", "Value": "movies" }]),
+            metadata_options: json!([{ "ItemType": "Movie" }]),
+            path_substitutions: json!([{ "From": "/mnt/a", "To": "/mnt/b" }]),
+            plugin_repositories: json!([{ "Name": "Example", "Url": "https://example.invalid" }]),
+        })
+        .await
+        .unwrap();
+        let stored = db.system_configuration_payloads().await.unwrap();
+        assert_eq!(
+            stored.content_types,
+            json!([{ "Name": "Movies", "Value": "movies" }])
+        );
+        assert_eq!(stored.metadata_options, json!([{ "ItemType": "Movie" }]));
+        assert_eq!(
+            stored.path_substitutions,
+            json!([{ "From": "/mnt/a", "To": "/mnt/b" }])
+        );
+        assert_eq!(
+            stored.plugin_repositories,
+            json!([{ "Name": "Example", "Url": "https://example.invalid" }])
+        );
+
+        db.update_system_configuration_payloads(SystemConfigurationPayloads {
+            content_types: json!({ "Name": "Movies" }),
+            metadata_options: json!("invalid"),
+            path_substitutions: json!(null),
+            plugin_repositories: json!([{ "Name": "Kept" }]),
+        })
+        .await
+        .unwrap();
+        let sanitized = db.system_configuration_payloads().await.unwrap();
+        assert_eq!(sanitized.content_types, json!([]));
+        assert_eq!(sanitized.metadata_options, json!([]));
+        assert_eq!(sanitized.path_substitutions, json!([]));
+        assert_eq!(sanitized.plugin_repositories, json!([{ "Name": "Kept" }]));
     }
 
     #[tokio::test]

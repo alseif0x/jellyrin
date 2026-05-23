@@ -22,7 +22,10 @@ use jellyrin_compat::{
     StartupRemoteAccessDto, StartupUserDto, UserDto, UserPolicyDto,
 };
 use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
-use jellyrin_db::{ActivePlaybackSession, BrandingConfig, Database, DeviceSession, TaskRun};
+use jellyrin_db::{
+    ActivePlaybackSession, BrandingConfig, Database, DeviceSession, SystemConfigurationPayloads,
+    TaskRun,
+};
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -1119,6 +1122,7 @@ async fn system_configuration(
     Ok(Json(system_configuration_json(
         state.db.startup_config().await?,
         state.db.server_state().await?.startup_wizard_completed,
+        state.db.system_configuration_payloads().await?,
     )))
 }
 
@@ -1134,6 +1138,14 @@ struct SystemConfigurationUpdate {
     preferred_metadata_language: Option<String>,
     #[serde(alias = "EnableRemoteAccess")]
     enable_remote_access: Option<bool>,
+    #[serde(rename = "ContentTypes", alias = "contentTypes")]
+    content_types: Option<serde_json::Value>,
+    #[serde(rename = "MetadataOptions", alias = "metadataOptions")]
+    metadata_options: Option<serde_json::Value>,
+    #[serde(rename = "PathSubstitutions", alias = "pathSubstitutions")]
+    path_substitutions: Option<serde_json::Value>,
+    #[serde(rename = "PluginRepositories", alias = "pluginRepositories")]
+    plugin_repositories: Option<serde_json::Value>,
 }
 
 async fn update_system_configuration(
@@ -1162,6 +1174,28 @@ async fn update_system_configuration(
                 .unwrap_or(current.enable_remote_access),
         })
         .await?;
+    let current_payloads = state.db.system_configuration_payloads().await?;
+    state
+        .db
+        .update_system_configuration_payloads(SystemConfigurationPayloads {
+            content_types: array_update_or_current(
+                payload.content_types,
+                current_payloads.content_types,
+            ),
+            metadata_options: array_update_or_current(
+                payload.metadata_options,
+                current_payloads.metadata_options,
+            ),
+            path_substitutions: array_update_or_current(
+                payload.path_substitutions,
+                current_payloads.path_substitutions,
+            ),
+            plugin_repositories: array_update_or_current(
+                payload.plugin_repositories,
+                current_payloads.plugin_repositories,
+            ),
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1172,9 +1206,20 @@ fn non_empty_or_current(update: Option<String>, current: String) -> String {
         .unwrap_or(current)
 }
 
+fn array_update_or_current(
+    update: Option<serde_json::Value>,
+    current: serde_json::Value,
+) -> serde_json::Value {
+    match update {
+        Some(value @ serde_json::Value::Array(_)) => value,
+        _ => current,
+    }
+}
+
 fn system_configuration_json(
     config: StartupConfig,
     startup_wizard_completed: bool,
+    payloads: SystemConfigurationPayloads,
 ) -> serde_json::Value {
     serde_json::json!({
         "ServerName": config.server_name,
@@ -1191,10 +1236,10 @@ fn system_configuration_json(
         "SkipDeserializationForBasicTypes": false,
         "SkipDeserializationForPrograms": false,
         "SaveMetadataHidden": false,
-        "ContentTypes": [],
-        "MetadataOptions": [],
-        "PathSubstitutions": [],
-        "PluginRepositories": [],
+        "ContentTypes": payloads.content_types,
+        "MetadataOptions": payloads.metadata_options,
+        "PathSubstitutions": payloads.path_substitutions,
+        "PluginRepositories": payloads.plugin_repositories,
         "RemoteClientBitrateLimit": 0,
         "LogFileRetentionDays": 3,
         "RunAtStartup": false
@@ -4674,23 +4719,20 @@ mod tests {
         assert_eq!(updated_config["EnableRemoteAccess"], true);
         assert_eq!(updated_config["IsStartupWizardCompleted"], false);
         assert_eq!(
-            updated_config["MetadataOptions"].as_array().unwrap().len(),
-            0
-        );
-        assert_eq!(updated_config["ContentTypes"].as_array().unwrap().len(), 0);
-        assert_eq!(
-            updated_config["PathSubstitutions"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
+            updated_config["MetadataOptions"],
+            json!([{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }])
         );
         assert_eq!(
-            updated_config["PluginRepositories"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
+            updated_config["ContentTypes"],
+            json!([{ "Name": "Movies", "Value": "movies" }])
+        );
+        assert_eq!(
+            updated_config["PathSubstitutions"],
+            json!([{ "From": "/mnt/a", "To": "/mnt/b" }])
+        );
+        assert_eq!(
+            updated_config["PluginRepositories"],
+            json!([{ "Name": "Example", "Url": "https://example.invalid" }])
         );
 
         let persisted_config = db.startup_config().await.unwrap();
@@ -4733,6 +4775,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ContentTypes": { "Name": "Not an array" },
+                            "MetadataOptions": "invalid",
+                            "PathSubstitutions": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/System/Configuration")
@@ -4746,6 +4810,22 @@ mod tests {
         assert_eq!(preserved_config["ServerName"], "Jellyrin Admin QA");
         assert_eq!(preserved_config["UICulture"], "es-ES");
         assert_eq!(preserved_config["EnableRemoteAccess"], false);
+        assert_eq!(
+            preserved_config["MetadataOptions"],
+            json!([{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }])
+        );
+        assert_eq!(
+            preserved_config["ContentTypes"],
+            json!([{ "Name": "Movies", "Value": "movies" }])
+        );
+        assert_eq!(
+            preserved_config["PathSubstitutions"],
+            json!([{ "From": "/mnt/a", "To": "/mnt/b" }])
+        );
+        assert_eq!(
+            preserved_config["PluginRepositories"],
+            json!([{ "Name": "Example", "Url": "https://example.invalid" }])
+        );
     }
 
     #[tokio::test]
