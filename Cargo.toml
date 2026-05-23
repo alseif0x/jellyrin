@@ -32,3 +32,4 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
+tempfile = "3.23"

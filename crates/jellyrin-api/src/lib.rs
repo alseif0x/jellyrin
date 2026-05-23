@@ -13,7 +13,7 @@ use jellyrin_compat::{
     LocalizationOptionDto, PublicSystemInfo, SessionInfoDto, StartupConfigurationDto,
     StartupRemoteAccessDto, StartupUserDto, UserDto, UserPolicyDto,
 };
-use jellyrin_core::{DeviceToken, StartupConfig, User, VirtualFolder};
+use jellyrin_core::{DeviceToken, MediaItem, StartupConfig, User, VirtualFolder};
 use jellyrin_db::Database;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -57,8 +57,8 @@ pub fn router(state: AppState) -> Router {
         .route("/users/AuthenticateByName", post(authenticate_by_name))
         .route("/Users/Me", get(get_current_user))
         .route("/users/me", get(get_current_user))
-        .route("/Users/{user_id}/Views", get(empty_items_result))
-        .route("/users/{user_id}/views", get(empty_items_result))
+        .route("/Users/{user_id}/Views", get(user_views_result))
+        .route("/users/{user_id}/views", get(user_views_result))
         .route("/Users/{user_id}", get(get_user_by_id))
         .route("/users/{user_id}", get(get_user_by_id))
         .route("/Sessions/Logout", post(logout))
@@ -107,12 +107,12 @@ pub fn router(state: AppState) -> Router {
         .route("/system/endpoint", get(system_endpoint))
         .route("/Playback/BitrateTest", get(bitrate_test))
         .route("/playback/bitratetest", get(bitrate_test))
-        .route("/UserViews", get(empty_items_result))
-        .route("/userviews", get(empty_items_result))
-        .route("/Items", get(empty_items_result))
-        .route("/items", get(empty_items_result))
-        .route("/Items/Latest", get(empty_list))
-        .route("/items/latest", get(empty_list))
+        .route("/UserViews", get(user_views_result))
+        .route("/userviews", get(user_views_result))
+        .route("/Items", get(items_result))
+        .route("/items", get(items_result))
+        .route("/Items/Latest", get(latest_items))
+        .route("/items/latest", get(latest_items))
         .route("/Items/{item_id}/Images/{image_type}", get(placeholder_png))
         .route("/items/{item_id}/images/{image_type}", get(placeholder_png))
         .route("/Users/{user_id}/Images/{image_type}", get(placeholder_png))
@@ -338,10 +338,6 @@ async fn empty_text() -> &'static str {
     ""
 }
 
-async fn empty_list() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
-}
-
 async fn get_virtual_folders(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
@@ -394,10 +390,11 @@ async fn add_virtual_folder(
         );
     }
 
-    state
+    let folder = state
         .db
         .upsert_virtual_folder(&query.name, query.collection_type.as_deref(), locations)
         .await?;
+    state.db.scan_virtual_folder_items(folder.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -424,6 +421,14 @@ async fn add_virtual_folder_path(
         .db
         .add_virtual_folder_path(&payload.name, &path)
         .await?;
+    let folder = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
+        .ok_or_else(|| ApiError::bad_request("Virtual folder not found"))?;
+    state.db.scan_virtual_folder_items(folder.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -555,12 +560,118 @@ async fn environment_validate_path(Json(payload): Json<ValidatePathRequest>) -> 
     }
 }
 
+async fn user_views_result(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let folders = state.db.virtual_folders().await?;
+    let items = folders.iter().map(user_view_to_json).collect::<Vec<_>>();
+    Ok(Json(query_result(items)))
+}
+
+async fn items_result(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let items = state
+        .db
+        .media_items()
+        .await?
+        .iter()
+        .map(media_item_to_json)
+        .collect::<Vec<_>>();
+    Ok(Json(query_result(items)))
+}
+
+async fn latest_items(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .latest_media_items(20)
+            .await?
+            .iter()
+            .map(media_item_to_json)
+            .collect(),
+    ))
+}
+
 async fn empty_items_result() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0
-    }))
+    Json(query_result(Vec::new()))
+}
+
+fn query_result(items: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "TotalRecordCount": items.len(),
+        "StartIndex": 0,
+        "Items": items,
+    })
+}
+
+fn user_view_to_json(folder: &VirtualFolder) -> serde_json::Value {
+    serde_json::json!({
+        "Name": folder.name,
+        "ServerId": null,
+        "Id": folder.id.simple().to_string(),
+        "Etag": null,
+        "DateCreated": folder.created_at.to_string(),
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": folder.name,
+        "ExternalUrls": [],
+        "Path": null,
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": {},
+        "IsFolder": true,
+        "ParentId": null,
+        "Type": "CollectionFolder",
+        "CollectionType": folder.collection_type,
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "LocationType": "FileSystem",
+        "MediaType": null,
+    })
+}
+
+fn media_item_to_json(item: &MediaItem) -> serde_json::Value {
+    let item_type = match (item.media_type.as_str(), item.collection_type.as_deref()) {
+        ("Video", Some("movies")) => "Movie",
+        ("Video", _) => "Video",
+        ("Audio", _) => "Audio",
+        ("Photo", _) => "Photo",
+        ("Book", _) => "Book",
+        _ => "BaseItem",
+    };
+    serde_json::json!({
+        "Name": item.name,
+        "ServerId": null,
+        "Id": item.id.simple().to_string(),
+        "Etag": null,
+        "DateCreated": item.created_at.to_string(),
+        "CanDelete": false,
+        "CanDownload": true,
+        "SortName": item.name,
+        "ExternalUrls": [],
+        "Path": item.path,
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": {},
+        "IsFolder": false,
+        "ParentId": item.virtual_folder_id.simple().to_string(),
+        "Type": item_type,
+        "MediaType": item.media_type,
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "LocationType": "FileSystem",
+    })
 }
 
 async fn display_preferences() -> Json<serde_json::Value> {
@@ -1318,5 +1429,54 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+    }
+
+    #[tokio::test]
+    async fn virtual_folder_scan_populates_items_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Example Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(result["TotalRecordCount"], 1);
+        assert_eq!(result["Items"][0]["Name"], "Example Movie");
+        assert_eq!(result["Items"][0]["Type"], "Movie");
+        assert_eq!(result["Items"][0]["Path"], movie.to_string_lossy().as_ref());
     }
 }

@@ -1,9 +1,11 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::Context;
 use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
 };
-use jellyrin_core::{DeviceToken, ServerState, StartupConfig, User, VirtualFolder};
+use jellyrin_core::{DeviceToken, MediaItem, ServerState, StartupConfig, User, VirtualFolder};
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -395,6 +397,110 @@ impl Database {
         Ok(())
     }
 
+    pub async fn media_items(&self) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
+            FROM media_items
+            ORDER BY name COLLATE NOCASE
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn latest_media_items(&self, limit: i64) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
+            FROM media_items
+            ORDER BY created_at DESC, name COLLATE NOCASE
+            LIMIT ?1
+            "#,
+        )
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn scan_virtual_folder_items(&self, folder_id: Uuid) -> anyhow::Result<usize> {
+        let folder = self
+            .virtual_folder_by_id(folder_id)
+            .await?
+            .context("virtual folder not found")?;
+        let mut scanned = 0usize;
+
+        for location in &folder.locations {
+            for path in collect_media_files(Path::new(location)).await? {
+                let Some(name) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(ToOwned::to_owned)
+                else {
+                    continue;
+                };
+                let Some(media_type) = media_type_for_path(&path) else {
+                    continue;
+                };
+
+                self.upsert_media_item(&folder, &name, &path, media_type)
+                    .await?;
+                scanned += 1;
+            }
+        }
+
+        Ok(scanned)
+    }
+
+    async fn upsert_media_item(
+        &self,
+        folder: &VirtualFolder,
+        name: &str,
+        path: &Path,
+        media_type: &str,
+    ) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let path = path.to_string_lossy().to_string();
+        let existing_id =
+            sqlx::query_as::<_, MediaItemIdRow>("SELECT id FROM media_items WHERE path = ?1")
+                .bind(&path)
+                .fetch_optional(&self.pool)
+                .await?
+                .map_or_else(|| Uuid::new_v4().to_string(), |row| row.id);
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            ON CONFLICT(path) DO UPDATE SET
+                virtual_folder_id = excluded.virtual_folder_id,
+                name = excluded.name,
+                media_type = excluded.media_type,
+                collection_type = excluded.collection_type,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(existing_id)
+        .bind(folder.id.to_string())
+        .bind(name)
+        .bind(path)
+        .bind(media_type)
+        .bind(&folder.collection_type)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     async fn create_initial_server_state(&self) -> anyhow::Result<ServerState> {
         let now = OffsetDateTime::now_utc();
         let state = ServerState {
@@ -558,6 +664,21 @@ impl Database {
 
         row.map(TryInto::try_into).transpose()
     }
+
+    async fn virtual_folder_by_id(&self, id: Uuid) -> anyhow::Result<Option<VirtualFolder>> {
+        let row = sqlx::query_as::<_, VirtualFolderRow>(
+            r#"
+            SELECT id, name, collection_type, locations_json, created_at, updated_at
+            FROM virtual_folders
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -634,6 +755,23 @@ struct VirtualFolderRow {
     updated_at: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct MediaItemRow {
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MediaItemIdRow {
+    id: String,
+}
+
 impl TryFrom<VirtualFolderRow> for VirtualFolder {
     type Error = anyhow::Error;
 
@@ -644,6 +782,24 @@ impl TryFrom<VirtualFolderRow> for VirtualFolder {
             collection_type: row.collection_type,
             locations: serde_json::from_str(&row.locations_json)
                 .context("invalid virtual folder locations in database")?,
+            created_at: parse_time(&row.created_at)?,
+            updated_at: parse_time(&row.updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<MediaItemRow> for MediaItem {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaItemRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: Uuid::parse_str(&row.id).context("invalid media item id in database")?,
+            virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                .context("invalid media item virtual folder id in database")?,
+            name: row.name,
+            path: row.path,
+            media_type: row.media_type,
+            collection_type: row.collection_type,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         })
@@ -700,6 +856,49 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<()> {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
         .map_err(|_| anyhow::anyhow!("invalid username or password"))
+}
+
+async fn collect_media_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut media_files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(path) = pending.pop() {
+        let Ok(metadata) = tokio::fs::symlink_metadata(&path).await else {
+            continue;
+        };
+
+        if metadata.is_file() {
+            if media_type_for_path(&path).is_some() {
+                media_files.push(path);
+            }
+            continue;
+        }
+
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let Ok(mut entries) = tokio::fs::read_dir(&path).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            pending.push(entry.path());
+        }
+    }
+
+    media_files.sort();
+    Ok(media_files)
+}
+
+fn media_type_for_path(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "mkv" | "mp4" | "avi" | "mov" | "wmv" | "m4v" | "webm" => Some("Video"),
+        "mp3" | "flac" | "m4a" | "aac" | "ogg" | "wav" => Some("Audio"),
+        "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" => Some("Photo"),
+        "epub" | "pdf" | "cbz" | "cbr" => Some("Book"),
+        _ => None,
+    }
 }
 
 fn normalized_locations(locations: Vec<String>) -> Vec<String> {
@@ -808,5 +1007,38 @@ mod tests {
             folders[0].locations,
             vec!["/media/movies", "/media/more-movies"]
         );
+    }
+
+    #[tokio::test]
+    async fn scans_media_items_from_virtual_folder_locations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Movies").join("Example Movie.mkv");
+        tokio::fs::create_dir_all(movie.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+        tokio::fs::write(tmp.path().join("ignore.txt"), b"not media")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+
+        let scanned = db.scan_virtual_folder_items(folder.id).await.unwrap();
+        assert_eq!(scanned, 1);
+
+        let items = db.media_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Example Movie");
+        assert_eq!(items[0].path, movie.to_string_lossy());
+        assert_eq!(items[0].media_type, "Video");
+        assert_eq!(items[0].collection_type.as_deref(), Some("movies"));
     }
 }

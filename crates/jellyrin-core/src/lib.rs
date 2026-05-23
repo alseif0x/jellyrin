@@ -49,3 +49,15 @@ pub struct VirtualFolder {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaItem {
+    pub id: Uuid,
+    pub virtual_folder_id: Uuid,
+    pub name: String,
+    pub path: String,
+    pub media_type: String,
+    pub collection_type: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
