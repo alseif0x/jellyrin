@@ -1,19 +1,25 @@
-use std::{fs, path::PathBuf};
+#![recursion_limit = "256"]
+
+use std::{
+    fs,
+    path::{Path as FsPath, PathBuf},
+};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use jellyrin_compat::{
     AuthenticateUserByNameDto, AuthenticationResultDto, CountryDto, CultureDto, HealthResponse,
     LocalizationOptionDto, PublicSystemInfo, SessionInfoDto, StartupConfigurationDto,
     StartupRemoteAccessDto, StartupUserDto, UserDto, UserPolicyDto,
 };
-use jellyrin_core::{DeviceToken, MediaItem, StartupConfig, User, VirtualFolder};
+use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
 use jellyrin_db::Database;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -42,6 +48,78 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(ready))
         .route("/System/Info/Public", get(system_info_public))
         .route("/System/Info", get(system_info))
+        .route("/System/Ping", get(ping))
+        .route("/System/Ping", post(ping))
+        .route("/system/ping", get(ping))
+        .route("/system/ping", post(ping))
+        .route("/System/Info/Storage", get(system_storage))
+        .route("/system/info/storage", get(system_storage))
+        .route("/System/ActivityLog/Entries", get(activity_log_entries))
+        .route("/system/activitylog/entries", get(activity_log_entries))
+        .route("/System/Configuration", get(system_configuration))
+        .route("/system/configuration", get(system_configuration))
+        .route("/System/Configuration", post(admin_no_content))
+        .route("/system/configuration", post(admin_no_content))
+        .route(
+            "/System/Configuration/MetadataOptions/Default",
+            get(default_metadata_options),
+        )
+        .route(
+            "/system/configuration/metadataoptions/default",
+            get(default_metadata_options),
+        )
+        .route("/System/Configuration/Branding", post(admin_no_content))
+        .route("/system/configuration/branding", post(admin_no_content))
+        .route("/System/Configuration/{key}", get(named_configuration))
+        .route("/system/configuration/{key}", get(named_configuration))
+        .route("/System/Configuration/{key}", post(admin_no_content))
+        .route("/system/configuration/{key}", post(admin_no_content))
+        .route(
+            "/Dashboard/web/ConfigurationPages",
+            get(dashboard_configuration_pages),
+        )
+        .route(
+            "/dashboard/web/configurationpages",
+            get(dashboard_configuration_pages),
+        )
+        .route("/Dashboard/web/ConfigurationPage", get(empty_text))
+        .route("/dashboard/web/configurationpage", get(empty_text))
+        .route("/Devices", get(devices))
+        .route("/devices", get(devices))
+        .route("/Devices/Info", get(device_info))
+        .route("/devices/info", get(device_info))
+        .route("/Devices/Options", get(device_options))
+        .route("/devices/options", get(device_options))
+        .route("/Devices/Options", post(admin_no_content))
+        .route("/devices/options", post(admin_no_content))
+        .route("/Devices", delete(admin_no_content))
+        .route("/devices", delete(admin_no_content))
+        .route("/Session/Sessions", get(session_sessions))
+        .route("/session/sessions", get(session_sessions))
+        .route("/Sessions", get(session_sessions))
+        .route("/sessions", get(session_sessions))
+        .route("/Plugins", get(installed_plugins))
+        .route("/plugins", get(installed_plugins))
+        .route("/Plugins/{plugin_id}/Configuration", get(empty_object))
+        .route("/plugins/{plugin_id}/configuration", get(empty_object))
+        .route("/Plugins/{plugin_id}/Manifest", get(plugin_manifest))
+        .route("/plugins/{plugin_id}/manifest", get(plugin_manifest))
+        .route("/Packages", get(available_packages))
+        .route("/packages", get(available_packages))
+        .route("/Repositories", get(package_repositories))
+        .route("/repositories", get(package_repositories))
+        .route("/ScheduledTasks", get(scheduled_tasks))
+        .route("/scheduledtasks", get(scheduled_tasks))
+        .route("/ScheduledTasks/{task_id}", get(scheduled_task))
+        .route("/scheduledtasks/{task_id}", get(scheduled_task))
+        .route(
+            "/ScheduledTasks/Running/{task_id}",
+            post(start_scheduled_task),
+        )
+        .route(
+            "/scheduledtasks/running/{task_id}",
+            post(start_scheduled_task),
+        )
         .route("/Startup/Configuration", get(get_startup_configuration))
         .route("/Startup/Configuration", post(post_startup_configuration))
         .route("/Startup/RemoteAccess", post(post_startup_remote_access))
@@ -63,6 +141,12 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{user_id}", get(get_user_by_id))
         .route("/Sessions/Logout", post(logout))
         .route("/sessions/logout", post(logout))
+        .route("/Sessions/Playing", post(report_playback_start))
+        .route("/sessions/playing", post(report_playback_start))
+        .route("/Sessions/Playing/Progress", post(report_playback_progress))
+        .route("/sessions/playing/progress", post(report_playback_progress))
+        .route("/Sessions/Playing/Stopped", post(report_playback_stopped))
+        .route("/sessions/playing/stopped", post(report_playback_stopped))
         .route("/Sessions/Capabilities", post(no_content))
         .route("/Sessions/Capabilities/Full", post(no_content))
         .route("/sessions/capabilities", post(no_content))
@@ -71,6 +155,24 @@ pub fn router(state: AppState) -> Router {
         .route("/quickconnect/enabled", get(quick_connect_enabled))
         .route("/SyncPlay/List", get(empty_json_array))
         .route("/syncplay/list", get(empty_json_array))
+        .route("/LiveTv/Info", get(live_tv_info))
+        .route("/livetv/info", get(live_tv_info))
+        .route("/LiveTv/GuideInfo", get(live_tv_guide_info))
+        .route("/livetv/guideinfo", get(live_tv_guide_info))
+        .route("/LiveTv/Channels", get(empty_items_result))
+        .route("/livetv/channels", get(empty_items_result))
+        .route("/LiveTv/Programs", get(empty_items_result))
+        .route("/livetv/programs", get(empty_items_result))
+        .route("/LiveTv/RecommendedPrograms", get(empty_items_result))
+        .route("/livetv/recommendedprograms", get(empty_items_result))
+        .route("/LiveTv/Recordings", get(empty_items_result))
+        .route("/livetv/recordings", get(empty_items_result))
+        .route("/LiveTv/RecordingGroups", get(empty_items_result))
+        .route("/livetv/recordinggroups", get(empty_items_result))
+        .route("/LiveTv/Timers", get(empty_result_json))
+        .route("/livetv/timers", get(empty_result_json))
+        .route("/LiveTv/SeriesTimers", get(empty_result_json))
+        .route("/livetv/seriestimers", get(empty_result_json))
         .route("/Branding/Configuration", get(branding_configuration))
         .route("/branding/configuration", get(branding_configuration))
         .route("/Branding/Css", get(empty_text))
@@ -79,15 +181,25 @@ pub fn router(state: AppState) -> Router {
         .route("/branding/splashscreen", get(empty_text))
         .route("/Library/VirtualFolders", get(get_virtual_folders))
         .route("/Library/VirtualFolders", post(add_virtual_folder))
+        .route("/Library/VirtualFolders", delete(delete_virtual_folder))
         .route(
             "/Library/VirtualFolders/Paths",
             post(add_virtual_folder_path),
         )
+        .route(
+            "/Library/VirtualFolders/Paths",
+            delete(delete_virtual_folder_path),
+        )
         .route("/library/virtualfolders", get(get_virtual_folders))
         .route("/library/virtualfolders", post(add_virtual_folder))
+        .route("/library/virtualfolders", delete(delete_virtual_folder))
         .route(
             "/library/virtualfolders/paths",
             post(add_virtual_folder_path),
+        )
+        .route(
+            "/library/virtualfolders/paths",
+            delete(delete_virtual_folder_path),
         )
         .route("/Environment/Drives", get(environment_drives))
         .route("/environment/drives", get(environment_drives))
@@ -111,20 +223,48 @@ pub fn router(state: AppState) -> Router {
         .route("/playback/bitratetest", get(bitrate_test))
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
+        .route("/Items/Counts", get(item_counts))
+        .route("/items/counts", get(item_counts))
         .route("/Items", get(items_result))
         .route("/items", get(items_result))
         .route("/Items/Latest", get(latest_items))
         .route("/items/latest", get(latest_items))
+        .route("/Items/{item_id}/Ancestors", get(item_ancestors))
+        .route("/items/{item_id}/ancestors", get(item_ancestors))
+        .route("/Items/{item_id}/Similar", get(empty_items_result))
+        .route("/items/{item_id}/similar", get(empty_items_result))
+        .route("/Items/{item_id}/PlaybackInfo", get(item_playback_info))
+        .route("/items/{item_id}/playbackinfo", get(item_playback_info))
+        .route("/Videos/{item_id}/stream", get(direct_stream_item))
+        .route("/videos/{item_id}/stream", get(direct_stream_item))
         .route("/Items/{item_id}", get(item_detail))
         .route("/items/{item_id}", get(item_detail))
+        .route("/Users/{user_id}/Items/{item_id}", get(user_item_detail))
+        .route("/users/{user_id}/items/{item_id}", get(user_item_detail))
+        .route(
+            "/Users/{user_id}/PlayedItems/{item_id}",
+            post(mark_item_played),
+        )
+        .route(
+            "/users/{user_id}/playeditems/{item_id}",
+            post(mark_item_played),
+        )
+        .route(
+            "/Users/{user_id}/PlayedItems/{item_id}",
+            delete(mark_item_unplayed),
+        )
+        .route(
+            "/users/{user_id}/playeditems/{item_id}",
+            delete(mark_item_unplayed),
+        )
         .route("/Items/{item_id}/Images/{image_type}", get(placeholder_png))
         .route("/items/{item_id}/images/{image_type}", get(placeholder_png))
         .route("/Users/{user_id}/Images/{image_type}", get(placeholder_png))
         .route("/users/{user_id}/images/{image_type}", get(placeholder_png))
         .route("/Shows/NextUp", get(empty_items_result))
         .route("/shows/nextup", get(empty_items_result))
-        .route("/UserItems/Resume", get(empty_items_result))
-        .route("/useritems/resume", get(empty_items_result))
+        .route("/UserItems/Resume", get(resume_items))
+        .route("/useritems/resume", get(resume_items))
         .route("/Localization/Options", get(localization_options))
         .route("/Localization/Cultures", get(localization_cultures))
         .route("/Localization/cultures", get(localization_cultures))
@@ -327,8 +467,269 @@ async fn logout(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn ping() -> &'static str {
+    "Jellyfin Server"
+}
+
+async fn system_storage() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ProgramDataPath": null,
+        "WebPath": null,
+        "Items": []
+    }))
+}
+
+async fn activity_log_entries() -> Json<serde_json::Value> {
+    Json(empty_result())
+}
+
+async fn session_sessions() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
+}
+
+async fn devices() -> Json<serde_json::Value> {
+    Json(empty_result())
+}
+
+async fn installed_plugins() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
+}
+
+async fn available_packages() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
+}
+
+async fn package_repositories() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
+}
+
+async fn plugin_manifest(Path(plugin_id): Path<String>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "Guid": plugin_id,
+        "Name": plugin_id,
+        "Overview": "Plugin manifests are not supported by Jellyrin yet.",
+        "Description": "Plugin compatibility is intentionally disabled in this milestone.",
+        "Owner": "Jellyrin",
+        "Category": "General",
+        "Versions": []
+    }))
+}
+
+async fn device_info() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "Name": null,
+        "Id": null,
+        "LastUserName": null,
+        "AppName": null,
+        "AppVersion": null,
+        "LastUserId": null,
+        "DateLastActivity": null,
+        "Capabilities": null
+    }))
+}
+
+async fn device_options() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "CustomName": null
+    }))
+}
+
+async fn system_configuration() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ServerName": "Jellyrin",
+        "UICulture": "en-US",
+        "MetadataCountryCode": "US",
+        "PreferredMetadataLanguage": "en",
+        "EnableRemoteAccess": false,
+        "EnableUPnP": false,
+        "IsStartupWizardCompleted": true,
+        "LibraryMonitorDelay": 60,
+        "EnableRealtimeMonitor": false,
+        "EnableCaseSensitiveItemIds": true,
+        "ImageSavingConvention": "Compatible",
+        "SkipDeserializationForBasicTypes": false,
+        "SkipDeserializationForPrograms": false,
+        "SaveMetadataHidden": false,
+        "ContentTypes": [],
+        "MetadataOptions": [],
+        "PathSubstitutions": [],
+        "PluginRepositories": [],
+        "RemoteClientBitrateLimit": 0,
+        "LogFileRetentionDays": 3,
+        "RunAtStartup": false
+    }))
+}
+
+async fn named_configuration(Path(key): Path<String>) -> Json<serde_json::Value> {
+    let value = match key.as_str() {
+        "branding" | "Branding" => serde_json::json!({
+            "LoginDisclaimer": null,
+            "CustomCss": null,
+            "SplashscreenEnabled": true
+        }),
+        _ => serde_json::json!({}),
+    };
+    Json(value)
+}
+
+async fn default_metadata_options() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ItemType": null,
+        "DisabledMetadataSavers": [],
+        "LocalMetadataReaderOrder": [],
+        "DisabledMetadataFetchers": [],
+        "MetadataFetcherOrder": [],
+        "DisabledImageFetchers": [],
+        "ImageFetcherOrder": [],
+        "DisabledSubtitleFetchers": [],
+        "SubtitleFetcherOrder": []
+    }))
+}
+
+async fn dashboard_configuration_pages() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
+}
+
+fn empty_result() -> serde_json::Value {
+    serde_json::json!({
+        "Items": [],
+        "TotalRecordCount": 0,
+        "StartIndex": 0
+    })
+}
+
 async fn no_content() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn admin_no_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !user.is_administrator {
+        return Err(ApiError::forbidden("Administrator access required"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn empty_object() -> Json<serde_json::Value> {
+    Json(serde_json::json!({}))
+}
+
+async fn scheduled_tasks() -> Json<Vec<serde_json::Value>> {
+    Json(vec![library_scan_task_json()])
+}
+
+async fn scheduled_task(Path(task_id): Path<String>) -> Result<Json<serde_json::Value>, ApiError> {
+    if task_id == "scan-media-library" || task_id == "RefreshLibrary" {
+        return Ok(Json(library_scan_task_json()));
+    }
+
+    Err(ApiError::not_found("Scheduled task not found"))
+}
+
+async fn start_scheduled_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(task_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !user.is_administrator {
+        return Err(ApiError::forbidden("Administrator access required"));
+    }
+    if task_id == "scan-media-library" || task_id == "RefreshLibrary" {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    Err(ApiError::not_found("Scheduled task not found"))
+}
+
+fn library_scan_task_json() -> serde_json::Value {
+    serde_json::json!({
+        "Name": "Scan Media Library",
+        "State": "Idle",
+        "CurrentProgressPercentage": null,
+        "Id": "scan-media-library",
+        "LastExecutionResult": null,
+        "Triggers": [
+            {
+                "Type": "IntervalTrigger",
+                "TimeOfDayTicks": null,
+                "IntervalTicks": 43_200_000_000_i64,
+                "DayOfWeek": null,
+                "MaxRuntimeTicks": null,
+            }
+        ],
+        "Description": "Scans configured Jellyrin media libraries. Execution is currently handled by explicit library scan calls; this task is exposed for Jellyfin Web compatibility.",
+        "Category": "Library",
+        "IsHidden": false,
+        "Key": "RefreshLibrary",
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct PlaybackReportBody {
+    #[serde(alias = "ItemId")]
+    item_id: String,
+    #[serde(alias = "MediaSourceId")]
+    media_source_id: Option<String>,
+    #[serde(alias = "PositionTicks")]
+    position_ticks: Option<i64>,
+    #[serde(alias = "IsPaused")]
+    is_paused: Option<bool>,
+}
+
+async fn report_playback_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<PlaybackReportBody>,
+) -> Result<StatusCode, ApiError> {
+    report_playback(state, headers, query, payload, false).await
+}
+
+async fn report_playback_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<PlaybackReportBody>,
+) -> Result<StatusCode, ApiError> {
+    report_playback(state, headers, query, payload, false).await
+}
+
+async fn report_playback_stopped(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<PlaybackReportBody>,
+) -> Result<StatusCode, ApiError> {
+    report_playback(state, headers, query, payload, false).await
+}
+
+async fn report_playback(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    payload: PlaybackReportBody,
+    played: bool,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &payload.item_id).await?;
+    state
+        .db
+        .upsert_playback_state(
+            user.id,
+            item.id,
+            payload.media_source_id.as_deref(),
+            payload.position_ticks.unwrap_or_default(),
+            payload.is_paused.unwrap_or(false),
+            played,
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn quick_connect_enabled() -> Json<bool> {
@@ -337,6 +738,27 @@ async fn quick_connect_enabled() -> Json<bool> {
 
 async fn empty_json_array() -> Json<Vec<serde_json::Value>> {
     Json(Vec::new())
+}
+
+async fn empty_result_json() -> Json<serde_json::Value> {
+    Json(empty_result())
+}
+
+async fn live_tv_info() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "Services": [],
+        "IsEnabled": false,
+        "EnabledUsers": [],
+        "TunerHosts": [],
+        "ListingsProviders": []
+    }))
+}
+
+async fn live_tv_guide_info() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "StartDate": null,
+        "EndDate": null
+    }))
 }
 
 async fn branding_configuration() -> Json<serde_json::Value> {
@@ -443,6 +865,46 @@ async fn add_virtual_folder_path(
         .ok_or_else(|| ApiError::bad_request("Virtual folder not found"))?;
     state.db.scan_virtual_folder_items(folder.id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct VirtualFolderNameQuery {
+    #[serde(alias = "Name", alias = "name")]
+    name: String,
+}
+
+async fn delete_virtual_folder(
+    State(state): State<AppState>,
+    Query(query): Query<VirtualFolderNameQuery>,
+) -> Result<StatusCode, ApiError> {
+    if state.db.delete_virtual_folder(&query.name).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Virtual folder not found"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteMediaPathQuery {
+    #[serde(alias = "Name", alias = "name")]
+    name: String,
+    #[serde(alias = "Path", alias = "path")]
+    path: String,
+}
+
+async fn delete_virtual_folder_path(
+    State(state): State<AppState>,
+    Query(query): Query<DeleteMediaPathQuery>,
+) -> Result<StatusCode, ApiError> {
+    if state
+        .db
+        .remove_virtual_folder_path(&query.name, &query.path)
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Virtual folder path not found"))
+    }
 }
 
 fn comma_delimited_paths(paths: Option<&str>) -> Vec<String> {
@@ -575,9 +1037,16 @@ async fn environment_validate_path(Json(payload): Json<ValidatePathRequest>) -> 
 
 async fn user_views_result(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let folders = state.db.virtual_folders().await?;
-    let items = folders.iter().map(user_view_to_json).collect::<Vec<_>>();
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let items = folders
+        .iter()
+        .map(|folder| user_view_to_json(folder, &server_id))
+        .collect::<Vec<_>>();
     Ok(Json(query_result(items)))
 }
 
@@ -603,23 +1072,46 @@ struct ItemsQuery {
     _fields: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct LatestItemsQuery {
+    #[serde(alias = "Limit")]
+    limit: Option<usize>,
+}
+
 async fn items_result(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
     let filtered_items = filtered_media_items(state.db.media_items().await?, &query);
     let total_record_count = filtered_items.len();
     let items = paged_media_items(filtered_items, &query)
         .iter()
-        .map(media_item_to_json)
+        .map(|item| media_item_to_json(item, &server_id))
         .collect::<Vec<_>>();
     Ok(Json(query_result_with_total(items, total_record_count)))
 }
 
+async fn item_counts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(item_counts_json(&state.db.media_items().await?)))
+}
+
 async fn latest_items(
     State(state): State<AppState>,
-    Query(query): Query<ItemsQuery>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<LatestItemsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
     let limit = query.limit.unwrap_or(20).min(100) as i64;
     Ok(Json(
         state
@@ -627,24 +1119,189 @@ async fn latest_items(
             .latest_media_items(limit)
             .await?
             .iter()
-            .map(media_item_to_json)
+            .map(|item| media_item_to_json(item, &server_id))
             .collect(),
     ))
 }
 
+async fn resume_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let items = state
+        .db
+        .resume_items_for_user(user.id, 20)
+        .await?
+        .iter()
+        .map(|(item, playback)| media_item_to_json_with_playback(item, &server_id, Some(playback)))
+        .collect();
+    Ok(Json(query_result(items)))
+}
+
 async fn item_detail(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let requested_id = parse_jellyfin_uuid(&item_id)?;
-    let item = state
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(Json(media_item_to_json(&item, &server_id)))
+}
+
+async fn user_item_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, user_id)?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let playback = state.db.playback_state_for_item(user_id, item.id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(Json(media_item_to_json_with_playback(
+        &item,
+        &server_id,
+        playback.as_ref(),
+    )))
+}
+
+async fn mark_item_played(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    set_item_played(state, headers, query, user_id, item_id, true).await
+}
+
+async fn mark_item_unplayed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    set_item_played(state, headers, query, user_id, item_id, false).await
+}
+
+async fn set_item_played(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    user_id: String,
+    item_id: String,
+    played: bool,
+) -> Result<StatusCode, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, user_id)?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    state
         .db
-        .media_items()
+        .upsert_playback_state(user_id, item.id, None, 0, false, played)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn resolve_user_id(user_id: &str) -> Result<Uuid, ApiError> {
+    parse_jellyfin_uuid(user_id).map_err(|_| ApiError::bad_request("Invalid user id"))
+}
+
+async fn item_ancestors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let folder = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == item.virtual_folder_id)
+        .ok_or_else(|| ApiError::not_found("Parent folder not found"))?;
+    Ok(Json(vec![user_view_to_json(&folder, &server_id)]))
+}
+
+async fn item_playback_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let item_json = media_item_to_json(&item, &server_id);
+    Ok(Json(serde_json::json!({
+        "MediaSources": item_json["MediaSources"].clone(),
+        "PlaySessionId": null,
+        "ErrorCode": null,
+    })))
+}
+
+async fn direct_stream_item(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    if item.media_type != "Video" {
+        return Err(ApiError::not_found("Video stream not found"));
+    }
+
+    let bytes = fs::read(media_item_path(&item))?;
+    let total_len = bytes.len();
+    let content_type = media_item_content_type(&item);
+
+    if let Some((start, end)) = parse_range_header(&headers, total_len) {
+        let body = bytes[start..=end].to_vec();
+        return Ok((
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CONTENT_LENGTH, body.len().to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total_len}"),
+                ),
+            ],
+            Body::from(body),
+        )
+            .into_response());
+    }
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CONTENT_LENGTH, total_len.to_string()),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+async fn media_item_by_id(db: &Database, item_id: &str) -> Result<MediaItem, ApiError> {
+    let requested_id = parse_jellyfin_uuid(item_id)?;
+    db.media_items()
         .await?
         .into_iter()
         .find(|item| item.id == requested_id)
-        .ok_or_else(|| ApiError::not_found("Item not found"))?;
-    Ok(Json(media_item_to_json(&item)))
+        .ok_or_else(|| ApiError::not_found("Item not found"))
 }
 
 async fn empty_items_result() -> Json<serde_json::Value> {
@@ -736,10 +1393,10 @@ fn hyphenate_uuid(value: &str) -> String {
     }
 }
 
-fn user_view_to_json(folder: &VirtualFolder) -> serde_json::Value {
+fn user_view_to_json(folder: &VirtualFolder, server_id: &str) -> serde_json::Value {
     serde_json::json!({
         "Name": folder.name,
-        "ServerId": null,
+        "ServerId": server_id,
         "Id": folder.id.simple().to_string(),
         "Etag": null,
         "DateCreated": folder.created_at.to_string(),
@@ -760,30 +1417,95 @@ fn user_view_to_json(folder: &VirtualFolder) -> serde_json::Value {
         "Type": "CollectionFolder",
         "CollectionType": folder.collection_type,
         "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
-        "ImageTags": {},
+        "ImageTags": { "Primary": "placeholder" },
+        "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
         "MediaType": null,
     })
 }
 
-fn media_item_to_json(item: &MediaItem) -> serde_json::Value {
+fn media_item_to_json(item: &MediaItem, server_id: &str) -> serde_json::Value {
+    media_item_to_json_with_playback(item, server_id, None)
+}
+
+fn media_item_to_json_with_playback(
+    item: &MediaItem,
+    server_id: &str,
+    playback: Option<&PlaybackState>,
+) -> serde_json::Value {
     let item_type = media_item_type(item);
+    let item_id = item.id.simple().to_string();
+    let container = media_item_container(item);
+    let file_name = media_item_file_name(item);
+    let file_size = media_item_file_size(item);
+    let playback_position_ticks = playback.map_or(0, |state| state.position_ticks);
+    let played = playback.is_some_and(|state| state.played);
+    let play_count = i32::from(played);
+
+    let media_source = serde_json::json!({
+        "Protocol": "File",
+        "Id": playback.and_then(|state| state.media_source_id.clone()).unwrap_or_else(|| item_id.clone()),
+        "Path": item.path,
+        "Type": "Default",
+        "Container": container,
+        "Size": file_size,
+        "Name": item.name,
+        "IsRemote": false,
+        "ETag": null,
+        "RunTimeTicks": null,
+        "ReadAtNativeFramerate": false,
+        "IgnoreDts": false,
+        "IgnoreIndex": false,
+        "GenPtsInput": false,
+        "SupportsTranscoding": false,
+        "SupportsDirectStream": true,
+        "SupportsDirectPlay": true,
+        "IsInfiniteStream": false,
+        "RequiresOpening": false,
+        "RequiresClosing": false,
+        "RequiresLooping": false,
+        "SupportsProbing": true,
+        "VideoType": "VideoFile",
+        "MediaStreams": [],
+        "Formats": [],
+        "Bitrate": null,
+    });
+
     serde_json::json!({
         "Name": item.name,
-        "ServerId": null,
-        "Id": item.id.simple().to_string(),
+        "OriginalTitle": null,
+        "ServerId": server_id,
+        "Id": item_id,
         "Etag": null,
         "DateCreated": item.created_at.to_string(),
+        "DateLastMediaAdded": item.updated_at.to_string(),
+        "PremiereDate": null,
+        "ProductionYear": null,
+        "CommunityRating": null,
+        "CriticRating": null,
+        "OfficialRating": null,
+        "Overview": "",
         "CanDelete": false,
         "CanDownload": true,
         "SortName": item.name,
+        "ForcedSortName": null,
         "ExternalUrls": [],
         "Path": item.path,
+        "FileName": file_name,
+        "Container": container,
+        "Size": file_size,
         "EnableMediaSourceDisplay": true,
         "ChannelId": null,
         "Taglines": [],
         "Genres": [],
+        "GenreItems": [],
+        "Studios": [],
+        "People": [],
+        "Tags": [],
+        "TagItems": [],
+        "Chapters": [],
+        "MediaStreams": [],
         "PlayAccess": "Full",
         "RemoteTrailers": [],
         "ProviderIds": {},
@@ -791,11 +1513,106 @@ fn media_item_to_json(item: &MediaItem) -> serde_json::Value {
         "ParentId": item.virtual_folder_id.simple().to_string(),
         "Type": item_type,
         "MediaType": item.media_type,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
-        "ImageTags": {},
+        "RunTimeTicks": null,
+        "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": false, "Played": played, "Key": item_id },
+        "ImageTags": { "Primary": "placeholder" },
+        "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
+        "MediaSources": [media_source],
     })
+}
+
+fn item_counts_json(items: &[MediaItem]) -> serde_json::Value {
+    let mut movie_count = 0;
+    let mut series_count = 0;
+    let mut episode_count = 0;
+    let mut song_count = 0;
+    let mut album_count = 0;
+    let mut book_count = 0;
+    let mut music_video_count = 0;
+
+    for item in items {
+        match media_item_type(item) {
+            "Movie" => movie_count += 1,
+            "Series" => series_count += 1,
+            "Episode" => episode_count += 1,
+            "Audio" => song_count += 1,
+            "MusicAlbum" => album_count += 1,
+            "Book" => book_count += 1,
+            "MusicVideo" => music_video_count += 1,
+            _ => {}
+        }
+    }
+
+    serde_json::json!({
+        "MovieCount": movie_count,
+        "SeriesCount": series_count,
+        "EpisodeCount": episode_count,
+        "ArtistCount": 0,
+        "ProgramCount": 0,
+        "TrailerCount": 0,
+        "SongCount": song_count,
+        "AlbumCount": album_count,
+        "MusicVideoCount": music_video_count,
+        "BoxSetCount": 0,
+        "BookCount": book_count,
+        "ItemCount": items.len(),
+    })
+}
+
+fn media_item_path(item: &MediaItem) -> &FsPath {
+    FsPath::new(&item.path)
+}
+
+fn media_item_container(item: &MediaItem) -> Option<String> {
+    media_item_path(item)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn media_item_file_name(item: &MediaItem) -> Option<String> {
+    media_item_path(item)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .map(ToOwned::to_owned)
+}
+
+fn media_item_file_size(item: &MediaItem) -> Option<u64> {
+    fs::metadata(media_item_path(item))
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+fn media_item_content_type(item: &MediaItem) -> String {
+    match media_item_container(item).as_deref() {
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        Some("mov") => "video/quicktime",
+        Some("avi") => "video/x-msvideo",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn parse_range_header(headers: &HeaderMap, total_len: usize) -> Option<(usize, usize)> {
+    if total_len == 0 {
+        return None;
+    }
+
+    let range = headers.get(header::RANGE)?.to_str().ok()?;
+    let range = range.strip_prefix("bytes=")?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = if end.is_empty() {
+        total_len - 1
+    } else {
+        end.parse::<usize>().ok()?.min(total_len - 1)
+    };
+
+    (start <= end && start < total_len).then_some((start, end))
 }
 
 fn media_item_type(item: &MediaItem) -> &'static str {
@@ -1029,6 +1846,24 @@ async fn require_user(
             .user_by_api_key(&token)
             .await
             .map_err(|_| ApiError::unauthorized("Invalid token")),
+    }
+}
+
+async fn require_request_user(
+    db: &Database,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<User, ApiError> {
+    require_user(db, headers, query_token)
+        .await
+        .map(|(user, _)| user)
+}
+
+fn ensure_user_access(auth_user: &User, requested_user_id: Uuid) -> Result<(), ApiError> {
+    if auth_user.id == requested_user_id || auth_user.is_administrator {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("User access denied"))
     }
 }
 
@@ -1394,6 +2229,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduled_tasks_endpoints_expose_library_scan_stub() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ScheduledTasks?IsEnabled=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let tasks: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks[0]["Id"], "scan-media-library");
+        assert_eq!(tasks[0]["Key"], "RefreshLibrary");
+        assert_eq!(tasks[0]["Name"], "Scan Media Library");
+        assert_eq!(tasks[0]["State"], "Idle");
+        assert_eq!(tasks[0]["IsHidden"], false);
+        assert_eq!(tasks[0]["Triggers"].as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ScheduledTasks/scan-media-library")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let task: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(task["Id"], "scan-media-library");
+
+        for endpoint in [
+            "/ScheduledTasks/Running/scan-media-library",
+            "/scheduledtasks/running/scan-media-library",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_shell_stubs_avoid_404s() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for endpoint in [
+            "/System/Ping",
+            "/System/Info/Storage",
+            "/System/ActivityLog/Entries",
+            "/System/Configuration",
+            "/System/Configuration/MetadataOptions/Default",
+            "/System/Configuration/branding",
+            "/Dashboard/web/ConfigurationPages",
+            "/Dashboard/web/ConfigurationPage?name=home.html",
+            "/Devices",
+            "/Devices/Info?Id=test-device",
+            "/Devices/Options?Id=test-device",
+            "/Session/Sessions",
+            "/Sessions",
+            "/Plugins",
+            "/plugins",
+            "/Plugins/test-plugin/Configuration",
+            "/Plugins/test-plugin/Manifest",
+            "/Packages",
+            "/packages",
+            "/Repositories",
+            "/repositories",
+            "/LiveTv/Info",
+            "/livetv/info",
+            "/LiveTv/GuideInfo?UserId=test-user",
+            "/LiveTv/Channels?UserId=test-user",
+            "/LiveTv/Programs?UserId=test-user",
+            "/LiveTv/RecommendedPrograms?UserId=test-user",
+            "/LiveTv/Recordings?UserId=test-user",
+            "/LiveTv/RecordingGroups?UserId=test-user",
+            "/LiveTv/Timers",
+            "/LiveTv/SeriesTimers",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["ServerName"], "Jellyrin");
+        assert_eq!(config["EnableRemoteAccess"], false);
+        assert_eq!(config["ContentTypes"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries?StartIndex=0&Limit=20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let activity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(activity["TotalRecordCount"], 0);
+        assert_eq!(activity["Items"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let plugins: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(plugins.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/test-plugin/Manifest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(manifest["Guid"], "test-plugin");
+        assert_eq!(manifest["Versions"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Repositories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let repositories: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repositories.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let live_tv_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(live_tv_info["IsEnabled"], false);
+        assert_eq!(live_tv_info["Services"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Channels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let live_tv_channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(live_tv_channels["TotalRecordCount"], 0);
+        assert_eq!(live_tv_channels["Items"].as_array().unwrap().len(), 0);
+
+        for endpoint in [
+            "/System/Configuration",
+            "/System/Configuration/Branding",
+            "/System/Configuration/metadata",
+            "/Devices/Options",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Devices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Devices")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn websocket_requires_auth_and_accepts_query_or_header_token() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let app = router(AppState {
@@ -1548,6 +2687,63 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
+                    .uri("/Library/VirtualFolders/Paths")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Name": "Movies", "Path": "/media/more-movies" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Library/VirtualFolders/Paths?Name=Movies&Path=/media/more-movies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Library/VirtualFolders?Name=Movies")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/library/virtualfolders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let folders: Value = serde_json::from_slice(&body).unwrap();
+        assert!(folders.as_array().unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
                     .uri("/environment/validatepath")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(json!({ "Path": "/" }).to_string()))
@@ -1595,6 +2791,15 @@ mod tests {
         tokio::fs::write(&movie, b"fake video").await.unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let user_id = user.id.simple().to_string();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -1628,6 +2833,19 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: Value = serde_json::from_slice(&body).unwrap();
@@ -1643,9 +2861,29 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/Items/Counts")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(counts["MovieCount"], 1);
+        assert_eq!(counts["ItemCount"], 1);
+        assert_eq!(counts["SongCount"], 0);
+        assert_eq!(counts["BookCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!(
                         "/items?ParentId={parent_id}&IncludeItemTypes=Movie&StartIndex=0&Limit=1&SortBy=SortName"
                     ))
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1659,9 +2897,11 @@ mod tests {
         assert_eq!(filtered["Items"][0]["Name"], "Example Movie");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1672,6 +2912,231 @@ mod tests {
         let detail: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(detail["Id"], item_id);
         assert_eq!(detail["Name"], "Example Movie");
+        assert_eq!(detail["Container"], "mp4");
+        assert_eq!(detail["Size"], 10);
+        assert_eq!(detail["FileName"], "Example Movie.mp4");
+        assert_eq!(detail["ImageTags"]["Primary"], "placeholder");
+        assert_eq!(detail["PrimaryImageAspectRatio"], 0.6666667);
+        assert_eq!(detail["MediaSources"][0]["Id"], item_id);
+        assert_eq!(
+            detail["MediaSources"][0]["Path"],
+            movie.to_string_lossy().as_ref()
+        );
+        assert_eq!(detail["MediaSources"][0]["Container"], "mp4");
+        assert_eq!(detail["MediaSources"][0]["Size"], 10);
+        assert_eq!(detail["People"].as_array().unwrap().len(), 0);
+        assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
+        assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_detail["Id"], item_id);
+        assert_eq!(user_detail["Name"], "Example Movie");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/Ancestors"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let ancestors: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ancestors.as_array().unwrap().len(), 1);
+        assert_eq!(ancestors[0]["Id"], parent_id);
+        assert_eq!(ancestors[0]["Type"], "CollectionFolder");
+        assert_eq!(ancestors[0]["ImageTags"]["Primary"], "placeholder");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback_info["ErrorCode"], Value::Null);
+        assert_eq!(playback_info["MediaSources"][0]["SupportsDirectPlay"], true);
+        assert_eq!(
+            playback_info["MediaSources"][0]["SupportsTranscoding"],
+            false
+        );
+
+        for (endpoint, position_ticks) in [
+            ("/Sessions/Playing", 0_i64),
+            ("/Sessions/Playing/Progress", 50_000_000_i64),
+            ("/Sessions/Playing/Stopped", 50_000_000_i64),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({
+                                "ItemId": item_id,
+                                "MediaSourceId": item_id,
+                                "PositionTicks": position_ticks,
+                                "CanSeek": true,
+                                "IsPaused": false,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserItems/Resume")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resume: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resume["TotalRecordCount"], 1);
+        assert_eq!(resume["Items"][0]["Id"], item_id);
+        assert_eq!(
+            resume["Items"][0]["UserData"]["PlaybackPositionTicks"],
+            50_000_000
+        );
+        assert_eq!(resume["Items"][0]["UserData"]["Played"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{user_id}/PlayedItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_item_after_played: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_item_after_played["UserData"]["Played"], true);
+        assert_eq!(user_item_after_played["UserData"]["PlayCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserItems/Resume")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resume_after_played: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resume_after_played["TotalRecordCount"], 0);
+        assert_eq!(resume_after_played["Items"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/users/{user_id}/playeditems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/stream"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-3/10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/Similar"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let similar: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(similar["TotalRecordCount"], 0);
+        assert_eq!(similar["Items"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

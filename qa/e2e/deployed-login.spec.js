@@ -3,8 +3,7 @@ const { test, expect } = require('@playwright/test');
 test('deployed server login page loads without spinner deadlock', async ({ page, request, baseURL }) => {
   test.skip(process.env.JELLYRIN_E2E_DEPLOYED !== '1', 'Only runs against an already deployed server');
 
-  const adminUser = process.env.JELLYRIN_E2E_ADMIN_USER;
-  test.skip(!adminUser, 'Requires JELLYRIN_E2E_ADMIN_USER');
+  const adminUser = process.env.JELLYRIN_E2E_ADMIN_USER || 'admin';
 
   const publicInfoResponse = await request.get('/System/Info/Public');
   expect(publicInfoResponse.ok()).toBeTruthy();

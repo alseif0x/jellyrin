@@ -5,7 +5,9 @@ use argon2::{
     Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
     password_hash::{SaltString, rand_core::OsRng},
 };
-use jellyrin_core::{DeviceToken, MediaItem, ServerState, StartupConfig, User, VirtualFolder};
+use jellyrin_core::{
+    DeviceToken, MediaItem, PlaybackState, ServerState, StartupConfig, User, VirtualFolder,
+};
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -459,6 +461,52 @@ impl Database {
         Ok(())
     }
 
+    pub async fn remove_virtual_folder_path(&self, name: &str, path: &str) -> anyhow::Result<bool> {
+        let Some(mut folder) = self.virtual_folder_by_name(name).await? else {
+            return Ok(false);
+        };
+        let trimmed_path = path.trim();
+        anyhow::ensure!(
+            !trimmed_path.is_empty(),
+            "virtual folder path must not be empty"
+        );
+
+        let original_len = folder.locations.len();
+        folder.locations.retain(|location| location != trimmed_path);
+        if folder.locations.len() == original_len {
+            return Ok(false);
+        }
+
+        let folder_id = folder.id;
+        self.upsert_virtual_folder(
+            &folder.name,
+            folder.collection_type.as_deref(),
+            folder.locations,
+        )
+        .await?;
+        self.delete_media_items_under_path(folder_id, trimmed_path)
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn delete_virtual_folder(&self, name: &str) -> anyhow::Result<bool> {
+        let trimmed_name = name.trim();
+        anyhow::ensure!(
+            !trimmed_name.is_empty(),
+            "virtual folder name must not be empty"
+        );
+        let Some(folder) = self.virtual_folder_by_name(trimmed_name).await? else {
+            return Ok(false);
+        };
+
+        self.delete_media_items_for_folder(folder.id).await?;
+        let result = sqlx::query("DELETE FROM virtual_folders WHERE id = ?1")
+            .bind(folder.id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn media_items(&self) -> anyhow::Result<Vec<MediaItem>> {
         let rows = sqlx::query_as::<_, MediaItemRow>(
             r#"
@@ -482,6 +530,93 @@ impl Database {
             LIMIT ?1
             "#,
         )
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_playback_state(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+        position_ticks: i64,
+        is_paused: bool,
+        played: bool,
+    ) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO playback_states (
+                user_id, item_id, media_source_id, position_ticks, is_paused, played, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(user_id, item_id) DO UPDATE SET
+                media_source_id = excluded.media_source_id,
+                position_ticks = excluded.position_ticks,
+                is_paused = excluded.is_paused,
+                played = excluded.played,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(item_id.to_string())
+        .bind(media_source_id)
+        .bind(position_ticks.max(0))
+        .bind(is_paused)
+        .bind(played)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn playback_state_for_item(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> anyhow::Result<Option<PlaybackState>> {
+        let row = sqlx::query_as::<_, PlaybackStateRow>(
+            r#"
+            SELECT user_id, item_id, media_source_id, position_ticks, is_paused, played, updated_at
+            FROM playback_states
+            WHERE user_id = ?1 AND item_id = ?2
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(item_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn resume_items_for_user(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(MediaItem, PlaybackState)>> {
+        let rows = sqlx::query_as::<_, ResumeItemRow>(
+            r#"
+            SELECT
+                media_items.id, media_items.virtual_folder_id, media_items.name, media_items.path,
+                media_items.media_type, media_items.collection_type, media_items.created_at,
+                media_items.updated_at, playback_states.user_id, playback_states.item_id,
+                playback_states.media_source_id, playback_states.position_ticks,
+                playback_states.is_paused, playback_states.played,
+                playback_states.updated_at AS playback_updated_at
+            FROM playback_states
+            INNER JOIN media_items ON media_items.id = playback_states.item_id
+            WHERE playback_states.user_id = ?1
+              AND playback_states.position_ticks > 0
+              AND playback_states.played = 0
+            ORDER BY playback_states.updated_at DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(user_id.to_string())
         .bind(limit.max(0))
         .fetch_all(&self.pool)
         .await?;
@@ -746,6 +881,57 @@ impl Database {
 
         row.map(TryInto::try_into).transpose()
     }
+
+    async fn delete_media_items_for_folder(&self, folder_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM playback_states
+            WHERE item_id IN (SELECT id FROM media_items WHERE virtual_folder_id = ?1)
+            "#,
+        )
+        .bind(folder_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM media_items WHERE virtual_folder_id = ?1")
+            .bind(folder_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_media_items_under_path(
+        &self,
+        folder_id: Uuid,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        let nested_prefix = format!("{}/%", path.trim_end_matches('/'));
+        sqlx::query(
+            r#"
+            DELETE FROM playback_states
+            WHERE item_id IN (
+                SELECT id FROM media_items
+                WHERE virtual_folder_id = ?1 AND (path = ?2 OR path LIKE ?3)
+            )
+            "#,
+        )
+        .bind(folder_id.to_string())
+        .bind(path)
+        .bind(&nested_prefix)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            DELETE FROM media_items
+            WHERE virtual_folder_id = ?1 AND (path = ?2 OR path LIKE ?3)
+            "#,
+        )
+        .bind(folder_id.to_string())
+        .bind(path)
+        .bind(nested_prefix)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -839,6 +1025,36 @@ struct MediaItemIdRow {
     id: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct ResumeItemRow {
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    created_at: String,
+    updated_at: String,
+    user_id: String,
+    item_id: String,
+    media_source_id: Option<String>,
+    position_ticks: i64,
+    is_paused: bool,
+    played: bool,
+    playback_updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PlaybackStateRow {
+    user_id: String,
+    item_id: String,
+    media_source_id: Option<String>,
+    position_ticks: i64,
+    is_paused: bool,
+    played: bool,
+    updated_at: String,
+}
+
 impl TryFrom<VirtualFolderRow> for VirtualFolder {
     type Error = anyhow::Error;
 
@@ -868,6 +1084,54 @@ impl TryFrom<MediaItemRow> for MediaItem {
             media_type: row.media_type,
             collection_type: row.collection_type,
             created_at: parse_time(&row.created_at)?,
+            updated_at: parse_time(&row.updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<ResumeItemRow> for (MediaItem, PlaybackState) {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ResumeItemRow) -> Result<Self, Self::Error> {
+        let item = MediaItem {
+            id: Uuid::parse_str(&row.id).context("invalid media item id in database")?,
+            virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                .context("invalid media item virtual folder id in database")?,
+            name: row.name,
+            path: row.path,
+            media_type: row.media_type,
+            collection_type: row.collection_type,
+            created_at: parse_time(&row.created_at)?,
+            updated_at: parse_time(&row.updated_at)?,
+        };
+        let playback = PlaybackState {
+            user_id: Uuid::parse_str(&row.user_id)
+                .context("invalid playback user id in database")?,
+            item_id: Uuid::parse_str(&row.item_id)
+                .context("invalid playback item id in database")?,
+            media_source_id: row.media_source_id,
+            position_ticks: row.position_ticks,
+            is_paused: row.is_paused,
+            played: row.played,
+            updated_at: parse_time(&row.playback_updated_at)?,
+        };
+        Ok((item, playback))
+    }
+}
+
+impl TryFrom<PlaybackStateRow> for PlaybackState {
+    type Error = anyhow::Error;
+
+    fn try_from(row: PlaybackStateRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            user_id: Uuid::parse_str(&row.user_id)
+                .context("invalid playback user id in database")?,
+            item_id: Uuid::parse_str(&row.item_id)
+                .context("invalid playback item id in database")?,
+            media_source_id: row.media_source_id,
+            position_ticks: row.position_ticks,
+            is_paused: row.is_paused,
+            played: row.played,
             updated_at: parse_time(&row.updated_at)?,
         })
     }
@@ -1074,6 +1338,16 @@ mod tests {
             folders[0].locations,
             vec!["/media/movies", "/media/more-movies"]
         );
+
+        assert!(
+            db.remove_virtual_folder_path("Movies", "/media/more-movies")
+                .await
+                .unwrap()
+        );
+        let folders = db.virtual_folders().await.unwrap();
+        assert_eq!(folders[0].locations, vec!["/media/movies"]);
+        assert!(db.delete_virtual_folder("Movies").await.unwrap());
+        assert!(db.virtual_folders().await.unwrap().is_empty());
     }
 
     #[tokio::test]

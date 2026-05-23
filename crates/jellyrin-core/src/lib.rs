@@ -61,3 +61,14 @@ pub struct MediaItem {
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybackState {
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub media_source_id: Option<String>,
+    pub position_ticks: i64,
+    pub is_paused: bool,
+    pub played: bool,
+    pub updated_at: OffsetDateTime,
+}
