@@ -58,6 +58,13 @@ pub struct ActivePlaybackSession {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrandingConfig {
+    pub login_disclaimer: Option<String>,
+    pub custom_css: Option<String>,
+    pub splashscreen_enabled: bool,
+}
+
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let pool = SqlitePoolOptions::new()
@@ -162,6 +169,47 @@ impl Database {
         let mut config = self.startup_config().await?;
         config.enable_remote_access = enabled;
         self.update_startup_config(config).await
+    }
+
+    pub async fn branding_config(&self) -> anyhow::Result<BrandingConfig> {
+        let row = sqlx::query_as::<_, BrandingConfigRow>(
+            r#"
+            SELECT login_disclaimer, custom_css, splashscreen_enabled
+            FROM branding_config
+            WHERE id = 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => row.try_into(),
+            None => Ok(BrandingConfig::default()),
+        }
+    }
+
+    pub async fn update_branding_config(&self, config: BrandingConfig) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO branding_config (
+                id, login_disclaimer, custom_css, splashscreen_enabled, updated_at
+            )
+            VALUES (1, ?1, ?2, ?3, ?4)
+            ON CONFLICT(id) DO UPDATE SET
+                login_disclaimer = excluded.login_disclaimer,
+                custom_css = excluded.custom_css,
+                splashscreen_enabled = excluded.splashscreen_enabled,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(config.login_disclaimer)
+        .bind(config.custom_css)
+        .bind(config.splashscreen_enabled)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn complete_startup_wizard(&self) -> anyhow::Result<()> {
@@ -1458,6 +1506,35 @@ struct StartupConfigRow {
     metadata_country_code: String,
     preferred_metadata_language: String,
     enable_remote_access: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct BrandingConfigRow {
+    login_disclaimer: Option<String>,
+    custom_css: Option<String>,
+    splashscreen_enabled: bool,
+}
+
+impl Default for BrandingConfig {
+    fn default() -> Self {
+        Self {
+            login_disclaimer: None,
+            custom_css: None,
+            splashscreen_enabled: true,
+        }
+    }
+}
+
+impl TryFrom<BrandingConfigRow> for BrandingConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(row: BrandingConfigRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            login_disclaimer: row.login_disclaimer,
+            custom_css: row.custom_css,
+            splashscreen_enabled: row.splashscreen_enabled,
+        })
+    }
 }
 
 #[derive(sqlx::FromRow)]

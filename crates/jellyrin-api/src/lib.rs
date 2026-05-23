@@ -22,7 +22,7 @@ use jellyrin_compat::{
     StartupRemoteAccessDto, StartupUserDto, UserDto, UserPolicyDto,
 };
 use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
-use jellyrin_db::{ActivePlaybackSession, Database, DeviceSession, TaskRun};
+use jellyrin_db::{ActivePlaybackSession, BrandingConfig, Database, DeviceSession, TaskRun};
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -72,8 +72,14 @@ pub fn router(state: AppState) -> Router {
             "/system/configuration/metadataoptions/default",
             get(default_metadata_options),
         )
-        .route("/System/Configuration/Branding", post(admin_no_content))
-        .route("/system/configuration/branding", post(admin_no_content))
+        .route(
+            "/System/Configuration/Branding",
+            post(update_branding_configuration),
+        )
+        .route(
+            "/system/configuration/branding",
+            post(update_branding_configuration),
+        )
         .route("/System/Configuration/{key}", get(named_configuration))
         .route("/system/configuration/{key}", get(named_configuration))
         .route(
@@ -205,8 +211,8 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/seriestimers", get(empty_result_json))
         .route("/Branding/Configuration", get(branding_configuration))
         .route("/branding/configuration", get(branding_configuration))
-        .route("/Branding/Css", get(empty_text))
-        .route("/Branding/Css.css", get(empty_text))
+        .route("/Branding/Css", get(branding_css))
+        .route("/Branding/Css.css", get(branding_css))
         .route("/Branding/Splashscreen", get(empty_text))
         .route("/branding/splashscreen", get(empty_text))
         .route("/Library/VirtualFolders", get(get_virtual_folders))
@@ -845,16 +851,15 @@ fn system_configuration_json(
     })
 }
 
-async fn named_configuration(Path(key): Path<String>) -> Json<serde_json::Value> {
+async fn named_configuration(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let value = match key.as_str() {
-        "branding" | "Branding" => serde_json::json!({
-            "LoginDisclaimer": null,
-            "CustomCss": null,
-            "SplashscreenEnabled": true
-        }),
+        "branding" | "Branding" => branding_configuration_json(state.db.branding_config().await?),
         _ => serde_json::json!({}),
     };
-    Json(value)
+    Ok(Json(value))
 }
 
 async fn unsupported_named_configuration_update(
@@ -865,6 +870,61 @@ async fn unsupported_named_configuration_update(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     Ok(StatusCode::NOT_IMPLEMENTED)
+}
+
+async fn update_branding_configuration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let current = state.db.branding_config().await?;
+    state
+        .db
+        .update_branding_config(BrandingConfig {
+            login_disclaimer: optional_nullable_string(
+                payload.get("LoginDisclaimer").cloned(),
+                current.login_disclaimer,
+            ),
+            custom_css: optional_nullable_string(
+                payload.get("CustomCss").cloned(),
+                current.custom_css,
+            ),
+            splashscreen_enabled: payload
+                .get("SplashscreenEnabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(current.splashscreen_enabled),
+        })
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn optional_nullable_string(
+    update: Option<serde_json::Value>,
+    current: Option<String>,
+) -> Option<String> {
+    match update {
+        None => current,
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Some(value) => Some(value.to_string()),
+    }
+}
+
+fn branding_configuration_json(config: BrandingConfig) -> serde_json::Value {
+    serde_json::json!({
+        "LoginDisclaimer": config.login_disclaimer,
+        "CustomCss": config.custom_css,
+        "SplashscreenEnabled": config.splashscreen_enabled
+    })
 }
 
 async fn default_metadata_options() -> Json<serde_json::Value> {
@@ -895,18 +955,6 @@ fn empty_result() -> serde_json::Value {
 
 async fn no_content() -> StatusCode {
     StatusCode::NO_CONTENT
-}
-
-async fn admin_no_content(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<StatusCode, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    if !user.is_administrator {
-        return Err(ApiError::forbidden("Administrator access required"));
-    }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn empty_object() -> Json<serde_json::Value> {
@@ -1247,12 +1295,21 @@ async fn live_tv_guide_info() -> Json<serde_json::Value> {
     }))
 }
 
-async fn branding_configuration() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "LoginDisclaimer": null,
-        "CustomCss": null,
-        "SplashscreenEnabled": true
-    }))
+async fn branding_configuration(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(branding_configuration_json(
+        state.db.branding_config().await?,
+    )))
+}
+
+async fn branding_css(State(state): State<AppState>) -> Result<String, ApiError> {
+    Ok(state
+        .db
+        .branding_config()
+        .await?
+        .custom_css
+        .unwrap_or_default())
 }
 
 async fn empty_text() -> &'static str {
@@ -3851,7 +3908,39 @@ mod tests {
         assert_eq!(live_tv_channels["TotalRecordCount"], 0);
         assert_eq!(live_tv_channels["Items"].as_array().unwrap().len(), 0);
 
-        for endpoint in ["/System/Configuration", "/System/Configuration/Branding"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        for endpoint in [
+            "/System/Configuration/Branding",
+            "/system/configuration/branding",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -4141,6 +4230,150 @@ mod tests {
         assert_eq!(preserved_config["ServerName"], "Jellyrin Admin QA");
         assert_eq!(preserved_config["UICulture"], "es-ES");
         assert_eq!(preserved_config["EnableRemoteAccess"], false);
+    }
+
+    #[tokio::test]
+    async fn branding_configuration_round_trips_supported_fields() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Branding/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(defaults["LoginDisclaimer"], Value::Null);
+        assert_eq!(defaults["CustomCss"], Value::Null);
+        assert_eq!(defaults["SplashscreenEnabled"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/Branding")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "LoginDisclaimer": "Private server",
+                            "CustomCss": "body { color: rgb(1, 2, 3); }",
+                            "SplashscreenEnabled": false,
+                            "UnknownBrandingField": "ignored"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/Branding")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "LoginDisclaimer": "Private server",
+                            "CustomCss": "body { color: rgb(1, 2, 3); }",
+                            "SplashscreenEnabled": false,
+                            "UnknownBrandingField": "ignored"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        for endpoint in ["/Branding/Configuration", "/System/Configuration/branding"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let branding: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(branding["LoginDisclaimer"], "Private server");
+            assert_eq!(branding["CustomCss"], "body { color: rgb(1, 2, 3); }");
+            assert_eq!(branding["SplashscreenEnabled"], false);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Branding/Css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"body { color: rgb(1, 2, 3); }");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration/branding")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "LoginDisclaimer": null }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/branding/configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let branding: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(branding["LoginDisclaimer"], Value::Null);
+        assert_eq!(branding["CustomCss"], "body { color: rgb(1, 2, 3); }");
+        assert_eq!(branding["SplashscreenEnabled"], false);
     }
 
     #[tokio::test]
