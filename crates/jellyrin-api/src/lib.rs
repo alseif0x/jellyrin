@@ -76,8 +76,14 @@ pub fn router(state: AppState) -> Router {
         .route("/system/configuration/branding", post(admin_no_content))
         .route("/System/Configuration/{key}", get(named_configuration))
         .route("/system/configuration/{key}", get(named_configuration))
-        .route("/System/Configuration/{key}", post(admin_no_content))
-        .route("/system/configuration/{key}", post(admin_no_content))
+        .route(
+            "/System/Configuration/{key}",
+            post(unsupported_named_configuration_update),
+        )
+        .route(
+            "/system/configuration/{key}",
+            post(unsupported_named_configuration_update),
+        )
         .route(
             "/Dashboard/web/ConfigurationPages",
             get(dashboard_configuration_pages),
@@ -795,6 +801,16 @@ async fn named_configuration(Path(key): Path<String>) -> Json<serde_json::Value>
         _ => serde_json::json!({}),
     };
     Json(value)
+}
+
+async fn unsupported_named_configuration_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NOT_IMPLEMENTED)
 }
 
 async fn default_metadata_options() -> Json<serde_json::Value> {
@@ -3784,7 +3800,6 @@ mod tests {
         for endpoint in [
             "/System/Configuration",
             "/System/Configuration/Branding",
-            "/System/Configuration/metadata",
             "/Devices/Options",
         ] {
             let response = app
@@ -3815,6 +3830,42 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
+
+        for endpoint in [
+            "/System/Configuration/metadata",
+            "/system/configuration/metadata",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({ "Sentinel": "not-persisted" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{endpoint}");
         }
 
         let response = app
