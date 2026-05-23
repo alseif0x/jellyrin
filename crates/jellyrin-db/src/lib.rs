@@ -268,6 +268,49 @@ impl Database {
         Ok(())
     }
 
+    pub async fn user_configuration(&self, user_id: Uuid) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query_as::<_, UserConfigurationRow>(
+            r#"
+            SELECT payload_json
+            FROM user_configurations
+            WHERE user_id = ?1
+            "#,
+        )
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| serde_json::from_str(&row.payload_json).context("invalid user configuration"))
+            .transpose()
+    }
+
+    pub async fn update_user_configuration(
+        &self,
+        user_id: Uuid,
+        payload: Value,
+    ) -> anyhow::Result<()> {
+        self.user_by_id(user_id).await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let payload_json = serde_json::to_string(&payload)?;
+        sqlx::query(
+            r#"
+            INSERT INTO user_configurations (
+                user_id, payload_json, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?3)
+            ON CONFLICT(user_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(payload_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn complete_startup_wizard(&self) -> anyhow::Result<()> {
         sqlx::query(
             r#"
@@ -1573,6 +1616,11 @@ struct BrandingConfigRow {
 
 #[derive(sqlx::FromRow)]
 struct DisplayPreferencesRow {
+    payload_json: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct UserConfigurationRow {
     payload_json: String,
 }
 

@@ -59,6 +59,7 @@ pub struct UserDto {
     pub has_configured_password: bool,
     pub has_configured_easy_password: bool,
     pub enable_auto_login: bool,
+    pub configuration: serde_json::Value,
     pub policy: UserPolicyDto,
 }
 

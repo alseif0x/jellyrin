@@ -159,12 +159,22 @@ pub fn router(state: AppState) -> Router {
         .route("/users/public", get(get_public_users))
         .route("/Users", get(get_users))
         .route("/users", get(get_users))
+        .route("/Users/Configuration", post(update_user_configuration))
+        .route("/users/configuration", post(update_user_configuration))
         .route("/Users/AuthenticateByName", post(authenticate_by_name))
         .route("/Users/authenticatebyname", post(authenticate_by_name))
         .route("/users/authenticatebyname", post(authenticate_by_name))
         .route("/users/AuthenticateByName", post(authenticate_by_name))
         .route("/Users/Me", get(get_current_user))
         .route("/users/me", get(get_current_user))
+        .route(
+            "/Users/{user_id}/Configuration",
+            post(update_user_configuration_for_path),
+        )
+        .route(
+            "/users/{user_id}/configuration",
+            post(update_user_configuration_for_path),
+        )
         .route("/Users/{user_id}/Views", get(user_views_result))
         .route("/users/{user_id}/views", get(user_views_result))
         .route("/Users/{user_id}/Items", get(user_items_result))
@@ -522,12 +532,11 @@ async fn post_startup_complete(State(state): State<AppState>) -> Result<StatusCo
 async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
     let server = state.db.server_state().await?;
     let users = state.db.users().await?;
-    Ok(Json(
-        users
-            .iter()
-            .map(|user| user_to_dto(user, server.server_id))
-            .collect(),
-    ))
+    let mut dtos = Vec::with_capacity(users.len());
+    for user in &users {
+        dtos.push(user_to_dto(&state.db, user, server.server_id).await?);
+    }
+    Ok(Json(dtos))
 }
 
 async fn get_users(
@@ -538,12 +547,11 @@ async fn get_users(
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let server = state.db.server_state().await?;
     let users = state.db.users().await?;
-    Ok(Json(
-        users
-            .iter()
-            .map(|user| user_to_dto(user, server.server_id))
-            .collect(),
-    ))
+    let mut dtos = Vec::with_capacity(users.len());
+    for user in &users {
+        dtos.push(user_to_dto(&state.db, user, server.server_id).await?);
+    }
+    Ok(Json(dtos))
 }
 
 async fn authenticate_by_name(
@@ -572,11 +580,9 @@ async fn authenticate_by_name(
         .map_err(|_| ApiError::unauthorized("Invalid username or password"))?;
     let server = state.db.server_state().await?;
 
-    Ok(Json(authentication_result_to_dto(
-        &user,
-        &token,
-        server.server_id,
-    )))
+    Ok(Json(
+        authentication_result_to_dto(&state.db, &user, &token, server.server_id).await?,
+    ))
 }
 
 async fn get_current_user(
@@ -586,7 +592,7 @@ async fn get_current_user(
 ) -> Result<Json<UserDto>, ApiError> {
     let (user, _) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let server = state.db.server_state().await?;
-    Ok(Json(user_to_dto(&user, server.server_id)))
+    Ok(Json(user_to_dto(&state.db, &user, server.server_id).await?))
 }
 
 async fn get_user_by_id(
@@ -600,7 +606,118 @@ async fn get_user_by_id(
         return Err(ApiError::forbidden("User access denied"));
     }
     let server = state.db.server_state().await?;
-    Ok(Json(user_to_dto(&user, server.server_id)))
+    let requested_user = if user.id == user_id {
+        user
+    } else {
+        state
+            .db
+            .users()
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.id == user_id)
+            .ok_or_else(|| ApiError::not_found("User not found"))?
+    };
+    Ok(Json(
+        user_to_dto(&state.db, &requested_user, server.server_id).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct UserConfigurationQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "UserId", alias = "userId")]
+    user_id: Option<String>,
+}
+
+async fn update_user_configuration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UserConfigurationQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    update_user_configuration_for_id(
+        state,
+        headers,
+        query.auth,
+        query.user_id.as_deref(),
+        payload,
+    )
+    .await
+}
+
+async fn update_user_configuration_for_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    update_user_configuration_for_id(state, headers, auth, Some(&user_id), payload).await
+}
+
+async fn update_user_configuration_for_id(
+    state: AppState,
+    headers: HeaderMap,
+    auth: AuthQuery,
+    user_id: Option<&str>,
+    payload: serde_json::Value,
+) -> Result<StatusCode, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, auth.api_key.as_deref()).await?;
+    let user_id = match user_id {
+        Some(user_id) => resolve_user_id(user_id)?,
+        None => auth_user.id,
+    };
+    ensure_user_access(&auth_user, user_id)?;
+    let current = state
+        .db
+        .user_configuration(user_id)
+        .await?
+        .unwrap_or_else(default_user_configuration);
+    let merged = merge_user_configuration(current, payload)?;
+    state.db.update_user_configuration(user_id, merged).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn merge_user_configuration(
+    current: serde_json::Value,
+    update: serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let serde_json::Value::Object(mut current) = current else {
+        return Err(ApiError::bad_request(
+            "Stored user configuration is invalid",
+        ));
+    };
+    let serde_json::Value::Object(update) = update else {
+        return Err(ApiError::bad_request(
+            "User configuration body must be an object",
+        ));
+    };
+    for (key, value) in update {
+        current.insert(key, value);
+    }
+    Ok(serde_json::Value::Object(current))
+}
+
+fn default_user_configuration() -> serde_json::Value {
+    serde_json::json!({
+        "AudioLanguagePreference": null,
+        "PlayDefaultAudioTrack": true,
+        "SubtitleLanguagePreference": null,
+        "DisplayMissingEpisodes": false,
+        "GroupedFolders": [],
+        "SubtitleMode": "Default",
+        "DisplayCollectionsView": false,
+        "EnableLocalPassword": false,
+        "OrderedViews": [],
+        "LatestItemsExcludes": [],
+        "MyMediaExcludes": [],
+        "HidePlayedInLatest": true,
+        "RememberAudioSelections": true,
+        "RememberSubtitleSelections": true,
+        "EnableNextEpisodeAutoPlay": true,
+        "CastReceiverId": null
+    })
 }
 
 async fn logout(
@@ -3190,8 +3307,12 @@ fn startup_config_to_dto(config: StartupConfig) -> StartupConfigurationDto {
     }
 }
 
-fn user_to_dto(user: &User, server_id: Uuid) -> UserDto {
-    UserDto {
+async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<UserDto, ApiError> {
+    let configuration = db
+        .user_configuration(user.id)
+        .await?
+        .unwrap_or_else(default_user_configuration);
+    Ok(UserDto {
         id: user.id,
         name: user.name.clone(),
         server_id,
@@ -3199,6 +3320,7 @@ fn user_to_dto(user: &User, server_id: Uuid) -> UserDto {
         has_configured_password: true,
         has_configured_easy_password: false,
         enable_auto_login: false,
+        configuration,
         policy: UserPolicyDto {
             is_administrator: user.is_administrator,
             is_disabled: user.is_disabled,
@@ -3207,16 +3329,17 @@ fn user_to_dto(user: &User, server_id: Uuid) -> UserDto {
             enable_shared_device_control: true,
             enable_remote_access: true,
         },
-    }
+    })
 }
 
-fn authentication_result_to_dto(
+async fn authentication_result_to_dto(
+    db: &Database,
     user: &User,
     token: &DeviceToken,
     server_id: Uuid,
-) -> AuthenticationResultDto {
-    AuthenticationResultDto {
-        user: user_to_dto(user, server_id),
+) -> Result<AuthenticationResultDto, ApiError> {
+    Ok(AuthenticationResultDto {
+        user: user_to_dto(db, user, server_id).await?,
         session_info: SessionInfoDto {
             id: token.access_token.clone(),
             user_id: user.id,
@@ -3232,7 +3355,7 @@ fn authentication_result_to_dto(
         },
         access_token: token.access_token.clone(),
         server_id,
-    }
+    })
 }
 
 fn session_to_json(
@@ -6654,5 +6777,163 @@ mod tests {
                     .all(|user| user["Policy"]["IsAdministrator"] == true)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn user_configuration_round_trips_partial_updates() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/Me")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let me: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(me["Configuration"]["SubtitleMode"], "Default");
+        assert_eq!(me["Configuration"]["EnableNextEpisodeAutoPlay"], true);
+        assert_eq!(me["Configuration"]["HidePlayedInLatest"], true);
+        assert_eq!(me["Configuration"]["DisplayCollectionsView"], false);
+        assert_eq!(me["Configuration"]["LatestItemsExcludes"], json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/Configuration?userId={}", user.id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/Configuration?userId={}", user.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "DisplayMissingEpisodes": true,
+                            "EnableNextEpisodeAutoPlay": false,
+                            "LatestItemsExcludes": ["movies"],
+                            "UnknownFutureSetting": "kept"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/users/{}/configuration", user.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "SubtitleMode": "OnlyForced",
+                            "RememberAudioSelections": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/Me")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_me: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_me["Configuration"]["DisplayMissingEpisodes"], true);
+        assert_eq!(
+            updated_me["Configuration"]["EnableNextEpisodeAutoPlay"],
+            false
+        );
+        assert_eq!(
+            updated_me["Configuration"]["LatestItemsExcludes"],
+            json!(["movies"])
+        );
+        assert_eq!(updated_me["Configuration"]["SubtitleMode"], "OnlyForced");
+        assert_eq!(
+            updated_me["Configuration"]["RememberAudioSelections"],
+            false
+        );
+        assert_eq!(updated_me["Configuration"]["PlayDefaultAudioTrack"], true);
+        assert_eq!(updated_me["Configuration"]["UnknownFutureSetting"], "kept");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/Me")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let after_no_user_id: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            after_no_user_id["Configuration"]["SubtitleMode"],
+            "OnlyForced"
+        );
     }
 }
