@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use argon2::{
@@ -8,8 +11,9 @@ use argon2::{
 use jellyrin_core::{
     DeviceToken, MediaItem, PlaybackState, ServerState, StartupConfig, User, VirtualFolder,
 };
+use serde_json::Value;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -17,6 +21,41 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRun {
+    pub id: Uuid,
+    pub task_key: String,
+    pub status: String,
+    pub started_at: OffsetDateTime,
+    pub completed_at: Option<OffsetDateTime>,
+    pub result_json: Option<Value>,
+    pub error_message: Option<String>,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceSession {
+    pub access_token: String,
+    pub user_id: Uuid,
+    pub user_name: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub client: String,
+    pub version: String,
+    pub last_activity_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivePlaybackSession {
+    pub session_id: String,
+    pub user_id: Uuid,
+    pub item: MediaItem,
+    pub media_source_id: Option<String>,
+    pub position_ticks: i64,
+    pub is_paused: bool,
+    pub updated_at: OffsetDateTime,
 }
 
 impl Database {
@@ -300,6 +339,7 @@ impl Database {
         .context("invalid token")?;
 
         let token: DeviceToken = token_row.try_into()?;
+        self.touch_device_token(&token.access_token).await?;
         let user = self.user_by_id(token.user_id).await?;
         Ok((user, token))
     }
@@ -369,6 +409,269 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn device_sessions(&self) -> anyhow::Result<Vec<DeviceSession>> {
+        let rows = sqlx::query_as::<_, DeviceSessionRow>(
+            r#"
+            SELECT devices.access_token, devices.user_id, users.name AS user_name,
+                   devices.device_id, devices.device_name, devices.client, devices.version,
+                   devices.last_activity_at
+            FROM devices
+            INNER JOIN users ON users.id = devices.user_id
+            WHERE users.is_disabled = 0
+            ORDER BY devices.last_activity_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn device_sessions_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<DeviceSession>> {
+        let rows = sqlx::query_as::<_, DeviceSessionRow>(
+            r#"
+            SELECT devices.access_token, devices.user_id, users.name AS user_name,
+                   devices.device_id, devices.device_name, devices.client, devices.version,
+                   devices.last_activity_at
+            FROM devices
+            INNER JOIN users ON users.id = devices.user_id
+            WHERE users.is_disabled = 0 AND devices.user_id = ?1
+            ORDER BY devices.last_activity_at DESC
+            "#,
+        )
+        .bind(user_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_active_playback_session(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+        position_ticks: i64,
+        is_paused: bool,
+    ) -> anyhow::Result<()> {
+        let trimmed_session_id = session_id.trim();
+        anyhow::ensure!(
+            !trimmed_session_id.is_empty(),
+            "session id must not be empty"
+        );
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO active_playback_sessions (
+                session_id, user_id, item_id, media_source_id, position_ticks, is_paused, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(session_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                item_id = excluded.item_id,
+                media_source_id = excluded.media_source_id,
+                position_ticks = excluded.position_ticks,
+                is_paused = excluded.is_paused,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(trimmed_session_id)
+        .bind(user_id.to_string())
+        .bind(item_id.to_string())
+        .bind(media_source_id)
+        .bind(position_ticks)
+        .bind(is_paused)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_active_playback_session(&self, session_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM active_playback_sessions WHERE session_id = ?1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn active_playback_sessions(&self) -> anyhow::Result<Vec<ActivePlaybackSession>> {
+        let rows = sqlx::query_as::<_, ActivePlaybackSessionRow>(
+            r#"
+            SELECT active_playback_sessions.session_id,
+                   active_playback_sessions.user_id,
+                   active_playback_sessions.media_source_id,
+                   active_playback_sessions.position_ticks,
+                   active_playback_sessions.is_paused,
+                   active_playback_sessions.updated_at AS playback_updated_at,
+                   media_items.id,
+                   media_items.virtual_folder_id,
+                   media_items.name,
+                   media_items.path,
+                   media_items.media_type,
+                   media_items.collection_type,
+                   media_items.created_at,
+                   media_items.updated_at
+            FROM active_playback_sessions
+            INNER JOIN media_items ON media_items.id = active_playback_sessions.item_id
+            WHERE media_items.missing_since IS NULL
+            ORDER BY active_playback_sessions.updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn start_task_run(&self, task_key: &str) -> anyhow::Result<TaskRun> {
+        let trimmed_key = task_key.trim();
+        anyhow::ensure!(!trimmed_key.is_empty(), "task key must not be empty");
+
+        let id = Uuid::new_v4();
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO task_runs (id, task_key, status, started_at, updated_at)
+            VALUES (?1, ?2, 'running', ?3, ?3)
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(trimmed_key)
+        .bind(now)
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => self.task_run_by_id(id).await,
+            Err(error) if is_unique_constraint_error(&error) => {
+                anyhow::bail!("task is already running")
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn complete_task_run(&self, run_id: Uuid, result: Value) -> anyhow::Result<TaskRun> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result_json = serde_json::to_string(&result)?;
+        sqlx::query(
+            r#"
+            UPDATE task_runs
+            SET status = 'completed',
+                completed_at = ?1,
+                result_json = ?2,
+                error_message = NULL,
+                updated_at = ?1
+            WHERE id = ?3 AND status = 'running'
+            "#,
+        )
+        .bind(now)
+        .bind(result_json)
+        .bind(run_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.task_run_by_id(run_id).await
+    }
+
+    pub async fn fail_task_run(&self, run_id: Uuid, error: &str) -> anyhow::Result<TaskRun> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            UPDATE task_runs
+            SET status = 'failed',
+                completed_at = ?1,
+                error_message = ?2,
+                updated_at = ?1
+            WHERE id = ?3 AND status = 'running'
+            "#,
+        )
+        .bind(now)
+        .bind(error)
+        .bind(run_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.task_run_by_id(run_id).await
+    }
+
+    pub async fn fail_current_task_run(
+        &self,
+        task_key: &str,
+        error: &str,
+    ) -> anyhow::Result<Option<TaskRun>> {
+        let Some(run) = self.current_task_run(task_key).await? else {
+            return Ok(None);
+        };
+        self.fail_task_run(run.id, error).await.map(Some)
+    }
+
+    pub async fn fail_stale_task_runs(
+        &self,
+        task_key: &str,
+        older_than: Duration,
+        error: &str,
+    ) -> anyhow::Result<usize> {
+        let cutoff = format_time(OffsetDateTime::now_utc() - older_than)?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            UPDATE task_runs
+            SET status = 'failed',
+                completed_at = ?1,
+                error_message = ?2,
+                updated_at = ?1
+            WHERE task_key = ?3 AND status = 'running' AND updated_at < ?4
+            "#,
+        )
+        .bind(now)
+        .bind(error)
+        .bind(task_key)
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    pub async fn current_task_run(&self, task_key: &str) -> anyhow::Result<Option<TaskRun>> {
+        let row = sqlx::query_as::<_, TaskRunRow>(
+            r#"
+            SELECT id, task_key, status, started_at, completed_at, result_json, error_message, updated_at
+            FROM task_runs
+            WHERE task_key = ?1 AND status = 'running'
+            ORDER BY started_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn last_task_result(&self, task_key: &str) -> anyhow::Result<Option<TaskRun>> {
+        let row = sqlx::query_as::<_, TaskRunRow>(
+            r#"
+            SELECT id, task_key, status, started_at, completed_at, result_json, error_message, updated_at
+            FROM task_runs
+            WHERE task_key = ?1 AND status IN ('completed', 'failed')
+            ORDER BY completed_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
     }
 
     pub async fn virtual_folders(&self) -> anyhow::Result<Vec<VirtualFolder>> {
@@ -512,6 +815,7 @@ impl Database {
             r#"
             SELECT id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
             FROM media_items
+            WHERE missing_since IS NULL
             ORDER BY name COLLATE NOCASE
             "#,
         )
@@ -526,6 +830,7 @@ impl Database {
             r#"
             SELECT id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
             FROM media_items
+            WHERE missing_since IS NULL
             ORDER BY created_at DESC, name COLLATE NOCASE
             LIMIT ?1
             "#,
@@ -610,6 +915,7 @@ impl Database {
             FROM playback_states
             INNER JOIN media_items ON media_items.id = playback_states.item_id
             WHERE playback_states.user_id = ?1
+              AND media_items.missing_since IS NULL
               AND playback_states.position_ticks > 0
               AND playback_states.played = 0
             ORDER BY playback_states.updated_at DESC
@@ -630,9 +936,16 @@ impl Database {
             .await?
             .context("virtual folder not found")?;
         let mut scanned = 0usize;
+        let mut found_paths = HashSet::new();
+        let mut can_reconcile_stale = true;
 
         for location in &folder.locations {
-            for path in collect_media_files(Path::new(location)).await? {
+            let location = Path::new(location);
+            let Some(media_files) = collect_media_files_if_root_available(location).await? else {
+                can_reconcile_stale = false;
+                continue;
+            };
+            for path in media_files {
                 let Some(name) = path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -646,10 +959,16 @@ impl Database {
                     continue;
                 };
 
+                found_paths.insert(path.to_string_lossy().to_string());
                 self.upsert_media_item(&folder, &name, &path, media_type)
                     .await?;
                 scanned += 1;
             }
+        }
+
+        if can_reconcile_stale {
+            self.mark_stale_media_items_for_folder(folder.id, &found_paths)
+                .await?;
         }
 
         Ok(scanned)
@@ -664,25 +983,70 @@ impl Database {
     ) -> anyhow::Result<()> {
         let now = format_time(OffsetDateTime::now_utc())?;
         let path = path.to_string_lossy().to_string();
-        let existing_id =
+        let metadata = tokio::fs::metadata(path.as_str()).await.ok();
+        let file_size = metadata.as_ref().map(|metadata| metadata.len() as i64);
+        let modified_at = metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| format_time(OffsetDateTime::from(modified)).ok());
+        let exact_id =
             sqlx::query_as::<_, MediaItemIdRow>("SELECT id FROM media_items WHERE path = ?1")
                 .bind(&path)
                 .fetch_optional(&self.pool)
                 .await?
-                .map_or_else(|| Uuid::new_v4().to_string(), |row| row.id);
+                .map(|row| row.id);
+
+        if exact_id.is_none()
+            && let Some(missing_id) = self
+                .missing_media_item_id_for_identity(
+                    folder.id,
+                    media_type,
+                    &path,
+                    file_size,
+                    modified_at.as_deref(),
+                )
+                .await?
+        {
+            sqlx::query(
+                r#"
+                UPDATE media_items
+                SET name = ?1, path = ?2, media_type = ?3, collection_type = ?4,
+                    updated_at = ?5, last_seen_at = ?5, missing_since = NULL,
+                    file_size = ?6, modified_at = ?7
+                WHERE id = ?8
+                "#,
+            )
+            .bind(name)
+            .bind(path)
+            .bind(media_type)
+            .bind(&folder.collection_type)
+            .bind(&now)
+            .bind(file_size)
+            .bind(modified_at)
+            .bind(missing_id)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+
+        let existing_id = exact_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         sqlx::query(
             r#"
             INSERT INTO media_items (
-                id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
+                id, virtual_folder_id, name, path, media_type, collection_type,
+                created_at, updated_at, last_seen_at, missing_since, file_size, modified_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, NULL, ?8, ?9)
             ON CONFLICT(path) DO UPDATE SET
                 virtual_folder_id = excluded.virtual_folder_id,
                 name = excluded.name,
                 media_type = excluded.media_type,
                 collection_type = excluded.collection_type,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at,
+                missing_since = NULL,
+                file_size = excluded.file_size,
+                modified_at = excluded.modified_at
             "#,
         )
         .bind(existing_id)
@@ -691,7 +1055,9 @@ impl Database {
         .bind(path)
         .bind(media_type)
         .bind(&folder.collection_type)
-        .bind(now)
+        .bind(&now)
+        .bind(file_size)
+        .bind(modified_at)
         .execute(&self.pool)
         .await?;
 
@@ -808,6 +1174,15 @@ impl Database {
         row.try_into()
     }
 
+    async fn touch_device_token(&self, token: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE devices SET last_activity_at = ?1 WHERE access_token = ?2")
+            .bind(format_time(OffsetDateTime::now_utc())?)
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn issue_device_token(
         &self,
         user: &User,
@@ -882,6 +1257,22 @@ impl Database {
         row.map(TryInto::try_into).transpose()
     }
 
+    async fn task_run_by_id(&self, id: Uuid) -> anyhow::Result<TaskRun> {
+        let row = sqlx::query_as::<_, TaskRunRow>(
+            r#"
+            SELECT id, task_key, status, started_at, completed_at, result_json, error_message, updated_at
+            FROM task_runs
+            WHERE id = ?1
+            "#,
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .context("task run not found")?;
+
+        row.try_into()
+    }
+
     async fn delete_media_items_for_folder(&self, folder_id: Uuid) -> anyhow::Result<()> {
         sqlx::query(
             r#"
@@ -930,6 +1321,78 @@ impl Database {
         .bind(nested_prefix)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn missing_media_item_id_for_identity(
+        &self,
+        folder_id: Uuid,
+        media_type: &str,
+        current_path: &str,
+        file_size: Option<i64>,
+        modified_at: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(file_size) = file_size else {
+            return Ok(None);
+        };
+        let Some(modified_at) = modified_at else {
+            return Ok(None);
+        };
+
+        let row = sqlx::query_as::<_, MediaItemIdRow>(
+            r#"
+            SELECT id
+            FROM media_items
+            WHERE virtual_folder_id = ?1
+              AND media_type = ?2
+              AND file_size = ?3
+              AND modified_at = ?4
+              AND path <> ?5
+            ORDER BY missing_since IS NULL, missing_since DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(folder_id.to_string())
+        .bind(media_type)
+        .bind(file_size)
+        .bind(modified_at)
+        .bind(current_path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| row.id))
+    }
+
+    async fn mark_stale_media_items_for_folder(
+        &self,
+        folder_id: Uuid,
+        found_paths: &HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let rows = sqlx::query_as::<_, MediaItemPathRow>(
+            "SELECT id, path FROM media_items WHERE virtual_folder_id = ?1 AND missing_since IS NULL",
+        )
+        .bind(folder_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        for row in rows
+            .into_iter()
+            .filter(|row| !found_paths.contains(&row.path))
+        {
+            sqlx::query(
+                r#"
+                UPDATE media_items
+                SET missing_since = ?1, updated_at = ?1
+                WHERE id = ?2
+                "#,
+            )
+            .bind(&now)
+            .bind(&row.id)
+            .execute(&self.pool)
+            .await?;
+        }
+
         Ok(())
     }
 }
@@ -992,6 +1455,18 @@ struct DeviceTokenRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct DeviceSessionRow {
+    access_token: String,
+    user_id: String,
+    user_name: String,
+    device_id: String,
+    device_name: String,
+    client: String,
+    version: String,
+    last_activity_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct ApiKeyRow {
     access_token: String,
     user_id: String,
@@ -1026,6 +1501,12 @@ struct MediaItemIdRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct MediaItemPathRow {
+    id: String,
+    path: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct ResumeItemRow {
     id: String,
     virtual_folder_id: String,
@@ -1052,6 +1533,36 @@ struct PlaybackStateRow {
     position_ticks: i64,
     is_paused: bool,
     played: bool,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ActivePlaybackSessionRow {
+    session_id: String,
+    user_id: String,
+    media_source_id: Option<String>,
+    position_ticks: i64,
+    is_paused: bool,
+    playback_updated_at: String,
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct TaskRunRow {
+    id: String,
+    task_key: String,
+    status: String,
+    started_at: String,
+    completed_at: Option<String>,
+    result_json: Option<String>,
+    error_message: Option<String>,
     updated_at: String,
 }
 
@@ -1137,6 +1648,53 @@ impl TryFrom<PlaybackStateRow> for PlaybackState {
     }
 }
 
+impl TryFrom<ActivePlaybackSessionRow> for ActivePlaybackSession {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ActivePlaybackSessionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session_id: row.session_id,
+            user_id: Uuid::parse_str(&row.user_id).context("invalid active playback user id")?,
+            item: MediaItem {
+                id: Uuid::parse_str(&row.id).context("invalid active playback item id")?,
+                virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                    .context("invalid active playback virtual folder id")?,
+                name: row.name,
+                path: row.path,
+                media_type: row.media_type,
+                collection_type: row.collection_type,
+                created_at: parse_time(&row.created_at)?,
+                updated_at: parse_time(&row.updated_at)?,
+            },
+            media_source_id: row.media_source_id,
+            position_ticks: row.position_ticks,
+            is_paused: row.is_paused,
+            updated_at: parse_time(&row.playback_updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<TaskRunRow> for TaskRun {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TaskRunRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: Uuid::parse_str(&row.id).context("invalid task run id in database")?,
+            task_key: row.task_key,
+            status: row.status,
+            started_at: parse_time(&row.started_at)?,
+            completed_at: row.completed_at.as_deref().map(parse_time).transpose()?,
+            result_json: row
+                .result_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+            error_message: row.error_message,
+            updated_at: parse_time(&row.updated_at)?,
+        })
+    }
+}
+
 impl TryFrom<DeviceTokenRow> for DeviceToken {
     type Error = anyhow::Error;
 
@@ -1148,6 +1706,23 @@ impl TryFrom<DeviceTokenRow> for DeviceToken {
             device_name: row.device_name,
             client: row.client,
             version: row.version,
+        })
+    }
+}
+
+impl TryFrom<DeviceSessionRow> for DeviceSession {
+    type Error = anyhow::Error;
+
+    fn try_from(row: DeviceSessionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            access_token: row.access_token,
+            user_id: Uuid::parse_str(&row.user_id).context("invalid session user id")?,
+            user_name: row.user_name,
+            device_id: row.device_id,
+            device_name: row.device_name,
+            client: row.client,
+            version: row.version,
+            last_activity_at: parse_time(&row.last_activity_at)?,
         })
     }
 }
@@ -1172,6 +1747,12 @@ fn format_time(value: OffsetDateTime) -> anyhow::Result<String> {
 
 fn parse_time(value: &str) -> anyhow::Result<OffsetDateTime> {
     OffsetDateTime::parse(value, &Rfc3339).context("failed to parse timestamp")
+}
+
+fn is_unique_constraint_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|database_error| database_error.is_unique_violation())
 }
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
@@ -1221,6 +1802,20 @@ async fn collect_media_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(media_files)
 }
 
+async fn collect_media_files_if_root_available(
+    root: &Path,
+) -> anyhow::Result<Option<Vec<PathBuf>>> {
+    let Ok(metadata) = tokio::fs::symlink_metadata(root).await else {
+        return Ok(None);
+    };
+
+    if metadata.is_dir() && tokio::fs::read_dir(root).await.is_err() {
+        return Ok(None);
+    }
+
+    collect_media_files(root).await.map(Some)
+}
+
 fn media_type_for_path(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
@@ -1246,6 +1841,8 @@ fn normalized_locations(locations: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::Database;
+    use serde_json::json;
+    use time::Duration;
 
     #[tokio::test]
     async fn creates_initial_server_state_once() {
@@ -1310,6 +1907,163 @@ mod tests {
         assert_eq!(api_user.id, user.id);
         assert_eq!(token.access_token, api_key);
         assert_eq!(token.client, "API Key");
+    }
+
+    #[tokio::test]
+    async fn device_sessions_are_created_by_login_and_revoked_with_token() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+
+        let (_, token) = db
+            .authenticate_user_by_name(
+                "root",
+                "secret",
+                "device-1",
+                "Firefox",
+                "Jellyfin Web",
+                "dev",
+            )
+            .await
+            .unwrap();
+        let sessions = db.device_sessions_for_user(user.id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].access_token, token.access_token);
+        assert_eq!(sessions[0].user_name, "root");
+        assert_eq!(sessions[0].device_id, "device-1");
+        assert_eq!(sessions[0].client, "Jellyfin Web");
+
+        db.revoke_token(&token.access_token).await.unwrap();
+        assert!(
+            db.device_sessions_for_user(user.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn active_playback_sessions_track_and_clear_now_playing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Example Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        let (_, token) = db
+            .authenticate_user_by_name(
+                "root",
+                "secret",
+                "device-1",
+                "Firefox",
+                "Jellyfin Web",
+                "dev",
+            )
+            .await
+            .unwrap();
+
+        db.upsert_active_playback_session(
+            &token.access_token,
+            user.id,
+            item.id,
+            Some(&item.id.to_string()),
+            42,
+            false,
+        )
+        .await
+        .unwrap();
+        let sessions = db.active_playback_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, token.access_token);
+        assert_eq!(sessions[0].item.id, item.id);
+        assert_eq!(sessions[0].position_ticks, 42);
+
+        db.clear_active_playback_session(&token.access_token)
+            .await
+            .unwrap();
+        assert!(db.active_playback_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_runs_track_current_and_last_result() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        let run = db.start_task_run("RefreshLibrary").await.unwrap();
+        assert_eq!(run.task_key, "RefreshLibrary");
+        assert_eq!(run.status, "running");
+        assert!(db.start_task_run("RefreshLibrary").await.is_err());
+        assert!(
+            db.current_task_run("RefreshLibrary")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let completed = db
+            .complete_task_run(run.id, json!({ "ItemsScanned": 7 }))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.result_json.unwrap()["ItemsScanned"], 7);
+        assert!(
+            db.current_task_run("RefreshLibrary")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let last = db
+            .last_task_result("RefreshLibrary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.id, run.id);
+        assert_eq!(last.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn task_runs_can_be_cancelled_and_stale_runs_expire() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        let run = db.start_task_run("RefreshLibrary").await.unwrap();
+        let failed = db
+            .fail_current_task_run("RefreshLibrary", "cancelled")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.id, run.id);
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error_message.as_deref(), Some("cancelled"));
+
+        let stale = db.start_task_run("RefreshLibrary").await.unwrap();
+        let expired = db
+            .fail_stale_task_runs("RefreshLibrary", Duration::ZERO, "expired")
+            .await
+            .unwrap();
+        assert_eq!(expired, 1);
+        let last = db
+            .last_task_result("RefreshLibrary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.id, stale.id);
+        assert_eq!(last.status, "failed");
+        assert_eq!(last.error_message.as_deref(), Some("expired"));
     }
 
     #[tokio::test]
@@ -1381,6 +2135,116 @@ mod tests {
         assert_eq!(items[0].path, movie.to_string_lossy());
         assert_eq!(items[0].media_type, "Video");
         assert_eq!(items[0].collection_type.as_deref(), Some("movies"));
+    }
+
+    #[tokio::test]
+    async fn rescan_marks_stale_media_items_without_deleting_playback_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Example Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        let item = db.media_items().await.unwrap().remove(0);
+        db.upsert_playback_state(user.id, item.id, Some("source"), 42, false, false)
+            .await
+            .unwrap();
+
+        tokio::fs::remove_file(&movie).await.unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 0);
+
+        assert!(db.media_items().await.unwrap().is_empty());
+        assert!(
+            db.playback_state_for_item(user.id, item.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn rescan_renamed_file_preserves_item_id_and_playback_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Example Movie.mp4");
+        let renamed_movie = tmp.path().join("Renamed Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        let item = db.media_items().await.unwrap().remove(0);
+        db.upsert_playback_state(user.id, item.id, Some("source"), 42, false, false)
+            .await
+            .unwrap();
+
+        tokio::fs::rename(&movie, &renamed_movie).await.unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+
+        let items = db.media_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, item.id);
+        assert_eq!(items[0].name, "Renamed Movie");
+        assert_eq!(items[0].path, renamed_movie.to_string_lossy());
+        assert_eq!(
+            db.playback_state_for_item(user.id, item.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .position_ticks,
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn rescan_skips_missing_reconciliation_when_library_root_is_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Movies");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let movie = root.join("Example Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![root.to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 0);
+
+        let items = db.media_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, movie.to_string_lossy());
     }
 
     #[tokio::test]

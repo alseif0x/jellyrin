@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path as FsPath, PathBuf},
 };
@@ -12,7 +13,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect},
-    routing::{delete, get, post},
+    routing::{delete, get, head, post},
 };
 use jellyrin_compat::{
     AuthenticateUserByNameDto, AuthenticationResultDto, CountryDto, CultureDto, HealthResponse,
@@ -20,9 +21,11 @@ use jellyrin_compat::{
     StartupRemoteAccessDto, StartupUserDto, UserDto, UserPolicyDto,
 };
 use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
-use jellyrin_db::Database;
+use jellyrin_db::{ActivePlaybackSession, Database, DeviceSession, TaskRun};
 use serde::Deserialize;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use uuid::Uuid;
 
@@ -114,12 +117,24 @@ pub fn router(state: AppState) -> Router {
         .route("/scheduledtasks/{task_id}", get(scheduled_task))
         .route(
             "/ScheduledTasks/Running/{task_id}",
-            post(start_scheduled_task),
+            post(start_scheduled_task).delete(stop_scheduled_task),
         )
         .route(
             "/scheduledtasks/running/{task_id}",
-            post(start_scheduled_task),
+            post(start_scheduled_task).delete(stop_scheduled_task),
         )
+        .route(
+            "/ScheduledTasks/{task_id}/Triggers",
+            post(update_scheduled_task_triggers),
+        )
+        .route(
+            "/scheduledtasks/{task_id}/triggers",
+            post(update_scheduled_task_triggers),
+        )
+        .route("/Library/Refresh", post(refresh_library))
+        .route("/library/refresh", post(refresh_library))
+        .route("/Library/MediaFolders", get(user_views_result))
+        .route("/library/mediafolders", get(user_views_result))
         .route("/Startup/Configuration", get(get_startup_configuration))
         .route("/Startup/Configuration", post(post_startup_configuration))
         .route("/Startup/RemoteAccess", post(post_startup_remote_access))
@@ -137,6 +152,14 @@ pub fn router(state: AppState) -> Router {
         .route("/users/me", get(get_current_user))
         .route("/Users/{user_id}/Views", get(user_views_result))
         .route("/users/{user_id}/views", get(user_views_result))
+        .route("/Users/{user_id}/Items", get(user_items_result))
+        .route("/users/{user_id}/items", get(user_items_result))
+        .route("/Users/{user_id}/Items/Counts", get(user_item_counts))
+        .route("/users/{user_id}/items/counts", get(user_item_counts))
+        .route("/Users/{user_id}/Items/Latest", get(user_latest_items))
+        .route("/users/{user_id}/items/latest", get(user_latest_items))
+        .route("/Users/{user_id}/Items/Resume", get(user_resume_items))
+        .route("/users/{user_id}/items/resume", get(user_resume_items))
         .route("/Users/{user_id}", get(get_user_by_id))
         .route("/users/{user_id}", get(get_user_by_id))
         .route("/Sessions/Logout", post(logout))
@@ -229,14 +252,58 @@ pub fn router(state: AppState) -> Router {
         .route("/items", get(items_result))
         .route("/Items/Latest", get(latest_items))
         .route("/items/latest", get(latest_items))
+        .route("/Items/Filters", get(item_filters))
+        .route("/items/filters", get(item_filters))
         .route("/Items/{item_id}/Ancestors", get(item_ancestors))
         .route("/items/{item_id}/ancestors", get(item_ancestors))
-        .route("/Items/{item_id}/Similar", get(empty_items_result))
-        .route("/items/{item_id}/similar", get(empty_items_result))
+        .route("/Items/{item_id}/Similar", get(authenticated_empty_items))
+        .route("/items/{item_id}/similar", get(authenticated_empty_items))
+        .route(
+            "/Items/{item_id}/Images",
+            get(authenticated_empty_json_array),
+        )
+        .route(
+            "/items/{item_id}/images",
+            get(authenticated_empty_json_array),
+        )
+        .route(
+            "/Items/{item_id}/ThemeMedia",
+            get(authenticated_theme_media),
+        )
+        .route(
+            "/items/{item_id}/thememedia",
+            get(authenticated_theme_media),
+        )
+        .route(
+            "/Items/{item_id}/ThemeSongs",
+            get(authenticated_theme_items),
+        )
+        .route(
+            "/items/{item_id}/themesongs",
+            get(authenticated_theme_items),
+        )
+        .route(
+            "/Items/{item_id}/ThemeVideos",
+            get(authenticated_theme_items),
+        )
+        .route(
+            "/items/{item_id}/themevideos",
+            get(authenticated_theme_items),
+        )
         .route("/Items/{item_id}/PlaybackInfo", get(item_playback_info))
         .route("/items/{item_id}/playbackinfo", get(item_playback_info))
+        .route(
+            "/Items/{item_id}/PlaybackInfo",
+            post(post_item_playback_info),
+        )
+        .route(
+            "/items/{item_id}/playbackinfo",
+            post(post_item_playback_info),
+        )
         .route("/Videos/{item_id}/stream", get(direct_stream_item))
         .route("/videos/{item_id}/stream", get(direct_stream_item))
+        .route("/Videos/{item_id}/stream", head(direct_stream_item_head))
+        .route("/videos/{item_id}/stream", head(direct_stream_item_head))
         .route("/Items/{item_id}", get(item_detail))
         .route("/items/{item_id}", get(item_detail))
         .route("/Users/{user_id}/Items/{item_id}", get(user_item_detail))
@@ -261,8 +328,32 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{item_id}/images/{image_type}", get(placeholder_png))
         .route("/Users/{user_id}/Images/{image_type}", get(placeholder_png))
         .route("/users/{user_id}/images/{image_type}", get(placeholder_png))
-        .route("/Shows/NextUp", get(empty_items_result))
-        .route("/shows/nextup", get(empty_items_result))
+        .route("/Shows/NextUp", get(authenticated_empty_items))
+        .route("/shows/nextup", get(authenticated_empty_items))
+        .route("/Shows/Upcoming", get(authenticated_empty_items))
+        .route("/shows/upcoming", get(authenticated_empty_items))
+        .route(
+            "/Movies/Recommendations",
+            get(authenticated_empty_json_array),
+        )
+        .route(
+            "/movies/recommendations",
+            get(authenticated_empty_json_array),
+        )
+        .route("/Genres", get(authenticated_empty_items))
+        .route("/genres", get(authenticated_empty_items))
+        .route("/Persons", get(authenticated_empty_items))
+        .route("/persons", get(authenticated_empty_items))
+        .route("/Studios", get(authenticated_empty_items))
+        .route("/studios", get(authenticated_empty_items))
+        .route("/Years", get(authenticated_empty_items))
+        .route("/years", get(authenticated_empty_items))
+        .route("/Artists", get(authenticated_empty_items))
+        .route("/artists", get(authenticated_empty_items))
+        .route("/AlbumArtists", get(authenticated_empty_items))
+        .route("/albumartists", get(authenticated_empty_items))
+        .route("/Albums", get(authenticated_empty_items))
+        .route("/albums", get(authenticated_empty_items))
         .route("/UserItems/Resume", get(resume_items))
         .route("/useritems/resume", get(resume_items))
         .route("/Localization/Options", get(localization_options))
@@ -483,8 +574,37 @@ async fn activity_log_entries() -> Json<serde_json::Value> {
     Json(empty_result())
 }
 
-async fn session_sessions() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
+async fn session_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let sessions = if user.is_administrator {
+        state.db.device_sessions().await?
+    } else {
+        state.db.device_sessions_for_user(user.id).await?
+    };
+    let active_playback = state
+        .db
+        .active_playback_sessions()
+        .await?
+        .into_iter()
+        .map(|session| (session.session_id.clone(), session))
+        .collect::<HashMap<_, _>>();
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(Json(
+        sessions
+            .iter()
+            .map(|session| {
+                session_to_json(
+                    session,
+                    active_playback.get(&session.access_token),
+                    &server_id,
+                )
+            })
+            .collect::<Vec<serde_json::Value>>(),
+    ))
 }
 
 async fn devices() -> Json<serde_json::Value> {
@@ -618,13 +738,30 @@ async fn empty_object() -> Json<serde_json::Value> {
     Json(serde_json::json!({}))
 }
 
-async fn scheduled_tasks() -> Json<Vec<serde_json::Value>> {
-    Json(vec![library_scan_task_json()])
+const LIBRARY_SCAN_TASK_ID: &str = "scan-media-library";
+const LIBRARY_SCAN_TASK_KEY: &str = "RefreshLibrary";
+const STALE_TASK_HOURS: i64 = 24;
+
+async fn scheduled_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    recover_stale_library_scan_runs(&state.db).await?;
+    Ok(Json(vec![library_scan_task_json(&state.db).await?]))
 }
 
-async fn scheduled_task(Path(task_id): Path<String>) -> Result<Json<serde_json::Value>, ApiError> {
-    if task_id == "scan-media-library" || task_id == "RefreshLibrary" {
-        return Ok(Json(library_scan_task_json()));
+async fn scheduled_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(task_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    recover_stale_library_scan_runs(&state.db).await?;
+    if is_library_scan_task(&task_id) {
+        return Ok(Json(library_scan_task_json(&state.db).await?));
     }
 
     Err(ApiError::not_found("Scheduled task not found"))
@@ -636,24 +773,131 @@ async fn start_scheduled_task(
     Query(query): Query<AuthQuery>,
     Path(task_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    if !user.is_administrator {
-        return Err(ApiError::forbidden("Administrator access required"));
-    }
-    if task_id == "scan-media-library" || task_id == "RefreshLibrary" {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if is_library_scan_task(&task_id) {
+        recover_stale_library_scan_runs(&state.db).await?;
+        let run = match state.db.start_task_run(LIBRARY_SCAN_TASK_KEY).await {
+            Ok(run) => run,
+            Err(error) if format!("{error:#}").contains("task is already running") => {
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(error)
+                if state
+                    .db
+                    .current_task_run(LIBRARY_SCAN_TASK_KEY)
+                    .await?
+                    .is_some() =>
+            {
+                let _ = error;
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            match scan_all_library_items(&db).await {
+                Ok(scanned_count) => {
+                    let _ = db
+                        .complete_task_run(
+                            run.id,
+                            serde_json::json!({
+                                "ItemsScanned": scanned_count,
+                            }),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let message = format!("{error:?}");
+                    let _ = db.fail_task_run(run.id, &message).await;
+                }
+            }
+        });
         return Ok(StatusCode::NO_CONTENT);
     }
 
     Err(ApiError::not_found("Scheduled task not found"))
 }
 
-fn library_scan_task_json() -> serde_json::Value {
-    serde_json::json!({
+async fn stop_scheduled_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(task_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if is_library_scan_task(&task_id) {
+        state
+            .db
+            .fail_current_task_run(LIBRARY_SCAN_TASK_KEY, "Task run cancelled.")
+            .await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    Err(ApiError::not_found("Scheduled task not found"))
+}
+
+async fn update_scheduled_task_triggers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(task_id): Path<String>,
+    Json(_triggers): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if is_library_scan_task(&task_id) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    Err(ApiError::not_found("Scheduled task not found"))
+}
+
+async fn recover_stale_library_scan_runs(db: &Database) -> Result<(), ApiError> {
+    db.fail_stale_task_runs(
+        LIBRARY_SCAN_TASK_KEY,
+        Duration::hours(STALE_TASK_HOURS),
+        "Task run expired before completion.",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn refresh_library(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !user.is_administrator {
+        return Err(ApiError::forbidden("Administrator access required"));
+    }
+    scan_all_library_items(&state.db).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
+    let folders = db.virtual_folders().await?;
+    let mut scanned = 0usize;
+    for folder in folders {
+        scanned += db.scan_virtual_folder_items(folder.id).await?;
+    }
+    Ok(scanned)
+}
+
+async fn library_scan_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let current_run = db.current_task_run(LIBRARY_SCAN_TASK_KEY).await?;
+    let last_result = db.last_task_result(LIBRARY_SCAN_TASK_KEY).await?;
+    let state = if current_run.is_some() {
+        "Running"
+    } else {
+        "Idle"
+    };
+
+    Ok(serde_json::json!({
         "Name": "Scan Media Library",
-        "State": "Idle",
+        "State": state,
         "CurrentProgressPercentage": null,
-        "Id": "scan-media-library",
-        "LastExecutionResult": null,
+        "Id": LIBRARY_SCAN_TASK_ID,
+        "LastExecutionResult": last_result.as_ref().map(task_run_result_json),
         "Triggers": [
             {
                 "Type": "IntervalTrigger",
@@ -663,11 +907,40 @@ fn library_scan_task_json() -> serde_json::Value {
                 "MaxRuntimeTicks": null,
             }
         ],
-        "Description": "Scans configured Jellyrin media libraries. Execution is currently handled by explicit library scan calls; this task is exposed for Jellyfin Web compatibility.",
+        "Description": "Scans configured Jellyrin media libraries.",
         "Category": "Library",
         "IsHidden": false,
-        "Key": "RefreshLibrary",
+        "Key": LIBRARY_SCAN_TASK_KEY,
+    }))
+}
+
+fn is_library_scan_task(task_id: &str) -> bool {
+    task_id == LIBRARY_SCAN_TASK_ID || task_id == LIBRARY_SCAN_TASK_KEY
+}
+
+fn task_run_result_json(run: &TaskRun) -> serde_json::Value {
+    let status = match run.status.as_str() {
+        "completed" => "Completed",
+        "failed" => "Failed",
+        _ => "Running",
+    };
+
+    serde_json::json!({
+        "Name": "Scan Media Library",
+        "Key": run.task_key.clone(),
+        "Id": run.id.to_string(),
+        "Status": status,
+        "StartTimeUtc": format_time_for_json(run.started_at),
+        "EndTimeUtc": run.completed_at.map(format_time_for_json),
+        "ErrorMessage": run.error_message.clone(),
+        "Result": run.result_json.clone(),
     })
+}
+
+fn format_time_for_json(value: OffsetDateTime) -> String {
+    value
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,6 +949,24 @@ struct PlaybackReportBody {
     item_id: String,
     #[serde(alias = "MediaSourceId")]
     media_source_id: Option<String>,
+    #[serde(alias = "PlaySessionId")]
+    _play_session_id: Option<String>,
+    #[serde(alias = "PlayMethod")]
+    _play_method: Option<String>,
+    #[serde(alias = "CanSeek")]
+    _can_seek: Option<bool>,
+    #[serde(alias = "AudioStreamIndex")]
+    _audio_stream_index: Option<i32>,
+    #[serde(alias = "SubtitleStreamIndex")]
+    _subtitle_stream_index: Option<i32>,
+    #[serde(alias = "PlaylistItemId")]
+    _playlist_item_id: Option<String>,
+    #[serde(alias = "SessionId")]
+    _session_id: Option<String>,
+    #[serde(alias = "VolumeLevel")]
+    _volume_level: Option<i32>,
+    #[serde(alias = "IsMuted")]
+    _is_muted: Option<bool>,
     #[serde(alias = "PositionTicks")]
     position_ticks: Option<i64>,
     #[serde(alias = "IsPaused")]
@@ -688,7 +979,7 @@ async fn report_playback_start(
     Query(query): Query<AuthQuery>,
     Json(payload): Json<PlaybackReportBody>,
 ) -> Result<StatusCode, ApiError> {
-    report_playback(state, headers, query, payload, false).await
+    report_playback(state, headers, query, payload, true).await
 }
 
 async fn report_playback_progress(
@@ -697,7 +988,7 @@ async fn report_playback_progress(
     Query(query): Query<AuthQuery>,
     Json(payload): Json<PlaybackReportBody>,
 ) -> Result<StatusCode, ApiError> {
-    report_playback(state, headers, query, payload, false).await
+    report_playback(state, headers, query, payload, true).await
 }
 
 async fn report_playback_stopped(
@@ -714,21 +1005,41 @@ async fn report_playback(
     headers: HeaderMap,
     query: AuthQuery,
     payload: PlaybackReportBody,
-    played: bool,
+    playback_active: bool,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &payload.item_id).await?;
+    let position_ticks = payload.position_ticks.unwrap_or_default();
+    let is_paused = payload.is_paused.unwrap_or(false);
     state
         .db
         .upsert_playback_state(
             user.id,
             item.id,
             payload.media_source_id.as_deref(),
-            payload.position_ticks.unwrap_or_default(),
-            payload.is_paused.unwrap_or(false),
-            played,
+            position_ticks,
+            is_paused,
+            false,
         )
         .await?;
+    if playback_active {
+        state
+            .db
+            .upsert_active_playback_session(
+                &token.access_token,
+                user.id,
+                item.id,
+                payload.media_source_id.as_deref(),
+                position_ticks,
+                is_paused,
+            )
+            .await?;
+    } else {
+        state
+            .db
+            .clear_active_playback_session(&token.access_token)
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -775,7 +1086,10 @@ async fn empty_text() -> &'static str {
 
 async fn get_virtual_folders(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
     let folders = state.db.virtual_folders().await?;
     Ok(Json(folders.iter().map(virtual_folder_to_json).collect()))
 }
@@ -810,9 +1124,12 @@ struct MediaPathInfoBody {
 
 async fn add_virtual_folder(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
     Query(query): Query<AddVirtualFolderQuery>,
     body: Option<Json<AddVirtualFolderBody>>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let mut locations = comma_delimited_paths(query.paths.as_deref());
     if let Some(Json(body)) = body
         && let Some(library_options) = body.library_options
@@ -845,8 +1162,11 @@ struct AddMediaPathBody {
 
 async fn add_virtual_folder_path(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
     Json(payload): Json<AddMediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
     let path = payload
         .path_info
         .and_then(|path_info| path_info.path)
@@ -875,8 +1195,11 @@ struct VirtualFolderNameQuery {
 
 async fn delete_virtual_folder(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
     Query(query): Query<VirtualFolderNameQuery>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     if state.db.delete_virtual_folder(&query.name).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -894,8 +1217,11 @@ struct DeleteMediaPathQuery {
 
 async fn delete_virtual_folder_path(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
     Query(query): Query<DeleteMediaPathQuery>,
 ) -> Result<StatusCode, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     if state
         .db
         .remove_virtual_folder_path(&query.name, &query.path)
@@ -952,8 +1278,13 @@ fn virtual_folder_to_json(folder: &VirtualFolder) -> serde_json::Value {
     })
 }
 
-async fn environment_drives() -> Json<Vec<serde_json::Value>> {
-    Json(vec![
+async fn environment_drives(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(vec![
         serde_json::json!({
             "Name": "/",
             "Path": "/",
@@ -964,7 +1295,7 @@ async fn environment_drives() -> Json<Vec<serde_json::Value>> {
             "Path": "/home/cdmonio",
             "Type": "Network",
         }),
-    ])
+    ]))
 }
 
 #[derive(Debug, Deserialize)]
@@ -976,8 +1307,12 @@ struct DirectoryQuery {
 }
 
 async fn environment_directory_contents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
     Query(query): Query<DirectoryQuery>,
-) -> Json<Vec<serde_json::Value>> {
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let path = query.path.unwrap_or_else(|| PathBuf::from("/"));
     let include_files = query.include_files.unwrap_or(false);
 
@@ -1003,7 +1338,7 @@ async fn environment_directory_contents(
         })
         .unwrap_or_default();
 
-    Json(entries)
+    Ok(Json(entries))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1012,13 +1347,19 @@ struct PathQuery {
     path: Option<PathBuf>,
 }
 
-async fn environment_parent_path(Query(query): Query<PathQuery>) -> Json<serde_json::Value> {
+async fn environment_parent_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let parent = query
         .path
         .as_deref()
         .and_then(|path| path.parent())
         .map(|path| path.to_string_lossy().into_owned());
-    Json(serde_json::json!({ "Path": parent }))
+    Ok(Json(serde_json::json!({ "Path": parent })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1027,11 +1368,17 @@ struct ValidatePathRequest {
     path: Option<PathBuf>,
 }
 
-async fn environment_validate_path(Json(payload): Json<ValidatePathRequest>) -> StatusCode {
+async fn environment_validate_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<ValidatePathRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
     if payload.path.as_deref().is_some_and(|path| path.exists()) {
-        StatusCode::NO_CONTENT
+        Ok(StatusCode::NO_CONTENT)
     } else {
-        StatusCode::BAD_REQUEST
+        Ok(StatusCode::BAD_REQUEST)
     }
 }
 
@@ -1053,11 +1400,23 @@ async fn user_views_result(
 #[derive(Debug, Deserialize, Default)]
 struct ItemsQuery {
     #[serde(alias = "UserId")]
-    _user_id: Option<String>,
+    user_id: Option<String>,
+    #[serde(alias = "Ids")]
+    ids: Option<String>,
     #[serde(alias = "ParentId")]
     parent_id: Option<String>,
     #[serde(alias = "IncludeItemTypes")]
     include_item_types: Option<String>,
+    #[serde(alias = "ExcludeItemTypes")]
+    exclude_item_types: Option<String>,
+    #[serde(alias = "MediaTypes")]
+    media_types: Option<String>,
+    #[serde(alias = "SearchTerm")]
+    search_term: Option<String>,
+    #[serde(alias = "IsPlayed")]
+    is_played: Option<bool>,
+    #[serde(alias = "IsFolder")]
+    is_folder: Option<bool>,
     #[serde(alias = "Recursive")]
     _recursive: Option<bool>,
     #[serde(alias = "StartIndex")]
@@ -1084,15 +1443,67 @@ async fn items_result(
     Query(auth_query): Query<AuthQuery>,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let filtered_items = filtered_media_items(state.db.media_items().await?, &query);
+    let filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        requested_user_id,
+        &state.db,
+    )
+    .await?;
     let total_record_count = filtered_items.len();
-    let items = paged_media_items(filtered_items, &query)
-        .iter()
-        .map(|item| media_item_to_json(item, &server_id))
-        .collect::<Vec<_>>();
-    Ok(Json(query_result_with_total(items, total_record_count)))
+    let items = items_to_json(
+        &state.db,
+        paged_media_items(filtered_items, &query),
+        &server_id,
+        requested_user_id,
+    )
+    .await?;
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        query.start_index.unwrap_or(0),
+    )))
+}
+
+async fn user_items_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+    Query(query): Query<ItemsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    let total_record_count = filtered_items.len();
+    let items = items_to_json(
+        &state.db,
+        paged_media_items(filtered_items, &query),
+        &server_id,
+        Some(requested_user_id),
+    )
+    .await?;
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        query.start_index.unwrap_or(0),
+    )))
 }
 
 async fn item_counts(
@@ -1104,6 +1515,18 @@ async fn item_counts(
     Ok(Json(item_counts_json(&state.db.media_items().await?)))
 }
 
+async fn user_item_counts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    Ok(Json(item_counts_json(&state.db.media_items().await?)))
+}
+
 async fn latest_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1111,6 +1534,30 @@ async fn latest_items(
     Query(query): Query<LatestItemsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let limit = query.limit.unwrap_or(20).min(100) as i64;
+    Ok(Json(
+        state
+            .db
+            .latest_media_items(limit)
+            .await?
+            .iter()
+            .map(|item| media_item_to_json(item, &server_id))
+            .collect(),
+    ))
+}
+
+async fn user_latest_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+    Query(query): Query<LatestItemsQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let limit = query.limit.unwrap_or(20).min(100) as i64;
     Ok(Json(
@@ -1141,6 +1588,26 @@ async fn resume_items(
     Ok(Json(query_result(items)))
 }
 
+async fn user_resume_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let items = state
+        .db
+        .resume_items_for_user(requested_user_id, 20)
+        .await?
+        .iter()
+        .map(|(item, playback)| media_item_to_json_with_playback(item, &server_id, Some(playback)))
+        .collect();
+    Ok(Json(query_result(items)))
+}
+
 async fn item_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1148,8 +1615,25 @@ async fn item_detail(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(folder) = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == requested_id)
+    {
+        return Ok(Json(user_view_to_json(&folder, &server_id)));
+    }
+
+    let item = state
+        .db
+        .media_items()
+        .await?
+        .into_iter()
+        .find(|item| item.id == requested_id)
+        .ok_or_else(|| ApiError::not_found("Item not found"))?;
     Ok(Json(media_item_to_json(&item, &server_id)))
 }
 
@@ -1239,12 +1723,31 @@ async fn item_playback_info(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    let server_id = state.db.server_state().await?.server_id.to_string();
+    playback_info_response(&state.db, &item_id).await
+}
+
+async fn post_item_playback_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    drop(body);
+    playback_info_response(&state.db, &item_id).await
+}
+
+async fn playback_info_response(
+    db: &Database,
+    item_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let item = media_item_by_id(db, item_id).await?;
+    let server_id = db.server_state().await?.server_id.to_string();
     let item_json = media_item_to_json(&item, &server_id);
     Ok(Json(serde_json::json!({
         "MediaSources": item_json["MediaSources"].clone(),
-        "PlaySessionId": null,
+        "PlaySessionId": Uuid::new_v4().simple().to_string(),
         "ErrorCode": null,
     })))
 }
@@ -1253,7 +1756,7 @@ async fn direct_stream_item(
     State(state): State<AppState>,
     Path(item_id): Path<String>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<StreamQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
@@ -1261,28 +1764,80 @@ async fn direct_stream_item(
         return Err(ApiError::not_found("Video stream not found"));
     }
 
-    let bytes = fs::read(media_item_path(&item))?;
-    let total_len = bytes.len();
+    stream_media_item(item, &headers, true).await
+}
+
+async fn direct_stream_item_head(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    if item.media_type != "Video" {
+        return Err(ApiError::not_found("Video stream not found"));
+    }
+
+    stream_media_item(item, &headers, false).await
+}
+
+async fn stream_media_item(
+    item: MediaItem,
+    headers: &HeaderMap,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let mut file = tokio::fs::File::open(media_item_path(&item)).await?;
+    let total_len = file.metadata().await?.len();
     let content_type = media_item_content_type(&item);
 
-    if let Some((start, end)) = parse_range_header(&headers, total_len) {
-        let body = bytes[start..=end].to_vec();
+    let range = match parse_range_header(headers, total_len) {
+        Ok(range) => range,
+        Err(()) => {
+            return Ok((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_RANGE, format!("bytes */{total_len}")),
+                ],
+                Body::empty(),
+            )
+                .into_response());
+        }
+    };
+
+    if let Some((start, end)) = range {
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let content_length = end - start + 1;
+        let stream = ReaderStream::new(file.take(content_length));
+        let body = if include_body {
+            Body::from_stream(stream)
+        } else {
+            Body::empty()
+        };
         return Ok((
             StatusCode::PARTIAL_CONTENT,
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::ACCEPT_RANGES, "bytes".to_string()),
-                (header::CONTENT_LENGTH, body.len().to_string()),
+                (header::CONTENT_LENGTH, content_length.to_string()),
                 (
                     header::CONTENT_RANGE,
                     format!("bytes {start}-{end}/{total_len}"),
                 ),
             ],
-            Body::from(body),
+            body,
         )
             .into_response());
     }
 
+    let stream = ReaderStream::new(file);
+    let body = if include_body {
+        Body::from_stream(stream)
+    } else {
+        Body::empty()
+    };
     Ok((
         StatusCode::OK,
         [
@@ -1290,7 +1845,7 @@ async fn direct_stream_item(
             (header::ACCEPT_RANGES, "bytes".to_string()),
             (header::CONTENT_LENGTH, total_len.to_string()),
         ],
-        Body::from(bytes),
+        body,
     )
         .into_response())
 }
@@ -1308,38 +1863,112 @@ async fn empty_items_result() -> Json<serde_json::Value> {
     Json(query_result(Vec::new()))
 }
 
+async fn authenticated_empty_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(empty_items_result().await)
+}
+
+async fn authenticated_empty_json_array(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(empty_json_array().await)
+}
+
+async fn authenticated_theme_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "ThemeVideosResult": query_result(Vec::new()),
+        "ThemeSongsResult": query_result(Vec::new()),
+        "SoundtrackSongsResult": query_result(Vec::new())
+    })))
+}
+
+async fn authenticated_theme_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(empty_items_result().await)
+}
+
+async fn item_filters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "Genres": [],
+        "Tags": [],
+        "OfficialRatings": [],
+        "Years": [],
+        "Containers": [],
+        "MediaTypes": [],
+        "VideoTypes": [],
+        "SeriesStatuses": [],
+        "Staff": [],
+        "Artists": [],
+        "Albums": [],
+        "Studios": [],
+        "Trailers": [],
+        "Features": []
+    })))
+}
+
 fn query_result(items: Vec<serde_json::Value>) -> serde_json::Value {
     let total_record_count = items.len();
-    query_result_with_total(items, total_record_count)
+    query_result_with_total(items, total_record_count, 0)
 }
 
 fn query_result_with_total(
     items: Vec<serde_json::Value>,
     total_record_count: usize,
+    start_index: usize,
 ) -> serde_json::Value {
     serde_json::json!({
         "TotalRecordCount": total_record_count,
-        "StartIndex": 0,
+        "StartIndex": start_index,
         "Items": items,
     })
 }
 
-fn filtered_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaItem> {
+async fn filtered_media_items(
+    items: Vec<MediaItem>,
+    query: &ItemsQuery,
+    user_id: Option<Uuid>,
+    db: &Database,
+) -> Result<Vec<MediaItem>, ApiError> {
     let parent_id = query
         .parent_id
         .as_deref()
-        .and_then(|parent_id| parse_jellyfin_uuid(parent_id).ok());
-    let include_types = query.include_item_types.as_deref().map(|types| {
-        types
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    });
+        .map(parse_jellyfin_uuid)
+        .transpose()?;
+    let ids = query.ids.as_deref().map(parse_uuid_list).transpose()?;
+    let include_types = csv_lowercase(query.include_item_types.as_deref());
+    let exclude_types = csv_lowercase(query.exclude_item_types.as_deref());
+    let media_types = csv_lowercase(query.media_types.as_deref());
+    let search_term = query
+        .search_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
 
     let mut items = items
         .into_iter()
+        .filter(|item| ids.as_ref().is_none_or(|ids| ids.contains(&item.id)))
         .filter(|item| parent_id.is_none_or(|parent_id| item.virtual_folder_id == parent_id))
         .filter(|item| {
             include_types.as_ref().is_none_or(|types| {
@@ -1347,7 +1976,43 @@ fn filtered_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaI
                 types.iter().any(|allowed| allowed == &item_type)
             })
         })
+        .filter(|item| {
+            exclude_types.as_ref().is_none_or(|types| {
+                let item_type = media_item_type(item).to_ascii_lowercase();
+                !types.iter().any(|excluded| excluded == &item_type)
+            })
+        })
+        .filter(|item| {
+            media_types.as_ref().is_none_or(|types| {
+                let media_type = item.media_type.to_ascii_lowercase();
+                types.iter().any(|allowed| allowed == &media_type)
+            })
+        })
+        .filter(|_| query.is_folder.is_none_or(|is_folder| !is_folder))
+        .filter(|item| {
+            search_term
+                .as_ref()
+                .is_none_or(|term| item.name.to_ascii_lowercase().contains(term))
+        })
         .collect::<Vec<_>>();
+
+    if let Some(is_played) = query.is_played {
+        let Some(user_id) = user_id else {
+            items.clear();
+            return Ok(items);
+        };
+        let mut filtered = Vec::new();
+        for item in items {
+            let played = db
+                .playback_state_for_item(user_id, item.id)
+                .await?
+                .is_some_and(|state| state.played);
+            if played == is_played {
+                filtered.push(item);
+            }
+        }
+        items = filtered;
+    }
 
     let sort_by = query.sort_by.as_deref().unwrap_or("SortName");
     if sort_by.eq_ignore_ascii_case("DateCreated") {
@@ -1363,13 +2028,58 @@ fn filtered_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaI
         items.reverse();
     }
 
-    items
+    Ok(items)
 }
 
 fn paged_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaItem> {
     let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(usize::MAX);
     items.into_iter().skip(start_index).take(limit).collect()
+}
+
+async fn items_to_json(
+    db: &Database,
+    items: Vec<MediaItem>,
+    server_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let playback = if let Some(user_id) = user_id {
+            db.playback_state_for_item(user_id, item.id).await?
+        } else {
+            None
+        };
+        values.push(media_item_to_json_with_playback(
+            &item,
+            server_id,
+            playback.as_ref(),
+        ));
+    }
+    Ok(values)
+}
+
+fn csv_lowercase(value: Option<&str>) -> Option<Vec<String>> {
+    let values = value?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn parse_uuid_list(value: &str) -> Result<Vec<Uuid>, ApiError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(parse_jellyfin_uuid)
+        .collect()
 }
 
 fn parse_jellyfin_uuid(value: &str) -> Result<Uuid, ApiError> {
@@ -1442,6 +2152,7 @@ fn media_item_to_json_with_playback(
     let playback_position_ticks = playback.map_or(0, |state| state.position_ticks);
     let played = playback.is_some_and(|state| state.played);
     let play_count = i32::from(played);
+    let media_streams = media_item_streams(item);
 
     let media_source = serde_json::json!({
         "Protocol": "File",
@@ -1452,6 +2163,7 @@ fn media_item_to_json_with_playback(
         "Size": file_size,
         "Name": item.name,
         "IsRemote": false,
+        "DirectStreamUrl": format!("/Videos/{item_id}/stream"),
         "ETag": null,
         "RunTimeTicks": null,
         "ReadAtNativeFramerate": false,
@@ -1467,7 +2179,9 @@ fn media_item_to_json_with_playback(
         "RequiresLooping": false,
         "SupportsProbing": true,
         "VideoType": "VideoFile",
-        "MediaStreams": [],
+        "DefaultAudioStreamIndex": null,
+        "DefaultSubtitleStreamIndex": null,
+        "MediaStreams": media_streams.clone(),
         "Formats": [],
         "Bitrate": null,
     });
@@ -1505,7 +2219,7 @@ fn media_item_to_json_with_playback(
         "Tags": [],
         "TagItems": [],
         "Chapters": [],
-        "MediaStreams": [],
+        "MediaStreams": media_streams,
         "PlayAccess": "Full",
         "RemoteTrailers": [],
         "ProviderIds": {},
@@ -1514,7 +2228,7 @@ fn media_item_to_json_with_playback(
         "Type": item_type,
         "MediaType": item.media_type,
         "RunTimeTicks": null,
-        "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": false, "Played": played, "Key": item_id },
+        "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": false, "Played": played, "Key": item_id, "ItemId": item_id, "PlayedPercentage": null, "LastPlayedDate": null },
         "ImageTags": { "Primary": "placeholder" },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
@@ -1597,22 +2311,75 @@ fn media_item_content_type(item: &MediaItem) -> String {
     .to_string()
 }
 
-fn parse_range_header(headers: &HeaderMap, total_len: usize) -> Option<(usize, usize)> {
-    if total_len == 0 {
-        return None;
+fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
+    if item.media_type != "Video" {
+        return Vec::new();
     }
 
-    let range = headers.get(header::RANGE)?.to_str().ok()?;
-    let range = range.strip_prefix("bytes=")?;
-    let (start, end) = range.split_once('-')?;
-    let start = start.parse::<usize>().ok()?;
-    let end = if end.is_empty() {
-        total_len - 1
+    vec![serde_json::json!({
+        "Codec": media_item_container(item).unwrap_or_else(|| "unknown".to_string()),
+        "Language": null,
+        "ColorTransfer": null,
+        "ColorPrimaries": null,
+        "ColorSpace": null,
+        "TimeBase": null,
+        "VideoRange": null,
+        "DisplayTitle": "Video",
+        "NalLengthSize": null,
+        "IsInterlaced": false,
+        "IsAVC": null,
+        "BitRate": null,
+        "BitDepth": null,
+        "RefFrames": null,
+        "IsDefault": true,
+        "IsForced": false,
+        "Height": null,
+        "Width": null,
+        "AverageFrameRate": null,
+        "RealFrameRate": null,
+        "Profile": null,
+        "Type": "Video",
+        "AspectRatio": null,
+        "Index": 0,
+        "IsExternal": false,
+        "IsTextSubtitleStream": false,
+        "SupportsExternalStream": false,
+        "Path": null,
+        "PixelFormat": null,
+        "Level": null,
+        "IsAnamorphic": null
+    })]
+}
+
+fn parse_range_header(headers: &HeaderMap, total_len: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(range) = headers.get(header::RANGE) else {
+        return Ok(None);
+    };
+    if total_len == 0 {
+        return Err(());
+    }
+
+    let range = range.to_str().map_err(|_| ())?;
+    let range = range.strip_prefix("bytes=").ok_or(())?;
+    let (start, end) = range.split_once('-').ok_or(())?;
+    let (start, end) = if start.is_empty() {
+        let suffix_len = end.parse::<u64>().map_err(|_| ())?.min(total_len);
+        (total_len - suffix_len, total_len - 1)
     } else {
-        end.parse::<usize>().ok()?.min(total_len - 1)
+        let start = start.parse::<u64>().map_err(|_| ())?;
+        let end = if end.is_empty() {
+            total_len - 1
+        } else {
+            end.parse::<u64>().map_err(|_| ())?.min(total_len - 1)
+        };
+        (start, end)
     };
 
-    (start <= end && start < total_len).then_some((start, end))
+    if start <= end && start < total_len {
+        Ok(Some((start, end)))
+    } else {
+        Err(())
+    }
 }
 
 fn media_item_type(item: &MediaItem) -> &'static str {
@@ -1770,6 +2537,28 @@ struct AuthQuery {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StreamQuery {
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(alias = "Static", alias = "static", alias = "static_")]
+    _static_file: Option<bool>,
+    #[serde(alias = "MediaSourceId")]
+    _media_source_id: Option<String>,
+    #[serde(alias = "DeviceId")]
+    _device_id: Option<String>,
+    #[serde(alias = "PlaySessionId")]
+    _play_session_id: Option<String>,
+    #[serde(alias = "Tag")]
+    _tag: Option<String>,
+    #[serde(alias = "StartTimeTicks")]
+    _start_time_ticks: Option<i64>,
+    #[serde(alias = "AudioStreamIndex")]
+    _audio_stream_index: Option<i32>,
+    #[serde(alias = "SubtitleStreamIndex")]
+    _subtitle_stream_index: Option<i32>,
+}
+
 #[derive(Debug)]
 struct ClientAuth {
     client: String,
@@ -1832,6 +2621,45 @@ fn authentication_result_to_dto(
     }
 }
 
+fn session_to_json(
+    session: &DeviceSession,
+    active_playback: Option<&ActivePlaybackSession>,
+    server_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "Id": session.access_token,
+        "UserId": session.user_id,
+        "UserName": session.user_name,
+        "Client": session.client,
+        "LastActivityDate": format_time_for_json(session.last_activity_at),
+        "DeviceName": session.device_name,
+        "DeviceId": session.device_id,
+        "ApplicationVersion": session.version,
+        "IsActive": true,
+        "SupportsRemoteControl": false,
+        "PlayableMediaTypes": [],
+        "SupportedCommands": [],
+        "NowPlayingItem": active_playback.map(|playback| media_item_to_json(&playback.item, server_id)),
+        "PlayState": active_playback.map(active_playback_state_json),
+        "NowViewingItem": null,
+    })
+}
+
+fn active_playback_state_json(playback: &ActivePlaybackSession) -> serde_json::Value {
+    serde_json::json!({
+        "PositionTicks": playback.position_ticks,
+        "CanSeek": true,
+        "IsPaused": playback.is_paused,
+        "IsMuted": false,
+        "VolumeLevel": 100,
+        "AudioStreamIndex": null,
+        "SubtitleStreamIndex": null,
+        "MediaSourceId": playback.media_source_id.clone(),
+        "PlayMethod": "DirectPlay",
+        "RepeatMode": "RepeatNone",
+    })
+}
+
 async fn require_user(
     db: &Database,
     headers: &HeaderMap,
@@ -1859,11 +2687,41 @@ async fn require_request_user(
         .map(|(user, _)| user)
 }
 
+async fn require_admin(
+    db: &Database,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<User, ApiError> {
+    let user = require_request_user(db, headers, query_token).await?;
+    if user.is_administrator {
+        Ok(user)
+    } else {
+        Err(ApiError::forbidden("Administrator access required"))
+    }
+}
+
 fn ensure_user_access(auth_user: &User, requested_user_id: Uuid) -> Result<(), ApiError> {
     if auth_user.id == requested_user_id || auth_user.is_administrator {
         Ok(())
     } else {
         Err(ApiError::forbidden("User access denied"))
+    }
+}
+
+async fn require_admin_or_startup_incomplete(
+    db: &Database,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<(), ApiError> {
+    if !db.server_state().await?.startup_wizard_completed {
+        return Ok(());
+    }
+
+    let user = require_request_user(db, headers, query_token).await?;
+    if user.is_administrator {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("Administrator access required"))
     }
 }
 
@@ -2128,6 +2986,7 @@ mod tests {
         assert_eq!(result["User"]["Name"], "admin");
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/System/Info")
@@ -2143,6 +3002,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions.as_array().unwrap().len(), 1);
+        assert_eq!(sessions[0]["UserName"], "admin");
+        assert_eq!(sessions[0]["DeviceId"], "test-device");
+        assert_eq!(sessions[0]["Client"], "Jellyfin Web");
+        assert_eq!(sessions[0]["IsActive"], true);
     }
 
     #[tokio::test]
@@ -2255,6 +3145,18 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ScheduledTasks?IsEnabled=true&api_key={api_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let tasks: Value = serde_json::from_slice(&body).unwrap();
@@ -2271,6 +3173,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/ScheduledTasks/scan-media-library")
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2299,6 +3202,74 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
         }
+
+        let mut task = json!({});
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/ScheduledTasks/scan-media-library")
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            task = serde_json::from_slice(&body).unwrap();
+            if task["LastExecutionResult"]["Status"] == "Completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(task["State"], "Idle");
+        assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
+        assert_eq!(task["LastExecutionResult"]["Key"], "RefreshLibrary");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/ScheduledTasks/Running/scan-media-library")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ScheduledTasks/scan-media-library/Triggers")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!([]).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ScheduledTasks/unknown/Triggers")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!([]).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2356,6 +3327,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -2525,6 +3497,81 @@ mod tests {
                     .uri("/Devices")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn library_and_environment_routes_require_admin_after_startup() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        db.server_state().await.unwrap();
+        db.complete_startup_wizard().await.unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for endpoint in ["/Library/VirtualFolders", "/Environment/Drives"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Environment/ValidatePath")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Path": "/" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Environment/ValidatePath")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Path": "/" }).to_string()))
                     .unwrap(),
             )
             .await
@@ -2893,8 +3940,99 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let filtered: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(filtered["TotalRecordCount"], 1);
+        assert_eq!(filtered["StartIndex"], 0);
         assert_eq!(filtered["Items"].as_array().unwrap().len(), 1);
         assert_eq!(filtered["Items"][0]["Name"], "Example Movie");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?ParentId=not-a-valid-id")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Items?IncludeItemTypes=Movie"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_items["TotalRecordCount"], 1);
+        assert_eq!(user_items["Items"][0]["Name"], "Example Movie");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/Filters")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filters: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filters["Genres"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Genres")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Genres")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let genres: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(genres["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Movies/Recommendations")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let recommendations: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recommendations.as_array().unwrap().len(), 0);
 
         let response = app
             .clone()
@@ -2924,6 +4062,15 @@ mod tests {
         );
         assert_eq!(detail["MediaSources"][0]["Container"], "mp4");
         assert_eq!(detail["MediaSources"][0]["Size"], 10);
+        assert_eq!(
+            detail["MediaSources"][0]["DirectStreamUrl"],
+            format!("/Videos/{item_id}/stream")
+        );
+        assert_eq!(
+            detail["MediaSources"][0]["MediaStreams"][0]["Type"],
+            "Video"
+        );
+        assert_eq!(detail["MediaStreams"][0]["Index"], 0);
         assert_eq!(detail["People"].as_array().unwrap().len(), 0);
         assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
         assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
@@ -2979,11 +4126,147 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let playback_info: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(playback_info["ErrorCode"], Value::Null);
+        assert!(
+            playback_info["PlaySessionId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
         assert_eq!(playback_info["MediaSources"][0]["SupportsDirectPlay"], true);
         assert_eq!(
             playback_info["MediaSources"][0]["SupportsTranscoding"],
             false
         );
+        assert_eq!(
+            playback_info["MediaSources"][0]["MediaStreams"][0]["Type"],
+            "Video"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "DeviceProfile": {} }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let posted_playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            posted_playback_info["PlaySessionId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="playback-device", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let playback_token = login["AccessToken"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Playing/Progress")
+                    .header("X-Emby-Token", playback_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ItemId": item_id,
+                            "MediaSourceId": item_id,
+                            "PositionTicks": 25_000_000,
+                            "CanSeek": true,
+                            "IsPaused": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions[0]["DeviceId"], "playback-device");
+        assert_eq!(sessions[0]["NowPlayingItem"]["Id"], item_id);
+        assert_eq!(sessions[0]["PlayState"]["PositionTicks"], 25_000_000);
+        assert_eq!(sessions[0]["PlayState"]["IsPaused"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Playing/Stopped")
+                    .header("X-Emby-Token", playback_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ItemId": item_id,
+                            "MediaSourceId": item_id,
+                            "PositionTicks": 25_000_000,
+                            "IsPaused": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let stopped_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stopped_sessions[0]["NowPlayingItem"], Value::Null);
 
         for (endpoint, position_ticks) in [
             ("/Sessions/Playing", 0_i64),
@@ -3072,6 +4355,41 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/Users/{user_id}/Items?IsPlayed=true"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let played_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(played_items["TotalRecordCount"], 1);
+        assert_eq!(played_items["Items"][0]["Id"], item_id);
+        assert_eq!(played_items["Items"][0]["UserData"]["Played"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?UserId={user_id}&IsPlayed=true"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_context_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_context_items["TotalRecordCount"], 1);
+        assert_eq!(user_context_items["Items"][0]["UserData"]["Played"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/UserItems/Resume")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -3124,9 +4442,217 @@ mod tests {
         assert_eq!(&body[..], b"fake");
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/stream"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 5-9/10"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"video");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/Videos/{item_id}/stream"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/stream"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=99-100")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */10"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/stream?Static=true&MediaSourceId={item_id}&DeviceId=test-device&PlaySessionId=test-play-session&Tag=test-tag"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+
+        let extra_movie = tmp.path().join("Second Movie.mp4");
+        tokio::fs::write(&extra_movie, b"second video")
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ScheduledTasks/Running/scan-media-library")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let mut rescanned = json!({});
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/Items")
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            rescanned = serde_json::from_slice(&body).unwrap();
+            if rescanned["TotalRecordCount"] == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rescanned["TotalRecordCount"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?IncludeItemTypes=Movie&StartIndex=1&Limit=1&SortBy=SortName")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let paged: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged["TotalRecordCount"], 2);
+        assert_eq!(paged["StartIndex"], 1);
+        assert_eq!(paged["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(paged["Items"][0]["Name"], "Second Movie");
+
+        let second_item_id = paged["Items"][0]["Id"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?Ids={second_item_id}&SearchTerm=second&MediaTypes=Video&ExcludeItemTypes=Audio&IsFolder=false"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_items["TotalRecordCount"], 1);
+        assert_eq!(filtered_items["Items"][0]["Id"], second_item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?ExcludeItemTypes=Movie")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let excluded_movies: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(excluded_movies["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?IsFolder=true")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let folders_only: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(folders_only["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?SearchTerm=missing-title")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let no_matches: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(no_matches["TotalRecordCount"], 0);
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri(format!("/Items/{item_id}/Similar"))
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )

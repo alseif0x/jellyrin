@@ -1,6 +1,19 @@
 const { test, expect } = require('@playwright/test');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 
-test('fresh install completes the Jellyfin web startup wizard', async ({ page, request }) => {
+test('fresh install completes the Jellyfin web startup wizard and loads a scanned library', async ({ page, request, baseURL }, testInfo) => {
+  const mediaDir = await fs.mkdtemp(path.join(os.tmpdir(), `jellyrin-e2e-media-${testInfo.workerIndex}-`));
+  await fs.writeFile(path.join(mediaDir, 'Example Movie.mp4'), Buffer.from('fake video'));
+  const failedResponses = [];
+  page.on('response', response => {
+    const url = response.url();
+    if (response.status() >= 400 && !url.includes('/Branding/Splashscreen')) {
+      failedResponses.push(`${response.status()} ${url}`);
+    }
+  });
+
   await page.goto('/web/#/wizard/start');
 
   await expect(page.locator('#txtServerName')).toBeVisible();
@@ -19,15 +32,16 @@ test('fresh install completes the Jellyfin web startup wizard', async ({ page, r
   await expect((await request.get('/Environment/Drives')).ok()).toBeTruthy();
   await expect((await request.get('/Environment/DirectoryContents?Path=/&IncludeFiles=false')).ok()).toBeTruthy();
   await expect((await request.post('/Environment/ValidatePath', { data: { Path: '/' } })).ok()).toBeTruthy();
-  await expect((await request.post('/Library/VirtualFolders?name=QA%20Movies&collectionType=movies&paths=/tmp')).ok()).toBeTruthy();
+  await expect((await request.post(`/Library/VirtualFolders?name=QA%20Movies&collectionType=movies&paths=${encodeURIComponent(mediaDir)}`)).ok()).toBeTruthy();
   const virtualFolders = await (await request.get('/Library/VirtualFolders')).json();
   expect(virtualFolders).toEqual(expect.arrayContaining([
     expect.objectContaining({
       Name: 'QA Movies',
       CollectionType: 'movies',
-      Locations: expect.arrayContaining(['/tmp'])
+      Locations: expect.arrayContaining([mediaDir])
     })
   ]));
+  const movieFolder = virtualFolders.find(folder => folder.Name === 'QA Movies');
   await page.locator('#wizardLibraryPage .button-submit').click();
 
   await expect(page.locator('#selectLanguage')).toBeVisible();
@@ -65,4 +79,26 @@ test('fresh install completes the Jellyfin web startup wizard', async ({ page, r
   await page.locator('.manualLoginForm .button-submit').click();
   await authResponse;
   await expect(page).toHaveURL(/\/web\/#\/home/);
+
+  const apiAuthResponse = await request.post('/Users/AuthenticateByName', {
+    headers: {
+      Authorization: 'MediaBrowser Client="Jellyfin Web", Device="Playwright", DeviceId="wizard-library", Version="dev"',
+    },
+    data: { Username: 'admin', Pw: 'qa-secret-123' },
+  });
+  expect(apiAuthResponse.ok()).toBeTruthy();
+  const auth = await apiAuthResponse.json();
+  const itemsResponse = await request.get(`/Users/${auth.User.Id}/Items?ParentId=${movieFolder.ItemId}&IncludeItemTypes=Movie`, {
+    headers: { 'X-Emby-Token': auth.AccessToken },
+  });
+  expect(itemsResponse.ok()).toBeTruthy();
+  const items = await itemsResponse.json();
+  expect(items.TotalRecordCount).toBe(1);
+  expect(items.Items[0].Name).toBe('Example Movie');
+
+  const libraryLink = page.locator('a.itemAction[title="QA Movies"]').first();
+  await expect(libraryLink).toBeVisible({ timeout: 20_000 });
+  await libraryLink.click();
+  await page.waitForLoadState('networkidle');
+  expect(failedResponses).toEqual([]);
 });
