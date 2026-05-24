@@ -1282,6 +1282,10 @@ async fn system_logs(
         }
 
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_server_log_file_name(&name) {
+            continue;
+        }
+
         let modified = metadata
             .modified()
             .ok()
@@ -1308,6 +1312,14 @@ async fn system_logs(
     });
 
     Ok(Json(logs))
+}
+
+fn is_server_log_file_name(name: &str) -> bool {
+    FsPath::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "log" | "txt"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -6008,6 +6020,7 @@ mod tests {
         std::fs::create_dir_all(&log_dir).unwrap();
         std::fs::write(log_dir.join("jellyrin.log"), "first line\nsecond line\n").unwrap();
         std::fs::write(log_dir.join("older.log"), "older\n").unwrap();
+        std::fs::write(log_dir.join("notes.json"), "{}\n").unwrap();
         std::fs::create_dir(log_dir.join("nested")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", log_dir.join("passwd.log")).unwrap();
@@ -6206,6 +6219,7 @@ mod tests {
         let logs = logs.as_array().unwrap();
         assert_eq!(logs.len(), 2);
         assert!(logs.iter().any(|log| log["Name"] == "jellyrin.log"));
+        assert!(!logs.iter().any(|log| log["Name"] == "notes.json"));
         assert!(!logs.iter().any(|log| log["Name"] == "passwd.log"));
         assert!(logs.iter().all(|log| log["Size"].as_u64().unwrap() > 0));
         assert!(logs.iter().all(|log| log["DateModified"].is_string()));
