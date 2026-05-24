@@ -1955,6 +1955,10 @@ struct SystemConfigurationUpdate {
     max_audiobook_resume: Option<i64>,
     #[serde(rename = "TrickplayOptions", alias = "trickplayOptions")]
     trickplay_options: Option<serde_json::Value>,
+    #[serde(alias = "EnableSlowResponseWarning")]
+    enable_slow_response_warning: Option<bool>,
+    #[serde(alias = "SlowResponseThresholdMs")]
+    slow_response_threshold_ms: Option<i64>,
 }
 
 async fn update_system_configuration(
@@ -2091,6 +2095,16 @@ fn server_configuration_options_json(
     if let Some(trickplay_options) = &payload.trickplay_options {
         config["TrickplayOptions"] = trickplay_options_json(trickplay_options.clone());
     }
+    merge_bool_option(
+        &mut config,
+        "EnableSlowResponseWarning",
+        payload.enable_slow_response_warning,
+    );
+    merge_i64_option(
+        &mut config,
+        "SlowResponseThresholdMs",
+        payload.slow_response_threshold_ms,
+    );
     config
 }
 
@@ -2102,6 +2116,8 @@ fn default_server_configuration_options() -> serde_json::Value {
         "MinResumeDurationSeconds": 300,
         "MinAudiobookResume": 5,
         "MaxAudiobookResume": 5,
+        "EnableSlowResponseWarning": true,
+        "SlowResponseThresholdMs": 500,
         "TrickplayOptions": default_trickplay_options()
     })
 }
@@ -2150,6 +2166,12 @@ fn merge_i64_option(config: &mut serde_json::Value, key: &'static str, value: Op
     }
 }
 
+fn merge_bool_option(config: &mut serde_json::Value, key: &'static str, value: Option<bool>) {
+    if let Some(value) = value {
+        config[key] = serde_json::json!(value);
+    }
+}
+
 fn system_configuration_json(
     config: StartupConfig,
     startup_wizard_completed: bool,
@@ -2190,8 +2212,8 @@ fn system_configuration_json(
         "MaxAudiobookResume": server_options["MaxAudiobookResume"],
         "TrickplayOptions": server_options["TrickplayOptions"],
         "LogFileRetentionDays": 3,
-        "EnableSlowResponseWarning": false,
-        "SlowResponseThresholdMs": 500,
+        "EnableSlowResponseWarning": server_options["EnableSlowResponseWarning"],
+        "SlowResponseThresholdMs": server_options["SlowResponseThresholdMs"],
         "RunAtStartup": false
     })
 }
@@ -6538,6 +6560,8 @@ mod tests {
         assert_eq!(default_config["MinResumeDurationSeconds"], 300);
         assert_eq!(default_config["MinAudiobookResume"], 5);
         assert_eq!(default_config["MaxAudiobookResume"], 5);
+        assert_eq!(default_config["EnableSlowResponseWarning"], true);
+        assert_eq!(default_config["SlowResponseThresholdMs"], 500);
         assert_eq!(
             default_config["TrickplayOptions"]["EnableHwAcceleration"],
             false
@@ -6576,6 +6600,8 @@ mod tests {
                             "MinResumeDurationSeconds": 120,
                             "MinAudiobookResume": 7,
                             "MaxAudiobookResume": 12,
+                            "EnableSlowResponseWarning": false,
+                            "SlowResponseThresholdMs": 750,
                             "TrickplayOptions": {
                                 "EnableHwAcceleration": true,
                                 "EnableHwEncoding": true,
@@ -6628,6 +6654,8 @@ mod tests {
                             "MinResumeDurationSeconds": 120,
                             "MinAudiobookResume": 7,
                             "MaxAudiobookResume": 12,
+                            "EnableSlowResponseWarning": false,
+                            "SlowResponseThresholdMs": 750,
                             "TrickplayOptions": {
                                 "EnableHwAcceleration": true,
                                 "EnableHwEncoding": true,
@@ -6683,6 +6711,8 @@ mod tests {
         assert_eq!(updated_config["MinResumeDurationSeconds"], 120);
         assert_eq!(updated_config["MinAudiobookResume"], 7);
         assert_eq!(updated_config["MaxAudiobookResume"], 12);
+        assert_eq!(updated_config["EnableSlowResponseWarning"], false);
+        assert_eq!(updated_config["SlowResponseThresholdMs"], 750);
         assert_eq!(
             updated_config["TrickplayOptions"]["EnableHwAcceleration"],
             true
@@ -6742,6 +6772,43 @@ mod tests {
         assert_eq!(persisted_config.dummy_chapter_duration, 300);
         assert_eq!(persisted_config.chapter_image_resolution, "P720");
         assert!(persisted_config.enable_remote_access);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "EnableSlowResponseWarning": true,
+                            "SlowResponseThresholdMs": 1_234
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/system/configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let reenabled_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reenabled_config["EnableSlowResponseWarning"], true);
+        assert_eq!(reenabled_config["SlowResponseThresholdMs"], 1_234);
 
         let response = app
             .clone()
@@ -6835,6 +6902,8 @@ mod tests {
         assert_eq!(preserved_config["MinResumeDurationSeconds"], 120);
         assert_eq!(preserved_config["MinAudiobookResume"], 7);
         assert_eq!(preserved_config["MaxAudiobookResume"], 12);
+        assert_eq!(preserved_config["EnableSlowResponseWarning"], true);
+        assert_eq!(preserved_config["SlowResponseThresholdMs"], 1_234);
         assert_eq!(
             preserved_config["TrickplayOptions"]["ProcessPriority"],
             "High"
