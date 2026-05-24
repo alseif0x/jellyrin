@@ -135,8 +135,14 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins/{plugin_id}/manifest", get(plugin_manifest))
         .route("/Packages", get(available_packages))
         .route("/packages", get(available_packages))
-        .route("/Repositories", get(package_repositories))
-        .route("/repositories", get(package_repositories))
+        .route(
+            "/Repositories",
+            get(package_repositories).post(update_package_repositories),
+        )
+        .route(
+            "/repositories",
+            get(package_repositories).post(update_package_repositories),
+        )
         .route("/ScheduledTasks", get(scheduled_tasks))
         .route("/scheduledtasks", get(scheduled_tasks))
         .route("/ScheduledTasks/{task_id}", get(scheduled_task))
@@ -1036,8 +1042,85 @@ async fn available_packages() -> Json<Vec<serde_json::Value>> {
     Json(Vec::new())
 }
 
-async fn package_repositories() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
+async fn package_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(repository_infos_from_config(
+        state
+            .db
+            .system_configuration_payloads()
+            .await?
+            .plugin_repositories,
+    )))
+}
+
+async fn update_package_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let mut current_payloads = state.db.system_configuration_payloads().await?;
+    current_payloads.plugin_repositories =
+        serde_json::Value::Array(repository_infos_from_config(payload));
+    state
+        .db
+        .update_system_configuration_payloads(current_payloads)
+        .await?;
+    record_activity(
+        &state.db,
+        "Plugin repositories updated",
+        Some("Plugin repository list was updated."),
+        "System",
+        Some(user.id),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn repository_infos_from_config(value: serde_json::Value) -> Vec<serde_json::Value> {
+    let serde_json::Value::Array(repositories) = value else {
+        return Vec::new();
+    };
+
+    repositories
+        .into_iter()
+        .filter_map(normalize_repository_info)
+        .collect()
+}
+
+fn normalize_repository_info(value: serde_json::Value) -> Option<serde_json::Value> {
+    let serde_json::Value::Object(repository) = value else {
+        return None;
+    };
+    let name = repository
+        .get("Name")
+        .or_else(|| repository.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?;
+    let url = repository
+        .get("Url")
+        .or_else(|| repository.get("URL"))
+        .or_else(|| repository.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())?;
+    let enabled = repository
+        .get("Enabled")
+        .or_else(|| repository.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    Some(serde_json::json!({
+        "Name": name,
+        "Url": url,
+        "Enabled": enabled
+    }))
 }
 
 async fn plugin_manifest(Path(plugin_id): Path<String>) -> Json<serde_json::Value> {
@@ -4354,7 +4437,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             task = serde_json::from_slice(&body).unwrap();
-            if task["LastExecutionResult"]["Status"] == "Completed" {
+            if task["State"] == "Idle" && task["LastExecutionResult"]["Status"] == "Completed" {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -4621,6 +4704,20 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let repositories: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(repositories.as_array().unwrap().len(), 0);
@@ -5117,6 +5214,93 @@ mod tests {
         assert_eq!(activity["Items"][0]["Type"], "System");
         assert_eq!(activity["Items"][0]["Severity"], "Information");
         assert_eq!(activity["Items"][0]["UserId"], user.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn package_repositories_round_trip_system_configuration_payload() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Repositories")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!([
+                            { "Name": "Stable", "Url": "https://repo.example/manifest.json", "Enabled": true },
+                            { "name": "Disabled", "url": "https://disabled.example/manifest.json", "enabled": false },
+                            { "Name": "Missing URL" },
+                            "invalid"
+                        ])
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let repositories: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repositories.as_array().unwrap().len(), 2);
+        assert_eq!(repositories[0]["Name"], "Stable");
+        assert_eq!(repositories[0]["Url"], "https://repo.example/manifest.json");
+        assert_eq!(repositories[0]["Enabled"], true);
+        assert_eq!(repositories[1]["Name"], "Disabled");
+        assert_eq!(repositories[1]["Enabled"], false);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["PluginRepositories"], repositories);
     }
 
     #[tokio::test]
