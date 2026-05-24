@@ -23,7 +23,7 @@ use jellyrin_compat::{
 };
 use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
 use jellyrin_db::{
-    ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField,
+    ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
     BrandingConfig, Database, DeviceSession, SortDirection, SystemConfigurationPayloads, TaskRun,
 };
 use serde::{Deserialize, Deserializer, de};
@@ -187,6 +187,10 @@ pub fn router(state: AppState) -> Router {
         .route("/users/public", get(get_public_users))
         .route("/Auth/Providers", get(authentication_providers))
         .route("/auth/providers", get(authentication_providers))
+        .route("/Auth/Keys", get(api_keys).post(create_api_key))
+        .route("/auth/keys", get(api_keys).post(create_api_key))
+        .route("/Auth/Keys/{key}", delete(revoke_api_key))
+        .route("/auth/keys/{key}", delete(revoke_api_key))
         .route(
             "/Auth/PasswordResetProviders",
             get(password_reset_providers),
@@ -632,6 +636,78 @@ async fn password_reset_providers(
         "Name": "Default",
         "Id": DEFAULT_PASSWORD_RESET_PROVIDER_ID
     })]))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateApiKeyQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "App")]
+    app: Option<String>,
+}
+
+async fn api_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let keys = state.db.api_keys().await?;
+    let items = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| api_key_to_json(index, key))
+        .collect::<Vec<_>>();
+
+    Ok(Json(serde_json::json!({
+        "Items": items,
+        "TotalRecordCount": keys.len(),
+        "StartIndex": 0
+    })))
+}
+
+async fn create_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CreateApiKeyQuery>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let app = query
+        .app
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("App must not be empty"))?;
+    state.db.issue_api_key_for_user(user.id, app).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    state.db.revoke_api_key(&key).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn api_key_to_json(index: usize, key: &ApiKey) -> serde_json::Value {
+    serde_json::json!({
+        "Id": index + 1,
+        "AccessToken": key.access_token,
+        "DeviceId": null,
+        "AppName": key.name,
+        "AppVersion": null,
+        "DeviceName": null,
+        "UserId": key.user_id,
+        "UserName": key.user_name,
+        "IsActive": true,
+        "DateCreated": format_time_for_json(key.created_at),
+        "DateRevoked": null,
+        "DateLastActivity": format_time_for_json(key.last_activity_at)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -4782,6 +4858,179 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_keys_round_trip_with_admin_session_token() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Auth/Keys")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Auth Keys Test", DeviceId="auth-keys-device", Version="dev""#,
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let session_token = login["AccessToken"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Auth/Keys")
+                    .header("X-Emby-Token", session_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let keys: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(keys["Items"].as_array().unwrap().len(), 0);
+        assert_eq!(keys["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Auth/Keys?app=QA%20Client")
+                    .header("X-Emby-Token", session_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/auth/keys?app=")
+                    .header("X-Emby-Token", session_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/keys")
+                    .header("X-Emby-Token", session_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let keys: Value = serde_json::from_slice(&body).unwrap();
+        let item = keys["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["AppName"] == "QA Client")
+            .unwrap();
+        let api_key = item["AccessToken"].as_str().unwrap();
+        assert!(!api_key.is_empty());
+        assert_eq!(item["UserName"], "admin");
+        assert_eq!(item["IsActive"], true);
+        assert!(item["DateCreated"].as_str().unwrap().ends_with('Z'));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/System/Info?api_key={api_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Auth/Keys/{api_key}"))
+                    .header("X-Emby-Token", session_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/System/Info?api_key={api_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Auth/Keys")
+                    .header("X-Emby-Token", session_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let keys: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(keys["Items"].as_array().unwrap().len(), 0);
+        assert_eq!(keys["TotalRecordCount"], 0);
     }
 
     #[tokio::test]

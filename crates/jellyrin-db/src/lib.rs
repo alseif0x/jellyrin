@@ -49,6 +49,16 @@ pub struct DeviceSession {
 }
 
 #[derive(Debug, Clone)]
+pub struct ApiKey {
+    pub access_token: String,
+    pub user_id: Uuid,
+    pub user_name: String,
+    pub name: String,
+    pub created_at: OffsetDateTime,
+    pub last_activity_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct ActivePlaybackSession {
     pub session_id: String,
     pub user_id: Uuid,
@@ -778,6 +788,35 @@ impl Database {
         .await?;
 
         Ok(access_token)
+    }
+
+    pub async fn api_keys(&self) -> anyhow::Result<Vec<ApiKey>> {
+        let rows = sqlx::query_as::<_, ApiKeyListRow>(
+            r#"
+            SELECT
+                api_keys.access_token,
+                api_keys.user_id,
+                users.name AS user_name,
+                api_keys.name,
+                api_keys.created_at,
+                api_keys.last_activity_at
+            FROM api_keys
+            INNER JOIN users ON users.id = api_keys.user_id
+            ORDER BY api_keys.created_at DESC, api_keys.name COLLATE NOCASE
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn revoke_api_key(&self, api_key: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query("DELETE FROM api_keys WHERE access_token = ?1")
+            .bind(api_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn revoke_token(&self, token: &str) -> anyhow::Result<()> {
@@ -2180,6 +2219,16 @@ struct ApiKeyRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct ApiKeyListRow {
+    access_token: String,
+    user_id: String,
+    user_name: String,
+    name: String,
+    created_at: String,
+    last_activity_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct VirtualFolderRow {
     id: String,
     name: String,
@@ -2462,6 +2511,21 @@ impl TryFrom<DeviceSessionRow> for DeviceSession {
                 .capabilities_json
                 .map(|value| serde_json::from_str(&value).context("invalid device capabilities"))
                 .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<ApiKeyListRow> for ApiKey {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ApiKeyListRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            access_token: row.access_token,
+            user_id: Uuid::parse_str(&row.user_id).context("invalid api key user id")?,
+            user_name: row.user_name,
+            name: row.name,
+            created_at: parse_time(&row.created_at)?,
+            last_activity_at: parse_time(&row.last_activity_at)?,
         })
     }
 }
@@ -2816,10 +2880,20 @@ mod tests {
 
         let api_key = db.issue_api_key_for_user(user.id, "qa").await.unwrap();
         let (api_user, token) = db.user_by_api_key(&api_key).await.unwrap();
+        let keys = db.api_keys().await.unwrap();
 
         assert_eq!(api_user.id, user.id);
         assert_eq!(token.access_token, api_key);
         assert_eq!(token.client, "API Key");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].access_token, api_key);
+        assert_eq!(keys[0].user_id, user.id);
+        assert_eq!(keys[0].user_name, "root");
+        assert_eq!(keys[0].name, "qa");
+
+        assert!(db.revoke_api_key(&api_key).await.unwrap());
+        assert!(!db.revoke_api_key(&api_key).await.unwrap());
+        assert!(db.user_by_api_key(&api_key).await.is_err());
     }
 
     #[tokio::test]
