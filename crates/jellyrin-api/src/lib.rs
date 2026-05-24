@@ -755,6 +755,15 @@ async fn logout(
     let token = bearer_token(&headers)
         .or_else(|| query.api_key.clone())
         .ok_or_else(|| ApiError::unauthorized("Missing token"))?;
+    let (user, _) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    record_activity(
+        &state.db,
+        &format!("{} signed out", user.name),
+        Some(&format!("{} signed out", user.name)),
+        "Authentication",
+        Some(user.id),
+    )
+    .await?;
     state.db.revoke_token(&token).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1853,7 +1862,12 @@ async fn add_virtual_folder(
     Query(query): Query<AddVirtualFolderQuery>,
     body: Option<Json<AddVirtualFolderBody>>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let user = require_admin_or_startup_incomplete_user(
+        &state.db,
+        &headers,
+        auth_query.api_key.as_deref(),
+    )
+    .await?;
     let mut locations = comma_delimited_paths(query.paths.as_deref());
     if let Some(Json(body)) = body
         && let Some(library_options) = body.library_options
@@ -1871,6 +1885,14 @@ async fn add_virtual_folder(
         .upsert_virtual_folder(&query.name, query.collection_type.as_deref(), locations)
         .await?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    record_activity(
+        &state.db,
+        "Library added",
+        Some(&format!("Library {} was added or updated.", folder.name)),
+        "Library",
+        user.map(|user| user.id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1890,7 +1912,9 @@ async fn add_virtual_folder_path(
     Query(query): Query<AuthQuery>,
     Json(payload): Json<AddMediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user =
+        require_admin_or_startup_incomplete_user(&state.db, &headers, query.api_key.as_deref())
+            .await?;
     let path = payload
         .path_info
         .and_then(|path_info| path_info.path)
@@ -1908,6 +1932,14 @@ async fn add_virtual_folder_path(
         .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
         .ok_or_else(|| ApiError::bad_request("Virtual folder not found"))?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    record_activity(
+        &state.db,
+        "Library path added",
+        Some(&format!("A path was added to library {}.", folder.name)),
+        "Library",
+        user.map(|user| user.id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1923,8 +1955,21 @@ async fn delete_virtual_folder(
     Query(auth_query): Query<AuthQuery>,
     Query(query): Query<VirtualFolderNameQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let user = require_admin_or_startup_incomplete_user(
+        &state.db,
+        &headers,
+        auth_query.api_key.as_deref(),
+    )
+    .await?;
     if state.db.delete_virtual_folder(&query.name).await? {
+        record_activity(
+            &state.db,
+            "Library deleted",
+            Some(&format!("Library {} was deleted.", query.name)),
+            "Library",
+            user.map(|user| user.id),
+        )
+        .await?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("Virtual folder not found"))
@@ -1945,12 +1990,25 @@ async fn delete_virtual_folder_path(
     Query(auth_query): Query<AuthQuery>,
     Query(query): Query<DeleteMediaPathQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let user = require_admin_or_startup_incomplete_user(
+        &state.db,
+        &headers,
+        auth_query.api_key.as_deref(),
+    )
+    .await?;
     if state
         .db
         .remove_virtual_folder_path(&query.name, &query.path)
         .await?
     {
+        record_activity(
+            &state.db,
+            "Library path deleted",
+            Some(&format!("A path was removed from library {}.", query.name)),
+            "Library",
+            user.map(|user| user.id),
+        )
+        .await?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("Virtual folder path not found"))
@@ -3786,16 +3844,21 @@ async fn require_admin_or_startup_incomplete(
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> Result<(), ApiError> {
+    require_admin_or_startup_incomplete_user(db, headers, query_token)
+        .await
+        .map(|_| ())
+}
+
+async fn require_admin_or_startup_incomplete_user(
+    db: &Database,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<Option<User>, ApiError> {
     if !db.server_state().await?.startup_wizard_completed {
-        return Ok(());
+        return Ok(None);
     }
 
-    let user = require_request_user(db, headers, query_token).await?;
-    if user.is_administrator {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden("Administrator access required"))
-    }
+    require_admin(db, headers, query_token).await.map(Some)
 }
 
 async fn require_startup_wizard_incomplete(db: &Database) -> Result<(), ApiError> {
@@ -4002,7 +4065,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-
         let response = app
             .clone()
             .oneshot(
@@ -5000,6 +5062,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let session_token = login["AccessToken"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Logout")
+                    .header("X-Emby-Token", session_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
@@ -5031,7 +5110,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let activity: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(activity["TotalRecordCount"], 2);
+        assert_eq!(activity["TotalRecordCount"], 3);
         assert_eq!(activity["StartIndex"], 0);
         assert_eq!(activity["Items"].as_array().unwrap().len(), 1);
         assert_eq!(activity["Items"][0]["Name"], "Server configuration updated");
@@ -6450,6 +6529,25 @@ mod tests {
         assert_eq!(filters["Genres"].as_array().unwrap().len(), 0);
         assert_eq!(filters["MediaTypes"], json!(["Video"]));
         assert_eq!(filters["Containers"], json!(["mp4"]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let activity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(activity["TotalRecordCount"], 1);
+        assert_eq!(activity["Items"][0]["Name"], "Library added");
+        assert_eq!(activity["Items"][0]["Type"], "Library");
+        assert_eq!(activity["Items"][0]["UserId"], Value::Null);
 
         let response = app
             .clone()
