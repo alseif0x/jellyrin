@@ -23,10 +23,10 @@ use jellyrin_compat::{
 };
 use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
 use jellyrin_db::{
-    ActivePlaybackSession, ActivityLogEntry, BrandingConfig, Database, DeviceSession,
-    SystemConfigurationPayloads, TaskRun,
+    ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField,
+    BrandingConfig, Database, DeviceSession, SortDirection, SystemConfigurationPayloads, TaskRun,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
@@ -935,10 +935,92 @@ fn folder_storage_json(path: PathBuf) -> serde_json::Value {
 
 #[derive(Debug, Deserialize)]
 struct ActivityLogQuery {
+    #[serde(alias = "startIndex")]
     #[serde(alias = "StartIndex")]
     start_index: Option<i64>,
+    #[serde(alias = "limit")]
     #[serde(alias = "Limit")]
     limit: Option<i64>,
+    #[serde(alias = "hasUserId")]
+    #[serde(alias = "HasUserId")]
+    has_user_id: Option<bool>,
+    #[serde(alias = "name")]
+    #[serde(alias = "Name")]
+    name: Option<String>,
+    #[serde(alias = "overview")]
+    #[serde(alias = "Overview")]
+    overview: Option<String>,
+    #[serde(alias = "shortOverview")]
+    #[serde(alias = "ShortOverview")]
+    short_overview: Option<String>,
+    #[serde(alias = "type")]
+    #[serde(alias = "Type")]
+    entry_type: Option<String>,
+    #[serde(alias = "itemId")]
+    #[serde(alias = "ItemId")]
+    item_id: Option<String>,
+    #[serde(alias = "username")]
+    #[serde(alias = "Username")]
+    username: Option<String>,
+    #[serde(alias = "severity")]
+    #[serde(alias = "Severity")]
+    severity: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_query_string_list")]
+    #[serde(alias = "sortBy")]
+    #[serde(alias = "SortBy")]
+    sort_by: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_query_string_list")]
+    #[serde(alias = "sortOrder")]
+    #[serde(alias = "SortOrder")]
+    sort_order: Vec<String>,
+    #[serde(alias = "minDate")]
+    #[serde(alias = "MinDate")]
+    min_date: Option<String>,
+    #[serde(alias = "maxDate")]
+    #[serde(alias = "MaxDate")]
+    max_date: Option<String>,
+}
+
+fn deserialize_query_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringListVisitor;
+
+    impl<'de> de::Visitor<'de> for StringListVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a string or a list of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_string()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = seq.next_element::<String>()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_any(StringListVisitor)
 }
 
 async fn activity_log_entries(
@@ -950,12 +1032,125 @@ async fn activity_log_entries(
     require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let start_index = query.start_index.unwrap_or_default().max(0);
     let limit = query.limit.unwrap_or(100).clamp(0, 1000);
-    let (entries, total) = state.db.activity_log_entries(start_index, limit).await?;
+    let filter = activity_log_filter_from_query(&query)?;
+    let (entries, total) = state
+        .db
+        .activity_log_entries(start_index, limit, filter)
+        .await?;
     Ok(Json(serde_json::json!({
         "Items": entries.iter().map(activity_log_entry_json).collect::<Vec<_>>(),
         "TotalRecordCount": total,
         "StartIndex": start_index
     })))
+}
+
+fn activity_log_filter_from_query(query: &ActivityLogQuery) -> Result<ActivityLogFilter, ApiError> {
+    if query
+        .item_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "activity log item filtering is not implemented",
+        ));
+    }
+
+    Ok(ActivityLogFilter {
+        has_user_id: query.has_user_id,
+        name: query.name.clone(),
+        overview: query.overview.clone(),
+        short_overview: query.short_overview.clone(),
+        entry_type: query.entry_type.clone(),
+        username: query.username.clone(),
+        severity: query
+            .severity
+            .as_deref()
+            .map(normalize_activity_log_severity)
+            .transpose()?,
+        min_date: query
+            .min_date
+            .as_deref()
+            .map(parse_activity_log_date)
+            .transpose()?,
+        max_date: query
+            .max_date
+            .as_deref()
+            .map(parse_activity_log_date)
+            .transpose()?,
+        sort: parse_activity_log_sort(&query.sort_by, &query.sort_order),
+    })
+}
+
+fn normalize_activity_log_severity(value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    let severity = match value.to_ascii_lowercase().as_str() {
+        "trace" => "Trace",
+        "debug" => "Debug",
+        "information" => "Information",
+        "warning" => "Warning",
+        "error" => "Error",
+        "critical" => "Critical",
+        "none" => "None",
+        _ => return Err(ApiError::bad_request("invalid activity log severity")),
+    };
+    Ok(severity.to_string())
+}
+
+fn parse_activity_log_date(value: &str) -> Result<OffsetDateTime, ApiError> {
+    OffsetDateTime::parse(value.trim(), &Rfc3339)
+        .map_err(|_| ApiError::bad_request("invalid activity log date"))
+}
+
+fn parse_activity_log_sort(
+    sort_by: &[String],
+    sort_order: &[String],
+) -> Vec<(ActivityLogSortField, SortDirection)> {
+    let fields = expand_query_values(sort_by);
+    let orders = expand_query_values(sort_order);
+    fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let field = parse_activity_log_sort_field(field)?;
+            let direction = orders
+                .get(index)
+                .or_else(|| orders.first())
+                .and_then(|order| parse_sort_direction(order))
+                .unwrap_or(SortDirection::Ascending);
+            Some((field, direction))
+        })
+        .collect()
+}
+
+fn expand_query_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn parse_activity_log_sort_field(value: &str) -> Option<ActivityLogSortField> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "name" => Some(ActivityLogSortField::Name),
+        "overview" | "overiew" => Some(ActivityLogSortField::Overview),
+        "shortoverview" | "short_overview" => Some(ActivityLogSortField::ShortOverview),
+        "type" => Some(ActivityLogSortField::Type),
+        "datecreated" | "date" | "createdat" => Some(ActivityLogSortField::DateCreated),
+        "username" | "user" => Some(ActivityLogSortField::Username),
+        "logseverity" | "severity" => Some(ActivityLogSortField::LogSeverity),
+        _ => None,
+    }
+}
+
+fn parse_sort_direction(value: &str) -> Option<SortDirection> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ascending" | "asc" => Some(SortDirection::Ascending),
+        "descending" | "desc" => Some(SortDirection::Descending),
+        _ => None,
+    }
 }
 
 fn activity_log_entry_json(entry: &ActivityLogEntry) -> serde_json::Value {
@@ -5195,6 +5390,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/System/ActivityLog/Entries?StartIndex=0&Limit=1")
@@ -5214,6 +5410,23 @@ mod tests {
         assert_eq!(activity["Items"][0]["Type"], "System");
         assert_eq!(activity["Items"][0]["Severity"], "Information");
         assert_eq!(activity["Items"][0]["UserId"], user.id.to_string());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries?startIndex=0&limit=10&hasUserId=true&username=adm&name=Server&severity=Information&sortBy=Name&sortOrder=Ascending")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered["TotalRecordCount"], 1);
+        assert_eq!(filtered["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["Items"][0]["Name"], "Server configuration updated");
     }
 
     #[tokio::test]

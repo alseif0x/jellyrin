@@ -12,7 +12,7 @@ use jellyrin_core::{
     DeviceToken, MediaItem, PlaybackState, ServerState, StartupConfig, User, VirtualFolder,
 };
 use serde_json::Value;
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{QueryBuilder, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -69,6 +69,54 @@ pub struct ActivityLogEntry {
     pub severity: String,
     pub user_id: Option<Uuid>,
     pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityLogSortField {
+    Name,
+    Overview,
+    ShortOverview,
+    Type,
+    DateCreated,
+    Username,
+    LogSeverity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivityLogFilter {
+    pub has_user_id: Option<bool>,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub short_overview: Option<String>,
+    pub entry_type: Option<String>,
+    pub username: Option<String>,
+    pub severity: Option<String>,
+    pub min_date: Option<OffsetDateTime>,
+    pub max_date: Option<OffsetDateTime>,
+    pub sort: Vec<(ActivityLogSortField, SortDirection)>,
+}
+
+impl Default for ActivityLogFilter {
+    fn default() -> Self {
+        Self {
+            has_user_id: None,
+            name: None,
+            overview: None,
+            short_overview: None,
+            entry_type: None,
+            username: None,
+            severity: None,
+            min_date: None,
+            max_date: None,
+            sort: vec![(ActivityLogSortField::DateCreated, SortDirection::Descending)],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,25 +333,36 @@ impl Database {
         &self,
         start_index: i64,
         limit: i64,
+        filter: ActivityLogFilter,
     ) -> anyhow::Result<(Vec<ActivityLogEntry>, i64)> {
         let start_index = start_index.max(0);
         let limit = limit.clamp(0, 1000);
-        let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM activity_log_entries")
+        let mut total_query =
+            QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM activity_log_entries");
+        push_activity_log_join_and_filters(&mut total_query, &filter)?;
+        let total = total_query
+            .build_query_scalar::<i64>()
             .fetch_one(&self.pool)
             .await?;
 
-        let rows = sqlx::query_as::<_, ActivityLogEntryRow>(
-            r#"
-            SELECT id, name, overview, short_overview, entry_type, severity, user_id, created_at
-            FROM activity_log_entries
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?1 OFFSET ?2
-            "#,
-        )
-        .bind(limit)
-        .bind(start_index)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut rows_query = QueryBuilder::<Sqlite>::new(
+            "SELECT activity_log_entries.id, activity_log_entries.name, \
+             activity_log_entries.overview, activity_log_entries.short_overview, \
+             activity_log_entries.entry_type, activity_log_entries.severity, \
+             activity_log_entries.user_id, activity_log_entries.created_at \
+             FROM activity_log_entries",
+        );
+        push_activity_log_join_and_filters(&mut rows_query, &filter)?;
+        push_activity_log_order_by(&mut rows_query, &filter.sort);
+        rows_query.push(" LIMIT ");
+        rows_query.push_bind(limit);
+        rows_query.push(" OFFSET ");
+        rows_query.push_bind(start_index);
+
+        let rows = rows_query
+            .build_query_as::<ActivityLogEntryRow>()
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok((
             rows.into_iter()
@@ -1779,6 +1838,162 @@ impl Database {
     }
 }
 
+fn push_activity_log_join_and_filters(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    filter: &ActivityLogFilter,
+) -> anyhow::Result<()> {
+    if filter
+        .username
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || filter
+            .sort
+            .iter()
+            .any(|(field, _)| *field == ActivityLogSortField::Username)
+    {
+        query.push(" LEFT JOIN users ON users.id = activity_log_entries.user_id");
+    }
+
+    let mut first_filter = true;
+    push_activity_log_filter_clause(
+        query,
+        &mut first_filter,
+        "activity_log_entries.name",
+        &filter.name,
+    );
+    push_activity_log_filter_clause(
+        query,
+        &mut first_filter,
+        "activity_log_entries.overview",
+        &filter.overview,
+    );
+    push_activity_log_filter_clause(
+        query,
+        &mut first_filter,
+        "activity_log_entries.short_overview",
+        &filter.short_overview,
+    );
+    push_activity_log_filter_clause(
+        query,
+        &mut first_filter,
+        "activity_log_entries.entry_type",
+        &filter.entry_type,
+    );
+    push_activity_log_filter_clause(query, &mut first_filter, "users.name", &filter.username);
+    push_activity_log_exact_clause(
+        query,
+        &mut first_filter,
+        "activity_log_entries.severity",
+        &filter.severity,
+    );
+
+    if let Some(has_user_id) = filter.has_user_id {
+        push_activity_log_where(query, &mut first_filter);
+        if has_user_id {
+            query.push("activity_log_entries.user_id IS NOT NULL");
+        } else {
+            query.push("activity_log_entries.user_id IS NULL");
+        }
+    }
+
+    if let Some(min_date) = filter.min_date {
+        push_activity_log_where(query, &mut first_filter);
+        query.push("activity_log_entries.created_at >= ");
+        query.push_bind(format_time(min_date)?);
+    }
+
+    if let Some(max_date) = filter.max_date {
+        push_activity_log_where(query, &mut first_filter);
+        query.push("activity_log_entries.created_at <= ");
+        query.push_bind(format_time(max_date)?);
+    }
+
+    Ok(())
+}
+
+fn push_activity_log_filter_clause(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    first_filter: &mut bool,
+    column: &'static str,
+    value: &Option<String>,
+) {
+    let Some(value) = trimmed_filter_value(value) else {
+        return;
+    };
+    push_activity_log_where(query, first_filter);
+    query.push(column);
+    query.push(" LIKE ");
+    query.push_bind(format!("%{value}%"));
+}
+
+fn push_activity_log_exact_clause(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    first_filter: &mut bool,
+    column: &'static str,
+    value: &Option<String>,
+) {
+    let Some(value) = trimmed_filter_value(value) else {
+        return;
+    };
+    push_activity_log_where(query, first_filter);
+    query.push(column);
+    query.push(" = ");
+    query.push_bind(value);
+}
+
+fn push_activity_log_where(query: &mut QueryBuilder<'_, Sqlite>, first_filter: &mut bool) {
+    if *first_filter {
+        query.push(" WHERE ");
+        *first_filter = false;
+    } else {
+        query.push(" AND ");
+    }
+}
+
+fn push_activity_log_order_by(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    sort: &[(ActivityLogSortField, SortDirection)],
+) {
+    query.push(" ORDER BY ");
+    let fallback = [(ActivityLogSortField::DateCreated, SortDirection::Descending)];
+    let requested_sort = if sort.is_empty() { &fallback[..] } else { sort };
+    let order_parts = requested_sort
+        .iter()
+        .copied()
+        .take(4)
+        .map(|(field, direction)| {
+            let direction = match direction {
+                SortDirection::Ascending => "ASC",
+                SortDirection::Descending => "DESC",
+            };
+            format!("{} {}", activity_log_sort_column(field), direction)
+        })
+        .chain(std::iter::once("activity_log_entries.id DESC".to_string()))
+        .collect::<Vec<_>>();
+
+    query.push(order_parts.join(", "));
+}
+
+fn activity_log_sort_column(field: ActivityLogSortField) -> &'static str {
+    match field {
+        ActivityLogSortField::Name => "activity_log_entries.name COLLATE NOCASE",
+        ActivityLogSortField::Overview => "activity_log_entries.overview COLLATE NOCASE",
+        ActivityLogSortField::ShortOverview => "activity_log_entries.short_overview COLLATE NOCASE",
+        ActivityLogSortField::Type => "activity_log_entries.entry_type COLLATE NOCASE",
+        ActivityLogSortField::DateCreated => "activity_log_entries.created_at",
+        ActivityLogSortField::Username => "users.name COLLATE NOCASE",
+        ActivityLogSortField::LogSeverity => "activity_log_entries.severity COLLATE NOCASE",
+    }
+}
+
+fn trimmed_filter_value(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[derive(sqlx::FromRow)]
 struct StartupConfigRow {
     ui_culture: String,
@@ -2342,7 +2557,10 @@ fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, SystemConfigurationPayloads};
+    use super::{
+        ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
+        SystemConfigurationPayloads,
+    };
     use serde_json::json;
     use time::Duration;
 
@@ -2473,7 +2691,10 @@ mod tests {
             .unwrap();
 
         assert!(second.id > first.id);
-        let (entries, total) = db.activity_log_entries(0, 1).await.unwrap();
+        let (entries, total) = db
+            .activity_log_entries(0, 1, ActivityLogFilter::default())
+            .await
+            .unwrap();
         assert_eq!(total, 2);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "Second event");
@@ -2485,11 +2706,75 @@ mod tests {
         );
         assert_eq!(entries[0].user_id, None);
 
-        let (entries, total) = db.activity_log_entries(1, 10).await.unwrap();
+        let (entries, total) = db
+            .activity_log_entries(1, 10, ActivityLogFilter::default())
+            .await
+            .unwrap();
         assert_eq!(total, 2);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "First event");
         assert_eq!(entries[0].user_id, Some(user.id));
+    }
+
+    #[tokio::test]
+    async fn activity_log_entries_filter_and_sort() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+
+        db.add_activity_log_entry(
+            "Alpha event",
+            Some("First overview"),
+            Some("Alpha short"),
+            "System",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        db.add_activity_log_entry(
+            "Beta event",
+            Some("Second overview"),
+            Some("Beta short"),
+            "Library",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (entries, total) = db
+            .activity_log_entries(
+                0,
+                10,
+                ActivityLogFilter {
+                    has_user_id: Some(true),
+                    username: Some("roo".to_string()),
+                    sort: vec![(ActivityLogSortField::Name, SortDirection::Ascending)],
+                    ..ActivityLogFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].name, "Alpha event");
+        assert_eq!(entries[0].user_id, Some(user.id));
+
+        let (entries, total) = db
+            .activity_log_entries(
+                0,
+                10,
+                ActivityLogFilter {
+                    has_user_id: Some(false),
+                    entry_type: Some("lib".to_string()),
+                    sort: vec![(ActivityLogSortField::Name, SortDirection::Descending)],
+                    ..ActivityLogFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].name, "Beta event");
     }
 
     #[tokio::test]
