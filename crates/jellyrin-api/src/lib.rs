@@ -2078,6 +2078,14 @@ async fn named_configuration(
                 .await?
                 .unwrap_or_else(default_metadata_configuration)
         }
+        "xbmcmetadata" => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(default_xbmc_metadata_configuration)
+        }
         _ => serde_json::json!({}),
     };
     Ok(Json(value))
@@ -2110,6 +2118,10 @@ async fn update_named_configuration(
         "metadata" => (
             metadata_configuration_json(payload),
             "Metadata configuration updated",
+        ),
+        "xbmcmetadata" => (
+            xbmc_metadata_configuration_json(payload),
+            "NFO metadata configuration updated",
         ),
         _ => return Ok(StatusCode::NOT_IMPLEMENTED),
     };
@@ -2247,6 +2259,26 @@ fn default_metadata_configuration() -> serde_json::Value {
 fn metadata_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     let mut config = default_metadata_configuration();
     merge_known_network_value(&mut config, &payload, "UseFileCreationTimeForDateAdded");
+    config
+}
+
+fn default_xbmc_metadata_configuration() -> serde_json::Value {
+    serde_json::json!({
+        "UserId": null,
+        "ReleaseDateFormat": "yyyy-MM-dd",
+        "SaveImagePathsInNfo": true,
+        "EnablePathSubstitution": true,
+        "EnableExtraThumbsDuplication": false
+    })
+}
+
+fn xbmc_metadata_configuration_json(payload: serde_json::Value) -> serde_json::Value {
+    let mut config = default_xbmc_metadata_configuration();
+    merge_known_network_value(&mut config, &payload, "UserId");
+    merge_known_network_value(&mut config, &payload, "ReleaseDateFormat");
+    merge_known_network_value(&mut config, &payload, "SaveImagePathsInNfo");
+    merge_known_network_value(&mut config, &payload, "EnablePathSubstitution");
+    merge_known_network_value(&mut config, &payload, "EnableExtraThumbsDuplication");
     config
 }
 
@@ -6775,6 +6807,131 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({ "UseFileCreationTimeForDateAdded": false }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn xbmc_metadata_named_configuration_round_trips_dashboard_contract() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/xbmcmetadata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/xbmcmetadata")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(defaults["UserId"], Value::Null);
+        assert_eq!(defaults["ReleaseDateFormat"], "yyyy-MM-dd");
+        assert_eq!(defaults["SaveImagePathsInNfo"], true);
+        assert_eq!(defaults["EnablePathSubstitution"], true);
+        assert_eq!(defaults["EnableExtraThumbsDuplication"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/xbmcmetadata")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload = json!({
+            "UserId": user.id.to_string(),
+            "ReleaseDateFormat": "dd/MM/yyyy",
+            "SaveImagePathsInNfo": false,
+            "EnablePathSubstitution": false,
+            "EnableExtraThumbsDuplication": true,
+            "UnknownNfoField": "ignored"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/xbmcmetadata")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/system/configuration/xbmcmetadata")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["UserId"], user.id.to_string());
+        assert_eq!(config["ReleaseDateFormat"], "dd/MM/yyyy");
+        assert_eq!(config["SaveImagePathsInNfo"], false);
+        assert_eq!(config["EnablePathSubstitution"], false);
+        assert_eq!(config["EnableExtraThumbsDuplication"], true);
+        assert!(config.get("UnknownNfoField").is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration/xbmcmetadata")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "SaveImagePathsInNfo": true }).to_string(),
                     ))
                     .unwrap(),
             )
