@@ -574,6 +574,10 @@ pub fn router(state: AppState) -> Router {
         .route("/studios", get(authenticated_empty_items))
         .route("/Years", get(authenticated_empty_items))
         .route("/years", get(authenticated_empty_items))
+        .route("/Channels", get(channels))
+        .route("/channels", get(channels))
+        .route("/Channels/Features", get(authenticated_empty_json_array))
+        .route("/channels/features", get(authenticated_empty_json_array))
         .route("/Artists", get(authenticated_empty_items))
         .route("/artists", get(authenticated_empty_items))
         .route("/AlbumArtists", get(authenticated_empty_items))
@@ -587,6 +591,9 @@ pub fn router(state: AppState) -> Router {
         .route("/Localization/cultures", get(localization_cultures))
         .route("/Localization/Countries", get(localization_countries))
         .route("/Localization/countries", get(localization_countries))
+        .route("/Localization/ParentalRatings", get(parental_ratings))
+        .route("/Localization/parentalratings", get(parental_ratings))
+        .route("/localization/parentalratings", get(parental_ratings))
         .route("/socket", get(websocket))
         .nest_service(
             "/web",
@@ -4671,6 +4678,37 @@ async fn authenticated_empty_items(
     Ok(empty_items_result().await)
 }
 
+#[derive(Debug, Deserialize)]
+struct ChannelsQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "UserId")]
+    _user_id: Option<String>,
+    #[serde(alias = "startIndex", alias = "StartIndex")]
+    start_index: Option<usize>,
+    #[serde(alias = "limit", alias = "Limit")]
+    _limit: Option<usize>,
+    #[serde(alias = "supportsLatestItems", alias = "SupportsLatestItems")]
+    _supports_latest_items: Option<bool>,
+    #[serde(alias = "supportsMediaDeletion", alias = "SupportsMediaDeletion")]
+    _supports_media_deletion: Option<bool>,
+    #[serde(alias = "isFavorite", alias = "IsFavorite")]
+    _is_favorite: Option<bool>,
+}
+
+async fn channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChannelsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    Ok(Json(query_result_with_total(
+        Vec::new(),
+        0,
+        query.start_index.unwrap_or(0),
+    )))
+}
+
 async fn authenticated_item_empty_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5541,6 +5579,32 @@ async fn localization_countries() -> Json<Vec<CountryDto>> {
     Json(load_countries())
 }
 
+async fn parental_ratings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_user_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(vec![
+        parental_rating("US-G", 1),
+        parental_rating("US-PG", 5),
+        parental_rating("US-PG-13", 7),
+        parental_rating("US-R", 9),
+        parental_rating("US-NC-17", 10),
+    ]))
+}
+
+fn parental_rating(name: &str, score: i32) -> serde_json::Value {
+    serde_json::json!({
+        "Name": name,
+        "Value": name,
+        "RatingScore": {
+            "score": score,
+            "subScore": null
+        }
+    })
+}
+
 fn load_cultures() -> Vec<CultureDto> {
     let mut cultures = ISO_639_2_DATA
         .lines()
@@ -5824,6 +5888,20 @@ async fn require_admin_or_startup_incomplete_user(
     require_admin(db, headers, query_token).await.map(Some)
 }
 
+async fn require_user_or_startup_incomplete(
+    db: &Database,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<(), ApiError> {
+    if !db.server_state().await?.startup_wizard_completed {
+        return Ok(());
+    }
+
+    require_request_user(db, headers, query_token)
+        .await
+        .map(|_| ())
+}
+
 async fn require_startup_wizard_incomplete(db: &Database) -> Result<(), ApiError> {
     let server = db.server_state().await?;
     if server.startup_wizard_completed {
@@ -5843,6 +5921,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
     headers
         .get("authorization")
+        .or_else(|| headers.get("x-emby-authorization"))
         .and_then(|value| value.to_str().ok())
         .and_then(parse_authorization_token)
 }
@@ -6784,6 +6863,11 @@ mod tests {
             "/LiveTv/RecordingGroups?UserId=test-user",
             "/LiveTv/Timers",
             "/LiveTv/SeriesTimers",
+            "/Channels?UserId=test-user&StartIndex=3&SupportsMediaDeletion=true",
+            "/channels?supportsLatestItems=true&isFavorite=false",
+            "/Channels/Features",
+            "/Localization/ParentalRatings",
+            "/localization/parentalratings",
         ] {
             let response = app
                 .clone()
@@ -12017,6 +12101,73 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/Channels?UserId=00000000-0000-0000-0000-000000000000&StartIndex=2&Limit=10&SupportsMediaDeletion=true&IsFavorite=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels?UserId=00000000-0000-0000-0000-000000000000&StartIndex=2&Limit=10&SupportsMediaDeletion=true&IsFavorite=false")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels["Items"], json!([]));
+        assert_eq!(channels["TotalRecordCount"], 0);
+        assert_eq!(channels["StartIndex"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Channels?startIndex=7&limit=1&supportsLatestItems=true&api_key={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels["Items"], json!([]));
+        assert_eq!(channels["TotalRecordCount"], 0);
+        assert_eq!(channels["StartIndex"], 7);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/localization/parentalratings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let ratings: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ratings[0]["Name"], "US-G");
+        assert_eq!(ratings[0]["Value"], "US-G");
+        assert_eq!(ratings[0]["RatingScore"]["score"], 1);
+        assert_eq!(ratings[0]["RatingScore"]["subScore"], Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!("/Users?userId={}", managed.id))
                     .header("X-Emby-Token", &api_key)
@@ -12095,6 +12246,66 @@ mod tests {
         assert_eq!(user["Name"], "managed-renamed");
         assert_eq!(user["Policy"]["IsAdministrator"], true);
         assert_eq!(user["Policy"]["IsDisabled"], false);
+    }
+
+    #[tokio::test]
+    async fn parental_ratings_follow_first_time_setup_auth() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Localization/ParentalRatings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        db.complete_startup_wizard().await.unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Localization/ParentalRatings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Localization/ParentalRatings")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let ratings: Value = serde_json::from_slice(&body).unwrap();
+        assert!(ratings.as_array().unwrap().len() >= 5);
     }
 
     #[tokio::test]
