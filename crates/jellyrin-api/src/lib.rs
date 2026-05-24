@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect},
     routing::{delete, get, head, post},
@@ -472,6 +472,12 @@ pub fn router(state: AppState) -> Router {
         .route("/items/latest", get(latest_items))
         .route("/Items/Filters", get(item_filters))
         .route("/items/filters", get(item_filters))
+        .route("/Items/Filters2", get(query_filters))
+        .route("/items/filters2", get(query_filters))
+        .route("/Filter/Items/Filters", get(item_filters))
+        .route("/filter/items/filters", get(item_filters))
+        .route("/Filter/Items/Filters2", get(query_filters))
+        .route("/filter/items/filters2", get(query_filters))
         .route("/Items/{item_id}/Ancestors", get(item_ancestors))
         .route("/items/{item_id}/ancestors", get(item_ancestors))
         .route(
@@ -4246,68 +4252,180 @@ async fn user_views_result(
 
 #[derive(Debug, Deserialize, Default)]
 struct ItemsQuery {
-    #[serde(alias = "UserId")]
+    #[serde(alias = "UserId", alias = "userId")]
     user_id: Option<String>,
-    #[serde(alias = "Ids")]
+    #[serde(alias = "Ids", alias = "ids")]
     ids: Option<String>,
-    #[serde(alias = "ParentId")]
+    #[serde(alias = "ParentId", alias = "parentId")]
     parent_id: Option<String>,
-    #[serde(alias = "IncludeItemTypes")]
-    include_item_types: Option<String>,
-    #[serde(alias = "ExcludeItemTypes")]
-    exclude_item_types: Option<String>,
-    #[serde(alias = "MediaTypes")]
-    media_types: Option<String>,
-    #[serde(alias = "SearchTerm")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "IncludeItemTypes",
+        alias = "includeItemTypes"
+    )]
+    include_item_types: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "ExcludeItemTypes",
+        alias = "excludeItemTypes"
+    )]
+    exclude_item_types: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "MediaTypes",
+        alias = "mediaTypes"
+    )]
+    media_types: Vec<String>,
+    #[serde(alias = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
-    #[serde(alias = "IsPlayed")]
+    #[serde(alias = "IsPlayed", alias = "isPlayed")]
     is_played: Option<bool>,
-    #[serde(alias = "IsFolder")]
+    #[serde(alias = "IsFolder", alias = "isFolder")]
     is_folder: Option<bool>,
-    #[serde(alias = "Filters")]
-    filters: Option<String>,
-    #[serde(alias = "NameStartsWith")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "Filters",
+        alias = "filters"
+    )]
+    filters: Vec<String>,
+    #[serde(alias = "NameStartsWith", alias = "nameStartsWith")]
     name_starts_with: Option<String>,
-    #[serde(alias = "NameStartsWithOrGreater")]
+    #[serde(alias = "NameStartsWithOrGreater", alias = "nameStartsWithOrGreater")]
     name_starts_with_or_greater: Option<String>,
-    #[serde(alias = "NameLessThan")]
+    #[serde(alias = "NameLessThan", alias = "nameLessThan")]
     name_less_than: Option<String>,
-    #[serde(alias = "Recursive")]
+    #[serde(alias = "Recursive", alias = "recursive")]
     _recursive: Option<String>,
-    #[serde(alias = "StartIndex")]
+    #[serde(alias = "StartIndex", alias = "startIndex")]
     start_index: Option<usize>,
-    #[serde(alias = "Limit")]
+    #[serde(alias = "Limit", alias = "limit")]
     limit: Option<usize>,
-    #[serde(alias = "SortBy")]
+    #[serde(alias = "SortBy", alias = "sortBy")]
     sort_by: Option<String>,
-    #[serde(alias = "SortOrder")]
+    #[serde(alias = "SortOrder", alias = "sortOrder")]
     sort_order: Option<String>,
-    #[serde(alias = "Fields")]
+    #[serde(alias = "Fields", alias = "fields")]
     _fields: Option<String>,
-    #[serde(alias = "ImageTypeLimit")]
+    #[serde(alias = "ImageTypeLimit", alias = "imageTypeLimit")]
     _image_type_limit: Option<String>,
-    #[serde(alias = "EnableImages")]
+    #[serde(alias = "EnableImages", alias = "enableImages")]
     _enable_images: Option<String>,
-    #[serde(alias = "EnableUserData")]
+    #[serde(alias = "EnableUserData", alias = "enableUserData")]
     _enable_user_data: Option<String>,
-    #[serde(alias = "CollapseBoxSetItems")]
+    #[serde(alias = "CollapseBoxSetItems", alias = "collapseBoxSetItems")]
     _collapse_box_set_items: Option<String>,
-    #[serde(alias = "ImageTypes")]
+    #[serde(alias = "ImageTypes", alias = "imageTypes")]
     _image_types: Option<String>,
-    #[serde(alias = "EnableImageTypes")]
+    #[serde(alias = "EnableImageTypes", alias = "enableImageTypes")]
     _enable_image_types: Option<String>,
-    #[serde(alias = "EnableTotalRecordCount")]
+    #[serde(alias = "EnableTotalRecordCount", alias = "enableTotalRecordCount")]
     _enable_total_record_count: Option<String>,
-    #[serde(alias = "ExcludeLocationTypes")]
+    #[serde(alias = "ExcludeLocationTypes", alias = "excludeLocationTypes")]
     _exclude_location_types: Option<String>,
+}
+
+fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
+    let mut query = ItemsQuery::default();
+    let Some(raw_query) = raw_query else {
+        return query;
+    };
+
+    for part in raw_query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let key = percent_decode_query_component(key).to_ascii_lowercase();
+        let value = percent_decode_query_component(value);
+        match key.as_str() {
+            "userid" => query.user_id = Some(value),
+            "ids" => set_query_scalar(&mut query.ids, value),
+            "parentid" => query.parent_id = Some(value),
+            "includeitemtypes" => query.include_item_types.push(value),
+            "excludeitemtypes" => query.exclude_item_types.push(value),
+            "mediatypes" => query.media_types.push(value),
+            "searchterm" => query.search_term = Some(value),
+            "isplayed" => query.is_played = parse_query_bool(&value),
+            "isfolder" => query.is_folder = parse_query_bool(&value),
+            "filters" => query.filters.push(value),
+            "namestartswith" => query.name_starts_with = Some(value),
+            "namestartswithorgreater" => query.name_starts_with_or_greater = Some(value),
+            "namelessthan" => query.name_less_than = Some(value),
+            "startindex" => query.start_index = value.parse().ok(),
+            "limit" => query.limit = value.parse().ok(),
+            "sortby" => set_query_scalar(&mut query.sort_by, value),
+            "sortorder" => set_query_scalar(&mut query.sort_order, value),
+            _ => {}
+        }
+    }
+
+    query
+}
+
+fn set_query_scalar(target: &mut Option<String>, value: String) {
+    if let Some(existing) = target {
+        existing.push(',');
+        existing.push_str(&value);
+    } else {
+        *target = Some(value);
+    }
+}
+
+fn parse_query_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn percent_decode_query_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) =
+                    (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+                {
+                    output.push((high << 4) | low);
+                    index += 3;
+                } else {
+                    output.push(bytes[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 async fn items_result(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
-    Query(query): Query<ItemsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
@@ -4342,8 +4460,9 @@ async fn user_items_result(
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path(user_id): Path<String>,
-    Query(query): Query<ItemsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
@@ -4375,8 +4494,9 @@ async fn item_counts(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
-    Query(query): Query<ItemsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
@@ -4398,8 +4518,9 @@ async fn user_item_counts(
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path(user_id): Path<String>,
-    Query(query): Query<ItemsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
@@ -4418,8 +4539,9 @@ async fn latest_items(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
-    Query(query): Query<ItemsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
@@ -4458,8 +4580,9 @@ async fn user_latest_items(
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path(user_id): Path<String>,
-    Query(query): Query<ItemsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
@@ -4974,10 +5097,12 @@ async fn authenticated_item_theme_items(
 async fn item_filters(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let items = state.db.media_items().await?;
+    let query = parse_items_query(raw_query.as_deref());
+    let items =
+        filtered_items_for_query(&state, &headers, auth_query.api_key.as_deref(), &query).await?;
     let media_types = items
         .iter()
         .map(|item| item.media_type.clone())
@@ -5009,6 +5134,42 @@ async fn item_filters(
     })))
 }
 
+async fn query_filters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    filtered_items_for_query(&state, &headers, auth_query.api_key.as_deref(), &query).await?;
+    Ok(Json(serde_json::json!({
+        "Genres": [],
+        "Tags": [],
+        "AudioLanguages": [],
+        "SubtitleLanguages": []
+    })))
+}
+
+async fn filtered_items_for_query(
+    state: &AppState,
+    headers: &HeaderMap,
+    api_key: Option<&str>,
+    query: &ItemsQuery,
+) -> Result<Vec<MediaItem>, ApiError> {
+    let auth_user = require_request_user(&state.db, headers, api_key).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+    filtered_media_items(
+        state.db.media_items().await?,
+        query,
+        requested_user_id,
+        &state.db,
+    )
+    .await
+}
+
 fn query_result(items: Vec<serde_json::Value>) -> serde_json::Value {
     let total_record_count = items.len();
     query_result_with_total(items, total_record_count, 0)
@@ -5038,10 +5199,10 @@ async fn filtered_media_items(
         .map(parse_jellyfin_uuid)
         .transpose()?;
     let ids = query.ids.as_deref().map(parse_uuid_list).transpose()?;
-    let include_types = csv_lowercase(query.include_item_types.as_deref());
-    let exclude_types = csv_lowercase(query.exclude_item_types.as_deref());
-    let media_types = csv_lowercase(query.media_types.as_deref());
-    let filters = csv_lowercase(query.filters.as_deref());
+    let include_types = csv_values_lowercase(&query.include_item_types);
+    let exclude_types = csv_values_lowercase(&query.exclude_item_types);
+    let media_types = csv_values_lowercase(&query.media_types);
+    let filters = csv_values_lowercase(&query.filters);
     let search_term = query
         .search_term
         .as_deref()
@@ -5164,9 +5325,10 @@ async fn items_to_json(
     Ok(values)
 }
 
-fn csv_lowercase(value: Option<&str>) -> Option<Vec<String>> {
-    let values = value?
-        .split(',')
+fn csv_values_lowercase(values: &[String]) -> Option<Vec<String>> {
+    let values = values
+        .iter()
+        .flat_map(|value| value.split(','))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase)
@@ -5176,6 +5338,25 @@ fn csv_lowercase(value: Option<&str>) -> Option<Vec<String>> {
     } else {
         Some(values)
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum QueryStringValues {
+    One(String),
+    Many(Vec<String>),
+}
+
+fn deserialize_csv_values<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Option::<QueryStringValues>::deserialize(deserializer)?;
+    Ok(match values {
+        Some(QueryStringValues::One(value)) => vec![value],
+        Some(QueryStringValues::Many(values)) => values,
+        None => Vec::new(),
+    })
 }
 
 fn normalized_prefix(value: Option<&str>) -> Option<String> {
@@ -11164,6 +11345,98 @@ mod tests {
         assert_eq!(filters["Genres"].as_array().unwrap().len(), 0);
         assert_eq!(filters["MediaTypes"], json!(["Video"]));
         assert_eq!(filters["Containers"], json!(["mp4"]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Filters2?userId={user_id}&parentId={parent_id}&includeItemTypes=Movie"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Filters2?userId={user_id}&parentId={parent_id}&includeItemTypes=Movie"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filters2: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filters2["Genres"].as_array().unwrap().len(), 0);
+        assert_eq!(filters2["Tags"].as_array().unwrap().len(), 0);
+        assert_eq!(filters2["AudioLanguages"].as_array().unwrap().len(), 0);
+        assert_eq!(filters2["SubtitleLanguages"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Filter/Items/Filters?userId={user_id}&parentId={parent_id}&includeItemTypes=Movie&mediaTypes=Video"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filter_alias: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filter_alias["MediaTypes"], json!(["Video"]));
+        assert_eq!(filter_alias["Containers"], json!(["mp4"]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?userId={user_id}&parentId={parent_id}&includeItemTypes=Movie&includeItemTypes=BoxSet"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let repeated_include_types: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repeated_include_types["TotalRecordCount"], 1);
+        assert_eq!(repeated_include_types["Items"][0]["Id"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Filter/Items/Filters?userId={user_id}&parentId={parent_id}&includeItemTypes=Audio&mediaTypes=Audio"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let empty_audio_filter_alias: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(empty_audio_filter_alias["MediaTypes"], json!([]));
+        assert_eq!(empty_audio_filter_alias["Containers"], json!([]));
 
         let response = app
             .clone()
