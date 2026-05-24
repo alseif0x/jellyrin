@@ -381,6 +381,14 @@ pub fn router(state: AppState) -> Router {
         .route("/Environment/Drives", get(environment_drives))
         .route("/environment/drives", get(environment_drives))
         .route(
+            "/Environment/DefaultDirectoryBrowser",
+            get(environment_default_directory_browser),
+        )
+        .route(
+            "/environment/defaultdirectorybrowser",
+            get(environment_default_directory_browser),
+        )
+        .route(
             "/Environment/DirectoryContents",
             get(environment_directory_contents),
         )
@@ -3854,6 +3862,15 @@ async fn environment_drives(
     ]))
 }
 
+async fn environment_default_directory_browser(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({ "Path": null })))
+}
+
 #[derive(Debug, Deserialize)]
 struct DirectoryQuery {
     #[serde(alias = "Path", alias = "path")]
@@ -3908,14 +3925,14 @@ async fn environment_parent_path(
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Query(query): Query<PathQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<Option<String>>, ApiError> {
     require_admin_or_startup_incomplete(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let parent = query
         .path
         .as_deref()
         .and_then(|path| path.parent())
         .map(|path| path.to_string_lossy().into_owned());
-    Ok(Json(serde_json::json!({ "Path": parent })))
+    Ok(Json(parent))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5799,6 +5816,8 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, load_countries, load_cultures,
@@ -9915,7 +9934,11 @@ mod tests {
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
-        for endpoint in ["/Library/VirtualFolders", "/Environment/Drives"] {
+        for endpoint in [
+            "/Library/VirtualFolders",
+            "/Environment/Drives",
+            "/Environment/DefaultDirectoryBrowser",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -9946,6 +9969,117 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/environment/defaultdirectorybrowser")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let default_browser: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(default_browser["Path"], Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Environment/ParentPath?Path=/tmp/jellyrin-child")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parent_path: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parent_path, json!("/tmp"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Environment/Drives")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let drives: Value = serde_json::from_slice(&body).unwrap();
+        let drive = drives.as_array().unwrap().first().unwrap();
+        assert!(drive["Name"].as_str().is_some_and(|name| !name.is_empty()));
+        assert!(drive["Path"].as_str().is_some_and(|path| !path.is_empty()));
+        assert!(drive["Type"].as_str().is_some_and(|kind| !kind.is_empty()));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let child_dir = tmp.path().join("child-dir");
+        let child_file = tmp.path().join("child-file.txt");
+        fs::create_dir(&child_dir).unwrap();
+        fs::write(&child_file, b"test").unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Environment/DirectoryContents?Path={}&IncludeFiles=false",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Value = serde_json::from_slice(&body).unwrap();
+        let entries = entries.as_array().unwrap();
+        let child_dir_path = child_dir.to_string_lossy();
+        assert!(entries.iter().any(|entry| {
+            entry["Name"] == "child-dir"
+                && entry["Path"] == *child_dir_path
+                && entry["Type"] == "Directory"
+        }));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["Name"] != "child-file.txt")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Environment/DirectoryContents?Path={}&IncludeFiles=true",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let entries: Value = serde_json::from_slice(&body).unwrap();
+        let entries = entries.as_array().unwrap();
+        let child_file_path = child_file.to_string_lossy();
+        assert!(entries.iter().any(|entry| {
+            entry["Name"] == "child-file.txt"
+                && entry["Path"] == *child_file_path
+                && entry["Type"] == "File"
+        }));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri("/Environment/ValidatePath")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -9957,6 +10091,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -9969,6 +10104,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Environment/ValidatePath")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Path": tmp.path().join("missing").to_string_lossy() }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -10074,6 +10225,18 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/Environment/Drives")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Environment/DefaultDirectoryBrowser")
                     .body(Body::empty())
                     .unwrap(),
             )
