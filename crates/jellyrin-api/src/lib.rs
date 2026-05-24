@@ -42,6 +42,7 @@ const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 pub struct AppState {
     pub db: Database,
     pub web_dir: PathBuf,
+    pub log_dir: PathBuf,
     pub local_address: String,
 }
 
@@ -61,6 +62,10 @@ pub fn router(state: AppState) -> Router {
         .route("/system/ping", post(ping))
         .route("/System/Info/Storage", get(system_storage))
         .route("/system/info/storage", get(system_storage))
+        .route("/System/Logs", get(system_logs))
+        .route("/system/logs", get(system_logs))
+        .route("/System/Logs/Log", get(system_log_file))
+        .route("/system/logs/log", get(system_log_file))
         .route("/System/ActivityLog/Entries", get(activity_log_entries))
         .route("/system/activitylog/entries", get(activity_log_entries))
         .route("/System/Configuration", get(system_configuration))
@@ -916,7 +921,7 @@ async fn system_storage(
         "WebFolder": folder_storage_json(state.web_dir),
         "ImageCacheFolder": folder_storage_json(temp_dir.join("jellyrin").join("images")),
         "CacheFolder": folder_storage_json(temp_dir.join("jellyrin").join("cache")),
-        "LogFolder": folder_storage_json(current_dir.join("logs")),
+        "LogFolder": folder_storage_json(state.log_dir),
         "InternalMetadataFolder": folder_storage_json(current_dir.join("metadata")),
         "TranscodingTempFolder": folder_storage_json(temp_dir.join("jellyrin").join("transcodes")),
         "Libraries": libraries
@@ -931,6 +936,112 @@ fn folder_storage_json(path: PathBuf) -> serde_json::Value {
         "StorageType": null,
         "DeviceId": null
     })
+}
+
+async fn system_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+
+    let mut read_dir = match tokio::fs::read_dir(&state.log_dir).await {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Json(Vec::new())),
+        Err(error) => return Err(ApiError::from(error)),
+    };
+
+    let mut logs = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await.map_err(ApiError::from)? {
+        let metadata = tokio::fs::symlink_metadata(entry.path())
+            .await
+            .map_err(ApiError::from)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let modified = metadata
+            .modified()
+            .ok()
+            .map(OffsetDateTime::from)
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        let created = metadata
+            .created()
+            .ok()
+            .map(OffsetDateTime::from)
+            .unwrap_or(modified);
+        logs.push(serde_json::json!({
+            "Name": name,
+            "Size": metadata.len(),
+            "DateCreated": format_time_for_json(created),
+            "DateModified": format_time_for_json(modified)
+        }));
+    }
+
+    logs.sort_by(|left, right| {
+        right["DateModified"]
+            .as_str()
+            .cmp(&left["DateModified"].as_str())
+            .then_with(|| left["Name"].as_str().cmp(&right["Name"].as_str()))
+    });
+
+    Ok(Json(logs))
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemLogFileQuery {
+    #[serde(alias = "Name")]
+    name: String,
+}
+
+async fn system_log_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<SystemLogFileQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let Some(path) = safe_log_file_path(&state.log_dir, &query.name) else {
+        return Err(ApiError::bad_request("invalid log file name"));
+    };
+    let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found("Log file not found")
+        } else {
+            ApiError::from(error)
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ApiError::not_found("Log file not found"));
+    }
+
+    let contents = tokio::fs::read_to_string(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found("Log file not found")
+        } else {
+            ApiError::from(error)
+        }
+    })?;
+
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        contents,
+    ))
+}
+
+fn safe_log_file_path(log_dir: &FsPath, name: &str) -> Option<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+
+    let path = FsPath::new(name);
+    if path.file_name().and_then(|file_name| file_name.to_str()) != Some(name) {
+        return None;
+    }
+
+    Some(log_dir.join(name))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1609,6 +1720,8 @@ fn system_configuration_json(
         "PluginRepositories": payloads.plugin_repositories,
         "RemoteClientBitrateLimit": 0,
         "LogFileRetentionDays": 3,
+        "EnableSlowResponseWarning": false,
+        "SlowResponseThresholdMs": 500,
         "RunAtStartup": false
     })
 }
@@ -4329,6 +4442,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -4454,6 +4568,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -4516,6 +4631,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -4545,6 +4661,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -4698,7 +4815,14 @@ mod tests {
             .unwrap();
         let storage_root = tempfile::tempdir().unwrap();
         let storage_path = storage_root.path().join("movies");
+        let log_dir = storage_root.path().join("logs");
         std::fs::create_dir_all(&storage_path).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("jellyrin.log"), "first line\nsecond line\n").unwrap();
+        std::fs::write(log_dir.join("older.log"), "older\n").unwrap();
+        std::fs::create_dir(log_dir.join("nested")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/passwd", log_dir.join("passwd.log")).unwrap();
         let storage_folder = db
             .upsert_virtual_folder(
                 "Storage Movies",
@@ -4710,6 +4834,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: log_dir.clone(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -4812,6 +4937,10 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(storage["WebFolder"]["Path"], ".");
+        assert_eq!(
+            storage["LogFolder"]["Path"],
+            log_dir.to_string_lossy().to_string()
+        );
         assert_eq!(storage["Libraries"][0]["Id"], storage_folder.id.to_string());
         assert_eq!(storage["Libraries"][0]["Name"], "Storage Movies");
         assert_eq!(
@@ -4859,6 +4988,107 @@ mod tests {
         let activity: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(activity["TotalRecordCount"], 0);
         assert_eq!(activity["Items"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Logs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Logs")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let logs: Value = serde_json::from_slice(&body).unwrap();
+        let logs = logs.as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().any(|log| log["Name"] == "jellyrin.log"));
+        assert!(!logs.iter().any(|log| log["Name"] == "passwd.log"));
+        assert!(logs.iter().all(|log| log["Size"].as_u64().unwrap() > 0));
+        assert!(logs.iter().all(|log| log["DateModified"].is_string()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Logs/Log?name=jellyrin.log")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(content_type.starts_with("text/plain"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"first line\nsecond line\n");
+
+        for uri in [
+            "/System/Logs/Log?name=../jellyrin.log",
+            "/System/Logs/Log?name=nested/file.log",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Logs/Log?name=missing.log")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        #[cfg(unix)]
+        {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/System/Logs/Log?name=passwd.log")
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
 
         let response = app
             .clone()
@@ -5117,6 +5347,7 @@ mod tests {
         let app = router(AppState {
             db: db.clone(),
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -5320,6 +5551,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -5443,6 +5675,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -5530,6 +5763,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -5674,6 +5908,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
         let endpoint = format!(
@@ -5788,6 +6023,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -5916,6 +6152,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -6047,6 +6284,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -6182,6 +6420,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -6256,6 +6495,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -6404,6 +6644,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -6469,6 +6710,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -6556,6 +6798,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -6730,6 +6973,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -7961,6 +8205,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -8038,6 +8283,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
+            log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 

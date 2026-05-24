@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db,
         web_dir: args.web_dir,
+        log_dir: args.log_dir,
         local_address,
     };
 
