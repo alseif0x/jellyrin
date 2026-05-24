@@ -528,6 +528,26 @@ pub fn router(state: AppState) -> Router {
         .route("/videos/{item_id}/stream", get(direct_stream_item))
         .route("/Videos/{item_id}/stream", head(direct_stream_item_head))
         .route("/videos/{item_id}/stream", head(direct_stream_item_head))
+        .route("/Audio/{item_id}/stream", get(direct_stream_audio))
+        .route("/audio/{item_id}/stream", get(direct_stream_audio))
+        .route("/Audio/{item_id}/stream", head(direct_stream_audio_head))
+        .route("/audio/{item_id}/stream", head(direct_stream_audio_head))
+        .route(
+            "/Audio/{item_id}/stream.{container}",
+            get(direct_stream_audio_by_container),
+        )
+        .route(
+            "/audio/{item_id}/stream.{container}",
+            get(direct_stream_audio_by_container),
+        )
+        .route(
+            "/Audio/{item_id}/stream.{container}",
+            head(direct_stream_audio_by_container_head),
+        )
+        .route(
+            "/audio/{item_id}/stream.{container}",
+            head(direct_stream_audio_by_container_head),
+        )
         .route("/Items/{item_id}", get(item_detail))
         .route("/items/{item_id}", get(item_detail))
         .route("/Users/{user_id}/Items/{item_id}", get(user_item_detail))
@@ -4658,13 +4678,15 @@ async fn direct_stream_item(
     headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    if item.media_type != "Video" {
-        return Err(ApiError::not_found("Video stream not found"));
-    }
-
-    stream_media_item(item, &headers, true).await
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Video",
+        true,
+    )
+    .await
 }
 
 async fn direct_stream_item_head(
@@ -4673,13 +4695,102 @@ async fn direct_stream_item_head(
     headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    if item.media_type != "Video" {
-        return Err(ApiError::not_found("Video stream not found"));
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Video",
+        false,
+    )
+    .await
+}
+
+async fn direct_stream_audio(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Audio",
+        true,
+    )
+    .await
+}
+
+async fn direct_stream_audio_head(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Audio",
+        false,
+    )
+    .await
+}
+
+async fn direct_stream_audio_by_container(
+    State(state): State<AppState>,
+    Path((item_id, _container)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Audio",
+        true,
+    )
+    .await
+}
+
+async fn direct_stream_audio_by_container_head(
+    State(state): State<AppState>,
+    Path((item_id, _container)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Audio",
+        false,
+    )
+    .await
+}
+
+async fn direct_stream_media(
+    state: &AppState,
+    headers: &HeaderMap,
+    api_key: Option<&str>,
+    item_id: &str,
+    media_type: &str,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, headers, api_key).await?;
+    let item = media_item_by_id(&state.db, item_id).await?;
+    if item.media_type != media_type {
+        return Err(ApiError::not_found(format!(
+            "{media_type} stream not found"
+        )));
     }
 
-    stream_media_item(item, &headers, false).await
+    stream_media_item(item, headers, include_body).await
 }
 
 async fn stream_media_item(
@@ -5215,6 +5326,12 @@ fn media_item_to_json_with_playback(
     let played = playback.is_some_and(|state| state.played);
     let play_count = i32::from(played);
     let media_streams = media_item_streams(item);
+    let direct_stream_url = media_item_direct_stream_url(item, &item_id);
+    let video_type = if item.media_type == "Video" {
+        serde_json::json!("VideoFile")
+    } else {
+        serde_json::Value::Null
+    };
 
     let media_source = serde_json::json!({
         "Protocol": "File",
@@ -5225,7 +5342,7 @@ fn media_item_to_json_with_playback(
         "Size": file_size,
         "Name": item.name,
         "IsRemote": false,
-        "DirectStreamUrl": format!("/Videos/{item_id}/stream"),
+        "DirectStreamUrl": direct_stream_url,
         "ETag": null,
         "RunTimeTicks": null,
         "ReadAtNativeFramerate": false,
@@ -5240,7 +5357,7 @@ fn media_item_to_json_with_playback(
         "RequiresClosing": false,
         "RequiresLooping": false,
         "SupportsProbing": true,
-        "VideoType": "VideoFile",
+        "VideoType": video_type,
         "DefaultAudioStreamIndex": null,
         "DefaultSubtitleStreamIndex": null,
         "MediaStreams": media_streams.clone(),
@@ -5368,49 +5485,81 @@ fn media_item_content_type(item: &MediaItem) -> String {
         Some("mkv") => "video/x-matroska",
         Some("mov") => "video/quicktime",
         Some("avi") => "video/x-msvideo",
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        Some("flac") => "audio/flac",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
         _ => "application/octet-stream",
     }
     .to_string()
 }
 
+fn media_item_direct_stream_url(item: &MediaItem, item_id: &str) -> String {
+    match item.media_type.as_str() {
+        "Audio" => format!("/Audio/{item_id}/stream"),
+        _ => format!("/Videos/{item_id}/stream"),
+    }
+}
+
 fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
-    if item.media_type != "Video" {
-        return Vec::new();
+    if item.media_type == "Audio" {
+        return vec![serde_json::json!({
+            "Codec": media_item_container(item).unwrap_or_else(|| "unknown".to_string()),
+            "Language": null,
+            "DisplayTitle": "Audio",
+            "IsInterlaced": false,
+            "BitRate": null,
+            "BitDepth": null,
+            "Channels": null,
+            "SampleRate": null,
+            "IsDefault": true,
+            "IsForced": false,
+            "Type": "Audio",
+            "Index": 0,
+            "IsExternal": false,
+            "Path": null
+        })];
     }
 
-    vec![serde_json::json!({
-        "Codec": media_item_container(item).unwrap_or_else(|| "unknown".to_string()),
-        "Language": null,
-        "ColorTransfer": null,
-        "ColorPrimaries": null,
-        "ColorSpace": null,
-        "TimeBase": null,
-        "VideoRange": null,
-        "DisplayTitle": "Video",
-        "NalLengthSize": null,
-        "IsInterlaced": false,
-        "IsAVC": null,
-        "BitRate": null,
-        "BitDepth": null,
-        "RefFrames": null,
-        "IsDefault": true,
-        "IsForced": false,
-        "Height": null,
-        "Width": null,
-        "AverageFrameRate": null,
-        "RealFrameRate": null,
-        "Profile": null,
-        "Type": "Video",
-        "AspectRatio": null,
-        "Index": 0,
-        "IsExternal": false,
-        "IsTextSubtitleStream": false,
-        "SupportsExternalStream": false,
-        "Path": null,
-        "PixelFormat": null,
-        "Level": null,
-        "IsAnamorphic": null
-    })]
+    if item.media_type == "Video" {
+        return vec![serde_json::json!({
+            "Codec": media_item_container(item).unwrap_or_else(|| "unknown".to_string()),
+            "Language": null,
+            "ColorTransfer": null,
+            "ColorPrimaries": null,
+            "ColorSpace": null,
+            "TimeBase": null,
+            "VideoRange": null,
+            "DisplayTitle": "Video",
+            "NalLengthSize": null,
+            "IsInterlaced": false,
+            "IsAVC": null,
+            "BitRate": null,
+            "BitDepth": null,
+            "RefFrames": null,
+            "IsDefault": true,
+            "IsForced": false,
+            "Height": null,
+            "Width": null,
+            "AverageFrameRate": null,
+            "RealFrameRate": null,
+            "Profile": null,
+            "Type": "Video",
+            "AspectRatio": null,
+            "Index": 0,
+            "IsExternal": false,
+            "IsTextSubtitleStream": false,
+            "SupportsExternalStream": false,
+            "Path": null,
+            "PixelFormat": null,
+            "Level": null,
+            "IsAnamorphic": null
+        })];
+    }
+
+    Vec::new()
 }
 
 fn parse_range_header(headers: &HeaderMap, total_len: u64) -> Result<Option<(u64, u64)>, ()> {
@@ -12031,6 +12180,166 @@ mod tests {
         let similar: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(similar["TotalRecordCount"], 0);
         assert_eq!(similar["Items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn audio_items_support_direct_stream_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let song = tmp.path().join("Example Song.mp3");
+        tokio::fs::write(&song, b"fake audio").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Music&collectionType=music&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?IncludeItemTypes=Audio")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["TotalRecordCount"], 1);
+        assert_eq!(result["Items"][0]["Name"], "Example Song");
+        assert_eq!(result["Items"][0]["Type"], "Audio");
+        let item_id = result["Items"][0]["Id"].as_str().unwrap();
+        assert_eq!(
+            result["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
+            format!("/Audio/{item_id}/stream")
+        );
+        assert_eq!(
+            result["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Type"],
+            "Audio"
+        );
+        assert_eq!(
+            result["Items"][0]["MediaSources"][0]["VideoType"],
+            Value::Null
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/Counts")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(counts["SongCount"], 1);
+        assert_eq!(counts["ItemCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Audio/{item_id}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Audio/{item_id}/stream"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-3/10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/Audio/{item_id}/stream.mp3?Static=true"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/stream"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
