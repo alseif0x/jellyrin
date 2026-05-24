@@ -274,6 +274,12 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/info", get(live_tv_info))
         .route("/LiveTv/GuideInfo", get(live_tv_guide_info))
         .route("/livetv/guideinfo", get(live_tv_guide_info))
+        .route("/LiveTv/TunerHosts/Types", get(live_tv_tuner_host_types))
+        .route("/livetv/tunerhosts/types", get(live_tv_tuner_host_types))
+        .route("/LiveTv/TunerHosts", post(add_live_tv_tuner_host))
+        .route("/livetv/tunerhosts", post(add_live_tv_tuner_host))
+        .route("/LiveTv/TunerHosts", delete(delete_live_tv_tuner_host))
+        .route("/livetv/tunerhosts", delete(delete_live_tv_tuner_host))
         .route("/LiveTv/Channels", get(empty_items_result))
         .route("/livetv/channels", get(empty_items_result))
         .route("/LiveTv/Programs", get(empty_items_result))
@@ -3076,6 +3082,105 @@ async fn live_tv_guide_info() -> Json<serde_json::Value> {
         "StartDate": null,
         "EndDate": null
     }))
+}
+
+async fn live_tv_tuner_host_types(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(vec![
+        serde_json::json!({ "Id": "hdhomerun", "Name": "HDHomeRun" }),
+        serde_json::json!({ "Id": "m3u", "Name": "M3U Tuner" }),
+    ]))
+}
+
+async fn add_live_tv_tuner_host(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(mut payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !payload.is_object() {
+        return Err(ApiError::bad_request("Tuner host must be an object"));
+    }
+
+    let tuner_id = payload
+        .get("Id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    payload["Id"] = serde_json::json!(tuner_id);
+
+    let mut config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let mut tuner_hosts = config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(existing) = tuner_hosts.iter_mut().find(|tuner| {
+        tuner.get("Id").and_then(serde_json::Value::as_str)
+            == payload.get("Id").and_then(serde_json::Value::as_str)
+    }) {
+        *existing = payload.clone();
+    } else {
+        tuner_hosts.push(payload.clone());
+    }
+    config["TunerHosts"] = serde_json::json!(tuner_hosts);
+    state
+        .db
+        .update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await?;
+    Ok(Json(payload))
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveTvTunerHostQuery {
+    #[serde(alias = "Id")]
+    id: Option<String>,
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+}
+
+async fn delete_live_tv_tuner_host(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveTvTunerHostQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let tuner_id = query.id.as_deref().unwrap_or_default();
+    let mut config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let tuner_hosts = config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter(|tuner| {
+                    tuner.get("Id").and_then(serde_json::Value::as_str) != Some(tuner_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    config["TunerHosts"] = serde_json::json!(tuner_hosts);
+    state
+        .db
+        .update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn branding_configuration(
@@ -7273,6 +7378,180 @@ mod tests {
         assert_eq!(config["TunerHosts"].as_array().unwrap().len(), 1);
         assert_eq!(config["ListingProviders"].as_array().unwrap().len(), 1);
         assert!(config.get("UnknownLiveTvField").is_none());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/TunerHosts/Types")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/TunerHosts/Types")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let types: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            types
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tuner_type| tuner_type["Id"] == "m3u")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/TunerHosts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "tuner-2",
+                            "Type": "m3u",
+                            "Url": "http://example.test/playlist.m3u",
+                            "FriendlyName": "Test tuner"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/TunerHosts")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "tuner-2",
+                            "Type": "m3u",
+                            "Url": "http://example.test/playlist.m3u",
+                            "FriendlyName": "Test tuner",
+                            "TunerCount": "2",
+                            "AllowStreamSharing": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created_tuner: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created_tuner["Id"], "tuner-2");
+        assert_eq!(created_tuner["FriendlyName"], "Test tuner");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/livetv/tunerhosts")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "tuner-2",
+                            "Type": "m3u",
+                            "Url": "http://example.test/replaced.m3u",
+                            "FriendlyName": "Updated tuner"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/livetv")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        let tuner_hosts = config["TunerHosts"].as_array().unwrap();
+        assert_eq!(tuner_hosts.len(), 2);
+        let tuner = tuner_hosts
+            .iter()
+            .find(|tuner| tuner["Id"] == "tuner-2")
+            .unwrap();
+        assert_eq!(tuner["Url"], "http://example.test/replaced.m3u");
+        assert_eq!(tuner["FriendlyName"], "Updated tuner");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/LiveTv/TunerHosts?id=tuner-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/LiveTv/TunerHosts?id=tuner-2")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/livetv")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        let tuner_hosts = config["TunerHosts"].as_array().unwrap();
+        assert_eq!(tuner_hosts.len(), 1);
+        assert!(tuner_hosts.iter().all(|tuner| tuner["Id"] != "tuner-2"));
 
         let response = app
             .oneshot(
