@@ -1945,6 +1945,16 @@ struct SystemConfigurationUpdate {
     chapter_image_resolution: Option<String>,
     #[serde(alias = "EnableRemoteAccess")]
     enable_remote_access: Option<bool>,
+    #[serde(alias = "CachePath")]
+    cache_path: Option<String>,
+    #[serde(alias = "MetadataPath")]
+    metadata_path: Option<String>,
+    #[serde(alias = "QuickConnectAvailable")]
+    quick_connect_available: Option<bool>,
+    #[serde(alias = "LibraryScanFanoutConcurrency")]
+    library_scan_fanout_concurrency: Option<i64>,
+    #[serde(alias = "ParallelImageEncodingLimit")]
+    parallel_image_encoding_limit: Option<i64>,
     #[serde(rename = "ContentTypes", alias = "contentTypes")]
     content_types: Option<serde_json::Value>,
     #[serde(rename = "MetadataOptions", alias = "metadataOptions")]
@@ -2117,6 +2127,27 @@ fn server_configuration_options_json(
         "SlowResponseThresholdMs",
         payload.slow_response_threshold_ms,
     );
+    merge_string_option(&mut config, "CachePath", payload.cache_path.as_deref());
+    merge_string_option(
+        &mut config,
+        "MetadataPath",
+        payload.metadata_path.as_deref(),
+    );
+    merge_bool_option(
+        &mut config,
+        "QuickConnectAvailable",
+        payload.quick_connect_available,
+    );
+    merge_i64_option(
+        &mut config,
+        "LibraryScanFanoutConcurrency",
+        payload.library_scan_fanout_concurrency,
+    );
+    merge_i64_option(
+        &mut config,
+        "ParallelImageEncodingLimit",
+        payload.parallel_image_encoding_limit,
+    );
     config
 }
 
@@ -2130,6 +2161,11 @@ fn default_server_configuration_options() -> serde_json::Value {
         "MaxAudiobookResume": 5,
         "EnableSlowResponseWarning": true,
         "SlowResponseThresholdMs": 500,
+        "CachePath": null,
+        "MetadataPath": "",
+        "QuickConnectAvailable": true,
+        "LibraryScanFanoutConcurrency": 0,
+        "ParallelImageEncodingLimit": 0,
         "TrickplayOptions": default_trickplay_options()
     })
 }
@@ -2184,6 +2220,12 @@ fn merge_bool_option(config: &mut serde_json::Value, key: &'static str, value: O
     }
 }
 
+fn merge_string_option(config: &mut serde_json::Value, key: &'static str, value: Option<&str>) {
+    if let Some(value) = value {
+        config[key] = serde_json::json!(value);
+    }
+}
+
 fn system_configuration_json(
     config: StartupConfig,
     startup_wizard_completed: bool,
@@ -2216,6 +2258,11 @@ fn system_configuration_json(
         "MetadataOptions": payloads.metadata_options,
         "PathSubstitutions": payloads.path_substitutions,
         "PluginRepositories": payloads.plugin_repositories,
+        "CachePath": server_options["CachePath"],
+        "MetadataPath": server_options["MetadataPath"],
+        "QuickConnectAvailable": server_options["QuickConnectAvailable"],
+        "LibraryScanFanoutConcurrency": server_options["LibraryScanFanoutConcurrency"],
+        "ParallelImageEncodingLimit": server_options["ParallelImageEncodingLimit"],
         "RemoteClientBitrateLimit": server_options["RemoteClientBitrateLimit"],
         "MinResumePct": server_options["MinResumePct"],
         "MaxResumePct": server_options["MaxResumePct"],
@@ -6576,6 +6623,11 @@ mod tests {
         assert_eq!(default_config["MaxAudiobookResume"], 5);
         assert_eq!(default_config["EnableSlowResponseWarning"], true);
         assert_eq!(default_config["SlowResponseThresholdMs"], 500);
+        assert_eq!(default_config["CachePath"], Value::Null);
+        assert_eq!(default_config["MetadataPath"], "");
+        assert_eq!(default_config["QuickConnectAvailable"], true);
+        assert_eq!(default_config["LibraryScanFanoutConcurrency"], 0);
+        assert_eq!(default_config["ParallelImageEncodingLimit"], 0);
         assert_eq!(
             default_config["TrickplayOptions"]["EnableHwAcceleration"],
             false
@@ -6616,6 +6668,11 @@ mod tests {
                             "MaxAudiobookResume": 12,
                             "EnableSlowResponseWarning": false,
                             "SlowResponseThresholdMs": 750,
+                            "CachePath": "/tmp/jellyrin-cache",
+                            "MetadataPath": "/tmp/jellyrin-metadata",
+                            "QuickConnectAvailable": false,
+                            "LibraryScanFanoutConcurrency": 3,
+                            "ParallelImageEncodingLimit": 4,
                             "TrickplayOptions": {
                                 "EnableHwAcceleration": true,
                                 "EnableHwEncoding": true,
@@ -6670,6 +6727,11 @@ mod tests {
                             "MaxAudiobookResume": 12,
                             "EnableSlowResponseWarning": false,
                             "SlowResponseThresholdMs": 750,
+                            "CachePath": "/tmp/jellyrin-cache",
+                            "MetadataPath": "/tmp/jellyrin-metadata",
+                            "QuickConnectAvailable": false,
+                            "LibraryScanFanoutConcurrency": 3,
+                            "ParallelImageEncodingLimit": 4,
                             "TrickplayOptions": {
                                 "EnableHwAcceleration": true,
                                 "EnableHwEncoding": true,
@@ -6727,6 +6789,11 @@ mod tests {
         assert_eq!(updated_config["MaxAudiobookResume"], 12);
         assert_eq!(updated_config["EnableSlowResponseWarning"], false);
         assert_eq!(updated_config["SlowResponseThresholdMs"], 750);
+        assert_eq!(updated_config["CachePath"], "/tmp/jellyrin-cache");
+        assert_eq!(updated_config["MetadataPath"], "/tmp/jellyrin-metadata");
+        assert_eq!(updated_config["QuickConnectAvailable"], false);
+        assert_eq!(updated_config["LibraryScanFanoutConcurrency"], 3);
+        assert_eq!(updated_config["ParallelImageEncodingLimit"], 4);
         assert_eq!(
             updated_config["TrickplayOptions"]["EnableHwAcceleration"],
             true
@@ -6918,6 +6985,11 @@ mod tests {
         assert_eq!(preserved_config["MaxAudiobookResume"], 12);
         assert_eq!(preserved_config["EnableSlowResponseWarning"], true);
         assert_eq!(preserved_config["SlowResponseThresholdMs"], 1_234);
+        assert_eq!(preserved_config["CachePath"], "/tmp/jellyrin-cache");
+        assert_eq!(preserved_config["MetadataPath"], "/tmp/jellyrin-metadata");
+        assert_eq!(preserved_config["QuickConnectAvailable"], false);
+        assert_eq!(preserved_config["LibraryScanFanoutConcurrency"], 3);
+        assert_eq!(preserved_config["ParallelImageEncodingLimit"], 4);
         assert_eq!(
             preserved_config["TrickplayOptions"]["ProcessPriority"],
             "High"
