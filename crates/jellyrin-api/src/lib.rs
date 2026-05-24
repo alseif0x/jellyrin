@@ -65,6 +65,10 @@ pub fn router(state: AppState) -> Router {
         .route("/System/Ping", post(ping))
         .route("/system/ping", get(ping))
         .route("/system/ping", post(ping))
+        .route("/System/Restart", post(system_admin_noop))
+        .route("/system/restart", post(system_admin_noop))
+        .route("/System/Shutdown", post(system_admin_noop))
+        .route("/system/shutdown", post(system_admin_noop))
         .route("/Backup", get(backups))
         .route("/backup", get(backups))
         .route("/Backup/Create", post(create_backup))
@@ -1255,6 +1259,15 @@ fn default_session_capabilities() -> serde_json::Value {
 
 async fn ping() -> &'static str {
     "Jellyfin Server"
+}
+
+async fn system_admin_noop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn system_storage(
@@ -6473,6 +6486,37 @@ mod tests {
         assert_eq!(config["ServerName"], "Jellyrin");
         assert_eq!(config["EnableRemoteAccess"], false);
         assert_eq!(config["ContentTypes"].as_array().unwrap().len(), 0);
+
+        for endpoint in ["/System/Restart", "/System/Shutdown"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+        }
+
+        for endpoint in ["/System/Restart", "/system/shutdown"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
 
         let response = app
             .clone()
