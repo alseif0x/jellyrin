@@ -2114,6 +2114,14 @@ async fn named_configuration(
                 .await?
                 .unwrap_or_else(default_xbmc_metadata_configuration)
         }
+        "encoding" => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(default_encoding_configuration)
+        }
         _ => serde_json::json!({}),
     };
     Ok(Json(value))
@@ -2150,6 +2158,10 @@ async fn update_named_configuration(
         "xbmcmetadata" => (
             xbmc_metadata_configuration_json(payload),
             "NFO metadata configuration updated",
+        ),
+        "encoding" => (
+            encoding_configuration_json(payload),
+            "Encoding configuration updated",
         ),
         _ => return Ok(StatusCode::NOT_IMPLEMENTED),
     };
@@ -2307,6 +2319,118 @@ fn xbmc_metadata_configuration_json(payload: serde_json::Value) -> serde_json::V
     merge_known_network_value(&mut config, &payload, "SaveImagePathsInNfo");
     merge_known_network_value(&mut config, &payload, "EnablePathSubstitution");
     merge_known_network_value(&mut config, &payload, "EnableExtraThumbsDuplication");
+    config
+}
+
+fn default_encoding_configuration() -> serde_json::Value {
+    serde_json::json!({
+        "EncodingThreadCount": -1,
+        "TranscodingTempPath": null,
+        "FallbackFontPath": null,
+        "EnableFallbackFont": false,
+        "EnableAudioVbr": false,
+        "DownMixAudioBoost": 2.0,
+        "DownMixStereoAlgorithm": "None",
+        "MaxMuxingQueueSize": 2048,
+        "EnableThrottling": false,
+        "ThrottleDelaySeconds": 180,
+        "EnableSegmentDeletion": false,
+        "SegmentKeepSeconds": 720,
+        "HardwareAccelerationType": "none",
+        "EncoderAppPath": null,
+        "EncoderAppPathDisplay": null,
+        "VaapiDevice": "/dev/dri/renderD128",
+        "QsvDevice": "",
+        "EnableTonemapping": false,
+        "EnableVppTonemapping": false,
+        "EnableVideoToolboxTonemapping": false,
+        "TonemappingAlgorithm": "bt2390",
+        "TonemappingMode": "auto",
+        "TonemappingRange": "auto",
+        "TonemappingDesat": 0.0,
+        "TonemappingPeak": 100.0,
+        "TonemappingParam": 0.0,
+        "VppTonemappingBrightness": 16.0,
+        "VppTonemappingContrast": 1.0,
+        "H264Crf": 23,
+        "H265Crf": 28,
+        "EncoderPreset": null,
+        "DeinterlaceDoubleRate": false,
+        "DeinterlaceMethod": "yadif",
+        "EnableDecodingColorDepth10Hevc": true,
+        "EnableDecodingColorDepth10Vp9": true,
+        "EnableDecodingColorDepth10HevcRext": false,
+        "EnableDecodingColorDepth12HevcRext": false,
+        "EnableEnhancedNvdecDecoder": true,
+        "PreferSystemNativeHwDecoder": true,
+        "EnableIntelLowPowerH264HwEncoder": false,
+        "EnableIntelLowPowerHevcHwEncoder": false,
+        "EnableHardwareEncoding": true,
+        "AllowHevcEncoding": false,
+        "AllowAv1Encoding": false,
+        "EnableSubtitleExtraction": true,
+        "SubtitleExtractionTimeoutMinutes": 30,
+        "HardwareDecodingCodecs": ["h264", "vc1"],
+        "AllowOnDemandMetadataBasedKeyframeExtractionForExtensions": ["mkv"],
+        "HlsAudioSeekStrategy": "DisableAccurateSeek"
+    })
+}
+
+fn encoding_configuration_json(payload: serde_json::Value) -> serde_json::Value {
+    let mut config = default_encoding_configuration();
+    for key in [
+        "EncodingThreadCount",
+        "TranscodingTempPath",
+        "FallbackFontPath",
+        "EnableFallbackFont",
+        "EnableAudioVbr",
+        "DownMixAudioBoost",
+        "DownMixStereoAlgorithm",
+        "MaxMuxingQueueSize",
+        "EnableThrottling",
+        "ThrottleDelaySeconds",
+        "EnableSegmentDeletion",
+        "SegmentKeepSeconds",
+        "HardwareAccelerationType",
+        "EncoderAppPath",
+        "EncoderAppPathDisplay",
+        "VaapiDevice",
+        "QsvDevice",
+        "EnableTonemapping",
+        "EnableVppTonemapping",
+        "EnableVideoToolboxTonemapping",
+        "TonemappingAlgorithm",
+        "TonemappingMode",
+        "TonemappingRange",
+        "TonemappingDesat",
+        "TonemappingPeak",
+        "TonemappingParam",
+        "VppTonemappingBrightness",
+        "VppTonemappingContrast",
+        "H264Crf",
+        "H265Crf",
+        "EncoderPreset",
+        "DeinterlaceDoubleRate",
+        "DeinterlaceMethod",
+        "EnableDecodingColorDepth10Hevc",
+        "EnableDecodingColorDepth10Vp9",
+        "EnableDecodingColorDepth10HevcRext",
+        "EnableDecodingColorDepth12HevcRext",
+        "EnableEnhancedNvdecDecoder",
+        "PreferSystemNativeHwDecoder",
+        "EnableIntelLowPowerH264HwEncoder",
+        "EnableIntelLowPowerHevcHwEncoder",
+        "EnableHardwareEncoding",
+        "AllowHevcEncoding",
+        "AllowAv1Encoding",
+        "EnableSubtitleExtraction",
+        "SubtitleExtractionTimeoutMinutes",
+        "HardwareDecodingCodecs",
+        "AllowOnDemandMetadataBasedKeyframeExtractionForExtensions",
+        "HlsAudioSeekStrategy",
+    ] {
+        merge_known_network_value(&mut config, &payload, key);
+    }
     config
 }
 
@@ -7003,6 +7127,198 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({ "SaveImagePathsInNfo": true }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn encoding_named_configuration_round_trips_dashboard_contract() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/encoding")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/encoding")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(defaults["HardwareAccelerationType"], "none");
+        assert_eq!(defaults["EncodingThreadCount"], -1);
+        assert_eq!(defaults["TranscodingTempPath"], Value::Null);
+        assert_eq!(defaults["FallbackFontPath"], Value::Null);
+        assert_eq!(defaults["EncoderAppPath"], Value::Null);
+        assert_eq!(defaults["EncoderAppPathDisplay"], Value::Null);
+        assert_eq!(defaults["VaapiDevice"], "/dev/dri/renderD128");
+        assert_eq!(defaults["EncoderPreset"], Value::Null);
+        assert_eq!(defaults["EnableHardwareEncoding"], true);
+        assert_eq!(defaults["EnableSubtitleExtraction"], true);
+        assert_eq!(defaults["HardwareDecodingCodecs"], json!(["h264", "vc1"]));
+        assert_eq!(
+            defaults["AllowOnDemandMetadataBasedKeyframeExtractionForExtensions"],
+            json!(["mkv"])
+        );
+        assert_eq!(defaults["HlsAudioSeekStrategy"], "DisableAccurateSeek");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/encoding")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload = json!({
+            "HardwareAccelerationType": "vaapi",
+            "VaapiDevice": "/dev/dri/renderD129",
+            "EncodingThreadCount": 4,
+            "TranscodingTempPath": "/tmp/jellyrin-transcode",
+            "FallbackFontPath": "/usr/share/fonts",
+            "EnableFallbackFont": true,
+            "EnableAudioVbr": true,
+            "DownMixAudioBoost": 1.5,
+            "DownMixStereoAlgorithm": "Rfc7845",
+            "MaxMuxingQueueSize": 4096,
+            "EnableThrottling": true,
+            "ThrottleDelaySeconds": 60,
+            "EnableSegmentDeletion": true,
+            "SegmentKeepSeconds": 300,
+            "EnableTonemapping": true,
+            "EnableVppTonemapping": true,
+            "TonemappingAlgorithm": "mobius",
+            "TonemappingMode": "max",
+            "TonemappingRange": "pc",
+            "TonemappingPeak": 120.0,
+            "VppTonemappingBrightness": 20.0,
+            "VppTonemappingContrast": 1.2,
+            "H264Crf": 20,
+            "H265Crf": 24,
+            "EncoderPreset": "fast",
+            "DeinterlaceMethod": "bwdif",
+            "DeinterlaceDoubleRate": true,
+            "EnableDecodingColorDepth10Hevc": false,
+            "EnableDecodingColorDepth10Vp9": false,
+            "EnableHardwareEncoding": false,
+            "AllowHevcEncoding": true,
+            "AllowAv1Encoding": true,
+            "EnableSubtitleExtraction": false,
+            "SubtitleExtractionTimeoutMinutes": 15,
+            "HardwareDecodingCodecs": ["h264", "hevc"],
+            "AllowOnDemandMetadataBasedKeyframeExtractionForExtensions": ["mkv", "mp4"],
+            "HlsAudioSeekStrategy": "TranscodeAudio",
+            "UnknownEncodingField": "ignored"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/encoding")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/system/configuration/encoding")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["HardwareAccelerationType"], "vaapi");
+        assert_eq!(config["VaapiDevice"], "/dev/dri/renderD129");
+        assert_eq!(config["EncodingThreadCount"], 4);
+        assert_eq!(config["TranscodingTempPath"], "/tmp/jellyrin-transcode");
+        assert_eq!(config["EnableFallbackFont"], true);
+        assert_eq!(config["DownMixAudioBoost"], 1.5);
+        assert_eq!(config["DownMixStereoAlgorithm"], "Rfc7845");
+        assert_eq!(config["EnableThrottling"], true);
+        assert_eq!(config["EnableSegmentDeletion"], true);
+        assert_eq!(config["EnableTonemapping"], true);
+        assert_eq!(config["EnableVppTonemapping"], true);
+        assert_eq!(config["TonemappingAlgorithm"], "mobius");
+        assert_eq!(config["TonemappingMode"], "max");
+        assert_eq!(config["TonemappingRange"], "pc");
+        assert_eq!(config["H264Crf"], 20);
+        assert_eq!(config["H265Crf"], 24);
+        assert_eq!(config["EncoderPreset"], "fast");
+        assert_eq!(config["DeinterlaceMethod"], "bwdif");
+        assert_eq!(config["DeinterlaceDoubleRate"], true);
+        assert_eq!(config["EnableHardwareEncoding"], false);
+        assert_eq!(config["AllowHevcEncoding"], true);
+        assert_eq!(config["AllowAv1Encoding"], true);
+        assert_eq!(config["EnableSubtitleExtraction"], false);
+        assert_eq!(config["HardwareDecodingCodecs"], json!(["h264", "hevc"]));
+        assert_eq!(
+            config["AllowOnDemandMetadataBasedKeyframeExtractionForExtensions"],
+            json!(["mkv", "mp4"])
+        );
+        assert_eq!(config["HlsAudioSeekStrategy"], "TranscodeAudio");
+        assert!(config.get("UnknownEncodingField").is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration/encoding")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "HardwareAccelerationType": "none" }).to_string(),
                     ))
                     .unwrap(),
             )
