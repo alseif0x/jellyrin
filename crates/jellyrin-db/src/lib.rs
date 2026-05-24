@@ -642,6 +642,35 @@ impl Database {
         self.user_by_id(user.id).await
     }
 
+    pub async fn update_user_profile(
+        &self,
+        user_id: Uuid,
+        name: &str,
+        is_administrator: bool,
+        is_disabled: bool,
+    ) -> anyhow::Result<User> {
+        let trimmed_name = name.trim();
+        anyhow::ensure!(!trimmed_name.is_empty(), "user name must not be empty");
+        self.user_by_id(user_id).await?;
+
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET name = ?1, is_administrator = ?2, is_disabled = ?3, updated_at = ?4
+            WHERE id = ?5
+            "#,
+        )
+        .bind(trimmed_name)
+        .bind(is_administrator)
+        .bind(is_disabled)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        self.user_by_id(user_id).await
+    }
+
     pub async fn authenticate_user_by_name(
         &self,
         username: &str,

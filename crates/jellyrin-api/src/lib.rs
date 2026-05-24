@@ -35,6 +35,10 @@ use uuid::Uuid;
 
 const COMPATIBLE_SERVER_VERSION: &str = "12.0.0";
 const COMPATIBLE_PRODUCT_NAME: &str = "Jellyfin Server";
+const DEFAULT_AUTHENTICATION_PROVIDER_ID: &str =
+    "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider";
+const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
+    "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 
@@ -181,8 +185,26 @@ pub fn router(state: AppState) -> Router {
         .route("/Startup/Complete", post(post_startup_complete))
         .route("/Users/Public", get(get_public_users))
         .route("/users/public", get(get_public_users))
-        .route("/Users", get(get_users))
-        .route("/users", get(get_users))
+        .route("/Auth/Providers", get(authentication_providers))
+        .route("/auth/providers", get(authentication_providers))
+        .route(
+            "/Auth/PasswordResetProviders",
+            get(password_reset_providers),
+        )
+        .route(
+            "/auth/passwordresetproviders",
+            get(password_reset_providers),
+        )
+        .route(
+            "/Session/Auth/PasswordResetProviders",
+            get(password_reset_providers),
+        )
+        .route(
+            "/session/auth/passwordresetproviders",
+            get(password_reset_providers),
+        )
+        .route("/Users", get(get_users).post(update_user))
+        .route("/users", get(get_users).post(update_user))
         .route("/Users/Configuration", post(update_user_configuration))
         .route("/users/configuration", post(update_user_configuration))
         .route("/Users/AuthenticateByName", post(authenticate_by_name))
@@ -211,6 +233,8 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{user_id}/items/resume", get(user_resume_items))
         .route("/Users/{user_id}", get(get_user_by_id))
         .route("/users/{user_id}", get(get_user_by_id))
+        .route("/Users/{user_id}/Policy", post(update_user_policy))
+        .route("/users/{user_id}/policy", post(update_user_policy))
         .route("/Sessions/Logout", post(logout))
         .route("/sessions/logout", post(logout))
         .route("/Sessions/Playing", post(report_playback_start))
@@ -243,6 +267,8 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/programs", get(empty_items_result))
         .route("/LiveTv/RecommendedPrograms", get(empty_items_result))
         .route("/livetv/recommendedprograms", get(empty_items_result))
+        .route("/LiveTv/Programs/Recommended", get(empty_items_result))
+        .route("/livetv/programs/recommended", get(empty_items_result))
         .route("/LiveTv/Recordings", get(empty_items_result))
         .route("/livetv/recordings", get(empty_items_result))
         .route("/LiveTv/RecordingGroups", get(empty_items_result))
@@ -582,6 +608,97 @@ async fn get_users(
         dtos.push(user_to_dto(&state.db, user, server.server_id).await?);
     }
     Ok(Json(dtos))
+}
+
+async fn authentication_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(vec![serde_json::json!({
+        "Name": "Default",
+        "Id": DEFAULT_AUTHENTICATION_PROVIDER_ID
+    })]))
+}
+
+async fn password_reset_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(vec![serde_json::json!({
+        "Name": "Default",
+        "Id": DEFAULT_PASSWORD_RESET_PROVIDER_ID
+    })]))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "UserId", alias = "userId")]
+    user_id: Option<String>,
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UpdateUserQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user_id = query
+        .user_id
+        .as_deref()
+        .or_else(|| payload.get("Id").and_then(serde_json::Value::as_str))
+        .ok_or_else(|| ApiError::bad_request("User id is required"))?;
+    update_user_profile_from_payload(&state.db, resolve_user_id(user_id)?, payload).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_user_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    update_user_profile_from_payload(&state.db, user_id, serde_json::json!({ "Policy": payload }))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_user_profile_from_payload(
+    db: &Database,
+    user_id: Uuid,
+    payload: serde_json::Value,
+) -> Result<User, ApiError> {
+    let current = db
+        .users()
+        .await?
+        .into_iter()
+        .find(|user| user.id == user_id)
+        .ok_or_else(|| ApiError::not_found("User not found"))?;
+    let policy = payload.get("Policy");
+    let name = payload
+        .get("Name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&current.name);
+    let is_administrator =
+        bool_value(policy, "IsAdministrator").unwrap_or(current.is_administrator);
+    let is_disabled = bool_value(policy, "IsDisabled").unwrap_or(current.is_disabled);
+    db.update_user_profile(user_id, name, is_administrator, is_disabled)
+        .await
+        .map_err(ApiError::from)
+}
+
+fn bool_value(payload: Option<&serde_json::Value>, key: &str) -> Option<bool> {
+    payload
+        .and_then(|payload| payload.get(key))
+        .and_then(serde_json::Value::as_bool)
 }
 
 async fn authenticate_by_name(
@@ -4092,10 +4209,29 @@ async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<User
         policy: UserPolicyDto {
             is_administrator: user.is_administrator,
             is_disabled: user.is_disabled,
+            is_hidden: false,
             enable_all_devices: true,
             enable_remote_control_of_other_users: user.is_administrator,
             enable_shared_device_control: true,
             enable_remote_access: true,
+            enable_collection_management: user.is_administrator,
+            enable_subtitle_management: user.is_administrator,
+            enable_content_downloading: true,
+            enable_live_tv_management: user.is_administrator,
+            enable_live_tv_access: true,
+            enable_media_playback: true,
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            force_remote_source_transcoding: false,
+            enable_content_deletion: false,
+            enable_content_deletion_from_folders: Vec::new(),
+            remote_client_bitrate_limit: 0,
+            login_attempts_before_lockout: -1,
+            max_active_sessions: 0,
+            authentication_provider_id: DEFAULT_AUTHENTICATION_PROVIDER_ID.to_string(),
+            password_reset_provider_id: DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_string(),
+            sync_play_access: "CreateAndJoinGroups".to_string(),
         },
     })
 }
@@ -4391,8 +4527,9 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, load_countries, load_cultures, parse_authorization_token,
-        parse_media_browser_pairs, router,
+        AppState, DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
+        load_countries, load_cultures, parse_authorization_token, parse_media_browser_pairs,
+        router,
     };
     use axum::{
         body::Body,
@@ -8266,7 +8403,169 @@ mod tests {
                     .iter()
                     .all(|user| user["Policy"]["IsAdministrator"] == true)
             );
+            assert_eq!(
+                users[0]["Policy"]["AuthenticationProviderId"],
+                DEFAULT_AUTHENTICATION_PROVIDER_ID
+            );
+            assert_eq!(
+                users[0]["Policy"]["PasswordResetProviderId"],
+                DEFAULT_PASSWORD_RESET_PROVIDER_ID
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn user_admin_provider_and_policy_routes_support_dashboard_editing() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "test-key")
+            .await
+            .unwrap();
+        let managed = db
+            .upsert_admin_user("managed", "managed-secret")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for endpoint in ["/Auth/Providers", "/Auth/PasswordResetProviders"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Auth/Providers")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let providers: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(providers[0]["Name"], "Default");
+        assert_eq!(providers[0]["Id"], DEFAULT_AUTHENTICATION_PROVIDER_ID);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Auth/PasswordResetProviders")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let providers: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(providers[0]["Name"], "Default");
+        assert_eq!(providers[0]["Id"], DEFAULT_PASSWORD_RESET_PROVIDER_ID);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users?userId={}", managed.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": managed.id,
+                            "Name": "managed-renamed",
+                            "Policy": {
+                                "IsAdministrator": false,
+                                "IsDisabled": true
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}", managed.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user["Name"], "managed-renamed");
+        assert_eq!(user["Policy"]["IsAdministrator"], false);
+        assert_eq!(user["Policy"]["IsDisabled"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{}/Policy", managed.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "IsAdministrator": true,
+                            "IsDisabled": false,
+                            "AuthenticationProviderId": DEFAULT_AUTHENTICATION_PROVIDER_ID,
+                            "PasswordResetProviderId": DEFAULT_PASSWORD_RESET_PROVIDER_ID
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}", managed.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user["Name"], "managed-renamed");
+        assert_eq!(user["Policy"]["IsAdministrator"], true);
+        assert_eq!(user["Policy"]["IsDisabled"], false);
     }
 
     #[tokio::test]
