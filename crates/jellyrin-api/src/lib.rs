@@ -2062,6 +2062,14 @@ async fn named_configuration(
                 .await?
                 .unwrap_or_else(default_network_configuration)
         }
+        "livetv" => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(default_live_tv_configuration)
+        }
         _ => serde_json::json!({}),
     };
     Ok(Json(value))
@@ -2076,25 +2084,31 @@ async fn update_named_configuration(
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let key = key.to_ascii_lowercase();
-    if key != "network" {
-        return Ok(StatusCode::NOT_IMPLEMENTED);
-    }
-
-    let normalized = network_configuration_json(payload);
-    if let Some(enable_remote_access) = normalized
-        .get("EnableRemoteAccess")
-        .and_then(serde_json::Value::as_bool)
-    {
-        state.db.set_remote_access(enable_remote_access).await?;
-    }
+    let (normalized, activity_name) = match key.as_str() {
+        "network" => {
+            let normalized = network_configuration_json(payload);
+            if let Some(enable_remote_access) = normalized
+                .get("EnableRemoteAccess")
+                .and_then(serde_json::Value::as_bool)
+            {
+                state.db.set_remote_access(enable_remote_access).await?;
+            }
+            (normalized, "Network configuration updated")
+        }
+        "livetv" => (
+            live_tv_configuration_json(payload),
+            "Live TV configuration updated",
+        ),
+        _ => return Ok(StatusCode::NOT_IMPLEMENTED),
+    };
     state
         .db
         .update_named_configuration(&key, normalized)
         .await?;
     record_activity(
         &state.db,
-        "Network configuration updated",
-        Some("Network configuration was updated."),
+        activity_name,
+        Some("Named configuration was updated."),
         "System",
         Some(user.id),
     )
@@ -2166,6 +2180,50 @@ fn merge_known_network_value(
     if let Some(value) = payload.get(key) {
         config[key] = value.clone();
     }
+}
+
+fn default_live_tv_configuration() -> serde_json::Value {
+    serde_json::json!({
+        "GuideDays": null,
+        "RecordingPath": "",
+        "MovieRecordingPath": "",
+        "SeriesRecordingPath": "",
+        "EnableRecordingSubfolders": false,
+        "EnableOriginalAudioWithEncodedRecordings": false,
+        "TunerHosts": [],
+        "ListingProviders": [],
+        "PrePaddingSeconds": 180,
+        "PostPaddingSeconds": 180,
+        "MediaLocationsCreated": [],
+        "RecordingPostProcessor": "",
+        "RecordingPostProcessorArguments": "",
+        "SaveRecordingNFO": false,
+        "SaveRecordingImages": false
+    })
+}
+
+fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
+    let mut config = default_live_tv_configuration();
+    merge_known_network_value(&mut config, &payload, "GuideDays");
+    merge_known_network_value(&mut config, &payload, "RecordingPath");
+    merge_known_network_value(&mut config, &payload, "MovieRecordingPath");
+    merge_known_network_value(&mut config, &payload, "SeriesRecordingPath");
+    merge_known_network_value(&mut config, &payload, "EnableRecordingSubfolders");
+    merge_known_network_value(
+        &mut config,
+        &payload,
+        "EnableOriginalAudioWithEncodedRecordings",
+    );
+    merge_known_network_value(&mut config, &payload, "TunerHosts");
+    merge_known_network_value(&mut config, &payload, "ListingProviders");
+    merge_known_network_value(&mut config, &payload, "PrePaddingSeconds");
+    merge_known_network_value(&mut config, &payload, "PostPaddingSeconds");
+    merge_known_network_value(&mut config, &payload, "MediaLocationsCreated");
+    merge_known_network_value(&mut config, &payload, "RecordingPostProcessor");
+    merge_known_network_value(&mut config, &payload, "RecordingPostProcessorArguments");
+    merge_known_network_value(&mut config, &payload, "SaveRecordingNFO");
+    merge_known_network_value(&mut config, &payload, "SaveRecordingImages");
+    config
 }
 
 async fn update_branding_configuration(
@@ -6452,6 +6510,140 @@ mod tests {
 
         let startup = db.startup_config().await.unwrap();
         assert!(!startup.enable_remote_access);
+    }
+
+    #[tokio::test]
+    async fn live_tv_named_configuration_round_trips_dashboard_contract() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/livetv")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/livetv")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(defaults["GuideDays"], Value::Null);
+        assert_eq!(defaults["RecordingPath"], "");
+        assert_eq!(defaults["PrePaddingSeconds"], 180);
+        assert_eq!(defaults["PostPaddingSeconds"], 180);
+        assert_eq!(defaults["SaveRecordingNFO"], false);
+        assert!(defaults["TunerHosts"].is_array());
+        assert!(defaults["ListingProviders"].is_array());
+
+        let payload = json!({
+            "GuideDays": 7,
+            "RecordingPath": "/srv/recordings",
+            "MovieRecordingPath": "/srv/recordings/movies",
+            "SeriesRecordingPath": "/srv/recordings/series",
+            "EnableRecordingSubfolders": true,
+            "EnableOriginalAudioWithEncodedRecordings": true,
+            "TunerHosts": [{ "Id": "tuner-1", "Url": "http://192.0.2.10" }],
+            "ListingProviders": [{ "Id": "provider-1", "Type": "xmltv" }],
+            "PrePaddingSeconds": 300,
+            "PostPaddingSeconds": 600,
+            "MediaLocationsCreated": ["/srv/recordings"],
+            "RecordingPostProcessor": "/usr/local/bin/process-recording",
+            "RecordingPostProcessorArguments": "{path}",
+            "SaveRecordingNFO": true,
+            "SaveRecordingImages": true,
+            "UnknownLiveTvField": "ignored"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration/livetv")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/system/configuration/livetv")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["GuideDays"], 7);
+        assert_eq!(config["RecordingPath"], "/srv/recordings");
+        assert_eq!(config["MovieRecordingPath"], "/srv/recordings/movies");
+        assert_eq!(config["SeriesRecordingPath"], "/srv/recordings/series");
+        assert_eq!(config["EnableRecordingSubfolders"], true);
+        assert_eq!(config["EnableOriginalAudioWithEncodedRecordings"], true);
+        assert_eq!(config["PrePaddingSeconds"], 300);
+        assert_eq!(config["PostPaddingSeconds"], 600);
+        assert_eq!(
+            config["RecordingPostProcessor"],
+            "/usr/local/bin/process-recording"
+        );
+        assert_eq!(config["RecordingPostProcessorArguments"], "{path}");
+        assert_eq!(config["SaveRecordingNFO"], true);
+        assert_eq!(config["SaveRecordingImages"], true);
+        assert_eq!(config["TunerHosts"].as_array().unwrap().len(), 1);
+        assert_eq!(config["ListingProviders"].as_array().unwrap().len(), 1);
+        assert!(config.get("UnknownLiveTvField").is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/metadata")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Sentinel": "not-persisted" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
