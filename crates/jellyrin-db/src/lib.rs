@@ -194,7 +194,7 @@ impl Database {
         let state = self.server_state().await?;
         let row = sqlx::query_as::<_, StartupConfigRow>(
             r#"
-            SELECT ui_culture, metadata_country_code, preferred_metadata_language, enable_remote_access
+            SELECT ui_culture, metadata_country_code, preferred_metadata_language, dummy_chapter_duration, chapter_image_resolution, enable_remote_access
             FROM startup_config
             WHERE id = 1
             "#,
@@ -208,6 +208,8 @@ impl Database {
                 ui_culture: row.ui_culture,
                 metadata_country_code: row.metadata_country_code,
                 preferred_metadata_language: row.preferred_metadata_language,
+                dummy_chapter_duration: row.dummy_chapter_duration,
+                chapter_image_resolution: row.chapter_image_resolution,
                 enable_remote_access: row.enable_remote_access,
             }),
             None => self.create_initial_startup_config(state.server_name).await,
@@ -231,13 +233,15 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO startup_config (
-                id, ui_culture, metadata_country_code, preferred_metadata_language, enable_remote_access, updated_at
+                id, ui_culture, metadata_country_code, preferred_metadata_language, dummy_chapter_duration, chapter_image_resolution, enable_remote_access, updated_at
             )
-            VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(id) DO UPDATE SET
                 ui_culture = excluded.ui_culture,
                 metadata_country_code = excluded.metadata_country_code,
                 preferred_metadata_language = excluded.preferred_metadata_language,
+                dummy_chapter_duration = excluded.dummy_chapter_duration,
+                chapter_image_resolution = excluded.chapter_image_resolution,
                 enable_remote_access = excluded.enable_remote_access,
                 updated_at = excluded.updated_at
             "#,
@@ -245,6 +249,8 @@ impl Database {
         .bind(config.ui_culture)
         .bind(config.metadata_country_code)
         .bind(config.preferred_metadata_language)
+        .bind(config.dummy_chapter_duration)
+        .bind(config.chapter_image_resolution)
         .bind(config.enable_remote_access)
         .bind(now)
         .execute(&self.pool)
@@ -1712,6 +1718,8 @@ impl Database {
             ui_culture: "en-US".to_string(),
             metadata_country_code: "US".to_string(),
             preferred_metadata_language: "en".to_string(),
+            dummy_chapter_duration: 0,
+            chapter_image_resolution: "MatchSource".to_string(),
             enable_remote_access: false,
         };
         self.update_startup_config(config.clone()).await?;
@@ -2183,6 +2191,8 @@ struct StartupConfigRow {
     ui_culture: String,
     metadata_country_code: String,
     preferred_metadata_language: String,
+    dummy_chapter_duration: i64,
+    chapter_image_resolution: String,
     enable_remote_access: bool,
 }
 

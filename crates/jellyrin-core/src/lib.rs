@@ -17,6 +17,8 @@ pub struct StartupConfig {
     pub ui_culture: String,
     pub metadata_country_code: String,
     pub preferred_metadata_language: String,
+    pub dummy_chapter_duration: i64,
+    pub chapter_image_resolution: String,
     pub enable_remote_access: bool,
 }
 

@@ -544,6 +544,8 @@ async fn post_startup_configuration(
             ui_culture: payload.ui_culture,
             metadata_country_code: payload.metadata_country_code,
             preferred_metadata_language: payload.preferred_metadata_language,
+            dummy_chapter_duration: current.dummy_chapter_duration,
+            chapter_image_resolution: current.chapter_image_resolution,
             enable_remote_access: current.enable_remote_access,
         })
         .await?;
@@ -1925,6 +1927,10 @@ struct SystemConfigurationUpdate {
     metadata_country_code: Option<String>,
     #[serde(alias = "PreferredMetadataLanguage")]
     preferred_metadata_language: Option<String>,
+    #[serde(alias = "DummyChapterDuration")]
+    dummy_chapter_duration: Option<i64>,
+    #[serde(alias = "ChapterImageResolution")]
+    chapter_image_resolution: Option<String>,
     #[serde(alias = "EnableRemoteAccess")]
     enable_remote_access: Option<bool>,
     #[serde(rename = "ContentTypes", alias = "contentTypes")]
@@ -1945,6 +1951,10 @@ async fn update_system_configuration(
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let current = state.db.startup_config().await?;
+    let chapter_image_resolution = match payload.chapter_image_resolution {
+        Some(value) => validate_chapter_image_resolution(value, &current.chapter_image_resolution)?,
+        None => current.chapter_image_resolution,
+    };
     state
         .db
         .update_startup_config(StartupConfig {
@@ -1958,6 +1968,10 @@ async fn update_system_configuration(
                 payload.preferred_metadata_language,
                 current.preferred_metadata_language,
             ),
+            dummy_chapter_duration: payload
+                .dummy_chapter_duration
+                .unwrap_or(current.dummy_chapter_duration),
+            chapter_image_resolution,
             enable_remote_access: payload
                 .enable_remote_access
                 .unwrap_or(current.enable_remote_access),
@@ -2003,6 +2017,18 @@ fn non_empty_or_current(update: Option<String>, current: String) -> String {
         .unwrap_or(current)
 }
 
+fn validate_chapter_image_resolution(update: String, current: &str) -> Result<String, ApiError> {
+    let value = update.trim();
+    if value.is_empty() {
+        return Ok(current.to_string());
+    }
+    match value {
+        "MatchSource" | "P144" | "P240" | "P360" | "P480" | "P720" | "P1080" | "P1440"
+        | "P2160" => Ok(value.to_string()),
+        _ => Err(ApiError::bad_request("Invalid ChapterImageResolution")),
+    }
+}
+
 fn array_update_or_current(
     update: Option<serde_json::Value>,
     current: serde_json::Value,
@@ -2023,6 +2049,8 @@ fn system_configuration_json(
         "UICulture": config.ui_culture,
         "MetadataCountryCode": config.metadata_country_code,
         "PreferredMetadataLanguage": config.preferred_metadata_language,
+        "DummyChapterDuration": config.dummy_chapter_duration,
+        "ChapterImageResolution": config.chapter_image_resolution,
         "EnableRemoteAccess": config.enable_remote_access,
         "EnableUPnP": false,
         "IsStartupWizardCompleted": startup_wizard_completed,
@@ -6246,6 +6274,22 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/System/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let default_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(default_config["DummyChapterDuration"], 0);
+        assert_eq!(default_config["ChapterImageResolution"], "MatchSource");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri("/System/Configuration")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -6255,6 +6299,8 @@ mod tests {
                             "UICulture": "es-ES",
                             "MetadataCountryCode": "ES",
                             "PreferredMetadataLanguage": "es",
+                            "DummyChapterDuration": 300,
+                            "ChapterImageResolution": "P720",
                             "EnableRemoteAccess": true,
                             "UnknownJellyfinWebSetting": "ignored",
                             "MetadataOptions": [{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }],
@@ -6284,6 +6330,8 @@ mod tests {
                             "UICulture": "es-ES",
                             "MetadataCountryCode": "ES",
                             "PreferredMetadataLanguage": "es",
+                            "DummyChapterDuration": 300,
+                            "ChapterImageResolution": "P720",
                             "EnableRemoteAccess": true,
                             "UnknownJellyfinWebSetting": "ignored",
                             "MetadataOptions": [{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }],
@@ -6316,6 +6364,8 @@ mod tests {
         assert_eq!(updated_config["UICulture"], "es-ES");
         assert_eq!(updated_config["MetadataCountryCode"], "ES");
         assert_eq!(updated_config["PreferredMetadataLanguage"], "es");
+        assert_eq!(updated_config["DummyChapterDuration"], 300);
+        assert_eq!(updated_config["ChapterImageResolution"], "P720");
         assert_eq!(updated_config["EnableRemoteAccess"], true);
         assert_eq!(updated_config["IsStartupWizardCompleted"], false);
         assert_eq!(
@@ -6340,6 +6390,8 @@ mod tests {
         assert_eq!(persisted_config.ui_culture, "es-ES");
         assert_eq!(persisted_config.metadata_country_code, "ES");
         assert_eq!(persisted_config.preferred_metadata_language, "es");
+        assert_eq!(persisted_config.dummy_chapter_duration, 300);
+        assert_eq!(persisted_config.chapter_image_resolution, "P720");
         assert!(persisted_config.enable_remote_access);
 
         let response = app
@@ -6356,6 +6408,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ChapterImageResolution": "InvalidResolution" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
@@ -6409,6 +6478,8 @@ mod tests {
         let preserved_config: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(preserved_config["ServerName"], "Jellyrin Admin QA");
         assert_eq!(preserved_config["UICulture"], "es-ES");
+        assert_eq!(preserved_config["DummyChapterDuration"], 300);
+        assert_eq!(preserved_config["ChapterImageResolution"], "P720");
         assert_eq!(preserved_config["EnableRemoteAccess"], false);
         assert_eq!(
             preserved_config["MetadataOptions"],
