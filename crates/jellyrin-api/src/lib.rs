@@ -280,6 +280,30 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/tunerhosts", post(add_live_tv_tuner_host))
         .route("/LiveTv/TunerHosts", delete(delete_live_tv_tuner_host))
         .route("/livetv/tunerhosts", delete(delete_live_tv_tuner_host))
+        .route(
+            "/LiveTv/ListingProviders/Default",
+            get(default_live_tv_listing_provider),
+        )
+        .route(
+            "/livetv/listingproviders/default",
+            get(default_live_tv_listing_provider),
+        )
+        .route(
+            "/LiveTv/ListingProviders",
+            post(add_live_tv_listing_provider),
+        )
+        .route(
+            "/livetv/listingproviders",
+            post(add_live_tv_listing_provider),
+        )
+        .route(
+            "/LiveTv/ListingProviders",
+            delete(delete_live_tv_listing_provider),
+        )
+        .route(
+            "/livetv/listingproviders",
+            delete(delete_live_tv_listing_provider),
+        )
         .route("/LiveTv/Channels", get(empty_items_result))
         .route("/livetv/channels", get(empty_items_result))
         .route("/LiveTv/Programs", get(empty_items_result))
@@ -2476,6 +2500,29 @@ fn default_live_tv_configuration() -> serde_json::Value {
     })
 }
 
+fn default_listing_provider_info() -> serde_json::Value {
+    serde_json::json!({
+        "Id": null,
+        "Type": null,
+        "Username": null,
+        "Password": null,
+        "ListingsId": null,
+        "ZipCode": null,
+        "Country": null,
+        "Path": null,
+        "EnabledTuners": [],
+        "EnableAllTuners": true,
+        "NewsCategories": ["news", "journalism", "documentary", "current affairs"],
+        "SportsCategories": ["sports", "basketball", "baseball", "football"],
+        "KidsCategories": ["kids", "family", "children", "childrens", "disney"],
+        "MovieCategories": ["movie"],
+        "ChannelMappings": [],
+        "MoviePrefix": null,
+        "PreferredLanguage": null,
+        "UserAgent": null
+    })
+}
+
 fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     let mut config = default_live_tv_configuration();
     merge_known_network_value(&mut config, &payload, "GuideDays");
@@ -3176,6 +3223,122 @@ async fn delete_live_tv_tuner_host(
         })
         .unwrap_or_default();
     config["TunerHosts"] = serde_json::json!(tuner_hosts);
+    state
+        .db
+        .update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn default_live_tv_listing_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(default_listing_provider_info()))
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveTvListingProviderPostQuery {
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(alias = "pw", alias = "Pw")]
+    _password: Option<String>,
+    #[serde(alias = "ValidateListings")]
+    _validate_listings: Option<bool>,
+    #[serde(alias = "ValidateLogin")]
+    _validate_login: Option<bool>,
+}
+
+async fn add_live_tv_listing_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveTvListingProviderPostQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !payload.is_object() {
+        return Err(ApiError::bad_request("Listing provider must be an object"));
+    }
+
+    let mut provider = default_listing_provider_info();
+    if let serde_json::Value::Object(fields) = payload {
+        for (key, value) in fields {
+            provider[key] = value;
+        }
+    }
+    let provider_id = provider
+        .get("Id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    provider["Id"] = serde_json::json!(provider_id);
+
+    let mut config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let mut listing_providers = config
+        .get("ListingProviders")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(existing) = listing_providers.iter_mut().find(|listing_provider| {
+        listing_provider
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            == provider.get("Id").and_then(serde_json::Value::as_str)
+    }) {
+        *existing = provider.clone();
+    } else {
+        listing_providers.push(provider.clone());
+    }
+    config["ListingProviders"] = serde_json::json!(listing_providers);
+    state
+        .db
+        .update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await?;
+    Ok(Json(provider))
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveTvListingProviderDeleteQuery {
+    #[serde(alias = "Id")]
+    id: Option<String>,
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+}
+
+async fn delete_live_tv_listing_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveTvListingProviderDeleteQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let provider_id = query.id.as_deref().unwrap_or_default();
+    let mut config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let listing_providers = config
+        .get("ListingProviders")
+        .and_then(serde_json::Value::as_array)
+        .map(|providers| {
+            providers
+                .iter()
+                .filter(|provider| {
+                    provider.get("Id").and_then(serde_json::Value::as_str) != Some(provider_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    config["ListingProviders"] = serde_json::json!(listing_providers);
     state
         .db
         .update_named_configuration("livetv", live_tv_configuration_json(config))
@@ -7552,6 +7715,187 @@ mod tests {
         let tuner_hosts = config["TunerHosts"].as_array().unwrap();
         assert_eq!(tuner_hosts.len(), 1);
         assert!(tuner_hosts.iter().all(|tuner| tuner["Id"] != "tuner-2"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/ListingProviders/Default")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/livetv/listingproviders/default")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let default_provider: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(default_provider["EnableAllTuners"], true);
+        assert_eq!(default_provider["NewsCategories"][0], "news");
+        assert!(
+            default_provider["EnabledTuners"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/ListingProviders")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "provider-2",
+                            "Type": "xmltv",
+                            "Path": "/srv/xmltv.xml",
+                            "EnableAllTuners": false,
+                            "EnabledTuners": ["tuner-1"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/ListingProviders?ValidateListings=true")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "provider-2",
+                            "Type": "xmltv",
+                            "Path": "/srv/xmltv.xml",
+                            "EnableAllTuners": false,
+                            "EnabledTuners": ["tuner-1"],
+                            "MovieCategories": ["film"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created_provider: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created_provider["Id"], "provider-2");
+        assert_eq!(created_provider["Type"], "xmltv");
+        assert_eq!(created_provider["MovieCategories"], json!(["film"]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/livetv/listingproviders")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "provider-2",
+                            "Type": "xmltv",
+                            "Path": "/srv/updated.xml",
+                            "EnableAllTuners": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/livetv")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        let providers = config["ListingProviders"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+        let provider = providers
+            .iter()
+            .find(|provider| provider["Id"] == "provider-2")
+            .unwrap();
+        assert_eq!(provider["Path"], "/srv/updated.xml");
+        assert_eq!(provider["EnableAllTuners"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/LiveTv/ListingProviders?id=provider-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/LiveTv/ListingProviders?id=provider-2")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/livetv")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        let providers = config["ListingProviders"].as_array().unwrap();
+        assert_eq!(providers.len(), 1);
+        assert!(
+            providers
+                .iter()
+                .all(|provider| provider["Id"] != "provider-2")
+        );
 
         let response = app
             .oneshot(
