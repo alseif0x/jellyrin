@@ -23,8 +23,8 @@ use jellyrin_compat::{
 };
 use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
 use jellyrin_db::{
-    ActivePlaybackSession, BrandingConfig, Database, DeviceSession, SystemConfigurationPayloads,
-    TaskRun,
+    ActivePlaybackSession, ActivityLogEntry, BrandingConfig, Database, DeviceSession,
+    SystemConfigurationPayloads, TaskRun,
 };
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -598,6 +598,14 @@ async fn authenticate_by_name(
         .await
         .map_err(|_| ApiError::unauthorized("Invalid username or password"))?;
     let server = state.db.server_state().await?;
+    record_activity(
+        &state.db,
+        &format!("{} signed in", user.name),
+        Some(&format!("{} signed in from {}", user.name, auth.client)),
+        "Authentication",
+        Some(user.id),
+    )
+    .await?;
 
     Ok(Json(
         authentication_result_to_dto(&state.db, &user, &token, server.server_id).await?,
@@ -910,8 +918,56 @@ fn folder_storage_json(path: PathBuf) -> serde_json::Value {
     })
 }
 
-async fn activity_log_entries() -> Json<serde_json::Value> {
-    Json(empty_result())
+#[derive(Debug, Deserialize)]
+struct ActivityLogQuery {
+    #[serde(alias = "StartIndex")]
+    start_index: Option<i64>,
+    #[serde(alias = "Limit")]
+    limit: Option<i64>,
+}
+
+async fn activity_log_entries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<ActivityLogQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let start_index = query.start_index.unwrap_or_default().max(0);
+    let limit = query.limit.unwrap_or(100).clamp(0, 1000);
+    let (entries, total) = state.db.activity_log_entries(start_index, limit).await?;
+    Ok(Json(serde_json::json!({
+        "Items": entries.iter().map(activity_log_entry_json).collect::<Vec<_>>(),
+        "TotalRecordCount": total,
+        "StartIndex": start_index
+    })))
+}
+
+fn activity_log_entry_json(entry: &ActivityLogEntry) -> serde_json::Value {
+    serde_json::json!({
+        "Id": entry.id,
+        "Name": entry.name,
+        "Overview": entry.overview,
+        "ShortOverview": entry.short_overview,
+        "Type": entry.entry_type,
+        "Severity": entry.severity,
+        "Date": format_time_for_json(entry.created_at),
+        "UserId": entry.user_id.map(|id| id.to_string()),
+        "ItemId": null,
+        "UserPrimaryImageTag": null
+    })
+}
+
+async fn record_activity(
+    db: &Database,
+    name: &str,
+    overview: Option<&str>,
+    entry_type: &str,
+    user_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    db.add_activity_log_entry(name, overview, overview, entry_type, user_id)
+        .await?;
+    Ok(())
 }
 
 async fn session_sessions(
@@ -1072,7 +1128,7 @@ async fn update_device_options(
     Query(query): Query<DeviceOptionsQuery>,
     Json(payload): Json<DeviceOptionsUpdate>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let Some(id) = trimmed_optional(query.id) else {
         return Err(ApiError::bad_request("Device id is required"));
     };
@@ -1083,6 +1139,14 @@ async fn update_device_options(
         return Err(ApiError::not_found("Device not found"));
     }
     state.db.update_device_name(&id, &custom_name).await?;
+    record_activity(
+        &state.db,
+        "Device options updated",
+        Some("A device custom name was updated."),
+        "Device",
+        Some(user.id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1104,7 +1168,7 @@ async fn delete_device(
     Query(auth_query): Query<AuthQuery>,
     Query(query): Query<DeleteDeviceQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     if let Some(id) = query
         .id
         .as_deref()
@@ -1112,6 +1176,14 @@ async fn delete_device(
         .filter(|id| !id.is_empty())
     {
         state.db.revoke_device(id).await?;
+        record_activity(
+            &state.db,
+            "Device deleted",
+            Some("A device was revoked."),
+            "Device",
+            Some(user.id),
+        )
+        .await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1154,7 +1226,7 @@ async fn update_system_configuration(
     Query(query): Query<AuthQuery>,
     Json(payload): Json<SystemConfigurationUpdate>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let current = state.db.startup_config().await?;
     state
         .db
@@ -1196,6 +1268,14 @@ async fn update_system_configuration(
             ),
         })
         .await?;
+    record_activity(
+        &state.db,
+        "Server configuration updated",
+        Some("Server configuration was updated."),
+        "System",
+        Some(user.id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1273,7 +1353,7 @@ async fn update_branding_configuration(
     Query(query): Query<AuthQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let current = state.db.branding_config().await?;
     state
         .db
@@ -1292,6 +1372,14 @@ async fn update_branding_configuration(
                 .unwrap_or(current.splashscreen_enabled),
         })
         .await?;
+    record_activity(
+        &state.db,
+        "Branding configuration updated",
+        Some("Branding configuration was updated."),
+        "System",
+        Some(user.id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1489,7 +1577,15 @@ async fn refresh_library(
     if !user.is_administrator {
         return Err(ApiError::forbidden("Administrator access required"));
     }
-    scan_all_library_items(&state.db).await?;
+    let scanned = scan_all_library_items(&state.db).await?;
+    record_activity(
+        &state.db,
+        "Library scan completed",
+        Some(&format!("Library refresh scanned {scanned} item(s).")),
+        "Library",
+        Some(user.id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4405,6 +4501,20 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries?StartIndex=0&Limit=20")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let activity: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(activity["TotalRecordCount"], 0);
@@ -4840,6 +4950,94 @@ mod tests {
             preserved_config["PluginRepositories"],
             json!([{ "Name": "Example", "Url": "https://example.invalid" }])
         );
+    }
+
+    #[tokio::test]
+    async fn activity_log_requires_admin_and_returns_persisted_events() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="activity-device", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ServerName": "Activity Server" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries?StartIndex=0&Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let activity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(activity["TotalRecordCount"], 2);
+        assert_eq!(activity["StartIndex"], 0);
+        assert_eq!(activity["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(activity["Items"][0]["Name"], "Server configuration updated");
+        assert_eq!(activity["Items"][0]["Type"], "System");
+        assert_eq!(activity["Items"][0]["Severity"], "Information");
+        assert_eq!(activity["Items"][0]["UserId"], user.id.to_string());
     }
 
     #[tokio::test]

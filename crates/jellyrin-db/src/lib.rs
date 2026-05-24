@@ -59,6 +59,18 @@ pub struct ActivePlaybackSession {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActivityLogEntry {
+    pub id: i64,
+    pub name: String,
+    pub overview: Option<String>,
+    pub short_overview: Option<String>,
+    pub entry_type: String,
+    pub severity: String,
+    pub user_id: Option<Uuid>,
+    pub created_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrandingConfig {
     pub login_disclaimer: Option<String>,
@@ -226,6 +238,79 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn add_activity_log_entry(
+        &self,
+        name: &str,
+        overview: Option<&str>,
+        short_overview: Option<&str>,
+        entry_type: &str,
+        user_id: Option<Uuid>,
+    ) -> anyhow::Result<ActivityLogEntry> {
+        let trimmed_name = name.trim();
+        let trimmed_type = entry_type.trim();
+        anyhow::ensure!(
+            !trimmed_name.is_empty(),
+            "activity log name must not be empty"
+        );
+        anyhow::ensure!(
+            !trimmed_type.is_empty(),
+            "activity log type must not be empty"
+        );
+
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO activity_log_entries (
+                name, overview, short_overview, entry_type, severity, user_id, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 'Information', ?5, ?6)
+            "#,
+        )
+        .bind(trimmed_name)
+        .bind(trimmed_optional_str(overview))
+        .bind(trimmed_optional_str(short_overview))
+        .bind(trimmed_type)
+        .bind(user_id.map(|id| id.to_string()))
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.activity_log_entry_by_rowid(result.last_insert_rowid())
+            .await
+    }
+
+    pub async fn activity_log_entries(
+        &self,
+        start_index: i64,
+        limit: i64,
+    ) -> anyhow::Result<(Vec<ActivityLogEntry>, i64)> {
+        let start_index = start_index.max(0);
+        let limit = limit.clamp(0, 1000);
+        let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM activity_log_entries")
+            .fetch_one(&self.pool)
+            .await?;
+
+        let rows = sqlx::query_as::<_, ActivityLogEntryRow>(
+            r#"
+            SELECT id, name, overview, short_overview, entry_type, severity, user_id, created_at
+            FROM activity_log_entries
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .bind(limit)
+        .bind(start_index)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok((
+            rows.into_iter()
+                .map(TryInto::try_into)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            total,
+        ))
     }
 
     pub async fn branding_config(&self) -> anyhow::Result<BrandingConfig> {
@@ -1456,6 +1541,21 @@ impl Database {
         row.try_into()
     }
 
+    async fn activity_log_entry_by_rowid(&self, rowid: i64) -> anyhow::Result<ActivityLogEntry> {
+        let row = sqlx::query_as::<_, ActivityLogEntryRow>(
+            r#"
+            SELECT id, name, overview, short_overview, entry_type, severity, user_id, created_at
+            FROM activity_log_entries
+            WHERE id = ?1
+            "#,
+        )
+        .bind(rowid)
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
     async fn touch_device_token(&self, token: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE devices SET last_activity_at = ?1 WHERE access_token = ?2")
             .bind(format_time(OffsetDateTime::now_utc())?)
@@ -1917,6 +2017,18 @@ struct ActivePlaybackSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct ActivityLogEntryRow {
+    id: i64,
+    name: String,
+    overview: Option<String>,
+    short_overview: Option<String>,
+    entry_type: String,
+    severity: String,
+    user_id: Option<String>,
+    created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct TaskRunRow {
     id: String,
     task_key: String,
@@ -2032,6 +2144,23 @@ impl TryFrom<ActivePlaybackSessionRow> for ActivePlaybackSession {
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             updated_at: parse_time(&row.playback_updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<ActivityLogEntryRow> for ActivityLogEntry {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ActivityLogEntryRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: row.id,
+            name: row.name,
+            overview: row.overview,
+            short_overview: row.short_overview,
+            entry_type: row.entry_type,
+            severity: row.severity,
+            user_id: row.user_id.as_deref().map(Uuid::parse_str).transpose()?,
+            created_at: parse_time(&row.created_at)?,
         })
     }
 }
@@ -2204,6 +2333,13 @@ fn normalized_locations(locations: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Database, SystemConfigurationPayloads};
@@ -2305,6 +2441,55 @@ mod tests {
         assert_eq!(sanitized.metadata_options, json!([]));
         assert_eq!(sanitized.path_substitutions, json!([]));
         assert_eq!(sanitized.plugin_repositories, json!([{ "Name": "Kept" }]));
+    }
+
+    #[tokio::test]
+    async fn activity_log_entries_page_newest_first() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+
+        let first = db
+            .add_activity_log_entry(
+                "First event",
+                Some("First overview"),
+                None,
+                "System",
+                Some(user.id),
+            )
+            .await
+            .unwrap();
+        let second = db
+            .add_activity_log_entry(
+                "Second event",
+                Some("Second overview"),
+                Some("Second short overview"),
+                "Library",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(second.id > first.id);
+        let (entries, total) = db.activity_log_entries(0, 1).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Second event");
+        assert_eq!(entries[0].entry_type, "Library");
+        assert_eq!(entries[0].severity, "Information");
+        assert_eq!(
+            entries[0].short_overview.as_deref(),
+            Some("Second short overview")
+        );
+        assert_eq!(entries[0].user_id, None);
+
+        let (entries, total) = db.activity_log_entries(1, 10).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "First event");
+        assert_eq!(entries[0].user_id, Some(user.id));
     }
 
     #[tokio::test]
