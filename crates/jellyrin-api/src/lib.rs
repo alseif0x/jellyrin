@@ -2070,6 +2070,14 @@ async fn named_configuration(
                 .await?
                 .unwrap_or_else(default_live_tv_configuration)
         }
+        "metadata" => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(default_metadata_configuration)
+        }
         _ => serde_json::json!({}),
     };
     Ok(Json(value))
@@ -2098,6 +2106,10 @@ async fn update_named_configuration(
         "livetv" => (
             live_tv_configuration_json(payload),
             "Live TV configuration updated",
+        ),
+        "metadata" => (
+            metadata_configuration_json(payload),
+            "Metadata configuration updated",
         ),
         _ => return Ok(StatusCode::NOT_IMPLEMENTED),
     };
@@ -2223,6 +2235,18 @@ fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     merge_known_network_value(&mut config, &payload, "RecordingPostProcessorArguments");
     merge_known_network_value(&mut config, &payload, "SaveRecordingNFO");
     merge_known_network_value(&mut config, &payload, "SaveRecordingImages");
+    config
+}
+
+fn default_metadata_configuration() -> serde_json::Value {
+    serde_json::json!({
+        "UseFileCreationTimeForDateAdded": false
+    })
+}
+
+fn metadata_configuration_json(payload: serde_json::Value) -> serde_json::Value {
+    let mut config = default_metadata_configuration();
+    merge_known_network_value(&mut config, &payload, "UseFileCreationTimeForDateAdded");
     config
 }
 
@@ -6105,8 +6129,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         for endpoint in [
-            "/System/Configuration/metadata",
-            "/system/configuration/metadata",
+            "/System/Configuration/unsupported",
+            "/system/configuration/unsupported",
         ] {
             let response = app
                 .clone()
@@ -6633,7 +6657,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/System/Configuration/metadata")
+                    .uri("/System/Configuration/unsupported")
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -6644,6 +6668,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn metadata_named_configuration_round_trips_dashboard_contract() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/metadata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/metadata")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(defaults["UseFileCreationTimeForDateAdded"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/metadata")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload = json!({
+            "UseFileCreationTimeForDateAdded": true,
+            "UnknownMetadataField": "ignored"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/metadata")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/system/configuration/metadata")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["UseFileCreationTimeForDateAdded"], true);
+        assert!(config.get("UnknownMetadataField").is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration/metadata")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "UseFileCreationTimeForDateAdded": false }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
