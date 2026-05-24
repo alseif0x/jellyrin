@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs,
     path::{Path as FsPath, PathBuf},
 };
@@ -2636,13 +2636,27 @@ async fn item_filters(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let items = state.db.media_items().await?;
+    let media_types = items
+        .iter()
+        .map(|item| item.media_type.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let containers = items
+        .iter()
+        .filter_map(media_item_container)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
     Ok(Json(serde_json::json!({
         "Genres": [],
         "Tags": [],
         "OfficialRatings": [],
         "Years": [],
-        "Containers": [],
-        "MediaTypes": [],
+        "Containers": containers,
+        "MediaTypes": media_types,
         "VideoTypes": [],
         "SeriesStatuses": [],
         "Staff": [],
@@ -6236,6 +6250,8 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let filters: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(filters["Genres"].as_array().unwrap().len(), 0);
+        assert_eq!(filters["MediaTypes"], json!(["Video"]));
+        assert_eq!(filters["Containers"], json!(["mp4"]));
 
         let response = app
             .clone()
