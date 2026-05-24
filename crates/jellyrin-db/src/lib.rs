@@ -59,6 +59,15 @@ pub struct ApiKey {
 }
 
 #[derive(Debug, Clone)]
+pub struct BackupManifest {
+    pub path: String,
+    pub server_version: String,
+    pub backup_engine_version: String,
+    pub options: Value,
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct ActivePlaybackSession {
     pub session_id: String,
     pub user_id: Uuid,
@@ -817,6 +826,69 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn backup_manifests(&self) -> anyhow::Result<Vec<BackupManifest>> {
+        let rows = sqlx::query_as::<_, BackupManifestRow>(
+            r#"
+            SELECT path, server_version, backup_engine_version, options_json, created_at
+            FROM backup_manifests
+            ORDER BY created_at DESC, path
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn backup_manifest(&self, path: &str) -> anyhow::Result<Option<BackupManifest>> {
+        let row = sqlx::query_as::<_, BackupManifestRow>(
+            r#"
+            SELECT path, server_version, backup_engine_version, options_json, created_at
+            FROM backup_manifests
+            WHERE path = ?1
+            "#,
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn create_backup_manifest(
+        &self,
+        server_version: &str,
+        backup_engine_version: &str,
+        options: Value,
+    ) -> anyhow::Result<BackupManifest> {
+        let now = OffsetDateTime::now_utc();
+        let created_at = format_time(now)?;
+        let path = format!("jellyrin-backup-{}.zip", Uuid::new_v4().simple());
+        sqlx::query(
+            r#"
+            INSERT INTO backup_manifests (
+                path, server_version, backup_engine_version, options_json, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(&path)
+        .bind(server_version)
+        .bind(backup_engine_version)
+        .bind(serde_json::to_string(&options)?)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(BackupManifest {
+            path,
+            server_version: server_version.to_string(),
+            backup_engine_version: backup_engine_version.to_string(),
+            options,
+            created_at: now,
+        })
     }
 
     pub async fn revoke_token(&self, token: &str) -> anyhow::Result<()> {
@@ -2229,6 +2301,15 @@ struct ApiKeyListRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct BackupManifestRow {
+    path: String,
+    server_version: String,
+    backup_engine_version: String,
+    options_json: String,
+    created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct VirtualFolderRow {
     id: String,
     name: String,
@@ -2526,6 +2607,20 @@ impl TryFrom<ApiKeyListRow> for ApiKey {
             name: row.name,
             created_at: parse_time(&row.created_at)?,
             last_activity_at: parse_time(&row.last_activity_at)?,
+        })
+    }
+}
+
+impl TryFrom<BackupManifestRow> for BackupManifest {
+    type Error = anyhow::Error;
+
+    fn try_from(row: BackupManifestRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            path: row.path,
+            server_version: row.server_version,
+            backup_engine_version: row.backup_engine_version,
+            options: serde_json::from_str(&row.options_json).context("invalid backup options")?,
+            created_at: parse_time(&row.created_at)?,
         })
     }
 }
@@ -2894,6 +2989,41 @@ mod tests {
         assert!(db.revoke_api_key(&api_key).await.unwrap());
         assert!(!db.revoke_api_key(&api_key).await.unwrap());
         assert!(db.user_by_api_key(&api_key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn backup_manifests_round_trip() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        let defaults = db.backup_manifests().await.unwrap();
+        assert!(defaults.is_empty());
+
+        let created = db
+            .create_backup_manifest(
+                "12.0.0",
+                "1",
+                json!({
+                    "Metadata": true,
+                    "Subtitles": false,
+                    "Trickplay": true,
+                    "Database": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(created.path.starts_with("jellyrin-backup-"));
+        assert_eq!(created.server_version, "12.0.0");
+        assert_eq!(created.backup_engine_version, "1");
+        assert_eq!(created.options["Database"], true);
+
+        let manifests = db.backup_manifests().await.unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].path, created.path);
+
+        let manifest = db.backup_manifest(&created.path).await.unwrap().unwrap();
+        assert_eq!(manifest.path, created.path);
+        assert_eq!(manifest.options["Metadata"], true);
+        assert!(db.backup_manifest("missing.zip").await.unwrap().is_none());
     }
 
     #[tokio::test]

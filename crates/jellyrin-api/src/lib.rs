@@ -24,7 +24,8 @@ use jellyrin_compat::{
 use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
-    BrandingConfig, Database, DeviceSession, SortDirection, SystemConfigurationPayloads, TaskRun,
+    BackupManifest, BrandingConfig, Database, DeviceSession, SortDirection,
+    SystemConfigurationPayloads, TaskRun,
 };
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -64,6 +65,14 @@ pub fn router(state: AppState) -> Router {
         .route("/System/Ping", post(ping))
         .route("/system/ping", get(ping))
         .route("/system/ping", post(ping))
+        .route("/Backup", get(backups))
+        .route("/backup", get(backups))
+        .route("/Backup/Create", post(create_backup))
+        .route("/backup/create", post(create_backup))
+        .route("/Backup/Manifest", get(backup_manifest))
+        .route("/backup/manifest", get(backup_manifest))
+        .route("/Backup/Restore", post(restore_backup))
+        .route("/backup/restore", post(restore_backup))
         .route("/System/Info/Storage", get(system_storage))
         .route("/system/info/storage", get(system_storage))
         .route("/System/Logs", get(system_logs))
@@ -636,6 +645,123 @@ async fn password_reset_providers(
         "Name": "Default",
         "Id": DEFAULT_PASSWORD_RESET_PROVIDER_ID
     })]))
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupManifestQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupOptionsBody {
+    #[serde(alias = "Metadata")]
+    metadata: Option<bool>,
+    #[serde(alias = "Trickplay")]
+    trickplay: Option<bool>,
+    #[serde(alias = "Subtitles")]
+    subtitles: Option<bool>,
+    #[serde(alias = "Database")]
+    database: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupRestoreBody {
+    #[serde(alias = "ArchiveFileName")]
+    archive_file_name: String,
+}
+
+async fn backups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let manifests = state.db.backup_manifests().await?;
+    Ok(Json(manifests.iter().map(backup_manifest_json).collect()))
+}
+
+async fn create_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<Option<BackupOptionsBody>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let manifest = state
+        .db
+        .create_backup_manifest(COMPATIBLE_SERVER_VERSION, "1", backup_options_json(payload))
+        .await?;
+    record_activity(
+        &state.db,
+        "Backup manifest created",
+        Some("A backup manifest was created."),
+        "System",
+        Some(user.id),
+    )
+    .await?;
+    Ok(Json(backup_manifest_json(&manifest)))
+}
+
+async fn backup_manifest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BackupManifestQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let manifest = state
+        .db
+        .backup_manifest(&query.path)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Backup manifest not found"))?;
+    Ok(Json(backup_manifest_json(&manifest)))
+}
+
+async fn restore_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<BackupRestoreBody>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let archive = payload.archive_file_name.trim();
+    if archive.is_empty() {
+        return Err(ApiError::bad_request("ArchiveFileName must not be empty"));
+    }
+    state
+        .db
+        .backup_manifest(archive)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Backup manifest not found"))?;
+    Err(ApiError::conflict(
+        "Backup restore is not implemented in Jellyrin yet",
+    ))
+}
+
+fn backup_options_json(payload: Option<BackupOptionsBody>) -> serde_json::Value {
+    let payload = payload.unwrap_or(BackupOptionsBody {
+        metadata: None,
+        trickplay: None,
+        subtitles: None,
+        database: None,
+    });
+    serde_json::json!({
+        "Metadata": payload.metadata.unwrap_or(false),
+        "Trickplay": payload.trickplay.unwrap_or(false),
+        "Subtitles": payload.subtitles.unwrap_or(false),
+        "Database": payload.database.unwrap_or(true)
+    })
+}
+
+fn backup_manifest_json(manifest: &BackupManifest) -> serde_json::Value {
+    serde_json::json!({
+        "ServerVersion": manifest.server_version,
+        "BackupEngineVersion": manifest.backup_engine_version,
+        "DateCreated": format_time_for_json(manifest.created_at),
+        "Path": manifest.path,
+        "Options": manifest.options
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -4584,6 +4710,13 @@ impl ApiError {
             error: anyhow::anyhow!(message.into()),
         }
     }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            error: anyhow::anyhow!(message.into()),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -4603,9 +4736,9 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
-        load_countries, load_cultures, parse_authorization_token, parse_media_browser_pairs,
-        router,
+        AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
+        DEFAULT_PASSWORD_RESET_PROVIDER_ID, load_countries, load_cultures,
+        parse_authorization_token, parse_media_browser_pairs, router,
     };
     use axum::{
         body::Body,
@@ -5031,6 +5164,162 @@ mod tests {
         let keys: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(keys["Items"].as_array().unwrap().len(), 0);
         assert_eq!(keys["TotalRecordCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn backup_endpoints_list_create_manifest_and_reject_restore() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Backup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/backup")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let backups: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(backups.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Backup/Create")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Metadata": true,
+                            "Subtitles": false,
+                            "Trickplay": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let path = created["Path"].as_str().unwrap();
+        assert!(path.starts_with("jellyrin-backup-"));
+        assert_eq!(created["ServerVersion"], COMPATIBLE_SERVER_VERSION);
+        assert_eq!(created["BackupEngineVersion"], "1");
+        assert!(created["DateCreated"].as_str().unwrap().ends_with('Z'));
+        assert_eq!(created["Options"]["Metadata"], true);
+        assert_eq!(created["Options"]["Trickplay"], true);
+        assert_eq!(created["Options"]["Subtitles"], false);
+        assert_eq!(created["Options"]["Database"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Backup")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let backups: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(backups.as_array().unwrap().len(), 1);
+        assert_eq!(backups[0]["Path"], path);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Backup/Manifest?path={path}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(manifest["Path"], path);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Backup/Manifest?path=missing.zip")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Backup/Restore")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ArchiveFileName": "missing.zip" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/backup/restore")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ArchiveFileName": path }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
