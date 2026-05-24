@@ -304,6 +304,22 @@ pub fn router(state: AppState) -> Router {
             "/livetv/listingproviders",
             delete(delete_live_tv_listing_provider),
         )
+        .route(
+            "/LiveTv/ListingProviders/Lineups",
+            get(live_tv_listing_provider_lineups),
+        )
+        .route(
+            "/livetv/listingproviders/lineups",
+            get(live_tv_listing_provider_lineups),
+        )
+        .route(
+            "/LiveTv/ListingProviders/SchedulesDirect/Countries",
+            get(live_tv_schedules_direct_countries),
+        )
+        .route(
+            "/livetv/listingproviders/schedulesdirect/countries",
+            get(live_tv_schedules_direct_countries),
+        )
         .route("/LiveTv/Channels", get(empty_items_result))
         .route("/livetv/channels", get(empty_items_result))
         .route("/LiveTv/Programs", get(empty_items_result))
@@ -3344,6 +3360,44 @@ async fn delete_live_tv_listing_provider(
         .update_named_configuration("livetv", live_tv_configuration_json(config))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveTvListingProviderLineupsQuery {
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(alias = "Id")]
+    _id: Option<String>,
+    #[serde(alias = "Type")]
+    _provider_type: Option<String>,
+    #[serde(alias = "Location")]
+    _location: Option<String>,
+    #[serde(alias = "Country")]
+    _country: Option<String>,
+}
+
+async fn live_tv_listing_provider_lineups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveTvListingProviderLineupsQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(Vec::new()))
+}
+
+async fn live_tv_schedules_direct_countries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "North America": [
+            { "fullName": "Canada", "shortName": "CAN" },
+            { "fullName": "United States", "shortName": "USA" }
+        ],
+        "ZZZ": []
+    })))
 }
 
 async fn branding_configuration(
@@ -7896,6 +7950,70 @@ mod tests {
                 .iter()
                 .all(|provider| provider["Id"] != "provider-2")
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/ListingProviders/SchedulesDirect/Countries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/livetv/listingproviders/schedulesdirect/countries")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let countries: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            countries["North America"][0],
+            json!({ "fullName": "Canada", "shortName": "CAN" })
+        );
+        assert!(countries["ZZZ"].as_array().unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/LiveTv/ListingProviders/Lineups?Id=provider-1&Location=90210&Country=USA",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/livetv/listingproviders/lineups?Id=provider-1&Location=90210&Country=USA",
+                    )
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lineups: Value = serde_json::from_slice(&body).unwrap();
+        assert!(lineups.as_array().unwrap().is_empty());
 
         let response = app
             .oneshot(
