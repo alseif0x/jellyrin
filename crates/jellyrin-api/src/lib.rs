@@ -151,12 +151,50 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions", get(session_sessions))
         .route("/Plugins", get(installed_plugins))
         .route("/plugins", get(installed_plugins))
-        .route("/Plugins/{plugin_id}/Configuration", get(empty_object))
-        .route("/plugins/{plugin_id}/configuration", get(empty_object))
+        .route("/Plugins/{plugin_id}/{version}/Enable", post(enable_plugin))
+        .route("/plugins/{plugin_id}/{version}/enable", post(enable_plugin))
+        .route(
+            "/Plugins/{plugin_id}/{version}/Disable",
+            post(disable_plugin),
+        )
+        .route(
+            "/plugins/{plugin_id}/{version}/disable",
+            post(disable_plugin),
+        )
+        .route(
+            "/Plugins/{plugin_id}/{version}",
+            delete(uninstall_plugin_by_version),
+        )
+        .route(
+            "/plugins/{plugin_id}/{version}",
+            delete(uninstall_plugin_by_version),
+        )
+        .route("/Plugins/{plugin_id}", delete(uninstall_plugin))
+        .route("/plugins/{plugin_id}", delete(uninstall_plugin))
+        .route(
+            "/Plugins/{plugin_id}/Configuration",
+            get(plugin_configuration).post(update_plugin_configuration),
+        )
+        .route(
+            "/plugins/{plugin_id}/configuration",
+            get(plugin_configuration).post(update_plugin_configuration),
+        )
         .route("/Plugins/{plugin_id}/Manifest", get(plugin_manifest))
         .route("/plugins/{plugin_id}/manifest", get(plugin_manifest))
         .route("/Packages", get(available_packages))
         .route("/packages", get(available_packages))
+        .route("/Packages/{name}", get(package_info))
+        .route("/packages/{name}", get(package_info))
+        .route("/Packages/Installed/{name}", post(install_package))
+        .route("/packages/installed/{name}", post(install_package))
+        .route(
+            "/Packages/Installing/{package_id}",
+            delete(cancel_package_installation),
+        )
+        .route(
+            "/packages/installing/{package_id}",
+            delete(cancel_package_installation),
+        )
         .route(
             "/Repositories",
             get(package_repositories).post(update_package_repositories),
@@ -1750,12 +1788,64 @@ async fn devices(
     Ok(Json(query_result(items)))
 }
 
-async fn installed_plugins() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
+async fn installed_plugins(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(Vec::new()))
 }
 
-async fn available_packages() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
+async fn available_packages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(Vec::new()))
+}
+
+#[derive(Debug, Deserialize)]
+struct PackageQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "AssemblyGuid")]
+    _assembly_guid: Option<String>,
+    #[serde(alias = "Version")]
+    _version: Option<String>,
+    #[serde(alias = "RepositoryUrl")]
+    _repository_url: Option<String>,
+}
+
+async fn package_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PackageQuery>,
+    Path(_name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Package not found"))
+}
+
+async fn install_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PackageQuery>,
+    Path(_name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Package not found"))
+}
+
+async fn cancel_package_installation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_package_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn package_repositories(
@@ -1839,8 +1929,75 @@ fn normalize_repository_info(value: serde_json::Value) -> Option<serde_json::Val
     }))
 }
 
-async fn plugin_manifest(Path(plugin_id): Path<String>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+async fn plugin_configuration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Plugin not found"))
+}
+
+async fn update_plugin_configuration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_plugin_id): Path<String>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Plugin not found"))
+}
+
+async fn enable_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((_plugin_id, _version)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Plugin not found"))
+}
+
+async fn disable_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((_plugin_id, _version)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Plugin not found"))
+}
+
+async fn uninstall_plugin_by_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((_plugin_id, _version)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Plugin not found"))
+}
+
+async fn uninstall_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_plugin_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Plugin not found"))
+}
+
+async fn plugin_manifest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
         "Guid": plugin_id,
         "Name": plugin_id,
         "Overview": "Plugin manifests are not supported by Jellyrin yet.",
@@ -1848,7 +2005,7 @@ async fn plugin_manifest(Path(plugin_id): Path<String>) -> Json<serde_json::Valu
         "Owner": "Jellyrin",
         "Category": "General",
         "Versions": []
-    }))
+    })))
 }
 
 async fn device_info(
@@ -2830,10 +2987,6 @@ fn empty_result() -> serde_json::Value {
         "TotalRecordCount": 0,
         "StartIndex": 0
     })
-}
-
-async fn empty_object() -> Json<serde_json::Value> {
-    Json(serde_json::json!({}))
 }
 
 const LIBRARY_SCAN_TASK_ID: &str = "scan-media-library";
@@ -6616,7 +6769,6 @@ mod tests {
             "/Sessions",
             "/Plugins",
             "/plugins",
-            "/Plugins/test-plugin/Configuration",
             "/Plugins/test-plugin/Manifest",
             "/Packages",
             "/packages",
@@ -6881,11 +7033,26 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
+        for endpoint in ["/Plugins", "/Packages", "/Plugins/test-plugin/Manifest"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+        }
+
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6900,6 +7067,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/Plugins/test-plugin/Manifest")
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -6909,6 +7077,74 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(manifest["Guid"], "test-plugin");
         assert_eq!(manifest["Versions"].as_array().unwrap().len(), 0);
+
+        for endpoint in [
+            "/Plugins/test-plugin/Configuration",
+            "/Packages/MissingPlugin",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+
+        for endpoint in [
+            "/Plugins/test-plugin/1.0.0.0/Enable",
+            "/Plugins/test-plugin/1.0.0.0/Disable",
+            "/Packages/Installed/MissingPlugin",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+
+        for endpoint in ["/Plugins/test-plugin", "/Plugins/test-plugin/1.0.0.0"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::DELETE)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Packages/Installing/00000000-0000-0000-0000-000000000000")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
