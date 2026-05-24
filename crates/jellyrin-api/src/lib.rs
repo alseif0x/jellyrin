@@ -1941,6 +1941,20 @@ struct SystemConfigurationUpdate {
     path_substitutions: Option<serde_json::Value>,
     #[serde(rename = "PluginRepositories", alias = "pluginRepositories")]
     plugin_repositories: Option<serde_json::Value>,
+    #[serde(alias = "RemoteClientBitrateLimit")]
+    remote_client_bitrate_limit: Option<i64>,
+    #[serde(rename = "MinResumePct", alias = "minResumePct")]
+    min_resume_pct: Option<i64>,
+    #[serde(rename = "MaxResumePct", alias = "maxResumePct")]
+    max_resume_pct: Option<i64>,
+    #[serde(alias = "MinResumeDurationSeconds")]
+    min_resume_duration_seconds: Option<i64>,
+    #[serde(alias = "MinAudiobookResume")]
+    min_audiobook_resume: Option<i64>,
+    #[serde(alias = "MaxAudiobookResume")]
+    max_audiobook_resume: Option<i64>,
+    #[serde(rename = "TrickplayOptions", alias = "trickplayOptions")]
+    trickplay_options: Option<serde_json::Value>,
 }
 
 async fn update_system_configuration(
@@ -1951,10 +1965,13 @@ async fn update_system_configuration(
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let current = state.db.startup_config().await?;
-    let chapter_image_resolution = match payload.chapter_image_resolution {
+    let chapter_image_resolution = match payload.chapter_image_resolution.as_deref() {
         Some(value) => validate_chapter_image_resolution(value, &current.chapter_image_resolution)?,
         None => current.chapter_image_resolution,
     };
+    let current_payloads = state.db.system_configuration_payloads().await?;
+    let server_options =
+        server_configuration_options_json(&payload, current_payloads.server_options);
     state
         .db
         .update_startup_config(StartupConfig {
@@ -1977,7 +1994,6 @@ async fn update_system_configuration(
                 .unwrap_or(current.enable_remote_access),
         })
         .await?;
-    let current_payloads = state.db.system_configuration_payloads().await?;
     state
         .db
         .update_system_configuration_payloads(SystemConfigurationPayloads {
@@ -1997,6 +2013,7 @@ async fn update_system_configuration(
                 payload.plugin_repositories,
                 current_payloads.plugin_repositories,
             ),
+            server_options,
         })
         .await?;
     record_activity(
@@ -2017,7 +2034,7 @@ fn non_empty_or_current(update: Option<String>, current: String) -> String {
         .unwrap_or(current)
 }
 
-fn validate_chapter_image_resolution(update: String, current: &str) -> Result<String, ApiError> {
+fn validate_chapter_image_resolution(update: &str, current: &str) -> Result<String, ApiError> {
     let value = update.trim();
     if value.is_empty() {
         return Ok(current.to_string());
@@ -2039,11 +2056,111 @@ fn array_update_or_current(
     }
 }
 
+fn server_configuration_options_json(
+    payload: &SystemConfigurationUpdate,
+    current: serde_json::Value,
+) -> serde_json::Value {
+    let mut config = default_server_configuration_options();
+    if let serde_json::Value::Object(current) = current {
+        for (key, value) in current {
+            config[key] = value;
+        }
+    }
+    merge_i64_option(
+        &mut config,
+        "RemoteClientBitrateLimit",
+        payload.remote_client_bitrate_limit,
+    );
+    merge_i64_option(&mut config, "MinResumePct", payload.min_resume_pct);
+    merge_i64_option(&mut config, "MaxResumePct", payload.max_resume_pct);
+    merge_i64_option(
+        &mut config,
+        "MinResumeDurationSeconds",
+        payload.min_resume_duration_seconds,
+    );
+    merge_i64_option(
+        &mut config,
+        "MinAudiobookResume",
+        payload.min_audiobook_resume,
+    );
+    merge_i64_option(
+        &mut config,
+        "MaxAudiobookResume",
+        payload.max_audiobook_resume,
+    );
+    if let Some(trickplay_options) = &payload.trickplay_options {
+        config["TrickplayOptions"] = trickplay_options_json(trickplay_options.clone());
+    }
+    config
+}
+
+fn default_server_configuration_options() -> serde_json::Value {
+    serde_json::json!({
+        "RemoteClientBitrateLimit": 0,
+        "MinResumePct": 5,
+        "MaxResumePct": 90,
+        "MinResumeDurationSeconds": 300,
+        "MinAudiobookResume": 5,
+        "MaxAudiobookResume": 5,
+        "TrickplayOptions": default_trickplay_options()
+    })
+}
+
+fn default_trickplay_options() -> serde_json::Value {
+    serde_json::json!({
+        "EnableHwAcceleration": false,
+        "EnableHwEncoding": false,
+        "EnableKeyFrameOnlyExtraction": false,
+        "ScanBehavior": "NonBlocking",
+        "ProcessPriority": "BelowNormal",
+        "Interval": 10000,
+        "WidthResolutions": [320],
+        "TileWidth": 10,
+        "TileHeight": 10,
+        "Qscale": 4,
+        "JpegQuality": 90,
+        "ProcessThreads": 1
+    })
+}
+
+fn trickplay_options_json(payload: serde_json::Value) -> serde_json::Value {
+    let mut config = default_trickplay_options();
+    for key in [
+        "EnableHwAcceleration",
+        "EnableHwEncoding",
+        "EnableKeyFrameOnlyExtraction",
+        "ScanBehavior",
+        "ProcessPriority",
+        "Interval",
+        "WidthResolutions",
+        "TileWidth",
+        "TileHeight",
+        "Qscale",
+        "JpegQuality",
+        "ProcessThreads",
+    ] {
+        merge_known_network_value(&mut config, &payload, key);
+    }
+    config
+}
+
+fn merge_i64_option(config: &mut serde_json::Value, key: &'static str, value: Option<i64>) {
+    if let Some(value) = value {
+        config[key] = serde_json::json!(value);
+    }
+}
+
 fn system_configuration_json(
     config: StartupConfig,
     startup_wizard_completed: bool,
     payloads: SystemConfigurationPayloads,
 ) -> serde_json::Value {
+    let mut server_options = default_server_configuration_options();
+    if let serde_json::Value::Object(current) = payloads.server_options {
+        for (key, value) in current {
+            server_options[key] = value;
+        }
+    }
     serde_json::json!({
         "ServerName": config.server_name,
         "UICulture": config.ui_culture,
@@ -2065,7 +2182,13 @@ fn system_configuration_json(
         "MetadataOptions": payloads.metadata_options,
         "PathSubstitutions": payloads.path_substitutions,
         "PluginRepositories": payloads.plugin_repositories,
-        "RemoteClientBitrateLimit": 0,
+        "RemoteClientBitrateLimit": server_options["RemoteClientBitrateLimit"],
+        "MinResumePct": server_options["MinResumePct"],
+        "MaxResumePct": server_options["MaxResumePct"],
+        "MinResumeDurationSeconds": server_options["MinResumeDurationSeconds"],
+        "MinAudiobookResume": server_options["MinAudiobookResume"],
+        "MaxAudiobookResume": server_options["MaxAudiobookResume"],
+        "TrickplayOptions": server_options["TrickplayOptions"],
         "LogFileRetentionDays": 3,
         "EnableSlowResponseWarning": false,
         "SlowResponseThresholdMs": 500,
@@ -6409,6 +6532,28 @@ mod tests {
         let default_config: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(default_config["DummyChapterDuration"], 0);
         assert_eq!(default_config["ChapterImageResolution"], "MatchSource");
+        assert_eq!(default_config["RemoteClientBitrateLimit"], 0);
+        assert_eq!(default_config["MinResumePct"], 5);
+        assert_eq!(default_config["MaxResumePct"], 90);
+        assert_eq!(default_config["MinResumeDurationSeconds"], 300);
+        assert_eq!(default_config["MinAudiobookResume"], 5);
+        assert_eq!(default_config["MaxAudiobookResume"], 5);
+        assert_eq!(
+            default_config["TrickplayOptions"]["EnableHwAcceleration"],
+            false
+        );
+        assert_eq!(
+            default_config["TrickplayOptions"]["ScanBehavior"],
+            "NonBlocking"
+        );
+        assert_eq!(
+            default_config["TrickplayOptions"]["ProcessPriority"],
+            "BelowNormal"
+        );
+        assert_eq!(
+            default_config["TrickplayOptions"]["WidthResolutions"],
+            json!([320])
+        );
 
         let response = app
             .clone()
@@ -6425,6 +6570,27 @@ mod tests {
                             "PreferredMetadataLanguage": "es",
                             "DummyChapterDuration": 300,
                             "ChapterImageResolution": "P720",
+                            "RemoteClientBitrateLimit": 1_500_000,
+                            "MinResumePct": 10,
+                            "MaxResumePct": 80,
+                            "MinResumeDurationSeconds": 120,
+                            "MinAudiobookResume": 7,
+                            "MaxAudiobookResume": 12,
+                            "TrickplayOptions": {
+                                "EnableHwAcceleration": true,
+                                "EnableHwEncoding": true,
+                                "EnableKeyFrameOnlyExtraction": true,
+                                "ScanBehavior": "Blocking",
+                                "ProcessPriority": "High",
+                                "Interval": 5000,
+                                "WidthResolutions": [320, 640],
+                                "TileWidth": 8,
+                                "TileHeight": 9,
+                                "Qscale": 6,
+                                "JpegQuality": 85,
+                                "ProcessThreads": 2,
+                                "UnknownTrickplayField": "ignored"
+                            },
                             "EnableRemoteAccess": true,
                             "UnknownJellyfinWebSetting": "ignored",
                             "MetadataOptions": [{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }],
@@ -6456,6 +6622,27 @@ mod tests {
                             "PreferredMetadataLanguage": "es",
                             "DummyChapterDuration": 300,
                             "ChapterImageResolution": "P720",
+                            "RemoteClientBitrateLimit": 1_500_000,
+                            "MinResumePct": 10,
+                            "MaxResumePct": 80,
+                            "MinResumeDurationSeconds": 120,
+                            "MinAudiobookResume": 7,
+                            "MaxAudiobookResume": 12,
+                            "TrickplayOptions": {
+                                "EnableHwAcceleration": true,
+                                "EnableHwEncoding": true,
+                                "EnableKeyFrameOnlyExtraction": true,
+                                "ScanBehavior": "Blocking",
+                                "ProcessPriority": "High",
+                                "Interval": 5000,
+                                "WidthResolutions": [320, 640],
+                                "TileWidth": 8,
+                                "TileHeight": 9,
+                                "Qscale": 6,
+                                "JpegQuality": 85,
+                                "ProcessThreads": 2,
+                                "UnknownTrickplayField": "ignored"
+                            },
                             "EnableRemoteAccess": true,
                             "UnknownJellyfinWebSetting": "ignored",
                             "MetadataOptions": [{ "ItemType": "Movie", "DisabledMetadataFetchers": ["Test"] }],
@@ -6490,6 +6677,44 @@ mod tests {
         assert_eq!(updated_config["PreferredMetadataLanguage"], "es");
         assert_eq!(updated_config["DummyChapterDuration"], 300);
         assert_eq!(updated_config["ChapterImageResolution"], "P720");
+        assert_eq!(updated_config["RemoteClientBitrateLimit"], 1_500_000);
+        assert_eq!(updated_config["MinResumePct"], 10);
+        assert_eq!(updated_config["MaxResumePct"], 80);
+        assert_eq!(updated_config["MinResumeDurationSeconds"], 120);
+        assert_eq!(updated_config["MinAudiobookResume"], 7);
+        assert_eq!(updated_config["MaxAudiobookResume"], 12);
+        assert_eq!(
+            updated_config["TrickplayOptions"]["EnableHwAcceleration"],
+            true
+        );
+        assert_eq!(updated_config["TrickplayOptions"]["EnableHwEncoding"], true);
+        assert_eq!(
+            updated_config["TrickplayOptions"]["EnableKeyFrameOnlyExtraction"],
+            true
+        );
+        assert_eq!(
+            updated_config["TrickplayOptions"]["ScanBehavior"],
+            "Blocking"
+        );
+        assert_eq!(
+            updated_config["TrickplayOptions"]["ProcessPriority"],
+            "High"
+        );
+        assert_eq!(updated_config["TrickplayOptions"]["Interval"], 5000);
+        assert_eq!(
+            updated_config["TrickplayOptions"]["WidthResolutions"],
+            json!([320, 640])
+        );
+        assert_eq!(updated_config["TrickplayOptions"]["TileWidth"], 8);
+        assert_eq!(updated_config["TrickplayOptions"]["TileHeight"], 9);
+        assert_eq!(updated_config["TrickplayOptions"]["Qscale"], 6);
+        assert_eq!(updated_config["TrickplayOptions"]["JpegQuality"], 85);
+        assert_eq!(updated_config["TrickplayOptions"]["ProcessThreads"], 2);
+        assert!(
+            updated_config["TrickplayOptions"]
+                .get("UnknownTrickplayField")
+                .is_none()
+        );
         assert_eq!(updated_config["EnableRemoteAccess"], true);
         assert_eq!(updated_config["IsStartupWizardCompleted"], false);
         assert_eq!(
@@ -6604,6 +6829,20 @@ mod tests {
         assert_eq!(preserved_config["UICulture"], "es-ES");
         assert_eq!(preserved_config["DummyChapterDuration"], 300);
         assert_eq!(preserved_config["ChapterImageResolution"], "P720");
+        assert_eq!(preserved_config["RemoteClientBitrateLimit"], 1_500_000);
+        assert_eq!(preserved_config["MinResumePct"], 10);
+        assert_eq!(preserved_config["MaxResumePct"], 80);
+        assert_eq!(preserved_config["MinResumeDurationSeconds"], 120);
+        assert_eq!(preserved_config["MinAudiobookResume"], 7);
+        assert_eq!(preserved_config["MaxAudiobookResume"], 12);
+        assert_eq!(
+            preserved_config["TrickplayOptions"]["ProcessPriority"],
+            "High"
+        );
+        assert_eq!(
+            preserved_config["TrickplayOptions"]["WidthResolutions"],
+            json!([320, 640])
+        );
         assert_eq!(preserved_config["EnableRemoteAccess"], false);
         assert_eq!(
             preserved_config["MetadataOptions"],

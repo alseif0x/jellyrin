@@ -151,6 +151,7 @@ pub struct SystemConfigurationPayloads {
     pub metadata_options: Value,
     pub path_substitutions: Value,
     pub plugin_repositories: Value,
+    pub server_options: Value,
 }
 
 impl Database {
@@ -270,7 +271,7 @@ impl Database {
     ) -> anyhow::Result<SystemConfigurationPayloads> {
         let row = sqlx::query_as::<_, SystemConfigurationPayloadsRow>(
             r#"
-            SELECT content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json
+            SELECT content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json, server_options_json
             FROM system_configuration_payloads
             WHERE id = 1
             "#,
@@ -292,14 +293,15 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO system_configuration_payloads (
-                id, content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json, updated_at
+                id, content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json, server_options_json, updated_at
             )
-            VALUES (1, ?1, ?2, ?3, ?4, ?5)
+            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(id) DO UPDATE SET
                 content_types_json = excluded.content_types_json,
                 metadata_options_json = excluded.metadata_options_json,
                 path_substitutions_json = excluded.path_substitutions_json,
                 plugin_repositories_json = excluded.plugin_repositories_json,
+                server_options_json = excluded.server_options_json,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -307,6 +309,7 @@ impl Database {
         .bind(serde_json::to_string(&payloads.metadata_options)?)
         .bind(serde_json::to_string(&payloads.path_substitutions)?)
         .bind(serde_json::to_string(&payloads.plugin_repositories)?)
+        .bind(serde_json::to_string(&payloads.server_options)?)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -2230,6 +2233,7 @@ impl Default for SystemConfigurationPayloads {
             metadata_options: Value::Array(Vec::new()),
             path_substitutions: Value::Array(Vec::new()),
             plugin_repositories: Value::Array(Vec::new()),
+            server_options: Value::Object(Default::default()),
         }
     }
 }
@@ -2243,6 +2247,7 @@ impl TryFrom<SystemConfigurationPayloadsRow> for SystemConfigurationPayloads {
             metadata_options: array_payload(&row.metadata_options_json)?,
             path_substitutions: array_payload(&row.path_substitutions_json)?,
             plugin_repositories: array_payload(&row.plugin_repositories_json)?,
+            server_options: object_payload(&row.server_options_json)?,
         })
     }
 }
@@ -2252,6 +2257,14 @@ fn array_payload(raw: &str) -> anyhow::Result<Value> {
     match value {
         Value::Array(_) => Ok(value),
         _ => Ok(Value::Array(Vec::new())),
+    }
+}
+
+fn object_payload(raw: &str) -> anyhow::Result<Value> {
+    let value: Value = serde_json::from_str(raw).context("invalid system configuration payload")?;
+    match value {
+        Value::Object(_) => Ok(value),
+        _ => Ok(Value::Object(Default::default())),
     }
 }
 
@@ -2339,6 +2352,7 @@ struct SystemConfigurationPayloadsRow {
     metadata_options_json: String,
     path_substitutions_json: String,
     plugin_repositories_json: String,
+    server_options_json: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -2873,12 +2887,14 @@ mod tests {
         assert_eq!(defaults.metadata_options, json!([]));
         assert_eq!(defaults.path_substitutions, json!([]));
         assert_eq!(defaults.plugin_repositories, json!([]));
+        assert_eq!(defaults.server_options, json!({}));
 
         db.update_system_configuration_payloads(SystemConfigurationPayloads {
             content_types: json!([{ "Name": "Movies", "Value": "movies" }]),
             metadata_options: json!([{ "ItemType": "Movie" }]),
             path_substitutions: json!([{ "From": "/mnt/a", "To": "/mnt/b" }]),
             plugin_repositories: json!([{ "Name": "Example", "Url": "https://example.invalid" }]),
+            server_options: json!({ "RemoteClientBitrateLimit": 1234 }),
         })
         .await
         .unwrap();
@@ -2896,12 +2912,17 @@ mod tests {
             stored.plugin_repositories,
             json!([{ "Name": "Example", "Url": "https://example.invalid" }])
         );
+        assert_eq!(
+            stored.server_options,
+            json!({ "RemoteClientBitrateLimit": 1234 })
+        );
 
         db.update_system_configuration_payloads(SystemConfigurationPayloads {
             content_types: json!({ "Name": "Movies" }),
             metadata_options: json!("invalid"),
             path_substitutions: json!(null),
             plugin_repositories: json!([{ "Name": "Kept" }]),
+            server_options: json!("invalid"),
         })
         .await
         .unwrap();
@@ -2910,6 +2931,7 @@ mod tests {
         assert_eq!(sanitized.metadata_options, json!([]));
         assert_eq!(sanitized.path_substitutions, json!([]));
         assert_eq!(sanitized.plugin_repositories, json!([{ "Name": "Kept" }]));
+        assert_eq!(sanitized.server_options, json!({}));
     }
 
     #[tokio::test]
