@@ -288,6 +288,16 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{user_id}/items/resume", get(user_resume_items))
         .route("/Users/{user_id}", get(get_user_by_id))
         .route("/users/{user_id}", get(get_user_by_id))
+        .route("/Users/Password", post(update_user_password))
+        .route("/users/password", post(update_user_password))
+        .route(
+            "/Users/{user_id}/Password",
+            post(update_user_password_legacy),
+        )
+        .route(
+            "/users/{user_id}/password",
+            post(update_user_password_legacy),
+        )
         .route("/Users/{user_id}/Policy", post(update_user_policy))
         .route("/users/{user_id}/policy", post(update_user_policy))
         .route("/Sessions/Logout", post(logout))
@@ -972,6 +982,90 @@ async fn update_user(
         .or_else(|| payload.get("Id").and_then(serde_json::Value::as_str))
         .ok_or_else(|| ApiError::bad_request("User id is required"))?;
     update_user_profile_from_payload(&state.db, resolve_user_id(user_id)?, payload).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserPasswordQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "UserId", alias = "userId")]
+    user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserPasswordBody {
+    #[serde(alias = "CurrentPw")]
+    current_pw: Option<String>,
+    #[serde(alias = "NewPw")]
+    new_pw: Option<String>,
+    #[serde(alias = "ResetPassword")]
+    reset_password: Option<bool>,
+}
+
+async fn update_user_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UpdateUserPasswordQuery>,
+    Json(payload): Json<UpdateUserPasswordBody>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, token) =
+        require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let requested_user_id = match query.user_id.as_deref() {
+        Some(user_id) => resolve_user_id(user_id)?,
+        None => auth_user.id,
+    };
+    update_user_password_inner(&state, &auth_user, &token, requested_user_id, payload).await
+}
+
+async fn update_user_password_legacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<UpdateUserPasswordBody>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    update_user_password_inner(&state, &auth_user, &token, user_id, payload).await
+}
+
+async fn update_user_password_inner(
+    state: &AppState,
+    auth_user: &User,
+    token: &DeviceToken,
+    requested_user_id: Uuid,
+    payload: UpdateUserPasswordBody,
+) -> Result<StatusCode, ApiError> {
+    let target = state
+        .db
+        .users()
+        .await?
+        .into_iter()
+        .find(|user| user.id == requested_user_id)
+        .ok_or_else(|| ApiError::not_found("User not found"))?;
+    ensure_user_access(auth_user, target.id)?;
+
+    if payload.reset_password.unwrap_or(false) {
+        state.db.reset_user_password(target.id).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    if !auth_user.is_administrator || auth_user.id == target.id {
+        state
+            .db
+            .verify_user_password(target.id, payload.current_pw.as_deref().unwrap_or_default())
+            .await
+            .map_err(|_| ApiError::forbidden("Invalid user or password entered"))?;
+    }
+
+    state
+        .db
+        .set_user_password(target.id, payload.new_pw.as_deref().unwrap_or_default())
+        .await?;
+    state
+        .db
+        .revoke_user_tokens_except(target.id, &token.access_token)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5697,12 +5791,13 @@ async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<User
         .user_configuration(user.id)
         .await?
         .unwrap_or_else(default_user_configuration);
+    let has_configured_password = db.user_has_password(user.id).await?;
     Ok(UserDto {
         id: user.id,
         name: user.name.clone(),
         server_id,
-        has_password: true,
-        has_configured_password: true,
+        has_password: has_configured_password,
+        has_configured_password,
         has_configured_easy_password: false,
         enable_auto_login: false,
         configuration,
@@ -12163,6 +12258,205 @@ mod tests {
         assert_eq!(ratings[0]["Value"], "US-G");
         assert_eq!(ratings[0]["RatingScore"]["score"], 1);
         assert_eq!(ratings[0]["RatingScore"]["subScore"], Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/Password?userId={}", admin.id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "CurrentPw": "secret", "NewPw": "changed-secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/Password?userId={}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "CurrentPw": "wrong", "NewPw": "changed-secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/Password?userId={}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "CurrentPw": "secret",
+                            "NewPw": "changed-secret",
+                            "ResetPassword": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="old-password-test", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="new-password-test", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "changed-secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{}/Password", managed.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "NewPw": "managed-changed" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="managed-password-test", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "managed", "Pw": "managed-changed" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/00000000-0000-0000-0000-000000000000/Password")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "NewPw": "missing" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{}/Password", managed.id))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ResetPassword": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}", managed.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user["HasConfiguredPassword"], false);
+        assert_eq!(user["HasPassword"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="managed-reset-test", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "managed", "Pw": "managed-changed" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
             .clone()

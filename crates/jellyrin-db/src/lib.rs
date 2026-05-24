@@ -714,6 +714,45 @@ impl Database {
         self.user_by_id(user.id).await
     }
 
+    pub async fn set_user_password(&self, user_id: Uuid, password: &str) -> anyhow::Result<()> {
+        self.user_by_id(user_id).await?;
+        let password_hash = hash_password(password)?;
+        sqlx::query(
+            r#"
+            INSERT INTO user_passwords (user_id, algorithm, password_hash, updated_at)
+            VALUES (?1, 'argon2id', ?2, ?3)
+            ON CONFLICT(user_id) DO UPDATE SET
+                algorithm = excluded.algorithm,
+                password_hash = excluded.password_hash,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(password_hash)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn reset_user_password(&self, user_id: Uuid) -> anyhow::Result<()> {
+        self.user_by_id(user_id).await?;
+        sqlx::query("DELETE FROM user_passwords WHERE user_id = ?1")
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn user_has_password(&self, user_id: Uuid) -> anyhow::Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_passwords WHERE user_id = ?1")
+                .bind(user_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count > 0)
+    }
+
     pub async fn update_user_profile(
         &self,
         user_id: Uuid,
@@ -772,6 +811,22 @@ impl Database {
             .issue_device_token(&user, device_id, device_name, client, version)
             .await?;
         Ok((user, token))
+    }
+
+    pub async fn verify_user_password(&self, user_id: Uuid, password: &str) -> anyhow::Result<()> {
+        self.user_by_id(user_id).await?;
+        let password_hash: String = sqlx::query_scalar(
+            r#"
+            SELECT password_hash
+            FROM user_passwords
+            WHERE user_id = ?1
+            "#,
+        )
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .context("password is not configured")?;
+        verify_password(password, &password_hash)
     }
 
     pub async fn user_by_token(&self, token: &str) -> anyhow::Result<(User, DeviceToken)> {
@@ -947,6 +1002,33 @@ impl Database {
     pub async fn revoke_token(&self, token: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM devices WHERE access_token = ?1")
             .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn revoke_user_tokens_except(
+        &self,
+        user_id: Uuid,
+        keep_token: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM active_playback_sessions
+            WHERE session_id IN (
+                SELECT access_token FROM devices
+                WHERE user_id = ?1 AND access_token != ?2
+            )
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(keep_token)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("DELETE FROM devices WHERE user_id = ?1 AND access_token != ?2")
+            .bind(user_id.to_string())
+            .bind(keep_token)
             .execute(&self.pool)
             .await?;
         Ok(())
