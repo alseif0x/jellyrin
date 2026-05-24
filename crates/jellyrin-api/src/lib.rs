@@ -105,11 +105,11 @@ pub fn router(state: AppState) -> Router {
         .route("/system/configuration/{key}", get(named_configuration))
         .route(
             "/System/Configuration/{key}",
-            post(unsupported_named_configuration_update),
+            post(update_named_configuration),
         )
         .route(
             "/system/configuration/{key}",
-            post(unsupported_named_configuration_update),
+            post(update_named_configuration),
         )
         .route(
             "/Dashboard/web/ConfigurationPages",
@@ -2047,23 +2047,125 @@ fn system_configuration_json(
 
 async fn named_configuration(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
     Path(key): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let key = key.to_ascii_lowercase();
     let value = match key.as_str() {
-        "branding" | "Branding" => branding_configuration_json(state.db.branding_config().await?),
+        "branding" => branding_configuration_json(state.db.branding_config().await?),
+        "network" => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(default_network_configuration)
+        }
         _ => serde_json::json!({}),
     };
     Ok(Json(value))
 }
 
-async fn unsupported_named_configuration_update(
+async fn update_named_configuration(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_key): Path<String>,
+    Path(key): Path<String>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(StatusCode::NOT_IMPLEMENTED)
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let key = key.to_ascii_lowercase();
+    if key != "network" {
+        return Ok(StatusCode::NOT_IMPLEMENTED);
+    }
+
+    let normalized = network_configuration_json(payload);
+    if let Some(enable_remote_access) = normalized
+        .get("EnableRemoteAccess")
+        .and_then(serde_json::Value::as_bool)
+    {
+        state.db.set_remote_access(enable_remote_access).await?;
+    }
+    state
+        .db
+        .update_named_configuration(&key, normalized)
+        .await?;
+    record_activity(
+        &state.db,
+        "Network configuration updated",
+        Some("Network configuration was updated."),
+        "System",
+        Some(user.id),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn default_network_configuration() -> serde_json::Value {
+    serde_json::json!({
+        "BaseUrl": "",
+        "EnableHttps": false,
+        "RequireHttps": false,
+        "CertificatePath": "",
+        "CertificatePassword": "",
+        "InternalHttpPort": 8097,
+        "InternalHttpsPort": 8920,
+        "PublicHttpPort": 8097,
+        "PublicHttpsPort": 8920,
+        "AutoDiscovery": true,
+        "EnableUPnP": false,
+        "EnableIPv4": true,
+        "EnableIPv6": false,
+        "EnableRemoteAccess": true,
+        "LocalNetworkSubnets": [],
+        "LocalNetworkAddresses": [],
+        "KnownProxies": [],
+        "IgnoreVirtualInterfaces": true,
+        "VirtualInterfaceNames": ["vEthernet*", "utun*", "docker*", "veth*"],
+        "EnablePublishedServerUriByRequest": false,
+        "PublishedServerUriBySubnet": [],
+        "RemoteIPFilter": [],
+        "IsRemoteIPFilterBlacklist": false
+    })
+}
+
+fn network_configuration_json(payload: serde_json::Value) -> serde_json::Value {
+    let mut config = default_network_configuration();
+    merge_known_network_value(&mut config, &payload, "BaseUrl");
+    merge_known_network_value(&mut config, &payload, "CertificatePath");
+    merge_known_network_value(&mut config, &payload, "CertificatePassword");
+    merge_known_network_value(&mut config, &payload, "EnableHttps");
+    merge_known_network_value(&mut config, &payload, "RequireHttps");
+    merge_known_network_value(&mut config, &payload, "InternalHttpPort");
+    merge_known_network_value(&mut config, &payload, "InternalHttpsPort");
+    merge_known_network_value(&mut config, &payload, "PublicHttpPort");
+    merge_known_network_value(&mut config, &payload, "PublicHttpsPort");
+    merge_known_network_value(&mut config, &payload, "AutoDiscovery");
+    merge_known_network_value(&mut config, &payload, "EnableUPnP");
+    merge_known_network_value(&mut config, &payload, "EnableIPv4");
+    merge_known_network_value(&mut config, &payload, "EnableIPv6");
+    merge_known_network_value(&mut config, &payload, "EnableRemoteAccess");
+    merge_known_network_value(&mut config, &payload, "LocalNetworkSubnets");
+    merge_known_network_value(&mut config, &payload, "LocalNetworkAddresses");
+    merge_known_network_value(&mut config, &payload, "KnownProxies");
+    merge_known_network_value(&mut config, &payload, "IgnoreVirtualInterfaces");
+    merge_known_network_value(&mut config, &payload, "VirtualInterfaceNames");
+    merge_known_network_value(&mut config, &payload, "EnablePublishedServerUriByRequest");
+    merge_known_network_value(&mut config, &payload, "PublishedServerUriBySubnet");
+    merge_known_network_value(&mut config, &payload, "RemoteIPFilter");
+    merge_known_network_value(&mut config, &payload, "IsRemoteIPFilterBlacklist");
+    config
+}
+
+fn merge_known_network_value(
+    config: &mut serde_json::Value,
+    payload: &serde_json::Value,
+    key: &'static str,
+) {
+    if let Some(value) = payload.get(key) {
+        config[key] = value.clone();
+    }
 }
 
 async fn update_branding_configuration(
@@ -6210,6 +6312,146 @@ mod tests {
             preserved_config["PluginRepositories"],
             json!([{ "Name": "Example", "Url": "https://example.invalid" }])
         );
+    }
+
+    #[tokio::test]
+    async fn network_named_configuration_round_trips_dashboard_contract() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/network")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/network")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(defaults["InternalHttpPort"], 8097);
+        assert_eq!(defaults["InternalHttpsPort"], 8920);
+        assert_eq!(defaults["EnableIPv4"], true);
+        assert_eq!(defaults["EnableIPv6"], false);
+        assert_eq!(defaults["EnableRemoteAccess"], true);
+        assert!(defaults["LocalNetworkSubnets"].is_array());
+        assert!(defaults["KnownProxies"].is_array());
+        assert!(defaults["PublishedServerUriBySubnet"].is_array());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/network")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let payload = json!({
+            "BaseUrl": "/jellyrin",
+            "EnableHttps": true,
+            "RequireHttps": false,
+            "CertificatePath": "/tmp/cert.pfx",
+            "CertificatePassword": "secret",
+            "InternalHttpPort": 18097,
+            "InternalHttpsPort": 18920,
+            "PublicHttpPort": 80,
+            "PublicHttpsPort": 443,
+            "AutoDiscovery": false,
+            "EnableIPv4": true,
+            "EnableIPv6": true,
+            "EnableRemoteAccess": false,
+            "LocalNetworkSubnets": ["192.168.1.0/24"],
+            "LocalNetworkAddresses": ["0.0.0.0"],
+            "KnownProxies": ["10.0.0.1"],
+            "RemoteIPFilter": ["203.0.113.10"],
+            "IsRemoteIPFilterBlacklist": true,
+            "PublishedServerUriBySubnet": ["all=https://media.example.test"],
+            "UnknownNetworkField": "ignored"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/system/configuration/network")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/system/configuration/network")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(config["BaseUrl"], "/jellyrin");
+        assert_eq!(config["EnableHttps"], true);
+        assert_eq!(config["InternalHttpPort"], 18097);
+        assert_eq!(config["InternalHttpsPort"], 18920);
+        assert_eq!(config["PublicHttpPort"], 80);
+        assert_eq!(config["PublicHttpsPort"], 443);
+        assert_eq!(config["AutoDiscovery"], false);
+        assert_eq!(config["EnableIPv6"], true);
+        assert_eq!(config["EnableRemoteAccess"], false);
+        assert_eq!(config["LocalNetworkSubnets"], json!(["192.168.1.0/24"]));
+        assert_eq!(config["KnownProxies"], json!(["10.0.0.1"]));
+        assert_eq!(config["RemoteIPFilter"], json!(["203.0.113.10"]));
+        assert_eq!(config["IsRemoteIPFilterBlacklist"], true);
+        assert_eq!(
+            config["PublishedServerUriBySubnet"],
+            json!(["all=https://media.example.test"])
+        );
+        assert!(config.get("UnknownNetworkField").is_none());
+
+        let startup = db.startup_config().await.unwrap();
+        assert!(!startup.enable_remote_access);
     }
 
     #[tokio::test]

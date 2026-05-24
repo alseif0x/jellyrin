@@ -307,6 +307,50 @@ impl Database {
         Ok(())
     }
 
+    pub async fn named_configuration(&self, key: &str) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query_as::<_, NamedConfigurationRow>(
+            r#"
+            SELECT payload_json
+            FROM named_configurations
+            WHERE key = ?1
+            "#,
+        )
+        .bind(normalize_configuration_key(key))
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            serde_json::from_str(&row.payload_json).context("invalid named configuration")
+        })
+        .transpose()
+    }
+
+    pub async fn update_named_configuration(
+        &self,
+        key: &str,
+        payload: Value,
+    ) -> anyhow::Result<()> {
+        let key = normalize_configuration_key(key);
+        anyhow::ensure!(!key.is_empty(), "configuration key must not be empty");
+
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO named_configurations (key, payload_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(key)
+        .bind(serde_json::to_string(&payload)?)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn add_activity_log_entry(
         &self,
         name: &str,
@@ -2201,6 +2245,10 @@ fn array_payload(raw: &str) -> anyhow::Result<Value> {
     }
 }
 
+fn normalize_configuration_key(key: &str) -> String {
+    key.trim().to_ascii_lowercase()
+}
+
 impl TryFrom<BrandingConfigRow> for BrandingConfig {
     type Error = anyhow::Error;
 
@@ -2281,6 +2329,11 @@ struct SystemConfigurationPayloadsRow {
     metadata_options_json: String,
     path_substitutions_json: String,
     plugin_repositories_json: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct NamedConfigurationRow {
+    payload_json: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -2847,6 +2900,35 @@ mod tests {
         assert_eq!(sanitized.metadata_options, json!([]));
         assert_eq!(sanitized.path_substitutions, json!([]));
         assert_eq!(sanitized.plugin_repositories, json!([{ "Name": "Kept" }]));
+    }
+
+    #[tokio::test]
+    async fn named_configurations_round_trip_json_by_key() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        assert!(db.named_configuration("network").await.unwrap().is_none());
+
+        db.update_named_configuration(
+            " Network ",
+            json!({
+                "InternalHttpPort": 8097,
+                "EnableIPv4": true,
+                "LocalNetworkSubnets": ["192.168.1.0/24"]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stored = db.named_configuration("network").await.unwrap().unwrap();
+        assert_eq!(stored["InternalHttpPort"], 8097);
+        assert_eq!(stored["EnableIPv4"], true);
+        assert_eq!(stored["LocalNetworkSubnets"], json!(["192.168.1.0/24"]));
+
+        db.update_named_configuration("network", json!({ "InternalHttpPort": 8098 }))
+            .await
+            .unwrap();
+        let updated = db.named_configuration("NETWORK").await.unwrap().unwrap();
+        assert_eq!(updated, json!({ "InternalHttpPort": 8098 }));
     }
 
     #[tokio::test]
