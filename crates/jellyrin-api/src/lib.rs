@@ -1895,31 +1895,32 @@ async fn session_sessions(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(session_list_json(&state.db, &user).await?))
+}
+
+async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json::Value>, ApiError> {
     let sessions = if user.is_administrator {
-        state.db.device_sessions().await?
+        db.device_sessions().await?
     } else {
-        state.db.device_sessions_for_user(user.id).await?
+        db.device_sessions_for_user(user.id).await?
     };
-    let active_playback = state
-        .db
+    let active_playback = db
         .active_playback_sessions()
         .await?
         .into_iter()
         .map(|session| (session.session_id.clone(), session))
         .collect::<HashMap<_, _>>();
-    let server_id = state.db.server_state().await?.server_id.to_string();
-    Ok(Json(
-        sessions
-            .iter()
-            .map(|session| {
-                session_to_json(
-                    session,
-                    active_playback.get(&session.access_token),
-                    &server_id,
-                )
-            })
-            .collect::<Vec<serde_json::Value>>(),
-    ))
+    let server_id = db.server_state().await?.server_id.to_string();
+    Ok(sessions
+        .iter()
+        .map(|session| {
+            session_to_json(
+                session,
+                active_playback.get(&session.access_token),
+                &server_id,
+            )
+        })
+        .collect::<Vec<serde_json::Value>>())
 }
 
 async fn devices(
@@ -3548,6 +3549,7 @@ async fn send_play_command(
             .clear_active_playback_session(&target_session.access_token)
             .await?;
     }
+    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3670,6 +3672,7 @@ async fn send_playstate_command(
             }
         }),
     );
+    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -6301,26 +6304,42 @@ fn broadcast_session_message(session_id: &str, message: serde_json::Value) {
     });
 }
 
+async fn broadcast_sessions_message(
+    db: &Database,
+    session_id: &str,
+    user: &User,
+) -> Result<(), ApiError> {
+    broadcast_session_message(
+        session_id,
+        serde_json::json!({
+            "MessageType": "Sessions",
+            "Data": session_list_json(db, user).await?
+        }),
+    );
+    Ok(())
+}
+
 async fn websocket(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> axum::response::Response {
-    let session_id = match require_user(&state.db, &headers, query.api_key.as_deref()).await {
-        Ok((_, token)) => token.access_token,
+    let (user, session_id) = match require_user(&state.db, &headers, query.api_key.as_deref()).await
+    {
+        Ok((user, token)) => (user, token.access_token),
         Err(error) => return error.into_response(),
     };
 
     match ws {
         Ok(ws) => ws
-            .on_upgrade(move |socket| handle_websocket(socket, session_id))
+            .on_upgrade(move |socket| handle_websocket(socket, state, user, session_id))
             .into_response(),
         Err(rejection) => rejection.into_response(),
     }
 }
 
-async fn handle_websocket(mut socket: WebSocket, session_id: String) {
+async fn handle_websocket(mut socket: WebSocket, state: AppState, user: User, session_id: String) {
     let _ = socket
         .send(Message::Text(
             serde_json::json!({
@@ -6333,21 +6352,63 @@ async fn handle_websocket(mut socket: WebSocket, session_id: String) {
         .await;
     let mut receiver = subscribe_playback_events();
     loop {
-        match receiver.recv().await {
-            Ok(event) if event.session_id == session_id => {
-                if socket
-                    .send(Message::Text(event.message.to_string().into()))
-                    .await
-                    .is_err()
-                {
-                    break;
+        tokio::select! {
+            event = receiver.recv() => {
+                match event {
+                    Ok(event) if event.session_id == session_id => {
+                        if socket
+                            .send(Message::Text(event.message.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            Ok(_) => {}
-            Err(broadcast::error::RecvError::Lagged(_)) => {}
-            Err(broadcast::error::RecvError::Closed) => break,
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if should_send_sessions_message(&text) {
+                            let sessions = match session_list_json(&state.db, &user).await {
+                                Ok(sessions) => sessions,
+                                Err(_) => break,
+                            };
+                            let message = serde_json::json!({
+                                "MessageType": "Sessions",
+                                "Data": sessions
+                            });
+                            if socket
+                                .send(Message::Text(message.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+            }
         }
     }
+}
+
+fn should_send_sessions_message(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("MessageType")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|message_type| message_type.eq_ignore_ascii_case("SessionsStart"))
 }
 
 async fn localization_options() -> Json<Vec<LocalizationOptionDto>> {
@@ -11338,6 +11399,23 @@ mod tests {
         panic!("no playback websocket event for session {session_id}");
     }
 
+    async fn next_playback_event_type(
+        receiver: &mut tokio::sync::broadcast::Receiver<super::PlaybackEvent>,
+        session_id: &str,
+        message_type: &str,
+    ) -> Value {
+        for _ in 0..20 {
+            let event = next_playback_event(receiver, session_id).await;
+            if event["MessageType"]
+                .as_str()
+                .is_some_and(|value| value == message_type)
+            {
+                return event;
+            }
+        }
+        panic!("no {message_type} playback websocket event for session {session_id}");
+    }
+
     #[tokio::test]
     async fn m1_environment_library_and_image_compat_endpoints_exist() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -13067,7 +13145,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let play_event = next_playback_event(&mut playback_events, playback_token).await;
+        let play_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Play").await;
         assert_eq!(play_event["MessageType"], "Play");
         assert_eq!(play_event["Data"]["PlayCommand"], "PlayNow");
         assert_eq!(play_event["Data"]["StartPositionTicks"], 123);
@@ -13114,7 +13193,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let play_now_event = next_playback_event(&mut playback_events, playback_token).await;
+        let play_now_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Play").await;
         assert_eq!(play_now_event["MessageType"], "Play");
         assert_eq!(play_now_event["Data"]["PlayCommand"], "PlayNow");
         assert_eq!(play_now_event["Data"]["ItemIds"][0], item_id);
@@ -13163,7 +13243,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let pause_event = next_playback_event(&mut playback_events, playback_token).await;
+        let pause_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Playstate").await;
         assert_eq!(pause_event["MessageType"], "Playstate");
         assert_eq!(pause_event["Data"]["Command"], "Pause");
 
@@ -13182,7 +13263,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let seek_event = next_playback_event(&mut playback_events, playback_token).await;
+        let seek_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Playstate").await;
         assert_eq!(seek_event["MessageType"], "Playstate");
         assert_eq!(seek_event["Data"]["Command"], "Seek");
         assert_eq!(seek_event["Data"]["SeekPositionTicks"], 999);
