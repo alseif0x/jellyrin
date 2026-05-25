@@ -7239,7 +7239,7 @@ async fn audio_hls_legacy_aac_segment(
     Query(query): Query<HlsQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     let segment_id = parse_non_negative_i64(&segment_id, "Invalid audio HLS segment")?;
-    audio_hls_segment_response(&state, &headers, &item_id, segment_id, "aac", query).await
+    audio_hls_legacy_segment_response(&state, &headers, &item_id, segment_id, "aac", query).await
 }
 
 async fn audio_hls_legacy_mp3_segment(
@@ -7249,7 +7249,7 @@ async fn audio_hls_legacy_mp3_segment(
     Query(query): Query<HlsQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     let segment_id = parse_non_negative_i64(&segment_id, "Invalid audio HLS segment")?;
-    audio_hls_segment_response(&state, &headers, &item_id, segment_id, "mp3", query).await
+    audio_hls_legacy_segment_response(&state, &headers, &item_id, segment_id, "mp3", query).await
 }
 
 async fn audio_hls_master_playlist_response(
@@ -7367,6 +7367,38 @@ async fn audio_hls_segment_response(
         return Err(ApiError::not_found("Audio HLS segment not found"));
     }
     stream_media_item(item, headers, true).await
+}
+
+async fn audio_hls_legacy_segment_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    segment_id: i64,
+    container: &str,
+    query: HlsQuery,
+) -> Result<axum::response::Response, ApiError> {
+    if query
+        .play_session_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return hls_segment_response_for(
+            state,
+            headers,
+            item_id,
+            HlsSegmentRequest {
+                playlist_id: "main",
+                segment_id,
+                container: "ts",
+            },
+            query,
+            true,
+            "Audio",
+        )
+        .await;
+    }
+
+    audio_hls_segment_response(state, headers, item_id, segment_id, container, query).await
 }
 
 async fn audio_hls_item(
@@ -17731,6 +17763,48 @@ mod tests {
                 Request::builder()
                     .uri(format!(
                         "/DynamicHls/Audio/{item_id}/hls1/main/0.ts?PlaySessionId=audio-hls-ready"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"audio-ts");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/{item_id}/hls/0/stream.mp3?PlaySessionId=audio-hls-ready"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"audio-ts");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/{item_id}/hls/0/stream.aac?PlaySessionId=audio-hls-ready"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
