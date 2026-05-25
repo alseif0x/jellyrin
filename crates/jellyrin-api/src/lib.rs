@@ -11412,9 +11412,14 @@ async fn media_segments(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
+    let include_segment_types = csv_values_lowercase(&query_string_values(
+        raw_query.as_deref(),
+        &["IncludeSegmentTypes", "includeSegmentTypes"],
+    ));
     let metadata = state
         .db
         .media_item_metadata()
@@ -11423,7 +11428,7 @@ async fn media_segments(
         .find(|metadata| metadata.item_id == item.id)
         .map(|metadata| metadata.payload)
         .unwrap_or_else(|| serde_json::json!({}));
-    let segments = metadata
+    let mut segments = metadata
         .get("MediaSegments")
         .and_then(serde_json::Value::as_array)
         .map(|segments| {
@@ -11434,6 +11439,21 @@ async fn media_segments(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if let Some(include_segment_types) = include_segment_types {
+        segments.retain(|segment| {
+            segment["Type"].as_str().is_some_and(|segment_type| {
+                include_segment_types
+                    .iter()
+                    .any(|include_type| include_type.eq_ignore_ascii_case(segment_type))
+            })
+        });
+    }
+    segments.sort_by(|left, right| {
+        left["StartTicks"]
+            .as_i64()
+            .unwrap_or_default()
+            .cmp(&right["StartTicks"].as_i64().unwrap_or_default())
+    });
     Ok(Json(query_result(segments)))
 }
 
@@ -35123,14 +35143,30 @@ mod tests {
             .update_media_item_metadata(
                 item.id,
                 json!({
-                    "MediaSegments": [{
-                        "Id": "intro-1",
-                        "Type": "Intro",
-                        "StartTicks": 0,
-                        "EndTicks": 120000000,
-                        "SegmentProviderId": "jellyrin-test",
-                        "Status": "Succeeded"
-                    }]
+                    "MediaSegments": [
+                        {
+                            "Id": "intro-1",
+                            "Type": "Intro",
+                            "StartTicks": 0,
+                            "EndTicks": 120000000,
+                            "SegmentProviderId": "jellyrin-test",
+                            "Status": "Succeeded"
+                        },
+                        {
+                            "Id": "outro-1",
+                            "Type": "Outro",
+                            "StartTicks": 900000000,
+                            "EndTicks": 1000000000,
+                            "Status": "Succeeded"
+                        },
+                        {
+                            "Id": "preview-1",
+                            "Type": "Preview",
+                            "StartTicks": 500000000,
+                            "EndTicks": 520000000,
+                            "Status": "Skipped"
+                        }
+                    ]
                 }),
             )
             .await
@@ -35163,12 +35199,53 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let segments: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(segments["TotalRecordCount"], 1);
+        assert_eq!(segments["TotalRecordCount"], 3);
         assert_eq!(segments["Items"][0]["Id"], "intro-1");
         assert_eq!(segments["Items"][0]["ItemId"], item_id);
         assert_eq!(segments["Items"][0]["Type"], "Intro");
         assert_eq!(segments["Items"][0]["StartTicks"], 0);
         assert_eq!(segments["Items"][0]["EndTicks"], 120000000);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/MediaSegments/{item_id}?IncludeSegmentTypes=Preview&IncludeSegmentTypes=Intro"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_segments: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_segments["TotalRecordCount"], 2);
+        assert_eq!(filtered_segments["StartIndex"], 0);
+        assert_eq!(filtered_segments["Items"].as_array().unwrap().len(), 2);
+        assert_eq!(filtered_segments["Items"][0]["Id"], "intro-1");
+        assert_eq!(filtered_segments["Items"][1]["Id"], "preview-1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/MediaSegments/{item_id}?IncludeSegmentTypes=Commercial"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let empty_segments: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(empty_segments["TotalRecordCount"], 0);
+        assert_eq!(empty_segments["Items"], json!([]));
 
         let response = app
             .clone()
