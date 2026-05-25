@@ -13321,7 +13321,8 @@ async fn metadata_collection(
     let query = parse_items_query(raw_query.as_deref());
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut values = metadata_values(&state.db, metadata_key).await?;
-    if item_type == "Year" {
+    values.retain(|name| metadata_value_matches_query(name, &query));
+    if metadata_sort_descending(item_type, &query) {
         values.sort_by(|left, right| right.cmp(left));
     }
     let total = values.len();
@@ -13334,6 +13335,39 @@ async fn metadata_collection(
         .map(|name| metadata_entity_json(&server_id, &name, item_type, year_from_name(&name)))
         .collect::<Vec<_>>();
     Ok(Json(query_result_with_total(items, total, start_index)))
+}
+
+fn metadata_value_matches_query(name: &str, query: &ItemsQuery) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    if let Some(search_term) = query.search_term.as_deref()
+        && !normalized.contains(&search_term.to_ascii_lowercase())
+    {
+        return false;
+    }
+    if let Some(prefix) = query.name_starts_with.as_deref()
+        && !normalized.starts_with(&prefix.to_ascii_lowercase())
+    {
+        return false;
+    }
+    if let Some(lower_bound) = query.name_starts_with_or_greater.as_deref()
+        && normalized.as_str() < lower_bound.to_ascii_lowercase().as_str()
+    {
+        return false;
+    }
+    if let Some(upper_bound) = query.name_less_than.as_deref()
+        && normalized.as_str() >= upper_bound.to_ascii_lowercase().as_str()
+    {
+        return false;
+    }
+    true
+}
+
+fn metadata_sort_descending(item_type: &str, query: &ItemsQuery) -> bool {
+    query
+        .sort_order
+        .as_deref()
+        .map(|sort_order| sort_order.eq_ignore_ascii_case("Descending"))
+        .unwrap_or(item_type == "Year")
 }
 
 async fn metadata_entity_by_name(
@@ -29159,13 +29193,13 @@ mod tests {
             .update_media_item_metadata(
                 item.id,
                 json!({
-                    "Genres": ["Drama"],
-                    "MusicGenres": ["Rock"],
-                    "Artists": ["Artist One"],
-                    "AlbumArtists": ["Album Artist"],
-                    "People": [{ "Name": "John Williams" }],
-                    "Studios": ["Studio One"],
-                    "ProductionYear": 1984
+                    "Genres": ["Drama", "drama", "Thriller"],
+                    "MusicGenres": ["Rock", "Jazz"],
+                    "Artists": ["Artist One", "artist one", "Artist Two"],
+                    "AlbumArtists": ["Album Artist", "Album Artist Two"],
+                    "People": [{ "Name": "Jane Composer" }, "John Williams"],
+                    "Studios": ["Studio One", { "Name": "Studio Two" }],
+                    "ProductionYear": [1984, 1999]
                 }),
             )
             .await
@@ -29197,7 +29231,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let album_artists: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(album_artists["TotalRecordCount"], 1);
+        assert_eq!(album_artists["TotalRecordCount"], 2);
         assert_eq!(album_artists["Items"][0]["Name"], "Album Artist");
         assert_eq!(album_artists["Items"][0]["Type"], "MusicArtist");
 
@@ -29393,9 +29427,45 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let music_genres: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(music_genres["TotalRecordCount"], 1);
-        assert_eq!(music_genres["Items"][0]["Name"], "Rock");
+        assert_eq!(music_genres["TotalRecordCount"], 2);
+        assert_eq!(music_genres["Items"][0]["Name"], "Jazz");
         assert_eq!(music_genres["Items"][0]["Type"], "MusicGenre");
+
+        for (endpoint, expected_total, expected_first, expected_type) in [
+            ("/Artists?SearchTerm=artist", 2, "Artist One", "MusicArtist"),
+            ("/Genres?NameStartsWith=dr", 1, "Drama", "Genre"),
+            (
+                "/Persons?NameStartsWithOrGreater=Jo&NameLessThan=K",
+                1,
+                "John Williams",
+                "Person",
+            ),
+            (
+                "/Studios?SortOrder=Descending&Limit=1",
+                2,
+                "Studio Two",
+                "Studio",
+            ),
+            ("/Years?StartIndex=0&Limit=1", 2, "1999", "Year"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["TotalRecordCount"], expected_total, "{endpoint}");
+            assert_eq!(result["Items"][0]["Name"], expected_first, "{endpoint}");
+            assert_eq!(result["Items"][0]["Type"], expected_type, "{endpoint}");
+        }
 
         for (endpoint, name, item_type) in [
             ("/Artists/Artist%20One", "Artist One", "MusicArtist"),
