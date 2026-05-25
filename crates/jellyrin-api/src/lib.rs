@@ -8967,6 +8967,9 @@ async fn latest_items(
         &state.db,
     )
     .await?;
+    filtered_items =
+        apply_latest_user_configuration(&state.db, filtered_items, &query, requested_user_id)
+            .await?;
     filtered_items.sort_by(|left, right| {
         compare_media_items(
             right,
@@ -9010,6 +9013,9 @@ async fn current_user_latest_items(
         &state.db,
     )
     .await?;
+    filtered_items =
+        apply_latest_user_configuration(&state.db, filtered_items, &query, Some(requested_user_id))
+            .await?;
     filtered_items.sort_by(|left, right| {
         compare_media_items(
             right,
@@ -9049,6 +9055,9 @@ async fn user_latest_items(
         &state.db,
     )
     .await?;
+    filtered_items =
+        apply_latest_user_configuration(&state.db, filtered_items, &query, Some(requested_user_id))
+            .await?;
     filtered_items.sort_by(|left, right| {
         compare_media_items(
             right,
@@ -9066,6 +9075,87 @@ async fn user_latest_items(
         )
         .await?,
     ))
+}
+
+async fn apply_latest_user_configuration(
+    db: &Database,
+    mut items: Vec<MediaItem>,
+    query: &ItemsQuery,
+    user_id: Option<Uuid>,
+) -> Result<Vec<MediaItem>, ApiError> {
+    let Some(user_id) = user_id else {
+        return Ok(items);
+    };
+    let configuration = db
+        .user_configuration(user_id)
+        .await?
+        .unwrap_or_else(default_user_configuration);
+
+    let excluded_folder_ids = latest_items_excluded_folder_ids(db, &configuration).await?;
+    if !excluded_folder_ids.is_empty() {
+        items.retain(|item| !excluded_folder_ids.contains(&item.virtual_folder_id));
+    }
+
+    let hide_played = configuration
+        .get("HidePlayedInLatest")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let has_explicit_played_filter =
+        query.is_played.is_some() || query_filters_played_value(&query.filters).is_some();
+    if hide_played && !has_explicit_played_filter {
+        let mut visible = Vec::new();
+        for item in items {
+            let played = db
+                .playback_state_for_item(user_id, item.id)
+                .await?
+                .is_some_and(|state| state.played);
+            if !played {
+                visible.push(item);
+            }
+        }
+        items = visible;
+    }
+
+    Ok(items)
+}
+
+async fn latest_items_excluded_folder_ids(
+    db: &Database,
+    configuration: &serde_json::Value,
+) -> Result<HashSet<Uuid>, ApiError> {
+    let excludes = configuration
+        .get("LatestItemsExcludes")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    if excludes.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let folders = db.virtual_folders().await?;
+    Ok(folders
+        .into_iter()
+        .filter(|folder| {
+            let id = folder.id.simple().to_string().to_ascii_lowercase();
+            let name = folder.name.to_ascii_lowercase();
+            let collection_type = folder
+                .collection_type
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            excludes.contains(&id)
+                || excludes.contains(&name)
+                || excludes.contains(&collection_type)
+        })
+        .map(|folder| folder.id)
+        .collect())
 }
 
 async fn movie_recommendations(
@@ -18796,11 +18886,12 @@ mod tests {
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_orphan_hls_transcode_dirs,
         cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
-        encoding_configuration_json, hls_transcode_dedupe_key, json_value_i64, load_countries,
-        load_cultures, media_item_by_id, media_item_streams, parse_authorization_token,
-        parse_jellyfin_uuid, parse_media_browser_pairs, reconcile_transcode_sessions_on_startup,
-        router, spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        default_user_configuration, encoding_configuration_json, hls_transcode_dedupe_key,
+        json_value_i64, load_countries, load_cultures, media_item_by_id, media_item_streams,
+        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
+        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
+        subscribe_playback_events, transcode_dedupe_lock, transcode_temp_root, trickplay_settings,
+        trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -25001,6 +25092,38 @@ mod tests {
         assert_eq!(latest.as_array().unwrap().len(), 1);
         assert_eq!(latest[0]["Name"], "Example Movie");
 
+        test_db
+            .update_user_configuration(
+                user.id,
+                json!({
+                    "LatestItemsExcludes": ["movies"],
+                    "HidePlayedInLatest": true
+                }),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Latest?UserId={user_id}&ParentId={parent_id}&IncludeItemTypes=Movie&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let excluded_latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(excluded_latest.as_array().unwrap().len(), 0);
+        test_db
+            .update_user_configuration(user.id, default_user_configuration())
+            .await
+            .unwrap();
+
         let response = app
             .clone()
             .oneshot(
@@ -25649,11 +25772,29 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let current_user_latest: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(current_user_latest.as_array().unwrap().len(), 1);
-        assert_eq!(current_user_latest[0]["Id"], item_id);
-        assert_eq!(current_user_latest[0]["UserData"]["Played"], true);
+        assert_eq!(current_user_latest.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/UserLibrary/Items/Latest?ParentId={parent_id}&IncludeItemTypes=Movie&IsPlayed=true&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let played_current_user_latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(played_current_user_latest.as_array().unwrap().len(), 1);
+        assert_eq!(played_current_user_latest[0]["Id"], item_id);
+        assert_eq!(played_current_user_latest[0]["UserData"]["Played"], true);
         assert_eq!(
-            current_user_latest[0]["UserData"]["PlaybackPositionTicks"],
+            played_current_user_latest[0]["UserData"]["PlaybackPositionTicks"],
             321
         );
 
@@ -27617,9 +27758,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let user_latest: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(user_latest.as_array().unwrap().len(), 1);
-        assert_eq!(user_latest[0]["Id"], item_id);
-        assert_eq!(user_latest[0]["UserData"]["Played"], true);
+        assert_eq!(user_latest.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Users/{user_id}/Items/Latest?IncludeItemTypes=Movie&IsPlayed=true&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let played_user_latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(played_user_latest.as_array().unwrap().len(), 1);
+        assert_eq!(played_user_latest[0]["Id"], item_id);
+        assert_eq!(played_user_latest[0]["UserData"]["Played"], true);
 
         let response = app
             .clone()
