@@ -1452,59 +1452,56 @@ pub fn router(state: AppState) -> Router {
         .route("/library/items/{item_id}/ancestors", get(item_ancestors))
         .route(
             "/Items/{item_id}/Similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
-        .route(
-            "/items/{item_id}/similar",
-            get(authenticated_item_empty_items),
-        )
+        .route("/items/{item_id}/similar", get(authenticated_similar_items))
         .route(
             "/Library/Items/{item_id}/Similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/library/items/{item_id}/similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/Library/Albums/{item_id}/Similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/library/albums/{item_id}/similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/Library/Artists/{item_id}/Similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/library/artists/{item_id}/similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/Library/Movies/{item_id}/Similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/library/movies/{item_id}/similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/Library/Shows/{item_id}/Similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/library/shows/{item_id}/similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/Library/Trailers/{item_id}/Similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/library/trailers/{item_id}/similar",
-            get(authenticated_item_empty_items),
+            get(authenticated_similar_items),
         )
         .route(
             "/Users/{user_id}/Items/{item_id}/Intros",
@@ -14791,6 +14788,106 @@ async fn authenticated_item_theme_items(
     Ok(empty_items_result().await)
 }
 
+async fn authenticated_similar_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+
+    let source = media_item_by_id(&state.db, &item_id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let mut items_query = query;
+    if items_query.include_item_types.is_empty() {
+        items_query
+            .include_item_types
+            .push(media_item_type(&source).to_string());
+    }
+    let mut candidates = filtered_media_items(
+        state.db.media_items().await?,
+        &items_query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    candidates.retain(|item| item.id != source.id);
+
+    let metadata = state.db.media_item_metadata().await?;
+    let metadata_by_item = metadata
+        .iter()
+        .map(|metadata| (metadata.item_id, metadata))
+        .collect::<HashMap<_, _>>();
+    let source_terms = similar_item_terms(metadata_by_item.get(&source.id).copied());
+    let source_type = media_item_type(&source);
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|item| {
+            if media_item_type(&item) != source_type {
+                return None;
+            }
+            let terms = similar_item_terms(metadata_by_item.get(&item.id).copied());
+            let shared_terms = terms.intersection(&source_terms).count();
+            if shared_terms == 0 {
+                return None;
+            }
+            Some((shared_terms, item))
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|(left_score, left_item), (right_score, right_item)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| compare_media_items(left_item, right_item, &[SortField::SortName]))
+    });
+
+    let start_index = items_query.start_index.unwrap_or(0);
+    let total_record_count = scored.len();
+    let limit = items_query.limit.unwrap_or(20).min(100);
+    let items = scored
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    Ok(Json(query_result_with_total(
+        items_to_json(&state.db, items, &server_id, Some(requested_user_id)).await?,
+        total_record_count,
+        start_index,
+    )))
+}
+
+fn similar_item_terms(metadata: Option<&MediaItemMetadata>) -> BTreeSet<String> {
+    let mut terms = BTreeMap::<String, String>::new();
+    if let Some(metadata) = metadata {
+        for key in [
+            "Genres",
+            "MusicGenres",
+            "Tags",
+            "Studios",
+            "Artists",
+            "AlbumArtists",
+            "OfficialRating",
+            "ProductionYear",
+            "Series",
+            "SeriesName",
+        ] {
+            collect_item_count_metadata_value(metadata, key, &mut terms);
+        }
+    }
+    terms.into_keys().collect()
+}
+
 async fn item_filters(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -26238,6 +26335,17 @@ mod tests {
         assert_eq!(paged["Items"][0]["Name"], "Second Movie");
 
         let second_item_id = paged["Items"][0]["Id"].as_str().unwrap();
+        test_db
+            .update_media_item_metadata(
+                parse_jellyfin_uuid(second_item_id).unwrap(),
+                json!({
+                    "Genres": ["Drama", "Mystery"],
+                    "Studios": ["Studio One"],
+                    "ProductionYear": 2024
+                }),
+            )
+            .await
+            .unwrap();
         let response = app
             .clone()
             .oneshot(
@@ -26521,8 +26629,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let similar: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(similar["TotalRecordCount"], 0);
-        assert_eq!(similar["Items"].as_array().unwrap().len(), 0);
+        assert_eq!(similar["TotalRecordCount"], 1);
+        assert_eq!(similar["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(similar["Items"][0]["Id"], second_item_id);
+        assert_eq!(similar["Items"][0]["UserData"]["Played"], false);
 
         let response = app
             .oneshot(
