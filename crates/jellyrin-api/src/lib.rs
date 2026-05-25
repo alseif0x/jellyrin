@@ -9772,8 +9772,26 @@ async fn refresh_item(
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let scanned = state
+        .db
+        .scan_virtual_folder_items(item.virtual_folder_id)
+        .await?;
+    state
+        .db
+        .add_activity_log_entry_with_item(
+            "Item refreshed",
+            Some(&format!(
+                "Item {} was refreshed and {} media paths were scanned.",
+                item.name, scanned
+            )),
+            Some(&format!("Item {} was refreshed.", item.name)),
+            "Library",
+            Some(user.id),
+            Some(item.id),
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -23238,6 +23256,153 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn item_refresh_scans_parent_library_and_records_item_activity() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("Initial Refresh Movie.mp4"), b"initial")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "item-refresh-test-key")
+            .await
+            .unwrap();
+        let viewer = db.create_user("viewer", Some("secret")).await.unwrap();
+        let viewer_key = db
+            .issue_api_key_for_user(viewer.id, "item-refresh-viewer-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?SearchTerm=Initial")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let initial_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(initial_items["TotalRecordCount"], 1);
+        let item_id = initial_items["Items"][0]["Id"].as_str().unwrap();
+        let canonical_item_id = uuid::Uuid::parse_str(item_id).unwrap().to_string();
+
+        tokio::fs::write(tmp.path().join("Discovered By Item Refresh.mp4"), b"new")
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/Refresh"))
+                    .header("X-Emby-Token", &viewer_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/Refresh"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?SearchTerm=Discovered")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let refreshed_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refreshed_items["TotalRecordCount"], 1);
+        assert_eq!(
+            refreshed_items["Items"][0]["Name"],
+            "Discovered By Item Refresh"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/System/ActivityLog/Entries?ItemId={item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let activity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(activity["TotalRecordCount"], 1);
+        assert_eq!(activity["Items"][0]["Name"], "Item refreshed");
+        assert_eq!(activity["Items"][0]["ItemId"], canonical_item_id);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Items/00000000-0000-0000-0000-000000000000/Refresh")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
