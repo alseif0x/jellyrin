@@ -69,6 +69,12 @@ pub struct BackupManifest {
 }
 
 #[derive(Debug, Clone)]
+pub struct MediaItemMetadata {
+    pub item_id: Uuid,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct QuickConnectSession {
     pub secret: String,
     pub code: String,
@@ -2486,6 +2492,42 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_media_item_metadata(
+        &self,
+        item_id: Uuid,
+        metadata: Value,
+    ) -> anyhow::Result<()> {
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let result = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET metadata_json = ?2, updated_at = ?3
+            WHERE id = ?1
+            "#,
+        )
+        .bind(item_id.to_string())
+        .bind(metadata_json)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .execute(&self.pool)
+        .await?;
+        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        Ok(())
+    }
+
+    pub async fn media_item_metadata(&self) -> anyhow::Result<Vec<MediaItemMetadata>> {
+        let rows = sqlx::query_as::<_, MediaItemMetadataRow>(
+            r#"
+            SELECT id, metadata_json
+            FROM media_items
+            WHERE missing_since IS NULL
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn upsert_playback_state(&self, playback: UpsertPlaybackState) -> anyhow::Result<()> {
         let existing_stream_indexes =
             if playback.audio_stream_index.is_none() || playback.subtitle_stream_index.is_none() {
@@ -3497,6 +3539,12 @@ struct MediaItemRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct MediaItemMetadataRow {
+    id: String,
+    metadata_json: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct MediaItemIdRow {
     id: String,
 }
@@ -3701,6 +3749,18 @@ impl TryFrom<MediaItemRow> for MediaItem {
             media_streams: parse_media_streams_json(&row.media_streams_json)?,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<MediaItemMetadataRow> for MediaItemMetadata {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaItemMetadataRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            item_id: Uuid::parse_str(&row.id).context("invalid media item metadata id")?,
+            payload: serde_json::from_str(&row.metadata_json)
+                .context("invalid media item metadata json")?,
         })
     }
 }

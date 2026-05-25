@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path as FsPath, PathBuf},
     process::Stdio,
@@ -1890,22 +1890,44 @@ pub fn router(state: AppState) -> Router {
             "/movies/recommendations",
             get(authenticated_empty_json_array),
         )
-        .route("/Genres", get(authenticated_empty_items))
-        .route("/genres", get(authenticated_empty_items))
-        .route("/Persons", get(authenticated_empty_items))
-        .route("/persons", get(authenticated_empty_items))
-        .route("/Studios", get(authenticated_empty_items))
-        .route("/studios", get(authenticated_empty_items))
-        .route("/Years", get(authenticated_empty_items))
-        .route("/years", get(authenticated_empty_items))
+        .route("/Genres", get(metadata_genres))
+        .route("/genres", get(metadata_genres))
+        .route("/Genres/{genre_name}", get(metadata_genre_by_name))
+        .route("/genres/{genre_name}", get(metadata_genre_by_name))
+        .route("/MusicGenres", get(metadata_music_genres))
+        .route("/musicgenres", get(metadata_music_genres))
+        .route(
+            "/MusicGenres/{genre_name}",
+            get(metadata_music_genre_by_name),
+        )
+        .route(
+            "/musicgenres/{genre_name}",
+            get(metadata_music_genre_by_name),
+        )
+        .route("/Persons", get(metadata_persons))
+        .route("/persons", get(metadata_persons))
+        .route("/Persons/{name}", get(metadata_person_by_name))
+        .route("/persons/{name}", get(metadata_person_by_name))
+        .route("/Studios", get(metadata_studios))
+        .route("/studios", get(metadata_studios))
+        .route("/Studios/{name}", get(metadata_studio_by_name))
+        .route("/studios/{name}", get(metadata_studio_by_name))
+        .route("/Years", get(metadata_years))
+        .route("/years", get(metadata_years))
+        .route("/Years/{year}", get(metadata_year_by_value))
+        .route("/years/{year}", get(metadata_year_by_value))
         .route("/Channels", get(channels))
         .route("/channels", get(channels))
         .route("/Channels/Features", get(authenticated_empty_json_array))
         .route("/channels/features", get(authenticated_empty_json_array))
-        .route("/Artists", get(authenticated_empty_items))
-        .route("/artists", get(authenticated_empty_items))
-        .route("/AlbumArtists", get(authenticated_empty_items))
-        .route("/albumartists", get(authenticated_empty_items))
+        .route("/Artists", get(metadata_artists))
+        .route("/artists", get(metadata_artists))
+        .route("/Artists/AlbumArtists", get(metadata_album_artists))
+        .route("/artists/albumartists", get(metadata_album_artists))
+        .route("/Artists/{name}", get(metadata_artist_by_name))
+        .route("/artists/{name}", get(metadata_artist_by_name))
+        .route("/AlbumArtists", get(metadata_album_artists))
+        .route("/albumartists", get(metadata_album_artists))
         .route("/Albums", get(authenticated_empty_items))
         .route("/albums", get(authenticated_empty_items))
         .route("/UserItems/Resume", get(resume_items))
@@ -10538,6 +10560,307 @@ async fn search_hints(
         "SearchHints": search_hints,
         "TotalRecordCount": total_record_count
     })))
+}
+
+async fn metadata_genres(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection(state, headers, auth_query, raw_query, "Genres", "Genre").await
+}
+
+async fn metadata_music_genres(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        "MusicGenres",
+        "MusicGenre",
+    )
+    .await
+}
+
+async fn metadata_artists(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        "Artists",
+        "MusicArtist",
+    )
+    .await
+}
+
+async fn metadata_album_artists(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        "AlbumArtists",
+        "MusicArtist",
+    )
+    .await
+}
+
+async fn metadata_persons(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection(state, headers, auth_query, raw_query, "People", "Person").await
+}
+
+async fn metadata_studios(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection(state, headers, auth_query, raw_query, "Studios", "Studio").await
+}
+
+async fn metadata_years(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        "ProductionYear",
+        "Year",
+    )
+    .await
+}
+
+async fn metadata_genre_by_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_entity_by_name(state, headers, query, name, "Genre", None).await
+}
+
+async fn metadata_music_genre_by_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_entity_by_name(state, headers, query, name, "MusicGenre", None).await
+}
+
+async fn metadata_artist_by_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_entity_by_name(state, headers, query, name, "MusicArtist", None).await
+}
+
+async fn metadata_person_by_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_entity_by_name(state, headers, query, name, "Person", None).await
+}
+
+async fn metadata_studio_by_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_entity_by_name(state, headers, query, name, "Studio", None).await
+}
+
+async fn metadata_year_by_value(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(year): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let year = year
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| ApiError::bad_request("Year must be a number"))?;
+    metadata_entity_by_name(state, headers, query, year.to_string(), "Year", Some(year)).await
+}
+
+async fn metadata_collection(
+    state: AppState,
+    headers: HeaderMap,
+    auth_query: AuthQuery,
+    raw_query: Option<String>,
+    metadata_key: &'static str,
+    item_type: &'static str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let query = parse_items_query(raw_query.as_deref());
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let mut values = metadata_values(&state.db, metadata_key).await?;
+    if item_type == "Year" {
+        values.sort_by(|left, right| right.cmp(left));
+    }
+    let total = values.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    let items = values
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .map(|name| metadata_entity_json(&server_id, &name, item_type, year_from_name(&name)))
+        .collect::<Vec<_>>();
+    Ok(Json(query_result_with_total(items, total, start_index)))
+}
+
+async fn metadata_entity_by_name(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    name: String,
+    item_type: &'static str,
+    production_year: Option<i32>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request(
+            "Metadata entity name must not be empty",
+        ));
+    }
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(Json(metadata_entity_json(
+        &server_id,
+        name,
+        item_type,
+        production_year,
+    )))
+}
+
+async fn metadata_values(db: &Database, key: &str) -> Result<Vec<String>, ApiError> {
+    let mut values = BTreeMap::<String, String>::new();
+    for item in db.media_item_metadata().await? {
+        if let Some(value) = item.payload.get(key) {
+            collect_metadata_value(value, &mut values);
+        }
+    }
+    Ok(values.into_values().collect())
+}
+
+fn collect_metadata_value(value: &serde_json::Value, values: &mut BTreeMap<String, String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_metadata_value(item, values);
+            }
+        }
+        serde_json::Value::String(value) => insert_metadata_value(value, values),
+        serde_json::Value::Number(value) => insert_metadata_value(&value.to_string(), values),
+        serde_json::Value::Object(object) => {
+            if let Some(name) = object.get("Name").and_then(serde_json::Value::as_str) {
+                insert_metadata_value(name, values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn insert_metadata_value(value: &str, values: &mut BTreeMap<String, String>) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    values
+        .entry(value.to_ascii_lowercase())
+        .or_insert_with(|| value.to_string());
+}
+
+fn metadata_entity_json(
+    server_id: &str,
+    name: &str,
+    item_type: &str,
+    production_year: Option<i32>,
+) -> serde_json::Value {
+    let id = stable_entity_id(item_type, name);
+    serde_json::json!({
+        "Name": name,
+        "OriginalTitle": null,
+        "ServerId": server_id,
+        "Id": id,
+        "Etag": null,
+        "DateCreated": null,
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": name,
+        "ForcedSortName": null,
+        "ExternalUrls": [],
+        "Path": null,
+        "Overview": "",
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": {},
+        "IsFolder": true,
+        "ParentId": null,
+        "Type": item_type,
+        "MediaType": null,
+        "ProductionYear": production_year,
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "LocationType": "Virtual"
+    })
+}
+
+fn stable_entity_id(item_type: &str, name: &str) -> String {
+    let key = format!("{}:{}", item_type, name.trim().to_ascii_lowercase());
+    format!(
+        "{:016x}{:016x}",
+        fnv1a64(key.as_bytes(), 0xcbf29ce484222325),
+        fnv1a64(key.as_bytes(), 0x84222325cbf29ce4)
+    )
+}
+
+fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
+    bytes.iter().fold(seed, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3) ^ u64::from(*byte)
+    })
+}
+
+fn year_from_name(name: &str) -> Option<i32> {
+    name.parse().ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -24461,5 +24784,171 @@ mod tests {
             after_no_user_id["Configuration"]["SubtitleMode"],
             "OnlyForced"
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_entity_routes_use_persisted_item_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Metadata Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "test-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let item = test_db.media_items().await.unwrap().remove(0);
+        test_db
+            .update_media_item_metadata(
+                item.id,
+                json!({
+                    "Genres": ["Drama"],
+                    "MusicGenres": ["Rock"],
+                    "Artists": ["Artist One"],
+                    "AlbumArtists": ["Album Artist"],
+                    "People": [{ "Name": "John Williams" }],
+                    "Studios": ["Studio One"],
+                    "ProductionYear": 1984
+                }),
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/MusicGenres")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Artists/AlbumArtists")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let album_artists: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(album_artists["TotalRecordCount"], 1);
+        assert_eq!(album_artists["Items"][0]["Name"], "Album Artist");
+        assert_eq!(album_artists["Items"][0]["Type"], "MusicArtist");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/MusicGenres?StartIndex=0&Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let music_genres: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(music_genres["TotalRecordCount"], 1);
+        assert_eq!(music_genres["Items"][0]["Name"], "Rock");
+        assert_eq!(music_genres["Items"][0]["Type"], "MusicGenre");
+
+        for (endpoint, name, item_type) in [
+            ("/Artists/Artist%20One", "Artist One", "MusicArtist"),
+            ("/Genres/Drama", "Drama", "Genre"),
+            ("/MusicGenres/Rock", "Rock", "MusicGenre"),
+            ("/Persons/John%20Williams", "John Williams", "Person"),
+            ("/Studios/Studio%20One", "Studio One", "Studio"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let entity: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(entity["Name"], name);
+            assert_eq!(entity["Type"], item_type);
+            assert_eq!(entity["IsFolder"], true);
+            assert_eq!(entity["MediaType"], Value::Null);
+            assert_eq!(entity["ProviderIds"], json!({}));
+            assert_eq!(entity["ImageTags"], json!({}));
+            assert_eq!(entity["Id"].as_str().unwrap().len(), 32);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Years/1984")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let year: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(year["Name"], "1984");
+        assert_eq!(year["Type"], "Year");
+        assert_eq!(year["ProductionYear"], 1984);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Years/not-a-year")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
