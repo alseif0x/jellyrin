@@ -8651,7 +8651,7 @@ async fn user_grouping_options_legacy(
     Ok(empty_json_array().await)
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 struct ItemsQuery {
     #[serde(alias = "UserId", alias = "userId")]
     user_id: Option<String>,
@@ -14462,10 +14462,28 @@ async fn metadata_collection_keys(
     metadata_keys: &[&str],
     item_type: &'static str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let query = parse_items_query(raw_query.as_deref());
+    let mut scope_query = query.clone();
+    scope_query.ids = None;
+    scope_query.search_term = None;
+    scope_query.name_starts_with = None;
+    scope_query.name_starts_with_or_greater = None;
+    scope_query.name_less_than = None;
+    scope_query.is_folder = None;
+    scope_query.filters = metadata_scope_filters(&query.filters);
+    scope_query.start_index = None;
+    scope_query.limit = None;
+    scope_query.sort_by = None;
+    scope_query.sort_order = None;
+    let scoped_items = filtered_items_for_query(
+        &state,
+        &headers,
+        auth_query.api_key.as_deref(),
+        &scope_query,
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let mut values = metadata_values_for_keys(&state.db, metadata_keys).await?;
+    let mut values = metadata_values_for_keys(&state.db, metadata_keys, &scoped_items).await?;
     values.retain(|name| metadata_value_matches_query(name, &query));
     if metadata_sort_descending(item_type, &query) {
         values.sort_by(|left, right| right.cmp(left));
@@ -14515,6 +14533,18 @@ fn metadata_sort_descending(item_type: &str, query: &ItemsQuery) -> bool {
         .unwrap_or(item_type == "Year")
 }
 
+fn metadata_scope_filters(filters: &[String]) -> Vec<String> {
+    filters
+        .iter()
+        .flat_map(|filter| filter.split(','))
+        .map(str::trim)
+        .filter(|filter| {
+            filter.eq_ignore_ascii_case("IsPlayed") || filter.eq_ignore_ascii_case("IsUnplayed")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 async fn metadata_entity_by_name(
     state: AppState,
     headers: HeaderMap,
@@ -14539,9 +14569,20 @@ async fn metadata_entity_by_name(
     )))
 }
 
-async fn metadata_values_for_keys(db: &Database, keys: &[&str]) -> Result<Vec<String>, ApiError> {
+async fn metadata_values_for_keys(
+    db: &Database,
+    keys: &[&str],
+    items: &[MediaItem],
+) -> Result<Vec<String>, ApiError> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let item_ids = items.iter().map(|item| item.id).collect::<HashSet<_>>();
     let mut values = BTreeMap::<String, String>::new();
     for item in db.media_item_metadata().await? {
+        if !item_ids.contains(&item.item_id) {
+            continue;
+        }
         for key in keys {
             if let Some(value) = item.payload.get(*key) {
                 collect_metadata_value(value, &mut values);
@@ -19298,7 +19339,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(endpoint)
+                        .uri(endpoint.to_string())
                         .header("X-Emby-Token", &api_key)
                         .body(Body::empty())
                         .unwrap(),
@@ -33306,8 +33347,11 @@ mod tests {
     #[tokio::test]
     async fn metadata_entity_routes_use_persisted_item_metadata() {
         let tmp = tempfile::tempdir().unwrap();
+        let other_tmp = tempfile::tempdir().unwrap();
         let movie = tmp.path().join("Metadata Movie.mp4");
+        let other_movie = other_tmp.path().join("Other Metadata Movie.mp4");
         tokio::fs::write(&movie, b"fake video").await.unwrap();
+        tokio::fs::write(&other_movie, b"fake video").await.unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let admin = db
@@ -33348,8 +33392,37 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        let item = test_db.media_items().await.unwrap().remove(0);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=OtherMovies&collectionType=movies&paths={}",
+                        other_tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let items = test_db.media_items().await.unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.name == "Metadata Movie")
+            .unwrap()
+            .clone();
+        let other_item = items
+            .iter()
+            .find(|item| item.name == "Other Metadata Movie")
+            .unwrap()
+            .clone();
         let item_id = item.id.simple().to_string();
+        let parent_id = item.virtual_folder_id.simple().to_string();
+        let other_parent_id = other_item.virtual_folder_id.simple().to_string();
         test_db
             .update_media_item_metadata(
                 item.id,
@@ -33364,6 +33437,17 @@ mod tests {
                     "People": [{ "Name": "Jane Composer" }, "John Williams"],
                     "Studios": ["Studio One", { "Name": "Studio Two" }],
                     "ProductionYear": [1984, 1999]
+                }),
+            )
+            .await
+            .unwrap();
+        test_db
+            .update_media_item_metadata(
+                other_item.id,
+                json!({
+                    "Genres": ["Other Genre"],
+                    "Artists": ["Other Artist"],
+                    "Album": "Other Album"
                 }),
             )
             .await
@@ -33419,7 +33503,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(endpoint)
+                        .uri(endpoint.to_string())
                         .header("X-Emby-Token", &api_key)
                         .body(Body::empty())
                         .unwrap(),
@@ -33429,11 +33513,42 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let albums: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(albums["TotalRecordCount"], 2, "{endpoint}");
+            assert_eq!(albums["TotalRecordCount"], 3, "{endpoint}");
             assert_eq!(albums["Items"].as_array().unwrap().len(), 1, "{endpoint}");
             assert_eq!(albums["Items"][0]["Name"], "Example Album", "{endpoint}");
             assert_eq!(albums["Items"][0]["Type"], "MusicAlbum", "{endpoint}");
             assert_eq!(albums["Items"][0]["IsFolder"], true, "{endpoint}");
+        }
+
+        for (endpoint, expected_total, expected_first) in [
+            (
+                format!("/Albums?ParentId={parent_id}&SearchTerm=album"),
+                2,
+                "Example Album",
+            ),
+            (
+                format!("/Albums?ParentId={other_parent_id}&SearchTerm=album"),
+                1,
+                "Other Album",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let albums: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(albums["TotalRecordCount"], expected_total);
+            assert_eq!(albums["Items"][0]["Name"], expected_first);
+            assert_eq!(albums["Items"][0]["Type"], "MusicAlbum");
         }
 
         let response = app
@@ -33649,27 +33764,49 @@ mod tests {
         assert_eq!(music_genres["Items"][0]["Type"], "MusicGenre");
 
         for (endpoint, expected_total, expected_first, expected_type) in [
-            ("/Artists?SearchTerm=artist", 2, "Artist One", "MusicArtist"),
-            ("/Genres?NameStartsWith=dr", 1, "Drama", "Genre"),
             (
-                "/Persons?NameStartsWithOrGreater=Jo&NameLessThan=K",
+                "/Artists?SearchTerm=artist".to_string(),
+                3,
+                "Artist One",
+                "MusicArtist",
+            ),
+            (
+                format!("/Artists?ParentId={parent_id}&SearchTerm=artist"),
+                2,
+                "Artist One",
+                "MusicArtist",
+            ),
+            (
+                format!("/Artists?ParentId={other_parent_id}&SearchTerm=artist"),
+                1,
+                "Other Artist",
+                "MusicArtist",
+            ),
+            (
+                format!("/Genres?ParentId={parent_id}&NameStartsWith=dr"),
+                1,
+                "Drama",
+                "Genre",
+            ),
+            (
+                "/Persons?NameStartsWithOrGreater=Jo&NameLessThan=K".to_string(),
                 1,
                 "John Williams",
                 "Person",
             ),
             (
-                "/Studios?SortOrder=Descending&Limit=1",
+                "/Studios?SortOrder=Descending&Limit=1".to_string(),
                 2,
                 "Studio Two",
                 "Studio",
             ),
-            ("/Years?StartIndex=0&Limit=1", 2, "1999", "Year"),
+            ("/Years?StartIndex=0&Limit=1".to_string(), 2, "1999", "Year"),
         ] {
             let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(endpoint)
+                        .uri(endpoint.to_string())
                         .header("X-Emby-Token", &api_key)
                         .body(Body::empty())
                         .unwrap(),
@@ -33682,6 +33819,55 @@ mod tests {
             assert_eq!(result["TotalRecordCount"], expected_total, "{endpoint}");
             assert_eq!(result["Items"][0]["Name"], expected_first, "{endpoint}");
             assert_eq!(result["Items"][0]["Type"], expected_type, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{}/PlayedItems/{}", admin.id, item_id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        for (endpoint, expected_total, expected_first) in [
+            (
+                format!("/Albums?UserId={}&Filters=IsPlayed", admin.id),
+                2,
+                "Example Album",
+            ),
+            (
+                format!("/Albums?UserId={}&Filters=IsUnplayed", admin.id),
+                1,
+                "Other Album",
+            ),
+            (
+                format!("/Albums?UserId={}&IsPlayed=true", admin.id),
+                2,
+                "Example Album",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let albums: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(albums["TotalRecordCount"], expected_total);
+            assert_eq!(albums["Items"][0]["Name"], expected_first);
         }
 
         for (endpoint, name, item_type) in [
