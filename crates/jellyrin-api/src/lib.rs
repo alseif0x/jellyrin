@@ -7624,6 +7624,10 @@ async fn ensure_trickplay_tile(
         .arg(settings.process_threads.to_string())
         .arg("-q:v")
         .arg(settings.qscale.to_string())
+        .arg("-f")
+        .arg("image2")
+        .arg("-c:v")
+        .arg("mjpeg")
         .arg(&tmp_path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -17191,6 +17195,165 @@ mod tests {
         let intros: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(intros["TotalRecordCount"], 0);
         assert_eq!(intros["Items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn trickplay_generates_tiles_from_real_video_media() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Trickplay Source.mp4");
+        let ffmpeg = tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=160x90:rate=1")
+            .arg("-t")
+            .arg("1")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-c:v")
+            .arg("mpeg4")
+            .arg(&movie)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            ffmpeg.status.success(),
+            "ffmpeg failed to create test video: {}",
+            String::from_utf8_lossy(&ffmpeg.stderr)
+        );
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "trickplay-test-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?IncludeItemTypes=Movie&Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["TotalRecordCount"], 1);
+        let item_id = result["Items"][0]["Id"].as_str().unwrap();
+        assert_eq!(
+            result["Items"][0]["MediaSources"][0]["RunTimeTicks"],
+            10_000_000
+        );
+        assert_eq!(
+            result["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Width"],
+            160
+        );
+        assert_eq!(
+            result["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Height"],
+            90
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Trickplay/Videos/{item_id}/Trickplay/320/tiles.m3u8?api_key={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-IMAGES-ONLY"));
+        assert!(playlist.contains("#EXT-X-TILES:RESOLUTION=160x90"));
+        assert!(playlist.contains(&format!("0.jpg?api_key={api_key}")));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Trickplay/Videos/{item_id}/Trickplay/320/0.jpg"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[0xff, 0xd8]));
+        assert!(body.ends_with(&[0xff, 0xd9]));
+
+        let cached_item = media_item_by_id(&test_db, item_id).await.unwrap();
+        let trickplay_settings = trickplay_settings(&test_db).await.unwrap();
+        let cached_tile = trickplay_tile_cache_path(&cached_item, &trickplay_settings, 320, 0);
+        let first_modified = tokio::fs::metadata(&cached_tile)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Trickplay/Videos/{item_id}/Trickplay/320/0.jpg"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let second_modified = tokio::fs::metadata(&cached_tile)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(second_modified, first_modified);
     }
 
     #[tokio::test]
