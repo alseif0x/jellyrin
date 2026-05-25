@@ -659,22 +659,112 @@ pub fn router(state: AppState) -> Router {
             "/livetv/listingproviders/schedulesdirect/countries",
             get(live_tv_schedules_direct_countries),
         )
-        .route("/LiveTv/Channels", get(empty_items_result))
-        .route("/livetv/channels", get(empty_items_result))
-        .route("/LiveTv/Programs", get(empty_items_result))
-        .route("/livetv/programs", get(empty_items_result))
-        .route("/LiveTv/RecommendedPrograms", get(empty_items_result))
-        .route("/livetv/recommendedprograms", get(empty_items_result))
-        .route("/LiveTv/Programs/Recommended", get(empty_items_result))
-        .route("/livetv/programs/recommended", get(empty_items_result))
-        .route("/LiveTv/Recordings", get(empty_items_result))
-        .route("/livetv/recordings", get(empty_items_result))
-        .route("/LiveTv/RecordingGroups", get(empty_items_result))
-        .route("/livetv/recordinggroups", get(empty_items_result))
-        .route("/LiveTv/Timers", get(empty_result_json))
-        .route("/livetv/timers", get(empty_result_json))
-        .route("/LiveTv/SeriesTimers", get(empty_result_json))
-        .route("/livetv/seriestimers", get(empty_result_json))
+        .route("/LiveTv/Channels", get(live_tv_empty_items))
+        .route("/livetv/channels", get(live_tv_empty_items))
+        .route("/LiveTv/Channels/{channelId}", get(live_tv_missing_item))
+        .route("/livetv/channels/{channelId}", get(live_tv_missing_item))
+        .route(
+            "/LiveTv/LiveRecordings/{recordingId}/stream",
+            get(live_tv_missing_stream),
+        )
+        .route(
+            "/livetv/liverecordings/{recordingId}/stream",
+            get(live_tv_missing_stream),
+        )
+        .route(
+            "/LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
+            get(live_tv_missing_container_stream),
+        )
+        .route(
+            "/livetv/livestreamfiles/{streamId}/stream.{container}",
+            get(live_tv_missing_container_stream),
+        )
+        .route(
+            "/LiveTv/Programs",
+            get(live_tv_empty_items).post(live_tv_post_empty_items),
+        )
+        .route(
+            "/livetv/programs",
+            get(live_tv_empty_items).post(live_tv_post_empty_items),
+        )
+        .route("/LiveTv/Programs/{programId}", get(live_tv_missing_item))
+        .route("/livetv/programs/{programId}", get(live_tv_missing_item))
+        .route("/LiveTv/RecommendedPrograms", get(live_tv_empty_items))
+        .route("/livetv/recommendedprograms", get(live_tv_empty_items))
+        .route("/LiveTv/Programs/Recommended", get(live_tv_empty_items))
+        .route("/livetv/programs/recommended", get(live_tv_empty_items))
+        .route("/LiveTv/Recordings", get(live_tv_empty_items))
+        .route("/livetv/recordings", get(live_tv_empty_items))
+        .route("/LiveTv/Recordings/Folders", get(live_tv_empty_items))
+        .route("/livetv/recordings/folders", get(live_tv_empty_items))
+        .route("/LiveTv/Recordings/Groups", get(live_tv_empty_items))
+        .route("/livetv/recordings/groups", get(live_tv_empty_items))
+        .route("/LiveTv/Recordings/Series", get(live_tv_empty_items))
+        .route("/livetv/recordings/series", get(live_tv_empty_items))
+        .route(
+            "/LiveTv/Recordings/{recordingId}",
+            get(live_tv_missing_item).delete(live_tv_delete_missing_recording),
+        )
+        .route(
+            "/livetv/recordings/{recordingId}",
+            get(live_tv_missing_item).delete(live_tv_delete_missing_recording),
+        )
+        .route("/LiveTv/RecordingGroups", get(live_tv_empty_items))
+        .route("/livetv/recordinggroups", get(live_tv_empty_items))
+        .route(
+            "/LiveTv/Timers",
+            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+        )
+        .route(
+            "/livetv/timers",
+            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+        )
+        .route("/LiveTv/Timers/Defaults", get(live_tv_timer_defaults))
+        .route("/livetv/timers/defaults", get(live_tv_timer_defaults))
+        .route(
+            "/LiveTv/Timers/{timerId}",
+            get(live_tv_missing_item)
+                .post(live_tv_management_item_not_implemented)
+                .delete(live_tv_delete_missing_timer),
+        )
+        .route(
+            "/livetv/timers/{timerId}",
+            get(live_tv_missing_item)
+                .post(live_tv_management_item_not_implemented)
+                .delete(live_tv_delete_missing_timer),
+        )
+        .route(
+            "/LiveTv/SeriesTimers",
+            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+        )
+        .route(
+            "/livetv/seriestimers",
+            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+        )
+        .route(
+            "/LiveTv/SeriesTimers/{timerId}",
+            get(live_tv_missing_item)
+                .post(live_tv_management_item_not_implemented)
+                .delete(live_tv_delete_missing_timer),
+        )
+        .route(
+            "/livetv/seriestimers/{timerId}",
+            get(live_tv_missing_item)
+                .post(live_tv_management_item_not_implemented)
+                .delete(live_tv_delete_missing_timer),
+        )
+        .route("/LiveTv/Tuners/Discover", get(live_tv_discover_tuners))
+        .route("/livetv/tuners/discover", get(live_tv_discover_tuners))
+        .route("/LiveTv/Tuners/Discvover", get(live_tv_discover_tuners))
+        .route("/livetv/tuners/discvover", get(live_tv_discover_tuners))
+        .route(
+            "/LiveTv/Tuners/{tunerId}/Reset",
+            post(live_tv_reset_tuner),
+        )
+        .route(
+            "/livetv/tuners/{tunerId}/reset",
+            post(live_tv_reset_tuner),
+        )
         .route("/Branding/Configuration", get(branding_configuration))
         .route("/branding/configuration", get(branding_configuration))
         .route("/Branding/Css", get(branding_css))
@@ -4996,14 +5086,6 @@ async fn dashboard_configuration_pages(
     Ok(Json(Vec::new()))
 }
 
-fn empty_result() -> serde_json::Value {
-    serde_json::json!({
-        "Items": [],
-        "TotalRecordCount": 0,
-        "StartIndex": 0
-    })
-}
-
 const LIBRARY_SCAN_TASK_ID: &str = "scan-media-library";
 const LIBRARY_SCAN_TASK_KEY: &str = "RefreshLibrary";
 const STALE_TASK_HOURS: i64 = 24;
@@ -6217,10 +6299,6 @@ async fn empty_json_array() -> Json<Vec<serde_json::Value>> {
     Json(Vec::new())
 }
 
-async fn empty_result_json() -> Json<serde_json::Value> {
-    Json(empty_result())
-}
-
 async fn live_tv_info() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "Services": [],
@@ -6636,6 +6714,170 @@ async fn live_tv_schedules_direct_countries(
         ],
         "ZZZ": []
     })))
+}
+
+async fn live_tv_empty_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(query_result(Vec::new())))
+}
+
+async fn live_tv_post_empty_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(query_result(Vec::new())))
+}
+
+async fn live_tv_missing_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Live TV item not found"))
+}
+
+async fn live_tv_missing_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Live TV stream not found"))
+}
+
+async fn live_tv_missing_container_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((_stream_id, _container)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Live TV stream not found"))
+}
+
+async fn live_tv_delete_missing_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_recording_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Live TV recording not found"))
+}
+
+async fn live_tv_delete_missing_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_timer_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Live TV timer not found"))
+}
+
+async fn live_tv_management_not_implemented(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NOT_IMPLEMENTED)
+}
+
+async fn live_tv_management_item_not_implemented(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_timer_id): Path<String>,
+    Json(_payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NOT_IMPLEMENTED)
+}
+
+async fn live_tv_timer_defaults(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(Json(serde_json::json!({
+        "Id": null,
+        "ProgramId": null,
+        "ChannelId": null,
+        "Name": "",
+        "Overview": "",
+        "StartDate": null,
+        "EndDate": null,
+        "PrePaddingSeconds": config["PrePaddingSeconds"].clone(),
+        "PostPaddingSeconds": config["PostPaddingSeconds"].clone(),
+        "Priority": 0,
+        "IsPrePaddingRequired": false,
+        "IsPostPaddingRequired": false,
+        "KeepUntil": "UntilDeleted",
+        "RecordAnyTime": false,
+        "SkipEpisodesInLibrary": false,
+        "RecordAnyChannel": false,
+        "NewOnly": false,
+        "Days": [],
+        "RecordingsPath": config["RecordingPath"].clone(),
+        "SeriesRecordingPath": config["SeriesRecordingPath"].clone()
+    })))
+}
+
+async fn live_tv_discover_tuners(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(Vec::new()))
+}
+
+async fn live_tv_reset_tuner(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(tuner_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let tuner_exists = config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tuners| {
+            tuners.iter().any(|tuner| {
+                tuner
+                    .get("Id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&tuner_id))
+            })
+        });
+    if tuner_exists {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Live TV tuner not found"))
+    }
 }
 
 async fn branding_configuration(
@@ -16426,6 +16668,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/LiveTv/Channels")
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -17843,6 +18086,213 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let options: Value = serde_json::from_slice(&body).unwrap();
         assert!(options["Mappings"].as_array().unwrap().is_empty());
+
+        for endpoint in [
+            "/LiveTv/Channels?UserId=test-user",
+            "/livetv/programs",
+            "/LiveTv/RecommendedPrograms",
+            "/LiveTv/Programs/Recommended",
+            "/LiveTv/Recordings",
+            "/LiveTv/RecordingGroups",
+            "/LiveTv/Recordings/Folders",
+            "/livetv/recordings/groups",
+            "/LiveTv/Recordings/Series",
+            "/LiveTv/Timers",
+            "/LiveTv/SeriesTimers",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["TotalRecordCount"], 0, "{endpoint}");
+            assert!(result["Items"].as_array().unwrap().is_empty(), "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/Programs")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ChannelIds": ["missing"] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let programs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(programs["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Timers/Defaults")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let timer_defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(timer_defaults["PrePaddingSeconds"], 300);
+        assert_eq!(timer_defaults["PostPaddingSeconds"], 600);
+        assert_eq!(timer_defaults["RecordingsPath"], "/srv/recordings");
+        assert_eq!(
+            timer_defaults["SeriesRecordingPath"],
+            "/srv/recordings/series"
+        );
+        assert_eq!(timer_defaults["KeepUntil"], "UntilDeleted");
+
+        for endpoint in [
+            "/LiveTv/Channels/channel-missing",
+            "/LiveTv/Programs/program-missing",
+            "/LiveTv/Recordings/recording-missing",
+            "/LiveTv/Timers/timer-missing",
+            "/livetv/seriestimers/timer-missing",
+            "/LiveTv/LiveRecordings/recording-missing/stream",
+            "/LiveTv/LiveStreamFiles/stream-missing/stream.ts",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+
+        for endpoint in [
+            "/LiveTv/Recordings/recording-missing",
+            "/LiveTv/Timers/timer-missing",
+            "/LiveTv/SeriesTimers/timer-missing",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::DELETE)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+
+        for endpoint in [
+            "/LiveTv/Timers",
+            "/LiveTv/Timers/timer-missing",
+            "/LiveTv/SeriesTimers",
+            "/LiveTv/SeriesTimers/timer-missing",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({ "ProgramId": "missing" }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Tuners/Discover")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for endpoint in ["/LiveTv/Tuners/Discover", "/livetv/tuners/discvover"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let discovered: Value = serde_json::from_slice(&body).unwrap();
+            assert!(discovered.as_array().unwrap().is_empty(), "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/Tuners/tuner-1/Reset")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/Tuners/tuner-missing/Reset")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .oneshot(
