@@ -3769,6 +3769,12 @@ fn is_server_log_file_name(name: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct SystemLogFileQuery {
     #[serde(alias = "Name")]
+    #[serde(alias = "file")]
+    #[serde(alias = "File")]
+    #[serde(alias = "filename")]
+    #[serde(alias = "FileName")]
+    #[serde(alias = "log")]
+    #[serde(alias = "Log")]
     name: String,
 }
 
@@ -3810,6 +3816,9 @@ async fn system_log_file(
 fn safe_log_file_path(log_dir: &FsPath, name: &str) -> Option<PathBuf> {
     let name = name.trim();
     if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    if !is_server_log_file_name(name) {
         return None;
     }
 
@@ -18583,9 +18592,25 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"first line\nsecond line\n");
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Logs/Log?FileName=older.log")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"older\n");
+
         for uri in [
             "/System/Logs/Log?name=../jellyrin.log",
             "/System/Logs/Log?name=nested/file.log",
+            "/System/Logs/Log?name=notes.json",
         ] {
             let response = app
                 .clone()
