@@ -30,7 +30,7 @@ use jellyrin_core::{
 };
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
-    BackupManifest, BrandingConfig, Database, DeviceSession, SortDirection,
+    BackupManifest, BrandingConfig, Database, DeviceSession, QuickConnectSession, SortDirection,
     SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
     UpsertActivePlaybackSession, UpsertPlaybackState, UpsertTranscodeSession,
 };
@@ -310,6 +310,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Users", get(get_users).post(update_user))
         .route("/users", get(get_users).post(update_user))
+        .route("/Users/New", post(create_user_by_name))
+        .route("/users/new", post(create_user_by_name))
+        .route("/Users/ForgotPassword", post(forgot_password))
+        .route("/users/forgotpassword", post(forgot_password))
+        .route("/Users/ForgotPassword/Pin", post(forgot_password_pin))
+        .route("/users/forgotpassword/pin", post(forgot_password_pin))
         .route("/Users/Configuration", post(update_user_configuration))
         .route("/users/configuration", post(update_user_configuration))
         .route("/Users/AuthenticateByName", post(authenticate_by_name))
@@ -336,8 +342,22 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{user_id}/items/latest", get(user_latest_items))
         .route("/Users/{user_id}/Items/Resume", get(user_resume_items))
         .route("/users/{user_id}/items/resume", get(user_resume_items))
-        .route("/Users/{user_id}", get(get_user_by_id))
-        .route("/users/{user_id}", get(get_user_by_id))
+        .route(
+            "/Users/{user_id}",
+            get(get_user_by_id).post(update_user_legacy).delete(delete_user),
+        )
+        .route(
+            "/users/{user_id}",
+            get(get_user_by_id).post(update_user_legacy).delete(delete_user),
+        )
+        .route(
+            "/Users/{user_id}/Authenticate",
+            post(authenticate_user_by_id),
+        )
+        .route(
+            "/users/{user_id}/authenticate",
+            post(authenticate_user_by_id),
+        )
         .route("/Users/Password", post(update_user_password))
         .route("/users/password", post(update_user_password))
         .route(
@@ -558,6 +578,20 @@ pub fn router(state: AppState) -> Router {
         .route("/session/sessions/viewing", post(report_viewing))
         .route("/QuickConnect/Enabled", get(quick_connect_enabled))
         .route("/quickconnect/enabled", get(quick_connect_enabled))
+        .route("/QuickConnect/Initiate", post(initiate_quick_connect))
+        .route("/quickconnect/initiate", post(initiate_quick_connect))
+        .route("/QuickConnect/Connect", get(get_quick_connect_state))
+        .route("/quickconnect/connect", get(get_quick_connect_state))
+        .route("/QuickConnect/Authorize", post(authorize_quick_connect))
+        .route("/quickconnect/authorize", post(authorize_quick_connect))
+        .route(
+            "/Users/AuthenticateWithQuickConnect",
+            post(authenticate_with_quick_connect),
+        )
+        .route(
+            "/users/authenticatewithquickconnect",
+            post(authenticate_with_quick_connect),
+        )
         .route("/SyncPlay/List", get(empty_json_array))
         .route("/syncplay/list", get(empty_json_array))
         .route("/LiveTv/Info", get(live_tv_info))
@@ -2368,6 +2402,56 @@ fn api_key_to_json(index: usize, key: &ApiKey) -> serde_json::Value {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateUserByNameBody {
+    #[serde(alias = "Name")]
+    name: Option<String>,
+    #[serde(alias = "Password")]
+    password: Option<String>,
+}
+
+async fn create_user_by_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<CreateUserByNameBody>,
+) -> Result<Json<UserDto>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let name = payload
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ApiError::bad_request("Name must not be empty"))?;
+    let user = state
+        .db
+        .create_user(name, payload.password.as_deref())
+        .await
+        .map_err(|_| ApiError::conflict("User could not be created"))?;
+    let server = state.db.server_state().await?;
+    Ok(Json(user_to_dto(&state.db, &user, server.server_id).await?))
+}
+
+async fn delete_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    state
+        .db
+        .user_by_id(user_id)
+        .await
+        .map_err(|_| ApiError::not_found("User not found"))?;
+    state
+        .db
+        .delete_user(user_id)
+        .await
+        .map_err(|_| ApiError::conflict("User could not be deleted"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
 struct UpdateUserQuery {
     #[serde(flatten)]
     auth: AuthQuery,
@@ -2388,6 +2472,18 @@ async fn update_user(
         .or_else(|| payload.get("Id").and_then(serde_json::Value::as_str))
         .ok_or_else(|| ApiError::bad_request("User id is required"))?;
     update_user_profile_from_payload(&state.db, resolve_user_id(user_id)?, payload).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_user_legacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    update_user_profile_from_payload(&state.db, user_id, payload).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2555,6 +2651,69 @@ async fn authenticate_by_name(
     Ok(Json(
         authentication_result_to_dto(&state.db, &user, &token, server.server_id).await?,
     ))
+}
+
+async fn authenticate_user_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<AuthenticateUserByNameDto>,
+) -> Result<Json<AuthenticationResultDto>, ApiError> {
+    let auth = client_auth_from_headers(&headers);
+    let password = payload.pw.as_deref().unwrap_or("");
+    let (user, token) = state
+        .db
+        .authenticate_user_by_id(
+            user_id,
+            password,
+            &auth.device_id,
+            &auth.device,
+            &auth.client,
+            &auth.version,
+        )
+        .await
+        .map_err(|_| ApiError::unauthorized("Invalid username or password"))?;
+    let server = state.db.server_state().await?;
+    record_activity(
+        &state.db,
+        &format!("{} signed in", user.name),
+        Some(&format!("{} signed in from {}", user.name, auth.client)),
+        "Authentication",
+        Some(user.id),
+    )
+    .await?;
+
+    Ok(Json(
+        authentication_result_to_dto(&state.db, &user, &token, server.server_id).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ForgotPasswordBody {
+    #[serde(alias = "EnteredUsername", alias = "Username", alias = "Name")]
+    _entered_username: Option<String>,
+}
+
+async fn forgot_password(
+    _body: Option<Json<ForgotPasswordBody>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({
+        "Action": "ContactAdmin",
+        "PinFile": null,
+        "PinExpirationDate": null
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ForgotPasswordPinBody {
+    #[serde(alias = "Pin")]
+    _pin: Option<String>,
+}
+
+async fn forgot_password_pin(
+    _body: Option<Json<ForgotPasswordPinBody>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({ "Success": false })))
 }
 
 async fn get_current_user(
@@ -5581,7 +5740,129 @@ fn parse_send_playstate_command_query(raw_query: Option<&str>) -> SendPlaystateC
 }
 
 async fn quick_connect_enabled() -> Json<bool> {
-    Json(false)
+    Json(true)
+}
+
+async fn initiate_quick_connect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = client_auth_from_headers(&headers);
+    let session = state
+        .db
+        .initiate_quick_connect(&auth.device_id, &auth.device, &auth.client, &auth.version)
+        .await?;
+    Ok(Json(quick_connect_json(&session)))
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickConnectSecretQuery {
+    #[serde(alias = "Secret", alias = "secret")]
+    secret: String,
+}
+
+async fn get_quick_connect_state(
+    State(state): State<AppState>,
+    Query(query): Query<QuickConnectSecretQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = state
+        .db
+        .quick_connect_by_secret(&query.secret)
+        .await
+        .map_err(|_| ApiError::not_found("QuickConnect session not found"))?;
+    Ok(Json(quick_connect_json(&session)))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct QuickConnectCodePayload {
+    #[serde(alias = "Code", alias = "code")]
+    code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickConnectAuthorizeQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "Code", alias = "code")]
+    code: Option<String>,
+}
+
+async fn authorize_quick_connect(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<QuickConnectAuthorizeQuery>,
+    body: Option<Json<QuickConnectCodePayload>>,
+) -> Result<Json<bool>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let code = query
+        .code
+        .as_deref()
+        .or_else(|| body.as_ref().and_then(|body| body.code.as_deref()))
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .ok_or_else(|| ApiError::bad_request("Code must not be empty"))?;
+    state
+        .db
+        .authorize_quick_connect(code, user.id)
+        .await
+        .map_err(|_| ApiError::not_found("QuickConnect code not found"))?;
+    Ok(Json(true))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthenticateQuickConnectBody {
+    #[serde(alias = "Secret", alias = "secret")]
+    secret: String,
+}
+
+async fn authenticate_with_quick_connect(
+    State(state): State<AppState>,
+    Json(payload): Json<AuthenticateQuickConnectBody>,
+) -> Result<Json<AuthenticationResultDto>, ApiError> {
+    let session = state
+        .db
+        .quick_connect_by_secret(&payload.secret)
+        .await
+        .map_err(|_| ApiError::unauthorized("QuickConnect authorization is not complete"))?;
+    if !session.authorized || session.expires_at <= OffsetDateTime::now_utc() {
+        return Err(ApiError::unauthorized(
+            "QuickConnect authorization is not complete",
+        ));
+    }
+    let user_id = session
+        .user_id
+        .ok_or_else(|| ApiError::unauthorized("QuickConnect authorization is not complete"))?;
+    let (user, token) = state
+        .db
+        .issue_device_token_for_user(
+            user_id,
+            &session.device_id,
+            &session.device_name,
+            &session.client,
+            &session.version,
+        )
+        .await
+        .map_err(|_| ApiError::unauthorized("QuickConnect authorization is not complete"))?;
+    state
+        .db
+        .delete_quick_connect_session(&session.secret)
+        .await?;
+    let server = state.db.server_state().await?;
+    Ok(Json(
+        authentication_result_to_dto(&state.db, &user, &token, server.server_id).await?,
+    ))
+}
+
+fn quick_connect_json(session: &QuickConnectSession) -> serde_json::Value {
+    serde_json::json!({
+        "Secret": session.secret,
+        "Code": session.code,
+        "DateAdded": format_time_for_json(session.created_at),
+        "DateUpdated": format_time_for_json(session.updated_at),
+        "DateExpires": format_time_for_json(session.expires_at),
+        "Authenticated": session.authorized,
+        "UserId": session.user_id.map(|id| id.simple().to_string())
+    })
 }
 
 async fn empty_json_array() -> Json<Vec<serde_json::Value>> {
@@ -23612,6 +23893,355 @@ mod tests {
         assert_eq!(user["Name"], "managed-renamed");
         assert_eq!(user["Policy"]["IsAdministrator"], true);
         assert_eq!(user["Policy"]["IsDisabled"], false);
+    }
+
+    #[tokio::test]
+    async fn user_lifecycle_and_quick_connect_routes_cover_auth_p0() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/New")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Name": "managed", "Password": "managed-secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/New")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Name": "managed", "Password": "managed-secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created_user: Value = serde_json::from_slice(&body).unwrap();
+        let managed_id = created_user["Id"].as_str().unwrap();
+        assert_eq!(created_user["Name"], "managed");
+        assert_eq!(created_user["HasConfiguredPassword"], true);
+        assert_eq!(created_user["Policy"]["IsAdministrator"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{managed_id}/Authenticate"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="user-id-auth", Version="dev""#,
+                    )
+                    .body(Body::from(json!({ "Pw": "wrong" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{managed_id}/Authenticate"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="user-id-auth", Version="dev""#,
+                    )
+                    .body(Body::from(json!({ "Pw": "managed-secret" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let auth_result: Value = serde_json::from_slice(&body).unwrap();
+        let managed_token = auth_result["AccessToken"].as_str().unwrap();
+        assert_eq!(auth_result["User"]["Id"], managed_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{managed_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Name": "managed-renamed",
+                            "Policy": { "IsDisabled": true }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{managed_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let renamed_user: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(renamed_user["Name"], "managed-renamed");
+        assert_eq!(renamed_user["Policy"]["IsDisabled"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/QuickConnect/Enabled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let enabled: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(enabled, true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/QuickConnect/Initiate")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="quick-device", Version="dev""#,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let initiated: Value = serde_json::from_slice(&body).unwrap();
+        let secret = initiated["Secret"].as_str().unwrap();
+        let code = initiated["Code"].as_str().unwrap();
+        assert_eq!(initiated["Authenticated"], false);
+        assert_eq!(code.len(), 6);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/QuickConnect/Connect?Secret={secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let pending: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pending["Authenticated"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/QuickConnect/Authorize")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Code": code }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/QuickConnect/Authorize")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Code": code }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let authorized: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(authorized, true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/QuickConnect/Connect?Secret={secret}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let connected: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(connected["Authenticated"], true);
+        assert_eq!(connected["UserId"], admin.id.simple().to_string());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateWithQuickConnect")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Secret": secret }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let quick_auth: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(quick_auth["User"]["Id"], admin.id.to_string());
+        assert!(!quick_auth["AccessToken"].as_str().unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateWithQuickConnect")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Secret": secret }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Users/{}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Users/{managed_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/Me")
+                    .header("X-Emby-Token", managed_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for body in [
+            json!({ "EnteredUsername": "admin" }),
+            json!({ "EnteredUsername": "does-not-exist" }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/Users/ForgotPassword")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let forgot: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(forgot["Action"], "ContactAdmin");
+            assert_eq!(forgot["PinFile"], Value::Null);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/ForgotPassword/Pin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Pin": "000000" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let pin: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pin["Success"], false);
     }
 
     #[tokio::test]

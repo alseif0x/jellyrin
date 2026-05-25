@@ -68,6 +68,21 @@ pub struct BackupManifest {
     pub created_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone)]
+pub struct QuickConnectSession {
+    pub secret: String,
+    pub code: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub client: String,
+    pub version: String,
+    pub user_id: Option<Uuid>,
+    pub authorized: bool,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, Default)]
 struct MediaInfo {
     runtime_ticks: Option<i64>,
@@ -817,6 +832,51 @@ impl Database {
         self.user_by_id(user.id).await
     }
 
+    pub async fn create_user(&self, name: &str, password: Option<&str>) -> anyhow::Result<User> {
+        let trimmed_name = name.trim();
+        anyhow::ensure!(!trimmed_name.is_empty(), "user name must not be empty");
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let user_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, name, is_administrator, is_disabled, created_at, updated_at)
+            VALUES (?1, ?2, 0, 0, ?3, ?3)
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(trimmed_name)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        if let Some(password) = password.filter(|password| !password.is_empty()) {
+            self.set_user_password(user_id, password).await?;
+        }
+
+        self.user_by_id(user_id).await
+    }
+
+    pub async fn delete_user(&self, user_id: Uuid) -> anyhow::Result<()> {
+        let user = self.user_by_id(user_id).await?;
+        if user.is_administrator {
+            let admin_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM users WHERE is_administrator = 1 AND is_disabled = 0",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            anyhow::ensure!(
+                admin_count > 1,
+                "cannot delete the last enabled administrator"
+            );
+        }
+
+        sqlx::query("DELETE FROM users WHERE id = ?1")
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_user_password(&self, user_id: Uuid, password: &str) -> anyhow::Result<()> {
         self.user_by_id(user_id).await?;
         let password_hash = hash_password(password)?;
@@ -910,6 +970,40 @@ impl Database {
         .context("password is not configured")?;
 
         verify_password(password, &password_row.password_hash)?;
+        let token = self
+            .issue_device_token(&user, device_id, device_name, client, version)
+            .await?;
+        Ok((user, token))
+    }
+
+    pub async fn authenticate_user_by_id(
+        &self,
+        user_id: Uuid,
+        password: &str,
+        device_id: &str,
+        device_name: &str,
+        client: &str,
+        version: &str,
+    ) -> anyhow::Result<(User, DeviceToken)> {
+        let user = self.user_by_id(user_id).await?;
+        anyhow::ensure!(!user.is_disabled, "user is disabled");
+        self.verify_user_password(user.id, password).await?;
+        let token = self
+            .issue_device_token(&user, device_id, device_name, client, version)
+            .await?;
+        Ok((user, token))
+    }
+
+    pub async fn issue_device_token_for_user(
+        &self,
+        user_id: Uuid,
+        device_id: &str,
+        device_name: &str,
+        client: &str,
+        version: &str,
+    ) -> anyhow::Result<(User, DeviceToken)> {
+        let user = self.user_by_id(user_id).await?;
+        anyhow::ensure!(!user.is_disabled, "user is disabled");
         let token = self
             .issue_device_token(&user, device_id, device_name, client, version)
             .await?;
@@ -1034,6 +1128,108 @@ impl Database {
     pub async fn revoke_api_key(&self, api_key: &str) -> anyhow::Result<bool> {
         let result = sqlx::query("DELETE FROM api_keys WHERE access_token = ?1")
             .bind(api_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn initiate_quick_connect(
+        &self,
+        device_id: &str,
+        device_name: &str,
+        client: &str,
+        version: &str,
+    ) -> anyhow::Result<QuickConnectSession> {
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + Duration::minutes(10);
+        let secret = Uuid::new_v4().simple().to_string();
+        let code = Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(6)
+            .collect::<String>()
+            .to_ascii_uppercase();
+        sqlx::query(
+            r#"
+            INSERT INTO quick_connect_sessions (
+                secret, code, device_id, device_name, client, version,
+                user_id, authorized, created_at, updated_at, expires_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7, ?7, ?8)
+            "#,
+        )
+        .bind(&secret)
+        .bind(&code)
+        .bind(device_id)
+        .bind(device_name)
+        .bind(client)
+        .bind(version)
+        .bind(format_time(now)?)
+        .bind(format_time(expires_at)?)
+        .execute(&self.pool)
+        .await?;
+
+        self.quick_connect_by_secret(&secret).await
+    }
+
+    pub async fn quick_connect_by_secret(
+        &self,
+        secret: &str,
+    ) -> anyhow::Result<QuickConnectSession> {
+        let session = sqlx::query_as::<_, QuickConnectSessionRow>(
+            r#"
+            SELECT secret, code, device_id, device_name, client, version,
+                   user_id, authorized, created_at, updated_at, expires_at
+            FROM quick_connect_sessions
+            WHERE secret = ?1
+            "#,
+        )
+        .bind(secret)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("quick connect session not found")?;
+        session.try_into()
+    }
+
+    pub async fn authorize_quick_connect(
+        &self,
+        code: &str,
+        user_id: Uuid,
+    ) -> anyhow::Result<QuickConnectSession> {
+        self.user_by_id(user_id).await?;
+        let now = OffsetDateTime::now_utc();
+        let now_text = format_time(now)?;
+        let result = sqlx::query(
+            r#"
+            UPDATE quick_connect_sessions
+            SET user_id = ?1, authorized = 1, updated_at = ?2
+            WHERE code = ?3 AND expires_at > ?2
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(&now_text)
+        .bind(code.trim().to_ascii_uppercase())
+        .execute(&self.pool)
+        .await?;
+        anyhow::ensure!(result.rows_affected() > 0, "quick connect code not found");
+        let session = sqlx::query_as::<_, QuickConnectSessionRow>(
+            r#"
+            SELECT secret, code, device_id, device_name, client, version,
+                   user_id, authorized, created_at, updated_at, expires_at
+            FROM quick_connect_sessions
+            WHERE code = ?1
+            "#,
+        )
+        .bind(code.trim().to_ascii_uppercase())
+        .fetch_one(&self.pool)
+        .await?;
+        session.try_into()
+    }
+
+    pub async fn delete_quick_connect_session(&self, secret: &str) -> anyhow::Result<bool> {
+        let result = sqlx::query("DELETE FROM quick_connect_sessions WHERE secret = ?1")
+            .bind(secret)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
@@ -2650,7 +2846,7 @@ impl Database {
         row.map(TryInto::try_into).transpose()
     }
 
-    async fn user_by_id(&self, user_id: Uuid) -> anyhow::Result<User> {
+    pub async fn user_by_id(&self, user_id: Uuid) -> anyhow::Result<User> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, name, is_administrator, is_disabled, created_at, updated_at
@@ -3218,6 +3414,21 @@ struct DeviceSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct QuickConnectSessionRow {
+    secret: String,
+    code: String,
+    device_id: String,
+    device_name: String,
+    client: String,
+    version: String,
+    user_id: Option<String>,
+    authorized: bool,
+    created_at: String,
+    updated_at: String,
+    expires_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct SystemConfigurationPayloadsRow {
     content_types_json: String,
     metadata_options_json: String,
@@ -3742,6 +3953,31 @@ impl TryFrom<DeviceSessionRow> for DeviceSession {
                 .capabilities_json
                 .map(|value| serde_json::from_str(&value).context("invalid device capabilities"))
                 .transpose()?,
+        })
+    }
+}
+
+impl TryFrom<QuickConnectSessionRow> for QuickConnectSession {
+    type Error = anyhow::Error;
+
+    fn try_from(row: QuickConnectSessionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            secret: row.secret,
+            code: row.code,
+            device_id: row.device_id,
+            device_name: row.device_name,
+            client: row.client,
+            version: row.version,
+            user_id: row
+                .user_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .context("invalid quick connect user id")?,
+            authorized: row.authorized,
+            created_at: parse_time(&row.created_at)?,
+            updated_at: parse_time(&row.updated_at)?,
+            expires_at: parse_time(&row.expires_at)?,
         })
     }
 }
