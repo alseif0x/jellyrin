@@ -306,6 +306,14 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/playing", post(report_playback_start))
         .route("/Sessions/{session_id}/Playing", post(send_play_command))
         .route("/sessions/{session_id}/playing", post(send_play_command))
+        .route(
+            "/Sessions/{session_id}/Playing/{command}",
+            post(send_playstate_command),
+        )
+        .route(
+            "/sessions/{session_id}/playing/{command}",
+            post(send_playstate_command),
+        )
         .route("/Sessions/Playing/Progress", post(report_playback_progress))
         .route("/sessions/playing/progress", post(report_playback_progress))
         .route("/Sessions/Playing/Stopped", post(report_playback_stopped))
@@ -3541,6 +3549,87 @@ fn parse_send_play_command_query(raw_query: Option<&str>) -> SendPlayCommandQuer
             "mediasourceid" => query.media_source_id = Some(value),
             "startindex" => query.start_index = value.parse().ok(),
             _ => {}
+        }
+    }
+
+    query
+}
+
+#[derive(Debug, Default)]
+struct SendPlaystateCommandQuery {
+    seek_position_ticks: Option<i64>,
+}
+
+async fn send_playstate_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path((session_id, command)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let query = parse_send_playstate_command_query(raw_query.as_deref());
+    let (auth_user, _) = require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let target_session = state
+        .db
+        .device_session_by_id(&session_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Device session not found"))?;
+    ensure_user_access(&auth_user, target_session.user_id)?;
+
+    let current_playback = state
+        .db
+        .active_playback_sessions()
+        .await?
+        .into_iter()
+        .find(|playback| playback.session_id == target_session.access_token);
+
+    match command.to_ascii_lowercase().as_str() {
+        "stop" => {
+            state
+                .db
+                .clear_active_playback_session(&target_session.access_token)
+                .await?;
+        }
+        "pause" | "unpause" | "playpause" | "seek" => {
+            if let Some(playback) = current_playback {
+                let is_paused = match command.to_ascii_lowercase().as_str() {
+                    "pause" => true,
+                    "unpause" => false,
+                    "playpause" => !playback.is_paused,
+                    _ => playback.is_paused,
+                };
+                state
+                    .db
+                    .upsert_active_playback_session(
+                        &target_session.access_token,
+                        target_session.user_id,
+                        playback.item.id,
+                        playback.media_source_id.as_deref(),
+                        query.seek_position_ticks.unwrap_or(playback.position_ticks),
+                        is_paused,
+                    )
+                    .await?;
+            }
+        }
+        "nexttrack" | "previoustrack" | "rewind" | "fastforward" => {}
+        _ => return Err(ApiError::bad_request("Unsupported PlaystateCommand")),
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_send_playstate_command_query(raw_query: Option<&str>) -> SendPlaystateCommandQuery {
+    let mut query = SendPlaystateCommandQuery::default();
+    let Some(raw_query) = raw_query else {
+        return query;
+    };
+
+    for part in raw_query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let key = percent_decode_query_component(key).to_ascii_lowercase();
+        let value = percent_decode_query_component(value);
+        if key == "seekpositionticks" {
+            query.seek_position_ticks = value.parse().ok();
         }
     }
 
@@ -12912,6 +13001,171 @@ mod tests {
         let play_now_sessions: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(play_now_sessions[0]["NowPlayingItem"]["Id"], item_id);
         assert_eq!(play_now_sessions[0]["PlayState"]["PositionTicks"], 456);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Sessions/{playback_token}/Playing/Pause"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Sessions/{playback_token}/Playing/Pause"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/sessions/{playback_token}/playing/seek?seekpositionticks=999"
+                    ))
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let paused_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused_sessions[0]["NowPlayingItem"]["Id"], item_id);
+        assert_eq!(paused_sessions[0]["PlayState"]["PositionTicks"], 999);
+        assert_eq!(paused_sessions[0]["PlayState"]["IsPaused"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Sessions/{playback_token}/Playing/PlayPause"))
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let toggled_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(toggled_sessions[0]["PlayState"]["IsPaused"], false);
+
+        for command in ["NextTrack", "PreviousTrack", "Rewind", "FastForward"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/Sessions/{playback_token}/Playing/{command}"))
+                        .header("X-Emby-Token", playback_token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{command}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/missing-session/Playing/Stop")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Sessions/{playback_token}/Playing/Unsupported"))
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Sessions/{playback_token}/Playing/Stop"))
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let stopped_remote_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stopped_remote_sessions[0]["NowPlayingItem"], Value::Null);
 
         let response = app
             .clone()
