@@ -5016,6 +5016,13 @@ async fn collect_media_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
         if !metadata.is_dir() {
             continue;
         }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".jellyrin-"))
+        {
+            continue;
+        }
 
         let Ok(mut entries) = tokio::fs::read_dir(&path).await else {
             continue;

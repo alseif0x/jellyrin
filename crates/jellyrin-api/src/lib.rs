@@ -15908,6 +15908,16 @@ async fn store_uploaded_image(
     if bytes.is_empty() {
         return Err(ApiError::bad_request("Image upload body is empty"));
     }
+    store_image_bytes(state, owner, image_type, image_index, bytes.to_vec()).await
+}
+
+async fn store_image_bytes(
+    state: &AppState,
+    owner: ImageOwner<'_>,
+    image_type: &str,
+    image_index: usize,
+    bytes: Vec<u8>,
+) -> Result<(), ApiError> {
     let format = image_format_from_bytes(&bytes);
     let dir = stored_image_owner_dir(state, owner);
     tokio::fs::create_dir_all(&dir).await?;
@@ -16157,6 +16167,9 @@ fn image_format_from_bytes(bytes: &[u8]) -> ImageFormat {
 }
 
 fn image_format_from_extension(extension: &str) -> ImageFormat {
+    if extension.eq_ignore_ascii_case("jpeg") {
+        return IMAGE_FORMATS[1];
+    }
     IMAGE_FORMATS
         .iter()
         .copied()
@@ -16382,12 +16395,14 @@ async fn item_image_infos(
 async fn item_remote_images(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<RemoteImageQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
-    Ok(Json(query_result(Vec::new())))
+    require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    Ok(Json(query_result(
+        remote_image_candidates(&item, query.image_type.as_deref()).await?,
+    )))
 }
 
 async fn item_remote_image_providers(
@@ -16398,18 +16413,207 @@ async fn item_remote_image_providers(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     media_item_by_id(&state.db, &item_id).await?;
-    Ok(empty_json_array().await)
+    Ok(Json(vec![serde_json::json!({
+        "Name": "Local cache",
+        "SupportedImages": ["Primary", "Backdrop", "Thumb", "Logo"],
+    })]))
 }
 
 async fn download_remote_image(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<RemoteImageDownloadQuery>,
     Path(item_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     media_item_by_id(&state.db, &item_id).await?;
+    let payload = body.as_ref().map(|body| &body.0);
+    let empty_payload = serde_json::Value::Null;
+    let payload = payload.unwrap_or(&empty_payload);
+    let body_image_url = json_string_any_field(payload, &["ImageUrl", "imageUrl", "Url", "url"]);
+    let Some(image_id) = query.image_url.as_deref().or(body_image_url.as_deref()) else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let body_image_type =
+        json_string_any_field(payload, &["ImageType", "imageType", "Type", "type"]);
+    let image_type = query
+        .image_type
+        .as_deref()
+        .or(body_image_type.as_deref())
+        .unwrap_or("Primary");
+    let remote_path = remote_image_path_from_id(image_id).await?;
+    install_remote_image(&state, &item_id, &remote_path, image_type).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteImageQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(
+        alias = "ImageType",
+        alias = "imageType",
+        alias = "Type",
+        alias = "type"
+    )]
+    image_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteImageDownloadQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "ImageUrl", alias = "imageUrl", alias = "Url", alias = "url")]
+    image_url: Option<String>,
+    #[serde(
+        alias = "ImageType",
+        alias = "imageType",
+        alias = "Type",
+        alias = "type"
+    )]
+    image_type: Option<String>,
+}
+
+async fn remote_image_candidates(
+    item: &MediaItem,
+    requested_image_type: Option<&str>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let Some(item_dir) = media_item_path(item).parent() else {
+        return Ok(Vec::new());
+    };
+    let remote_dir = item_dir.join(".jellyrin-remote-images");
+    let mut entries = match tokio::fs::read_dir(&remote_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let requested_image_type = requested_image_type.map(normalize_image_type);
+    let mut images = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !is_supported_remote_image_path(&path) {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
+        let canonical_path = tokio::fs::canonicalize(path).await?;
+        let image_type = remote_image_type_from_path(&canonical_path);
+        if requested_image_type
+            .as_deref()
+            .is_some_and(|requested| requested != image_type)
+        {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let extension = canonical_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        images.push(serde_json::json!({
+            "ProviderName": "Local cache",
+            "Url": remote_image_id_for_path(&canonical_path),
+            "ThumbnailUrl": null,
+            "Name": name,
+            "Type": canonical_image_type(&image_type),
+            "Language": null,
+            "RatingType": "Score",
+            "CommunityRating": null,
+            "VoteCount": null,
+            "Width": null,
+            "Height": null,
+            "Size": metadata.len(),
+            "MimeType": image_format_from_extension(extension).content_type,
+        }));
+    }
+    images.sort_by_key(|image| {
+        image
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+    Ok(images)
+}
+
+async fn install_remote_image(
+    state: &AppState,
+    item_id: &str,
+    remote_path: &FsPath,
+    image_type: &str,
+) -> Result<(), ApiError> {
+    let bytes = tokio::fs::read(remote_path).await?;
+    if bytes.is_empty() {
+        return Err(ApiError::bad_request("Remote image file is empty"));
+    }
+    if bytes.len() > IMAGE_UPLOAD_LIMIT_BYTES {
+        return Err(ApiError::bad_request("Remote image file is too large"));
+    }
+    store_image_bytes(state, ImageOwner::Item(item_id), image_type, 0, bytes).await
+}
+
+fn remote_image_id_for_path(path: &FsPath) -> String {
+    format!(
+        "local-image:{}",
+        general_purpose::URL_SAFE_NO_PAD.encode(path.to_string_lossy().as_bytes())
+    )
+}
+
+async fn remote_image_path_from_id(image_id: &str) -> Result<PathBuf, ApiError> {
+    let encoded = image_id
+        .strip_prefix("local-image:")
+        .ok_or_else(|| ApiError::not_found("Remote image not found"))?;
+    let bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError::not_found("Remote image not found"))?;
+    let path =
+        String::from_utf8(bytes).map_err(|_| ApiError::not_found("Remote image not found"))?;
+    let canonical_path = tokio::fs::canonicalize(PathBuf::from(path))
+        .await
+        .map_err(|_| ApiError::not_found("Remote image not found"))?;
+    if !is_supported_remote_image_path(&canonical_path)
+        || !path_contains_component(&canonical_path, ".jellyrin-remote-images")
+    {
+        return Err(ApiError::not_found("Remote image not found"));
+    }
+    Ok(canonical_path)
+}
+
+fn is_supported_remote_image_path(path: &FsPath) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn remote_image_type_from_path(path: &FsPath) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if stem.contains("backdrop") || stem.contains("fanart") || stem.contains("background") {
+        "backdrop".to_string()
+    } else if stem.contains("thumb") {
+        "thumb".to_string()
+    } else if stem.contains("logo") {
+        "logo".to_string()
+    } else {
+        "primary".to_string()
+    }
+}
+
+fn normalize_image_type(image_type: &str) -> String {
+    sanitize_image_path_segment(image_type)
 }
 
 async fn user_exists(db: &Database, user_id: Uuid) -> Result<(), ApiError> {
@@ -22544,6 +22748,7 @@ mod tests {
     #[tokio::test]
     async fn virtual_folder_scan_populates_items_endpoint() {
         let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
         let movie = tmp.path().join("Example Movie.mp4");
         tokio::fs::write(&movie, b"fake video").await.unwrap();
 
@@ -22561,7 +22766,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
-            log_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -24013,6 +24218,12 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), uploaded_png.as_slice());
 
+        let remote_image_dir = tmp.path().join(".jellyrin-remote-images");
+        tokio::fs::create_dir_all(&remote_image_dir).await.unwrap();
+        tokio::fs::write(remote_image_dir.join("poster-primary.png"), &uploaded_png)
+            .await
+            .unwrap();
+
         let response = app
             .clone()
             .oneshot(
@@ -24027,7 +24238,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let remote_images: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(remote_images["TotalRecordCount"], 0);
+        assert_eq!(remote_images["TotalRecordCount"], 1);
+        assert_eq!(remote_images["Items"][0]["ProviderName"], "Local cache");
+        assert_eq!(remote_images["Items"][0]["Type"], "Primary");
+        assert_eq!(remote_images["Items"][0]["MimeType"], "image/png");
+        let remote_image_id = remote_images["Items"][0]["Url"].as_str().unwrap();
 
         let response = app
             .clone()
@@ -24045,7 +24260,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let remote_providers: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(remote_providers.as_array().unwrap().len(), 0);
+        assert_eq!(remote_providers.as_array().unwrap().len(), 1);
+        assert_eq!(remote_providers[0]["Name"], "Local cache");
 
         let response = app
             .clone()
@@ -24062,6 +24278,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages/Download"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ImageUrl": remote_image_id,
+                            "ImageType": "Primary"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), uploaded_png.as_slice());
 
         let response = app
             .clone()
