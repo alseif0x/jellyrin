@@ -1713,11 +1713,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/InstantMix/MusicGenres/{name}/InstantMix",
-            get(authenticated_empty_items),
+            get(instant_mix_from_music_genre),
         )
         .route(
             "/instantmix/musicgenres/{name}/instantmix",
-            get(authenticated_empty_items),
+            get(instant_mix_from_music_genre),
         )
         .route("/MediaSegments/{item_id}", get(media_segments))
         .route("/mediasegments/{item_id}", get(media_segments))
@@ -10101,15 +10101,24 @@ async fn instant_mix_from_item(
 
     let server_id = state.db.server_state().await?.server_id.to_string();
     let total_record_count = mix_items.len();
+    let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(usize::MAX);
     let items = items_to_json(
         &state.db,
-        mix_items.into_iter().take(limit).collect(),
+        mix_items
+            .into_iter()
+            .skip(start_index)
+            .take(limit)
+            .collect(),
         &server_id,
         requested_user_id,
     )
     .await?;
-    Ok(Json(query_result_with_total(items, total_record_count, 0)))
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        start_index,
+    )))
 }
 
 async fn audio_instant_mix_items(db: &Database, item_id: &str) -> Result<Vec<MediaItem>, ApiError> {
@@ -10129,6 +10138,80 @@ async fn audio_instant_mix_items(db: &Database, item_id: &str) -> Result<Vec<Med
     mix_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
     mix_items.sort_by_key(|candidate| candidate.id != item.id);
     Ok(mix_items)
+}
+
+async fn instant_mix_from_music_genre(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+
+    let mut items_query = query.clone();
+    if items_query.include_item_types.is_empty() {
+        items_query.include_item_types.push("Audio".to_string());
+    }
+    items_query.search_term = None;
+    items_query.name_starts_with = None;
+    items_query.name_starts_with_or_greater = None;
+    items_query.name_less_than = None;
+    items_query.start_index = None;
+    items_query.limit = None;
+    items_query.sort_by = Some("SortName".to_string());
+    items_query.sort_order = None;
+    let candidates = filtered_media_items(
+        state.db.media_items().await?,
+        &items_query,
+        requested_user_id,
+        &state.db,
+    )
+    .await?;
+    let metadata_by_item = state
+        .db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .map(|metadata| (metadata.item_id, metadata))
+        .collect::<HashMap<_, _>>();
+    let genre_name = name.trim().to_ascii_lowercase();
+    let mut mix_items = candidates
+        .into_iter()
+        .filter(|item| {
+            metadata_by_item
+                .get(&item.id)
+                .is_some_and(|metadata| metadata_has_music_genre(metadata, &genre_name))
+        })
+        .collect::<Vec<_>>();
+    mix_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let total_record_count = mix_items.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    let items = mix_items
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .collect::<Vec<_>>();
+    Ok(Json(query_result_with_total(
+        items_to_json(&state.db, items, &server_id, requested_user_id).await?,
+        total_record_count,
+        start_index,
+    )))
+}
+
+fn metadata_has_music_genre(metadata: &MediaItemMetadata, genre_name: &str) -> bool {
+    metadata_strings(metadata, &["MusicGenres", "Genres"])
+        .into_iter()
+        .any(|genre| genre.eq_ignore_ascii_case(genre_name))
 }
 
 #[derive(Debug, Clone)]
@@ -29778,6 +29861,28 @@ mod tests {
             result["Items"][0]["MediaSources"][0]["VideoType"],
             Value::Null
         );
+        let media_items = test_db.media_items().await.unwrap();
+        let first_audio = media_items
+            .iter()
+            .find(|item| item.name == "Example Song")
+            .unwrap();
+        let second_audio = media_items
+            .iter()
+            .find(|item| item.name == "Second Song")
+            .unwrap();
+        let second_item_id = second_audio.id.simple().to_string();
+        let parent_id = first_audio.virtual_folder_id.simple().to_string();
+        test_db
+            .update_media_item_metadata(
+                first_audio.id,
+                json!({ "MusicGenres": ["Rock"], "Genres": ["Audio Genre"] }),
+            )
+            .await
+            .unwrap();
+        test_db
+            .update_media_item_metadata(second_audio.id, json!({ "MusicGenres": ["rock", "Jazz"] }))
+            .await
+            .unwrap();
 
         let response = app
             .clone()
@@ -29843,6 +29948,28 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/InstantMix?UserId={}&StartIndex=1&Limit=1",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let paged_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged_mix["TotalRecordCount"], 2);
+        assert_eq!(paged_mix["StartIndex"], 1);
+        assert_eq!(paged_mix["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(paged_mix["Items"][0]["Id"], second_item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/Songs/{item_id}/InstantMix?limit=5"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -29897,7 +30024,6 @@ mod tests {
         for endpoint in [
             "/InstantMix/Artists/InstantMix",
             "/InstantMix/MusicGenres/InstantMix",
-            "/InstantMix/MusicGenres/rock/InstantMix",
         ] {
             let response = app
                 .clone()
@@ -29916,6 +30042,58 @@ mod tests {
             assert_eq!(empty_mix["TotalRecordCount"], 0);
             assert_eq!(empty_mix["StartIndex"], 0);
             assert_eq!(empty_mix["Items"], json!([]));
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/InstantMix/MusicGenres/Rock/InstantMix")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for (endpoint, expected_id, expected_start_index) in [
+            (
+                "/InstantMix/MusicGenres/Rock/InstantMix?StartIndex=1&Limit=1".to_string(),
+                second_item_id.as_str(),
+                1,
+            ),
+            (
+                "/instantmix/musicgenres/rock/instantmix?StartIndex=1&Limit=1".to_string(),
+                second_item_id.as_str(),
+                1,
+            ),
+            (
+                format!("/InstantMix/MusicGenres/Rock/InstantMix?ParentId={parent_id}&Limit=5"),
+                item_id,
+                0,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let genre_mix: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(genre_mix["TotalRecordCount"], 2);
+            assert_eq!(genre_mix["StartIndex"], expected_start_index);
+            assert_eq!(genre_mix["Items"][0]["Type"], "Audio");
+            assert_eq!(
+                genre_mix["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
+                format!("/Audio/{expected_id}/stream")
+            );
         }
 
         let response = app
