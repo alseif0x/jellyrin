@@ -742,6 +742,17 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+pub async fn reconcile_transcode_sessions_on_startup(db: &Database) -> anyhow::Result<usize> {
+    let sessions = db.stale_transcode_sessions_on_startup().await?;
+    let count = sessions.len();
+    for session in sessions {
+        db.update_transcode_session_status(&session.play_session_id, "stopped")
+            .await?;
+        cleanup_hls_transcode_files(&session.output_path).await;
+    }
+    Ok(count)
+}
+
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "Healthy" })
 }
@@ -8342,8 +8353,9 @@ mod tests {
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, default_audio_stream_index,
         default_subtitle_stream_index, hls_transcode_dedupe_key, load_countries, load_cultures,
-        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs, router,
-        subscribe_playback_events, transcode_dedupe_lock,
+        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
+        reconcile_transcode_sessions_on_startup, router, subscribe_playback_events,
+        transcode_dedupe_lock,
     };
     use axum::{
         body::Body,
@@ -15983,6 +15995,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_stops_stale_transcodes_and_cleans_hls_files() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Stale.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let stale_dir = transcode_root.path().join("play-session-stale");
+        tokio::fs::create_dir_all(&stale_dir).await.unwrap();
+        let stale_playlist = stale_dir.join("main.m3u8");
+        tokio::fs::write(&stale_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(stale_dir.join("segment_00000.ts"), b"zero")
+            .await
+            .unwrap();
+
+        let completed_dir = transcode_root.path().join("play-session-completed");
+        tokio::fs::create_dir_all(&completed_dir).await.unwrap();
+        let completed_playlist = completed_dir.join("main.m3u8");
+        tokio::fs::write(&completed_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+
+        for (play_session_id, output_path, status) in [
+            (
+                "play-session-stale",
+                stale_playlist.to_string_lossy().to_string(),
+                "running",
+            ),
+            (
+                "play-session-completed",
+                completed_playlist.to_string_lossy().to_string(),
+                "completed",
+            ),
+        ] {
+            db.upsert_transcode_session(UpsertTranscodeSession {
+                play_session_id: play_session_id.to_string(),
+                user_id: user.id,
+                item_id: item.id,
+                media_source_id: Some(item.id.simple().to_string()),
+                audio_stream_index: Some(0),
+                subtitle_stream_index: Some(-1),
+                video_stream_index: Some(0),
+                output_path,
+                process_id: Some(222),
+                status: status.to_string(),
+                progress_percent: Some(10.0),
+                position_ticks: 0,
+            })
+            .await
+            .unwrap();
+        }
+
+        let stopped = reconcile_transcode_sessions_on_startup(&db).await.unwrap();
+        assert_eq!(stopped, 1);
+        assert!(!stale_dir.exists());
+        assert!(completed_dir.exists());
+
+        let stale = db
+            .transcode_session_by_play_session_id("play-session-stale")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.status, "stopped");
+        let completed = db
+            .transcode_session_by_play_session_id("play-session-completed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "completed");
+        assert!(db.active_transcode_sessions().await.unwrap().is_empty());
     }
 
     #[tokio::test]

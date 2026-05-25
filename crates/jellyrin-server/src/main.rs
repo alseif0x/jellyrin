@@ -2,7 +2,7 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use clap::Parser;
-use jellyrin_api::{AppState, router};
+use jellyrin_api::{AppState, reconcile_transcode_sessions_on_startup, router};
 use jellyrin_db::Database;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -60,6 +60,15 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Database::connect(&database_url).await?;
     bootstrap_e2e_admin(&db, &args).await?;
+    let stopped_transcodes = reconcile_transcode_sessions_on_startup(&db)
+        .await
+        .context("failed to reconcile transcode sessions")?;
+    if stopped_transcodes > 0 {
+        tracing::warn!(
+            count = stopped_transcodes,
+            "stopped stale transcode sessions from previous run"
+        );
+    }
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .context("invalid bind address")?;

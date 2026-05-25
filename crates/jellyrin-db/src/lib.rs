@@ -148,6 +148,14 @@ pub struct UpsertTranscodeSession {
     pub position_ticks: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleTranscodeSession {
+    pub play_session_id: String,
+    pub output_path: String,
+    pub status: String,
+    pub process_id: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActivityLogEntry {
     pub id: i64,
@@ -1404,6 +1412,24 @@ impl Database {
     pub async fn active_transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
         self.transcode_sessions_with_statuses(&["starting", "running"])
             .await
+    }
+
+    pub async fn stale_transcode_sessions_on_startup(
+        &self,
+    ) -> anyhow::Result<Vec<StaleTranscodeSession>> {
+        sqlx::query_as::<_, StaleTranscodeSessionRow>(
+            r#"
+            SELECT play_session_id, output_path, status, process_id
+            FROM transcode_sessions
+            WHERE status IN ('starting', 'running')
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
     }
 
     async fn transcode_sessions_with_statuses(
@@ -2978,6 +3004,14 @@ struct TranscodeSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct StaleTranscodeSessionRow {
+    play_session_id: String,
+    output_path: String,
+    status: String,
+    process_id: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
 struct ActivityLogEntryRow {
     id: i64,
     name: String,
@@ -3168,6 +3202,19 @@ impl TryFrom<TranscodeSessionRow> for TranscodeSession {
             position_ticks: row.position_ticks,
             created_at: parse_time(&row.transcode_created_at)?,
             updated_at: parse_time(&row.transcode_updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<StaleTranscodeSessionRow> for StaleTranscodeSession {
+    type Error = anyhow::Error;
+
+    fn try_from(row: StaleTranscodeSessionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            play_session_id: row.play_session_id,
+            output_path: row.output_path,
+            status: row.status,
+            process_id: row.process_id,
         })
     }
 }
@@ -4091,16 +4138,36 @@ mod tests {
         assert_eq!(active_sessions.len(), 1);
         assert_eq!(active_sessions[0].play_session_id, "play-session-1");
 
+        let stale_sessions = db.stale_transcode_sessions_on_startup().await.unwrap();
+        assert_eq!(stale_sessions.len(), 1);
+        assert_eq!(stale_sessions[0].play_session_id, "play-session-1");
+        assert_eq!(stale_sessions[0].status, "running");
+        assert_eq!(stale_sessions[0].process_id, Some(123));
+
+        tokio::fs::remove_file(&movie).await.unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        assert!(db.active_transcode_sessions().await.unwrap().is_empty());
+        let stale_sessions = db.stale_transcode_sessions_on_startup().await.unwrap();
+        assert_eq!(stale_sessions.len(), 1);
+        assert_eq!(stale_sessions[0].play_session_id, "play-session-1");
+
         db.update_transcode_session_status("play-session-1", "Stopped")
             .await
             .unwrap();
         assert!(db.active_transcode_sessions().await.unwrap().is_empty());
-        let stopped = db
-            .transcode_session_by_play_session_id("play-session-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stopped.status, "stopped");
+        assert!(
+            db.stale_transcode_sessions_on_startup()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let stopped_status: String =
+            sqlx::query_scalar("SELECT status FROM transcode_sessions WHERE play_session_id = ?1")
+                .bind("play-session-1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(stopped_status, "stopped");
     }
 
     #[tokio::test]
