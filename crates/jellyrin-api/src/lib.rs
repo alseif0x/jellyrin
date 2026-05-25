@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path as FsPath, PathBuf},
+    process::Stdio,
     sync::{Arc, OnceLock},
     time::SystemTime,
 };
@@ -40,6 +41,7 @@ use jellyrin_transcode::{
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_util::io::ReaderStream;
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -7400,16 +7402,22 @@ async fn trickplay_playlist(
 ) -> Result<axum::response::Response, ApiError> {
     let item = trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
     let width = parse_positive_u32(&width, "Invalid trickplay width")?;
-    let duration_seconds = item
-        .runtime_ticks
-        .and_then(|ticks| u64::try_from(ticks).ok())
-        .map(|ticks| (ticks as f64 / 10_000_000.0).max(1.0))
-        .unwrap_or(10.0);
-    let target_duration = duration_seconds.ceil().max(1.0) as u64;
-    let playlist = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-IMAGES-ONLY\n#EXT-X-TILES:RESOLUTION={width}x{width},LAYOUT=\"1x1\",DURATION={duration_seconds:.3}\n#EXTINF:{duration_seconds:.3},\n{}\n#EXT-X-ENDLIST\n",
-        append_query("0.jpg", raw_query.as_deref())
+    let duration_seconds = trickplay_duration_seconds(&item);
+    let interval_seconds = trickplay_interval_seconds();
+    let tile_count = trickplay_tile_count(duration_seconds, interval_seconds);
+    let (tile_width, tile_height) = trickplay_tile_resolution(&item, width);
+    let target_duration = interval_seconds.ceil().max(1.0) as u64;
+    let mut playlist = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-IMAGES-ONLY\n"
     );
+    for index in 0..tile_count {
+        let tile_duration = trickplay_tile_duration(duration_seconds, interval_seconds, index);
+        playlist.push_str(&format!(
+            "#EXT-X-TILES:RESOLUTION={tile_width}x{tile_height},LAYOUT=\"1x1\",DURATION={tile_duration:.3}\n#EXTINF:{tile_duration:.3},\n{}\n",
+            append_query(&format!("{index}.jpg"), raw_query.as_deref())
+        ));
+    }
+    playlist.push_str("#EXT-X-ENDLIST\n");
     playlist_response(playlist, true)
 }
 
@@ -7419,13 +7427,115 @@ async fn trickplay_tile(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
-    parse_positive_u32(&width, "Invalid trickplay width")?;
+    let item = trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
+    let width = parse_positive_u32(&width, "Invalid trickplay width")?;
     let index = tile_file
         .strip_suffix(".jpg")
         .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
-    parse_non_negative_i64(index, "Invalid trickplay index")?;
-    Ok(placeholder_jpeg_response())
+    let index = parse_non_negative_i64(index, "Invalid trickplay index")?;
+    let tile_count = trickplay_tile_count(
+        trickplay_duration_seconds(&item),
+        trickplay_interval_seconds(),
+    );
+    let index =
+        u32::try_from(index).map_err(|_| ApiError::not_found("Trickplay tile not found"))?;
+    if index >= tile_count {
+        return Err(ApiError::not_found("Trickplay tile not found"));
+    }
+    let tile_path = ensure_trickplay_tile(&item, width, index).await?;
+    stream_path(tile_path, "image/jpeg".to_string(), &headers, true).await
+}
+
+async fn ensure_trickplay_tile(
+    item: &MediaItem,
+    width: u32,
+    index: u32,
+) -> Result<PathBuf, ApiError> {
+    let tile_path = trickplay_tile_cache_path(item, width, index);
+    if tokio::fs::try_exists(&tile_path).await? {
+        return Ok(tile_path);
+    }
+
+    let parent = tile_path
+        .parent()
+        .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let tmp_path = tile_path.with_extension("jpg.tmp");
+    let seek_seconds = index as f64 * trickplay_interval_seconds();
+    let scale_filter = format!("scale='min({width},iw)':-2:force_original_aspect_ratio=decrease");
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-ss")
+        .arg(format!("{seek_seconds:.3}"))
+        .arg("-i")
+        .arg(media_item_path(item))
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg(scale_filter)
+        .arg("-q:v")
+        .arg("4")
+        .arg(&tmp_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(ApiError::not_found("Trickplay tile could not be generated"));
+    }
+    tokio::fs::rename(&tmp_path, &tile_path).await?;
+    Ok(tile_path)
+}
+
+fn trickplay_duration_seconds(item: &MediaItem) -> f64 {
+    item.runtime_ticks
+        .and_then(|ticks| u64::try_from(ticks).ok())
+        .map(|ticks| (ticks as f64 / 10_000_000.0).max(1.0))
+        .unwrap_or_else(trickplay_interval_seconds)
+}
+
+fn trickplay_interval_seconds() -> f64 {
+    10.0
+}
+
+fn trickplay_tile_count(duration_seconds: f64, interval_seconds: f64) -> u32 {
+    ((duration_seconds / interval_seconds).ceil() as u32).clamp(1, 10_000)
+}
+
+fn trickplay_tile_duration(duration_seconds: f64, interval_seconds: f64, index: u32) -> f64 {
+    let elapsed = index as f64 * interval_seconds;
+    (duration_seconds - elapsed).clamp(1.0, interval_seconds)
+}
+
+fn trickplay_tile_resolution(item: &MediaItem, requested_width: u32) -> (u32, u32) {
+    let source_width = item.width.and_then(|width| positive_u32(i64::from(width)));
+    let source_height = item
+        .height
+        .and_then(|height| positive_u32(i64::from(height)));
+    match (source_width, source_height) {
+        (Some(source_width), Some(source_height)) if source_width > 0 && source_height > 0 => {
+            let output_width = requested_width.min(source_width).max(1);
+            let output_height = ((output_width as f64 * source_height as f64 / source_width as f64)
+                .round() as u32)
+                .max(1);
+            (output_width, output_height)
+        }
+        _ => (requested_width, requested_width),
+    }
+}
+
+fn trickplay_tile_cache_path(item: &MediaItem, width: u32, index: u32) -> PathBuf {
+    trickplay_cache_root()
+        .join(item.id.simple().to_string())
+        .join(width.to_string())
+        .join(format!("{index}.jpg"))
+}
+
+fn trickplay_cache_root() -> PathBuf {
+    std::env::temp_dir().join("jellyrin").join("trickplay")
 }
 
 async fn trickplay_video_item(
@@ -8928,19 +9038,6 @@ fn placeholder_png_response() -> axum::response::Response {
         .into_response()
 }
 
-fn placeholder_jpeg_response() -> axum::response::Response {
-    const WHITE_JPEG: &[u8] = &[
-        255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 1, 1, 1, 0, 72, 0, 72, 0, 0, 255, 219, 0, 67,
-        0, 3, 2, 2, 3, 2, 2, 3, 3, 3, 3, 4, 3, 3, 4, 5, 8, 5, 5, 4, 4, 5, 10, 7, 7, 6, 8, 12, 10,
-        12, 12, 11, 10, 11, 11, 13, 14, 18, 16, 13, 14, 17, 14, 11, 11, 16, 22, 16, 17, 19, 20, 21,
-        21, 21, 12, 15, 23, 24, 22, 20, 24, 18, 20, 21, 20, 255, 192, 0, 11, 8, 0, 1, 0, 1, 1, 1,
-        17, 0, 255, 196, 0, 20, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 255,
-        196, 0, 20, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 218, 0, 8, 1,
-        1, 0, 0, 63, 0, 42, 255, 217,
-    ];
-    ([(header::CONTENT_TYPE, "image/jpeg")], WHITE_JPEG.to_vec()).into_response()
-}
-
 async fn media_item_or_folder_by_id(db: &Database, item_id: &str) -> Result<(), ApiError> {
     let requested_id = parse_jellyfin_uuid(item_id)?;
     if db
@@ -9602,9 +9699,10 @@ mod tests {
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_orphan_hls_transcode_dirs,
         cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
-        hls_transcode_dedupe_key, load_countries, load_cultures, parse_authorization_token,
-        parse_jellyfin_uuid, parse_media_browser_pairs, reconcile_transcode_sessions_on_startup,
-        router, spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
+        hls_transcode_dedupe_key, load_countries, load_cultures, media_item_by_id,
+        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
+        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
+        subscribe_playback_events, transcode_dedupe_lock, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -14914,9 +15012,20 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let trickplay_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(trickplay_playlist.contains("#EXT-X-TARGETDURATION:10"));
         assert!(trickplay_playlist.contains("#EXT-X-IMAGES-ONLY"));
-        assert!(trickplay_playlist.contains("#EXT-X-TILES:RESOLUTION=320x320"));
+        assert!(trickplay_playlist.contains("#EXT-X-TILES:RESOLUTION=320x180"));
         assert!(trickplay_playlist.contains(&format!("0.jpg?api_key={api_key}")));
+        assert!(trickplay_playlist.contains(&format!("9.jpg?api_key={api_key}")));
+
+        let cached_item = media_item_by_id(&test_db, item_id).await.unwrap();
+        let cached_tile = trickplay_tile_cache_path(&cached_item, 320, 0);
+        tokio::fs::create_dir_all(cached_tile.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&cached_tile, b"cached jpeg")
+            .await
+            .unwrap();
 
         let response = app
             .clone()
@@ -14935,7 +15044,20 @@ mod tests {
             "image/jpeg"
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(!body.is_empty());
+        assert_eq!(body.as_ref(), b"cached jpeg");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Trickplay/Videos/{item_id}/Trickplay/320/10.jpg"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
