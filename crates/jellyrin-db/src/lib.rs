@@ -161,6 +161,14 @@ pub struct UpsertPlaybackState {
     pub played: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ExistingUserItemData {
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
+    is_favorite: bool,
+    rating: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscodeSession {
     pub play_session_id: String,
@@ -2956,11 +2964,11 @@ impl Database {
     }
 
     pub async fn upsert_playback_state(&self, playback: UpsertPlaybackState) -> anyhow::Result<()> {
-        let existing_stream_indexes =
+        let existing_user_item_data =
             if playback.audio_stream_index.is_none() || playback.subtitle_stream_index.is_none() {
-                sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+                sqlx::query_as::<_, (Option<i64>, Option<i64>, bool, Option<f64>)>(
                     r#"
-                    SELECT audio_stream_index, subtitle_stream_index
+                    SELECT audio_stream_index, subtitle_stream_index, is_favorite, rating
                     FROM playback_states
                     WHERE user_id = ?1 AND item_id = ?2
                     "#,
@@ -2969,23 +2977,35 @@ impl Database {
                 .bind(playback.item_id.to_string())
                 .fetch_optional(&self.pool)
                 .await?
+                .map(
+                    |(audio_stream_index, subtitle_stream_index, is_favorite, rating)| {
+                        ExistingUserItemData {
+                            audio_stream_index,
+                            subtitle_stream_index,
+                            is_favorite,
+                            rating,
+                        }
+                    },
+                )
+                .unwrap_or_default()
             } else {
-                None
+                self.existing_user_item_data(playback.user_id, playback.item_id)
+                    .await?
             };
         let audio_stream_index = playback
             .audio_stream_index
-            .or_else(|| existing_stream_indexes.and_then(|indexes| indexes.0));
+            .or(existing_user_item_data.audio_stream_index);
         let subtitle_stream_index = playback
             .subtitle_stream_index
-            .or_else(|| existing_stream_indexes.and_then(|indexes| indexes.1));
+            .or(existing_user_item_data.subtitle_stream_index);
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
             INSERT INTO playback_states (
                 user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
-                position_ticks, is_paused, played, updated_at
+                position_ticks, is_paused, played, is_favorite, rating, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(user_id, item_id) DO UPDATE SET
                 media_source_id = excluded.media_source_id,
                 audio_stream_index = excluded.audio_stream_index,
@@ -2993,6 +3013,8 @@ impl Database {
                 position_ticks = excluded.position_ticks,
                 is_paused = excluded.is_paused,
                 played = excluded.played,
+                is_favorite = excluded.is_favorite,
+                rating = excluded.rating,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -3004,10 +3026,106 @@ impl Database {
         .bind(playback.position_ticks.max(0))
         .bind(playback.is_paused)
         .bind(playback.played)
+        .bind(existing_user_item_data.is_favorite)
+        .bind(existing_user_item_data.rating)
         .bind(now)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn set_item_favorite(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        is_favorite: bool,
+    ) -> anyhow::Result<()> {
+        let existing = self.existing_user_item_data(user_id, item_id).await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO playback_states (
+                user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
+                position_ticks, is_paused, played, is_favorite, rating, updated_at
+            )
+            VALUES (?1, ?2, NULL, ?3, ?4, 0, 0, 0, ?5, ?6, ?7)
+            ON CONFLICT(user_id, item_id) DO UPDATE SET
+                is_favorite = excluded.is_favorite,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(item_id.to_string())
+        .bind(existing.audio_stream_index)
+        .bind(existing.subtitle_stream_index)
+        .bind(is_favorite)
+        .bind(existing.rating)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_item_rating(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        rating: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let existing = self.existing_user_item_data(user_id, item_id).await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO playback_states (
+                user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
+                position_ticks, is_paused, played, is_favorite, rating, updated_at
+            )
+            VALUES (?1, ?2, NULL, ?3, ?4, 0, 0, 0, ?5, ?6, ?7)
+            ON CONFLICT(user_id, item_id) DO UPDATE SET
+                rating = excluded.rating,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(item_id.to_string())
+        .bind(existing.audio_stream_index)
+        .bind(existing.subtitle_stream_index)
+        .bind(existing.is_favorite)
+        .bind(rating)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn existing_user_item_data(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+    ) -> anyhow::Result<ExistingUserItemData> {
+        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, bool, Option<f64>)>(
+            r#"
+            SELECT audio_stream_index, subtitle_stream_index, is_favorite, rating
+            FROM playback_states
+            WHERE user_id = ?1 AND item_id = ?2
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(item_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(
+                |(audio_stream_index, subtitle_stream_index, is_favorite, rating)| {
+                    ExistingUserItemData {
+                        audio_stream_index,
+                        subtitle_stream_index,
+                        is_favorite,
+                        rating,
+                    }
+                },
+            )
+            .unwrap_or_default())
     }
 
     pub async fn playback_state_for_item(
@@ -3018,7 +3136,7 @@ impl Database {
         let row = sqlx::query_as::<_, PlaybackStateRow>(
             r#"
             SELECT user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
-                   position_ticks, is_paused, played, updated_at
+                   position_ticks, is_paused, played, is_favorite, rating, updated_at
             FROM playback_states
             WHERE user_id = ?1 AND item_id = ?2
             "#,
@@ -3046,6 +3164,7 @@ impl Database {
                 playback_states.media_source_id, playback_states.audio_stream_index,
                 playback_states.subtitle_stream_index, playback_states.position_ticks,
                 playback_states.is_paused, playback_states.played,
+                playback_states.is_favorite, playback_states.rating,
                 playback_states.updated_at AS playback_updated_at
             FROM playback_states
             INNER JOIN media_items ON media_items.id = playback_states.item_id
@@ -4057,6 +4176,8 @@ struct ResumeItemRow {
     position_ticks: i64,
     is_paused: bool,
     played: bool,
+    is_favorite: bool,
+    rating: Option<f64>,
     playback_updated_at: String,
 }
 
@@ -4070,6 +4191,8 @@ struct PlaybackStateRow {
     position_ticks: i64,
     is_paused: bool,
     played: bool,
+    is_favorite: bool,
+    rating: Option<f64>,
     updated_at: String,
 }
 
@@ -4344,6 +4467,8 @@ impl TryFrom<ResumeItemRow> for (MediaItem, PlaybackState) {
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             played: row.played,
+            is_favorite: row.is_favorite,
+            rating: row.rating,
             updated_at: parse_time(&row.playback_updated_at)?,
         };
         Ok((item, playback))
@@ -4365,6 +4490,8 @@ impl TryFrom<PlaybackStateRow> for PlaybackState {
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             played: row.played,
+            is_favorite: row.is_favorite,
+            rating: row.rating,
             updated_at: parse_time(&row.updated_at)?,
         })
     }

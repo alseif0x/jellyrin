@@ -83,6 +83,8 @@ pub struct PlaybackState {
     pub position_ticks: i64,
     pub is_paused: bool,
     pub played: bool,
+    pub is_favorite: bool,
+    pub rating: Option<f64>,
     pub updated_at: OffsetDateTime,
 }
 

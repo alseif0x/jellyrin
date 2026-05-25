@@ -9187,6 +9187,8 @@ async fn update_item_user_data_inner(
     let current = db.playback_state_for_item(user_id, item.id).await?;
     let played = json_value_bool_field(body.as_ref(), &["Played", "played"])
         .unwrap_or_else(|| current.as_ref().is_some_and(|state| state.played));
+    let is_favorite = json_value_bool_field(body.as_ref(), &["IsFavorite", "isFavorite"]);
+    let rating = json_value_f64_field(body.as_ref(), &["Rating", "rating"]);
     let position_ticks = json_value_i64_field(
         body.as_ref(),
         &["PlaybackPositionTicks", "playbackPositionTicks"],
@@ -9207,6 +9209,12 @@ async fn update_item_user_data_inner(
         played,
     })
     .await?;
+    if let Some(is_favorite) = is_favorite {
+        db.set_item_favorite(user_id, item.id, is_favorite).await?;
+    }
+    if let Some(rating) = rating {
+        db.set_item_rating(user_id, item.id, Some(rating)).await?;
+    }
     item_user_data_json(db, user_id, item_id).await.map(Json)
 }
 
@@ -9221,17 +9229,21 @@ async fn item_user_data_json(
     let playback_position_ticks = playback.as_ref().map_or(0, |state| state.position_ticks);
     let played = playback.as_ref().is_some_and(|state| state.played);
     let play_count = i64::from(played);
+    let is_favorite = playback.as_ref().is_some_and(|state| state.is_favorite);
+    let rating = playback.as_ref().and_then(|state| state.rating);
+    let likes = rating.map(|rating| rating > 0.0);
     Ok(serde_json::json!({
         "PlaybackPositionTicks": playback_position_ticks,
         "PlayCount": play_count,
-        "IsFavorite": false,
+        "IsFavorite": is_favorite,
+        "Likes": likes,
         "Played": played,
         "Key": item_id,
         "ItemId": item_id,
         "PlayedPercentage": null,
         "LastPlayedDate": null,
         "UnplayedItemCount": null,
-        "Rating": null
+        "Rating": rating
     }))
 }
 
@@ -9247,6 +9259,13 @@ fn json_value_i64_field(value: Option<&serde_json::Value>, names: &[&str]) -> Op
     names
         .iter()
         .find_map(|name| object.get(*name).and_then(|value| value.as_i64()))
+}
+
+fn json_value_f64_field(value: Option<&serde_json::Value>, names: &[&str]) -> Option<f64> {
+    let object = value.and_then(|value| value.as_object())?;
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(|value| value.as_f64()))
 }
 
 async fn mark_item_played(
@@ -9338,7 +9357,8 @@ async fn mark_authenticated_item_favorite(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    state.db.set_item_favorite(user.id, item.id, true).await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -9351,7 +9371,8 @@ async fn unmark_authenticated_item_favorite(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    state.db.set_item_favorite(user.id, item.id, false).await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -9363,7 +9384,7 @@ async fn mark_user_item_favorite(
     Query(query): Query<AuthQuery>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    user_item_favorite_inner(state, headers, query, user_id, item_id).await
+    user_item_favorite_inner(state, headers, query, user_id, item_id, true).await
 }
 
 async fn unmark_user_item_favorite(
@@ -9372,7 +9393,7 @@ async fn unmark_user_item_favorite(
     Query(query): Query<AuthQuery>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    user_item_favorite_inner(state, headers, query, user_id, item_id).await
+    user_item_favorite_inner(state, headers, query, user_id, item_id, false).await
 }
 
 async fn user_item_favorite_inner(
@@ -9381,24 +9402,41 @@ async fn user_item_favorite_inner(
     query: AuthQuery,
     user_id: String,
     item_id: String,
+    is_favorite: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    state
+        .db
+        .set_item_favorite(requested_user_id, item.id, is_favorite)
+        .await?;
     item_user_data_json(&state.db, requested_user_id, &item_id)
         .await
         .map(Json)
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ItemRatingQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "Likes", alias = "likes")]
+    likes: Option<bool>,
+    #[serde(alias = "Rating", alias = "rating")]
+    rating: Option<f64>,
+}
+
 async fn update_authenticated_item_rating(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<ItemRatingQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let rating = rating_from_query(&query);
+    state.db.set_item_rating(user.id, item.id, rating).await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -9411,7 +9449,8 @@ async fn delete_authenticated_item_rating(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    state.db.set_item_rating(user.id, item.id, None).await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -9420,10 +9459,10 @@ async fn delete_authenticated_item_rating(
 async fn update_user_item_rating(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<ItemRatingQuery>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    user_item_rating_inner(state, headers, query, user_id, item_id).await
+    user_item_rating_inner(state, headers, query, user_id, item_id, true).await
 }
 
 async fn delete_user_item_rating(
@@ -9432,23 +9471,43 @@ async fn delete_user_item_rating(
     Query(query): Query<AuthQuery>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    user_item_rating_inner(state, headers, query, user_id, item_id).await
+    let query = ItemRatingQuery {
+        auth: query,
+        likes: None,
+        rating: None,
+    };
+    user_item_rating_inner(state, headers, query, user_id, item_id, false).await
 }
 
 async fn user_item_rating_inner(
     state: AppState,
     headers: HeaderMap,
-    query: AuthQuery,
+    query: ItemRatingQuery,
     user_id: String,
     item_id: String,
+    set_rating: bool,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let auth_user =
+        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let rating = set_rating.then(|| rating_from_query(&query)).flatten();
+    state
+        .db
+        .set_item_rating(requested_user_id, item.id, rating)
+        .await?;
     item_user_data_json(&state.db, requested_user_id, &item_id)
         .await
         .map(Json)
+}
+
+fn rating_from_query(query: &ItemRatingQuery) -> Option<f64> {
+    query.rating.or_else(|| {
+        query
+            .likes
+            .map(|likes| if likes { 1.0_f64 } else { 0.0_f64 })
+    })
 }
 
 fn resolve_user_id(user_id: &str) -> Result<Uuid, ApiError> {
@@ -14030,6 +14089,9 @@ fn media_item_to_json_with_playback(
     let playback_position_ticks = playback.map_or(0, |state| state.position_ticks);
     let played = playback.is_some_and(|state| state.played);
     let play_count = i32::from(played);
+    let is_favorite = playback.is_some_and(|state| state.is_favorite);
+    let rating = playback.and_then(|state| state.rating);
+    let likes = rating.map(|rating| rating > 0.0);
     let media_streams = media_item_streams(item);
     let default_audio_stream_index = default_audio_stream_index(&media_streams);
     let default_subtitle_stream_index = default_subtitle_stream_index(&media_streams);
@@ -14119,7 +14181,7 @@ fn media_item_to_json_with_playback(
         "Type": item_type,
         "MediaType": item.media_type,
         "RunTimeTicks": item.runtime_ticks,
-        "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": false, "Played": played, "Key": item_id, "ItemId": item_id, "PlayedPercentage": null, "LastPlayedDate": null },
+        "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": is_favorite, "Likes": likes, "Played": played, "Key": item_id, "ItemId": item_id, "PlayedPercentage": null, "LastPlayedDate": null, "Rating": rating },
         "ImageTags": { "Primary": "placeholder" },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
@@ -21714,6 +21776,102 @@ mod tests {
         let updated_user_data: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(updated_user_data["Played"], true);
         assert_eq!(updated_user_data["PlaybackPositionTicks"], 321);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/UserLibrary/UserFavoriteItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let favorite_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(favorite_user_data["IsFavorite"], true);
+        assert_eq!(favorite_user_data["Played"], true);
+        assert_eq!(favorite_user_data["PlaybackPositionTicks"], 321);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/UserLibrary/Users/{user_id}/Items/{item_id}/Rating?likes=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rated_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rated_user_data["Likes"], true);
+        assert_eq!(rated_user_data["Rating"], 1.0);
+        assert_eq!(rated_user_data["IsFavorite"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let persisted_user_item: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(persisted_user_item["UserData"]["IsFavorite"], true);
+        assert_eq!(persisted_user_item["UserData"]["Likes"], true);
+        assert_eq!(persisted_user_item["UserData"]["Rating"], 1.0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/UserLibrary/UserItems/{item_id}/Rating"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let unrated_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unrated_user_data["Likes"], Value::Null);
+        assert_eq!(unrated_user_data["Rating"], Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/UserLibrary/Users/{user_id}/FavoriteItems/{item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let unfavorited_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unfavorited_user_data["IsFavorite"], false);
+        assert_eq!(unfavorited_user_data["Played"], true);
 
         let response = app
             .clone()
