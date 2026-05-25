@@ -2368,11 +2368,11 @@ pub fn router(state: AppState) -> Router {
         .route("/search/hints", get(search_hints))
         .route(
             "/Suggestions/Items/Suggestions",
-            get(authenticated_empty_items),
+            get(item_suggestions),
         )
         .route(
             "/suggestions/items/suggestions",
-            get(authenticated_empty_items),
+            get(item_suggestions),
         )
         .route(
             "/Suggestions/Users/{user_id}/Suggestions",
@@ -13814,16 +13814,74 @@ async fn authenticated_empty_items(
     Ok(empty_items_result().await)
 }
 
+async fn item_suggestions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    suggestions_result(&state.db, query, requested_user_id).await
+}
+
 async fn user_suggestions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(auth_query): Query<AuthQuery>,
     Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    Ok(empty_items_result().await)
+    suggestions_result(&state.db, query, requested_user_id).await
+}
+
+async fn suggestions_result(
+    db: &Database,
+    mut query: ItemsQuery,
+    requested_user_id: Uuid,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if query.is_played.is_none() && query_filters_played_value(&query.filters).is_none() {
+        query.is_played = Some(false);
+    }
+    if query.sort_by.is_none() {
+        query.sort_by = Some("DateCreated,SortName".to_string());
+    }
+    if query.sort_order.is_none() {
+        query.sort_order = Some("Descending".to_string());
+    }
+    if query.limit.is_none() {
+        query.limit = Some(20);
+    }
+
+    let filtered_items =
+        filtered_media_items(db.media_items().await?, &query, Some(requested_user_id), db).await?;
+    let total_record_count = filtered_items.len();
+    let server_id = db.server_state().await?.server_id.to_string();
+    let items = items_to_json(
+        db,
+        paged_media_items(filtered_items, &query),
+        &server_id,
+        Some(requested_user_id),
+    )
+    .await?;
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        query.start_index.unwrap_or(0),
+    )))
 }
 
 async fn series_episodes(
@@ -26299,6 +26357,112 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
+    }
+
+    #[tokio::test]
+    async fn suggestions_return_visible_unplayed_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("Already Played.mp4"), b"played")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("Fresh Suggestion.mp4"), b"fresh")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "suggestions-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let played = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "Already Played")
+            .unwrap();
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: played.id,
+            media_source_id: None,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: 0,
+            is_paused: false,
+            played: true,
+        })
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Suggestions/Items/Suggestions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Suggestions/Items/Suggestions?Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let suggestions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(suggestions["TotalRecordCount"], 1);
+        assert_eq!(suggestions["Items"][0]["Name"], "Fresh Suggestion");
+        assert_eq!(suggestions["Items"][0]["UserData"]["Played"], false);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Suggestions/Users/{}/Suggestions?Limit=1",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_suggestions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_suggestions["TotalRecordCount"], 1);
+        assert_eq!(user_suggestions["Items"][0]["Name"], "Fresh Suggestion");
     }
 
     #[tokio::test]
