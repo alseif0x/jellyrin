@@ -2385,11 +2385,11 @@ pub fn router(state: AppState) -> Router {
         .route("/trailers", get(authenticated_empty_items))
         .route(
             "/Movies/Recommendations",
-            get(authenticated_empty_json_array),
+            get(movie_recommendations),
         )
         .route(
             "/movies/recommendations",
-            get(authenticated_empty_json_array),
+            get(movie_recommendations),
         )
         .route("/Genres", get(metadata_genres))
         .route("/genres", get(metadata_genres))
@@ -8777,6 +8777,67 @@ async fn user_latest_items(
     ))
 }
 
+async fn movie_recommendations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let mut query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+
+    if query.include_item_types.is_empty() {
+        query.include_item_types.push("Movie".to_string());
+    }
+    if query.is_played.is_none() && query_filters_played_value(&query.filters).is_none() {
+        query.is_played = Some(false);
+    }
+    if query.sort_by.is_none() {
+        query.sort_by = Some("DateCreated,SortName".to_string());
+    }
+    if query.sort_order.is_none() {
+        query.sort_order = Some("Descending".to_string());
+    }
+    if query.limit.is_none() {
+        query.limit = Some(20);
+    }
+
+    let filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let items = items_to_json(
+        &state.db,
+        paged_media_items(filtered_items, &query),
+        &server_id,
+        Some(requested_user_id),
+    )
+    .await?;
+
+    if items.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    Ok(Json(vec![serde_json::json!({
+        "BaselineItemName": null,
+        "CategoryId": "latest",
+        "RecommendationType": "Latest",
+        "Items": items,
+    })]))
+}
+
 async fn resume_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -14070,6 +14131,17 @@ fn played_filter_value(filters: &[String]) -> Option<bool> {
     } else {
         None
     }
+}
+
+fn query_filters_played_value(filters: &[String]) -> Option<bool> {
+    let filters = filters
+        .iter()
+        .flat_map(|filter| filter.split(','))
+        .map(str::trim)
+        .filter(|filter| !filter.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    played_filter_value(&filters)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -21681,6 +21753,18 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/Movies/Recommendations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Movies/Recommendations?UserId={user_id}&Limit=1"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -21690,7 +21774,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let recommendations: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(recommendations.as_array().unwrap().len(), 0);
+        assert_eq!(recommendations.as_array().unwrap().len(), 1);
+        assert_eq!(recommendations[0]["RecommendationType"], "Latest");
+        assert_eq!(recommendations[0]["CategoryId"], "latest");
+        assert_eq!(recommendations[0]["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(recommendations[0]["Items"][0]["Id"], item_id);
+        assert_eq!(recommendations[0]["Items"][0]["Type"], "Movie");
+        assert_eq!(recommendations[0]["Items"][0]["UserData"]["Played"], false);
 
         let response = app
             .clone()
