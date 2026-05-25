@@ -557,6 +557,22 @@ pub fn router(state: AppState) -> Router {
         .route("/videos/{item_id}/stream", get(direct_stream_item))
         .route("/Videos/{item_id}/stream", head(direct_stream_item_head))
         .route("/videos/{item_id}/stream", head(direct_stream_item_head))
+        .route(
+            "/Videos/{item_id}/stream.{container}",
+            get(direct_stream_item_by_container),
+        )
+        .route(
+            "/videos/{item_id}/stream.{container}",
+            get(direct_stream_item_by_container),
+        )
+        .route(
+            "/Videos/{item_id}/stream.{container}",
+            head(direct_stream_item_by_container_head),
+        )
+        .route(
+            "/videos/{item_id}/stream.{container}",
+            head(direct_stream_item_by_container_head),
+        )
         .route("/Audio/{item_id}/stream", get(direct_stream_audio))
         .route("/audio/{item_id}/stream", get(direct_stream_audio))
         .route("/Audio/{item_id}/stream", head(direct_stream_audio_head))
@@ -5148,6 +5164,40 @@ async fn direct_stream_item(
 async fn direct_stream_item_head(
     State(state): State<AppState>,
     Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Video",
+        false,
+    )
+    .await
+}
+
+async fn direct_stream_item_by_container(
+    State(state): State<AppState>,
+    Path((item_id, _container)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Video",
+        true,
+    )
+    .await
+}
+
+async fn direct_stream_item_by_container_head(
+    State(state): State<AppState>,
+    Path((item_id, _container)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<axum::response::Response, ApiError> {
@@ -12662,6 +12712,54 @@ mod tests {
         assert_eq!(
             response.headers().get(header::ACCEPT_RANGES).unwrap(),
             "bytes"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/stream.mp4?Static=true"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-3/10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/videos/{item_id}/stream.mp4?Static=true"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
