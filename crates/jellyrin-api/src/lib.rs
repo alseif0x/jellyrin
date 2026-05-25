@@ -6293,14 +6293,37 @@ fn parse_send_playstate_command_query(raw_query: Option<&str>) -> SendPlaystateC
     query
 }
 
-async fn quick_connect_enabled() -> Json<bool> {
-    Json(true)
+async fn quick_connect_enabled(State(state): State<AppState>) -> Result<Json<bool>, ApiError> {
+    Ok(Json(quick_connect_available(&state.db).await?))
+}
+
+async fn quick_connect_available(db: &Database) -> Result<bool, ApiError> {
+    let mut server_options = default_server_configuration_options();
+    if let serde_json::Value::Object(current) =
+        db.system_configuration_payloads().await?.server_options
+    {
+        for (key, value) in current {
+            server_options[key] = value;
+        }
+    }
+    Ok(server_options["QuickConnectAvailable"]
+        .as_bool()
+        .unwrap_or(true))
+}
+
+async fn require_quick_connect_available(db: &Database) -> Result<(), ApiError> {
+    if quick_connect_available(db).await? {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("QuickConnect is disabled"))
+    }
 }
 
 async fn initiate_quick_connect(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_quick_connect_available(&state.db).await?;
     let auth = client_auth_from_headers(&headers);
     let session = state
         .db
@@ -6347,6 +6370,7 @@ async fn authorize_quick_connect(
     Query(query): Query<QuickConnectAuthorizeQuery>,
     body: Option<Json<QuickConnectCodePayload>>,
 ) -> Result<Json<bool>, ApiError> {
+    require_quick_connect_available(&state.db).await?;
     let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let code = query
         .code
@@ -6373,6 +6397,7 @@ async fn authenticate_with_quick_connect(
     State(state): State<AppState>,
     Json(payload): Json<AuthenticateQuickConnectBody>,
 ) -> Result<Json<AuthenticationResultDto>, ApiError> {
+    require_quick_connect_available(&state.db).await?;
     let session = state
         .db
         .quick_connect_by_secret(&payload.secret)
@@ -28440,6 +28465,72 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let enabled: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(enabled, true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "QuickConnectAvailable": false }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/quickconnect/enabled")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let disabled: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(disabled, false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/QuickConnect/Initiate")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="quick-device-disabled", Version="dev""#,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "QuickConnectAvailable": true }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
