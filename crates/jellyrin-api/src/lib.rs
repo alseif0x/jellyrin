@@ -6053,7 +6053,7 @@ async fn playback_info_response(
         })));
     }
     if !direct_play_supported && !direct_stream_supported {
-        if options.enable_transcoding && item.media_type == "Video" {
+        if options.enable_transcoding && matches!(item.media_type.as_str(), "Audio" | "Video") {
             return playback_transcode_info_response(state, user, token, &item, item_json, options)
                 .await;
         }
@@ -6101,8 +6101,11 @@ async fn playback_transcode_info_response(
     let item_id = item.id.simple().to_string();
 
     let streams = media_item_streams(item);
+    let include_video = item.media_type == "Video";
     let selection = TranscodeStreamSelection {
-        video_stream_index: first_stream_index(&streams, "Video"),
+        video_stream_index: include_video
+            .then(|| first_stream_index(&streams, "Video"))
+            .flatten(),
         audio_stream_index: options
             .audio_stream_index
             .or_else(|| default_audio_stream_index(&streams)),
@@ -6116,6 +6119,7 @@ async fn playback_transcode_info_response(
     if let Some(session) = reusable_hls_transcode_session(&state.db, &dedupe_key).await? {
         return playback_transcode_session_info_response(
             item_json,
+            &item.media_type,
             &token.access_token,
             &item_id,
             &session.play_session_id,
@@ -6132,6 +6136,7 @@ async fn playback_transcode_info_response(
         selection.clone(),
     );
     request.start_position_ticks = options.start_position_ticks;
+    request.include_video = include_video;
     let command = build_hls_ffmpeg_command(&request);
 
     let (session, claimed_new_session) = state
@@ -6165,6 +6170,7 @@ async fn playback_transcode_info_response(
 
     playback_transcode_session_info_response(
         item_json,
+        &item.media_type,
         &token.access_token,
         &item_id,
         &play_session_id,
@@ -6174,6 +6180,7 @@ async fn playback_transcode_info_response(
 
 fn playback_transcode_session_info_response(
     item_json: serde_json::Value,
+    media_type: &str,
     access_token: &str,
     item_id: &str,
     play_session_id: &str,
@@ -6196,7 +6203,12 @@ fn playback_transcode_session_info_response(
         media_source.insert("Container".to_string(), serde_json::json!("ts"));
         media_source.insert(
             "TranscodingUrl".to_string(),
-            serde_json::json!(hls_master_url(item_id, play_session_id, access_token)),
+            serde_json::json!(hls_master_url(
+                media_type,
+                item_id,
+                play_session_id,
+                access_token
+            )),
         );
         media_source.insert("DirectStreamUrl".to_string(), serde_json::Value::Null);
         apply_playback_stream_selection(media_source, options);
@@ -6994,7 +7006,29 @@ async fn hls_master_playlist_response(
     raw_query: Option<&str>,
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
-    let session = active_hls_transcode_session(state, headers, item_id, &query).await?;
+    hls_master_playlist_response_for(
+        state,
+        headers,
+        item_id,
+        query,
+        raw_query,
+        include_body,
+        "Video",
+    )
+    .await
+}
+
+async fn hls_master_playlist_response_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    query: HlsQuery,
+    raw_query: Option<&str>,
+    include_body: bool,
+    media_type: &str,
+) -> Result<axum::response::Response, ApiError> {
+    let session =
+        active_hls_transcode_session_for(state, headers, item_id, &query, media_type).await?;
     let playlist = render_hls_master_playlist(&HlsVariantInfo {
         uri: append_query(HLS_MEDIA_PLAYLIST_NAME, raw_query),
         bandwidth: session
@@ -7025,7 +7059,38 @@ async fn hls_media_playlist_response(
     raw_query: Option<&str>,
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
-    let session = active_hls_transcode_session(state, headers, item_id, &query).await?;
+    hls_media_playlist_response_for(
+        state,
+        headers,
+        item_id,
+        query,
+        raw_query,
+        include_body,
+        HlsPlaylistRoute {
+            media_type: "Video",
+            route_media_type: "Videos",
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct HlsPlaylistRoute {
+    media_type: &'static str,
+    route_media_type: &'static str,
+}
+
+async fn hls_media_playlist_response_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    query: HlsQuery,
+    raw_query: Option<&str>,
+    include_body: bool,
+    route: HlsPlaylistRoute,
+) -> Result<axum::response::Response, ApiError> {
+    let session =
+        active_hls_transcode_session_for(state, headers, item_id, &query, route.media_type).await?;
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
     let ready = wait_for_hls_readiness(
         &layout.media_playlist_path,
@@ -7038,7 +7103,8 @@ async fn hls_media_playlist_response(
     }
 
     let playlist = tokio::fs::read_to_string(&layout.media_playlist_path).await?;
-    let playlist = rewrite_hls_media_playlist(&playlist, item_id, raw_query);
+    let playlist =
+        rewrite_hls_media_playlist(&playlist, item_id, raw_query, route.route_media_type);
     playlist_response(playlist, include_body)
 }
 
@@ -7063,7 +7129,36 @@ async fn hls_segment_response(
         return Err(ApiError::not_found("HLS segment not found"));
     }
 
-    let session = active_hls_transcode_session(state, headers, item_id, &query).await?;
+    hls_segment_response_for(
+        state,
+        headers,
+        item_id,
+        segment,
+        query,
+        include_body,
+        "Video",
+    )
+    .await
+}
+
+async fn hls_segment_response_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    segment: HlsSegmentRequest<'_>,
+    query: HlsQuery,
+    include_body: bool,
+    media_type: &str,
+) -> Result<axum::response::Response, ApiError> {
+    if segment.playlist_id != "main"
+        || !segment.container.eq_ignore_ascii_case("ts")
+        || segment.segment_id < 0
+    {
+        return Err(ApiError::not_found("HLS segment not found"));
+    }
+
+    let session =
+        active_hls_transcode_session_for(state, headers, item_id, &query, media_type).await?;
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
     let segment_id = u32::try_from(segment.segment_id)
         .map_err(|_| ApiError::not_found("HLS segment not found"))?;
@@ -7163,6 +7258,23 @@ async fn audio_hls_master_playlist_response(
     raw_query: Option<&str>,
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
+    if query
+        .play_session_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return hls_master_playlist_response_for(
+            state,
+            headers,
+            item_id,
+            query,
+            raw_query,
+            include_body,
+            "Audio",
+        )
+        .await;
+    }
+
     let item = audio_hls_item(state, headers, query.api_key.as_deref(), item_id).await?;
     let playlist = render_hls_master_playlist(&HlsVariantInfo {
         uri: append_query(HLS_MEDIA_PLAYLIST_NAME, raw_query),
@@ -7180,6 +7292,26 @@ async fn audio_hls_media_playlist_response(
     query: HlsQuery,
     raw_query: Option<&str>,
 ) -> Result<axum::response::Response, ApiError> {
+    if query
+        .play_session_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return hls_media_playlist_response_for(
+            state,
+            headers,
+            item_id,
+            query,
+            raw_query,
+            true,
+            HlsPlaylistRoute {
+                media_type: "Audio",
+                route_media_type: "DynamicHls/Audio",
+            },
+        )
+        .await;
+    }
+
     let item = audio_hls_item(state, headers, query.api_key.as_deref(), item_id).await?;
     let container = audio_hls_segment_container(&item)?;
     let duration_seconds = item
@@ -7203,6 +7335,27 @@ async fn audio_hls_segment_response(
     container: &str,
     query: HlsQuery,
 ) -> Result<axum::response::Response, ApiError> {
+    if query
+        .play_session_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return hls_segment_response_for(
+            state,
+            headers,
+            item_id,
+            HlsSegmentRequest {
+                playlist_id: "main",
+                segment_id,
+                container,
+            },
+            query,
+            true,
+            "Audio",
+        )
+        .await;
+    }
+
     if segment_id != 0 {
         return Err(ApiError::not_found("Audio HLS segment not found"));
     }
@@ -7309,11 +7462,12 @@ fn parse_non_negative_i64(value: &str, message: &'static str) -> Result<i64, Api
     Ok(value)
 }
 
-async fn active_hls_transcode_session(
+async fn active_hls_transcode_session_for(
     state: &AppState,
     headers: &HeaderMap,
     item_id: &str,
     query: &HlsQuery,
+    media_type: &str,
 ) -> Result<TranscodeSession, ApiError> {
     require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
     let requested_item_id = parse_jellyfin_uuid(item_id)?;
@@ -7329,7 +7483,7 @@ async fn active_hls_transcode_session(
         .await?
         .ok_or_else(|| ApiError::not_found("HLS transcode session not found"))?;
     if session.item.id != requested_item_id
-        || session.item.media_type != "Video"
+        || session.item.media_type != media_type
         || !matches!(
             session.status.as_str(),
             "starting" | "running" | "completed"
@@ -8265,8 +8419,21 @@ fn transcode_temp_root() -> PathBuf {
     std::env::temp_dir().join("jellyrin").join("transcodes")
 }
 
-fn hls_master_url(item_id: &str, play_session_id: &str, access_token: &str) -> String {
-    format!("/Videos/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}")
+fn hls_master_url(
+    media_type: &str,
+    item_id: &str,
+    play_session_id: &str,
+    access_token: &str,
+) -> String {
+    if media_type == "Audio" {
+        format!(
+            "/DynamicHls/Audio/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}"
+        )
+    } else {
+        format!(
+            "/Videos/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}"
+        )
+    }
 }
 
 async fn cleanup_hls_transcode_files(output_path: &str) -> bool {
@@ -8459,14 +8626,19 @@ fn hls_codecs(item: &MediaItem) -> Option<String> {
     (!codecs.is_empty()).then(|| codecs.join(","))
 }
 
-fn rewrite_hls_media_playlist(playlist: &str, item_id: &str, raw_query: Option<&str>) -> String {
+fn rewrite_hls_media_playlist(
+    playlist: &str,
+    item_id: &str,
+    raw_query: Option<&str>,
+    route_media_type: &str,
+) -> String {
     let mut rewritten = String::with_capacity(playlist.len());
     for line in playlist.lines() {
         if line.trim().is_empty() || line.starts_with('#') {
             rewritten.push_str(line);
         } else if let Some(segment_id) = hls_segment_id_from_uri(line) {
             rewritten.push_str(&append_query(
-                &format!("/Videos/{item_id}/hls1/main/{segment_id}.ts"),
+                &format!("/{route_media_type}/{item_id}/hls1/main/{segment_id}.ts"),
                 raw_query,
             ));
         } else {
@@ -16482,6 +16654,7 @@ mod tests {
             .await
             .unwrap();
         let user_id = user.id.simple().to_string();
+        let test_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -17062,9 +17235,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/DynamicHls/Audio/{item_id}/master.m3u8?PlaySessionId=audio-hls"
+                        "/DynamicHls/Audio/{item_id}/master.m3u8?api_key={api_key}"
                     ))
-                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -17079,7 +17251,9 @@ mod tests {
         let audio_master = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(
             audio_master,
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=192000\nmain.m3u8?PlaySessionId=audio-hls\n"
+            format!(
+                "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=192000\nmain.m3u8?api_key={api_key}\n"
+            )
         );
 
         let response = app
@@ -17175,6 +17349,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&StartTimeTicks=50000000"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let audio_transcode_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(audio_transcode_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            audio_transcode_info["MediaSources"][0]["SupportsTranscoding"],
+            true
+        );
+        assert_eq!(
+            audio_transcode_info["MediaSources"][0]["TranscodingUrl"],
+            format!(
+                "/DynamicHls/Audio/{item_id}/master.m3u8?PlaySessionId={}&api_key={api_key}",
+                audio_transcode_info["PlaySessionId"].as_str().unwrap()
+            )
+        );
+        let audio_transcode_session = test_db
+            .transcode_session_by_play_session_id(
+                audio_transcode_info["PlaySessionId"].as_str().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(audio_transcode_session.item.media_type, "Audio");
+        assert_eq!(audio_transcode_session.video_stream_index, None);
+        assert_eq!(audio_transcode_session.audio_stream_index, Some(0));
+        assert_eq!(audio_transcode_session.position_ticks, 50_000_000);
+
+        let audio_hls_dir = tmp.path().join("audio-hls-ready");
+        tokio::fs::create_dir_all(&audio_hls_dir).await.unwrap();
+        let audio_hls_playlist = audio_hls_dir.join("main.m3u8");
+        let audio_hls_segment = audio_hls_dir.join("segment_00000.ts");
+        tokio::fs::write(
+            &audio_hls_playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:3\n#EXTINF:3.000,\nsegment_00000.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&audio_hls_segment, b"audio-ts")
+            .await
+            .unwrap();
+        test_db
+            .upsert_transcode_session(UpsertTranscodeSession {
+                play_session_id: "audio-hls-ready".to_string(),
+                dedupe_key: None,
+                device_id: None,
+                user_id: user.id,
+                item_id: parse_jellyfin_uuid(item_id).unwrap(),
+                media_source_id: Some(item_id.to_string()),
+                audio_stream_index: Some(0),
+                subtitle_stream_index: None,
+                video_stream_index: None,
+                output_path: audio_hls_playlist.to_string_lossy().to_string(),
+                process_id: Some(777),
+                status: "running".to_string(),
+                progress_percent: Some(10.0),
+                position_ticks: 10,
+            })
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Audio/{item_id}/main.m3u8?PlaySessionId=audio-hls-ready"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let audio_transcode_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(audio_transcode_playlist.contains(&format!(
+            "/DynamicHls/Audio/{item_id}/hls1/main/0.ts?PlaySessionId=audio-hls-ready"
+        )));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Audio/{item_id}/hls1/main/0.ts?PlaySessionId=audio-hls-ready"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"audio-ts");
 
         let response = app
             .clone()

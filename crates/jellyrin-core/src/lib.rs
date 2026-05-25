@@ -99,6 +99,7 @@ pub struct HlsTranscodeRequest {
     pub output_playlist_path: String,
     pub segment_pattern_path: String,
     pub selection: TranscodeStreamSelection,
+    pub include_video: bool,
     pub start_position_ticks: i64,
     pub max_video_width: Option<u32>,
     pub max_video_height: Option<u32>,
@@ -119,6 +120,7 @@ impl HlsTranscodeRequest {
             output_playlist_path: output_playlist_path.into(),
             segment_pattern_path: segment_pattern_path.into(),
             selection,
+            include_video: true,
             start_position_ticks: 0,
             max_video_width: None,
             max_video_height: None,
@@ -187,7 +189,11 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     args.push("-i".to_string());
     args.push(request.input_path.clone());
 
-    push_selected_stream_map(&mut args, "v", request.selection.video_stream_index, true);
+    if request.include_video {
+        push_selected_stream_map(&mut args, "v", request.selection.video_stream_index, true);
+    } else {
+        args.push("-vn".to_string());
+    }
     push_selected_stream_map(&mut args, "a", request.selection.audio_stream_index, true);
     if request
         .selection
@@ -206,30 +212,32 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         args.push("-sn".to_string());
     }
 
-    args.push("-c:v".to_string());
-    args.push("libx264".to_string());
-    args.push("-preset".to_string());
-    args.push("veryfast".to_string());
-    args.push("-profile:v".to_string());
-    args.push("main".to_string());
-    args.push("-pix_fmt".to_string());
-    args.push("yuv420p".to_string());
+    if request.include_video {
+        args.push("-c:v".to_string());
+        args.push("libx264".to_string());
+        args.push("-preset".to_string());
+        args.push("veryfast".to_string());
+        args.push("-profile:v".to_string());
+        args.push("main".to_string());
+        args.push("-pix_fmt".to_string());
+        args.push("yuv420p".to_string());
 
-    if let Some(video_bitrate) = request.video_bitrate {
-        args.push("-b:v".to_string());
-        args.push(video_bitrate.to_string());
-        args.push("-maxrate".to_string());
-        args.push(video_bitrate.to_string());
-        args.push("-bufsize".to_string());
-        args.push(video_bitrate.saturating_mul(2).to_string());
-    }
+        if let Some(video_bitrate) = request.video_bitrate {
+            args.push("-b:v".to_string());
+            args.push(video_bitrate.to_string());
+            args.push("-maxrate".to_string());
+            args.push(video_bitrate.to_string());
+            args.push("-bufsize".to_string());
+            args.push(video_bitrate.saturating_mul(2).to_string());
+        }
 
-    if request.max_video_width.is_some() || request.max_video_height.is_some() {
-        args.push("-vf".to_string());
-        args.push(scale_filter(
-            request.max_video_width,
-            request.max_video_height,
-        ));
+        if request.max_video_width.is_some() || request.max_video_height.is_some() {
+            args.push("-vf".to_string());
+            args.push(scale_filter(
+                request.max_video_width,
+                request.max_video_height,
+            ));
+        }
     }
 
     args.push("-c:a".to_string());
@@ -425,6 +433,35 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|pair| pair == ["-c:s", "webvtt"])
+        );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_can_transcode_audio_only() {
+        let mut request = HlsTranscodeRequest::new(
+            "/media/Song.flac",
+            "/tmp/audio/main.m3u8",
+            "/tmp/audio/segment_%05d.ts",
+            TranscodeStreamSelection {
+                video_stream_index: None,
+                audio_stream_index: Some(1),
+                subtitle_stream_index: None,
+            },
+        );
+        request.include_video = false;
+        request.audio_bitrate = Some(128_000);
+
+        let command = build_hls_ffmpeg_command(&request);
+
+        assert!(command.args.iter().any(|arg| arg == "-vn"));
+        assert!(!command.args.iter().any(|arg| arg == "-c:v"));
+        assert!(command.args.windows(2).any(|pair| pair == ["-map", "0:1?"]));
+        assert!(command.args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-b:a", "128000"])
         );
     }
 
