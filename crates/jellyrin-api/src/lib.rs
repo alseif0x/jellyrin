@@ -31964,11 +31964,13 @@ mod tests {
         );
 
         let legacy_segment_id = 987_654_321_i64;
-        let legacy_segment = transcode_temp_root().join(format!("{legacy_segment_id}.aac"));
-        if let Some(parent) = legacy_segment.parent() {
+        let legacy_aac_segment = transcode_temp_root().join(format!("{legacy_segment_id}.aac"));
+        let legacy_mp3_segment = transcode_temp_root().join(format!("{legacy_segment_id}.mp3"));
+        if let Some(parent) = legacy_aac_segment.parent() {
             tokio::fs::create_dir_all(parent).await.unwrap();
         }
-        let _ = tokio::fs::remove_file(&legacy_segment).await;
+        let _ = tokio::fs::remove_file(&legacy_aac_segment).await;
+        let _ = tokio::fs::remove_file(&legacy_mp3_segment).await;
 
         let response = app
             .clone()
@@ -31982,7 +31984,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        tokio::fs::write(&legacy_segment, b"legacy static aac")
+        tokio::fs::write(&legacy_aac_segment, b"legacy static aac")
             .await
             .unwrap();
         let response = app
@@ -32002,9 +32004,110 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "audio/aac"
         );
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "17"
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"legacy static aac");
-        tokio::fs::remove_file(&legacy_segment).await.unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Audio/not-a-real-item/hls/{legacy_segment_id}/stream.aac"
+                    ))
+                    .header(header::RANGE, "bytes=0-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/aac"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-5/17"
+        );
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "6");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"legacy");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/hlssegment/audio/not-a-real-item/hls/{legacy_segment_id}/stream.aac"
+                    ))
+                    .header(header::RANGE, "bytes=99-100")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/aac"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes */17"
+        );
+
+        tokio::fs::write(&legacy_mp3_segment, b"legacy static mp3")
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/audio/not-a-real-item/hls/{legacy_segment_id}/stream.mp3"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"legacy static mp3");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/hlssegment/audio/not-a-real-item/hls/{legacy_segment_id}/stream.mp3"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"legacy static mp3");
+        tokio::fs::remove_file(&legacy_aac_segment).await.unwrap();
+        tokio::fs::remove_file(&legacy_mp3_segment).await.unwrap();
 
         let response = app
             .clone()
@@ -32040,8 +32143,60 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "audio/aac"
         );
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "8");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"fake aac");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Audio/{item_id}/hls/0/stream.aac?apiKey={api_key}"
+                    ))
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/aac"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-3/8"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!(
+                        "/Audio/{item_id}/hls/0/stream.aac?apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/aac"
+        );
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "8");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
 
         let response = app
             .clone()
@@ -32076,6 +32231,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/{item_id}/hls/0/stream.aac?apiKey=bad-token"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
             .clone()
