@@ -8421,13 +8421,20 @@ async fn media_list_items_to_json(
     user_id: Option<Uuid>,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let mut values = Vec::with_capacity(items.len());
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.item.id).collect()).await?;
     for item in items {
         let playback = if let Some(user_id) = user_id {
             db.playback_state_for_item(user_id, item.item.id).await?
         } else {
             None
         };
-        let mut value = media_item_to_json_with_playback(&item.item, server_id, playback.as_ref());
+        let mut value = media_item_to_json_with_playback_and_metadata(
+            &item.item,
+            server_id,
+            playback.as_ref(),
+            metadata_by_item.get(&item.item.id),
+        );
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "PlaylistItemId".to_string(),
@@ -9353,7 +9360,13 @@ async fn item_detail(
         .into_iter()
         .find(|item| item.id == requested_id)
         .ok_or_else(|| ApiError::not_found("Item not found"))?;
-    Ok(Json(media_item_to_json(&item, &server_id)))
+    let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    Ok(Json(media_item_to_json_with_playback_and_metadata(
+        &item,
+        &server_id,
+        None,
+        Some(&metadata),
+    )))
 }
 
 async fn current_user_item_detail(
@@ -9390,10 +9403,12 @@ async fn current_user_item_detail(
         .db
         .playback_state_for_item(requested_user_id, item.id)
         .await?;
-    Ok(Json(media_item_to_json_with_playback(
+    let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    Ok(Json(media_item_to_json_with_playback_and_metadata(
         &item,
         &server_id,
         playback.as_ref(),
+        Some(&metadata),
     )))
 }
 
@@ -9409,10 +9424,12 @@ async fn user_item_detail(
     let item = media_item_by_id(&state.db, &item_id).await?;
     let playback = state.db.playback_state_for_item(user_id, item.id).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    Ok(Json(media_item_to_json_with_playback(
+    let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    Ok(Json(media_item_to_json_with_playback_and_metadata(
         &item,
         &server_id,
         playback.as_ref(),
+        Some(&metadata),
     )))
 }
 
@@ -14702,7 +14719,7 @@ fn metadata_remote_trailers(
 ) -> Vec<serde_json::Value> {
     let mut trailers = Vec::new();
     for key in ["RemoteTrailers", "Trailers"] {
-        if let Some(value) = metadata.get(key) {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
             collect_remote_trailer_values(value, item, server_id, &mut trailers);
         }
     }
@@ -15573,19 +15590,38 @@ async fn items_to_json(
     user_id: Option<Uuid>,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let mut values = Vec::with_capacity(items.len());
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
     for item in items {
         let playback = if let Some(user_id) = user_id {
             db.playback_state_for_item(user_id, item.id).await?
         } else {
             None
         };
-        values.push(media_item_to_json_with_playback(
+        values.push(media_item_to_json_with_playback_and_metadata(
             &item,
             server_id,
             playback.as_ref(),
+            metadata_by_item.get(&item.id),
         ));
     }
     Ok(values)
+}
+
+async fn media_metadata_by_item_id(
+    db: &Database,
+    item_ids: HashSet<Uuid>,
+) -> Result<HashMap<Uuid, serde_json::Value>, ApiError> {
+    if item_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .filter(|metadata| item_ids.contains(&metadata.item_id))
+        .map(|metadata| (metadata.item_id, metadata.payload))
+        .collect())
 }
 
 fn csv_values_lowercase(values: &[String]) -> Option<Vec<String>> {
@@ -15804,6 +15840,15 @@ fn media_item_to_json_with_playback(
     server_id: &str,
     playback: Option<&PlaybackState>,
 ) -> serde_json::Value {
+    media_item_to_json_with_playback_and_metadata(item, server_id, playback, None)
+}
+
+fn media_item_to_json_with_playback_and_metadata(
+    item: &MediaItem,
+    server_id: &str,
+    playback: Option<&PlaybackState>,
+    metadata: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let item_type = media_item_type(item);
     let item_id = item.id.simple().to_string();
     let container = media_item_container(item);
@@ -15886,7 +15931,7 @@ fn media_item_to_json_with_playback(
         "Bitrate": item.bitrate,
     });
 
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "Name": item.name,
         "OriginalTitle": null,
         "ServerId": server_id,
@@ -15939,7 +15984,178 @@ fn media_item_to_json_with_playback(
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
         "MediaSources": [media_source],
-    })
+    });
+    apply_media_item_metadata(&mut value, metadata, item, server_id);
+    value
+}
+
+fn apply_media_item_metadata(
+    value: &mut serde_json::Value,
+    metadata: Option<&serde_json::Value>,
+    item: &MediaItem,
+    server_id: &str,
+) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    let trailers = metadata_remote_trailers(metadata, item, server_id);
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    for (target, keys) in [
+        ("Overview", &["Overview", "overview"][..]),
+        ("OriginalTitle", &["OriginalTitle", "originalTitle"][..]),
+        ("OfficialRating", &["OfficialRating", "OfficialRatings"][..]),
+        ("Album", &["Album", "AlbumName"][..]),
+        ("AlbumArtist", &["AlbumArtist", "AlbumArtists"][..]),
+    ] {
+        if let Some(field_value) = first_metadata_value_from_json(metadata, keys) {
+            object.insert(target.to_string(), serde_json::Value::String(field_value));
+        }
+    }
+
+    for (target, keys) in [
+        ("CommunityRating", &["CommunityRating", "Rating"][..]),
+        ("CriticRating", &["CriticRating"][..]),
+    ] {
+        if let Some(field_value) = first_metadata_number_from_json(metadata, keys) {
+            object.insert(target.to_string(), serde_json::json!(field_value));
+        }
+    }
+
+    if let Some(year) = first_metadata_i32_from_json(metadata, &["ProductionYear", "Year"]) {
+        object.insert("ProductionYear".to_string(), serde_json::json!(year));
+    }
+    if let Some(premiere_date) =
+        first_metadata_value_from_json(metadata, &["PremiereDate", "AirDate", "DateCreated"])
+    {
+        object.insert(
+            "PremiereDate".to_string(),
+            serde_json::Value::String(premiere_date),
+        );
+    }
+
+    let taglines = metadata_values_from_json(metadata, &["Taglines"]);
+    if !taglines.is_empty() {
+        object.insert("Taglines".to_string(), serde_json::json!(taglines));
+    }
+
+    let genres = metadata_values_from_json(metadata, &["Genres", "MusicGenres"]);
+    if !genres.is_empty() {
+        object.insert("Genres".to_string(), serde_json::json!(genres));
+        object.insert(
+            "GenreItems".to_string(),
+            serde_json::json!(metadata_name_id_items("Genre", &genres)),
+        );
+    }
+
+    let studios = metadata_values_from_json(metadata, &["Studios"]);
+    if !studios.is_empty() {
+        object.insert("Studios".to_string(), serde_json::json!(studios));
+    }
+
+    let people = metadata_values_from_json(metadata, &["People", "Cast"]);
+    if !people.is_empty() {
+        object.insert(
+            "People".to_string(),
+            serde_json::json!(metadata_people_items(&people)),
+        );
+    }
+
+    let tags = metadata_values_from_json(metadata, &["Tags"]);
+    if !tags.is_empty() {
+        object.insert("Tags".to_string(), serde_json::json!(tags));
+        object.insert(
+            "TagItems".to_string(),
+            serde_json::json!(metadata_name_id_items("Tag", &tags)),
+        );
+    }
+
+    let artists = metadata_values_from_json(metadata, &["Artists"]);
+    if !artists.is_empty() {
+        object.insert("Artists".to_string(), serde_json::json!(artists));
+    }
+
+    if let Some(provider_ids) = json_field_case_insensitive(metadata, "ProviderIds")
+        .or_else(|| json_field_case_insensitive(metadata, "ProviderId"))
+        && provider_ids.is_object()
+    {
+        object.insert("ProviderIds".to_string(), provider_ids.clone());
+    }
+
+    if !trailers.is_empty() {
+        object.insert("RemoteTrailers".to_string(), serde_json::json!(trailers));
+    }
+}
+
+fn metadata_values_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    let mut values = BTreeMap::<String, String>::new();
+    for key in keys {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
+            collect_metadata_value(value, &mut values);
+        }
+    }
+    values.into_values().collect()
+}
+
+fn first_metadata_value_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    metadata_values_from_json(metadata, keys).into_iter().next()
+}
+
+fn first_metadata_number_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
+            if let Some(value) = value.as_f64() {
+                return Some(value);
+            }
+            if let Some(value) = value.as_str().and_then(|value| value.parse::<f64>().ok()) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn first_metadata_i32_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Option<i32> {
+    for key in keys {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
+            if let Some(value) = value.as_i64().and_then(|value| i32::try_from(value).ok()) {
+                return Some(value);
+            }
+            if let Some(value) = value.as_str().and_then(|value| value.parse::<i32>().ok()) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn metadata_name_id_items(item_type: &str, names: &[String]) -> Vec<serde_json::Value> {
+    names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "Name": name,
+                "Id": stable_entity_id(item_type, name)
+            })
+        })
+        .collect()
+}
+
+fn metadata_people_items(names: &[String]) -> Vec<serde_json::Value> {
+    names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "Name": name,
+                "Id": stable_entity_id("Person", name),
+                "Role": null,
+                "Type": "Person",
+                "PrimaryImageTag": null
+            })
+        })
+        .collect()
 }
 
 fn selected_subtitle_stream_index(
@@ -24352,10 +24568,19 @@ mod tests {
                     "Album": "Example Album",
                     "Artists": ["Artist One", "artist one", { "Name": "Artist Two" }],
                     "AlbumArtists": ["Album Artist"],
+                    "CommunityRating": 7.5,
+                    "CriticRating": 86,
                     "Genres": ["Drama", "drama", "Thriller"],
                     "OfficialRating": "PG-13",
+                    "Overview": "Metadata overview",
+                    "OriginalTitle": "Original Metadata Title",
+                    "People": [{ "Name": "Actor One" }],
+                    "PremiereDate": "2024-01-02T00:00:00.0000000Z",
                     "ProductionYear": 2024,
+                    "ProviderIds": { "Imdb": "tt1234567" },
+                    "RemoteTrailers": [{ "Name": "Main Trailer", "Url": "https://trailers.example/main.mp4" }],
                     "Studios": ["Studio One", { "Name": "Studio Two" }],
+                    "Taglines": ["One test movie"],
                     "Tags": ["Library Tag"]
                 }),
             )
@@ -24460,6 +24685,36 @@ mod tests {
         assert_eq!(filtered["StartIndex"], 0);
         assert_eq!(filtered["Items"].as_array().unwrap().len(), 1);
         assert_eq!(filtered["Items"][0]["Name"], "Example Movie");
+        assert_eq!(filtered["Items"][0]["Overview"], "Metadata overview");
+        assert_eq!(filtered["Items"][0]["OfficialRating"], "PG-13");
+        assert_eq!(filtered["Items"][0]["CommunityRating"], 7.5);
+        assert_eq!(filtered["Items"][0]["CriticRating"], 86.0);
+        assert_eq!(filtered["Items"][0]["ProductionYear"], 2024);
+        assert_eq!(
+            filtered["Items"][0]["PremiereDate"],
+            "2024-01-02T00:00:00.0000000Z"
+        );
+        assert_eq!(filtered["Items"][0]["Album"], "Example Album");
+        assert_eq!(filtered["Items"][0]["AlbumArtist"], "Album Artist");
+        assert_eq!(
+            filtered["Items"][0]["Artists"],
+            json!(["Artist One", "Artist Two"])
+        );
+        assert_eq!(filtered["Items"][0]["Genres"], json!(["Drama", "Thriller"]));
+        assert_eq!(filtered["Items"][0]["GenreItems"][0]["Name"], "Drama");
+        assert_eq!(
+            filtered["Items"][0]["Studios"],
+            json!(["Studio One", "Studio Two"])
+        );
+        assert_eq!(filtered["Items"][0]["People"][0]["Name"], "Actor One");
+        assert_eq!(filtered["Items"][0]["Tags"], json!(["Library Tag"]));
+        assert_eq!(filtered["Items"][0]["TagItems"][0]["Name"], "Library Tag");
+        assert_eq!(filtered["Items"][0]["Taglines"], json!(["One test movie"]));
+        assert_eq!(filtered["Items"][0]["ProviderIds"]["Imdb"], "tt1234567");
+        assert_eq!(
+            filtered["Items"][0]["RemoteTrailers"][0]["Name"],
+            "Main Trailer"
+        );
 
         let response = app
             .clone()
@@ -24676,8 +24931,9 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let persons: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(persons["StartIndex"], 0);
-        assert_eq!(persons["TotalRecordCount"], 0);
-        assert_eq!(persons["Items"].as_array().unwrap().len(), 0);
+        assert_eq!(persons["TotalRecordCount"], 1);
+        assert_eq!(persons["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(persons["Items"][0]["Name"], "Actor One");
 
         let response = app
             .clone()
@@ -24733,6 +24989,7 @@ mod tests {
         assert_eq!(detail["Size"], 10);
         assert_eq!(detail["RunTimeTicks"], 987_650_000);
         assert_eq!(detail["FileName"], "Example Movie.mp4");
+        assert_eq!(detail["OriginalTitle"], "Original Metadata Title");
         assert_eq!(detail["ImageTags"]["Primary"], "placeholder");
         assert_eq!(detail["PrimaryImageAspectRatio"], 0.6666667);
         assert_eq!(detail["MediaSources"][0]["Id"], item_id);
@@ -24772,9 +25029,30 @@ mod tests {
         assert_eq!(detail["MediaStreams"][2]["Type"], "Subtitle");
         assert_eq!(detail["MediaStreams"][2]["Codec"], "subrip");
         assert_eq!(detail["MediaStreams"][2]["Index"], 2);
-        assert_eq!(detail["People"].as_array().unwrap().len(), 0);
-        assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
-        assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
+        assert_eq!(detail["Overview"], "Metadata overview");
+        assert_eq!(detail["OfficialRating"], "PG-13");
+        assert_eq!(detail["CommunityRating"], 7.5);
+        assert_eq!(detail["CriticRating"], 86.0);
+        assert_eq!(detail["PremiereDate"], "2024-01-02T00:00:00.0000000Z");
+        assert_eq!(detail["ProductionYear"], 2024);
+        assert_eq!(detail["Album"], "Example Album");
+        assert_eq!(detail["AlbumArtist"], "Album Artist");
+        assert_eq!(detail["Artists"], json!(["Artist One", "Artist Two"]));
+        assert_eq!(detail["Genres"], json!(["Drama", "Thriller"]));
+        assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["GenreItems"][0]["Name"], "Drama");
+        assert_eq!(detail["Studios"], json!(["Studio One", "Studio Two"]));
+        assert_eq!(detail["People"].as_array().unwrap().len(), 1);
+        assert_eq!(detail["People"][0]["Name"], "Actor One");
+        assert_eq!(detail["Tags"], json!(["Library Tag"]));
+        assert_eq!(detail["TagItems"][0]["Name"], "Library Tag");
+        assert_eq!(detail["Taglines"], json!(["One test movie"]));
+        assert_eq!(detail["ProviderIds"]["Imdb"], "tt1234567");
+        assert_eq!(detail["RemoteTrailers"][0]["Name"], "Main Trailer");
+        assert_eq!(
+            detail["RemoteTrailers"][0]["Path"],
+            "https://trailers.example/main.mp4"
+        );
 
         let response = app
             .clone()
@@ -24844,6 +25122,9 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let user_library_detail: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(user_library_detail["Id"], item_id);
+        assert_eq!(user_library_detail["Overview"], "Metadata overview");
+        assert_eq!(user_library_detail["Genres"], json!(["Drama", "Thriller"]));
+        assert_eq!(user_library_detail["ProviderIds"]["Imdb"], "tt1234567");
 
         let response = app
             .clone()
