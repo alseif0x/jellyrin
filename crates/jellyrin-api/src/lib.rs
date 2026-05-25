@@ -9590,9 +9590,14 @@ struct StreamQuery {
 
 #[derive(Debug, Deserialize)]
 struct HlsQuery {
-    #[serde(alias = "api_key", alias = "ApiKey")]
+    #[serde(alias = "api_key", alias = "ApiKey", alias = "apiKey")]
     api_key: Option<String>,
-    #[serde(alias = "PlaySessionId", alias = "playSessionId")]
+    #[serde(
+        alias = "PlaySessionId",
+        alias = "playSessionId",
+        alias = "playsessionid",
+        alias = "play_session_id"
+    )]
     play_session_id: Option<String>,
 }
 
@@ -18285,6 +18290,199 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audio_hls_legacy_supports_aac_fallback_and_query_casing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let song = tmp.path().join("Example Clip.aac");
+        tokio::fs::write(&song, b"fake aac").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "aac-hls-test-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Music&collectionType=music&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?IncludeItemTypes=Audio&Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["TotalRecordCount"], 1);
+        let item_id = result["Items"][0]["Id"].as_str().unwrap();
+        assert_eq!(result["Items"][0]["MediaSources"][0]["Container"], "aac");
+        assert_eq!(
+            result["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
+            format!("/Audio/{item_id}/stream")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/HlsSegment/Audio/{item_id}/hls/0/stream.aac"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Audio/{item_id}/main.m3u8?apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(playlist.contains(&format!("hls1/main/0.aac?apiKey={api_key}")));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/{item_id}/hls/0/stream.aac?apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/aac"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake aac");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/{item_id}/hls/0/stream.mp3?apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/{item_id}/hls/1/stream.aac?apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let audio_hls_dir = tmp.path().join("aac-audio-hls-ready");
+        tokio::fs::create_dir_all(&audio_hls_dir).await.unwrap();
+        let audio_hls_playlist = audio_hls_dir.join("main.m3u8");
+        let audio_hls_segment = audio_hls_dir.join("segment_00000.ts");
+        tokio::fs::write(
+            &audio_hls_playlist,
+            "#EXTM3U\n#EXT-X-TARGETDURATION:3\n#EXTINF:3.000,\nsegment_00000.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&audio_hls_segment, b"aac-audio-ts")
+            .await
+            .unwrap();
+        test_db
+            .upsert_transcode_session(UpsertTranscodeSession {
+                play_session_id: "aac-audio-hls-ready".to_string(),
+                dedupe_key: None,
+                device_id: None,
+                user_id: user.id,
+                item_id: parse_jellyfin_uuid(item_id).unwrap(),
+                media_source_id: Some(item_id.to_string()),
+                audio_stream_index: Some(0),
+                subtitle_stream_index: None,
+                video_stream_index: None,
+                output_path: audio_hls_playlist.to_string_lossy().to_string(),
+                process_id: Some(778),
+                status: "running".to_string(),
+                progress_percent: Some(20.0),
+                position_ticks: 20,
+            })
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/{item_id}/hls/0/stream.aac?playsessionid=aac-audio-hls-ready&apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"aac-audio-ts");
     }
 
     #[tokio::test]
