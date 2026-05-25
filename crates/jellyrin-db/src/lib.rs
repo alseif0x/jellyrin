@@ -75,6 +75,13 @@ pub struct MediaItemMetadata {
 }
 
 #[derive(Debug, Clone)]
+pub struct MediaItemLyrics {
+    pub item_id: Uuid,
+    pub payload: Value,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct MediaList {
     pub id: Uuid,
     pub kind: String,
@@ -682,6 +689,63 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn media_item_lyrics(
+        &self,
+        item_id: Uuid,
+    ) -> anyhow::Result<Option<MediaItemLyrics>> {
+        let row = sqlx::query_as::<_, MediaItemLyricsRow>(
+            r#"
+            SELECT item_id, lyrics_json, updated_at
+            FROM media_item_lyrics
+            WHERE item_id = ?1
+            "#,
+        )
+        .bind(item_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn update_media_item_lyrics(
+        &self,
+        item_id: Uuid,
+        payload: Value,
+    ) -> anyhow::Result<()> {
+        self.media_item_by_id(item_id).await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let lyrics_json = serde_json::to_string(&payload)?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_lyrics (item_id, lyrics_json, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?3)
+            ON CONFLICT(item_id) DO UPDATE SET
+                lyrics_json = excluded.lyrics_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(item_id.to_string())
+        .bind(lyrics_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_media_item_lyrics(&self, item_id: Uuid) -> anyhow::Result<bool> {
+        self.media_item_by_id(item_id).await?;
+        let result = sqlx::query(
+            r#"
+            DELETE FROM media_item_lyrics
+            WHERE item_id = ?1
+            "#,
+        )
+        .bind(item_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn user_configuration(&self, user_id: Uuid) -> anyhow::Result<Option<Value>> {
@@ -3618,6 +3682,13 @@ struct DisplayPreferencesRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct MediaItemLyricsRow {
+    item_id: String,
+    lyrics_json: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct UserConfigurationRow {
     payload_json: String,
 }
@@ -4096,6 +4167,19 @@ impl TryFrom<MediaItemMetadataRow> for MediaItemMetadata {
             item_id: Uuid::parse_str(&row.id).context("invalid media item metadata id")?,
             payload: serde_json::from_str(&row.metadata_json)
                 .context("invalid media item metadata json")?,
+        })
+    }
+}
+
+impl TryFrom<MediaItemLyricsRow> for MediaItemLyrics {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaItemLyricsRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            item_id: Uuid::parse_str(&row.item_id).context("invalid media item lyrics id")?,
+            payload: serde_json::from_str(&row.lyrics_json)
+                .context("invalid media item lyrics json")?,
+            updated_at: parse_time(&row.updated_at)?,
         })
     }
 }

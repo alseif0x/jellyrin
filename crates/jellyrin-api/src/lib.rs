@@ -810,12 +810,28 @@ pub fn router(state: AppState) -> Router {
         .route("/DisplayPreferences/usersettings", get(display_preferences))
         .route("/displaypreferences/usersettings", get(display_preferences))
         .route(
+            "/DisplayPreferences/{display_preferences_id}",
+            get(display_preferences_by_id),
+        )
+        .route(
+            "/displaypreferences/{display_preferences_id}",
+            get(display_preferences_by_id),
+        )
+        .route(
             "/DisplayPreferences/usersettings",
             post(update_display_preferences),
         )
         .route(
             "/displaypreferences/usersettings",
             post(update_display_preferences),
+        )
+        .route(
+            "/DisplayPreferences/{display_preferences_id}",
+            post(update_display_preferences_by_id),
+        )
+        .route(
+            "/displaypreferences/{display_preferences_id}",
+            post(update_display_preferences_by_id),
         )
         .route("/System/Endpoint", get(system_endpoint))
         .route("/system/endpoint", get(system_endpoint))
@@ -1072,6 +1088,38 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/subtitle/providers/subtitles/subtitles/{subtitle_id}",
             get(get_remote_subtitle),
+        )
+        .route(
+            "/Lyrics/Audio/{item_id}/Lyrics",
+            get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
+        )
+        .route(
+            "/lyrics/audio/{item_id}/lyrics",
+            get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
+        )
+        .route(
+            "/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics",
+            get(search_remote_lyrics),
+        )
+        .route(
+            "/lyrics/audio/{item_id}/remotesearch/lyrics",
+            get(search_remote_lyrics),
+        )
+        .route(
+            "/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics/{lyric_id}",
+            post(download_remote_lyrics),
+        )
+        .route(
+            "/lyrics/audio/{item_id}/remotesearch/lyrics/{lyric_id}",
+            post(download_remote_lyrics),
+        )
+        .route(
+            "/Lyrics/Providers/Lyrics/{lyric_id}",
+            get(get_remote_lyrics),
+        )
+        .route(
+            "/lyrics/providers/lyrics/{lyric_id}",
+            get(get_remote_lyrics),
         )
         .route(
             "/Subtitle/Videos/{item_id}/Subtitles",
@@ -10201,6 +10249,231 @@ async fn get_remote_subtitle(
     Err(ApiError::not_found("Remote subtitle not found"))
 }
 
+const LYRICS_UPLOAD_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct UploadLyricsQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "FileName", alias = "fileName")]
+    file_name: Option<String>,
+}
+
+async fn get_lyrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = lyrics_audio_item(&state.db, &item_id).await?;
+    let lyrics = state
+        .db
+        .media_item_lyrics(item.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Lyrics not found"))?;
+    Ok(Json(lyrics.payload))
+}
+
+async fn upload_lyrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UploadLyricsQuery>,
+    Path(item_id): Path<String>,
+    body: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let item = lyrics_audio_item(&state.db, &item_id).await?;
+    let file_name = query
+        .file_name
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("Lyrics fileName is required"))?;
+    let format = lyrics_upload_format(file_name)?;
+    let body = to_bytes(body, LYRICS_UPLOAD_LIMIT_BYTES)
+        .await
+        .map_err(|_| ApiError::bad_request("Invalid lyrics upload body"))?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request("Lyrics upload body is empty"));
+    }
+    let text = String::from_utf8(body.to_vec())
+        .map_err(|_| ApiError::bad_request("Lyrics upload body must be UTF-8 text"))?;
+    let lyrics = parse_lyrics_text(&text, &format, file_name)?;
+    state
+        .db
+        .update_media_item_lyrics(item.id, lyrics.clone())
+        .await?;
+    Ok(Json(lyrics))
+}
+
+async fn delete_lyrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = lyrics_audio_item(&state.db, &item_id).await?;
+    state.db.delete_media_item_lyrics(item.id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn search_remote_lyrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    lyrics_audio_item(&state.db, &item_id).await?;
+    Ok(Json(Vec::new()))
+}
+
+async fn download_remote_lyrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _lyric_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    lyrics_audio_item(&state.db, &item_id).await?;
+    Err(ApiError::not_found("Remote lyrics not found"))
+}
+
+async fn get_remote_lyrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_lyric_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Remote lyrics not found"))
+}
+
+async fn lyrics_audio_item(db: &Database, item_id: &str) -> Result<MediaItem, ApiError> {
+    let item = media_item_by_id(db, item_id).await?;
+    if !item.media_type.eq_ignore_ascii_case("Audio") {
+        return Err(ApiError::bad_request(
+            "Lyrics are only supported for audio items",
+        ));
+    }
+    Ok(item)
+}
+
+fn lyrics_upload_format(file_name: &str) -> Result<String, ApiError> {
+    let candidate = FsPath::new(file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if matches!(candidate.as_str(), "lrc" | "elrc" | "txt") {
+        Ok(candidate)
+    } else {
+        Err(ApiError::bad_request("Unsupported lyrics format"))
+    }
+}
+
+fn parse_lyrics_text(
+    text: &str,
+    format: &str,
+    file_name: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let lines = match format {
+        "lrc" | "elrc" => parse_lrc_lyrics_lines(text),
+        "txt" => parse_plain_lyrics_lines(text),
+        _ => return Err(ApiError::bad_request("Unsupported lyrics format")),
+    };
+    if lines.is_empty() {
+        return Err(ApiError::bad_request(
+            "Lyrics upload body contains no lyrics",
+        ));
+    }
+    Ok(serde_json::json!({
+        "Metadata": {
+            "FileName": file_name,
+            "Format": format,
+            "IsSynced": format != "txt"
+        },
+        "Lyrics": lines
+    }))
+}
+
+fn parse_plain_lyrics_lines(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::json!({ "Text": line, "Start": null }))
+        .collect()
+}
+
+fn parse_lrc_lyrics_lines(text: &str) -> Vec<serde_json::Value> {
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        let mut remainder = raw_line.trim();
+        let mut starts = Vec::new();
+        while let Some(stripped) = remainder.strip_prefix('[') {
+            let Some((tag, rest)) = stripped.split_once(']') else {
+                break;
+            };
+            match parse_lrc_timestamp_ticks(tag) {
+                Some(start) => {
+                    starts.push(start);
+                    remainder = rest.trim_start();
+                }
+                None => {
+                    remainder = rest.trim_start();
+                    break;
+                }
+            }
+        }
+        let text = remainder.trim();
+        if text.is_empty() {
+            continue;
+        }
+        for start in &starts {
+            lines.push(serde_json::json!({ "Text": text, "Start": start }));
+        }
+    }
+    lines.sort_by_key(|line| {
+        line.get("Start")
+            .and_then(json_value_i64)
+            .unwrap_or_default()
+    });
+    lines
+}
+
+fn parse_lrc_timestamp_ticks(value: &str) -> Option<i64> {
+    let (minutes, rest) = value.split_once(':')?;
+    let minutes = minutes.parse::<i64>().ok()?;
+    let (seconds, fraction) = rest
+        .split_once('.')
+        .or_else(|| rest.split_once(','))
+        .map_or((rest, ""), |(seconds, fraction)| (seconds, fraction));
+    let seconds = seconds.parse::<i64>().ok()?;
+    if !(0..60).contains(&seconds) {
+        return None;
+    }
+    let fraction = fraction
+        .chars()
+        .take(7)
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    let fraction_ticks = if fraction.is_empty() {
+        0
+    } else {
+        let scale = 10_i64.pow(7_u32.saturating_sub(fraction.len() as u32));
+        fraction.parse::<i64>().ok()?.saturating_mul(scale)
+    };
+    Some(
+        minutes
+            .saturating_mul(60)
+            .saturating_add(seconds)
+            .saturating_mul(10_000_000)
+            .saturating_add(fraction_ticks),
+    )
+}
+
 async fn upload_subtitle(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -13048,6 +13321,24 @@ async fn display_preferences(
     headers: HeaderMap,
     Query(query): Query<DisplayPreferencesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    display_preferences_for_id(state, headers, query, "usersettings").await
+}
+
+async fn display_preferences_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DisplayPreferencesQuery>,
+    Path(display_preferences_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    display_preferences_for_id(state, headers, query, &display_preferences_id).await
+}
+
+async fn display_preferences_for_id(
+    state: AppState,
+    headers: HeaderMap,
+    query: DisplayPreferencesQuery,
+    display_preferences_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let auth_user =
         require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let user_id = match query.user_id.as_deref() {
@@ -13058,9 +13349,9 @@ async fn display_preferences(
     let client = display_preferences_client(query.client.as_deref());
     let preferences = state
         .db
-        .display_preferences(user_id, &client, "usersettings")
+        .display_preferences(user_id, &client, display_preferences_id)
         .await?
-        .unwrap_or_else(|| default_display_preferences("usersettings"));
+        .unwrap_or_else(|| default_display_preferences(display_preferences_id));
     Ok(Json(preferences))
 }
 
@@ -13070,6 +13361,27 @@ async fn update_display_preferences(
     Query(query): Query<DisplayPreferencesQuery>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
+    update_display_preferences_for_id_inner(state, headers, query, payload, "usersettings").await
+}
+
+async fn update_display_preferences_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DisplayPreferencesQuery>,
+    Path(display_preferences_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    update_display_preferences_for_id_inner(state, headers, query, payload, &display_preferences_id)
+        .await
+}
+
+async fn update_display_preferences_for_id_inner(
+    state: AppState,
+    headers: HeaderMap,
+    query: DisplayPreferencesQuery,
+    payload: serde_json::Value,
+    display_preferences_id: &str,
+) -> Result<StatusCode, ApiError> {
     let auth_user =
         require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let user_id = match query.user_id.as_deref() {
@@ -13078,10 +13390,10 @@ async fn update_display_preferences(
     };
     ensure_user_access(&auth_user, user_id)?;
     let client = display_preferences_client(query.client.as_deref());
-    let preferences = normalize_display_preferences_payload(payload, "usersettings")?;
+    let preferences = normalize_display_preferences_payload(payload, display_preferences_id)?;
     state
         .db
-        .update_display_preferences(user_id, &client, "usersettings", preferences)
+        .update_display_preferences(user_id, &client, display_preferences_id, preferences)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -22878,6 +23190,301 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn display_preferences_and_lyrics_routes_cover_p1_contracts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let song = tmp.path().join("Lyric Song.mp3");
+        tokio::fs::write(&song, b"fake audio").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let admin_key = db
+            .issue_api_key_for_user(admin.id, "lyrics-admin-key")
+            .await
+            .unwrap();
+        let user = db.create_user("listener", Some("secret")).await.unwrap();
+        let user_key = db
+            .issue_api_key_for_user(user.id, "lyrics-user-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DisplayPreferences/customview?UserId={}&Client=emby",
+                        user.id.simple()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DisplayPreferences/customview?UserId={}&Client=emby",
+                        user.id.simple()
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prefs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prefs["Id"], "customview");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/displaypreferences/customview?UserId={}&Client=emby",
+                        user.id.simple()
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "client-sent-id",
+                            "SortBy": "DateCreated",
+                            "RememberIndexing": true,
+                            "CustomPrefs": { "layout": "poster" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DisplayPreferences/customview?UserId={}&Client=emby",
+                        user.id.simple()
+                    ))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prefs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prefs["Id"], "customview");
+        assert_eq!(prefs["SortBy"], "DateCreated");
+        assert_eq!(prefs["RememberIndexing"], true);
+        assert_eq!(prefs["CustomPrefs"]["layout"], "poster");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=LyricsMusic&collectionType=music&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let item = test_db.media_items().await.unwrap().remove(0);
+        assert_eq!(item.media_type, "Audio");
+        let item_id = item.id.simple().to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics"))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let lyric_body = "[00:01.00]Hello from Jellyrin\n[00:02.50]Second line\n";
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics?fileName=song.lrc"))
+                    .header("X-Emby-Token", &user_key)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(lyric_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics?fileName=song.lrc"))
+                    .header("X-Emby-Token", &admin_key)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from(lyric_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lyrics: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lyrics["Metadata"]["Format"], "lrc");
+        assert_eq!(lyrics["Metadata"]["IsSynced"], true);
+        assert_eq!(lyrics["Lyrics"][0]["Text"], "Hello from Jellyrin");
+        assert_eq!(lyrics["Lyrics"][0]["Start"], 10_000_000);
+        assert_eq!(lyrics["Lyrics"][1]["Start"], 25_000_000);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/lyrics/audio/{item_id}/lyrics"))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let persisted: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(persisted, lyrics);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics"))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_results, json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics/missing-lyrics"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Lyrics/Providers/Lyrics/missing-lyrics")
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics"))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
