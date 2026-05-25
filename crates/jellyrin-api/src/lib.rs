@@ -5635,24 +5635,33 @@ async fn playback_transcode_info_response(
     );
     let command = build_hls_ffmpeg_command(&request);
 
-    state
+    let (session, claimed_new_session) = state
         .db
-        .upsert_transcode_session(UpsertTranscodeSession {
-            play_session_id: play_session_id.clone(),
-            user_id: user.id,
-            item_id: item.id,
-            media_source_id: Some(item_id.clone()),
-            audio_stream_index: selection.audio_stream_index,
-            subtitle_stream_index: selection.subtitle_stream_index,
-            video_stream_index: selection.video_stream_index,
-            output_path: layout.media_playlist_path.to_string_lossy().to_string(),
-            process_id: None,
-            status: "starting".to_string(),
-            progress_percent: None,
-            position_ticks: request.start_position_ticks,
-        })
+        .claim_transcode_session(
+            &dedupe_key,
+            UpsertTranscodeSession {
+                play_session_id: play_session_id.clone(),
+                dedupe_key: Some(dedupe_key.clone()),
+                user_id: user.id,
+                item_id: item.id,
+                media_source_id: Some(item_id.clone()),
+                audio_stream_index: selection.audio_stream_index,
+                subtitle_stream_index: selection.subtitle_stream_index,
+                video_stream_index: selection.video_stream_index,
+                output_path: layout.media_playlist_path.to_string_lossy().to_string(),
+                process_id: None,
+                status: "starting".to_string(),
+                progress_percent: None,
+                position_ticks: request.start_position_ticks,
+            },
+        )
         .await?;
-    spawn_hls_transcode_task(state.db.clone(), play_session_id.clone(), command).await;
+    let play_session_id = session.play_session_id;
+    if claimed_new_session {
+        spawn_hls_transcode_task(state.db.clone(), play_session_id.clone(), command).await;
+    } else {
+        cleanup_hls_transcode_dir(&layout.session_dir).await;
+    }
 
     playback_transcode_session_info_response(
         item_json,
@@ -5806,6 +5815,7 @@ async fn spawn_hls_transcode_task(
                 let _ = db
                     .upsert_transcode_session(UpsertTranscodeSession {
                         play_session_id: play_session_id.clone(),
+                        dedupe_key: session.dedupe_key,
                         user_id: session.user_id,
                         item_id: session.item.id,
                         media_source_id: session.media_source_id,
@@ -15930,6 +15940,7 @@ mod tests {
 
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-active".to_string(),
+            dedupe_key: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16054,6 +16065,7 @@ mod tests {
 
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-stop".to_string(),
+            dedupe_key: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16227,6 +16239,7 @@ mod tests {
         ] {
             db.upsert_transcode_session(UpsertTranscodeSession {
                 play_session_id: play_session_id.to_string(),
+                dedupe_key: None,
                 user_id: user.id,
                 item_id: item.id,
                 media_source_id: Some(item.id.simple().to_string()),
@@ -16297,6 +16310,7 @@ mod tests {
             .unwrap();
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-progress".to_string(),
+            dedupe_key: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16394,6 +16408,7 @@ mod tests {
         ] {
             db.upsert_transcode_session(UpsertTranscodeSession {
                 play_session_id: play_session_id.to_string(),
+                dedupe_key: None,
                 user_id: user.id,
                 item_id: item.id,
                 media_source_id: Some(item.id.simple().to_string()),
@@ -16461,6 +16476,7 @@ mod tests {
         let item = db.media_items().await.unwrap().remove(0);
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-known".to_string(),
+            dedupe_key: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16552,6 +16568,7 @@ mod tests {
 
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-reuse".to_string(),
+            dedupe_key: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
@@ -16650,6 +16667,7 @@ mod tests {
 
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-hls".to_string(),
+            dedupe_key: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),

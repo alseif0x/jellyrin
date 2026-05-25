@@ -117,6 +117,7 @@ pub struct UpsertPlaybackState {
 #[derive(Debug, Clone)]
 pub struct TranscodeSession {
     pub play_session_id: String,
+    pub dedupe_key: Option<String>,
     pub user_id: Uuid,
     pub item: MediaItem,
     pub media_source_id: Option<String>,
@@ -135,6 +136,7 @@ pub struct TranscodeSession {
 #[derive(Debug, Clone)]
 pub struct UpsertTranscodeSession {
     pub play_session_id: String,
+    pub dedupe_key: Option<String>,
     pub user_id: Uuid,
     pub item_id: Uuid,
     pub media_source_id: Option<String>,
@@ -1371,12 +1373,13 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO transcode_sessions (
-                play_session_id, user_id, item_id, media_source_id, audio_stream_index,
+                play_session_id, dedupe_key, user_id, item_id, media_source_id, audio_stream_index,
                 subtitle_stream_index, video_stream_index, output_path, process_id, status,
                 progress_percent, position_ticks, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
             ON CONFLICT(play_session_id) DO UPDATE SET
+                dedupe_key = excluded.dedupe_key,
                 user_id = excluded.user_id,
                 item_id = excluded.item_id,
                 media_source_id = excluded.media_source_id,
@@ -1392,6 +1395,7 @@ impl Database {
             "#,
         )
         .bind(&play_session_id)
+        .bind(session.dedupe_key)
         .bind(session.user_id.to_string())
         .bind(session.item_id.to_string())
         .bind(session.media_source_id)
@@ -1412,6 +1416,70 @@ impl Database {
             .context("transcode session missing after upsert")
     }
 
+    pub async fn claim_transcode_session(
+        &self,
+        dedupe_key: &str,
+        mut session: UpsertTranscodeSession,
+    ) -> anyhow::Result<(TranscodeSession, bool)> {
+        let dedupe_key = dedupe_key.trim();
+        anyhow::ensure!(!dedupe_key.is_empty(), "dedupe key must not be empty");
+        let play_session_id = session.play_session_id.trim().to_string();
+        let output_path = session.output_path.trim().to_string();
+        let status = session.status.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            !play_session_id.is_empty(),
+            "play session id must not be empty"
+        );
+        anyhow::ensure!(
+            !output_path.is_empty(),
+            "transcode output path must not be empty"
+        );
+        anyhow::ensure!(!status.is_empty(), "transcode status must not be empty");
+        session.dedupe_key = Some(dedupe_key.to_string());
+
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO transcode_sessions (
+                play_session_id, dedupe_key, user_id, item_id, media_source_id, audio_stream_index,
+                subtitle_stream_index, video_stream_index, output_path, process_id, status,
+                progress_percent, position_ticks, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+            "#,
+        )
+        .bind(&play_session_id)
+        .bind(dedupe_key)
+        .bind(session.user_id.to_string())
+        .bind(session.item_id.to_string())
+        .bind(session.media_source_id)
+        .bind(session.audio_stream_index)
+        .bind(session.subtitle_stream_index)
+        .bind(session.video_stream_index)
+        .bind(&output_path)
+        .bind(session.process_id)
+        .bind(&status)
+        .bind(session.progress_percent)
+        .bind(session.position_ticks.max(0))
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            let claimed = self
+                .transcode_session_by_play_session_id(&play_session_id)
+                .await?
+                .context("claimed transcode session missing after insert")?;
+            return Ok((claimed, true));
+        }
+
+        let existing = self
+            .active_transcode_session_by_dedupe_key(dedupe_key)
+            .await?
+            .context("active transcode claim exists but no reusable session was visible")?;
+        Ok((existing, false))
+    }
+
     pub async fn transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
         self.transcode_sessions_with_statuses(&[]).await
     }
@@ -1426,6 +1494,56 @@ impl Database {
     pub async fn active_transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
         self.transcode_sessions_with_statuses(&["starting", "running"])
             .await
+    }
+
+    pub async fn active_transcode_session_by_dedupe_key(
+        &self,
+        dedupe_key: &str,
+    ) -> anyhow::Result<Option<TranscodeSession>> {
+        let row = sqlx::query_as::<_, TranscodeSessionRow>(
+            r#"
+            SELECT transcode_sessions.play_session_id,
+                   transcode_sessions.dedupe_key,
+                   transcode_sessions.user_id,
+                   transcode_sessions.media_source_id,
+                   transcode_sessions.audio_stream_index,
+                   transcode_sessions.subtitle_stream_index,
+                   transcode_sessions.video_stream_index,
+                   transcode_sessions.output_path,
+                   transcode_sessions.process_id,
+                   transcode_sessions.status,
+                   transcode_sessions.progress_percent,
+                   transcode_sessions.position_ticks,
+                   transcode_sessions.created_at AS transcode_created_at,
+                   transcode_sessions.updated_at AS transcode_updated_at,
+                   media_items.id,
+                   media_items.virtual_folder_id,
+                   media_items.name,
+                   media_items.path,
+                   media_items.media_type,
+                   media_items.collection_type,
+                   media_items.file_size,
+                   media_items.runtime_ticks,
+                   media_items.bitrate,
+                   media_items.width,
+                   media_items.height,
+                   media_items.media_streams_json,
+                   media_items.created_at,
+                   media_items.updated_at
+            FROM transcode_sessions
+            INNER JOIN media_items ON media_items.id = transcode_sessions.item_id
+            WHERE transcode_sessions.dedupe_key = ?1
+              AND transcode_sessions.status IN ('starting', 'running')
+              AND media_items.missing_since IS NULL
+            ORDER BY transcode_sessions.updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(dedupe_key.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
     }
 
     pub async fn stale_transcode_sessions_on_startup(
@@ -1475,6 +1593,7 @@ impl Database {
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
             SELECT transcode_sessions.play_session_id,
+                   transcode_sessions.dedupe_key,
                    transcode_sessions.user_id,
                    transcode_sessions.media_source_id,
                    transcode_sessions.audio_stream_index,
@@ -1530,6 +1649,7 @@ impl Database {
         let row = sqlx::query_as::<_, TranscodeSessionRow>(
             r#"
             SELECT transcode_sessions.play_session_id,
+                   transcode_sessions.dedupe_key,
                    transcode_sessions.user_id,
                    transcode_sessions.media_source_id,
                    transcode_sessions.audio_stream_index,
@@ -3041,6 +3161,7 @@ struct ActivePlaybackSessionRow {
 #[derive(sqlx::FromRow)]
 struct TranscodeSessionRow {
     play_session_id: String,
+    dedupe_key: Option<String>,
     user_id: String,
     media_source_id: Option<String>,
     audio_stream_index: Option<i64>,
@@ -3246,6 +3367,7 @@ impl TryFrom<TranscodeSessionRow> for TranscodeSession {
     fn try_from(row: TranscodeSessionRow) -> Result<Self, Self::Error> {
         Ok(Self {
             play_session_id: row.play_session_id,
+            dedupe_key: row.dedupe_key,
             user_id: Uuid::parse_str(&row.user_id).context("invalid transcode session user id")?,
             item: MediaItem {
                 id: Uuid::parse_str(&row.id).context("invalid transcode session item id")?,
@@ -4184,6 +4306,7 @@ mod tests {
         let session = db
             .upsert_transcode_session(UpsertTranscodeSession {
                 play_session_id: "play-session-1".to_string(),
+                dedupe_key: Some("dedupe:play-session-1".to_string()),
                 user_id: user.id,
                 item_id: item.id,
                 media_source_id: Some(item.id.simple().to_string()),
@@ -4200,6 +4323,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.play_session_id, "play-session-1");
+        assert_eq!(session.dedupe_key.as_deref(), Some("dedupe:play-session-1"));
         assert_eq!(session.user_id, user.id);
         assert_eq!(session.item.id, item.id);
         assert_eq!(session.status, "running");
@@ -4248,6 +4372,36 @@ mod tests {
         let active_sessions = db.active_transcode_sessions().await.unwrap();
         assert_eq!(active_sessions.len(), 1);
         assert_eq!(active_sessions[0].play_session_id, "play-session-1");
+
+        let (claimed, claimed_new) = db
+            .claim_transcode_session(
+                "dedupe:play-session-1",
+                UpsertTranscodeSession {
+                    play_session_id: "play-session-2".to_string(),
+                    dedupe_key: None,
+                    user_id: user.id,
+                    item_id: item.id,
+                    media_source_id: Some(item.id.simple().to_string()),
+                    audio_stream_index: Some(1),
+                    subtitle_stream_index: Some(-1),
+                    video_stream_index: Some(0),
+                    output_path: "/tmp/jellyrin-transcodes/play-session-2/main.m3u8".to_string(),
+                    process_id: None,
+                    status: "starting".to_string(),
+                    progress_percent: None,
+                    position_ticks: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!claimed_new);
+        assert_eq!(claimed.play_session_id, "play-session-1");
+        assert!(
+            db.transcode_session_by_play_session_id("play-session-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let stale_sessions = db.stale_transcode_sessions_on_startup().await.unwrap();
         assert_eq!(stale_sessions.len(), 1);
