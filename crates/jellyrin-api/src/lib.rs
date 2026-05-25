@@ -6173,6 +6173,7 @@ async fn send_general_command(
 ) -> Result<StatusCode, ApiError> {
     let (auth_user, target_session) =
         command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    ensure_session_supports_command(&target_session, &command)?;
     broadcast_general_command(
         &target_session,
         &auth_user,
@@ -6190,6 +6191,7 @@ async fn send_system_command(
 ) -> Result<StatusCode, ApiError> {
     let (auth_user, target_session) =
         command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    ensure_session_supports_command(&target_session, &command)?;
     broadcast_general_command(
         &target_session,
         &auth_user,
@@ -6216,6 +6218,7 @@ async fn send_full_general_command(
         .ok_or_else(|| ApiError::bad_request("Command body must be an object"))?;
     let command = json_object_string_field(object, &["Name", "Command"])
         .ok_or_else(|| ApiError::bad_request("Name is required"))?;
+    ensure_session_supports_command(&target_session, &command)?;
     let arguments = object
         .get("Arguments")
         .or_else(|| object.get("arguments"))
@@ -6225,6 +6228,30 @@ async fn send_full_general_command(
 
     broadcast_general_command(&target_session, &auth_user, &command, arguments);
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn ensure_session_supports_command(
+    target_session: &DeviceSession,
+    command: &str,
+) -> Result<(), ApiError> {
+    let Some(capabilities) = target_session.capabilities.as_ref() else {
+        return Ok(());
+    };
+    let Some(commands) = capabilities
+        .get("SupportedCommands")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    if commands.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|supported| supported.eq_ignore_ascii_case(command))
+    }) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("Command is not supported by session"))
+    }
 }
 
 fn broadcast_general_command(
@@ -6437,6 +6464,7 @@ async fn send_message_command(
 ) -> Result<StatusCode, ApiError> {
     let (auth_user, target_session) =
         command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    ensure_session_supports_command(&target_session, "DisplayMessage")?;
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -32102,6 +32130,75 @@ mod tests {
             next_playback_event_type(&mut playback_events, playback_token, "MessageCommand").await;
         assert_eq!(message_event["Data"]["Header"], "Heads up");
         assert_eq!(message_event["Data"]["Text"], "Testing");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Capabilities/Full")
+                    .header("X-Emby-Token", playback_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "SupportedCommands": ["GoHome"],
+                            "SupportsRemoteControl": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Session/Sessions/{playback_token}/Command/GoHome"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let supported_command_event =
+            next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
+        assert_eq!(supported_command_event["Data"]["Name"], "GoHome");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Session/Sessions/{playback_token}/Command/DisplayContent"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Session/Sessions/{playback_token}/Message"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Text": "Blocked" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
