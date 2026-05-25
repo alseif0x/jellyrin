@@ -83,9 +83,23 @@ pub struct ActivePlaybackSession {
     pub user_id: Uuid,
     pub item: MediaItem,
     pub media_source_id: Option<String>,
+    pub audio_stream_index: Option<i64>,
+    pub subtitle_stream_index: Option<i64>,
     pub position_ticks: i64,
     pub is_paused: bool,
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertActivePlaybackSession {
+    pub session_id: String,
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub media_source_id: Option<String>,
+    pub audio_stream_index: Option<i64>,
+    pub subtitle_stream_index: Option<i64>,
+    pub position_ticks: i64,
+    pub is_paused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1164,14 +1178,9 @@ impl Database {
 
     pub async fn upsert_active_playback_session(
         &self,
-        session_id: &str,
-        user_id: Uuid,
-        item_id: Uuid,
-        media_source_id: Option<&str>,
-        position_ticks: i64,
-        is_paused: bool,
+        playback: UpsertActivePlaybackSession,
     ) -> anyhow::Result<()> {
-        let trimmed_session_id = session_id.trim();
+        let trimmed_session_id = playback.session_id.trim();
         anyhow::ensure!(
             !trimmed_session_id.is_empty(),
             "session id must not be empty"
@@ -1180,24 +1189,29 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO active_playback_sessions (
-                session_id, user_id, item_id, media_source_id, position_ticks, is_paused, updated_at
+                session_id, user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
+                position_ticks, is_paused, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(session_id) DO UPDATE SET
                 user_id = excluded.user_id,
                 item_id = excluded.item_id,
                 media_source_id = excluded.media_source_id,
+                audio_stream_index = excluded.audio_stream_index,
+                subtitle_stream_index = excluded.subtitle_stream_index,
                 position_ticks = excluded.position_ticks,
                 is_paused = excluded.is_paused,
                 updated_at = excluded.updated_at
             "#,
         )
         .bind(trimmed_session_id)
-        .bind(user_id.to_string())
-        .bind(item_id.to_string())
-        .bind(media_source_id)
-        .bind(position_ticks)
-        .bind(is_paused)
+        .bind(playback.user_id.to_string())
+        .bind(playback.item_id.to_string())
+        .bind(playback.media_source_id)
+        .bind(playback.audio_stream_index)
+        .bind(playback.subtitle_stream_index)
+        .bind(playback.position_ticks)
+        .bind(playback.is_paused)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -1218,6 +1232,8 @@ impl Database {
             SELECT active_playback_sessions.session_id,
                    active_playback_sessions.user_id,
                    active_playback_sessions.media_source_id,
+                   active_playback_sessions.audio_stream_index,
+                   active_playback_sessions.subtitle_stream_index,
                    active_playback_sessions.position_ticks,
                    active_playback_sessions.is_paused,
                    active_playback_sessions.updated_at AS playback_updated_at,
@@ -2617,6 +2633,8 @@ struct ActivePlaybackSessionRow {
     session_id: String,
     user_id: String,
     media_source_id: Option<String>,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
     position_ticks: i64,
     is_paused: bool,
     playback_updated_at: String,
@@ -2779,6 +2797,8 @@ impl TryFrom<ActivePlaybackSessionRow> for ActivePlaybackSession {
                 updated_at: parse_time(&row.updated_at)?,
             },
             media_source_id: row.media_source_id,
+            audio_stream_index: row.audio_stream_index,
+            subtitle_stream_index: row.subtitle_stream_index,
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             updated_at: parse_time(&row.playback_updated_at)?,
@@ -3212,7 +3232,7 @@ fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
-        SystemConfigurationPayloads, parse_ffprobe_media_info,
+        SystemConfigurationPayloads, UpsertActivePlaybackSession, parse_ffprobe_media_info,
     };
     use serde_json::json;
     use time::Duration;
@@ -3596,20 +3616,24 @@ mod tests {
             .await
             .unwrap();
 
-        db.upsert_active_playback_session(
-            &token.access_token,
-            user.id,
-            item.id,
-            Some(&item.id.to_string()),
-            42,
-            false,
-        )
+        db.upsert_active_playback_session(UpsertActivePlaybackSession {
+            session_id: token.access_token.clone(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item.id.to_string()),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(-1),
+            position_ticks: 42,
+            is_paused: false,
+        })
         .await
         .unwrap();
         let sessions = db.active_playback_sessions().await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, token.access_token);
         assert_eq!(sessions[0].item.id, item.id);
+        assert_eq!(sessions[0].audio_stream_index, Some(1));
+        assert_eq!(sessions[0].subtitle_stream_index, Some(-1));
         assert_eq!(sessions[0].position_ticks, 42);
 
         db.clear_active_playback_session(&token.access_token)

@@ -26,7 +26,7 @@ use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, 
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
     BackupManifest, BrandingConfig, Database, DeviceSession, SortDirection,
-    SystemConfigurationPayloads, TaskRun,
+    SystemConfigurationPayloads, TaskRun, UpsertActivePlaybackSession,
 };
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -3394,9 +3394,9 @@ struct PlaybackReportBody {
     #[serde(alias = "CanSeek")]
     _can_seek: Option<bool>,
     #[serde(alias = "AudioStreamIndex")]
-    _audio_stream_index: Option<i32>,
+    audio_stream_index: Option<i64>,
     #[serde(alias = "SubtitleStreamIndex")]
-    _subtitle_stream_index: Option<i32>,
+    subtitle_stream_index: Option<i64>,
     #[serde(alias = "PlaylistItemId")]
     _playlist_item_id: Option<String>,
     #[serde(alias = "SessionId")]
@@ -3463,14 +3463,16 @@ async fn report_playback(
     if playback_active {
         state
             .db
-            .upsert_active_playback_session(
-                &token.access_token,
-                user.id,
-                item.id,
-                payload.media_source_id.as_deref(),
+            .upsert_active_playback_session(UpsertActivePlaybackSession {
+                session_id: token.access_token.clone(),
+                user_id: user.id,
+                item_id: item.id,
+                media_source_id: payload.media_source_id,
+                audio_stream_index: payload.audio_stream_index,
+                subtitle_stream_index: payload.subtitle_stream_index,
                 position_ticks,
                 is_paused,
-            )
+            })
             .await?;
     } else {
         state
@@ -3487,6 +3489,8 @@ struct SendPlayCommandQuery {
     item_ids: Option<String>,
     start_position_ticks: Option<i64>,
     media_source_id: Option<String>,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
     start_index: Option<usize>,
 }
 
@@ -3547,14 +3551,16 @@ async fn send_play_command(
             .unwrap_or_else(|| item.id.simple().to_string());
         state
             .db
-            .upsert_active_playback_session(
-                &target_session.access_token,
-                target_session.user_id,
-                item.id,
-                Some(&media_source_id),
-                query.start_position_ticks.unwrap_or_default(),
-                false,
-            )
+            .upsert_active_playback_session(UpsertActivePlaybackSession {
+                session_id: target_session.access_token.clone(),
+                user_id: target_session.user_id,
+                item_id: item.id,
+                media_source_id: Some(media_source_id),
+                audio_stream_index: query.audio_stream_index,
+                subtitle_stream_index: query.subtitle_stream_index,
+                position_ticks: query.start_position_ticks.unwrap_or_default(),
+                is_paused: false,
+            })
             .await?;
         broadcast_session_message(
             &target_session.access_token,
@@ -3565,8 +3571,8 @@ async fn send_play_command(
                     "StartPositionTicks": query.start_position_ticks,
                     "PlayCommand": event_play_command,
                     "MediaSourceId": query.media_source_id,
-                    "AudioStreamIndex": null,
-                    "SubtitleStreamIndex": null,
+                    "AudioStreamIndex": query.audio_stream_index,
+                    "SubtitleStreamIndex": query.subtitle_stream_index,
                     "StartIndex": query.start_index,
                 }
             }),
@@ -3622,6 +3628,8 @@ fn parse_send_play_command_query(raw_query: Option<&str>) -> SendPlayCommandQuer
             "itemids" => set_query_scalar(&mut query.item_ids, value),
             "startpositionticks" => query.start_position_ticks = value.parse().ok(),
             "mediasourceid" => query.media_source_id = Some(value),
+            "audiostreamindex" => query.audio_stream_index = value.parse().ok(),
+            "subtitlestreamindex" => query.subtitle_stream_index = value.parse().ok(),
             "startindex" => query.start_index = value.parse().ok(),
             _ => {}
         }
@@ -3676,14 +3684,18 @@ async fn send_playstate_command(
                 };
                 state
                     .db
-                    .upsert_active_playback_session(
-                        &target_session.access_token,
-                        target_session.user_id,
-                        playback.item.id,
-                        playback.media_source_id.as_deref(),
-                        query.seek_position_ticks.unwrap_or(playback.position_ticks),
+                    .upsert_active_playback_session(UpsertActivePlaybackSession {
+                        session_id: target_session.access_token.clone(),
+                        user_id: target_session.user_id,
+                        item_id: playback.item.id,
+                        media_source_id: playback.media_source_id,
+                        audio_stream_index: playback.audio_stream_index,
+                        subtitle_stream_index: playback.subtitle_stream_index,
+                        position_ticks: query
+                            .seek_position_ticks
+                            .unwrap_or(playback.position_ticks),
                         is_paused,
-                    )
+                    })
                     .await?;
             }
         }
@@ -7182,8 +7194,8 @@ fn active_playback_state_json(playback: &ActivePlaybackSession) -> serde_json::V
         "IsPaused": playback.is_paused,
         "IsMuted": false,
         "VolumeLevel": 100,
-        "AudioStreamIndex": null,
-        "SubtitleStreamIndex": null,
+        "AudioStreamIndex": playback.audio_stream_index,
+        "SubtitleStreamIndex": playback.subtitle_stream_index,
         "MediaSourceId": playback.media_source_id.clone(),
         "PlayMethod": "DirectPlay",
         "RepeatMode": "RepeatNone",
@@ -13409,6 +13421,8 @@ mod tests {
                         json!({
                             "ItemId": item_id,
                             "MediaSourceId": item_id,
+                            "AudioStreamIndex": 1,
+                            "SubtitleStreamIndex": -1,
                             "PositionTicks": 25_000_000,
                             "CanSeek": true,
                             "IsPaused": false,
@@ -13439,6 +13453,8 @@ mod tests {
         assert_eq!(sessions[0]["NowPlayingItem"]["Id"], item_id);
         assert_eq!(sessions[0]["PlayState"]["PositionTicks"], 25_000_000);
         assert_eq!(sessions[0]["PlayState"]["IsPaused"], false);
+        assert_eq!(sessions[0]["PlayState"]["AudioStreamIndex"], 1);
+        assert_eq!(sessions[0]["PlayState"]["SubtitleStreamIndex"], -1);
 
         let response = app
             .clone()
@@ -14239,7 +14255,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/Sessions/{playback_token}/Playing?PlayCommand=PlayInstantMix&ItemIds={item_id}&StartPositionTicks=123"
+                        "/Sessions/{playback_token}/Playing?PlayCommand=PlayInstantMix&ItemIds={item_id}&StartPositionTicks=123&AudioStreamIndex=1&SubtitleStreamIndex=-1"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -14254,7 +14270,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/Sessions/{playback_token}/Playing?PlayCommand=PlayInstantMix&ItemIds={item_id}&StartPositionTicks=123"
+                        "/Sessions/{playback_token}/Playing?PlayCommand=PlayInstantMix&ItemIds={item_id}&StartPositionTicks=123&AudioStreamIndex=1&SubtitleStreamIndex=-1"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -14268,6 +14284,8 @@ mod tests {
         assert_eq!(play_event["MessageType"], "Play");
         assert_eq!(play_event["Data"]["PlayCommand"], "PlayNow");
         assert_eq!(play_event["Data"]["StartPositionTicks"], 123);
+        assert_eq!(play_event["Data"]["AudioStreamIndex"], 1);
+        assert_eq!(play_event["Data"]["SubtitleStreamIndex"], -1);
         assert_eq!(play_event["Data"]["ItemIds"].as_array().unwrap().len(), 2);
         assert_eq!(play_event["Data"]["ItemIds"][0], item_id);
 
@@ -14295,6 +14313,8 @@ mod tests {
                 .replace('-', ""),
             item_id
         );
+        assert_eq!(sessions[0]["PlayState"]["AudioStreamIndex"], 1);
+        assert_eq!(sessions[0]["PlayState"]["SubtitleStreamIndex"], -1);
 
         let response = app
             .clone()
@@ -14302,7 +14322,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/sessions/{playback_token}/playing?playCommand=PlayNow&itemIds={item_id}&startPositionTicks=456"
+                        "/sessions/{playback_token}/playing?playCommand=PlayNow&itemIds={item_id}&startPositionTicks=456&audioStreamIndex=1&subtitleStreamIndex=-1"
                     ))
                     .header("X-Emby-Token", playback_token)
                     .body(Body::empty())
@@ -14317,6 +14337,8 @@ mod tests {
         assert_eq!(play_now_event["Data"]["PlayCommand"], "PlayNow");
         assert_eq!(play_now_event["Data"]["ItemIds"][0], item_id);
         assert_eq!(play_now_event["Data"]["StartPositionTicks"], 456);
+        assert_eq!(play_now_event["Data"]["AudioStreamIndex"], 1);
+        assert_eq!(play_now_event["Data"]["SubtitleStreamIndex"], -1);
 
         let response = app
             .clone()
@@ -14334,6 +14356,8 @@ mod tests {
         let play_now_sessions: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(play_now_sessions[0]["NowPlayingItem"]["Id"], item_id);
         assert_eq!(play_now_sessions[0]["PlayState"]["PositionTicks"], 456);
+        assert_eq!(play_now_sessions[0]["PlayState"]["AudioStreamIndex"], 1);
+        assert_eq!(play_now_sessions[0]["PlayState"]["SubtitleStreamIndex"], -1);
 
         let response = app
             .clone()
@@ -14404,6 +14428,8 @@ mod tests {
         assert_eq!(paused_sessions[0]["NowPlayingItem"]["Id"], item_id);
         assert_eq!(paused_sessions[0]["PlayState"]["PositionTicks"], 999);
         assert_eq!(paused_sessions[0]["PlayState"]["IsPaused"], true);
+        assert_eq!(paused_sessions[0]["PlayState"]["AudioStreamIndex"], 1);
+        assert_eq!(paused_sessions[0]["PlayState"]["SubtitleStreamIndex"], -1);
 
         let response = app
             .clone()
