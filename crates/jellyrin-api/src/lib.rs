@@ -7,7 +7,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{Arc, OnceLock},
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -7402,8 +7402,10 @@ async fn trickplay_playlist(
 ) -> Result<axum::response::Response, ApiError> {
     let item = trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
     let width = parse_positive_u32(&width, "Invalid trickplay width")?;
+    let settings = trickplay_settings(&state.db).await?;
+    validate_trickplay_width(width, &settings)?;
     let duration_seconds = trickplay_duration_seconds(&item);
-    let interval_seconds = trickplay_interval_seconds();
+    let interval_seconds = settings.interval_seconds;
     let tile_count = trickplay_tile_count(duration_seconds, interval_seconds);
     let (tile_width, tile_height) = trickplay_tile_resolution(&item, width);
     let target_duration = interval_seconds.ceil().max(1.0) as u64;
@@ -7429,29 +7431,36 @@ async fn trickplay_tile(
 ) -> Result<axum::response::Response, ApiError> {
     let item = trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
     let width = parse_positive_u32(&width, "Invalid trickplay width")?;
+    let settings = trickplay_settings(&state.db).await?;
+    validate_trickplay_width(width, &settings)?;
     let index = tile_file
         .strip_suffix(".jpg")
         .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
     let index = parse_non_negative_i64(index, "Invalid trickplay index")?;
-    let tile_count = trickplay_tile_count(
-        trickplay_duration_seconds(&item),
-        trickplay_interval_seconds(),
-    );
+    let tile_count =
+        trickplay_tile_count(trickplay_duration_seconds(&item), settings.interval_seconds);
     let index =
         u32::try_from(index).map_err(|_| ApiError::not_found("Trickplay tile not found"))?;
     if index >= tile_count {
         return Err(ApiError::not_found("Trickplay tile not found"));
     }
-    let tile_path = ensure_trickplay_tile(&item, width, index).await?;
+    let tile_path = ensure_trickplay_tile(&item, &settings, width, index).await?;
     stream_path(tile_path, "image/jpeg".to_string(), &headers, true).await
 }
 
 async fn ensure_trickplay_tile(
     item: &MediaItem,
+    settings: &TrickplaySettings,
     width: u32,
     index: u32,
 ) -> Result<PathBuf, ApiError> {
-    let tile_path = trickplay_tile_cache_path(item, width, index);
+    let tile_path = trickplay_tile_cache_path(item, settings, width, index);
+    if tokio::fs::try_exists(&tile_path).await? {
+        return Ok(tile_path);
+    }
+
+    let tile_lock = trickplay_tile_lock(&tile_path).await;
+    let _tile_guard = tile_lock.lock().await;
     if tokio::fs::try_exists(&tile_path).await? {
         return Ok(tile_path);
     }
@@ -7460,8 +7469,8 @@ async fn ensure_trickplay_tile(
         .parent()
         .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
     tokio::fs::create_dir_all(parent).await?;
-    let tmp_path = tile_path.with_extension("jpg.tmp");
-    let seek_seconds = index as f64 * trickplay_interval_seconds();
+    let tmp_path = tile_path.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
+    let seek_seconds = index as f64 * settings.interval_seconds;
     let scale_filter = format!("scale='min({width},iw)':-2:force_original_aspect_ratio=decrease");
     let output = Command::new("ffmpeg")
         .arg("-hide_banner")
@@ -7475,16 +7484,35 @@ async fn ensure_trickplay_tile(
         .arg("1")
         .arg("-vf")
         .arg(scale_filter)
+        .arg("-threads")
+        .arg(settings.process_threads.to_string())
         .arg("-q:v")
-        .arg("4")
+        .arg(settings.qscale.to_string())
         .arg(&tmp_path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .await?;
+        .await
+        .map_err(|_| ApiError::not_found("Trickplay tile could not be generated"))?;
     if !output.status.success() {
         let _ = tokio::fs::remove_file(&tmp_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(512)
+            .collect::<String>();
+        tracing::warn!(
+            item_id = %item.id,
+            width,
+            index,
+            status = %output.status,
+            stderr = %stderr,
+            "ffmpeg failed to generate trickplay tile"
+        );
         return Err(ApiError::not_found("Trickplay tile could not be generated"));
+    }
+    if tokio::fs::try_exists(&tile_path).await? {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Ok(tile_path);
     }
     tokio::fs::rename(&tmp_path, &tile_path).await?;
     Ok(tile_path)
@@ -7494,11 +7522,7 @@ fn trickplay_duration_seconds(item: &MediaItem) -> f64 {
     item.runtime_ticks
         .and_then(|ticks| u64::try_from(ticks).ok())
         .map(|ticks| (ticks as f64 / 10_000_000.0).max(1.0))
-        .unwrap_or_else(trickplay_interval_seconds)
-}
-
-fn trickplay_interval_seconds() -> f64 {
-    10.0
+        .unwrap_or(10.0)
 }
 
 fn trickplay_tile_count(duration_seconds: f64, interval_seconds: f64) -> u32 {
@@ -7527,15 +7551,134 @@ fn trickplay_tile_resolution(item: &MediaItem, requested_width: u32) -> (u32, u3
     }
 }
 
-fn trickplay_tile_cache_path(item: &MediaItem, width: u32, index: u32) -> PathBuf {
+#[derive(Debug, Clone)]
+struct TrickplaySettings {
+    interval_seconds: f64,
+    allowed_widths: Vec<u32>,
+    qscale: u32,
+    process_threads: u32,
+}
+
+async fn trickplay_settings(db: &Database) -> Result<TrickplaySettings, ApiError> {
+    let payloads = db.system_configuration_payloads().await?;
+    let mut server_options = default_server_configuration_options();
+    if let serde_json::Value::Object(current) = payloads.server_options {
+        for (key, value) in current {
+            server_options[key] = value;
+        }
+    }
+    let options = server_options
+        .get("TrickplayOptions")
+        .cloned()
+        .unwrap_or_else(default_trickplay_options);
+    Ok(TrickplaySettings {
+        interval_seconds: trickplay_interval_seconds_from_options(&options),
+        allowed_widths: trickplay_width_resolutions_from_options(&options),
+        qscale: trickplay_qscale_from_options(&options),
+        process_threads: trickplay_process_threads_from_options(&options),
+    })
+}
+
+fn trickplay_interval_seconds_from_options(options: &serde_json::Value) -> f64 {
+    options
+        .get("Interval")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|interval_ms| *interval_ms > 0)
+        .map(|interval_ms| (interval_ms as f64 / 1000.0).max(1.0))
+        .unwrap_or(10.0)
+}
+
+fn trickplay_width_resolutions_from_options(options: &serde_json::Value) -> Vec<u32> {
+    let widths = options
+        .get("WidthResolutions")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_i64)
+                .filter_map(positive_u32)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_else(|| BTreeSet::from([320]));
+    if widths.is_empty() {
+        vec![320]
+    } else {
+        widths.into_iter().collect()
+    }
+}
+
+fn trickplay_qscale_from_options(options: &serde_json::Value) -> u32 {
+    options
+        .get("Qscale")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(positive_u32)
+        .map(|qscale| qscale.clamp(2, 31))
+        .unwrap_or(4)
+}
+
+fn trickplay_process_threads_from_options(options: &serde_json::Value) -> u32 {
+    options
+        .get("ProcessThreads")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(positive_u32)
+        .map(|threads| threads.clamp(1, 32))
+        .unwrap_or(1)
+}
+
+fn validate_trickplay_width(width: u32, settings: &TrickplaySettings) -> Result<(), ApiError> {
+    if settings.allowed_widths.contains(&width) {
+        Ok(())
+    } else {
+        Err(ApiError::not_found("Trickplay width not found"))
+    }
+}
+
+fn trickplay_tile_cache_path(
+    item: &MediaItem,
+    settings: &TrickplaySettings,
+    width: u32,
+    index: u32,
+) -> PathBuf {
     trickplay_cache_root()
         .join(item.id.simple().to_string())
+        .join(trickplay_cache_revision(item, settings))
         .join(width.to_string())
         .join(format!("{index}.jpg"))
 }
 
+fn trickplay_cache_revision(item: &MediaItem, settings: &TrickplaySettings) -> String {
+    let path = media_item_path(item);
+    let metadata = fs::metadata(path).ok();
+    let modified = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_else(|| item.updated_at.unix_timestamp_nanos() as u128);
+    let len = metadata
+        .map(|metadata| metadata.len())
+        .or_else(|| item.file_size.and_then(|size| u64::try_from(size).ok()))
+        .unwrap_or(0);
+    format!(
+        "mtime-{modified}-len-{len}-interval-{:.3}-q{}-threads{}",
+        settings.interval_seconds, settings.qscale, settings.process_threads
+    )
+}
+
 fn trickplay_cache_root() -> PathBuf {
     std::env::temp_dir().join("jellyrin").join("trickplay")
+}
+
+static TRICKPLAY_TILE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+async fn trickplay_tile_lock(tile_path: &FsPath) -> Arc<Mutex<()>> {
+    let key = tile_path.to_string_lossy().to_string();
+    let locks = TRICKPLAY_TILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks.lock().await;
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 async fn trickplay_video_item(
@@ -9702,7 +9845,8 @@ mod tests {
         hls_transcode_dedupe_key, load_countries, load_cultures, media_item_by_id,
         parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
         reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        subscribe_playback_events, transcode_dedupe_lock, trickplay_tile_cache_path,
+        subscribe_playback_events, transcode_dedupe_lock, trickplay_settings,
+        trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -15019,7 +15163,8 @@ mod tests {
         assert!(trickplay_playlist.contains(&format!("9.jpg?api_key={api_key}")));
 
         let cached_item = media_item_by_id(&test_db, item_id).await.unwrap();
-        let cached_tile = trickplay_tile_cache_path(&cached_item, 320, 0);
+        let trickplay_settings = trickplay_settings(&test_db).await.unwrap();
+        let cached_tile = trickplay_tile_cache_path(&cached_item, &trickplay_settings, 320, 0);
         tokio::fs::create_dir_all(cached_tile.parent().unwrap())
             .await
             .unwrap();
@@ -15045,6 +15190,21 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"cached jpeg");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Trickplay/Videos/{item_id}/Trickplay/640/tiles.m3u8"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
