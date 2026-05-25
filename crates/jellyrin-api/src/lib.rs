@@ -6223,6 +6223,10 @@ fn media_item_direct_stream_url(item: &MediaItem, item_id: &str) -> String {
 }
 
 fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
+    if !item.media_streams.is_empty() {
+        return item.media_streams.clone();
+    }
+
     if item.media_type == "Audio" {
         return vec![serde_json::json!({
             "Codec": media_item_container(item).unwrap_or_else(|| "unknown".to_string()),
@@ -11877,6 +11881,25 @@ mod tests {
                 Some(2_500_000),
                 Some(1920),
                 Some(1080),
+                vec![
+                    json!({
+                        "Type": "Video",
+                        "Index": 0,
+                        "Codec": "h264",
+                        "Width": 1920,
+                        "Height": 1080,
+                        "BitRate": 2_500_000,
+                        "AverageFrameRate": 24.0,
+                        "PixelFormat": "yuv420p"
+                    }),
+                    json!({
+                        "Type": "Audio",
+                        "Index": 1,
+                        "Codec": "aac",
+                        "Channels": 2,
+                        "SampleRate": 48000
+                    }),
+                ],
             )
             .await
             .unwrap();
@@ -12236,9 +12259,21 @@ mod tests {
             detail["MediaSources"][0]["MediaStreams"][0]["Type"],
             "Video"
         );
+        assert_eq!(
+            detail["MediaSources"][0]["MediaStreams"][0]["Codec"],
+            "h264"
+        );
         assert_eq!(detail["MediaSources"][0]["MediaStreams"][0]["Width"], 1920);
         assert_eq!(detail["MediaSources"][0]["MediaStreams"][0]["Height"], 1080);
+        assert_eq!(
+            detail["MediaSources"][0]["MediaStreams"][0]["PixelFormat"],
+            "yuv420p"
+        );
         assert_eq!(detail["MediaStreams"][0]["Index"], 0);
+        assert_eq!(detail["MediaStreams"][1]["Type"], "Audio");
+        assert_eq!(detail["MediaStreams"][1]["Codec"], "aac");
+        assert_eq!(detail["MediaStreams"][1]["Channels"], 2);
+        assert_eq!(detail["MediaStreams"][1]["SampleRate"], 48000);
         assert_eq!(detail["People"].as_array().unwrap().len(), 0);
         assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
         assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
@@ -12506,6 +12541,10 @@ mod tests {
             "Video"
         );
         assert_eq!(
+            playback_info["MediaSources"][0]["MediaStreams"][0]["Codec"],
+            "h264"
+        );
+        assert_eq!(
             playback_info["MediaSources"][0]["RunTimeTicks"],
             987_650_000
         );
@@ -12517,6 +12556,14 @@ mod tests {
         assert_eq!(
             playback_info["MediaSources"][0]["MediaStreams"][0]["Height"],
             1080
+        );
+        assert_eq!(
+            playback_info["MediaSources"][0]["MediaStreams"][1]["Type"],
+            "Audio"
+        );
+        assert_eq!(
+            playback_info["MediaSources"][0]["MediaStreams"][1]["Channels"],
+            2
         );
 
         let response = app

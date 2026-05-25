@@ -65,6 +65,7 @@ pub struct MediaItem {
     pub bitrate: Option<i64>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    pub media_streams: Vec<serde_json::Value>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

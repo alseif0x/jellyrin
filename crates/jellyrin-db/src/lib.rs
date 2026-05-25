@@ -74,6 +74,7 @@ struct MediaInfo {
     bitrate: Option<i64>,
     width: Option<i32>,
     height: Option<i32>,
+    media_streams: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1231,6 +1232,7 @@ impl Database {
                    media_items.bitrate,
                    media_items.width,
                    media_items.height,
+                   media_items.media_streams_json,
                    media_items.created_at,
                    media_items.updated_at
             FROM active_playback_sessions
@@ -1529,7 +1531,8 @@ impl Database {
         let rows = sqlx::query_as::<_, MediaItemRow>(
             r#"
             SELECT id, virtual_folder_id, name, path, media_type, collection_type,
-                   file_size, runtime_ticks, bitrate, width, height, created_at, updated_at
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
             FROM media_items
             WHERE missing_since IS NULL
             ORDER BY name COLLATE NOCASE
@@ -1545,7 +1548,8 @@ impl Database {
         let rows = sqlx::query_as::<_, MediaItemRow>(
             r#"
             SELECT id, virtual_folder_id, name, path, media_type, collection_type,
-                   file_size, runtime_ticks, bitrate, width, height, created_at, updated_at
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
             FROM media_items
             WHERE missing_since IS NULL
             ORDER BY created_at DESC, name COLLATE NOCASE
@@ -1566,11 +1570,13 @@ impl Database {
         bitrate: Option<i64>,
         width: Option<i32>,
         height: Option<i32>,
+        media_streams: Vec<Value>,
     ) -> anyhow::Result<()> {
+        let media_streams_json = serde_json::to_string(&media_streams)?;
         sqlx::query(
             r#"
             UPDATE media_items
-            SET runtime_ticks = ?2, bitrate = ?3, width = ?4, height = ?5
+            SET runtime_ticks = ?2, bitrate = ?3, width = ?4, height = ?5, media_streams_json = ?6
             WHERE id = ?1
             "#,
         )
@@ -1579,6 +1585,7 @@ impl Database {
         .bind(bitrate)
         .bind(width)
         .bind(height)
+        .bind(media_streams_json)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1651,7 +1658,7 @@ impl Database {
                 media_items.id, media_items.virtual_folder_id, media_items.name, media_items.path,
                 media_items.media_type, media_items.collection_type, media_items.file_size,
                 media_items.runtime_ticks, media_items.bitrate, media_items.width, media_items.height,
-                media_items.created_at, media_items.updated_at, playback_states.user_id, playback_states.item_id,
+                media_items.media_streams_json, media_items.created_at, media_items.updated_at, playback_states.user_id, playback_states.item_id,
                 playback_states.media_source_id, playback_states.position_ticks,
                 playback_states.is_paused, playback_states.played,
                 playback_states.updated_at AS playback_updated_at
@@ -1732,6 +1739,7 @@ impl Database {
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| format_time(OffsetDateTime::from(modified)).ok());
         let media_info = probe_media_info(Path::new(&path), media_type).await;
+        let media_streams_json = serde_json::to_string(&media_info.media_streams)?;
         let exact_id =
             sqlx::query_as::<_, MediaItemIdRow>("SELECT id FROM media_items WHERE path = ?1")
                 .bind(&path)
@@ -1756,8 +1764,9 @@ impl Database {
                 SET name = ?1, path = ?2, media_type = ?3, collection_type = ?4,
                     updated_at = ?5, last_seen_at = ?5, missing_since = NULL,
                     file_size = ?6, modified_at = ?7,
-                    runtime_ticks = ?8, bitrate = ?9, width = ?10, height = ?11
-                WHERE id = ?12
+                    runtime_ticks = ?8, bitrate = ?9, width = ?10, height = ?11,
+                    media_streams_json = ?12
+                WHERE id = ?13
                 "#,
             )
             .bind(name)
@@ -1771,6 +1780,7 @@ impl Database {
             .bind(media_info.bitrate)
             .bind(media_info.width)
             .bind(media_info.height)
+            .bind(&media_streams_json)
             .bind(missing_id)
             .execute(&self.pool)
             .await?;
@@ -1784,9 +1794,9 @@ impl Database {
             INSERT INTO media_items (
                 id, virtual_folder_id, name, path, media_type, collection_type,
                 created_at, updated_at, last_seen_at, missing_since, file_size, modified_at,
-                runtime_ticks, bitrate, width, height
+                runtime_ticks, bitrate, width, height, media_streams_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(path) DO UPDATE SET
                 virtual_folder_id = excluded.virtual_folder_id,
                 name = excluded.name,
@@ -1800,7 +1810,8 @@ impl Database {
                 runtime_ticks = excluded.runtime_ticks,
                 bitrate = excluded.bitrate,
                 width = excluded.width,
-                height = excluded.height
+                height = excluded.height,
+                media_streams_json = excluded.media_streams_json
             "#,
         )
         .bind(existing_id)
@@ -1816,6 +1827,7 @@ impl Database {
         .bind(media_info.bitrate)
         .bind(media_info.width)
         .bind(media_info.height)
+        .bind(media_streams_json)
         .execute(&self.pool)
         .await?;
 
@@ -2548,6 +2560,7 @@ struct MediaItemRow {
     bitrate: Option<i64>,
     width: Option<i32>,
     height: Option<i32>,
+    media_streams_json: String,
     created_at: String,
     updated_at: String,
 }
@@ -2576,6 +2589,7 @@ struct ResumeItemRow {
     bitrate: Option<i64>,
     width: Option<i32>,
     height: Option<i32>,
+    media_streams_json: String,
     created_at: String,
     updated_at: String,
     user_id: String,
@@ -2617,6 +2631,7 @@ struct ActivePlaybackSessionRow {
     bitrate: Option<i64>,
     width: Option<i32>,
     height: Option<i32>,
+    media_streams_json: String,
     created_at: String,
     updated_at: String,
 }
@@ -2678,6 +2693,7 @@ impl TryFrom<MediaItemRow> for MediaItem {
             bitrate: row.bitrate,
             width: row.width,
             height: row.height,
+            media_streams: parse_media_streams_json(&row.media_streams_json)?,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         })
@@ -2701,6 +2717,7 @@ impl TryFrom<ResumeItemRow> for (MediaItem, PlaybackState) {
             bitrate: row.bitrate,
             width: row.width,
             height: row.height,
+            media_streams: parse_media_streams_json(&row.media_streams_json)?,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         };
@@ -2757,6 +2774,7 @@ impl TryFrom<ActivePlaybackSessionRow> for ActivePlaybackSession {
                 bitrate: row.bitrate,
                 width: row.width,
                 height: row.height,
+                media_streams: parse_media_streams_json(&row.media_streams_json)?,
                 created_at: parse_time(&row.created_at)?,
                 updated_at: parse_time(&row.updated_at)?,
             },
@@ -2893,6 +2911,10 @@ fn parse_time(value: &str) -> anyhow::Result<OffsetDateTime> {
     OffsetDateTime::parse(value, &Rfc3339).context("failed to parse timestamp")
 }
 
+fn parse_media_streams_json(value: &str) -> anyhow::Result<Vec<Value>> {
+    serde_json::from_str(value).context("invalid media streams json in database")
+}
+
 fn is_unique_constraint_error(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
@@ -2966,6 +2988,10 @@ fn parse_ffprobe_media_info(value: &Value) -> MediaInfo {
         .iter()
         .filter_map(|stream| stream.get("bit_rate").and_then(json_number_or_string_i64))
         .max();
+    let media_streams = streams
+        .iter()
+        .filter_map(ffprobe_stream_to_media_stream)
+        .collect::<Vec<_>>();
 
     MediaInfo {
         runtime_ticks,
@@ -2978,7 +3004,117 @@ fn parse_ffprobe_media_info(value: &Value) -> MediaInfo {
             .and_then(|stream| stream.get("height"))
             .and_then(json_number_or_string_i64)
             .and_then(|value| i32::try_from(value).ok()),
+        media_streams,
     }
+}
+
+fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
+    let codec_type = stream.get("codec_type")?.as_str()?;
+    let index = stream.get("index").and_then(json_number_or_string_i64)?;
+    let codec = stream
+        .get("codec_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let language = stream
+        .get("tags")
+        .and_then(|tags| tags.get("language"))
+        .and_then(Value::as_str);
+    let bit_rate = stream.get("bit_rate").and_then(json_number_or_string_i64);
+    let is_default = stream
+        .get("disposition")
+        .and_then(|disposition| disposition.get("default"))
+        .and_then(json_number_or_string_i64)
+        .is_some_and(|value| value != 0);
+
+    match codec_type {
+        "video" => Some(serde_json::json!({
+            "Codec": codec,
+            "Language": language,
+            "DisplayTitle": "Video",
+            "IsInterlaced": false,
+            "BitRate": bit_rate,
+            "BitDepth": stream.get("bits_per_raw_sample").and_then(json_number_or_string_i64),
+            "RefFrames": null,
+            "IsDefault": is_default,
+            "IsForced": false,
+            "Height": stream.get("height").and_then(json_number_or_string_i64),
+            "Width": stream.get("width").and_then(json_number_or_string_i64),
+            "AverageFrameRate": parse_rational(stream.get("avg_frame_rate").and_then(Value::as_str)),
+            "RealFrameRate": parse_rational(stream.get("r_frame_rate").and_then(Value::as_str)),
+            "Profile": stream.get("profile").and_then(Value::as_str),
+            "Type": "Video",
+            "AspectRatio": display_aspect_ratio(stream),
+            "Index": index,
+            "IsExternal": false,
+            "IsTextSubtitleStream": false,
+            "SupportsExternalStream": false,
+            "Path": null,
+            "PixelFormat": stream.get("pix_fmt").and_then(Value::as_str),
+            "Level": stream.get("level").and_then(json_number_or_string_i64),
+            "IsAnamorphic": null
+        })),
+        "audio" => Some(serde_json::json!({
+            "Codec": codec,
+            "Language": language,
+            "DisplayTitle": "Audio",
+            "IsInterlaced": false,
+            "BitRate": bit_rate,
+            "BitDepth": stream.get("bits_per_sample").and_then(json_number_or_string_i64),
+            "Channels": stream.get("channels").and_then(json_number_or_string_i64),
+            "SampleRate": stream.get("sample_rate").and_then(json_number_or_string_i64),
+            "IsDefault": is_default,
+            "IsForced": false,
+            "Type": "Audio",
+            "Index": index,
+            "IsExternal": false,
+            "Path": null
+        })),
+        "subtitle" => Some(serde_json::json!({
+            "Codec": codec,
+            "Language": language,
+            "DisplayTitle": "Subtitle",
+            "IsDefault": is_default,
+            "IsForced": false,
+            "Type": "Subtitle",
+            "Index": index,
+            "IsExternal": false,
+            "Path": null,
+            "IsTextSubtitleStream": true,
+            "SupportsExternalStream": false
+        })),
+        _ => None,
+    }
+}
+
+fn parse_rational(value: Option<&str>) -> Option<f64> {
+    let value = value?;
+    if let Some((left, right)) = value.split_once('/') {
+        let numerator = left.parse::<f64>().ok()?;
+        let denominator = right.parse::<f64>().ok()?;
+        if denominator == 0.0 {
+            None
+        } else {
+            Some(numerator / denominator)
+        }
+    } else {
+        value.parse::<f64>().ok()
+    }
+}
+
+fn display_aspect_ratio(stream: &Value) -> Option<String> {
+    stream
+        .get("display_aspect_ratio")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let width = stream.get("width").and_then(json_number_or_string_i64)?;
+            let height = stream.get("height").and_then(json_number_or_string_i64)?;
+            if width > 0 && height > 0 {
+                Some(format!("{width}:{height}"))
+            } else {
+                None
+            }
+        })
 }
 
 fn json_number_or_string_i64(value: &Value) -> Option<i64> {
@@ -3627,6 +3763,13 @@ mod tests {
             Some(3_000_000),
             Some(1920),
             Some(1080),
+            vec![serde_json::json!({
+                "Type": "Video",
+                "Index": 0,
+                "Codec": "h264",
+                "Width": 1920,
+                "Height": 1080
+            })],
         )
         .await
         .unwrap();
@@ -3635,6 +3778,7 @@ mod tests {
         assert_eq!(updated.bitrate, Some(3_000_000));
         assert_eq!(updated.width, Some(1920));
         assert_eq!(updated.height, Some(1080));
+        assert_eq!(updated.media_streams[0]["Codec"], "h264");
     }
 
     #[test]
