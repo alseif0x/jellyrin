@@ -582,6 +582,62 @@ pub fn router(state: AppState) -> Router {
             "/hlssegment/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
             head(hls_segment_head),
         )
+        .route(
+            "/DynamicHls/Videos/{item_id}/master.m3u8",
+            get(hls_master_playlist),
+        )
+        .route(
+            "/dynamichls/videos/{item_id}/master.m3u8",
+            get(hls_master_playlist),
+        )
+        .route(
+            "/DynamicHls/Videos/{item_id}/master.m3u8",
+            head(hls_master_playlist_head),
+        )
+        .route(
+            "/dynamichls/videos/{item_id}/master.m3u8",
+            head(hls_master_playlist_head),
+        )
+        .route(
+            "/DynamicHls/Videos/{item_id}/main.m3u8",
+            get(hls_media_playlist),
+        )
+        .route(
+            "/dynamichls/videos/{item_id}/main.m3u8",
+            get(hls_media_playlist),
+        )
+        .route(
+            "/DynamicHls/Videos/{item_id}/live.m3u8",
+            get(hls_media_playlist),
+        )
+        .route(
+            "/dynamichls/videos/{item_id}/live.m3u8",
+            get(hls_media_playlist),
+        )
+        .route(
+            "/DynamicHls/Videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/dynamichls/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/hls/{playlist_id}/stream.m3u8",
+            get(hls_legacy_media_playlist),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/hls/{playlist_id}/stream.m3u8",
+            get(hls_legacy_media_playlist),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/hls/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/hls/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
         .route("/Items/Counts", get(item_counts))
@@ -711,6 +767,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
             head(hls_segment_head),
+        )
+        .route(
+            "/Videos/{item_id}/hls/{playlist_id}/stream.m3u8",
+            get(hls_legacy_media_playlist),
+        )
+        .route(
+            "/videos/{item_id}/hls/{playlist_id}/stream.m3u8",
+            get(hls_legacy_media_playlist),
+        )
+        .route(
+            "/Videos/{item_id}/hls/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/videos/{item_id}/hls/{playlist_id}/{segment_file}",
+            get(hls_segment),
         )
         .route(
             "/Videos/{item_id}/stream.{container}",
@@ -6506,6 +6578,24 @@ async fn hls_media_playlist_head(
         query,
         raw_query.as_deref(),
         false,
+    )
+    .await
+}
+
+async fn hls_legacy_media_playlist(
+    State(state): State<AppState>,
+    Path((item_id, _playlist_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    hls_media_playlist_response(
+        &state,
+        &headers,
+        &item_id,
+        query,
+        raw_query.as_deref(),
+        true,
     )
     .await
 }
@@ -17340,6 +17430,76 @@ mod tests {
         assert!(media_playlist.contains(&format!(
             "/Videos/{item_id}/hls1/main/1.ts?PlaySessionId=play-session-hls"
         )));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let dynamic_master = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            dynamic_master,
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmain.m3u8?PlaySessionId=play-session-hls\n"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!(
+                        "/DynamicHls/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Videos/{item_id}/main.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Videos/{item_id}/live.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
         let response = app
             .clone()
             .oneshot(
@@ -17381,6 +17541,87 @@ mod tests {
                 Request::builder()
                     .uri(format!(
                         "/HlsSegment/Videos/{item_id}/hls1/main/0.ts?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"zero");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/hls/main/stream.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/videos/{item_id}/hls/main/0.ts?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"zero");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Videos/{item_id}/hls1/main/0.ts?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"zero");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Videos/{item_id}/hls/main/stream.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Videos/{item_id}/hls/main/0.ts?PlaySessionId=play-session-hls"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
