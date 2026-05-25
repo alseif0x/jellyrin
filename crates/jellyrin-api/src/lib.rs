@@ -262,6 +262,8 @@ pub fn router(state: AppState) -> Router {
         .route("/users/public", get(get_public_users))
         .route("/Auth/Providers", get(authentication_providers))
         .route("/auth/providers", get(authentication_providers))
+        .route("/Session/Auth/Providers", get(authentication_providers))
+        .route("/session/auth/providers", get(authentication_providers))
         .route("/Auth/Keys", get(api_keys).post(create_api_key))
         .route("/auth/keys", get(api_keys).post(create_api_key))
         .route("/Auth/Keys/{key}", delete(revoke_api_key))
@@ -326,12 +328,24 @@ pub fn router(state: AppState) -> Router {
         .route("/users/{user_id}/policy", post(update_user_policy))
         .route("/Sessions/Logout", post(logout))
         .route("/sessions/logout", post(logout))
+        .route("/Session/Sessions/Logout", post(logout))
+        .route("/session/sessions/logout", post(logout))
         .route("/Sessions/Playing", post(report_playback_start))
         .route("/sessions/playing", post(report_playback_start))
+        .route("/Session/Sessions/Playing", post(report_playback_start))
+        .route("/session/sessions/playing", post(report_playback_start))
         .route("/Playstate/Sessions/Playing", post(report_playback_start))
         .route("/playstate/sessions/playing", post(report_playback_start))
         .route("/Sessions/{session_id}/Playing", post(send_play_command))
         .route("/sessions/{session_id}/playing", post(send_play_command))
+        .route(
+            "/Session/Sessions/{session_id}/Playing",
+            post(send_play_command),
+        )
+        .route(
+            "/session/sessions/{session_id}/playing",
+            post(send_play_command),
+        )
         .route(
             "/Sessions/{session_id}/Playing/{command}",
             post(send_playstate_command),
@@ -340,8 +354,120 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{session_id}/playing/{command}",
             post(send_playstate_command),
         )
+        .route(
+            "/Session/Sessions/{session_id}/Playing/{command}",
+            post(send_playstate_command),
+        )
+        .route(
+            "/session/sessions/{session_id}/playing/{command}",
+            post(send_playstate_command),
+        )
+        .route(
+            "/Sessions/{session_id}/Command",
+            post(send_full_general_command),
+        )
+        .route(
+            "/sessions/{session_id}/command",
+            post(send_full_general_command),
+        )
+        .route(
+            "/Session/Sessions/{session_id}/Command",
+            post(send_full_general_command),
+        )
+        .route(
+            "/session/sessions/{session_id}/command",
+            post(send_full_general_command),
+        )
+        .route(
+            "/Sessions/{session_id}/Command/{command}",
+            post(send_general_command),
+        )
+        .route(
+            "/sessions/{session_id}/command/{command}",
+            post(send_general_command),
+        )
+        .route(
+            "/Session/Sessions/{session_id}/Command/{command}",
+            post(send_general_command),
+        )
+        .route(
+            "/session/sessions/{session_id}/command/{command}",
+            post(send_general_command),
+        )
+        .route(
+            "/Sessions/{session_id}/System/{command}",
+            post(send_system_command),
+        )
+        .route(
+            "/sessions/{session_id}/system/{command}",
+            post(send_system_command),
+        )
+        .route(
+            "/Session/Sessions/{session_id}/System/{command}",
+            post(send_system_command),
+        )
+        .route(
+            "/session/sessions/{session_id}/system/{command}",
+            post(send_system_command),
+        )
+        .route(
+            "/Sessions/{session_id}/Message",
+            post(send_message_command),
+        )
+        .route(
+            "/sessions/{session_id}/message",
+            post(send_message_command),
+        )
+        .route(
+            "/Session/Sessions/{session_id}/Message",
+            post(send_message_command),
+        )
+        .route(
+            "/session/sessions/{session_id}/message",
+            post(send_message_command),
+        )
+        .route(
+            "/Sessions/{session_id}/Viewing",
+            post(display_content),
+        )
+        .route(
+            "/sessions/{session_id}/viewing",
+            post(display_content),
+        )
+        .route(
+            "/Session/Sessions/{session_id}/Viewing",
+            post(display_content),
+        )
+        .route(
+            "/session/sessions/{session_id}/viewing",
+            post(display_content),
+        )
+        .route(
+            "/Sessions/{session_id}/User/{user_id}",
+            post(add_user_to_session).delete(remove_user_from_session),
+        )
+        .route(
+            "/sessions/{session_id}/user/{user_id}",
+            post(add_user_to_session).delete(remove_user_from_session),
+        )
+        .route(
+            "/Session/Sessions/{session_id}/User/{user_id}",
+            post(add_user_to_session).delete(remove_user_from_session),
+        )
+        .route(
+            "/session/sessions/{session_id}/user/{user_id}",
+            post(add_user_to_session).delete(remove_user_from_session),
+        )
         .route("/Sessions/Playing/Progress", post(report_playback_progress))
         .route("/sessions/playing/progress", post(report_playback_progress))
+        .route(
+            "/Session/Sessions/Playing/Progress",
+            post(report_playback_progress),
+        )
+        .route(
+            "/session/sessions/playing/progress",
+            post(report_playback_progress),
+        )
         .route(
             "/Playstate/Sessions/Playing/Progress",
             post(report_playback_progress),
@@ -352,6 +478,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Sessions/Playing/Stopped", post(report_playback_stopped))
         .route("/sessions/playing/stopped", post(report_playback_stopped))
+        .route(
+            "/Session/Sessions/Playing/Stopped",
+            post(report_playback_stopped),
+        )
+        .route(
+            "/session/sessions/playing/stopped",
+            post(report_playback_stopped),
+        )
         .route(
             "/Playstate/Sessions/Playing/Stopped",
             post(report_playback_stopped),
@@ -370,7 +504,23 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Sessions/Capabilities", post(update_session_capabilities))
         .route(
+            "/Session/Sessions/Capabilities",
+            post(update_session_capabilities),
+        )
+        .route(
+            "/session/sessions/capabilities",
+            post(update_session_capabilities),
+        )
+        .route(
             "/Sessions/Capabilities/Full",
+            post(update_session_capabilities),
+        )
+        .route(
+            "/Session/Sessions/Capabilities/Full",
+            post(update_session_capabilities),
+        )
+        .route(
+            "/session/sessions/capabilities/full",
             post(update_session_capabilities),
         )
         .route("/sessions/capabilities", post(update_session_capabilities))
@@ -378,6 +528,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/capabilities/full",
             post(update_session_capabilities),
         )
+        .route("/Sessions/Viewing", post(report_viewing))
+        .route("/sessions/viewing", post(report_viewing))
+        .route("/Session/Sessions/Viewing", post(report_viewing))
+        .route("/session/sessions/viewing", post(report_viewing))
         .route("/QuickConnect/Enabled", get(quick_connect_enabled))
         .route("/quickconnect/enabled", get(quick_connect_enabled))
         .route("/SyncPlay/List", get(empty_json_array))
@@ -4432,6 +4586,337 @@ async fn send_playstate_command(
     );
     broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn command_target_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    auth_query: &AuthQuery,
+    session_id: &str,
+) -> Result<(User, DeviceSession), ApiError> {
+    let (auth_user, _) = require_user(&state.db, headers, auth_query.api_key.as_deref()).await?;
+    let target_session = state
+        .db
+        .device_session_by_id(session_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Device session not found"))?;
+    ensure_user_access(&auth_user, target_session.user_id)?;
+    Ok((auth_user, target_session))
+}
+
+async fn send_general_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path((session_id, command)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, target_session) =
+        command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    broadcast_general_command(
+        &target_session,
+        &auth_user,
+        &command,
+        serde_json::Map::new(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn send_system_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path((session_id, command)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, target_session) =
+        command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    broadcast_general_command(
+        &target_session,
+        &auth_user,
+        &command,
+        serde_json::Map::new(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn send_full_general_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(session_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, target_session) =
+        command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    let payload = body
+        .map(|Json(value)| value)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let object = payload
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("Command body must be an object"))?;
+    let command = json_object_string_field(object, &["Name", "Command"])
+        .ok_or_else(|| ApiError::bad_request("Name is required"))?;
+    let arguments = object
+        .get("Arguments")
+        .or_else(|| object.get("arguments"))
+        .and_then(|value| value.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    broadcast_general_command(&target_session, &auth_user, &command, arguments);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn broadcast_general_command(
+    target_session: &DeviceSession,
+    auth_user: &User,
+    command: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+) {
+    let mut data = serde_json::Map::new();
+    data.insert(
+        "Name".to_string(),
+        serde_json::Value::String(command.to_string()),
+    );
+    data.insert(
+        "ControllingUserId".to_string(),
+        serde_json::Value::String(auth_user.id.simple().to_string()),
+    );
+    data.insert(
+        "Arguments".to_string(),
+        serde_json::Value::Object(arguments),
+    );
+    broadcast_session_message(
+        &target_session.access_token,
+        serde_json::json!({
+            "MessageType": "GeneralCommand",
+            "Data": data
+        }),
+    );
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DisplayContentQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "ItemId", alias = "itemId")]
+    item_id: Option<String>,
+    #[serde(alias = "ItemName", alias = "itemName")]
+    item_name: Option<String>,
+    #[serde(alias = "ItemType", alias = "itemType")]
+    item_type: Option<String>,
+}
+
+async fn display_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DisplayContentQuery>,
+    Path(session_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, target_session) =
+        command_target_session(&state, &headers, &query.auth, &session_id).await?;
+    let body = body.map(|Json(value)| value);
+    let payload = display_content_payload(&state.db, query, body).await?;
+    broadcast_session_message(
+        &target_session.access_token,
+        serde_json::json!({
+            "MessageType": "Browse",
+            "Data": {
+                "ItemId": payload.item_id,
+                "ItemName": payload.item_name,
+                "ItemType": payload.item_type,
+                "ControllingUserId": auth_user.id.simple().to_string()
+            }
+        }),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReportViewingQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "SessionId", alias = "sessionId")]
+    session_id: Option<String>,
+    #[serde(alias = "ItemId", alias = "itemId")]
+    item_id: Option<String>,
+    #[serde(alias = "ItemName", alias = "itemName")]
+    item_name: Option<String>,
+    #[serde(alias = "ItemType", alias = "itemType")]
+    item_type: Option<String>,
+}
+
+async fn report_viewing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ReportViewingQuery>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, token) =
+        require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let target_session_id = query
+        .session_id
+        .clone()
+        .unwrap_or_else(|| token.access_token.clone());
+    let target_session = state
+        .db
+        .device_session_by_id(&target_session_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Device session not found"))?;
+    ensure_user_access(&auth_user, target_session.user_id)?;
+
+    let body = body.map(|Json(value)| value);
+    let payload = display_content_payload(
+        &state.db,
+        DisplayContentQuery {
+            auth: AuthQuery::default(),
+            item_id: query.item_id,
+            item_name: query.item_name,
+            item_type: query.item_type,
+        },
+        body,
+    )
+    .await?;
+    broadcast_session_message(
+        &target_session.access_token,
+        serde_json::json!({
+            "MessageType": "Browse",
+            "Data": {
+                "ItemId": payload.item_id,
+                "ItemName": payload.item_name,
+                "ItemType": payload.item_type,
+                "ControllingUserId": auth_user.id.simple().to_string()
+            }
+        }),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default)]
+struct DisplayContentPayload {
+    item_id: Option<String>,
+    item_name: Option<String>,
+    item_type: Option<String>,
+}
+
+async fn display_content_payload(
+    db: &Database,
+    query: DisplayContentQuery,
+    body: Option<serde_json::Value>,
+) -> Result<DisplayContentPayload, ApiError> {
+    let body_object = body.as_ref().and_then(|value| value.as_object());
+    let item_id = query.item_id.or_else(|| {
+        body_object.and_then(|object| json_object_string_field(object, &["ItemId", "itemId"]))
+    });
+    let mut item_name = query.item_name.or_else(|| {
+        body_object.and_then(|object| json_object_string_field(object, &["ItemName", "itemName"]))
+    });
+    let mut item_type = query.item_type.or_else(|| {
+        body_object.and_then(|object| json_object_string_field(object, &["ItemType", "itemType"]))
+    });
+
+    if let Some(item_id) = item_id.as_deref() {
+        let item = media_item_by_id(db, item_id).await?;
+        if item_name.as_deref().is_none_or(str::is_empty) {
+            item_name = Some(item.name.clone());
+        }
+        if item_type.as_deref().is_none_or(str::is_empty) {
+            item_type = Some(media_item_type(&item).to_string());
+        }
+    }
+
+    Ok(DisplayContentPayload {
+        item_id,
+        item_name,
+        item_type,
+    })
+}
+
+fn json_object_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<String> {
+    names.iter().find_map(|name| {
+        object
+            .get(*name)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+async fn send_message_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(session_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, target_session) =
+        command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    let payload = body
+        .map(|Json(value)| value)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let mut data = payload
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request("Message body must be an object"))?;
+    data.insert(
+        "ControllingUserId".to_string(),
+        serde_json::Value::String(auth_user.id.simple().to_string()),
+    );
+    broadcast_session_message(
+        &target_session.access_token,
+        serde_json::json!({
+            "MessageType": "MessageCommand",
+            "Data": data
+        }),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn add_user_to_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path((session_id, user_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    modify_session_user(state, headers, auth_query, session_id, user_id).await
+}
+
+async fn remove_user_from_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path((session_id, user_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    modify_session_user(state, headers, auth_query, session_id, user_id).await
+}
+
+async fn modify_session_user(
+    state: AppState,
+    headers: HeaderMap,
+    auth_query: AuthQuery,
+    session_id: String,
+    user_id: String,
+) -> Result<StatusCode, ApiError> {
+    let (auth_user, target_session) =
+        command_target_session(&state, &headers, &auth_query, &session_id).await?;
+    let requested_user_id = Uuid::parse_str(&user_id)
+        .or_else(|_| Uuid::parse_str(&hyphenate_uuid(&user_id)))
+        .map_err(|_| ApiError::bad_request("Invalid user id"))?;
+    if !state
+        .db
+        .users()
+        .await?
+        .into_iter()
+        .any(|user| user.id == requested_user_id)
+    {
+        return Err(ApiError::not_found("User not found"));
+    }
+    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -10210,7 +10695,7 @@ fn load_countries() -> Vec<CountryDto> {
     countries
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct AuthQuery {
     #[serde(alias = "api_key", alias = "ApiKey")]
     api_key: Option<String>,
@@ -14703,6 +15188,51 @@ mod tests {
         );
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Session/Sessions/Capabilities/Full")
+                    .header("X-Emby-Token", token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "PlayableMediaTypes": ["Video"],
+                            "SupportedCommands": ["DisplayMessage", "GoHome"],
+                            "SupportsRemoteControl": true,
+                            "SupportsMediaControl": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Session/Sessions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prefixed_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prefixed_sessions[0]["DeviceId"], "capable-device");
+        assert_eq!(prefixed_sessions[0]["PlayableMediaTypes"], json!(["Video"]));
+        assert_eq!(
+            prefixed_sessions[0]["SupportedCommands"],
+            json!(["DisplayMessage", "GoHome"])
+        );
+
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -14715,6 +15245,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Session/Sessions/Logout")
+                    .header("X-Emby-Token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -18484,6 +19027,149 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Session/Sessions/{playback_token}/Command/GoHome"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let command_event =
+            next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
+        assert_eq!(command_event["MessageType"], "GeneralCommand");
+        assert_eq!(command_event["Data"]["Name"], "GoHome");
+        assert_eq!(command_event["Data"]["ControllingUserId"], user_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Session/Sessions/{playback_token}/Command"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Name": "DisplayContent",
+                            "Arguments": { "ItemId": item_id }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let full_command_event =
+            next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
+        assert_eq!(full_command_event["Data"]["Name"], "DisplayContent");
+        assert_eq!(full_command_event["Data"]["Arguments"]["ItemId"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Session/Sessions/{playback_token}/System/Wake"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let system_event =
+            next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
+        assert_eq!(system_event["Data"]["Name"], "Wake");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Session/Sessions/{playback_token}/Message"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Header": "Heads up",
+                            "Text": "Testing",
+                            "TimeoutMs": 1000
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let message_event =
+            next_playback_event_type(&mut playback_events, playback_token, "MessageCommand").await;
+        assert_eq!(message_event["Data"]["Header"], "Heads up");
+        assert_eq!(message_event["Data"]["Text"], "Testing");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Session/Sessions/{playback_token}/Viewing?ItemId={item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let browse_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Browse").await;
+        assert_eq!(browse_event["Data"]["ItemId"], item_id);
+        assert_eq!(browse_event["Data"]["ItemName"], "Example Song");
+        assert_eq!(browse_event["Data"]["ItemType"], "Audio");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Session/Sessions/Viewing?SessionId={playback_token}&ItemId={item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let report_browse_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Browse").await;
+        assert_eq!(report_browse_event["Data"]["ItemId"], item_id);
+
+        for method in [Method::POST, Method::DELETE] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/Session/Sessions/{playback_token}/User/{user_id}"))
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Sessions")
                     .header("X-Emby-Token", playback_token)
                     .body(Body::empty())
@@ -20739,7 +21425,12 @@ mod tests {
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
-        for endpoint in ["/Auth/Providers", "/Auth/PasswordResetProviders"] {
+        for endpoint in [
+            "/Auth/Providers",
+            "/Auth/PasswordResetProviders",
+            "/Session/Auth/Providers",
+            "/Session/Auth/PasswordResetProviders",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -20757,7 +21448,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/Auth/Providers")
+                    .uri("/Session/Auth/Providers")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
