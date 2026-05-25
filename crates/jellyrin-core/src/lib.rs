@@ -60,6 +60,11 @@ pub struct MediaItem {
     pub path: String,
     pub media_type: String,
     pub collection_type: Option<String>,
+    pub file_size: Option<i64>,
+    pub runtime_ticks: Option<i64>,
+    pub bitrate: Option<i64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }

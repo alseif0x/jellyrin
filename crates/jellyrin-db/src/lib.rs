@@ -14,6 +14,7 @@ use jellyrin_core::{
 use serde_json::Value;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::process::Command;
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -65,6 +66,14 @@ pub struct BackupManifest {
     pub backup_engine_version: String,
     pub options: Value,
     pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MediaInfo {
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1217,6 +1226,11 @@ impl Database {
                    media_items.path,
                    media_items.media_type,
                    media_items.collection_type,
+                   media_items.file_size,
+                   media_items.runtime_ticks,
+                   media_items.bitrate,
+                   media_items.width,
+                   media_items.height,
                    media_items.created_at,
                    media_items.updated_at
             FROM active_playback_sessions
@@ -1514,7 +1528,8 @@ impl Database {
     pub async fn media_items(&self) -> anyhow::Result<Vec<MediaItem>> {
         let rows = sqlx::query_as::<_, MediaItemRow>(
             r#"
-            SELECT id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, created_at, updated_at
             FROM media_items
             WHERE missing_since IS NULL
             ORDER BY name COLLATE NOCASE
@@ -1529,7 +1544,8 @@ impl Database {
     pub async fn latest_media_items(&self, limit: i64) -> anyhow::Result<Vec<MediaItem>> {
         let rows = sqlx::query_as::<_, MediaItemRow>(
             r#"
-            SELECT id, virtual_folder_id, name, path, media_type, collection_type, created_at, updated_at
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, created_at, updated_at
             FROM media_items
             WHERE missing_since IS NULL
             ORDER BY created_at DESC, name COLLATE NOCASE
@@ -1541,6 +1557,31 @@ impl Database {
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn update_media_item_media_info(
+        &self,
+        item_id: Uuid,
+        runtime_ticks: Option<i64>,
+        bitrate: Option<i64>,
+        width: Option<i32>,
+        height: Option<i32>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE media_items
+            SET runtime_ticks = ?2, bitrate = ?3, width = ?4, height = ?5
+            WHERE id = ?1
+            "#,
+        )
+        .bind(item_id.to_string())
+        .bind(runtime_ticks)
+        .bind(bitrate)
+        .bind(width)
+        .bind(height)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn upsert_playback_state(
@@ -1608,8 +1649,9 @@ impl Database {
             r#"
             SELECT
                 media_items.id, media_items.virtual_folder_id, media_items.name, media_items.path,
-                media_items.media_type, media_items.collection_type, media_items.created_at,
-                media_items.updated_at, playback_states.user_id, playback_states.item_id,
+                media_items.media_type, media_items.collection_type, media_items.file_size,
+                media_items.runtime_ticks, media_items.bitrate, media_items.width, media_items.height,
+                media_items.created_at, media_items.updated_at, playback_states.user_id, playback_states.item_id,
                 playback_states.media_source_id, playback_states.position_ticks,
                 playback_states.is_paused, playback_states.played,
                 playback_states.updated_at AS playback_updated_at
@@ -1689,6 +1731,7 @@ impl Database {
         let modified_at = metadata
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| format_time(OffsetDateTime::from(modified)).ok());
+        let media_info = probe_media_info(Path::new(&path), media_type).await;
         let exact_id =
             sqlx::query_as::<_, MediaItemIdRow>("SELECT id FROM media_items WHERE path = ?1")
                 .bind(&path)
@@ -1712,8 +1755,9 @@ impl Database {
                 UPDATE media_items
                 SET name = ?1, path = ?2, media_type = ?3, collection_type = ?4,
                     updated_at = ?5, last_seen_at = ?5, missing_since = NULL,
-                    file_size = ?6, modified_at = ?7
-                WHERE id = ?8
+                    file_size = ?6, modified_at = ?7,
+                    runtime_ticks = ?8, bitrate = ?9, width = ?10, height = ?11
+                WHERE id = ?12
                 "#,
             )
             .bind(name)
@@ -1723,6 +1767,10 @@ impl Database {
             .bind(&now)
             .bind(file_size)
             .bind(modified_at)
+            .bind(media_info.runtime_ticks)
+            .bind(media_info.bitrate)
+            .bind(media_info.width)
+            .bind(media_info.height)
             .bind(missing_id)
             .execute(&self.pool)
             .await?;
@@ -1735,9 +1783,10 @@ impl Database {
             r#"
             INSERT INTO media_items (
                 id, virtual_folder_id, name, path, media_type, collection_type,
-                created_at, updated_at, last_seen_at, missing_since, file_size, modified_at
+                created_at, updated_at, last_seen_at, missing_since, file_size, modified_at,
+                runtime_ticks, bitrate, width, height
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, NULL, ?8, ?9)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, NULL, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(path) DO UPDATE SET
                 virtual_folder_id = excluded.virtual_folder_id,
                 name = excluded.name,
@@ -1747,7 +1796,11 @@ impl Database {
                 last_seen_at = excluded.last_seen_at,
                 missing_since = NULL,
                 file_size = excluded.file_size,
-                modified_at = excluded.modified_at
+                modified_at = excluded.modified_at,
+                runtime_ticks = excluded.runtime_ticks,
+                bitrate = excluded.bitrate,
+                width = excluded.width,
+                height = excluded.height
             "#,
         )
         .bind(existing_id)
@@ -1759,6 +1812,10 @@ impl Database {
         .bind(&now)
         .bind(file_size)
         .bind(modified_at)
+        .bind(media_info.runtime_ticks)
+        .bind(media_info.bitrate)
+        .bind(media_info.width)
+        .bind(media_info.height)
         .execute(&self.pool)
         .await?;
 
@@ -2486,6 +2543,11 @@ struct MediaItemRow {
     path: String,
     media_type: String,
     collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
     created_at: String,
     updated_at: String,
 }
@@ -2509,6 +2571,11 @@ struct ResumeItemRow {
     path: String,
     media_type: String,
     collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
     created_at: String,
     updated_at: String,
     user_id: String,
@@ -2545,6 +2612,11 @@ struct ActivePlaybackSessionRow {
     path: String,
     media_type: String,
     collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
     created_at: String,
     updated_at: String,
 }
@@ -2601,6 +2673,11 @@ impl TryFrom<MediaItemRow> for MediaItem {
             path: row.path,
             media_type: row.media_type,
             collection_type: row.collection_type,
+            file_size: row.file_size,
+            runtime_ticks: row.runtime_ticks,
+            bitrate: row.bitrate,
+            width: row.width,
+            height: row.height,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         })
@@ -2619,6 +2696,11 @@ impl TryFrom<ResumeItemRow> for (MediaItem, PlaybackState) {
             path: row.path,
             media_type: row.media_type,
             collection_type: row.collection_type,
+            file_size: row.file_size,
+            runtime_ticks: row.runtime_ticks,
+            bitrate: row.bitrate,
+            width: row.width,
+            height: row.height,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         };
@@ -2670,6 +2752,11 @@ impl TryFrom<ActivePlaybackSessionRow> for ActivePlaybackSession {
                 path: row.path,
                 media_type: row.media_type,
                 collection_type: row.collection_type,
+                file_size: row.file_size,
+                runtime_ticks: row.runtime_ticks,
+                bitrate: row.bitrate,
+                width: row.width,
+                height: row.height,
                 created_at: parse_time(&row.created_at)?,
                 updated_at: parse_time(&row.updated_at)?,
             },
@@ -2827,6 +2914,89 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("invalid username or password"))
 }
 
+async fn probe_media_info(path: &Path, media_type: &str) -> MediaInfo {
+    if !matches!(media_type, "Video" | "Audio") {
+        return MediaInfo::default();
+    }
+
+    let Ok(output) = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-show_format")
+        .arg("-show_streams")
+        .arg(path)
+        .output()
+        .await
+    else {
+        return MediaInfo::default();
+    };
+    if !output.status.success() {
+        return MediaInfo::default();
+    }
+
+    serde_json::from_slice::<Value>(&output.stdout)
+        .map(|value| parse_ffprobe_media_info(&value))
+        .unwrap_or_default()
+}
+
+fn parse_ffprobe_media_info(value: &Value) -> MediaInfo {
+    let format = value.get("format");
+    let runtime_ticks = format
+        .and_then(|format| format.get("duration"))
+        .and_then(json_number_or_string_f64)
+        .map(seconds_to_ticks);
+    let format_bitrate = format
+        .and_then(|format| format.get("bit_rate"))
+        .and_then(json_number_or_string_i64);
+
+    let streams = value
+        .get("streams")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let video_stream = streams.iter().find(|stream| {
+        stream
+            .get("codec_type")
+            .and_then(Value::as_str)
+            .is_some_and(|codec_type| codec_type.eq_ignore_ascii_case("video"))
+    });
+    let stream_bitrate = streams
+        .iter()
+        .filter_map(|stream| stream.get("bit_rate").and_then(json_number_or_string_i64))
+        .max();
+
+    MediaInfo {
+        runtime_ticks,
+        bitrate: format_bitrate.or(stream_bitrate),
+        width: video_stream
+            .and_then(|stream| stream.get("width"))
+            .and_then(json_number_or_string_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+        height: video_stream
+            .and_then(|stream| stream.get("height"))
+            .and_then(json_number_or_string_i64)
+            .and_then(|value| i32::try_from(value).ok()),
+    }
+}
+
+fn json_number_or_string_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+}
+
+fn json_number_or_string_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+}
+
+fn seconds_to_ticks(seconds: f64) -> i64 {
+    (seconds.max(0.0) * 10_000_000.0).round() as i64
+}
+
 async fn collect_media_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut media_files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -2906,7 +3076,7 @@ fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
-        SystemConfigurationPayloads,
+        SystemConfigurationPayloads, parse_ffprobe_media_info,
     };
     use serde_json::json;
     use time::Duration;
@@ -3448,6 +3618,52 @@ mod tests {
         assert_eq!(items[0].path, movie.to_string_lossy());
         assert_eq!(items[0].media_type, "Video");
         assert_eq!(items[0].collection_type.as_deref(), Some("movies"));
+        assert_eq!(items[0].file_size, Some(10));
+        assert_eq!(items[0].runtime_ticks, None);
+
+        db.update_media_item_media_info(
+            items[0].id,
+            Some(12_345_000_000),
+            Some(3_000_000),
+            Some(1920),
+            Some(1080),
+        )
+        .await
+        .unwrap();
+        let updated = db.media_items().await.unwrap().remove(0);
+        assert_eq!(updated.runtime_ticks, Some(12_345_000_000));
+        assert_eq!(updated.bitrate, Some(3_000_000));
+        assert_eq!(updated.width, Some(1920));
+        assert_eq!(updated.height, Some(1080));
+    }
+
+    #[test]
+    fn parses_ffprobe_media_info_json() {
+        let value = json!({
+            "streams": [
+                {
+                    "index": 0,
+                    "codec_type": "video",
+                    "width": 1920,
+                    "height": 1080,
+                    "bit_rate": "2500000"
+                },
+                {
+                    "index": 1,
+                    "codec_type": "audio",
+                    "bit_rate": "128000"
+                }
+            ],
+            "format": {
+                "duration": "123.456",
+                "bit_rate": "3000000"
+            }
+        });
+        let info = parse_ffprobe_media_info(&value);
+        assert_eq!(info.runtime_ticks, Some(1_234_560_000));
+        assert_eq!(info.bitrate, Some(3_000_000));
+        assert_eq!(info.width, Some(1920));
+        assert_eq!(info.height, Some(1080));
     }
 
     #[tokio::test]

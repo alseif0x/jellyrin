@@ -6064,7 +6064,7 @@ fn media_item_to_json_with_playback(
         "IsRemote": false,
         "DirectStreamUrl": direct_stream_url,
         "ETag": null,
-        "RunTimeTicks": null,
+        "RunTimeTicks": item.runtime_ticks,
         "ReadAtNativeFramerate": false,
         "IgnoreDts": false,
         "IgnoreIndex": false,
@@ -6082,7 +6082,7 @@ fn media_item_to_json_with_playback(
         "DefaultSubtitleStreamIndex": null,
         "MediaStreams": media_streams.clone(),
         "Formats": [],
-        "Bitrate": null,
+        "Bitrate": item.bitrate,
     });
 
     serde_json::json!({
@@ -6126,7 +6126,7 @@ fn media_item_to_json_with_playback(
         "ParentId": item.virtual_folder_id.simple().to_string(),
         "Type": item_type,
         "MediaType": item.media_type,
-        "RunTimeTicks": null,
+        "RunTimeTicks": item.runtime_ticks,
         "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": false, "Played": played, "Key": item_id, "ItemId": item_id, "PlayedPercentage": null, "LastPlayedDate": null },
         "ImageTags": { "Primary": "placeholder" },
         "PrimaryImageAspectRatio": 0.6666667,
@@ -6193,9 +6193,8 @@ fn media_item_file_name(item: &MediaItem) -> Option<String> {
 }
 
 fn media_item_file_size(item: &MediaItem) -> Option<u64> {
-    fs::metadata(media_item_path(item))
-        .ok()
-        .map(|metadata| metadata.len())
+    item.file_size
+        .and_then(|file_size| u64::try_from(file_size).ok())
 }
 
 fn media_item_content_type(item: &MediaItem) -> String {
@@ -6230,7 +6229,7 @@ fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
             "Language": null,
             "DisplayTitle": "Audio",
             "IsInterlaced": false,
-            "BitRate": null,
+            "BitRate": item.bitrate,
             "BitDepth": null,
             "Channels": null,
             "SampleRate": null,
@@ -6256,13 +6255,13 @@ fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
             "NalLengthSize": null,
             "IsInterlaced": false,
             "IsAVC": null,
-            "BitRate": null,
+            "BitRate": item.bitrate,
             "BitDepth": null,
             "RefFrames": null,
             "IsDefault": true,
             "IsForced": false,
-            "Height": null,
-            "Width": null,
+            "Height": item.height,
+            "Width": item.width,
             "AverageFrameRate": null,
             "RealFrameRate": null,
             "Profile": null,
@@ -7113,7 +7112,8 @@ mod tests {
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, load_countries, load_cultures,
-        parse_authorization_token, parse_media_browser_pairs, router, subscribe_playback_events,
+        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs, router,
+        subscribe_playback_events,
     };
     use axum::{
         body::Body,
@@ -11812,6 +11812,7 @@ mod tests {
             .await
             .unwrap();
         let user_id = user.id.simple().to_string();
+        let test_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -11869,6 +11870,16 @@ mod tests {
         assert_eq!(result["Items"][0]["Path"], movie.to_string_lossy().as_ref());
         let item_id = result["Items"][0]["Id"].as_str().unwrap();
         let parent_id = result["Items"][0]["ParentId"].as_str().unwrap();
+        test_db
+            .update_media_item_media_info(
+                parse_jellyfin_uuid(item_id).unwrap(),
+                Some(987_650_000),
+                Some(2_500_000),
+                Some(1920),
+                Some(1080),
+            )
+            .await
+            .unwrap();
 
         let response = app
             .clone()
@@ -12204,6 +12215,7 @@ mod tests {
         assert_eq!(detail["Name"], "Example Movie");
         assert_eq!(detail["Container"], "mp4");
         assert_eq!(detail["Size"], 10);
+        assert_eq!(detail["RunTimeTicks"], 987_650_000);
         assert_eq!(detail["FileName"], "Example Movie.mp4");
         assert_eq!(detail["ImageTags"]["Primary"], "placeholder");
         assert_eq!(detail["PrimaryImageAspectRatio"], 0.6666667);
@@ -12214,6 +12226,8 @@ mod tests {
         );
         assert_eq!(detail["MediaSources"][0]["Container"], "mp4");
         assert_eq!(detail["MediaSources"][0]["Size"], 10);
+        assert_eq!(detail["MediaSources"][0]["RunTimeTicks"], 987_650_000);
+        assert_eq!(detail["MediaSources"][0]["Bitrate"], 2_500_000);
         assert_eq!(
             detail["MediaSources"][0]["DirectStreamUrl"],
             format!("/Videos/{item_id}/stream")
@@ -12222,6 +12236,8 @@ mod tests {
             detail["MediaSources"][0]["MediaStreams"][0]["Type"],
             "Video"
         );
+        assert_eq!(detail["MediaSources"][0]["MediaStreams"][0]["Width"], 1920);
+        assert_eq!(detail["MediaSources"][0]["MediaStreams"][0]["Height"], 1080);
         assert_eq!(detail["MediaStreams"][0]["Index"], 0);
         assert_eq!(detail["People"].as_array().unwrap().len(), 0);
         assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
@@ -12488,6 +12504,19 @@ mod tests {
         assert_eq!(
             playback_info["MediaSources"][0]["MediaStreams"][0]["Type"],
             "Video"
+        );
+        assert_eq!(
+            playback_info["MediaSources"][0]["RunTimeTicks"],
+            987_650_000
+        );
+        assert_eq!(playback_info["MediaSources"][0]["Bitrate"], 2_500_000);
+        assert_eq!(
+            playback_info["MediaSources"][0]["MediaStreams"][0]["Width"],
+            1920
+        );
+        assert_eq!(
+            playback_info["MediaSources"][0]["MediaStreams"][0]["Height"],
+            1080
         );
 
         let response = app
