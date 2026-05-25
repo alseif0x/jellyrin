@@ -530,6 +530,10 @@ pub fn router(state: AppState) -> Router {
             "/items/{item_id}/playbackinfo",
             post(post_item_playback_info),
         )
+        .route("/Items/{item_id}/InstantMix", get(instant_mix_from_item))
+        .route("/items/{item_id}/instantmix", get(instant_mix_from_item))
+        .route("/Songs/{item_id}/InstantMix", get(instant_mix_from_item))
+        .route("/songs/{item_id}/instantmix", get(instant_mix_from_item))
         .route("/Videos/{item_id}/stream", get(direct_stream_item))
         .route("/videos/{item_id}/stream", get(direct_stream_item))
         .route("/Videos/{item_id}/stream", head(direct_stream_item_head))
@@ -4779,6 +4783,51 @@ async fn post_item_playback_info(
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     drop(body);
     playback_info_response(&state.db, &item_id).await
+}
+
+async fn instant_mix_from_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    if item.media_type != "Audio" {
+        return Ok(Json(query_result(Vec::new())));
+    }
+
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let mut mix_items = state
+        .db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.media_type == "Audio" && candidate.virtual_folder_id == item.virtual_folder_id
+        })
+        .collect::<Vec<_>>();
+    mix_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+    mix_items.sort_by_key(|candidate| candidate.id != item.id);
+
+    let total_record_count = mix_items.len();
+    let limit = query.limit.unwrap_or(usize::MAX);
+    let items = items_to_json(
+        &state.db,
+        mix_items.into_iter().take(limit).collect(),
+        &server_id,
+        requested_user_id,
+    )
+    .await?;
+    Ok(Json(query_result_with_total(items, total_record_count, 0)))
 }
 
 async fn playback_info_response(
@@ -12460,6 +12509,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let song = tmp.path().join("Example Song.mp3");
         tokio::fs::write(&song, b"fake audio").await.unwrap();
+        let other_song = tmp.path().join("Second Song.mp3");
+        tokio::fs::write(&other_song, b"other audio").await.unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -12498,7 +12549,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/Items?IncludeItemTypes=Audio")
+                    .uri("/Items?IncludeItemTypes=Audio&Limit=1&SortBy=SortName")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -12508,7 +12559,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(result["TotalRecordCount"], 1);
+        assert_eq!(result["TotalRecordCount"], 2);
+        assert_eq!(result["Items"].as_array().unwrap().len(), 1);
         assert_eq!(result["Items"][0]["Name"], "Example Song");
         assert_eq!(result["Items"][0]["Type"], "Audio");
         let item_id = result["Items"][0]["Id"].as_str().unwrap();
@@ -12539,8 +12591,94 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let counts: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(counts["SongCount"], 1);
-        assert_eq!(counts["ItemCount"], 1);
+        assert_eq!(counts["SongCount"], 2);
+        assert_eq!(counts["ItemCount"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/InstantMix?UserId={}&Limit=1",
+                        user.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/InstantMix?UserId={}&Limit=1",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let instant_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(instant_mix["TotalRecordCount"], 2);
+        assert_eq!(instant_mix["StartIndex"], 0);
+        assert_eq!(instant_mix["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(instant_mix["Items"][0]["Id"], item_id);
+        assert_eq!(instant_mix["Items"][0]["Type"], "Audio");
+        assert_eq!(
+            instant_mix["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
+            format!("/Audio/{item_id}/stream")
+        );
+        assert_eq!(instant_mix["Items"][0]["UserData"]["Played"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Songs/{item_id}/InstantMix?limit=5"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let song_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(song_mix["TotalRecordCount"], 2);
+        assert_eq!(song_mix["Items"][0]["Id"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/not-a-uuid/InstantMix")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/00000000-0000-0000-0000-000000000000/InstantMix")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
