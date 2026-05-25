@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path as FsPath, PathBuf},
+    sync::OnceLock,
 };
 
 use axum::{
@@ -30,6 +31,7 @@ use jellyrin_db::{
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::broadcast;
 use tokio_util::io::ReaderStream;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use uuid::Uuid;
@@ -42,6 +44,7 @@ const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
+static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,6 +52,12 @@ pub struct AppState {
     pub web_dir: PathBuf,
     pub log_dir: PathBuf,
     pub local_address: String,
+}
+
+#[derive(Debug, Clone)]
+struct PlaybackEvent {
+    session_id: String,
+    message: serde_json::Value,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -3476,26 +3485,37 @@ async fn send_play_command(
     let item_ids = parse_play_command_item_ids(query.item_ids.as_deref())?;
     let start_index = query.start_index.unwrap_or_default();
 
-    let selected_item = match play_command.to_ascii_lowercase().as_str() {
-        "playinstantmix" => audio_instant_mix_items(&state.db, &item_ids[0])
-            .await?
-            .into_iter()
-            .nth(start_index),
-        "playnow" | "playnext" | "playlast" | "playshuffle" => {
-            let selected_id = item_ids
-                .get(start_index)
-                .or_else(|| item_ids.first())
-                .ok_or_else(|| ApiError::bad_request("ItemIds is required"))?;
-            Some(media_item_by_id(&state.db, selected_id).await?)
-        }
-        _ => return Err(ApiError::bad_request("Unsupported PlayCommand")),
-    };
+    let (selected_item, event_item_ids, event_play_command) =
+        match play_command.to_ascii_lowercase().as_str() {
+            "playinstantmix" => {
+                let mix_items = audio_instant_mix_items(&state.db, &item_ids[0]).await?;
+                let selected_item = mix_items.get(start_index).cloned();
+                let event_item_ids = mix_items
+                    .iter()
+                    .take(200)
+                    .map(|item| item.id.simple().to_string())
+                    .collect::<Vec<_>>();
+                (selected_item, event_item_ids, "PlayNow")
+            }
+            "playnow" | "playnext" | "playlast" | "playshuffle" => {
+                let selected_id = item_ids
+                    .get(start_index)
+                    .or_else(|| item_ids.first())
+                    .ok_or_else(|| ApiError::bad_request("ItemIds is required"))?;
+                (
+                    Some(media_item_by_id(&state.db, selected_id).await?),
+                    item_ids.clone(),
+                    canonical_play_command(play_command),
+                )
+            }
+            _ => return Err(ApiError::bad_request("Unsupported PlayCommand")),
+        };
 
     if let Some(item) = selected_item {
         let media_source_id = query
             .media_source_id
             .clone()
-            .unwrap_or_else(|| item.id.to_string());
+            .unwrap_or_else(|| item.id.simple().to_string());
         state
             .db
             .upsert_active_playback_session(
@@ -3507,6 +3527,21 @@ async fn send_play_command(
                 false,
             )
             .await?;
+        broadcast_session_message(
+            &target_session.access_token,
+            serde_json::json!({
+                "MessageType": "Play",
+                "Data": {
+                    "ItemIds": event_item_ids,
+                    "StartPositionTicks": query.start_position_ticks,
+                    "PlayCommand": event_play_command,
+                    "MediaSourceId": query.media_source_id,
+                    "AudioStreamIndex": null,
+                    "SubtitleStreamIndex": null,
+                    "StartIndex": query.start_index,
+                }
+            }),
+        );
     } else {
         state
             .db
@@ -3515,6 +3550,16 @@ async fn send_play_command(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn canonical_play_command(command: &str) -> &'static str {
+    match command.to_ascii_lowercase().as_str() {
+        "playnext" => "PlayNext",
+        "playlast" => "PlayLast",
+        "playshuffle" => "PlayShuffle",
+        "playnow" => "PlayNow",
+        _ => "PlayNow",
+    }
 }
 
 fn parse_play_command_item_ids(value: Option<&str>) -> Result<Vec<String>, ApiError> {
@@ -3583,19 +3628,20 @@ async fn send_playstate_command(
         .into_iter()
         .find(|playback| playback.session_id == target_session.access_token);
 
-    match command.to_ascii_lowercase().as_str() {
-        "stop" => {
+    let canonical_command = canonical_playstate_command(&command)?;
+    match canonical_command {
+        "Stop" => {
             state
                 .db
                 .clear_active_playback_session(&target_session.access_token)
                 .await?;
         }
-        "pause" | "unpause" | "playpause" | "seek" => {
+        "Pause" | "Unpause" | "PlayPause" | "Seek" => {
             if let Some(playback) = current_playback {
-                let is_paused = match command.to_ascii_lowercase().as_str() {
-                    "pause" => true,
-                    "unpause" => false,
-                    "playpause" => !playback.is_paused,
+                let is_paused = match canonical_command {
+                    "Pause" => true,
+                    "Unpause" => false,
+                    "PlayPause" => !playback.is_paused,
                     _ => playback.is_paused,
                 };
                 state
@@ -3611,11 +3657,36 @@ async fn send_playstate_command(
                     .await?;
             }
         }
-        "nexttrack" | "previoustrack" | "rewind" | "fastforward" => {}
-        _ => return Err(ApiError::bad_request("Unsupported PlaystateCommand")),
+        "NextTrack" | "PreviousTrack" | "Rewind" | "FastForward" => {}
+        _ => unreachable!("canonical playstate command must be exhaustive"),
     }
+    broadcast_session_message(
+        &target_session.access_token,
+        serde_json::json!({
+            "MessageType": "Playstate",
+            "Data": {
+                "Command": canonical_command,
+                "SeekPositionTicks": query.seek_position_ticks,
+            }
+        }),
+    );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn canonical_playstate_command(command: &str) -> Result<&'static str, ApiError> {
+    match command.to_ascii_lowercase().as_str() {
+        "stop" => Ok("Stop"),
+        "pause" => Ok("Pause"),
+        "unpause" => Ok("Unpause"),
+        "playpause" => Ok("PlayPause"),
+        "seek" => Ok("Seek"),
+        "nexttrack" => Ok("NextTrack"),
+        "previoustrack" => Ok("PreviousTrack"),
+        "rewind" => Ok("Rewind"),
+        "fastforward" => Ok("FastForward"),
+        _ => Err(ApiError::bad_request("Unsupported PlaystateCommand")),
+    }
 }
 
 fn parse_send_playstate_command_query(raw_query: Option<&str>) -> SendPlaystateCommandQuery {
@@ -6212,33 +6283,71 @@ async fn media_item_or_folder_by_id(db: &Database, item_id: &str) -> Result<(), 
     Err(ApiError::not_found("Item not found"))
 }
 
+fn playback_event_sender() -> &'static broadcast::Sender<PlaybackEvent> {
+    PLAYBACK_EVENTS.get_or_init(|| {
+        let (sender, _) = broadcast::channel(256);
+        sender
+    })
+}
+
+fn subscribe_playback_events() -> broadcast::Receiver<PlaybackEvent> {
+    playback_event_sender().subscribe()
+}
+
+fn broadcast_session_message(session_id: &str, message: serde_json::Value) {
+    let _ = playback_event_sender().send(PlaybackEvent {
+        session_id: session_id.to_string(),
+        message,
+    });
+}
+
 async fn websocket(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> axum::response::Response {
-    if let Err(error) = require_user(&state.db, &headers, query.api_key.as_deref()).await {
-        return error.into_response();
-    }
+    let session_id = match require_user(&state.db, &headers, query.api_key.as_deref()).await {
+        Ok((_, token)) => token.access_token,
+        Err(error) => return error.into_response(),
+    };
 
     match ws {
-        Ok(ws) => ws.on_upgrade(handle_websocket).into_response(),
+        Ok(ws) => ws
+            .on_upgrade(move |socket| handle_websocket(socket, session_id))
+            .into_response(),
         Err(rejection) => rejection.into_response(),
     }
 }
 
-async fn handle_websocket(mut socket: WebSocket) {
+async fn handle_websocket(mut socket: WebSocket, session_id: String) {
     let _ = socket
         .send(Message::Text(
             serde_json::json!({
                 "MessageType": "ForceKeepAlive",
-                "Data": 300
+                "Data": 60
             })
             .to_string()
             .into(),
         ))
         .await;
+    let mut receiver = subscribe_playback_events();
+    loop {
+        match receiver.recv().await {
+            Ok(event) if event.session_id == session_id => {
+                if socket
+                    .send(Message::Text(event.message.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 async fn localization_options() -> Json<Vec<LocalizationOptionDto>> {
@@ -6737,7 +6846,7 @@ mod tests {
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, load_countries, load_cultures,
-        parse_authorization_token, parse_media_browser_pairs, router,
+        parse_authorization_token, parse_media_browser_pairs, router, subscribe_playback_events,
     };
     use axum::{
         body::Body,
@@ -6817,7 +6926,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
         let response = app
             .clone()
             .oneshot(
@@ -11214,6 +11322,22 @@ mod tests {
             .header("Sec-WebSocket-Key", "x3JJHMbDL1EzLkh9GBhXDw==")
     }
 
+    async fn next_playback_event(
+        receiver: &mut tokio::sync::broadcast::Receiver<super::PlaybackEvent>,
+        session_id: &str,
+    ) -> Value {
+        for _ in 0..10 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("timed out waiting for playback websocket event")
+                .expect("playback event channel closed");
+            if event.session_id == session_id {
+                return event.message;
+            }
+        }
+        panic!("no playback websocket event for session {session_id}");
+    }
+
     #[tokio::test]
     async fn m1_environment_library_and_image_compat_endpoints_exist() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -12126,7 +12250,6 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let login: Value = serde_json::from_slice(&body).unwrap();
         let playback_token = login["AccessToken"].as_str().unwrap();
-
         let response = app
             .clone()
             .oneshot(
@@ -12912,6 +13035,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let login: Value = serde_json::from_slice(&body).unwrap();
         let playback_token = login["AccessToken"].as_str().unwrap();
+        let mut playback_events = subscribe_playback_events();
 
         let response = app
             .clone()
@@ -12943,6 +13067,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let play_event = next_playback_event(&mut playback_events, playback_token).await;
+        assert_eq!(play_event["MessageType"], "Play");
+        assert_eq!(play_event["Data"]["PlayCommand"], "PlayNow");
+        assert_eq!(play_event["Data"]["StartPositionTicks"], 123);
+        assert_eq!(play_event["Data"]["ItemIds"].as_array().unwrap().len(), 2);
+        assert_eq!(play_event["Data"]["ItemIds"][0], item_id);
 
         let response = app
             .clone()
@@ -12984,6 +13114,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let play_now_event = next_playback_event(&mut playback_events, playback_token).await;
+        assert_eq!(play_now_event["MessageType"], "Play");
+        assert_eq!(play_now_event["Data"]["PlayCommand"], "PlayNow");
+        assert_eq!(play_now_event["Data"]["ItemIds"][0], item_id);
+        assert_eq!(play_now_event["Data"]["StartPositionTicks"], 456);
 
         let response = app
             .clone()
@@ -13028,6 +13163,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let pause_event = next_playback_event(&mut playback_events, playback_token).await;
+        assert_eq!(pause_event["MessageType"], "Playstate");
+        assert_eq!(pause_event["Data"]["Command"], "Pause");
 
         let response = app
             .clone()
@@ -13044,6 +13182,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let seek_event = next_playback_event(&mut playback_events, playback_token).await;
+        assert_eq!(seek_event["MessageType"], "Playstate");
+        assert_eq!(seek_event["Data"]["Command"], "Seek");
+        assert_eq!(seek_event["Data"]["SeekPositionTicks"], 999);
 
         let response = app
             .clone()
