@@ -6194,6 +6194,8 @@ fn media_item_to_json_with_playback(
     let played = playback.is_some_and(|state| state.played);
     let play_count = i32::from(played);
     let media_streams = media_item_streams(item);
+    let default_audio_stream_index = default_audio_stream_index(&media_streams);
+    let default_subtitle_stream_index = default_subtitle_stream_index(&media_streams);
     let direct_stream_url = media_item_direct_stream_url(item, &item_id);
     let video_type = if item.media_type == "Video" {
         serde_json::json!("VideoFile")
@@ -6226,8 +6228,8 @@ fn media_item_to_json_with_playback(
         "RequiresLooping": false,
         "SupportsProbing": true,
         "VideoType": video_type,
-        "DefaultAudioStreamIndex": null,
-        "DefaultSubtitleStreamIndex": null,
+        "DefaultAudioStreamIndex": default_audio_stream_index,
+        "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
         "MediaStreams": media_streams.clone(),
         "Formats": [],
         "Bitrate": item.bitrate,
@@ -6282,6 +6284,64 @@ fn media_item_to_json_with_playback(
         "LocationType": "FileSystem",
         "MediaSources": [media_source],
     })
+}
+
+fn default_audio_stream_index(media_streams: &[serde_json::Value]) -> Option<i64> {
+    let mut first_audio_index = None;
+    for stream in media_streams {
+        let Some(stream) = stream.as_object() else {
+            continue;
+        };
+        let Some(type_name) = stream.get("Type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !type_name.eq_ignore_ascii_case("Audio") {
+            continue;
+        }
+
+        let Some(index) = stream.get("Index").and_then(json_value_i64) else {
+            continue;
+        };
+        if first_audio_index.is_none() {
+            first_audio_index = Some(index);
+        }
+        if stream
+            .get("IsDefault")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Some(index);
+        }
+    }
+
+    first_audio_index
+}
+
+fn default_subtitle_stream_index(media_streams: &[serde_json::Value]) -> Option<i64> {
+    media_streams.iter().find_map(|stream| {
+        let stream = stream.as_object()?;
+        let type_name = stream.get("Type").and_then(serde_json::Value::as_str)?;
+        if !type_name.eq_ignore_ascii_case("Subtitle") {
+            return None;
+        }
+        if !stream
+            .get("IsDefault")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        stream.get("Index").and_then(json_value_i64)
+    })
+}
+
+fn json_value_i64(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Number(value) => value.as_i64(),
+        serde_json::Value::String(value) => value.parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 fn item_counts_json(items: &[MediaItem]) -> serde_json::Value {
@@ -7263,9 +7323,9 @@ mod tests {
 
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
-        DEFAULT_PASSWORD_RESET_PROVIDER_ID, load_countries, load_cultures,
-        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs, router,
-        subscribe_playback_events,
+        DEFAULT_PASSWORD_RESET_PROVIDER_ID, default_audio_stream_index,
+        default_subtitle_stream_index, load_countries, load_cultures, parse_authorization_token,
+        parse_jellyfin_uuid, parse_media_browser_pairs, router, subscribe_playback_events,
     };
     use axum::{
         body::Body,
@@ -7289,6 +7349,26 @@ mod tests {
             ),
             Some("tok".to_string())
         );
+    }
+
+    #[test]
+    fn default_stream_indexes_follow_jellyfin_selection_basics() {
+        let streams = vec![
+            json!({ "Type": "Audio", "Index": 1, "IsDefault": false }),
+            json!({ "Type": "Audio", "Index": 5, "IsDefault": true }),
+            json!({ "Type": "Subtitle", "Index": 2, "IsDefault": false }),
+            json!({ "Type": "Subtitle", "Index": "8", "IsDefault": true }),
+        ];
+
+        assert_eq!(default_audio_stream_index(&streams), Some(5));
+        assert_eq!(default_subtitle_stream_index(&streams), Some(8));
+
+        let streams = vec![
+            json!({ "Type": "Audio", "Index": "3" }),
+            json!({ "Type": "Subtitle", "Index": 4, "IsDefault": false }),
+        ];
+        assert_eq!(default_audio_stream_index(&streams), Some(3));
+        assert_eq!(default_subtitle_stream_index(&streams), None);
     }
 
     #[test]
@@ -12044,8 +12124,17 @@ mod tests {
                         "Type": "Audio",
                         "Index": 1,
                         "Codec": "aac",
+                        "IsDefault": true,
                         "Channels": 2,
                         "SampleRate": 48000
+                    }),
+                    json!({
+                        "Type": "Subtitle",
+                        "Index": 2,
+                        "Codec": "subrip",
+                        "IsDefault": true,
+                        "IsForced": false,
+                        "IsTextSubtitleStream": true
                     }),
                 ],
             )
@@ -12399,6 +12488,8 @@ mod tests {
         assert_eq!(detail["MediaSources"][0]["Size"], 10);
         assert_eq!(detail["MediaSources"][0]["RunTimeTicks"], 987_650_000);
         assert_eq!(detail["MediaSources"][0]["Bitrate"], 2_500_000);
+        assert_eq!(detail["MediaSources"][0]["DefaultAudioStreamIndex"], 1);
+        assert_eq!(detail["MediaSources"][0]["DefaultSubtitleStreamIndex"], 2);
         assert_eq!(
             detail["MediaSources"][0]["DirectStreamUrl"],
             format!("/Videos/{item_id}/stream")
@@ -12422,6 +12513,9 @@ mod tests {
         assert_eq!(detail["MediaStreams"][1]["Codec"], "aac");
         assert_eq!(detail["MediaStreams"][1]["Channels"], 2);
         assert_eq!(detail["MediaStreams"][1]["SampleRate"], 48000);
+        assert_eq!(detail["MediaStreams"][2]["Type"], "Subtitle");
+        assert_eq!(detail["MediaStreams"][2]["Codec"], "subrip");
+        assert_eq!(detail["MediaStreams"][2]["Index"], 2);
         assert_eq!(detail["People"].as_array().unwrap().len(), 0);
         assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
         assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
@@ -12698,6 +12792,14 @@ mod tests {
         );
         assert_eq!(playback_info["MediaSources"][0]["Bitrate"], 2_500_000);
         assert_eq!(
+            playback_info["MediaSources"][0]["DefaultAudioStreamIndex"],
+            1
+        );
+        assert_eq!(
+            playback_info["MediaSources"][0]["DefaultSubtitleStreamIndex"],
+            2
+        );
+        assert_eq!(
             playback_info["MediaSources"][0]["MediaStreams"][0]["Width"],
             1920
         );
@@ -12712,6 +12814,10 @@ mod tests {
         assert_eq!(
             playback_info["MediaSources"][0]["MediaStreams"][1]["Channels"],
             2
+        );
+        assert_eq!(
+            playback_info["MediaSources"][0]["MediaStreams"][2]["Type"],
+            "Subtitle"
         );
 
         let response = app
