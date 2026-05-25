@@ -17141,6 +17141,7 @@ async fn item_counts_json(
     let metadata_counts = item_count_metadata_values(db, items).await?;
     let artist_count = metadata_counts.artist_values.len();
     album_count += metadata_counts.album_values.len();
+    let trailer_count = metadata_counts.trailer_count;
 
     Ok(serde_json::json!({
         "MovieCount": movie_count,
@@ -17148,7 +17149,7 @@ async fn item_counts_json(
         "EpisodeCount": episode_count,
         "ArtistCount": artist_count,
         "ProgramCount": 0,
-        "TrailerCount": 0,
+        "TrailerCount": trailer_count,
         "SongCount": song_count,
         "AlbumCount": album_count,
         "MusicVideoCount": music_video_count,
@@ -17162,6 +17163,7 @@ async fn item_counts_json(
 struct ItemCountMetadataValues {
     album_values: BTreeMap<String, String>,
     artist_values: BTreeMap<String, String>,
+    trailer_count: usize,
 }
 
 async fn item_count_metadata_values(
@@ -17179,9 +17181,35 @@ async fn item_count_metadata_values(
             collect_item_count_metadata_value(&metadata, "AlbumName", &mut values.album_values);
             collect_item_count_metadata_value(&metadata, "Artists", &mut values.artist_values);
             collect_item_count_metadata_value(&metadata, "AlbumArtists", &mut values.artist_values);
+            values.trailer_count += metadata_remote_trailer_count(&metadata.payload);
         }
     }
     Ok(values)
+}
+
+fn metadata_remote_trailer_count(metadata: &serde_json::Value) -> usize {
+    ["RemoteTrailers", "Trailers"]
+        .into_iter()
+        .filter_map(|key| json_field_case_insensitive(metadata, key))
+        .map(count_remote_trailer_values)
+        .sum()
+}
+
+fn count_remote_trailer_values(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => values.iter().map(count_remote_trailer_values).sum(),
+        serde_json::Value::String(url) => usize::from(non_empty_json_string(url).is_some()),
+        serde_json::Value::Object(object) => object
+            .get("Url")
+            .or_else(|| object.get("url"))
+            .or_else(|| object.get("Path"))
+            .or_else(|| object.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(non_empty_json_string)
+            .map(|_| 1)
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn collect_item_count_metadata_value(
@@ -25673,6 +25701,7 @@ mod tests {
         assert_eq!(counts["SongCount"], 0);
         assert_eq!(counts["ArtistCount"], 3);
         assert_eq!(counts["AlbumCount"], 1);
+        assert_eq!(counts["TrailerCount"], 1);
         assert_eq!(counts["BookCount"], 0);
 
         let response = app
@@ -25695,6 +25724,7 @@ mod tests {
         assert_eq!(filtered_counts["ItemCount"], 1);
         assert_eq!(filtered_counts["ArtistCount"], 3);
         assert_eq!(filtered_counts["AlbumCount"], 1);
+        assert_eq!(filtered_counts["TrailerCount"], 1);
 
         let response = app
             .clone()
