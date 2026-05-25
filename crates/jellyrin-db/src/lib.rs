@@ -75,6 +75,25 @@ pub struct MediaItemMetadata {
 }
 
 #[derive(Debug, Clone)]
+pub struct MediaList {
+    pub id: Uuid,
+    pub kind: String,
+    pub name: String,
+    pub collection_type: Option<String>,
+    pub owner_user_id: Option<Uuid>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaListItem {
+    pub item: MediaItem,
+    pub playlist_item_id: Uuid,
+    pub position: i64,
+    pub added_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct QuickConnectSession {
     pub secret: String,
     pub code: String,
@@ -2336,6 +2355,23 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn media_item_by_id(&self, item_id: Uuid) -> anyhow::Result<MediaItem> {
+        let row = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
+            FROM media_items
+            WHERE id = ?1 AND missing_since IS NULL
+            "#,
+        )
+        .bind(item_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
     pub async fn media_item_versions(&self, item_id: Uuid) -> anyhow::Result<Vec<MediaItem>> {
         let item_id = item_id.to_string();
         let links = sqlx::query_as::<_, MediaItemVersionRow>(
@@ -2526,6 +2562,267 @@ impl Database {
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn create_media_list(
+        &self,
+        kind: &str,
+        name: &str,
+        collection_type: Option<&str>,
+        owner_user_id: Option<Uuid>,
+        item_ids: Vec<Uuid>,
+    ) -> anyhow::Result<MediaList> {
+        let kind = kind.trim();
+        let name = name.trim();
+        anyhow::ensure!(!kind.is_empty(), "media list kind must not be empty");
+        anyhow::ensure!(!name.is_empty(), "media list name must not be empty");
+        let id = Uuid::new_v4();
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_lists (
+                id, kind, name, collection_type, owner_user_id, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(kind)
+        .bind(name)
+        .bind(collection_type)
+        .bind(owner_user_id.map(|id| id.to_string()))
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        self.add_media_list_items(id, item_ids).await?;
+        self.media_list_by_id(id).await
+    }
+
+    pub async fn media_lists(&self, kind: &str) -> anyhow::Result<Vec<MediaList>> {
+        let rows = sqlx::query_as::<_, MediaListRow>(
+            r#"
+            SELECT id, kind, name, collection_type, owner_user_id, created_at, updated_at
+            FROM media_lists
+            WHERE kind = ?1
+            ORDER BY name COLLATE NOCASE
+            "#,
+        )
+        .bind(kind)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn media_list_by_id(&self, list_id: Uuid) -> anyhow::Result<MediaList> {
+        let row = sqlx::query_as::<_, MediaListRow>(
+            r#"
+            SELECT id, kind, name, collection_type, owner_user_id, created_at, updated_at
+            FROM media_lists
+            WHERE id = ?1
+            "#,
+        )
+        .bind(list_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+
+        row.try_into()
+    }
+
+    pub async fn update_media_list_name(
+        &self,
+        list_id: Uuid,
+        name: &str,
+    ) -> anyhow::Result<MediaList> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "media list name must not be empty");
+        sqlx::query(
+            r#"
+            UPDATE media_lists
+            SET name = ?2, updated_at = ?3
+            WHERE id = ?1
+            "#,
+        )
+        .bind(list_id.to_string())
+        .bind(name)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .execute(&self.pool)
+        .await?;
+
+        self.media_list_by_id(list_id).await
+    }
+
+    pub async fn add_media_list_items(
+        &self,
+        list_id: Uuid,
+        item_ids: Vec<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.media_list_by_id(list_id).await?;
+        let mut position = self.next_media_list_position(list_id).await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        for item_id in dedupe_uuids(item_ids) {
+            self.media_item_by_id(item_id).await?;
+            sqlx::query(
+                r#"
+                INSERT INTO media_list_items (
+                    list_id, item_id, playlist_item_id, position, added_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(list_id, item_id) DO NOTHING
+                "#,
+            )
+            .bind(list_id.to_string())
+            .bind(item_id.to_string())
+            .bind(Uuid::new_v4().to_string())
+            .bind(position)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+            position += 1;
+        }
+        self.touch_media_list(list_id).await
+    }
+
+    pub async fn remove_media_list_items(
+        &self,
+        list_id: Uuid,
+        item_ids: Vec<Uuid>,
+        playlist_item_ids: Vec<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.media_list_by_id(list_id).await?;
+        for item_id in dedupe_uuids(item_ids) {
+            sqlx::query("DELETE FROM media_list_items WHERE list_id = ?1 AND item_id = ?2")
+                .bind(list_id.to_string())
+                .bind(item_id.to_string())
+                .execute(&self.pool)
+                .await?;
+        }
+        for playlist_item_id in dedupe_uuids(playlist_item_ids) {
+            sqlx::query(
+                "DELETE FROM media_list_items WHERE list_id = ?1 AND playlist_item_id = ?2",
+            )
+            .bind(list_id.to_string())
+            .bind(playlist_item_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        }
+        self.reindex_media_list(list_id).await?;
+        self.touch_media_list(list_id).await
+    }
+
+    pub async fn move_media_list_item(
+        &self,
+        list_id: Uuid,
+        item_id: Uuid,
+        new_index: i64,
+    ) -> anyhow::Result<()> {
+        let mut rows = self.media_list_item_ids(list_id).await?;
+        let Some(current_index) = rows.iter().position(|row| row.0 == item_id) else {
+            anyhow::bail!("media list item not found");
+        };
+        let row = rows.remove(current_index);
+        let target = new_index.max(0).min(rows.len() as i64) as usize;
+        rows.insert(target, row);
+        self.update_media_list_positions(list_id, rows).await?;
+        self.touch_media_list(list_id).await
+    }
+
+    pub async fn media_list_items(&self, list_id: Uuid) -> anyhow::Result<Vec<MediaListItem>> {
+        self.media_list_by_id(list_id).await?;
+        let rows = sqlx::query_as::<_, MediaListItemRow>(
+            r#"
+            SELECT media_list_items.playlist_item_id,
+                   media_list_items.position,
+                   media_list_items.added_at,
+                   media_items.id,
+                   media_items.virtual_folder_id,
+                   media_items.name,
+                   media_items.path,
+                   media_items.media_type,
+                   media_items.collection_type,
+                   media_items.file_size,
+                   media_items.runtime_ticks,
+                   media_items.bitrate,
+                   media_items.width,
+                   media_items.height,
+                   media_items.media_streams_json,
+                   media_items.created_at,
+                   media_items.updated_at
+            FROM media_list_items
+            INNER JOIN media_items ON media_items.id = media_list_items.item_id
+            WHERE media_list_items.list_id = ?1
+              AND media_items.missing_since IS NULL
+            ORDER BY media_list_items.position ASC, media_items.name COLLATE NOCASE
+            "#,
+        )
+        .bind(list_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn next_media_list_position(&self, list_id: Uuid) -> anyhow::Result<i64> {
+        let max_position: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(position) FROM media_list_items WHERE list_id = ?1")
+                .bind(list_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(max_position.map_or(0, |position| position + 1))
+    }
+
+    async fn media_list_item_ids(&self, list_id: Uuid) -> anyhow::Result<Vec<(Uuid, Uuid)>> {
+        let rows = sqlx::query_as::<_, MediaListItemIdRow>(
+            r#"
+            SELECT item_id, playlist_item_id
+            FROM media_list_items
+            WHERE list_id = ?1
+            ORDER BY position ASC
+            "#,
+        )
+        .bind(list_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    async fn reindex_media_list(&self, list_id: Uuid) -> anyhow::Result<()> {
+        let rows = self.media_list_item_ids(list_id).await?;
+        self.update_media_list_positions(list_id, rows).await
+    }
+
+    async fn update_media_list_positions(
+        &self,
+        list_id: Uuid,
+        rows: Vec<(Uuid, Uuid)>,
+    ) -> anyhow::Result<()> {
+        for (position, (item_id, playlist_item_id)) in rows.into_iter().enumerate() {
+            sqlx::query(
+                r#"
+                UPDATE media_list_items
+                SET position = ?3
+                WHERE list_id = ?1 AND item_id = ?2 AND playlist_item_id = ?4
+                "#,
+            )
+            .bind(list_id.to_string())
+            .bind(item_id.to_string())
+            .bind(position as i64)
+            .bind(playlist_item_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn touch_media_list(&self, list_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE media_lists SET updated_at = ?2 WHERE id = ?1")
+            .bind(list_id.to_string())
+            .bind(format_time(OffsetDateTime::now_utc())?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn upsert_playback_state(&self, playback: UpsertPlaybackState) -> anyhow::Result<()> {
@@ -3545,6 +3842,44 @@ struct MediaItemMetadataRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct MediaListRow {
+    id: String,
+    kind: String,
+    name: String,
+    collection_type: Option<String>,
+    owner_user_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MediaListItemRow {
+    playlist_item_id: String,
+    position: i64,
+    added_at: String,
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    media_streams_json: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MediaListItemIdRow {
+    item_id: String,
+    playlist_item_id: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct MediaItemIdRow {
     id: String,
 }
@@ -3762,6 +4097,68 @@ impl TryFrom<MediaItemMetadataRow> for MediaItemMetadata {
             payload: serde_json::from_str(&row.metadata_json)
                 .context("invalid media item metadata json")?,
         })
+    }
+}
+
+impl TryFrom<MediaListRow> for MediaList {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaListRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: Uuid::parse_str(&row.id).context("invalid media list id")?,
+            kind: row.kind,
+            name: row.name,
+            collection_type: row.collection_type,
+            owner_user_id: row
+                .owner_user_id
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .context("invalid media list owner user id")?,
+            created_at: parse_time(&row.created_at)?,
+            updated_at: parse_time(&row.updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<MediaListItemRow> for MediaListItem {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaListItemRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            item: MediaItem {
+                id: Uuid::parse_str(&row.id).context("invalid media list item id")?,
+                virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                    .context("invalid media list item virtual folder id")?,
+                name: row.name,
+                path: row.path,
+                media_type: row.media_type,
+                collection_type: row.collection_type,
+                file_size: row.file_size,
+                runtime_ticks: row.runtime_ticks,
+                bitrate: row.bitrate,
+                width: row.width,
+                height: row.height,
+                media_streams: parse_media_streams_json(&row.media_streams_json)?,
+                created_at: parse_time(&row.created_at)?,
+                updated_at: parse_time(&row.updated_at)?,
+            },
+            playlist_item_id: Uuid::parse_str(&row.playlist_item_id)
+                .context("invalid playlist item id")?,
+            position: row.position,
+            added_at: parse_time(&row.added_at)?,
+        })
+    }
+}
+
+impl TryFrom<MediaListItemIdRow> for (Uuid, Uuid) {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaListItemIdRow) -> Result<Self, Self::Error> {
+        Ok((
+            Uuid::parse_str(&row.item_id).context("invalid media list item id")?,
+            Uuid::parse_str(&row.playlist_item_id).context("invalid playlist item id")?,
+        ))
     }
 }
 
@@ -4095,6 +4492,14 @@ fn parse_time(value: &str) -> anyhow::Result<OffsetDateTime> {
 
 fn parse_media_streams_json(value: &str) -> anyhow::Result<Vec<Value>> {
     serde_json::from_str(value).context("invalid media streams json in database")
+}
+
+fn dedupe_uuids(values: Vec<Uuid>) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(*value))
+        .collect()
 }
 
 fn is_unique_constraint_error(error: &sqlx::Error) -> bool {

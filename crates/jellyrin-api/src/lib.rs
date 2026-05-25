@@ -31,9 +31,9 @@ use jellyrin_core::{
 };
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
-    BackupManifest, BrandingConfig, Database, DeviceSession, QuickConnectSession, SortDirection,
-    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    UpsertActivePlaybackSession, UpsertPlaybackState, UpsertTranscodeSession,
+    BackupManifest, BrandingConfig, Database, DeviceSession, MediaList, MediaListItem,
+    QuickConnectSession, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
+    TrickplayInfo, UpsertActivePlaybackSession, UpsertPlaybackState, UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -696,6 +696,76 @@ pub fn router(state: AppState) -> Router {
         .route("/Library/VirtualFolders", get(get_virtual_folders))
         .route("/Library/VirtualFolders", post(add_virtual_folder))
         .route("/Library/VirtualFolders", delete(delete_virtual_folder))
+        .route("/Collections", post(create_collection))
+        .route("/collections", post(create_collection))
+        .route(
+            "/Collections/{collection_id}/Items",
+            post(add_collection_items),
+        )
+        .route(
+            "/collections/{collection_id}/items",
+            post(add_collection_items),
+        )
+        .route(
+            "/Collections/{collection_id}/Items",
+            delete(remove_collection_items),
+        )
+        .route(
+            "/collections/{collection_id}/items",
+            delete(remove_collection_items),
+        )
+        .route("/Playlists", post(create_playlist))
+        .route("/playlists", post(create_playlist))
+        .route("/Playlists/{playlist_id}", get(get_playlist))
+        .route("/playlists/{playlist_id}", get(get_playlist))
+        .route("/Playlists/{playlist_id}", post(update_playlist))
+        .route("/playlists/{playlist_id}", post(update_playlist))
+        .route("/Playlists/{playlist_id}/Items", get(get_playlist_items))
+        .route("/playlists/{playlist_id}/items", get(get_playlist_items))
+        .route("/Playlists/{playlist_id}/Items", post(add_playlist_items))
+        .route("/playlists/{playlist_id}/items", post(add_playlist_items))
+        .route(
+            "/Playlists/{playlist_id}/Items",
+            delete(remove_playlist_items),
+        )
+        .route(
+            "/playlists/{playlist_id}/items",
+            delete(remove_playlist_items),
+        )
+        .route(
+            "/Playlists/{playlist_id}/Items/{item_id}/Move/{new_index}",
+            post(move_playlist_item),
+        )
+        .route(
+            "/playlists/{playlist_id}/items/{item_id}/move/{new_index}",
+            post(move_playlist_item),
+        )
+        .route("/Playlists/{playlist_id}/Users", get(get_playlist_users))
+        .route("/playlists/{playlist_id}/users", get(get_playlist_users))
+        .route(
+            "/Playlists/{playlist_id}/Users/{user_id}",
+            get(get_playlist_user),
+        )
+        .route(
+            "/playlists/{playlist_id}/users/{user_id}",
+            get(get_playlist_user),
+        )
+        .route(
+            "/Playlists/{playlist_id}/Users/{user_id}",
+            post(add_playlist_user),
+        )
+        .route(
+            "/playlists/{playlist_id}/users/{user_id}",
+            post(add_playlist_user),
+        )
+        .route(
+            "/Playlists/{playlist_id}/Users/{user_id}",
+            delete(remove_playlist_user),
+        )
+        .route(
+            "/playlists/{playlist_id}/users/{user_id}",
+            delete(remove_playlist_user),
+        )
         .route(
             "/Library/VirtualFolders/Paths",
             post(add_virtual_folder_path),
@@ -6650,6 +6720,504 @@ fn virtual_folder_to_json(folder: &VirtualFolder) -> serde_json::Value {
         "PrimaryImageItemId": null,
         "RefreshProgress": null,
         "RefreshStatus": "Idle"
+    })
+}
+
+async fn create_collection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let body = body.map(|Json(value)| value);
+    let name = list_name_from_request(raw_query.as_deref(), body.as_ref())
+        .unwrap_or_else(|| "Collection".to_string());
+    let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
+    let collection = state
+        .db
+        .create_media_list("collection", &name, Some("boxsets"), None, item_ids)
+        .await?;
+    Ok(Json(list_created_json(&collection)))
+}
+
+async fn add_collection_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(collection_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let collection_id = parse_jellyfin_uuid(&collection_id)?;
+    ensure_media_list_kind(&state.db, collection_id, "collection").await?;
+    let body = body.map(|Json(value)| value);
+    let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
+    state
+        .db
+        .add_media_list_items(collection_id, item_ids)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_collection_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(collection_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let collection_id = parse_jellyfin_uuid(&collection_id)?;
+    ensure_media_list_kind(&state.db, collection_id, "collection").await?;
+    let item_ids = list_item_ids_from_request(raw_query.as_deref(), None)?;
+    state
+        .db
+        .remove_media_list_items(collection_id, item_ids, Vec::new())
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn create_playlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let body = body.map(|Json(value)| value);
+    let requested_user_id = query_string_value(raw_query.as_deref(), &["UserId"])
+        .or_else(|| json_string_field_from_body(body.as_ref(), &["UserId", "userId"]))
+        .map(|value| resolve_user_id(&value))
+        .transpose()?
+        .unwrap_or(user.id);
+    ensure_user_access(&user, requested_user_id)?;
+    let name = list_name_from_request(raw_query.as_deref(), body.as_ref())
+        .unwrap_or_else(|| "Playlist".to_string());
+    let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
+    let playlist = state
+        .db
+        .create_media_list(
+            "playlist",
+            &name,
+            Some("playlists"),
+            Some(requested_user_id),
+            item_ids,
+        )
+        .await?;
+    Ok(Json(list_created_json(&playlist)))
+}
+
+async fn get_playlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(playlist_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let child_count = state.db.media_list_items(playlist.id).await?.len();
+    Ok(Json(media_list_to_json(&playlist, &server_id, child_count)))
+}
+
+async fn update_playlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(playlist_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    let body = body.map(|Json(value)| value);
+    if let Some(name) = list_name_from_request(raw_query.as_deref(), body.as_ref()) {
+        state.db.update_media_list_name(playlist.id, &name).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_playlist_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(playlist_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    let mut items = state.db.media_list_items(playlist.id).await?;
+    let start_index = query_string_value(raw_query.as_deref(), &["StartIndex", "startIndex"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = query_string_value(raw_query.as_deref(), &["Limit", "limit"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    let total_record_count = items.len();
+    items = items.into_iter().skip(start_index).take(limit).collect();
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let values = media_list_items_to_json(&state.db, items, &server_id, Some(user.id)).await?;
+    Ok(Json(query_result_with_total(
+        values,
+        total_record_count,
+        start_index,
+    )))
+}
+
+async fn add_playlist_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(playlist_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    let body = body.map(|Json(value)| value);
+    let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
+    state.db.add_media_list_items(playlist.id, item_ids).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_playlist_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(playlist_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    let item_ids = query_uuid_values(raw_query.as_deref(), &["ItemIds", "itemIds"])?;
+    let playlist_item_ids = query_uuid_values(
+        raw_query.as_deref(),
+        &["PlaylistItemIds", "playlistItemIds", "EntryIds", "entryIds"],
+    )?;
+    state
+        .db
+        .remove_media_list_items(playlist.id, item_ids, playlist_item_ids)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn move_playlist_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((playlist_id, item_id, new_index)): Path<(String, String, i64)>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    state
+        .db
+        .move_media_list_item(playlist.id, parse_jellyfin_uuid(&item_id)?, new_index)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_playlist_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(playlist_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    Ok(Json(playlist_users_json(&state.db, &playlist).await?))
+}
+
+async fn get_playlist_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((playlist_id, user_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    let requested_user = state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    Ok(Json(playlist_user_json(
+        &requested_user,
+        playlist.owner_user_id == Some(requested_user.id),
+    )))
+}
+
+async fn add_playlist_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((playlist_id, user_id)): Path<(String, String)>,
+    _body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_playlist_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((playlist_id, user_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let playlist =
+        ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
+    ensure_media_list_access(&user, &playlist)?;
+    state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn list_created_json(list: &MediaList) -> serde_json::Value {
+    serde_json::json!({
+        "Id": list.id.simple().to_string()
+    })
+}
+
+async fn ensure_media_list_kind(
+    db: &Database,
+    list_id: Uuid,
+    expected_kind: &str,
+) -> Result<MediaList, ApiError> {
+    let list = db
+        .media_list_by_id(list_id)
+        .await
+        .map_err(|_| ApiError::not_found("List not found"))?;
+    if list.kind == expected_kind {
+        Ok(list)
+    } else {
+        Err(ApiError::not_found("List not found"))
+    }
+}
+
+fn ensure_media_list_access(user: &User, list: &MediaList) -> Result<(), ApiError> {
+    if user.is_administrator
+        || list
+            .owner_user_id
+            .is_none_or(|owner_id| owner_id == user.id)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("Playlist access denied"))
+    }
+}
+
+fn list_name_from_request(
+    raw_query: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Option<String> {
+    query_string_value(raw_query, &["Name", "name"])
+        .or_else(|| json_string_field_from_body(body, &["Name", "name"]))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn list_item_ids_from_request(
+    raw_query: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> Result<Vec<Uuid>, ApiError> {
+    let mut ids = query_uuid_values(raw_query, &["Ids", "ids", "ItemIds", "itemIds"])?;
+    ids.extend(json_uuid_values_from_body(
+        body,
+        &["Ids", "ids", "ItemIds", "itemIds"],
+    )?);
+    Ok(dedupe_uuid_vec(ids))
+}
+
+fn query_string_value(raw_query: Option<&str>, names: &[&str]) -> Option<String> {
+    query_string_values(raw_query, names).into_iter().next()
+}
+
+fn query_uuid_values(raw_query: Option<&str>, names: &[&str]) -> Result<Vec<Uuid>, ApiError> {
+    query_string_values(raw_query, names)
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .map(|value| parse_jellyfin_uuid(&value))
+        .collect::<Result<Vec<_>, _>>()
+        .map(dedupe_uuid_vec)
+}
+
+fn query_string_values(raw_query: Option<&str>, names: &[&str]) -> Vec<String> {
+    let Some(raw_query) = raw_query else {
+        return Vec::new();
+    };
+    let names = names
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    raw_query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter_map(|(key, value)| {
+            let key = percent_decode_query_component(key).to_ascii_lowercase();
+            if names.iter().any(|name| name == &key) {
+                Some(percent_decode_query_component(value))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn json_string_field_from_body(body: Option<&serde_json::Value>, names: &[&str]) -> Option<String> {
+    let body = body?;
+    names
+        .iter()
+        .find_map(|name| body.get(*name).and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+}
+
+fn json_uuid_values_from_body(
+    body: Option<&serde_json::Value>,
+    names: &[&str],
+) -> Result<Vec<Uuid>, ApiError> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = names.iter().find_map(|name| body.get(*name)) else {
+        return Ok(Vec::new());
+    };
+    match value {
+        serde_json::Value::String(value) => parse_uuid_list(value),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(parse_jellyfin_uuid)
+            .collect::<Result<Vec<_>, _>>()
+            .map(dedupe_uuid_vec),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn dedupe_uuid_vec(values: Vec<Uuid>) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(*value))
+        .collect()
+}
+
+fn media_list_to_json(list: &MediaList, server_id: &str, child_count: usize) -> serde_json::Value {
+    let item_type = if list.kind == "collection" {
+        "BoxSet"
+    } else {
+        "Playlist"
+    };
+    serde_json::json!({
+        "Name": list.name,
+        "ServerId": server_id,
+        "Id": list.id.simple().to_string(),
+        "Etag": null,
+        "DateCreated": list.created_at.to_string(),
+        "DateLastMediaAdded": list.updated_at.to_string(),
+        "CanDelete": true,
+        "CanDownload": false,
+        "SortName": list.name,
+        "ExternalUrls": [],
+        "Path": null,
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": {},
+        "IsFolder": true,
+        "ParentId": null,
+        "Type": item_type,
+        "MediaType": null,
+        "CollectionType": list.collection_type,
+        "ChildCount": child_count,
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "LocationType": "Virtual",
+        "OwnerUserId": list.owner_user_id.map(|id| id.simple().to_string())
+    })
+}
+
+async fn media_list_items_to_json(
+    db: &Database,
+    items: Vec<MediaListItem>,
+    server_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        let playback = if let Some(user_id) = user_id {
+            db.playback_state_for_item(user_id, item.item.id).await?
+        } else {
+            None
+        };
+        let mut value = media_item_to_json_with_playback(&item.item, server_id, playback.as_ref());
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "PlaylistItemId".to_string(),
+                serde_json::json!(item.playlist_item_id.simple().to_string()),
+            );
+            object.insert(
+                "IndexNumber".to_string(),
+                serde_json::json!(item.position + 1),
+            );
+            object.insert(
+                "DateCreated".to_string(),
+                serde_json::json!(item.added_at.to_string()),
+            );
+        }
+        values.push(value);
+    }
+    Ok(values)
+}
+
+async fn playlist_users_json(
+    db: &Database,
+    playlist: &MediaList,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    if let Some(owner_id) = playlist.owner_user_id {
+        let owner = db.user_by_id(owner_id).await?;
+        Ok(vec![playlist_user_json(&owner, true)])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn playlist_user_json(user: &User, is_owner: bool) -> serde_json::Value {
+    serde_json::json!({
+        "Id": user.id.simple().to_string(),
+        "UserId": user.id.simple().to_string(),
+        "Name": user.name,
+        "CanEdit": is_owner || user.is_administrator,
+        "IsOwner": is_owner
     })
 }
 
@@ -21979,6 +22547,337 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn collections_and_playlists_persist_items_and_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_movie = tmp.path().join("First Movie.mp4");
+        let second_movie = tmp.path().join("Second Movie.mp4");
+        tokio::fs::write(&first_movie, b"first").await.unwrap();
+        tokio::fs::write(&second_movie, b"second").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let admin_key = db
+            .issue_api_key_for_user(admin.id, "playlist-admin-key")
+            .await
+            .unwrap();
+        let viewer = db.create_user("viewer", Some("secret")).await.unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let items = test_db.media_items().await.unwrap();
+        assert_eq!(items.len(), 2);
+        let first_id = items
+            .iter()
+            .find(|item| item.name == "First Movie")
+            .unwrap()
+            .id
+            .simple()
+            .to_string();
+        let second_id = items
+            .iter()
+            .find(|item| item.name == "Second Movie")
+            .unwrap()
+            .id
+            .simple()
+            .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Playlists?Name=Road%20Trip&Ids={first_id},{second_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Playlists?Name=Road%20Trip&Ids={first_id},{second_id}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created_playlist: Value = serde_json::from_slice(&body).unwrap();
+        let playlist_id = created_playlist["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playlist["Name"], "Road Trip");
+        assert_eq!(playlist["Type"], "Playlist");
+        assert_eq!(playlist["ChildCount"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}/Items?Limit=1"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playlist_items["TotalRecordCount"], 2);
+        assert_eq!(playlist_items["Items"].as_array().unwrap().len(), 1);
+        assert!(
+            playlist_items["Items"][0]["PlaylistItemId"]
+                .as_str()
+                .is_some()
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Playlists/{playlist_id}/Items/{second_id}/Move/0"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}/Items"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playlist_items["Items"][0]["Id"], second_id);
+        let first_playlist_item_id = playlist_items["Items"][1]["PlaylistItemId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/Playlists/{playlist_id}/Items?PlaylistItemIds={first_playlist_item_id}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Playlists/{playlist_id}/Items"))
+                    .header("X-Emby-Token", &admin_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Ids": [first_id] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Playlists/{playlist_id}?Name=Renamed"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}/Users"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let users: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(users[0]["UserId"], admin.id.simple().to_string());
+        assert_eq!(users[0]["IsOwner"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Playlists/{playlist_id}/Users/{}",
+                        viewer.id.simple()
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "CanEdit": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Playlists/{playlist_id}/Users/{}",
+                        viewer.id.simple()
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist_user: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playlist_user["UserId"], viewer.id.simple().to_string());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/Playlists/{playlist_id}/Users/{}",
+                        viewer.id.simple()
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Collections?name=Favorites&ids={first_id}"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let collection: Value = serde_json::from_slice(&body).unwrap();
+        let collection_id = collection["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Collections/{collection_id}/Items?ids={second_id}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Collections/{collection_id}/Items?ids={first_id}"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
