@@ -1967,10 +1967,10 @@ pub fn router(state: AppState) -> Router {
         .route("/userlibrary/items/root", get(root_folder))
         .route("/UserLibrary/Items/{item_id}", get(current_user_item_detail))
         .route("/userlibrary/items/{item_id}", get(current_user_item_detail))
-        .route("/Library/Items/{item_id}/Download", get(direct_stream_item))
-        .route("/library/items/{item_id}/download", get(direct_stream_item))
-        .route("/Library/Items/{item_id}/File", get(direct_stream_item))
-        .route("/library/items/{item_id}/file", get(direct_stream_item))
+        .route("/Library/Items/{item_id}/Download", get(download_item_file))
+        .route("/library/items/{item_id}/download", get(download_item_file))
+        .route("/Library/Items/{item_id}/File", get(library_item_file))
+        .route("/library/items/{item_id}/file", get(library_item_file))
         .route("/Library/Items", delete(delete_library_items))
         .route("/library/items", delete(delete_library_items))
         .route("/Library/Items/{item_id}", delete(delete_library_item))
@@ -11160,6 +11160,40 @@ async fn direct_stream_item_head(
     .await
 }
 
+async fn library_item_file(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    library_item_file_response(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        query.media_source_id.as_deref(),
+        false,
+    )
+    .await
+}
+
+async fn download_item_file(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    library_item_file_response(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        query.media_source_id.as_deref(),
+        true,
+    )
+    .await
+}
+
 async fn hls_master_playlist(
     State(state): State<AppState>,
     Path(item_id): Path<String>,
@@ -14060,6 +14094,55 @@ async fn direct_stream_media(
     }
 
     stream_media_item(item, headers, include_body).await
+}
+
+async fn library_item_file_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    api_key: Option<&str>,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    download: bool,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, headers, api_key).await?;
+    let requested_item = media_item_by_id(&state.db, item_id).await?;
+    let item = resolve_media_source_item(&state.db, requested_item, media_source_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("File not found"))?;
+    let file_name = download.then(|| media_item_download_file_name(&item));
+    let mut response = stream_media_item(item, headers, true).await?;
+    if let Some(file_name) = file_name {
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{file_name}\"")
+                .parse()
+                .unwrap(),
+        );
+    }
+    Ok(response)
+}
+
+fn media_item_download_file_name(item: &MediaItem) -> String {
+    media_item_path(item)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_download_file_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}.{}",
+                item.id.simple(),
+                media_item_container(item).unwrap_or_else(|| "bin".to_string())
+            )
+        })
+}
+
+fn sanitize_download_file_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| !matches!(character, '"' | '\\' | '\r' | '\n'))
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 async fn stream_media_item(
@@ -28547,6 +28630,150 @@ mod tests {
         let intros: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(intros["TotalRecordCount"], 0);
         assert_eq!(intros["Items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn library_file_and_download_headers_match_jellyfin_baseline() {
+        let movie_dir = tempfile::tempdir().unwrap();
+        let music_dir = tempfile::tempdir().unwrap();
+        let movie = movie_dir.path().join("Download Movie.mp4");
+        let song = music_dir.path().join("Download Song.mp3");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+        tokio::fs::write(&song, b"fake audio").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "download-test-key")
+            .await
+            .unwrap();
+        let movies = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![movie_dir.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(movies.id).await.unwrap();
+        let music = db
+            .upsert_virtual_folder(
+                "Music",
+                Some("music"),
+                vec![music_dir.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(music.id).await.unwrap();
+
+        let items = db.media_items().await.unwrap();
+        let movie_id = items
+            .iter()
+            .find(|item| item.name == "Download Movie")
+            .unwrap()
+            .id
+            .simple()
+            .to_string();
+        let song_id = items
+            .iter()
+            .find(|item| item.name == "Download Song")
+            .unwrap()
+            .id
+            .simple()
+            .to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Library/Items/{movie_id}/File"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(
+            response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "10"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .is_none()
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake video");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Library/Items/{movie_id}/Download"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-3/10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"Download Movie.mp4\""
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Library/Items/{song_id}/Download"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"Download Song.mp3\""
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake audio");
     }
 
     #[tokio::test]
