@@ -2,7 +2,9 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::Context;
 use clap::Parser;
-use jellyrin_api::{AppState, reconcile_transcode_sessions_on_startup, router};
+use jellyrin_api::{
+    AppState, reconcile_transcode_sessions_on_startup, router, spawn_periodic_transcode_cleanup,
+};
 use jellyrin_db::Database;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -75,11 +77,12 @@ async fn main() -> anyhow::Result<()> {
     let local_address = format!("http://{address}");
 
     let state = AppState {
-        db,
+        db: db.clone(),
         web_dir: args.web_dir,
         log_dir: args.log_dir,
         local_address,
     };
+    let _transcode_cleanup_task = spawn_periodic_transcode_cleanup(db);
 
     let listener = tokio::net::TcpListener::bind(address)
         .await

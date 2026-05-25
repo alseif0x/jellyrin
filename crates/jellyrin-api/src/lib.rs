@@ -52,6 +52,8 @@ const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
+const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
+const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
 static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
 static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
@@ -748,6 +750,48 @@ pub async fn reconcile_transcode_sessions_on_startup(db: &Database) -> anyhow::R
     for session in sessions {
         db.update_transcode_session_status(&session.play_session_id, "stopped")
             .await?;
+        cleanup_hls_transcode_files(&session.output_path).await;
+    }
+    Ok(count)
+}
+
+pub fn spawn_periodic_transcode_cleanup(db: Database) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match cleanup_terminal_hls_transcodes(
+                &db,
+                Duration::hours(TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS),
+            )
+            .await
+            {
+                Ok(cleaned_count) if cleaned_count > 0 => {
+                    tracing::info!(
+                        count = cleaned_count,
+                        "cleaned terminal HLS transcode outputs"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to clean terminal HLS transcode outputs");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS,
+            ))
+            .await;
+        }
+    })
+}
+
+pub async fn cleanup_terminal_hls_transcodes(
+    db: &Database,
+    older_than: Duration,
+) -> anyhow::Result<usize> {
+    let sessions = db
+        .terminal_transcode_sessions_older_than(older_than)
+        .await?;
+    let count = sessions.len();
+    for session in sessions {
         cleanup_hls_transcode_files(&session.output_path).await;
     }
     Ok(count)
@@ -8402,11 +8446,11 @@ mod tests {
 
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
-        DEFAULT_PASSWORD_RESET_PROVIDER_ID, default_audio_stream_index,
-        default_subtitle_stream_index, hls_transcode_dedupe_key, load_countries, load_cultures,
-        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
-        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        subscribe_playback_events, transcode_dedupe_lock,
+        DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_subtitle_stream_index, hls_transcode_dedupe_key,
+        load_countries, load_cultures, parse_authorization_token, parse_jellyfin_uuid,
+        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
+        spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
     };
     use axum::{
         body::Body,
@@ -16213,6 +16257,84 @@ mod tests {
         let session = session.expect("transcode process did not complete");
         assert_eq!(session.position_ticks, 20_000);
         assert_eq!(session.progress_percent, Some(100.0));
+    }
+
+    #[tokio::test]
+    async fn terminal_transcode_cleanup_removes_old_hls_outputs_only() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Cleanup.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let completed_dir = transcode_root.path().join("play-session-completed");
+        tokio::fs::create_dir_all(&completed_dir).await.unwrap();
+        let completed_playlist = completed_dir.join("main.m3u8");
+        tokio::fs::write(&completed_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(completed_dir.join("segment_00000.ts"), b"zero")
+            .await
+            .unwrap();
+
+        let running_dir = transcode_root.path().join("play-session-running");
+        tokio::fs::create_dir_all(&running_dir).await.unwrap();
+        let running_playlist = running_dir.join("main.m3u8");
+        tokio::fs::write(&running_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+
+        for (play_session_id, output_path, status) in [
+            (
+                "play-session-completed",
+                completed_playlist.to_string_lossy().to_string(),
+                "completed",
+            ),
+            (
+                "play-session-running",
+                running_playlist.to_string_lossy().to_string(),
+                "running",
+            ),
+        ] {
+            db.upsert_transcode_session(UpsertTranscodeSession {
+                play_session_id: play_session_id.to_string(),
+                user_id: user.id,
+                item_id: item.id,
+                media_source_id: Some(item.id.simple().to_string()),
+                audio_stream_index: Some(0),
+                subtitle_stream_index: Some(-1),
+                video_stream_index: Some(0),
+                output_path,
+                process_id: None,
+                status: status.to_string(),
+                progress_percent: None,
+                position_ticks: 0,
+            })
+            .await
+            .unwrap();
+        }
+
+        let cleaned = cleanup_terminal_hls_transcodes(&db, time::Duration::seconds(-1))
+            .await
+            .unwrap();
+        assert_eq!(cleaned, 1);
+        assert!(!completed_dir.exists());
+        assert!(running_dir.exists());
     }
 
     #[tokio::test]

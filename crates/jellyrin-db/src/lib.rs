@@ -156,6 +156,13 @@ pub struct StaleTranscodeSession {
     pub process_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTranscodeSession {
+    pub play_session_id: String,
+    pub output_path: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActivityLogEntry {
     pub id: i64,
@@ -1425,6 +1432,28 @@ impl Database {
             ORDER BY updated_at DESC
             "#,
         )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect()
+    }
+
+    pub async fn terminal_transcode_sessions_older_than(
+        &self,
+        older_than: Duration,
+    ) -> anyhow::Result<Vec<TerminalTranscodeSession>> {
+        let cutoff = format_time(OffsetDateTime::now_utc() - older_than)?;
+        sqlx::query_as::<_, TerminalTranscodeSessionRow>(
+            r#"
+            SELECT play_session_id, output_path, status
+            FROM transcode_sessions
+            WHERE status IN ('completed', 'failed', 'stopped')
+              AND updated_at < ?1
+            ORDER BY updated_at ASC
+            "#,
+        )
+        .bind(cutoff)
         .fetch_all(&self.pool)
         .await?
         .into_iter()
@@ -3042,6 +3071,13 @@ struct StaleTranscodeSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct TerminalTranscodeSessionRow {
+    play_session_id: String,
+    output_path: String,
+    status: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct ActivityLogEntryRow {
     id: i64,
     name: String,
@@ -3245,6 +3281,18 @@ impl TryFrom<StaleTranscodeSessionRow> for StaleTranscodeSession {
             output_path: row.output_path,
             status: row.status,
             process_id: row.process_id,
+        })
+    }
+}
+
+impl TryFrom<TerminalTranscodeSessionRow> for TerminalTranscodeSession {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TerminalTranscodeSessionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            play_session_id: row.play_session_id,
+            output_path: row.output_path,
+            status: row.status,
         })
     }
 }
@@ -4213,6 +4261,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let terminal_sessions = db
+            .terminal_transcode_sessions_older_than(Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(terminal_sessions.len(), 1);
+        assert_eq!(terminal_sessions[0].play_session_id, "play-session-1");
+        assert_eq!(terminal_sessions[0].status, "stopped");
         let stopped_status: String =
             sqlx::query_scalar("SELECT status FROM transcode_sessions WHERE play_session_id = ?1")
                 .bind("play-session-1")
