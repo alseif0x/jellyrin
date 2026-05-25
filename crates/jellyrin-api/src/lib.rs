@@ -633,11 +633,27 @@ pub fn router(state: AppState) -> Router {
             get(audio_hls_master_playlist),
         )
         .route(
+            "/Audio/{item_id}/master.m3u8",
+            get(audio_hls_master_playlist),
+        )
+        .route(
+            "/audio/{item_id}/master.m3u8",
+            get(audio_hls_master_playlist),
+        )
+        .route(
             "/dynamichls/audio/{item_id}/master.m3u8",
             get(audio_hls_master_playlist),
         )
         .route(
             "/DynamicHls/Audio/{item_id}/master.m3u8",
+            head(audio_hls_master_playlist_head),
+        )
+        .route(
+            "/Audio/{item_id}/master.m3u8",
+            head(audio_hls_master_playlist_head),
+        )
+        .route(
+            "/audio/{item_id}/master.m3u8",
             head(audio_hls_master_playlist_head),
         )
         .route(
@@ -648,12 +664,22 @@ pub fn router(state: AppState) -> Router {
             "/DynamicHls/Audio/{item_id}/main.m3u8",
             get(audio_hls_media_playlist),
         )
+        .route("/Audio/{item_id}/main.m3u8", get(audio_hls_media_playlist))
+        .route("/audio/{item_id}/main.m3u8", get(audio_hls_media_playlist))
         .route(
             "/dynamichls/audio/{item_id}/main.m3u8",
             get(audio_hls_media_playlist),
         )
         .route(
             "/DynamicHls/Audio/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(audio_hls_dynamic_segment),
+        )
+        .route(
+            "/Audio/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(audio_hls_dynamic_segment),
+        )
+        .route(
+            "/audio/{item_id}/hls1/{playlist_id}/{segment_file}",
             get(audio_hls_dynamic_segment),
         )
         .route(
@@ -681,11 +707,27 @@ pub fn router(state: AppState) -> Router {
             get(audio_hls_legacy_aac_segment),
         )
         .route(
+            "/Audio/{item_id}/hls/{segment_id}/stream.aac",
+            get(audio_hls_legacy_aac_segment),
+        )
+        .route(
+            "/audio/{item_id}/hls/{segment_id}/stream.aac",
+            get(audio_hls_legacy_aac_segment),
+        )
+        .route(
             "/hlssegment/audio/{item_id}/hls/{segment_id}/stream.aac",
             get(audio_hls_legacy_aac_segment),
         )
         .route(
             "/HlsSegment/Audio/{item_id}/hls/{segment_id}/stream.mp3",
+            get(audio_hls_legacy_mp3_segment),
+        )
+        .route(
+            "/Audio/{item_id}/hls/{segment_id}/stream.mp3",
+            get(audio_hls_legacy_mp3_segment),
+        )
+        .route(
+            "/audio/{item_id}/hls/{segment_id}/stream.mp3",
             get(audio_hls_legacy_mp3_segment),
         )
         .route(
@@ -7412,7 +7454,7 @@ async fn audio_hls_media_playlist_response(
             true,
             HlsPlaylistRoute {
                 media_type: "Audio",
-                route_media_type: "DynamicHls/Audio",
+                route_media_type: "Audio",
             },
         )
         .await;
@@ -7481,6 +7523,16 @@ async fn audio_hls_legacy_segment_response(
     container: &str,
     query: HlsQuery,
 ) -> Result<axum::response::Response, ApiError> {
+    if let Some(path) = audio_hls_legacy_transcode_segment_path(segment_id, container).await? {
+        return stream_path(
+            path,
+            audio_hls_legacy_content_type(container).to_string(),
+            headers,
+            true,
+        )
+        .await;
+    }
+
     if query
         .play_session_id
         .as_deref()
@@ -7502,7 +7554,42 @@ async fn audio_hls_legacy_segment_response(
         .await;
     }
 
+    if query.api_key.is_none() && bearer_token(headers).is_none() {
+        return Err(ApiError::not_found("Audio HLS segment not found"));
+    }
+
     audio_hls_segment_response(state, headers, item_id, segment_id, container, query).await
+}
+
+async fn audio_hls_legacy_transcode_segment_path(
+    segment_id: i64,
+    container: &str,
+) -> Result<Option<PathBuf>, ApiError> {
+    if segment_id < 0 || !matches!(container, "aac" | "mp3") {
+        return Ok(None);
+    }
+    let transcode_root = transcode_temp_root();
+    let segment_path = transcode_root.join(format!("{segment_id}.{container}"));
+    let canonical_root = match tokio::fs::canonicalize(&transcode_root).await {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let canonical_segment = match tokio::fs::canonicalize(&segment_path).await {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !canonical_segment.starts_with(&canonical_root) {
+        return Err(ApiError::bad_request("Invalid segment"));
+    }
+    Ok(Some(canonical_segment))
+}
+
+fn audio_hls_legacy_content_type(container: &str) -> &'static str {
+    match container {
+        "mp3" => "audio/mpeg",
+        "aac" => "audio/aac",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn audio_hls_item(
@@ -8991,7 +9078,7 @@ fn hls_master_url(
 ) -> String {
     if media_type == "Audio" {
         format!(
-            "/DynamicHls/Audio/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}"
+            "/Audio/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}"
         )
     } else {
         format!(
@@ -10173,7 +10260,7 @@ mod tests {
         hls_transcode_dedupe_key, load_countries, load_cultures, media_item_by_id,
         parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
         reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        subscribe_playback_events, transcode_dedupe_lock, trickplay_settings,
+        subscribe_playback_events, transcode_dedupe_lock, transcode_temp_root, trickplay_settings,
         trickplay_tile_cache_path,
     };
     use axum::{
@@ -18214,8 +18301,23 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/Audio/{item_id}/master.m3u8?api_key={api_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let audio_master_alias = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(audio_master_alias, audio_master);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::HEAD)
-                    .uri(format!("/dynamichls/audio/{item_id}/master.m3u8"))
+                    .uri(format!("/audio/{item_id}/master.m3u8"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -18231,7 +18333,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/DynamicHls/Audio/{item_id}/main.m3u8?api_key={api_key}"
+                        "/Audio/{item_id}/main.m3u8?apiKey={api_key}&Static=true&MediaSourceId={item_id}"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -18242,14 +18344,17 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let audio_media_playlist = String::from_utf8(body.to_vec()).unwrap();
         assert!(audio_media_playlist.contains("#EXT-X-TARGETDURATION:10"));
-        assert!(audio_media_playlist.contains(&format!("hls1/main/0.mp3?api_key={api_key}")));
+        assert!(audio_media_playlist.contains(&format!("hls1/main/0.mp3?apiKey={api_key}")));
+        assert!(audio_media_playlist.contains("&Static=true"));
+        assert!(audio_media_playlist.contains(&format!("&MediaSourceId={item_id}")));
 
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/DynamicHls/Audio/{item_id}/hls1/main/0.mp3"))
-                    .header("X-Emby-Token", &api_key)
+                    .uri(format!(
+                        "/Audio/{item_id}/hls1/main/0.mp3?api_key={api_key}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -18267,8 +18372,9 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/HlsSegment/Audio/{item_id}/hls/0/stream.mp3"))
-                    .header("X-Emby-Token", &api_key)
+                    .uri(format!(
+                        "/Audio/{item_id}/hls/0/stream.mp3?api_key={api_key}"
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -18328,7 +18434,7 @@ mod tests {
         assert_eq!(
             audio_transcode_info["MediaSources"][0]["TranscodingUrl"],
             format!(
-                "/DynamicHls/Audio/{item_id}/master.m3u8?PlaySessionId={}&api_key={api_key}",
+                "/Audio/{item_id}/master.m3u8?PlaySessionId={}&api_key={api_key}",
                 audio_transcode_info["PlaySessionId"].as_str().unwrap()
             )
         );
@@ -18382,7 +18488,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/DynamicHls/Audio/{item_id}/main.m3u8?PlaySessionId=audio-hls-ready"
+                        "/Audio/{item_id}/main.m3u8?PlaySessionId=audio-hls-ready"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -18394,7 +18500,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let audio_transcode_playlist = String::from_utf8(body.to_vec()).unwrap();
         assert!(audio_transcode_playlist.contains(&format!(
-            "/DynamicHls/Audio/{item_id}/hls1/main/0.ts?PlaySessionId=audio-hls-ready"
+            "/Audio/{item_id}/hls1/main/0.ts?PlaySessionId=audio-hls-ready"
         )));
 
         let response = app
@@ -18402,7 +18508,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/DynamicHls/Audio/{item_id}/hls1/main/0.ts?PlaySessionId=audio-hls-ready"
+                        "/Audio/{item_id}/hls1/main/0.ts?PlaySessionId=audio-hls-ready"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -18583,6 +18689,13 @@ mod tests {
             format!("/Audio/{item_id}/stream")
         );
 
+        let legacy_segment_id = 987_654_321_i64;
+        let legacy_segment = transcode_temp_root().join(format!("{legacy_segment_id}.aac"));
+        if let Some(parent) = legacy_segment.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        let _ = tokio::fs::remove_file(&legacy_segment).await;
+
         let response = app
             .clone()
             .oneshot(
@@ -18593,7 +18706,31 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        tokio::fs::write(&legacy_segment, b"legacy static aac")
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Audio/not-a-real-item/hls/{legacy_segment_id}/stream.aac"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/aac"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"legacy static aac");
+        tokio::fs::remove_file(&legacy_segment).await.unwrap();
 
         let response = app
             .clone()
