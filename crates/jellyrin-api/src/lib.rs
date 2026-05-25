@@ -516,6 +516,14 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_item_empty_items),
         )
         .route(
+            "/Users/{user_id}/Items/{item_id}/Intros",
+            get(user_item_empty_items),
+        )
+        .route(
+            "/users/{user_id}/items/{item_id}/intros",
+            get(user_item_empty_items),
+        )
+        .route(
             "/Items/{item_id}/Images",
             get(authenticated_item_empty_json_array),
         )
@@ -5855,6 +5863,19 @@ async fn authenticated_item_empty_items(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    Ok(empty_items_result().await)
+}
+
+async fn user_item_empty_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, user_id)?;
     media_item_by_id(&state.db, &item_id).await?;
     Ok(empty_items_result().await)
 }
@@ -14071,6 +14092,7 @@ mod tests {
         assert_eq!(no_matches["TotalRecordCount"], 0);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/Items/{item_id}/Similar"))
@@ -14085,6 +14107,22 @@ mod tests {
         let similar: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(similar["TotalRecordCount"], 0);
         assert_eq!(similar["Items"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Items/{item_id}/Intros"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let intros: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(intros["TotalRecordCount"], 0);
+        assert_eq!(intros["Items"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

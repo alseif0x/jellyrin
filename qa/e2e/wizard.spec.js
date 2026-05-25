@@ -1,11 +1,33 @@
 const { test, expect } = require('@playwright/test');
+const { execFile } = require('node:child_process');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { promisify } = require('node:util');
+
+const execFileAsync = promisify(execFile);
+
+async function writePlayableVideo(mediaDir) {
+  const moviePath = path.join(mediaDir, 'Example Movie.webm');
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-f', 'lavfi',
+    '-i', 'testsrc=size=160x90:rate=5',
+    '-f', 'lavfi',
+    '-i', 'sine=frequency=440:sample_rate=48000',
+    '-t', '1',
+    '-c:v', 'libvpx',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'libvorbis',
+    moviePath
+  ], { timeout: 20_000 });
+  return moviePath;
+}
 
 test('fresh install completes the Jellyfin web startup wizard and loads a scanned library', async ({ page, request, baseURL }, testInfo) => {
   const mediaDir = await fs.mkdtemp(path.join(os.tmpdir(), `jellyrin-e2e-media-${testInfo.workerIndex}-`));
-  await fs.writeFile(path.join(mediaDir, 'Example Movie.mp4'), Buffer.from('fake video'));
+  const moviePath = await writePlayableVideo(mediaDir);
+  const movieSize = (await fs.stat(moviePath)).size;
   const failedResponses = [];
   page.on('response', response => {
     const url = response.url();
@@ -133,9 +155,9 @@ test('fresh install completes the Jellyfin web startup wizard and loads a scanne
     headers: { 'X-Emby-Token': auth.AccessToken },
   });
   expect(streamHeadResponse.status()).toBe(200);
-  expect(streamHeadResponse.headers()['content-length']).toBe('10');
+  expect(streamHeadResponse.headers()['content-length']).toBe(String(movieSize));
   expect(streamHeadResponse.headers()['accept-ranges']).toBe('bytes');
-  expect(streamHeadResponse.headers()['content-type']).toContain('video/mp4');
+  expect(streamHeadResponse.headers()['content-type']).toContain('video/webm');
 
   const rangeResponse = await request.get(`/Videos/${movie.Id}/stream`, {
     headers: {
@@ -144,17 +166,44 @@ test('fresh install completes the Jellyfin web startup wizard and loads a scanne
     },
   });
   expect(rangeResponse.status()).toBe(206);
-  expect(rangeResponse.headers()['content-range']).toBe('bytes 0-3/10');
-  expect(await rangeResponse.body()).toEqual(Buffer.from('fake'));
+  expect(rangeResponse.headers()['content-range']).toBe(`bytes 0-3/${movieSize}`);
+  expect((await rangeResponse.body()).length).toBe(4);
 
   const invalidRangeResponse = await request.get(`/Videos/${movie.Id}/stream`, {
     headers: {
       'X-Emby-Token': auth.AccessToken,
-      Range: 'bytes=99-100',
+      Range: `bytes=${movieSize + 1}-${movieSize + 2}`,
     },
   });
   expect(invalidRangeResponse.status()).toBe(416);
-  expect(invalidRangeResponse.headers()['content-range']).toBe('bytes */10');
+  expect(invalidRangeResponse.headers()['content-range']).toBe(`bytes */${movieSize}`);
+
+  const libraryLink = page.locator('a.itemAction[title="QA Movies"]').first();
+  await expect(libraryLink).toBeVisible({ timeout: 20_000 });
+  await libraryLink.click();
+  await page.waitForLoadState('networkidle');
+
+  const movieLink = page.locator(`a[href*="details?id=${movie.Id}"]`).last();
+  await expect(movieLink).toBeVisible({ timeout: 20_000 });
+  await movieLink.click();
+  await expect(page).toHaveURL(new RegExp(`details\\?id=${movie.Id}`));
+  await page.waitForLoadState('networkidle');
+
+  const browserPlaybackInfo = page.waitForResponse(response =>
+    response.url().includes(`/Items/${movie.Id}/PlaybackInfo`) && response.status() === 200
+  );
+  const browserStream = page.waitForResponse(response =>
+    response.url().includes(`/Videos/${movie.Id}/stream`) && [200, 206].includes(response.status())
+  );
+  const browserPlaybackReport = page.waitForResponse(response =>
+    response.url().includes('/Sessions/Playing') && response.request().method() === 'POST' && response.status() === 204
+  );
+  const playButton = page.locator('.btnPlay:not(.hide), .btnReplay:not(.hide)').first();
+  await expect(playButton).toBeVisible({ timeout: 20_000 });
+  await playButton.click();
+  await browserPlaybackInfo;
+  await browserStream;
+  await browserPlaybackReport;
 
   const playbackProgressResponse = await request.post('/Sessions/Playing/Progress', {
     headers: { 'X-Emby-Token': auth.AccessToken },
@@ -176,17 +225,6 @@ test('fresh install completes the Jellyfin web startup wizard and loads a scanne
   expect(resume.Items[0].Id).toBe(movie.Id);
   expect(resume.Items[0].UserData.PlaybackPositionTicks).toBe(50_000_000);
   expect(resume.Items[0].UserData.Played).toBe(false);
-
-  const libraryLink = page.locator('a.itemAction[title="QA Movies"]').first();
-  await expect(libraryLink).toBeVisible({ timeout: 20_000 });
-  await libraryLink.click();
-  await page.waitForLoadState('networkidle');
-
-  const movieLink = page.locator(`a[href*="details?id=${movie.Id}"]`).last();
-  await expect(movieLink).toBeVisible({ timeout: 20_000 });
-  await movieLink.click();
-  await expect(page).toHaveURL(new RegExp(`details\\?id=${movie.Id}`));
-  await page.waitForLoadState('networkidle');
 
   expect(failedResponses).toEqual([]);
 });
