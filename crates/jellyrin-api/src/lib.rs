@@ -17327,17 +17327,15 @@ async fn item_placeholder_image(
     State(state): State<AppState>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
-    stored_image_or_placeholder(&state, ImageOwner::Item(&item_id), &image_type, 0).await
+    item_image_or_placeholder(&state, &item_id, &image_type, 0).await
 }
 
 async fn item_placeholder_image_by_index(
     State(state): State<AppState>,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
     let image_index = parse_image_index(&image_index)?;
-    stored_image_or_placeholder(&state, ImageOwner::Item(&item_id), &image_type, image_index).await
+    item_image_or_placeholder(&state, &item_id, &image_type, image_index).await
 }
 
 type ExtendedItemImagePath = (
@@ -17366,9 +17364,8 @@ async fn item_placeholder_image_extended(
         _unplayed_count,
     )): Path<ExtendedItemImagePath>,
 ) -> Result<axum::response::Response, ApiError> {
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
     let image_index = parse_image_index(&image_index)?;
-    stored_image_or_placeholder(&state, ImageOwner::Item(&item_id), &image_type, image_index).await
+    item_image_or_placeholder(&state, &item_id, &image_type, image_index).await
 }
 
 async fn user_placeholder_image(
@@ -17410,16 +17407,18 @@ async fn current_user_placeholder_image(
 }
 
 async fn named_placeholder_image(
-    Path((_name, _image_type)): Path<(String, String)>,
-) -> axum::response::Response {
-    placeholder_png_response()
+    State(state): State<AppState>,
+    Path((name, image_type)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    named_entity_image_or_placeholder(&state, &name, &image_type, 0).await
 }
 
 async fn named_placeholder_image_by_index(
-    Path((_name, _image_type, image_index)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Path((name, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    validate_image_index(&image_index)?;
-    Ok(placeholder_png_response())
+    let image_index = parse_image_index(&image_index)?;
+    named_entity_image_or_placeholder(&state, &name, &image_type, image_index).await
 }
 
 async fn splashscreen_placeholder_image(
@@ -17467,6 +17466,166 @@ async fn stored_image_or_placeholder(
         return stored_image_response(stored).await;
     }
     Ok(placeholder_png_response())
+}
+
+async fn item_image_or_placeholder(
+    state: &AppState,
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<axum::response::Response, ApiError> {
+    let item = match media_item_by_id(&state.db, item_id).await {
+        Ok(item) => Some(item),
+        Err(error) if error.status == StatusCode::NOT_FOUND => {
+            media_item_or_folder_by_id(&state.db, item_id).await?;
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(stored) =
+        find_stored_image(state, ImageOwner::Item(item_id), image_type, image_index).await?
+    {
+        return stored_image_response(stored).await;
+    }
+    if let Some(item) = item.as_ref()
+        && let Some(local_image) = find_local_item_image(item, image_type, image_index).await?
+    {
+        return stored_image_response(local_image).await;
+    }
+    Ok(placeholder_png_response())
+}
+
+async fn find_local_item_image(
+    item: &MediaItem,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    let Some(item_dir) = media_item_path(item).parent().map(FsPath::to_path_buf) else {
+        return Ok(None);
+    };
+    let canonical_dir = match tokio::fs::canonicalize(&item_dir).await {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    for stem in local_item_image_stems(image_type, image_index) {
+        for format in IMAGE_FORMATS {
+            if format.extension == "bin" {
+                continue;
+            }
+            let path = item_dir.join(format!("{stem}.{}", format.extension));
+            let canonical_path = match tokio::fs::canonicalize(&path).await {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if !canonical_path.starts_with(&canonical_dir) {
+                continue;
+            }
+            if tokio::fs::metadata(&canonical_path)
+                .await
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+            {
+                return Ok(Some(canonical_path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn local_item_image_stems(image_type: &str, image_index: usize) -> Vec<String> {
+    match normalize_image_type(image_type).as_str() {
+        "primary" if image_index == 0 => ["poster", "folder", "cover", "default", "movie"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "backdrop" => {
+            let mut stems = if image_index == 0 {
+                vec![
+                    "backdrop".to_string(),
+                    "fanart".to_string(),
+                    "background".to_string(),
+                ]
+            } else {
+                Vec::new()
+            };
+            stems.push(format!("backdrop{image_index}"));
+            stems.push(format!("fanart{image_index}"));
+            stems.push(format!("background{image_index}"));
+            stems
+        }
+        "thumb" if image_index == 0 => vec!["thumb".to_string()],
+        "logo" if image_index == 0 => vec!["logo".to_string()],
+        _ => Vec::new(),
+    }
+}
+
+async fn named_entity_image_or_placeholder(
+    state: &AppState,
+    name: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<axum::response::Response, ApiError> {
+    if let Some(path) =
+        find_named_entity_representative_image(state, name, image_type, image_index).await?
+    {
+        return stored_image_response(path).await;
+    }
+    Ok(placeholder_png_response())
+}
+
+async fn find_named_entity_representative_image(
+    state: &AppState,
+    name: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    let needle = name.trim();
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    for metadata in state.db.media_item_metadata().await? {
+        if !metadata_payload_contains_entity_name(&metadata.payload, needle) {
+            continue;
+        }
+        let owner_id = metadata.item_id.simple().to_string();
+        if let Some(path) =
+            find_stored_image(state, ImageOwner::Item(&owner_id), image_type, image_index).await?
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn metadata_payload_contains_entity_name(metadata: &serde_json::Value, needle: &str) -> bool {
+    [
+        "Genres",
+        "MusicGenres",
+        "Artists",
+        "AlbumArtists",
+        "People",
+        "Studios",
+    ]
+    .iter()
+    .any(|key| {
+        json_field_case_insensitive(metadata, key)
+            .is_some_and(|value| metadata_value_contains_name(value, needle))
+    })
+}
+
+fn metadata_value_contains_name(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| metadata_value_contains_name(value, needle)),
+        serde_json::Value::String(value) => value.eq_ignore_ascii_case(needle),
+        serde_json::Value::Object(object) => object
+            .get("Name")
+            .or_else(|| object.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(needle)),
+        _ => false,
+    }
 }
 
 async fn store_uploaded_image(
@@ -26402,6 +26561,30 @@ mod tests {
             8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0,
             5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
         ];
+        tokio::fs::write(tmp.path().join("folder.png"), &uploaded_png)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), uploaded_png.as_slice());
+        tokio::fs::remove_file(tmp.path().join("folder.png"))
+            .await
+            .unwrap();
+
         let response = app
             .clone()
             .oneshot(
@@ -26452,6 +26635,31 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), uploaded_png.as_slice());
+
+        for endpoint in [
+            "/Image/Genres/Drama/Images/Primary".to_string(),
+            "/Image/Artists/Artist%20One/Images/Primary/0".to_string(),
+            "/Image/Persons/Actor%20One/Images/Primary".to_string(),
+            "/Image/Studios/Studio%20One/Images/Primary/0".to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/png"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), uploaded_png.as_slice());
+        }
 
         let response = app
             .clone()
