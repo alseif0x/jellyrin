@@ -332,6 +332,8 @@ pub fn router(state: AppState) -> Router {
         .route("/library/mediafolders", get(user_views_result))
         .route("/Library/Library/MediaFolders", get(user_views_result))
         .route("/library/library/mediafolders", get(user_views_result))
+        .route("/Library/PhysicalPaths", get(library_physical_paths))
+        .route("/library/physicalpaths", get(library_physical_paths))
         .route("/Library/Library/PhysicalPaths", get(library_physical_paths))
         .route("/library/library/physicalpaths", get(library_physical_paths))
         .route(
@@ -23421,6 +23423,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn library_mediafolders_physicalpaths_and_refresh_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("Initial Movie.mp4"), b"fake video")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Library/MediaFolders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Library/MediaFolders")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let media_folders: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(media_folders["TotalRecordCount"], 1);
+        assert_eq!(media_folders["Items"][0]["Name"], "Movies");
+        assert_eq!(media_folders["Items"][0]["CollectionType"], "movies");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Library/PhysicalPaths")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for endpoint in ["/Library/PhysicalPaths", "/Library/Library/PhysicalPaths"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let physical_paths: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(physical_paths, json!([tmp.path().to_string_lossy()]));
+        }
+
+        tokio::fs::write(tmp.path().join("Second Movie.mp4"), b"second video")
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Library/Refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Library/Refresh")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?SearchTerm=Second")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items["TotalRecordCount"], 1);
+        assert_eq!(items["Items"][0]["Name"], "Second Movie");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let activity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(activity["Items"][0]["Name"], "Library scan completed");
     }
 
     #[tokio::test]
