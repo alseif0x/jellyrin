@@ -9705,7 +9705,10 @@ async fn update_item_user_data_inner(
     let played = json_value_bool_field(body.as_ref(), &["Played", "played"])
         .unwrap_or_else(|| current.as_ref().is_some_and(|state| state.played));
     let is_favorite = json_value_bool_field(body.as_ref(), &["IsFavorite", "isFavorite"]);
-    let rating = json_value_f64_field(body.as_ref(), &["Rating", "rating"]);
+    let rating = json_value_f64_field(body.as_ref(), &["Rating", "rating"]).or_else(|| {
+        json_value_bool_field(body.as_ref(), &["Likes", "likes"])
+            .map(|likes| if likes { 1.0_f64 } else { 0.0_f64 })
+    });
     let position_ticks = json_value_i64_field(
         body.as_ref(),
         &["PlaybackPositionTicks", "playbackPositionTicks"],
@@ -24447,6 +24450,29 @@ mod tests {
         let updated_user_data: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(updated_user_data["Played"], true);
         assert_eq!(updated_user_data["PlaybackPositionTicks"], 321);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/UserItems/{item_id}/UserData"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Likes": false, "IsFavorite": true }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let liked_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(liked_user_data["Likes"], false);
+        assert_eq!(liked_user_data["Rating"], 0.0);
+        assert_eq!(liked_user_data["IsFavorite"], true);
+        assert_eq!(liked_user_data["PlaybackPositionTicks"], 321);
 
         let response = app
             .clone()
