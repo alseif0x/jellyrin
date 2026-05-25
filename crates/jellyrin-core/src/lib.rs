@@ -75,6 +75,8 @@ pub struct PlaybackState {
     pub user_id: Uuid,
     pub item_id: Uuid,
     pub media_source_id: Option<String>,
+    pub audio_stream_index: Option<i64>,
+    pub subtitle_stream_index: Option<i64>,
     pub position_ticks: i64,
     pub is_paused: bool,
     pub played: bool,

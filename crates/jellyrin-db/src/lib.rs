@@ -103,6 +103,18 @@ pub struct UpsertActivePlaybackSession {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpsertPlaybackState {
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub media_source_id: Option<String>,
+    pub audio_stream_index: Option<i64>,
+    pub subtitle_stream_index: Option<i64>,
+    pub position_ticks: i64,
+    pub is_paused: bool,
+    pub played: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ActivityLogEntry {
     pub id: i64,
     pub name: String,
@@ -1185,6 +1197,32 @@ impl Database {
             !trimmed_session_id.is_empty(),
             "session id must not be empty"
         );
+        let existing_stream_indexes = if playback.audio_stream_index.is_none()
+            || playback.subtitle_stream_index.is_none()
+        {
+            sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
+                r#"
+                    SELECT item_id, audio_stream_index, subtitle_stream_index
+                    FROM active_playback_sessions
+                    WHERE session_id = ?1
+                    "#,
+            )
+            .bind(trimmed_session_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .and_then(|(item_id, audio_stream_index, subtitle_stream_index)| {
+                (item_id == playback.item_id.to_string())
+                    .then_some((audio_stream_index, subtitle_stream_index))
+            })
+        } else {
+            None
+        };
+        let audio_stream_index = playback
+            .audio_stream_index
+            .or_else(|| existing_stream_indexes.and_then(|indexes| indexes.0));
+        let subtitle_stream_index = playback
+            .subtitle_stream_index
+            .or_else(|| existing_stream_indexes.and_then(|indexes| indexes.1));
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
@@ -1208,8 +1246,8 @@ impl Database {
         .bind(playback.user_id.to_string())
         .bind(playback.item_id.to_string())
         .bind(playback.media_source_id)
-        .bind(playback.audio_stream_index)
-        .bind(playback.subtitle_stream_index)
+        .bind(audio_stream_index)
+        .bind(subtitle_stream_index)
         .bind(playback.position_ticks)
         .bind(playback.is_paused)
         .bind(now)
@@ -1607,36 +1645,55 @@ impl Database {
         Ok(())
     }
 
-    pub async fn upsert_playback_state(
-        &self,
-        user_id: Uuid,
-        item_id: Uuid,
-        media_source_id: Option<&str>,
-        position_ticks: i64,
-        is_paused: bool,
-        played: bool,
-    ) -> anyhow::Result<()> {
+    pub async fn upsert_playback_state(&self, playback: UpsertPlaybackState) -> anyhow::Result<()> {
+        let existing_stream_indexes =
+            if playback.audio_stream_index.is_none() || playback.subtitle_stream_index.is_none() {
+                sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+                    r#"
+                    SELECT audio_stream_index, subtitle_stream_index
+                    FROM playback_states
+                    WHERE user_id = ?1 AND item_id = ?2
+                    "#,
+                )
+                .bind(playback.user_id.to_string())
+                .bind(playback.item_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+            } else {
+                None
+            };
+        let audio_stream_index = playback
+            .audio_stream_index
+            .or_else(|| existing_stream_indexes.and_then(|indexes| indexes.0));
+        let subtitle_stream_index = playback
+            .subtitle_stream_index
+            .or_else(|| existing_stream_indexes.and_then(|indexes| indexes.1));
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
             INSERT INTO playback_states (
-                user_id, item_id, media_source_id, position_ticks, is_paused, played, updated_at
+                user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
+                position_ticks, is_paused, played, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(user_id, item_id) DO UPDATE SET
                 media_source_id = excluded.media_source_id,
+                audio_stream_index = excluded.audio_stream_index,
+                subtitle_stream_index = excluded.subtitle_stream_index,
                 position_ticks = excluded.position_ticks,
                 is_paused = excluded.is_paused,
                 played = excluded.played,
                 updated_at = excluded.updated_at
             "#,
         )
-        .bind(user_id.to_string())
-        .bind(item_id.to_string())
-        .bind(media_source_id)
-        .bind(position_ticks.max(0))
-        .bind(is_paused)
-        .bind(played)
+        .bind(playback.user_id.to_string())
+        .bind(playback.item_id.to_string())
+        .bind(playback.media_source_id)
+        .bind(audio_stream_index)
+        .bind(subtitle_stream_index)
+        .bind(playback.position_ticks.max(0))
+        .bind(playback.is_paused)
+        .bind(playback.played)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -1650,7 +1707,8 @@ impl Database {
     ) -> anyhow::Result<Option<PlaybackState>> {
         let row = sqlx::query_as::<_, PlaybackStateRow>(
             r#"
-            SELECT user_id, item_id, media_source_id, position_ticks, is_paused, played, updated_at
+            SELECT user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
+                   position_ticks, is_paused, played, updated_at
             FROM playback_states
             WHERE user_id = ?1 AND item_id = ?2
             "#,
@@ -1675,7 +1733,8 @@ impl Database {
                 media_items.media_type, media_items.collection_type, media_items.file_size,
                 media_items.runtime_ticks, media_items.bitrate, media_items.width, media_items.height,
                 media_items.media_streams_json, media_items.created_at, media_items.updated_at, playback_states.user_id, playback_states.item_id,
-                playback_states.media_source_id, playback_states.position_ticks,
+                playback_states.media_source_id, playback_states.audio_stream_index,
+                playback_states.subtitle_stream_index, playback_states.position_ticks,
                 playback_states.is_paused, playback_states.played,
                 playback_states.updated_at AS playback_updated_at
             FROM playback_states
@@ -2611,6 +2670,8 @@ struct ResumeItemRow {
     user_id: String,
     item_id: String,
     media_source_id: Option<String>,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
     position_ticks: i64,
     is_paused: bool,
     played: bool,
@@ -2622,6 +2683,8 @@ struct PlaybackStateRow {
     user_id: String,
     item_id: String,
     media_source_id: Option<String>,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
     position_ticks: i64,
     is_paused: bool,
     played: bool,
@@ -2745,6 +2808,8 @@ impl TryFrom<ResumeItemRow> for (MediaItem, PlaybackState) {
             item_id: Uuid::parse_str(&row.item_id)
                 .context("invalid playback item id in database")?,
             media_source_id: row.media_source_id,
+            audio_stream_index: row.audio_stream_index,
+            subtitle_stream_index: row.subtitle_stream_index,
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             played: row.played,
@@ -2764,6 +2829,8 @@ impl TryFrom<PlaybackStateRow> for PlaybackState {
             item_id: Uuid::parse_str(&row.item_id)
                 .context("invalid playback item id in database")?,
             media_source_id: row.media_source_id,
+            audio_stream_index: row.audio_stream_index,
+            subtitle_stream_index: row.subtitle_stream_index,
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             played: row.played,
@@ -3232,7 +3299,8 @@ fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
-        SystemConfigurationPayloads, UpsertActivePlaybackSession, parse_ffprobe_media_info,
+        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertPlaybackState,
+        parse_ffprobe_media_info,
     };
     use serde_json::json;
     use time::Duration;
@@ -3636,6 +3704,24 @@ mod tests {
         assert_eq!(sessions[0].subtitle_stream_index, Some(-1));
         assert_eq!(sessions[0].position_ticks, 42);
 
+        db.upsert_active_playback_session(UpsertActivePlaybackSession {
+            session_id: token.access_token.clone(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item.id.to_string()),
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: 84,
+            is_paused: true,
+        })
+        .await
+        .unwrap();
+        let sessions = db.active_playback_sessions().await.unwrap();
+        assert_eq!(sessions[0].audio_stream_index, Some(1));
+        assert_eq!(sessions[0].subtitle_stream_index, Some(-1));
+        assert_eq!(sessions[0].position_ticks, 84);
+        assert!(sessions[0].is_paused);
+
         db.clear_active_playback_session(&token.access_token)
             .await
             .unwrap();
@@ -3856,20 +3942,48 @@ mod tests {
 
         assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
         let item = db.media_items().await.unwrap().remove(0);
-        db.upsert_playback_state(user.id, item.id, Some("source"), 42, false, false)
-            .await
-            .unwrap();
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some("source".to_string()),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(-1),
+            position_ticks: 42,
+            is_paused: false,
+            played: false,
+        })
+        .await
+        .unwrap();
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some("source".to_string()),
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: 84,
+            is_paused: true,
+            played: false,
+        })
+        .await
+        .unwrap();
+        let resume_items = db.resume_items_for_user(user.id, 10).await.unwrap();
+        assert_eq!(resume_items.len(), 1);
+        assert_eq!(resume_items[0].1.audio_stream_index, Some(1));
+        assert_eq!(resume_items[0].1.subtitle_stream_index, Some(-1));
 
         tokio::fs::remove_file(&movie).await.unwrap();
         assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 0);
 
         assert!(db.media_items().await.unwrap().is_empty());
-        assert!(
-            db.playback_state_for_item(user.id, item.id)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        let playback = db
+            .playback_state_for_item(user.id, item.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(playback.audio_stream_index, Some(1));
+        assert_eq!(playback.subtitle_stream_index, Some(-1));
+        assert_eq!(playback.position_ticks, 84);
+        assert!(playback.is_paused);
     }
 
     #[tokio::test]
@@ -3895,9 +4009,18 @@ mod tests {
 
         assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
         let item = db.media_items().await.unwrap().remove(0);
-        db.upsert_playback_state(user.id, item.id, Some("source"), 42, false, false)
-            .await
-            .unwrap();
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some("source".to_string()),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(-1),
+            position_ticks: 42,
+            is_paused: false,
+            played: false,
+        })
+        .await
+        .unwrap();
 
         tokio::fs::rename(&movie, &renamed_movie).await.unwrap();
         assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
@@ -3907,14 +4030,14 @@ mod tests {
         assert_eq!(items[0].id, item.id);
         assert_eq!(items[0].name, "Renamed Movie");
         assert_eq!(items[0].path, renamed_movie.to_string_lossy());
-        assert_eq!(
-            db.playback_state_for_item(user.id, item.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .position_ticks,
-            42
-        );
+        let playback = db
+            .playback_state_for_item(user.id, item.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(playback.position_ticks, 42);
+        assert_eq!(playback.audio_stream_index, Some(1));
+        assert_eq!(playback.subtitle_stream_index, Some(-1));
     }
 
     #[tokio::test]

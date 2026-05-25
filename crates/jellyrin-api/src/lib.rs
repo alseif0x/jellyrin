@@ -26,7 +26,7 @@ use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, 
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
     BackupManifest, BrandingConfig, Database, DeviceSession, SortDirection,
-    SystemConfigurationPayloads, TaskRun, UpsertActivePlaybackSession,
+    SystemConfigurationPayloads, TaskRun, UpsertActivePlaybackSession, UpsertPlaybackState,
 };
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -3451,14 +3451,16 @@ async fn report_playback(
     let is_paused = payload.is_paused.unwrap_or(false);
     state
         .db
-        .upsert_playback_state(
-            user.id,
-            item.id,
-            payload.media_source_id.as_deref(),
+        .upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: payload.media_source_id.clone(),
+            audio_stream_index: payload.audio_stream_index,
+            subtitle_stream_index: payload.subtitle_stream_index,
             position_ticks,
             is_paused,
-            false,
-        )
+            played: false,
+        })
         .await?;
     if playback_active {
         state
@@ -5052,7 +5054,16 @@ async fn set_item_played(
     let item = media_item_by_id(&state.db, &item_id).await?;
     state
         .db
-        .upsert_playback_state(user_id, item.id, None, 0, false, played)
+        .upsert_playback_state(UpsertPlaybackState {
+            user_id,
+            item_id: item.id,
+            media_source_id: None,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: 0,
+            is_paused: false,
+            played,
+        })
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -6309,6 +6320,11 @@ fn media_item_to_json_with_playback(
     let media_streams = media_item_streams(item);
     let default_audio_stream_index = default_audio_stream_index(&media_streams);
     let default_subtitle_stream_index = default_subtitle_stream_index(&media_streams);
+    let selected_audio_stream_index = playback
+        .and_then(|state| state.audio_stream_index)
+        .or(default_audio_stream_index);
+    let selected_subtitle_stream_index =
+        selected_subtitle_stream_index(playback, default_subtitle_stream_index);
     let direct_stream_url = media_item_direct_stream_url(item, &item_id);
     let video_type = if item.media_type == "Video" {
         serde_json::json!("VideoFile")
@@ -6341,8 +6357,8 @@ fn media_item_to_json_with_playback(
         "RequiresLooping": false,
         "SupportsProbing": true,
         "VideoType": video_type,
-        "DefaultAudioStreamIndex": default_audio_stream_index,
-        "DefaultSubtitleStreamIndex": default_subtitle_stream_index,
+        "DefaultAudioStreamIndex": selected_audio_stream_index,
+        "DefaultSubtitleStreamIndex": selected_subtitle_stream_index,
         "MediaStreams": media_streams.clone(),
         "Formats": [],
         "Bitrate": item.bitrate,
@@ -6397,6 +6413,17 @@ fn media_item_to_json_with_playback(
         "LocationType": "FileSystem",
         "MediaSources": [media_source],
     })
+}
+
+fn selected_subtitle_stream_index(
+    playback: Option<&PlaybackState>,
+    default_subtitle_stream_index: Option<i64>,
+) -> serde_json::Value {
+    match playback.and_then(|state| state.subtitle_stream_index) {
+        Some(index) if index < 0 => serde_json::Value::Null,
+        Some(index) => serde_json::json!(index),
+        None => serde_json::json!(default_subtitle_stream_index),
+    }
 }
 
 fn default_audio_stream_index(media_streams: &[serde_json::Value]) -> Option<i64> {
@@ -13468,6 +13495,8 @@ mod tests {
                         json!({
                             "ItemId": item_id,
                             "MediaSourceId": item_id,
+                            "AudioStreamIndex": 1,
+                            "SubtitleStreamIndex": -1,
                             "PositionTicks": 25_000_000,
                             "IsPaused": false,
                         })
@@ -13512,6 +13541,8 @@ mod tests {
                             json!({
                                 "ItemId": item_id,
                                 "MediaSourceId": item_id,
+                                "AudioStreamIndex": 1,
+                                "SubtitleStreamIndex": -1,
                                 "PositionTicks": position_ticks,
                                 "CanSeek": true,
                                 "IsPaused": false,
@@ -13546,6 +13577,14 @@ mod tests {
             50_000_000
         );
         assert_eq!(resume["Items"][0]["UserData"]["Played"], false);
+        assert_eq!(
+            resume["Items"][0]["MediaSources"][0]["DefaultAudioStreamIndex"],
+            1
+        );
+        assert_eq!(
+            resume["Items"][0]["MediaSources"][0]["DefaultSubtitleStreamIndex"],
+            Value::Null
+        );
 
         let response = app
             .clone()
