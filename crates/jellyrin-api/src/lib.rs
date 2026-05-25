@@ -326,6 +326,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/logout", post(logout))
         .route("/Sessions/Playing", post(report_playback_start))
         .route("/sessions/playing", post(report_playback_start))
+        .route("/Playstate/Sessions/Playing", post(report_playback_start))
+        .route("/playstate/sessions/playing", post(report_playback_start))
         .route("/Sessions/{session_id}/Playing", post(send_play_command))
         .route("/sessions/{session_id}/playing", post(send_play_command))
         .route(
@@ -338,8 +340,32 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Sessions/Playing/Progress", post(report_playback_progress))
         .route("/sessions/playing/progress", post(report_playback_progress))
+        .route(
+            "/Playstate/Sessions/Playing/Progress",
+            post(report_playback_progress),
+        )
+        .route(
+            "/playstate/sessions/playing/progress",
+            post(report_playback_progress),
+        )
         .route("/Sessions/Playing/Stopped", post(report_playback_stopped))
         .route("/sessions/playing/stopped", post(report_playback_stopped))
+        .route(
+            "/Playstate/Sessions/Playing/Stopped",
+            post(report_playback_stopped),
+        )
+        .route(
+            "/playstate/sessions/playing/stopped",
+            post(report_playback_stopped),
+        )
+        .route(
+            "/Playstate/Sessions/Playing/Ping",
+            post(ping_playback_session),
+        )
+        .route(
+            "/playstate/sessions/playing/ping",
+            post(ping_playback_session),
+        )
         .route("/Sessions/Capabilities", post(update_session_capabilities))
         .route(
             "/Sessions/Capabilities/Full",
@@ -494,6 +520,8 @@ pub fn router(state: AppState) -> Router {
         .route("/system/endpoint", get(system_endpoint))
         .route("/Playback/BitrateTest", get(bitrate_test))
         .route("/playback/bitratetest", get(bitrate_test))
+        .route("/MediaInfo/Playback/BitrateTest", get(bitrate_test))
+        .route("/mediainfo/playback/bitratetest", get(bitrate_test))
         .route("/Videos/ActiveEncodings", get(active_encodings))
         .route("/videos/activeencodings", get(active_encodings))
         .route("/Videos/ActiveEncodings", delete(stop_active_encoding))
@@ -623,11 +651,27 @@ pub fn router(state: AppState) -> Router {
         .route("/Items/{item_id}/PlaybackInfo", get(item_playback_info))
         .route("/items/{item_id}/playbackinfo", get(item_playback_info))
         .route(
+            "/MediaInfo/Items/{item_id}/PlaybackInfo",
+            get(item_playback_info),
+        )
+        .route(
+            "/mediainfo/items/{item_id}/playbackinfo",
+            get(item_playback_info),
+        )
+        .route(
             "/Items/{item_id}/PlaybackInfo",
             post(post_item_playback_info),
         )
         .route(
             "/items/{item_id}/playbackinfo",
+            post(post_item_playback_info),
+        )
+        .route(
+            "/MediaInfo/Items/{item_id}/PlaybackInfo",
+            post(post_item_playback_info),
+        )
+        .route(
+            "/mediainfo/items/{item_id}/playbackinfo",
             post(post_item_playback_info),
         )
         .route("/Items/{item_id}/InstantMix", get(instant_mix_from_item))
@@ -690,8 +734,24 @@ pub fn router(state: AppState) -> Router {
         .route("/audio/{item_id}/stream", head(direct_stream_audio_head))
         .route("/Audio/{item_id}/universal", get(universal_audio))
         .route("/audio/{item_id}/universal", get(universal_audio))
+        .route(
+            "/UniversalAudio/Audio/{item_id}/universal",
+            get(universal_audio),
+        )
+        .route(
+            "/universalaudio/audio/{item_id}/universal",
+            get(universal_audio),
+        )
         .route("/Audio/{item_id}/universal", head(universal_audio_head))
         .route("/audio/{item_id}/universal", head(universal_audio_head))
+        .route(
+            "/UniversalAudio/Audio/{item_id}/universal",
+            head(universal_audio_head),
+        )
+        .route(
+            "/universalaudio/audio/{item_id}/universal",
+            head(universal_audio_head),
+        )
         .route(
             "/Audio/{item_id}/stream.{container}",
             get(direct_stream_audio_by_container),
@@ -721,12 +781,92 @@ pub fn router(state: AppState) -> Router {
             post(mark_item_played),
         )
         .route(
+            "/Playstate/UserPlayedItems/{item_id}",
+            post(mark_authenticated_item_played),
+        )
+        .route(
+            "/playstate/userplayeditems/{item_id}",
+            post(mark_authenticated_item_played),
+        )
+        .route(
+            "/Playstate/Users/{user_id}/PlayedItems/{item_id}",
+            post(mark_item_played),
+        )
+        .route(
+            "/playstate/users/{user_id}/playeditems/{item_id}",
+            post(mark_item_played),
+        )
+        .route(
             "/Users/{user_id}/PlayedItems/{item_id}",
             delete(mark_item_unplayed),
         )
         .route(
             "/users/{user_id}/playeditems/{item_id}",
             delete(mark_item_unplayed),
+        )
+        .route(
+            "/Playstate/UserPlayedItems/{item_id}",
+            delete(mark_authenticated_item_unplayed),
+        )
+        .route(
+            "/playstate/userplayeditems/{item_id}",
+            delete(mark_authenticated_item_unplayed),
+        )
+        .route(
+            "/Playstate/Users/{user_id}/PlayedItems/{item_id}",
+            delete(mark_item_unplayed),
+        )
+        .route(
+            "/playstate/users/{user_id}/playeditems/{item_id}",
+            delete(mark_item_unplayed),
+        )
+        .route(
+            "/Playstate/PlayingItems/{item_id}",
+            post(report_path_playback_start),
+        )
+        .route(
+            "/playstate/playingitems/{item_id}",
+            post(report_path_playback_start),
+        )
+        .route(
+            "/Playstate/Users/{user_id}/PlayingItems/{item_id}",
+            post(report_path_playback_start_legacy),
+        )
+        .route(
+            "/playstate/users/{user_id}/playingitems/{item_id}",
+            post(report_path_playback_start_legacy),
+        )
+        .route(
+            "/Playstate/PlayingItems/{item_id}/Progress",
+            post(report_path_playback_progress),
+        )
+        .route(
+            "/playstate/playingitems/{item_id}/progress",
+            post(report_path_playback_progress),
+        )
+        .route(
+            "/Playstate/Users/{user_id}/PlayingItems/{item_id}/Progress",
+            post(report_path_playback_progress_legacy),
+        )
+        .route(
+            "/playstate/users/{user_id}/playingitems/{item_id}/progress",
+            post(report_path_playback_progress_legacy),
+        )
+        .route(
+            "/Playstate/PlayingItems/{item_id}",
+            delete(report_path_playback_stopped),
+        )
+        .route(
+            "/playstate/playingitems/{item_id}",
+            delete(report_path_playback_stopped),
+        )
+        .route(
+            "/Playstate/Users/{user_id}/PlayingItems/{item_id}",
+            delete(report_path_playback_stopped_legacy),
+        )
+        .route(
+            "/playstate/users/{user_id}/playingitems/{item_id}",
+            delete(report_path_playback_stopped_legacy),
         )
         .route(
             "/Items/{item_id}/Images/{image_type}",
@@ -3667,6 +3807,119 @@ async fn report_playback_stopped(
     report_playback(state, headers, query, payload, false).await
 }
 
+#[derive(Debug, Deserialize)]
+struct PathPlaybackReportQuery {
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(alias = "MediaSourceId")]
+    media_source_id: Option<String>,
+    #[serde(alias = "AudioStreamIndex")]
+    audio_stream_index: Option<i64>,
+    #[serde(alias = "SubtitleStreamIndex")]
+    subtitle_stream_index: Option<i64>,
+    #[serde(alias = "PositionTicks")]
+    position_ticks: Option<i64>,
+    #[serde(alias = "StartPositionTicks")]
+    start_position_ticks: Option<i64>,
+    #[serde(alias = "IsPaused")]
+    is_paused: Option<bool>,
+}
+
+impl PathPlaybackReportQuery {
+    fn auth_query(&self) -> AuthQuery {
+        AuthQuery {
+            api_key: self.api_key.clone(),
+        }
+    }
+
+    fn playback_body(&self, item_id: String) -> PlaybackReportBody {
+        PlaybackReportBody {
+            item_id,
+            media_source_id: self.media_source_id.clone(),
+            _play_session_id: None,
+            _play_method: None,
+            _can_seek: None,
+            audio_stream_index: self.audio_stream_index,
+            subtitle_stream_index: self.subtitle_stream_index,
+            _playlist_item_id: None,
+            _session_id: None,
+            _volume_level: None,
+            _is_muted: None,
+            position_ticks: self.position_ticks.or(self.start_position_ticks),
+            is_paused: self.is_paused,
+        }
+    }
+}
+
+async fn report_path_playback_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PathPlaybackReportQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let payload = query.playback_body(item_id);
+    report_playback(state, headers, query.auth_query(), payload, true).await
+}
+
+async fn report_path_playback_start_legacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PathPlaybackReportQuery>,
+    Path((_user_id, item_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let payload = query.playback_body(item_id);
+    report_playback(state, headers, query.auth_query(), payload, true).await
+}
+
+async fn report_path_playback_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PathPlaybackReportQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let payload = query.playback_body(item_id);
+    report_playback(state, headers, query.auth_query(), payload, true).await
+}
+
+async fn report_path_playback_progress_legacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PathPlaybackReportQuery>,
+    Path((_user_id, item_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let payload = query.playback_body(item_id);
+    report_playback(state, headers, query.auth_query(), payload, true).await
+}
+
+async fn report_path_playback_stopped(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PathPlaybackReportQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let payload = query.playback_body(item_id);
+    report_playback(state, headers, query.auth_query(), payload, false).await
+}
+
+async fn report_path_playback_stopped_legacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PathPlaybackReportQuery>,
+    Path((_user_id, item_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let payload = query.playback_body(item_id);
+    report_playback(state, headers, query.auth_query(), payload, false).await
+}
+
+async fn ping_playback_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn report_playback(
     state: AppState,
     headers: HeaderMap,
@@ -5267,6 +5520,42 @@ async fn mark_item_unplayed(
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     set_item_played(state, headers, query, user_id, item_id, false).await
+}
+
+async fn mark_authenticated_item_played(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    set_item_played(
+        state,
+        headers,
+        query,
+        user.id.simple().to_string(),
+        item_id,
+        true,
+    )
+    .await
+}
+
+async fn mark_authenticated_item_unplayed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    set_item_played(
+        state,
+        headers,
+        query,
+        user.id.simple().to_string(),
+        item_id,
+        false,
+    )
+    .await
 }
 
 async fn set_item_played(
@@ -14177,6 +14466,143 @@ mod tests {
             playback_info["MediaSources"][0]["MediaStreams"][2]["Type"],
             "Subtitle"
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/MediaInfo/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let media_info_playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(media_info_playback_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            media_info_playback_info["MediaSources"][0]["SupportsDirectPlay"],
+            true
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/MediaInfo/Playback/BitrateTest?Size=8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 8);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Playstate/PlayingItems/{item_id}?PositionTicks=123&AudioStreamIndex=1&SubtitleStreamIndex=-1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(playback_state.position_ticks, 123);
+        assert_eq!(playback_state.audio_stream_index, Some(1));
+        assert_eq!(playback_state.subtitle_stream_index, Some(-1));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Playstate/PlayingItems/{item_id}/Progress?PositionTicks=456"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(playback_state.position_ticks, 456);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/Playstate/PlayingItems/{item_id}?PositionTicks=789"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(test_db.active_playback_sessions().await.unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Playstate/UserPlayedItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(playback_state.played);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Playstate/UserPlayedItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!playback_state.played);
 
         let response = app
             .clone()
