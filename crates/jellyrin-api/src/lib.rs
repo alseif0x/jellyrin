@@ -304,6 +304,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/logout", post(logout))
         .route("/Sessions/Playing", post(report_playback_start))
         .route("/sessions/playing", post(report_playback_start))
+        .route("/Sessions/{session_id}/Playing", post(send_play_command))
+        .route("/sessions/{session_id}/playing", post(send_play_command))
         .route("/Sessions/Playing/Progress", post(report_playback_progress))
         .route("/sessions/playing/progress", post(report_playback_progress))
         .route("/Sessions/Playing/Stopped", post(report_playback_stopped))
@@ -3433,6 +3435,118 @@ async fn report_playback(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Default)]
+struct SendPlayCommandQuery {
+    play_command: Option<String>,
+    item_ids: Option<String>,
+    start_position_ticks: Option<i64>,
+    media_source_id: Option<String>,
+    start_index: Option<usize>,
+}
+
+async fn send_play_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let query = parse_send_play_command_query(raw_query.as_deref());
+    let (auth_user, _) = require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let target_session = state
+        .db
+        .device_session_by_id(&session_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Device session not found"))?;
+    ensure_user_access(&auth_user, target_session.user_id)?;
+
+    let play_command = query
+        .play_command
+        .as_deref()
+        .filter(|command| !command.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("PlayCommand is required"))?;
+    let item_ids = parse_play_command_item_ids(query.item_ids.as_deref())?;
+    let start_index = query.start_index.unwrap_or_default();
+
+    let selected_item = match play_command.to_ascii_lowercase().as_str() {
+        "playinstantmix" => audio_instant_mix_items(&state.db, &item_ids[0])
+            .await?
+            .into_iter()
+            .nth(start_index),
+        "playnow" | "playnext" | "playlast" | "playshuffle" => {
+            let selected_id = item_ids
+                .get(start_index)
+                .or_else(|| item_ids.first())
+                .ok_or_else(|| ApiError::bad_request("ItemIds is required"))?;
+            Some(media_item_by_id(&state.db, selected_id).await?)
+        }
+        _ => return Err(ApiError::bad_request("Unsupported PlayCommand")),
+    };
+
+    if let Some(item) = selected_item {
+        let media_source_id = query
+            .media_source_id
+            .clone()
+            .unwrap_or_else(|| item.id.to_string());
+        state
+            .db
+            .upsert_active_playback_session(
+                &target_session.access_token,
+                target_session.user_id,
+                item.id,
+                Some(&media_source_id),
+                query.start_position_ticks.unwrap_or_default(),
+                false,
+            )
+            .await?;
+    } else {
+        state
+            .db
+            .clear_active_playback_session(&target_session.access_token)
+            .await?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_play_command_item_ids(value: Option<&str>) -> Result<Vec<String>, ApiError> {
+    let item_ids = value
+        .ok_or_else(|| ApiError::bad_request("ItemIds is required"))?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if item_ids.is_empty() {
+        Err(ApiError::bad_request("ItemIds is required"))
+    } else {
+        Ok(item_ids)
+    }
+}
+
+fn parse_send_play_command_query(raw_query: Option<&str>) -> SendPlayCommandQuery {
+    let mut query = SendPlayCommandQuery::default();
+    let Some(raw_query) = raw_query else {
+        return query;
+    };
+
+    for part in raw_query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let key = percent_decode_query_component(key).to_ascii_lowercase();
+        let value = percent_decode_query_component(value);
+        match key.as_str() {
+            "playcommand" => query.play_command = Some(value),
+            "itemids" => set_query_scalar(&mut query.item_ids, value),
+            "startpositionticks" => query.start_position_ticks = value.parse().ok(),
+            "mediasourceid" => query.media_source_id = Some(value),
+            "startindex" => query.start_index = value.parse().ok(),
+            _ => {}
+        }
+    }
+
+    query
+}
+
 async fn quick_connect_enabled() -> Json<bool> {
     Json(false)
 }
@@ -4800,24 +4914,12 @@ async fn instant_mix_from_item(
         ensure_user_access(&auth_user, requested_user_id)?;
     }
 
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    if item.media_type != "Audio" {
+    let mix_items = audio_instant_mix_items(&state.db, &item_id).await?;
+    if mix_items.is_empty() {
         return Ok(Json(query_result(Vec::new())));
     }
 
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let mut mix_items = state
-        .db
-        .media_items()
-        .await?
-        .into_iter()
-        .filter(|candidate| {
-            candidate.media_type == "Audio" && candidate.virtual_folder_id == item.virtual_folder_id
-        })
-        .collect::<Vec<_>>();
-    mix_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
-    mix_items.sort_by_key(|candidate| candidate.id != item.id);
-
     let total_record_count = mix_items.len();
     let limit = query.limit.unwrap_or(usize::MAX);
     let items = items_to_json(
@@ -4828,6 +4930,25 @@ async fn instant_mix_from_item(
     )
     .await?;
     Ok(Json(query_result_with_total(items, total_record_count, 0)))
+}
+
+async fn audio_instant_mix_items(db: &Database, item_id: &str) -> Result<Vec<MediaItem>, ApiError> {
+    let item = media_item_by_id(db, item_id).await?;
+    if item.media_type != "Audio" {
+        return Ok(Vec::new());
+    }
+
+    let mut mix_items = db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|candidate| {
+            candidate.media_type == "Audio" && candidate.virtual_folder_id == item.virtual_folder_id
+        })
+        .collect::<Vec<_>>();
+    mix_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+    mix_items.sort_by_key(|candidate| candidate.id != item.id);
+    Ok(mix_items)
 }
 
 async fn playback_info_response(
@@ -12672,6 +12793,150 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/Items/00000000-0000-0000-0000-000000000000/InstantMix")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="audio-remote-device", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let playback_token = login["AccessToken"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Sessions/{playback_token}/Playing?PlayCommand=PlayInstantMix&ItemIds={item_id}&StartPositionTicks=123"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Sessions/{playback_token}/Playing?PlayCommand=PlayInstantMix&ItemIds={item_id}&StartPositionTicks=123"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions[0]["DeviceId"], "audio-remote-device");
+        assert_eq!(sessions[0]["NowPlayingItem"]["Id"], item_id);
+        assert_eq!(sessions[0]["PlayState"]["PositionTicks"], 123);
+        assert_eq!(
+            sessions[0]["PlayState"]["MediaSourceId"]
+                .as_str()
+                .unwrap()
+                .replace('-', ""),
+            item_id
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/sessions/{playback_token}/playing?playCommand=PlayNow&itemIds={item_id}&startPositionTicks=456"
+                    ))
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let play_now_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(play_now_sessions[0]["NowPlayingItem"]["Id"], item_id);
+        assert_eq!(play_now_sessions[0]["PlayState"]["PositionTicks"], 456);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Sessions/{playback_token}/Playing?PlayCommand=PlayInstantMix&ItemIds=not-a-uuid"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Sessions/missing-session/Playing?PlayCommand=PlayInstantMix&ItemIds={item_id}"
+                    ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
