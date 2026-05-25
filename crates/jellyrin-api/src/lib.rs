@@ -14802,42 +14802,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 
-        let active_encodings_tmp = tempfile::tempdir().unwrap();
-        let active_encodings_media = active_encodings_tmp.path().join("Transcode Me.mkv");
-        tokio::fs::write(&active_encodings_media, b"fake video")
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn active_encodings_returns_documented_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("Transcode Me.mkv");
+        tokio::fs::write(&media, b"fake video").await.unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("admin".to_string(), "secret")
             .await
             .unwrap();
-        let active_encodings_api_key = db
+        let api_key = db
             .issue_api_key_for_user(user.id, "active-encoding-test-key")
             .await
             .unwrap();
-        let active_encodings_folder = db
+        let folder = db
             .upsert_virtual_folder(
                 "Movies",
                 Some("movies"),
-                vec![active_encodings_tmp.path().to_string_lossy().to_string()],
+                vec![tmp.path().to_string_lossy().to_string()],
             )
             .await
             .unwrap();
-        db.scan_virtual_folder_items(active_encodings_folder.id)
-            .await
-            .unwrap();
-        let active_encoding_item = db.media_items().await.unwrap().remove(0);
-        let active_encodings_app = router(AppState {
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        let app = router(AppState {
             db: db.clone(),
             web_dir: ".".into(),
             log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
-        let response = active_encodings_app
+        let response = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -14849,12 +14848,12 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let response = active_encodings_app
+        let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/videos/activeencodings")
-                    .header("X-Emby-Token", &active_encodings_api_key)
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -14868,8 +14867,8 @@ mod tests {
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-active".to_string(),
             user_id: user.id,
-            item_id: active_encoding_item.id,
-            media_source_id: Some(active_encoding_item.id.simple().to_string()),
+            item_id: item.id,
+            media_source_id: Some(item.id.simple().to_string()),
             audio_stream_index: Some(1),
             subtitle_stream_index: Some(-1),
             video_stream_index: Some(0),
@@ -14882,11 +14881,12 @@ mod tests {
         .await
         .unwrap();
 
-        let response = active_encodings_app
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Videos/ActiveEncodings")
-                    .header("X-Emby-Token", &active_encodings_api_key)
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -14897,17 +14897,58 @@ mod tests {
         let active_encodings: Value = serde_json::from_slice(&body).unwrap();
         let active_encodings = active_encodings.as_array().unwrap();
         assert_eq!(active_encodings.len(), 1);
-        assert_eq!(active_encodings[0]["PlaySessionId"], "play-session-active");
+        let encoding = &active_encodings[0];
+        let updated_at = encoding["UpdatedAt"].as_str().unwrap();
+        assert!(!updated_at.is_empty());
         assert_eq!(
-            active_encodings[0]["ItemId"],
-            active_encoding_item.id.simple().to_string()
+            encoding,
+            &json!({
+                "PlaySessionId": "play-session-active",
+                "UserId": user.id.simple().to_string(),
+                "ItemId": item.id.simple().to_string(),
+                "MediaSourceId": item.id.simple().to_string(),
+                "DeviceId": null,
+                "Path": "/tmp/jellyrin-transcodes/play-session-active/main.m3u8",
+                "OutputPath": "/tmp/jellyrin-transcodes/play-session-active/main.m3u8",
+                "Status": "starting",
+                "ProcessId": 321,
+                "ProgressPercentage": 3.5,
+                "CompletionPercentage": 3.5,
+                "TranscodingPositionTicks": 99,
+                "TranscodingStartPositionTicks": 0,
+                "Container": "mkv",
+                "VideoCodec": null,
+                "AudioCodec": null,
+                "Width": null,
+                "Height": null,
+                "Bitrate": null,
+                "VideoStreamIndex": 0,
+                "AudioStreamIndex": 1,
+                "SubtitleStreamIndex": -1,
+                "TranscodeReasons": [],
+                "IsAudioDirect": false,
+                "IsVideoDirect": false,
+                "UpdatedAt": updated_at,
+            })
         );
-        assert_eq!(active_encodings[0]["Status"], "starting");
-        assert_eq!(active_encodings[0]["ProcessId"], 321);
-        assert_eq!(active_encodings[0]["VideoStreamIndex"], 0);
-        assert_eq!(active_encodings[0]["AudioStreamIndex"], 1);
-        assert_eq!(active_encodings[0]["SubtitleStreamIndex"], -1);
-        assert_eq!(active_encodings[0]["ProgressPercentage"], 3.5);
+
+        db.update_transcode_session_status("play-session-active", "Stopped")
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Videos/ActiveEncodings")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let active_encodings: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(active_encodings, json!([]));
     }
 
     #[tokio::test]
