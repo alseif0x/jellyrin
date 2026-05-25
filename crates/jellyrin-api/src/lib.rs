@@ -32,8 +32,9 @@ use jellyrin_core::{
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
     BackupManifest, BrandingConfig, Database, DeviceSession, MediaList, MediaListItem,
-    QuickConnectSession, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
-    TrickplayInfo, UpsertActivePlaybackSession, UpsertPlaybackState, UpsertTranscodeSession,
+    MediaListUserPermission, QuickConnectSession, SortDirection, SystemConfigurationPayloads,
+    TaskRun, TranscodeSession, TrickplayInfo, UpsertActivePlaybackSession, UpsertPlaybackState,
+    UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -7964,7 +7965,7 @@ async fn get_playlist(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
+    ensure_media_list_read_access(&state.db, &user, &playlist).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let child_count = state.db.media_list_items(playlist.id).await?.len();
     Ok(Json(media_list_to_json(&playlist, &server_id, child_count)))
@@ -7981,7 +7982,7 @@ async fn update_playlist(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
+    ensure_media_list_edit_access(&state.db, &user, &playlist).await?;
     let body = body.map(|Json(value)| value);
     if let Some(name) = list_name_from_request(raw_query.as_deref(), body.as_ref()) {
         state.db.update_media_list_name(playlist.id, &name).await?;
@@ -7999,7 +8000,7 @@ async fn get_playlist_items(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
+    ensure_media_list_read_access(&state.db, &user, &playlist).await?;
     let mut items = state.db.media_list_items(playlist.id).await?;
     let start_index = query_string_value(raw_query.as_deref(), &["StartIndex", "startIndex"])
         .and_then(|value| value.parse::<usize>().ok())
@@ -8029,7 +8030,7 @@ async fn add_playlist_items(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
+    ensure_media_list_edit_access(&state.db, &user, &playlist).await?;
     let body = body.map(|Json(value)| value);
     let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
     state.db.add_media_list_items(playlist.id, item_ids).await?;
@@ -8046,7 +8047,7 @@ async fn remove_playlist_items(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
+    ensure_media_list_edit_access(&state.db, &user, &playlist).await?;
     let item_ids = query_uuid_values(raw_query.as_deref(), &["ItemIds", "itemIds"])?;
     let playlist_item_ids = query_uuid_values(
         raw_query.as_deref(),
@@ -8068,7 +8069,7 @@ async fn move_playlist_item(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
+    ensure_media_list_edit_access(&state.db, &user, &playlist).await?;
     state
         .db
         .move_media_list_item(playlist.id, parse_jellyfin_uuid(&item_id)?, new_index)
@@ -8085,7 +8086,7 @@ async fn get_playlist_users(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
+    ensure_media_list_manage_access(&user, &playlist)?;
     Ok(Json(playlist_users_json(&state.db, &playlist).await?))
 }
 
@@ -8098,11 +8099,30 @@ async fn get_playlist_user(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
     let requested_user = state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    let is_owner = playlist.owner_user_id == Some(requested_user.id);
+    let permission = if is_owner {
+        None
+    } else {
+        state
+            .db
+            .media_list_user_permission(playlist.id, requested_user.id)
+            .await?
+    };
+    let can_read = media_list_is_owner_or_admin(&user, &playlist)
+        || (requested_user.id == user.id && (is_owner || permission.is_some()));
+    if !can_read {
+        return Err(ApiError::forbidden("Playlist access denied"));
+    }
+    if !is_owner && permission.is_none() {
+        return Err(ApiError::not_found("Playlist user not found"));
+    }
     Ok(Json(playlist_user_json(
         &requested_user,
-        playlist.owner_user_id == Some(requested_user.id),
+        is_owner,
+        permission
+            .as_ref()
+            .is_some_and(|permission| permission.can_edit),
     )))
 }
 
@@ -8111,13 +8131,24 @@ async fn add_playlist_user(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Path((playlist_id, user_id)): Path<(String, String)>,
-    _body: Option<Json<serde_json::Value>>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
-    state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    ensure_media_list_manage_access(&user, &playlist)?;
+    let requested_user = state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    if playlist.owner_user_id != Some(requested_user.id) {
+        let body = body.map(|Json(value)| value);
+        state
+            .db
+            .upsert_media_list_user_permission(
+                playlist.id,
+                requested_user.id,
+                playlist_user_can_edit_from_request(body.as_ref()),
+            )
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8130,8 +8161,15 @@ async fn remove_playlist_user(
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let playlist =
         ensure_media_list_kind(&state.db, parse_jellyfin_uuid(&playlist_id)?, "playlist").await?;
-    ensure_media_list_access(&user, &playlist)?;
-    state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    ensure_media_list_manage_access(&user, &playlist)?;
+    let requested_user = state.db.user_by_id(resolve_user_id(&user_id)?).await?;
+    if playlist.owner_user_id == Some(requested_user.id) {
+        return Err(ApiError::bad_request("Playlist owner cannot be removed"));
+    }
+    state
+        .db
+        .delete_media_list_user_permission(playlist.id, requested_user.id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8157,12 +8195,49 @@ async fn ensure_media_list_kind(
     }
 }
 
-fn ensure_media_list_access(user: &User, list: &MediaList) -> Result<(), ApiError> {
-    if user.is_administrator
+fn media_list_is_owner_or_admin(user: &User, list: &MediaList) -> bool {
+    user.is_administrator
         || list
             .owner_user_id
             .is_none_or(|owner_id| owner_id == user.id)
+}
+
+async fn ensure_media_list_read_access(
+    db: &Database,
+    user: &User,
+    list: &MediaList,
+) -> Result<(), ApiError> {
+    if media_list_is_owner_or_admin(user, list)
+        || db
+            .media_list_user_permission(list.id, user.id)
+            .await?
+            .is_some()
     {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("Playlist access denied"))
+    }
+}
+
+async fn ensure_media_list_edit_access(
+    db: &Database,
+    user: &User,
+    list: &MediaList,
+) -> Result<(), ApiError> {
+    if media_list_is_owner_or_admin(user, list)
+        || db
+            .media_list_user_permission(list.id, user.id)
+            .await?
+            .is_some_and(|permission| permission.can_edit)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("Playlist access denied"))
+    }
+}
+
+fn ensure_media_list_manage_access(user: &User, list: &MediaList) -> Result<(), ApiError> {
+    if media_list_is_owner_or_admin(user, list) {
         Ok(())
     } else {
         Err(ApiError::forbidden("Playlist access denied"))
@@ -8347,22 +8422,37 @@ async fn playlist_users_json(
     db: &Database,
     playlist: &MediaList,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
+    let permissions = db.media_list_user_permissions(playlist.id).await?;
+    let mut users = Vec::with_capacity(permissions.len() + 1);
     if let Some(owner_id) = playlist.owner_user_id {
         let owner = db.user_by_id(owner_id).await?;
-        Ok(vec![playlist_user_json(&owner, true)])
-    } else {
-        Ok(Vec::new())
+        users.push(playlist_user_json(&owner, true, true));
     }
+    users.extend(permissions.iter().map(playlist_user_permission_json));
+    Ok(users)
 }
 
-fn playlist_user_json(user: &User, is_owner: bool) -> serde_json::Value {
+fn playlist_user_permission_json(permission: &MediaListUserPermission) -> serde_json::Value {
+    playlist_user_json(&permission.user, false, permission.can_edit)
+}
+
+fn playlist_user_json(user: &User, is_owner: bool, can_edit: bool) -> serde_json::Value {
     serde_json::json!({
         "Id": user.id.simple().to_string(),
         "UserId": user.id.simple().to_string(),
         "Name": user.name,
-        "CanEdit": is_owner || user.is_administrator,
+        "CanEdit": is_owner || user.is_administrator || can_edit,
         "IsOwner": is_owner
     })
+}
+
+fn playlist_user_can_edit_from_request(body: Option<&serde_json::Value>) -> bool {
+    body.and_then(|body| {
+        ["CanEdit", "canEdit", "CanManage", "canManage"]
+            .iter()
+            .find_map(|name| body.get(*name).and_then(serde_json::Value::as_bool))
+    })
+    .unwrap_or(false)
 }
 
 async fn environment_drives(
@@ -26994,6 +27084,10 @@ mod tests {
             .await
             .unwrap();
         let viewer = db.create_user("viewer", Some("secret")).await.unwrap();
+        let viewer_key = db
+            .issue_api_key_for_user(viewer.id, "playlist-viewer-key")
+            .await
+            .unwrap();
         let test_db = db.clone();
         let app = router(AppState {
             db,
@@ -27069,6 +27163,19 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let created_playlist: Value = serde_json::from_slice(&body).unwrap();
         let playlist_id = created_playlist["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}"))
+                    .header("X-Emby-Token", &viewer_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let response = app
             .clone()
@@ -27217,12 +27324,30 @@ mod tests {
                     ))
                     .header("X-Emby-Token", &admin_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({ "CanEdit": true }).to_string()))
+                    .body(Body::from(json!({ "CanEdit": false }).to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}/Users"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let users: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(users.as_array().unwrap().len(), 2);
+        assert_eq!(users[1]["UserId"], viewer.id.simple().to_string());
+        assert_eq!(users[1]["CanEdit"], false);
 
         let response = app
             .clone()
@@ -27242,6 +27367,68 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let playlist_user: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(playlist_user["UserId"], viewer.id.simple().to_string());
+        assert_eq!(playlist_user["CanEdit"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}/Items"))
+                    .header("X-Emby-Token", &viewer_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Playlists/{playlist_id}/Items"))
+                    .header("X-Emby-Token", &viewer_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Ids": [first_id] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Playlists/{playlist_id}/Users/{}",
+                        viewer.id.simple()
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "CanEdit": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Playlists/{playlist_id}/Items"))
+                    .header("X-Emby-Token", &viewer_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Ids": [first_id] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
@@ -27259,6 +27446,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}"))
+                    .header("X-Emby-Token", &viewer_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let response = app
             .clone()

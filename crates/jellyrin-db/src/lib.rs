@@ -101,6 +101,15 @@ pub struct MediaListItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct MediaListUserPermission {
+    pub list_id: Uuid,
+    pub user: User,
+    pub can_edit: bool,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct QuickConnectSession {
     pub secret: String,
     pub code: String,
@@ -2901,6 +2910,109 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn media_list_user_permissions(
+        &self,
+        list_id: Uuid,
+    ) -> anyhow::Result<Vec<MediaListUserPermission>> {
+        self.media_list_by_id(list_id).await?;
+        let rows = sqlx::query_as::<_, MediaListUserPermissionRow>(
+            r#"
+            SELECT media_list_user_permissions.list_id,
+                   media_list_user_permissions.can_edit,
+                   media_list_user_permissions.created_at AS permission_created_at,
+                   media_list_user_permissions.updated_at AS permission_updated_at,
+                   users.id,
+                   users.name,
+                   users.is_administrator,
+                   users.is_disabled,
+                   users.created_at,
+                   users.updated_at
+            FROM media_list_user_permissions
+            INNER JOIN users ON users.id = media_list_user_permissions.user_id
+            WHERE media_list_user_permissions.list_id = ?1
+            ORDER BY users.name COLLATE NOCASE
+            "#,
+        )
+        .bind(list_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn media_list_user_permission(
+        &self,
+        list_id: Uuid,
+        user_id: Uuid,
+    ) -> anyhow::Result<Option<MediaListUserPermission>> {
+        let row = sqlx::query_as::<_, MediaListUserPermissionRow>(
+            r#"
+            SELECT media_list_user_permissions.list_id,
+                   media_list_user_permissions.can_edit,
+                   media_list_user_permissions.created_at AS permission_created_at,
+                   media_list_user_permissions.updated_at AS permission_updated_at,
+                   users.id,
+                   users.name,
+                   users.is_administrator,
+                   users.is_disabled,
+                   users.created_at,
+                   users.updated_at
+            FROM media_list_user_permissions
+            INNER JOIN users ON users.id = media_list_user_permissions.user_id
+            WHERE media_list_user_permissions.list_id = ?1
+              AND media_list_user_permissions.user_id = ?2
+            "#,
+        )
+        .bind(list_id.to_string())
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn upsert_media_list_user_permission(
+        &self,
+        list_id: Uuid,
+        user_id: Uuid,
+        can_edit: bool,
+    ) -> anyhow::Result<()> {
+        self.media_list_by_id(list_id).await?;
+        self.user_by_id(user_id).await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_list_user_permissions (
+                list_id, user_id, can_edit, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?4)
+            ON CONFLICT(list_id, user_id) DO UPDATE SET
+                can_edit = excluded.can_edit,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(list_id.to_string())
+        .bind(user_id.to_string())
+        .bind(can_edit)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_media_list_user_permission(
+        &self,
+        list_id: Uuid,
+        user_id: Uuid,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM media_list_user_permissions WHERE list_id = ?1 AND user_id = ?2")
+            .bind(list_id.to_string())
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn next_media_list_position(&self, list_id: Uuid) -> anyhow::Result<i64> {
         let max_position: Option<i64> =
             sqlx::query_scalar("SELECT MAX(position) FROM media_list_items WHERE list_id = ?1")
@@ -4136,6 +4248,20 @@ struct MediaListItemIdRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct MediaListUserPermissionRow {
+    list_id: String,
+    can_edit: bool,
+    permission_created_at: String,
+    permission_updated_at: String,
+    id: String,
+    name: String,
+    is_administrator: bool,
+    is_disabled: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct MediaItemIdRow {
     id: String,
 }
@@ -4420,6 +4546,28 @@ impl TryFrom<MediaListItemRow> for MediaListItem {
                 .context("invalid playlist item id")?,
             position: row.position,
             added_at: parse_time(&row.added_at)?,
+        })
+    }
+}
+
+impl TryFrom<MediaListUserPermissionRow> for MediaListUserPermission {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaListUserPermissionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            list_id: Uuid::parse_str(&row.list_id)
+                .context("invalid media list permission list id")?,
+            user: User {
+                id: Uuid::parse_str(&row.id).context("invalid media list permission user id")?,
+                name: row.name,
+                is_administrator: row.is_administrator,
+                is_disabled: row.is_disabled,
+                created_at: parse_time(&row.created_at)?,
+                updated_at: parse_time(&row.updated_at)?,
+            },
+            can_edit: row.can_edit,
+            created_at: parse_time(&row.permission_created_at)?,
+            updated_at: parse_time(&row.permission_updated_at)?,
         })
     }
 }
