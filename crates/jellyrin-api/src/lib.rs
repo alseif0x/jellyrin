@@ -5151,6 +5151,9 @@ struct PlaybackInfoOptions {
     enable_direct_play: bool,
     enable_direct_stream: bool,
     enable_transcoding: bool,
+    media_source_id: Option<String>,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
     direct_play_profiles: Option<Vec<DirectPlayProfileMatcher>>,
 }
 
@@ -5168,6 +5171,9 @@ impl Default for PlaybackInfoOptions {
             enable_direct_play: true,
             enable_direct_stream: true,
             enable_transcoding: true,
+            media_source_id: None,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
             direct_play_profiles: None,
         }
     }
@@ -5204,6 +5210,21 @@ fn parse_playback_info_options(
                     options.enable_transcoding = value;
                 }
             }
+            "mediasourceid" => {
+                if !value.trim().is_empty() {
+                    options.media_source_id = Some(value.trim().to_string());
+                }
+            }
+            "audiostreamindex" => {
+                if let Ok(value) = value.parse::<i64>() {
+                    options.audio_stream_index = Some(value);
+                }
+            }
+            "subtitlestreamindex" => {
+                if let Ok(value) = value.parse::<i64>() {
+                    options.subtitle_stream_index = Some(value);
+                }
+            }
             _ => {}
         }
     }
@@ -5222,6 +5243,9 @@ fn playback_info_options_from_body(body: &serde_json::Value) -> PlaybackInfoOpti
     if let Some(value) = json_bool_field(body, "EnableTranscoding") {
         options.enable_transcoding = value;
     }
+    options.media_source_id = json_string_field(body, "MediaSourceId");
+    options.audio_stream_index = json_i64_field(body, "AudioStreamIndex");
+    options.subtitle_stream_index = json_i64_field(body, "SubtitleStreamIndex");
     options.direct_play_profiles = parse_direct_play_profiles(body);
     options
 }
@@ -5256,6 +5280,10 @@ fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
         }
         _ => None,
     })
+}
+
+fn json_i64_field(value: &serde_json::Value, field: &str) -> Option<i64> {
+    json_field_case_insensitive(value, field).and_then(json_value_i64)
 }
 
 fn parse_direct_play_profiles(body: &serde_json::Value) -> Option<Vec<DirectPlayProfileMatcher>> {
@@ -5305,6 +5333,13 @@ async fn playback_info_response(
     let play_session_id = Uuid::new_v4().simple().to_string();
     let direct_play_supported = playback_direct_play_supported(&item, &options);
     let direct_stream_supported = options.enable_direct_stream || direct_play_supported;
+    if !playback_selection_supported(&item, &options) {
+        return Ok(Json(serde_json::json!({
+            "MediaSources": [],
+            "PlaySessionId": play_session_id,
+            "ErrorCode": "NoCompatibleStream",
+        })));
+    }
     if !direct_play_supported && !direct_stream_supported {
         return Ok(Json(serde_json::json!({
             "MediaSources": [],
@@ -5328,6 +5363,7 @@ async fn playback_info_response(
             serde_json::json!(direct_stream_supported),
         );
         media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(false));
+        apply_playback_stream_selection(media_source, &options);
     }
 
     Ok(Json(serde_json::json!({
@@ -5335,6 +5371,71 @@ async fn playback_info_response(
         "PlaySessionId": play_session_id,
         "ErrorCode": null,
     })))
+}
+
+fn playback_selection_supported(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
+    if let Some(media_source_id) = options.media_source_id.as_deref()
+        && parse_jellyfin_uuid(media_source_id).ok() != Some(item.id)
+    {
+        return false;
+    }
+
+    if let Some(audio_stream_index) = options.audio_stream_index
+        && !media_item_has_stream_index(item, "Audio", audio_stream_index)
+    {
+        return false;
+    }
+
+    if let Some(subtitle_stream_index) = options.subtitle_stream_index {
+        if subtitle_stream_index < 0 {
+            return true;
+        }
+        if !media_item_has_stream_index(item, "Subtitle", subtitle_stream_index) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn apply_playback_stream_selection(
+    media_source: &mut serde_json::Map<String, serde_json::Value>,
+    options: &PlaybackInfoOptions,
+) {
+    if let Some(audio_stream_index) = options.audio_stream_index {
+        media_source.insert(
+            "DefaultAudioStreamIndex".to_string(),
+            serde_json::json!(audio_stream_index),
+        );
+    }
+
+    if let Some(subtitle_stream_index) = options.subtitle_stream_index {
+        let value = if subtitle_stream_index < 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(subtitle_stream_index)
+        };
+        media_source.insert("DefaultSubtitleStreamIndex".to_string(), value);
+    }
+}
+
+fn media_item_has_stream_index(item: &MediaItem, stream_type: &str, index: i64) -> bool {
+    media_item_streams(item).iter().any(|stream| {
+        let Some(stream) = stream.as_object() else {
+            return false;
+        };
+        let Some(type_name) = stream.get("Type").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        if !type_name.eq_ignore_ascii_case(stream_type) {
+            return false;
+        }
+
+        stream
+            .get("Index")
+            .and_then(json_value_i64)
+            .is_some_and(|stream_index| stream_index == index)
+    })
 }
 
 fn playback_direct_play_supported(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
@@ -12818,6 +12919,154 @@ mod tests {
         assert_eq!(
             playback_info["MediaSources"][0]["MediaStreams"][2]["Type"],
             "Subtitle"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "MediaSourceId": item_id,
+                            "AudioStreamIndex": 1,
+                            "SubtitleStreamIndex": -1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let selected_streams_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(selected_streams_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            selected_streams_info["MediaSources"][0]["DefaultAudioStreamIndex"],
+            1
+        );
+        assert_eq!(
+            selected_streams_info["MediaSources"][0]["DefaultSubtitleStreamIndex"],
+            Value::Null
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "MediaSourceId": parse_jellyfin_uuid(item_id).unwrap().to_string(),
+                            "AudioStreamIndex": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let hyphenated_media_source_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(hyphenated_media_source_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            hyphenated_media_source_info["MediaSources"][0]["DefaultAudioStreamIndex"],
+            1
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?AudioStreamIndex=999"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let invalid_audio_selection_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            invalid_audio_selection_info["ErrorCode"],
+            "NoCompatibleStream"
+        );
+        assert_eq!(
+            invalid_audio_selection_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?SubtitleStreamIndex=999"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let invalid_subtitle_selection_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            invalid_subtitle_selection_info["ErrorCode"],
+            "NoCompatibleStream"
+        );
+        assert_eq!(
+            invalid_subtitle_selection_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "MediaSourceId": "00000000000000000000000000000000",
+                            "AudioStreamIndex": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let invalid_media_source_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(invalid_media_source_info["ErrorCode"], "NoCompatibleStream");
+        assert_eq!(
+            invalid_media_source_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
         );
 
         let response = app
