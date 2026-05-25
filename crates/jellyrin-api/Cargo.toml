@@ -12,6 +12,7 @@ axum.workspace = true
 jellyrin-compat = { path = "../jellyrin-compat" }
 jellyrin-core = { path = "../jellyrin-core" }
 jellyrin-db = { path = "../jellyrin-db" }
+jellyrin-transcode = { path = "../jellyrin-transcode" }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

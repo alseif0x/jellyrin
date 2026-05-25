@@ -908,6 +908,7 @@ dependencies = [
  "jellyrin-compat",
  "jellyrin-core",
  "jellyrin-db",
+ "jellyrin-transcode",
  "serde",
  "serde_json",
  "sqlx",

@@ -29,6 +29,10 @@ use jellyrin_db::{
     SystemConfigurationPayloads, TaskRun, TranscodeSession, UpsertActivePlaybackSession,
     UpsertPlaybackState,
 };
+use jellyrin_transcode::{
+    HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
+    wait_for_hls_readiness,
+};
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -568,6 +572,36 @@ pub fn router(state: AppState) -> Router {
         .route("/videos/{item_id}/stream", get(direct_stream_item))
         .route("/Videos/{item_id}/stream", head(direct_stream_item_head))
         .route("/videos/{item_id}/stream", head(direct_stream_item_head))
+        .route("/Videos/{item_id}/master.m3u8", get(hls_master_playlist))
+        .route("/videos/{item_id}/master.m3u8", get(hls_master_playlist))
+        .route(
+            "/Videos/{item_id}/master.m3u8",
+            head(hls_master_playlist_head),
+        )
+        .route(
+            "/videos/{item_id}/master.m3u8",
+            head(hls_master_playlist_head),
+        )
+        .route("/Videos/{item_id}/main.m3u8", get(hls_media_playlist))
+        .route("/videos/{item_id}/main.m3u8", get(hls_media_playlist))
+        .route("/Videos/{item_id}/main.m3u8", head(hls_media_playlist_head))
+        .route("/videos/{item_id}/main.m3u8", head(hls_media_playlist_head))
+        .route(
+            "/Videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/Videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            head(hls_segment_head),
+        )
+        .route(
+            "/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            head(hls_segment_head),
+        )
         .route(
             "/Videos/{item_id}/stream.{container}",
             get(direct_stream_item_by_container),
@@ -5575,6 +5609,122 @@ async fn direct_stream_item_head(
     .await
 }
 
+async fn hls_master_playlist(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    hls_master_playlist_response(
+        &state,
+        &headers,
+        &item_id,
+        query,
+        raw_query.as_deref(),
+        true,
+    )
+    .await
+}
+
+async fn hls_master_playlist_head(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    hls_master_playlist_response(
+        &state,
+        &headers,
+        &item_id,
+        query,
+        raw_query.as_deref(),
+        false,
+    )
+    .await
+}
+
+async fn hls_media_playlist(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    hls_media_playlist_response(
+        &state,
+        &headers,
+        &item_id,
+        query,
+        raw_query.as_deref(),
+        true,
+    )
+    .await
+}
+
+async fn hls_media_playlist_head(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    hls_media_playlist_response(
+        &state,
+        &headers,
+        &item_id,
+        query,
+        raw_query.as_deref(),
+        false,
+    )
+    .await
+}
+
+async fn hls_segment(
+    State(state): State<AppState>,
+    Path((item_id, playlist_id, segment_file)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let (segment_id, container) = parse_hls_segment_file(&segment_file)?;
+    hls_segment_response(
+        &state,
+        &headers,
+        &item_id,
+        HlsSegmentRequest {
+            playlist_id: &playlist_id,
+            segment_id,
+            container,
+        },
+        query,
+        true,
+    )
+    .await
+}
+
+async fn hls_segment_head(
+    State(state): State<AppState>,
+    Path((item_id, playlist_id, segment_file)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let (segment_id, container) = parse_hls_segment_file(&segment_file)?;
+    hls_segment_response(
+        &state,
+        &headers,
+        &item_id,
+        HlsSegmentRequest {
+            playlist_id: &playlist_id,
+            segment_id,
+            container,
+        },
+        query,
+        false,
+    )
+    .await
+}
+
 async fn direct_stream_item_by_container(
     State(state): State<AppState>,
     Path((item_id, _container)): Path<(String, String)>,
@@ -5709,6 +5859,215 @@ async fn direct_stream_audio_by_container_head(
         false,
     )
     .await
+}
+
+async fn hls_master_playlist_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    query: HlsQuery,
+    raw_query: Option<&str>,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let session = active_hls_transcode_session(state, headers, item_id, &query).await?;
+    let playlist = render_hls_master_playlist(&HlsVariantInfo {
+        uri: append_query(HLS_MEDIA_PLAYLIST_NAME, raw_query),
+        bandwidth: session
+            .item
+            .bitrate
+            .and_then(positive_u32)
+            .unwrap_or(1_000_000),
+        resolution: session
+            .item
+            .width
+            .and_then(|value| positive_u32(i64::from(value)))
+            .zip(
+                session
+                    .item
+                    .height
+                    .and_then(|value| positive_u32(i64::from(value))),
+            ),
+        codecs: hls_codecs(&session.item),
+    });
+    playlist_response(playlist, include_body)
+}
+
+async fn hls_media_playlist_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    query: HlsQuery,
+    raw_query: Option<&str>,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let session = active_hls_transcode_session(state, headers, item_id, &query).await?;
+    let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
+    let ready = wait_for_hls_readiness(
+        &layout.media_playlist_path,
+        layout.segment_path(0),
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    if !ready {
+        return Err(ApiError::not_found("HLS playlist is not ready"));
+    }
+
+    let playlist = tokio::fs::read_to_string(&layout.media_playlist_path).await?;
+    let playlist = rewrite_hls_media_playlist(&playlist, item_id, raw_query);
+    playlist_response(playlist, include_body)
+}
+
+struct HlsSegmentRequest<'a> {
+    playlist_id: &'a str,
+    segment_id: i64,
+    container: &'a str,
+}
+
+async fn hls_segment_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    segment: HlsSegmentRequest<'_>,
+    query: HlsQuery,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    if segment.playlist_id != "main"
+        || !segment.container.eq_ignore_ascii_case("ts")
+        || segment.segment_id < 0
+    {
+        return Err(ApiError::not_found("HLS segment not found"));
+    }
+
+    let session = active_hls_transcode_session(state, headers, item_id, &query).await?;
+    let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
+    let segment_id = u32::try_from(segment.segment_id)
+        .map_err(|_| ApiError::not_found("HLS segment not found"))?;
+    stream_path(
+        layout.segment_path(segment_id),
+        "video/mp2t".to_string(),
+        headers,
+        include_body,
+    )
+    .await
+}
+
+async fn active_hls_transcode_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    query: &HlsQuery,
+) -> Result<TranscodeSession, ApiError> {
+    require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
+    let requested_item_id = parse_jellyfin_uuid(item_id)?;
+    let play_session_id = query
+        .play_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
+    let session = state
+        .db
+        .transcode_session_by_play_session_id(play_session_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("HLS transcode session not found"))?;
+    if session.item.id != requested_item_id
+        || session.item.media_type != "Video"
+        || !matches!(session.status.as_str(), "starting" | "running")
+    {
+        return Err(ApiError::not_found("HLS transcode session not found"));
+    }
+    Ok(session)
+}
+
+fn playlist_response(
+    playlist: String,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let content_length = playlist.len().to_string();
+    let body = if include_body {
+        Body::from(playlist)
+    } else {
+        Body::empty()
+    };
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/vnd.apple.mpegurl".to_string(),
+            ),
+            (header::CONTENT_LENGTH, content_length),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+async fn stream_path(
+    path: PathBuf,
+    content_type: String,
+    headers: &HeaderMap,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let total_len = file.metadata().await?.len();
+    let range = match parse_range_header(headers, total_len) {
+        Ok(range) => range,
+        Err(()) => {
+            return Ok((
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_RANGE, format!("bytes */{total_len}")),
+                ],
+                Body::empty(),
+            )
+                .into_response());
+        }
+    };
+
+    if let Some((start, end)) = range {
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let content_length = end - start + 1;
+        let stream = ReaderStream::new(file.take(content_length));
+        let body = if include_body {
+            Body::from_stream(stream)
+        } else {
+            Body::empty()
+        };
+        return Ok((
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CONTENT_LENGTH, content_length.to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total_len}"),
+                ),
+            ],
+            body,
+        )
+            .into_response());
+    }
+
+    let stream = ReaderStream::new(file);
+    let body = if include_body {
+        Body::from_stream(stream)
+    } else {
+        Body::empty()
+    };
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CONTENT_LENGTH, total_len.to_string()),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 async fn direct_stream_media(
@@ -6628,6 +6987,63 @@ fn media_item_direct_stream_url(item: &MediaItem, item_id: &str) -> String {
     }
 }
 
+fn hls_codecs(item: &MediaItem) -> Option<String> {
+    let codecs = [
+        media_item_stream_codec(item, "Video"),
+        media_item_stream_codec(item, "Audio"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|codec| !codec.trim().is_empty())
+    .collect::<Vec<_>>();
+    (!codecs.is_empty()).then(|| codecs.join(","))
+}
+
+fn rewrite_hls_media_playlist(playlist: &str, item_id: &str, raw_query: Option<&str>) -> String {
+    let mut rewritten = String::with_capacity(playlist.len());
+    for line in playlist.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            rewritten.push_str(line);
+        } else if let Some(segment_id) = hls_segment_id_from_uri(line) {
+            rewritten.push_str(&append_query(
+                &format!("/Videos/{item_id}/hls1/main/{segment_id}.ts"),
+                raw_query,
+            ));
+        } else {
+            rewritten.push_str(line);
+        }
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
+fn hls_segment_id_from_uri(uri: &str) -> Option<u32> {
+    let path = uri.split_once('?').map_or(uri, |(path, _)| path);
+    let file_name = FsPath::new(path).file_name()?.to_str()?;
+    let segment_id = file_name.strip_prefix("segment_")?.strip_suffix(".ts")?;
+    segment_id.parse().ok()
+}
+
+fn parse_hls_segment_file(segment_file: &str) -> Result<(i64, &str), ApiError> {
+    let (segment_id, container) = segment_file
+        .rsplit_once('.')
+        .ok_or_else(|| ApiError::not_found("HLS segment not found"))?;
+    let segment_id = segment_id
+        .parse()
+        .map_err(|_| ApiError::not_found("HLS segment not found"))?;
+    Ok((segment_id, container))
+}
+
+fn append_query(path: &str, raw_query: Option<&str>) -> String {
+    raw_query
+        .filter(|query| !query.trim().is_empty())
+        .map_or_else(|| path.to_string(), |query| format!("{path}?{query}"))
+}
+
+fn positive_u32(value: i64) -> Option<u32> {
+    u32::try_from(value).ok().filter(|value| *value > 0)
+}
+
 fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
     if !item.media_streams.is_empty() {
         return item.media_streams.clone();
@@ -7141,6 +7557,14 @@ struct StreamQuery {
     _audio_stream_index: Option<i32>,
     #[serde(alias = "SubtitleStreamIndex")]
     _subtitle_stream_index: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HlsQuery {
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(alias = "PlaySessionId", alias = "playSessionId")]
+    play_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -14949,6 +15373,211 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let active_encodings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(active_encodings, json!([]));
+    }
+
+    #[tokio::test]
+    async fn hls_routes_serve_active_transcode_files() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Transcode Me.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let transcode_dir = transcode_root.path().join("play-session-hls");
+        tokio::fs::create_dir_all(&transcode_dir).await.unwrap();
+        let main_playlist = transcode_dir.join("main.m3u8");
+        let first_segment = transcode_dir.join("segment_00000.ts");
+        let second_segment = transcode_dir.join("segment_00001.ts");
+        tokio::fs::write(
+            &main_playlist,
+            format!(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:3\n#EXTINF:3.000,\n{}\n#EXTINF:2.000,\nsegment_00001.ts\n",
+                first_segment.to_string_lossy()
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&first_segment, b"zero").await.unwrap();
+        tokio::fs::write(&second_segment, b"one").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "hls-route-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        let item_id = item.id.simple().to_string();
+
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-hls".to_string(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item_id.clone()),
+            audio_stream_index: Some(0),
+            subtitle_stream_index: Some(-1),
+            video_stream_index: Some(0),
+            output_path: main_playlist.to_string_lossy().to_string(),
+            process_id: Some(456),
+            status: "running".to_string(),
+            progress_percent: Some(50.0),
+            position_ticks: 123,
+        })
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apple.mpegurl"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let master = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            master,
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmain.m3u8?PlaySessionId=play-session-hls\n"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/videos/{item_id}/main.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let media_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!media_playlist.contains(transcode_root.path().to_str().unwrap()));
+        assert!(media_playlist.contains(&format!(
+            "/Videos/{item_id}/hls1/main/0.ts?PlaySessionId=play-session-hls"
+        )));
+        assert!(media_playlist.contains(&format!(
+            "/Videos/{item_id}/hls1/main/1.ts?PlaySessionId=play-session-hls"
+        )));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/hls1/main/0.ts?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"zero");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!(
+                        "/videos/{item_id}/hls1/main/1.ts?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "3");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/hls1/main/0.mp4?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        db.update_transcode_session_status("play-session-hls", "stopped")
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
