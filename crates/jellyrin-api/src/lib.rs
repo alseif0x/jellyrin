@@ -14376,8 +14376,17 @@ async fn delete_library_items(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item_ids = query_uuid_values(raw_query.as_deref(), &["Ids", "ids", "ItemIds", "itemIds"])?;
+    if item_ids.is_empty() {
+        return Err(ApiError::bad_request("No item ids supplied"));
+    }
+    let deleted = state.db.delete_media_items(item_ids, Some(user.id)).await?;
+    if deleted == 0 {
+        return Err(ApiError::not_found("Item not found"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -14387,8 +14396,15 @@ async fn delete_library_item(
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item_id = parse_jellyfin_uuid(&item_id)?;
+    let deleted = state
+        .db
+        .delete_media_items(vec![item_id], Some(user.id))
+        .await?;
+    if deleted == 0 {
+        return Err(ApiError::not_found("Item not found"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -27505,6 +27521,216 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn library_item_delete_removes_items_and_associations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_movie = tmp.path().join("Delete One.mp4");
+        let second_movie = tmp.path().join("Delete Two.mp4");
+        tokio::fs::write(&first_movie, b"first").await.unwrap();
+        tokio::fs::write(&second_movie, b"second").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "delete-library-items-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let items = test_db.media_items().await.unwrap();
+        assert_eq!(items.len(), 2);
+        let first_id = items
+            .iter()
+            .find(|item| item.name == "Delete One")
+            .unwrap()
+            .id;
+        let second_id = items
+            .iter()
+            .find(|item| item.name == "Delete Two")
+            .unwrap()
+            .id;
+
+        test_db
+            .upsert_playback_state(UpsertPlaybackState {
+                user_id: admin.id,
+                item_id: first_id,
+                media_source_id: Some("source".to_string()),
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(-1),
+                position_ticks: 123,
+                is_paused: true,
+                played: false,
+            })
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Playlists?Name=Delete%20List&Ids={},{}",
+                        first_id.simple(),
+                        second_id.simple()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist: Value = serde_json::from_slice(&body).unwrap();
+        let playlist_id = playlist["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Library/Items/{}", first_id.simple()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Library/Items/{}", first_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(
+            test_db
+                .playback_state_for_item(admin.id, first_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(test_db.media_items().await.unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{}", first_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}/Items"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playlist_items["TotalRecordCount"], 1);
+        assert_eq!(
+            playlist_items["Items"][0]["Id"],
+            second_id.simple().to_string()
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Library/Items?Ids={}", second_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(test_db.media_items().await.unwrap().is_empty());
+        assert!(tokio::fs::metadata(&first_movie).await.is_ok());
+        assert!(tokio::fs::metadata(&second_movie).await.is_ok());
+        let folder_id = test_db.virtual_folders().await.unwrap()[0].id;
+        assert_eq!(
+            test_db.scan_virtual_folder_items(folder_id).await.unwrap(),
+            0
+        );
+        assert!(test_db.media_items().await.unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Library/Items/{}", second_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Library/Items")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

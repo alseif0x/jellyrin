@@ -2519,6 +2519,76 @@ impl Database {
         row.try_into()
     }
 
+    pub async fn delete_media_items(
+        &self,
+        item_ids: Vec<Uuid>,
+        deleted_by_user_id: Option<Uuid>,
+    ) -> anyhow::Result<u64> {
+        let ids = dedupe_uuids(item_ids)
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let visible_items = self.visible_media_item_paths_by_ids(&ids).await?;
+        if visible_items.is_empty() {
+            return Ok(0);
+        }
+        let visible_ids = visible_items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let now = format_time(OffsetDateTime::now_utc())?;
+        for item in &visible_items {
+            sqlx::query(
+                r#"
+                INSERT INTO media_item_deletions (path, item_id, deleted_by_user_id, deleted_at)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(path) DO UPDATE SET
+                    item_id = excluded.item_id,
+                    deleted_by_user_id = excluded.deleted_by_user_id,
+                    deleted_at = excluded.deleted_at
+                "#,
+            )
+            .bind(&item.path)
+            .bind(&item.id)
+            .bind(deleted_by_user_id.map(|id| id.to_string()))
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        self.delete_from_item_ref_table("active_playback_sessions", "item_id", &visible_ids)
+            .await?;
+        self.delete_from_item_ref_table("transcode_sessions", "item_id", &visible_ids)
+            .await?;
+        self.delete_from_item_ref_table("playback_states", "item_id", &visible_ids)
+            .await?;
+        self.delete_from_item_ref_table("media_list_items", "item_id", &visible_ids)
+            .await?;
+        self.delete_from_item_ref_table("media_item_lyrics", "item_id", &visible_ids)
+            .await?;
+        self.delete_from_item_ref_table("trickplay_infos", "item_id", &visible_ids)
+            .await?;
+        self.delete_media_item_versions_for_items(&visible_ids)
+            .await?;
+
+        let mut query = QueryBuilder::<Sqlite>::new("UPDATE media_items SET missing_since = ");
+        query
+            .push_bind(&now)
+            .push(", updated_at = ")
+            .push_bind(&now)
+            .push(" WHERE missing_since IS NULL AND id IN (");
+        let mut separated = query.separated(", ");
+        for id in &visible_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        let result = query.build().execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn media_item_versions(&self, item_id: Uuid) -> anyhow::Result<Vec<MediaItem>> {
         let item_id = item_id.to_string();
         let links = sqlx::query_as::<_, MediaItemVersionRow>(
@@ -3312,6 +3382,10 @@ impl Database {
                 continue;
             };
             for path in media_files {
+                let path_string = path.to_string_lossy().to_string();
+                if self.media_item_path_is_deleted(&path_string).await? {
+                    continue;
+                }
                 let Some(name) = path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -3325,7 +3399,7 @@ impl Database {
                     continue;
                 };
 
-                found_paths.insert(path.to_string_lossy().to_string());
+                found_paths.insert(path_string);
                 self.upsert_media_item(&folder, &name, &path, media_type)
                     .await?;
                 scanned += 1;
@@ -3725,6 +3799,84 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn visible_media_item_paths_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> anyhow::Result<Vec<MediaItemPathRow>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, path FROM media_items WHERE missing_since IS NULL AND id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in item_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        query
+            .build_query_as::<MediaItemPathRow>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn media_item_path_is_deleted(&self, path: &str) -> anyhow::Result<bool> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_item_deletions WHERE path = ?1)")
+                .bind(path)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(exists)
+    }
+
+    async fn delete_from_item_ref_table(
+        &self,
+        table: &'static str,
+        column: &'static str,
+        item_ids: &[String],
+    ) -> anyhow::Result<u64> {
+        if item_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut query =
+            QueryBuilder::<Sqlite>::new(format!("DELETE FROM {table} WHERE {column} IN ("));
+        let mut separated = query.separated(", ");
+        for id in item_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        let result = query.build().execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn delete_media_item_versions_for_items(
+        &self,
+        item_ids: &[String],
+    ) -> anyhow::Result<u64> {
+        if item_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "DELETE FROM media_item_versions WHERE primary_item_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in item_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(") OR alternate_item_id IN (");
+        let mut separated = query.separated(", ");
+        for id in item_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        let result = query.build().execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
 
     async fn missing_media_item_id_for_identity(
