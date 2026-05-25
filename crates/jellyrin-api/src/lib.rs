@@ -1709,11 +1709,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/InstantMix/MusicGenres/InstantMix",
-            get(authenticated_empty_items),
+            get(instant_mix_from_music_genre_by_id),
         )
         .route(
             "/instantmix/musicgenres/instantmix",
-            get(authenticated_empty_items),
+            get(instant_mix_from_music_genre_by_id),
         )
         .route(
             "/InstantMix/MusicGenres/{name}/InstantMix",
@@ -10429,6 +10429,68 @@ async fn instant_mix_from_music_genre(
         ensure_user_access(&auth_user, requested_user_id)?;
     }
 
+    music_genre_instant_mix_response(&state, &query, requested_user_id, name.trim()).await
+}
+
+async fn instant_mix_from_music_genre_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let genre_id = query_string_values(raw_query.as_deref(), &["Id"])
+        .into_iter()
+        .find(|id| !id.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("Music genre Id is required"))?;
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+    let genre_name =
+        music_genre_name_by_entity_id(&state, &query, requested_user_id, genre_id.trim()).await?;
+
+    music_genre_instant_mix_response(&state, &query, requested_user_id, &genre_name).await
+}
+
+async fn music_genre_name_by_entity_id(
+    state: &AppState,
+    query: &ItemsQuery,
+    requested_user_id: Option<Uuid>,
+    genre_id: &str,
+) -> Result<String, ApiError> {
+    let mut scope_query = query.clone();
+    scope_query.ids = None;
+    scope_query.search_term = None;
+    scope_query.name_starts_with = None;
+    scope_query.name_starts_with_or_greater = None;
+    scope_query.name_less_than = None;
+    scope_query.start_index = None;
+    scope_query.limit = None;
+    scope_query.sort_by = Some("SortName".to_string());
+    scope_query.sort_order = None;
+    let scoped_items = filtered_media_items(
+        state.db.media_items().await?,
+        &scope_query,
+        requested_user_id,
+        &state.db,
+    )
+    .await?;
+    metadata_values_for_keys(&state.db, &["MusicGenres", "Genres"], &scoped_items)
+        .await?
+        .into_iter()
+        .find(|name| stable_entity_id("MusicGenre", name).eq_ignore_ascii_case(genre_id))
+        .ok_or_else(|| ApiError::not_found("Music genre not found"))
+}
+
+async fn music_genre_instant_mix_response(
+    state: &AppState,
+    query: &ItemsQuery,
+    requested_user_id: Option<Uuid>,
+    name: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let mut items_query = query.clone();
     if items_query.include_item_types.is_empty() {
         items_query.include_item_types.push("Audio".to_string());
@@ -19266,8 +19328,8 @@ mod tests {
         json_value_i64, load_countries, load_cultures, media_item_by_id, media_item_streams,
         parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
         reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        subscribe_playback_events, transcode_dedupe_lock, transcode_temp_root, trickplay_settings,
-        trickplay_tile_cache_path,
+        stable_entity_id, subscribe_playback_events, transcode_dedupe_lock, transcode_temp_root,
+        trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -31546,9 +31608,66 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        for endpoint in [
-            "/InstantMix/Artists/InstantMix",
-            "/InstantMix/MusicGenres/InstantMix",
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/InstantMix/Artists/InstantMix")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let empty_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(empty_mix["TotalRecordCount"], 0);
+        assert_eq!(empty_mix["StartIndex"], 0);
+        assert_eq!(empty_mix["Items"], json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/InstantMix/MusicGenres/InstantMix")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/InstantMix/MusicGenres/InstantMix?Id=missing")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let rock_genre_id = stable_entity_id("MusicGenre", "Rock");
+        for (endpoint, expected_id, expected_start_index) in [
+            (
+                format!(
+                    "/InstantMix/MusicGenres/InstantMix?Id={rock_genre_id}&StartIndex=1&Limit=1"
+                ),
+                second_item_id.as_str(),
+                1,
+            ),
+            (
+                format!(
+                    "/instantmix/musicgenres/instantmix?Id={rock_genre_id}&ParentId={parent_id}"
+                ),
+                item_id,
+                0,
+            ),
         ] {
             let response = app
                 .clone()
@@ -31563,10 +31682,15 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let body = response.into_body().collect().await.unwrap().to_bytes();
-            let empty_mix: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(empty_mix["TotalRecordCount"], 0);
-            assert_eq!(empty_mix["StartIndex"], 0);
-            assert_eq!(empty_mix["Items"], json!([]));
+            let genre_id_mix: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(genre_id_mix["TotalRecordCount"], 2);
+            assert_eq!(genre_id_mix["StartIndex"], expected_start_index);
+            assert_eq!(genre_id_mix["Items"][0]["Id"], expected_id);
+            assert_eq!(genre_id_mix["Items"][0]["Type"], "Audio");
+            assert_eq!(
+                genre_id_mix["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
+                format!("/Audio/{expected_id}/stream")
+            );
         }
 
         let response = app
