@@ -17429,6 +17429,7 @@ fn parse_range_header(headers: &HeaderMap, total_len: u64) -> Result<Option<(u64
 fn media_item_type(item: &MediaItem) -> &'static str {
     match (item.media_type.as_str(), item.collection_type.as_deref()) {
         ("Video", Some("movies")) => "Movie",
+        ("Video", Some("musicvideos" | "musicvideo")) => "MusicVideo",
         ("Video", Some("tvshows" | "tvshow" | "series")) => "Episode",
         ("Video", _) => "Video",
         ("Audio", _) => "Audio",
@@ -25541,6 +25542,104 @@ mod tests {
             assert_eq!(theme_items["Items"][0]["Name"], "theme");
             assert_eq!(theme_items["Items"][0]["MediaType"], media_type);
         }
+    }
+
+    #[tokio::test]
+    async fn music_video_library_counts_as_music_video() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clip = tmp.path().join("Example Clip.mp4");
+        tokio::fs::write(&clip, b"fake music video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "music-video-test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=MusicVideos&collectionType=musicvideos&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?IncludeItemTypes=MusicVideo")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let music_videos: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(music_videos["TotalRecordCount"], 1);
+        assert_eq!(music_videos["Items"][0]["Name"], "Example Clip");
+        assert_eq!(music_videos["Items"][0]["Type"], "MusicVideo");
+        assert_eq!(music_videos["Items"][0]["MediaType"], "Video");
+        assert_eq!(
+            music_videos["Items"][0]["Path"],
+            clip.to_string_lossy().as_ref()
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/Counts")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(counts["MusicVideoCount"], 1);
+        assert_eq!(counts["MovieCount"], 0);
+        assert_eq!(counts["ItemCount"], 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/Counts?IncludeItemTypes=MusicVideo")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_counts["MusicVideoCount"], 1);
+        assert_eq!(filtered_counts["MovieCount"], 0);
+        assert_eq!(filtered_counts["ItemCount"], 1);
     }
 
     #[tokio::test]
