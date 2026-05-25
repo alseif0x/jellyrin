@@ -22,16 +22,19 @@ use jellyrin_compat::{
     LocalizationOptionDto, PublicSystemInfo, SessionInfoDto, StartupConfigurationDto,
     StartupRemoteAccessDto, StartupUserDto, UserDto, UserPolicyDto,
 };
-use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, VirtualFolder};
+use jellyrin_core::{
+    DeviceToken, HlsTranscodeRequest, MediaItem, PlaybackState, StartupConfig,
+    TranscodeStreamSelection, User, VirtualFolder, build_hls_ffmpeg_command,
+};
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
     BackupManifest, BrandingConfig, Database, DeviceSession, SortDirection,
     SystemConfigurationPayloads, TaskRun, TranscodeSession, UpsertActivePlaybackSession,
-    UpsertPlaybackState,
+    UpsertPlaybackState, UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
-    wait_for_hls_readiness,
+    spawn_transcode_process, wait_for_hls_readiness,
 };
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -5135,9 +5138,9 @@ async fn item_playback_info(
     RawQuery(raw_query): RawQuery,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let options = parse_playback_info_options(raw_query.as_deref(), None);
-    playback_info_response(&state.db, &item_id, options).await
+    playback_info_response(&state, &user, &token.access_token, &item_id, options).await
 }
 
 async fn post_item_playback_info(
@@ -5148,10 +5151,10 @@ async fn post_item_playback_info(
     Path(item_id): Path<String>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let options =
         parse_playback_info_options(raw_query.as_deref(), body.as_ref().map(|body| &body.0));
-    playback_info_response(&state.db, &item_id, options).await
+    playback_info_response(&state, &user, &token.access_token, &item_id, options).await
 }
 
 async fn instant_mix_from_item(
@@ -5383,12 +5386,14 @@ fn json_csv_field(value: &serde_json::Value, field: &str) -> Vec<String> {
 }
 
 async fn playback_info_response(
-    db: &Database,
+    state: &AppState,
+    user: &User,
+    access_token: &str,
     item_id: &str,
     options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let item = media_item_by_id(db, item_id).await?;
-    let server_id = db.server_state().await?.server_id.to_string();
+    let item = media_item_by_id(&state.db, item_id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
     let item_json = media_item_to_json(&item, &server_id);
     let play_session_id = Uuid::new_v4().simple().to_string();
     let direct_play_supported = playback_direct_play_supported(&item, &options);
@@ -5401,6 +5406,17 @@ async fn playback_info_response(
         })));
     }
     if !direct_play_supported && !direct_stream_supported {
+        if options.enable_transcoding && item.media_type == "Video" {
+            return playback_transcode_info_response(
+                state,
+                user,
+                access_token,
+                &item,
+                item_json,
+                options,
+            )
+            .await;
+        }
         return Ok(Json(serde_json::json!({
             "MediaSources": [],
             "PlaySessionId": play_session_id,
@@ -5431,6 +5447,147 @@ async fn playback_info_response(
         "PlaySessionId": play_session_id,
         "ErrorCode": null,
     })))
+}
+
+async fn playback_transcode_info_response(
+    state: &AppState,
+    user: &User,
+    access_token: &str,
+    item: &MediaItem,
+    item_json: serde_json::Value,
+    options: PlaybackInfoOptions,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let play_session_id = Uuid::new_v4().simple().to_string();
+    let item_id = item.id.simple().to_string();
+    let layout = HlsTranscodeLayout::new(transcode_temp_root(), &play_session_id);
+    tokio::fs::create_dir_all(&layout.session_dir).await?;
+
+    let streams = media_item_streams(item);
+    let selection = TranscodeStreamSelection {
+        video_stream_index: first_stream_index(&streams, "Video"),
+        audio_stream_index: options
+            .audio_stream_index
+            .or_else(|| default_audio_stream_index(&streams)),
+        subtitle_stream_index: options.subtitle_stream_index,
+    };
+    let request = HlsTranscodeRequest::new(
+        item.path.clone(),
+        layout.media_playlist_path.to_string_lossy().to_string(),
+        layout.segment_pattern_string(),
+        selection.clone(),
+    );
+    let command = build_hls_ffmpeg_command(&request);
+
+    state
+        .db
+        .upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: play_session_id.clone(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item_id.clone()),
+            audio_stream_index: selection.audio_stream_index,
+            subtitle_stream_index: selection.subtitle_stream_index,
+            video_stream_index: selection.video_stream_index,
+            output_path: layout.media_playlist_path.to_string_lossy().to_string(),
+            process_id: None,
+            status: "starting".to_string(),
+            progress_percent: None,
+            position_ticks: request.start_position_ticks,
+        })
+        .await?;
+    spawn_hls_transcode_task(state.db.clone(), play_session_id.clone(), command);
+
+    let mut media_sources = item_json["MediaSources"].clone();
+    if let Some(media_source) = media_sources
+        .as_array_mut()
+        .and_then(|sources| sources.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        media_source.insert("SupportsDirectPlay".to_string(), serde_json::json!(false));
+        media_source.insert("SupportsDirectStream".to_string(), serde_json::json!(false));
+        media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(true));
+        media_source.insert(
+            "TranscodingSubProtocol".to_string(),
+            serde_json::json!("hls"),
+        );
+        media_source.insert("TranscodingContainer".to_string(), serde_json::json!("ts"));
+        media_source.insert("Container".to_string(), serde_json::json!("ts"));
+        media_source.insert(
+            "TranscodingUrl".to_string(),
+            serde_json::json!(hls_master_url(&item_id, &play_session_id, access_token)),
+        );
+        media_source.insert("DirectStreamUrl".to_string(), serde_json::Value::Null);
+        apply_playback_stream_selection(media_source, &options);
+    }
+
+    Ok(Json(serde_json::json!({
+        "MediaSources": media_sources,
+        "PlaySessionId": play_session_id,
+        "ErrorCode": null,
+    })))
+}
+
+fn spawn_hls_transcode_task(
+    db: Database,
+    play_session_id: String,
+    command: jellyrin_core::FfmpegCommandSpec,
+) {
+    tokio::spawn(async move {
+        let mut process = match spawn_transcode_process(&command) {
+            Ok(process) => process,
+            Err(error) => {
+                let _ = db
+                    .update_transcode_session_status(&play_session_id, "failed")
+                    .await;
+                tracing::error!(%play_session_id, %error, "failed to spawn HLS transcode process");
+                return;
+            }
+        };
+
+        let process_id = process.process_id().map(i64::from);
+        match db
+            .transcode_session_by_play_session_id(&play_session_id)
+            .await
+        {
+            Ok(Some(session)) => {
+                let _ = db
+                    .upsert_transcode_session(UpsertTranscodeSession {
+                        play_session_id: play_session_id.clone(),
+                        user_id: session.user_id,
+                        item_id: session.item.id,
+                        media_source_id: session.media_source_id,
+                        audio_stream_index: session.audio_stream_index,
+                        subtitle_stream_index: session.subtitle_stream_index,
+                        video_stream_index: session.video_stream_index,
+                        output_path: session.output_path,
+                        process_id,
+                        status: "running".to_string(),
+                        progress_percent: session.progress_percent,
+                        position_ticks: session.position_ticks,
+                    })
+                    .await;
+            }
+            Ok(None) => {
+                tracing::warn!(%play_session_id, "transcode session disappeared before process start");
+            }
+            Err(error) => {
+                tracing::error!(%play_session_id, %error, "failed to load transcode session before process start");
+            }
+        }
+
+        let exit = process.wait().await;
+        let final_status = match exit {
+            Ok(exit) if exit.success => "completed",
+            Ok(_) => "failed",
+            Err(error) => {
+                tracing::error!(%play_session_id, %error, "HLS transcode process wait failed");
+                "failed"
+            }
+        };
+        let _ = db
+            .update_transcode_session_status(&play_session_id, final_status)
+            .await;
+    });
 }
 
 fn playback_selection_supported(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
@@ -5972,7 +6129,10 @@ async fn active_hls_transcode_session(
         .ok_or_else(|| ApiError::not_found("HLS transcode session not found"))?;
     if session.item.id != requested_item_id
         || session.item.media_type != "Video"
-        || !matches!(session.status.as_str(), "starting" | "running")
+        || !matches!(
+            session.status.as_str(),
+            "starting" | "running" | "completed"
+        )
     {
         return Err(ApiError::not_found("HLS transcode session not found"));
     }
@@ -6841,6 +7001,25 @@ fn selected_subtitle_stream_index(
         Some(index) => serde_json::json!(index),
         None => serde_json::json!(default_subtitle_stream_index),
     }
+}
+
+fn transcode_temp_root() -> PathBuf {
+    std::env::temp_dir().join("jellyrin").join("transcodes")
+}
+
+fn hls_master_url(item_id: &str, play_session_id: &str, access_token: &str) -> String {
+    format!("/Videos/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}")
+}
+
+fn first_stream_index(media_streams: &[serde_json::Value], stream_type: &str) -> Option<i64> {
+    media_streams.iter().find_map(|stream| {
+        let stream = stream.as_object()?;
+        let type_name = stream.get("Type").and_then(serde_json::Value::as_str)?;
+        if !type_name.eq_ignore_ascii_case(stream_type) {
+            return None;
+        }
+        stream.get("Index").and_then(json_value_i64)
+    })
 }
 
 fn default_audio_stream_index(media_streams: &[serde_json::Value]) -> Option<i64> {
@@ -7957,6 +8136,31 @@ mod tests {
     use jellyrin_db::{Database, UpsertTranscodeSession};
     use serde_json::{Value, json};
     use tower::ServiceExt;
+
+    fn assert_hls_transcode_playback_info(info: &Value, item_id: &str, api_key: &str) -> String {
+        assert_eq!(info["ErrorCode"], Value::Null);
+        assert!(
+            info["PlaySessionId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        let media_source = &info["MediaSources"][0];
+        assert_eq!(media_source["SupportsDirectPlay"], false);
+        assert_eq!(media_source["SupportsDirectStream"], false);
+        assert_eq!(media_source["SupportsTranscoding"], true);
+        assert_eq!(media_source["TranscodingSubProtocol"], "hls");
+        assert_eq!(media_source["TranscodingContainer"], "ts");
+        assert_eq!(media_source["Container"], "ts");
+        assert_eq!(media_source["DirectStreamUrl"], Value::Null);
+        let play_session_id = info["PlaySessionId"].as_str().unwrap();
+        assert_eq!(
+            media_source["TranscodingUrl"],
+            format!(
+                "/Videos/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}"
+            )
+        );
+        play_session_id.to_string()
+    }
 
     #[test]
     fn parses_media_browser_authorization_header() {
@@ -13636,18 +13840,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let transcode_only_info: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(transcode_only_info["ErrorCode"], "NoCompatibleStream");
-        assert_eq!(
-            transcode_only_info["MediaSources"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
+        let transcode_play_session_id =
+            assert_hls_transcode_playback_info(&transcode_only_info, item_id, &api_key);
+        let transcode_session = test_db
+            .transcode_session_by_play_session_id(&transcode_play_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(transcode_session.item.id.simple().to_string(), item_id);
+        assert_eq!(transcode_session.audio_stream_index, Some(1));
+        assert_eq!(transcode_session.video_stream_index, Some(0));
         assert!(
-            transcode_only_info["PlaySessionId"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty())
+            transcode_session
+                .output_path
+                .ends_with(&format!("{transcode_play_session_id}/main.m3u8"))
         );
 
         let response = app
@@ -13747,14 +13953,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let mismatching_profile_info: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(mismatching_profile_info["ErrorCode"], "NoCompatibleStream");
-        assert_eq!(
-            mismatching_profile_info["MediaSources"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
+        assert_hls_transcode_playback_info(&mismatching_profile_info, item_id, &api_key);
 
         let response = app
             .clone()
@@ -13780,14 +13979,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let empty_profiles_info: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(empty_profiles_info["ErrorCode"], "NoCompatibleStream");
-        assert_eq!(
-            empty_profiles_info["MediaSources"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
+        assert_hls_transcode_playback_info(&empty_profiles_info, item_id, &api_key);
 
         let response = app
             .clone()
@@ -13853,17 +14045,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let posted_transcode_only_info: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            posted_transcode_only_info["ErrorCode"],
-            "NoCompatibleStream"
-        );
-        assert_eq!(
-            posted_transcode_only_info["MediaSources"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
+        assert_hls_transcode_playback_info(&posted_transcode_only_info, item_id, &api_key);
 
         let response = app
             .clone()
