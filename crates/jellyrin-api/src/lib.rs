@@ -2441,8 +2441,8 @@ pub fn router(state: AppState) -> Router {
         .route("/artists/{name}", get(metadata_artist_by_name))
         .route("/AlbumArtists", get(metadata_album_artists))
         .route("/albumartists", get(metadata_album_artists))
-        .route("/Albums", get(authenticated_empty_items))
-        .route("/albums", get(authenticated_empty_items))
+        .route("/Albums", get(metadata_albums))
+        .route("/albums", get(metadata_albums))
         .route("/UserItems/Resume", get(resume_items))
         .route("/useritems/resume", get(resume_items))
         .route("/Localization/Options", get(localization_options))
@@ -14325,6 +14325,23 @@ async fn metadata_album_artists(
     .await
 }
 
+async fn metadata_albums(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection_keys(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        &["Album", "AlbumName", "Albums"],
+        "MusicAlbum",
+    )
+    .await
+}
+
 async fn metadata_persons(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -14426,10 +14443,29 @@ async fn metadata_collection(
     metadata_key: &'static str,
     item_type: &'static str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    metadata_collection_keys(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        &[metadata_key],
+        item_type,
+    )
+    .await
+}
+
+async fn metadata_collection_keys(
+    state: AppState,
+    headers: HeaderMap,
+    auth_query: AuthQuery,
+    raw_query: Option<String>,
+    metadata_keys: &[&str],
+    item_type: &'static str,
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let query = parse_items_query(raw_query.as_deref());
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let mut values = metadata_values(&state.db, metadata_key).await?;
+    let mut values = metadata_values_for_keys(&state.db, metadata_keys).await?;
     values.retain(|name| metadata_value_matches_query(name, &query));
     if metadata_sort_descending(item_type, &query) {
         values.sort_by(|left, right| right.cmp(left));
@@ -14503,11 +14539,13 @@ async fn metadata_entity_by_name(
     )))
 }
 
-async fn metadata_values(db: &Database, key: &str) -> Result<Vec<String>, ApiError> {
+async fn metadata_values_for_keys(db: &Database, keys: &[&str]) -> Result<Vec<String>, ApiError> {
     let mut values = BTreeMap::<String, String>::new();
     for item in db.media_item_metadata().await? {
-        if let Some(value) = item.payload.get(key) {
-            collect_metadata_value(value, &mut values);
+        for key in keys {
+            if let Some(value) = item.payload.get(*key) {
+                collect_metadata_value(value, &mut values);
+            }
         }
     }
     Ok(values.into_values().collect())
@@ -33320,6 +33358,9 @@ mod tests {
                     "MusicGenres": ["Rock", "Jazz"],
                     "Artists": ["Artist One", "artist one", "Artist Two"],
                     "AlbumArtists": ["Album Artist", "Album Artist Two"],
+                    "Album": "Example Album",
+                    "AlbumName": "example album",
+                    "Albums": ["Second Album"],
                     "People": [{ "Name": "Jane Composer" }, "John Williams"],
                     "Studios": ["Studio One", { "Name": "Studio Two" }],
                     "ProductionYear": [1984, 1999]
@@ -33357,6 +33398,59 @@ mod tests {
         assert_eq!(album_artists["TotalRecordCount"], 2);
         assert_eq!(album_artists["Items"][0]["Name"], "Album Artist");
         assert_eq!(album_artists["Items"][0]["Type"], "MusicArtist");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Albums")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for endpoint in [
+            "/Albums?SearchTerm=album&StartIndex=0&Limit=1",
+            "/albums?SearchTerm=album&StartIndex=0&Limit=1",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let albums: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(albums["TotalRecordCount"], 2, "{endpoint}");
+            assert_eq!(albums["Items"].as_array().unwrap().len(), 1, "{endpoint}");
+            assert_eq!(albums["Items"][0]["Name"], "Example Album", "{endpoint}");
+            assert_eq!(albums["Items"][0]["Type"], "MusicAlbum", "{endpoint}");
+            assert_eq!(albums["Items"][0]["IsFolder"], true, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/AlbumArtists")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let root_album_artists: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(root_album_artists, album_artists);
 
         let response = app
             .clone()
