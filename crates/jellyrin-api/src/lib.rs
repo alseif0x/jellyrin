@@ -9539,7 +9539,7 @@ async fn item_metadata_editor(
     let metadata = metadata_payload_for_item(&state.db, item.id).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     Ok(Json(serde_json::json!({
-        "Item": media_item_to_json(&item, &server_id),
+        "Item": media_item_to_json_with_playback_and_metadata(&item, &server_id, None, Some(&metadata)),
         "Metadata": metadata,
         "ExternalIdInfos": external_id_infos_for_item_type(media_item_type(&item)),
         "Cultures": load_cultures(),
@@ -34858,6 +34858,9 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let editor_payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(editor_payload["Item"]["Id"], item_id);
+        assert_eq!(editor_payload["Item"]["Overview"], "Manual overview");
+        assert_eq!(editor_payload["Item"]["ProviderIds"]["Tmdb"], "9876");
+        assert_eq!(editor_payload["Item"]["Tags"], json!(["Edited"]));
         assert_eq!(editor_payload["Metadata"]["Overview"], "Manual overview");
         assert_eq!(editor_payload["Metadata"]["ProviderIds"]["Tmdb"], "9876");
         assert_eq!(editor_payload["Metadata"]["ContentType"], "Movie");
