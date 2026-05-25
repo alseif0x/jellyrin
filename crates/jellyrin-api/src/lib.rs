@@ -500,11 +500,59 @@ pub fn router(state: AppState) -> Router {
         .route("/videos/activeencodings", delete(stop_active_encoding))
         .route(
             "/HlsSegment/Videos/ActiveEncodings",
-            delete(stop_active_encoding),
+            get(active_encodings).delete(stop_active_encoding),
         )
         .route(
             "/hlssegment/videos/activeencodings",
-            delete(stop_active_encoding),
+            get(active_encodings).delete(stop_active_encoding),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/master.m3u8",
+            get(hls_master_playlist),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/master.m3u8",
+            get(hls_master_playlist),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/master.m3u8",
+            head(hls_master_playlist_head),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/master.m3u8",
+            head(hls_master_playlist_head),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/main.m3u8",
+            get(hls_media_playlist),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/main.m3u8",
+            get(hls_media_playlist),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/main.m3u8",
+            head(hls_media_playlist_head),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/main.m3u8",
+            head(hls_media_playlist_head),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(hls_segment),
+        )
+        .route(
+            "/HlsSegment/Videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            head(hls_segment_head),
+        )
+        .route(
+            "/hlssegment/videos/{item_id}/hls1/{playlist_id}/{segment_file}",
+            head(hls_segment_head),
         )
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
@@ -16018,6 +16066,21 @@ mod tests {
                 "UpdatedAt": updated_at,
             })
         );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/HlsSegment/Videos/ActiveEncodings")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let active_encodings_alias: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(active_encodings_alias.as_array().unwrap().len(), 1);
 
         db.update_transcode_session_status("play-session-active", "Stopped")
             .await
@@ -16764,6 +16827,27 @@ mod tests {
             master,
             "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmain.m3u8?PlaySessionId=play-session-hls\n"
         );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!(
+                        "/HlsSegment/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apple.mpegurl"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
 
         let response = app
             .clone()
@@ -16788,6 +16872,20 @@ mod tests {
         assert!(media_playlist.contains(&format!(
             "/Videos/{item_id}/hls1/main/1.ts?PlaySessionId=play-session-hls"
         )));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/hlssegment/videos/{item_id}/main.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .clone()
@@ -16807,6 +16905,22 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "video/mp2t"
         );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"zero");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/HlsSegment/Videos/{item_id}/hls1/main/0.ts?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"zero");
 
