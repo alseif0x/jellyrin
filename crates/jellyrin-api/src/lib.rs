@@ -56,6 +56,7 @@ const DEFAULT_AUTHENTICATION_PROVIDER_ID: &str =
 const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 const SYNCPLAY_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
+const IMAGE_UPLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
@@ -1504,19 +1505,19 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Items/{item_id}/Images",
-            get(authenticated_item_empty_json_array),
+            get(item_image_infos),
         )
         .route(
             "/items/{item_id}/images",
-            get(authenticated_item_empty_json_array),
+            get(item_image_infos),
         )
         .route(
             "/Image/Items/{item_id}/Images",
-            get(authenticated_item_empty_json_array),
+            get(item_image_infos),
         )
         .route(
             "/image/items/{item_id}/images",
-            get(authenticated_item_empty_json_array),
+            get(item_image_infos),
         )
         .route(
             "/RemoteImage/Items/{item_id}/RemoteImages",
@@ -14377,17 +14378,6 @@ async fn stop_active_encoding(
     Ok(StatusCode::OK)
 }
 
-async fn authenticated_item_empty_json_array(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path(item_id): Path<String>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
-    Ok(empty_json_array().await)
-}
-
 async fn authenticated_item_theme_media(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15761,19 +15751,19 @@ async fn bitrate_test(Query(query): Query<BitrateQuery>) -> impl IntoResponse {
 
 async fn item_placeholder_image(
     State(state): State<AppState>,
-    Path((item_id, _image_type)): Path<(String, String)>,
+    Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     media_item_or_folder_by_id(&state.db, &item_id).await?;
-    Ok(placeholder_png_response())
+    stored_image_or_placeholder(&state, ImageOwner::Item(&item_id), &image_type, 0).await
 }
 
 async fn item_placeholder_image_by_index(
     State(state): State<AppState>,
-    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     media_item_or_folder_by_id(&state.db, &item_id).await?;
-    validate_image_index(&image_index)?;
-    Ok(placeholder_png_response())
+    let image_index = parse_image_index(&image_index)?;
+    stored_image_or_placeholder(&state, ImageOwner::Item(&item_id), &image_type, image_index).await
 }
 
 type ExtendedItemImagePath = (
@@ -15792,7 +15782,7 @@ async fn item_placeholder_image_extended(
     State(state): State<AppState>,
     Path((
         item_id,
-        _image_type,
+        image_type,
         image_index,
         _tag,
         _format,
@@ -15803,25 +15793,37 @@ async fn item_placeholder_image_extended(
     )): Path<ExtendedItemImagePath>,
 ) -> Result<axum::response::Response, ApiError> {
     media_item_or_folder_by_id(&state.db, &item_id).await?;
-    validate_image_index(&image_index)?;
-    Ok(placeholder_png_response())
+    let image_index = parse_image_index(&image_index)?;
+    stored_image_or_placeholder(&state, ImageOwner::Item(&item_id), &image_type, image_index).await
 }
 
 async fn user_placeholder_image(
     State(state): State<AppState>,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     user_exists(&state.db, user_id).await?;
-    Ok(placeholder_png_response())
+    stored_image_or_placeholder(
+        &state,
+        ImageOwner::User(&user_id.to_string()),
+        &image_type,
+        0,
+    )
+    .await
 }
 
 async fn user_placeholder_image_by_index(
     State(state): State<AppState>,
-    Path((user_id, _image_type, image_index)): Path<(Uuid, String, String)>,
+    Path((user_id, image_type, image_index)): Path<(Uuid, String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     user_exists(&state.db, user_id).await?;
-    validate_image_index(&image_index)?;
-    Ok(placeholder_png_response())
+    let image_index = parse_image_index(&image_index)?;
+    stored_image_or_placeholder(
+        &state,
+        ImageOwner::User(&user_id.to_string()),
+        &image_type,
+        image_index,
+    )
+    .await
 }
 
 async fn current_user_placeholder_image(
@@ -15829,8 +15831,8 @@ async fn current_user_placeholder_image(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(placeholder_png_response())
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    stored_image_or_placeholder(&state, ImageOwner::User(&user.id.to_string()), "Primary", 0).await
 }
 
 async fn named_placeholder_image(
@@ -15846,8 +15848,10 @@ async fn named_placeholder_image_by_index(
     Ok(placeholder_png_response())
 }
 
-async fn splashscreen_placeholder_image() -> axum::response::Response {
-    placeholder_png_response()
+async fn splashscreen_placeholder_image(
+    State(state): State<AppState>,
+) -> Result<axum::response::Response, ApiError> {
+    stored_image_or_placeholder(&state, ImageOwner::Branding, "Splashscreen", 0).await
 }
 
 fn placeholder_png_response() -> axum::response::Response {
@@ -15863,13 +15867,311 @@ fn placeholder_png_response() -> axum::response::Response {
         .into_response()
 }
 
+enum ImageOwner<'a> {
+    Item(&'a str),
+    User(&'a str),
+    Branding,
+}
+
+impl ImageOwner<'_> {
+    fn directory_segments(&self) -> [&str; 2] {
+        match self {
+            ImageOwner::Item(id) => ["items", id],
+            ImageOwner::User(id) => ["users", id],
+            ImageOwner::Branding => ["branding", "global"],
+        }
+    }
+}
+
+async fn stored_image_or_placeholder(
+    state: &AppState,
+    owner: ImageOwner<'_>,
+    image_type: &str,
+    image_index: usize,
+) -> Result<axum::response::Response, ApiError> {
+    if let Some(stored) = find_stored_image(state, owner, image_type, image_index).await? {
+        return stored_image_response(stored).await;
+    }
+    Ok(placeholder_png_response())
+}
+
+async fn store_uploaded_image(
+    state: &AppState,
+    owner: ImageOwner<'_>,
+    image_type: &str,
+    image_index: usize,
+    body: Body,
+) -> Result<(), ApiError> {
+    let bytes = to_bytes(body, IMAGE_UPLOAD_LIMIT_BYTES)
+        .await
+        .map_err(|_| ApiError::bad_request("Invalid image upload body"))?;
+    if bytes.is_empty() {
+        return Err(ApiError::bad_request("Image upload body is empty"));
+    }
+    let format = image_format_from_bytes(&bytes);
+    let dir = stored_image_owner_dir(state, owner);
+    tokio::fs::create_dir_all(&dir).await?;
+    delete_stored_image_files(&dir, image_type, image_index).await?;
+    let path = dir.join(stored_image_file_name(
+        image_type,
+        image_index,
+        format.extension,
+    ));
+    tokio::fs::write(path, bytes).await?;
+    Ok(())
+}
+
+async fn delete_stored_image(
+    state: &AppState,
+    owner: ImageOwner<'_>,
+    image_type: &str,
+    image_index: usize,
+) -> Result<(), ApiError> {
+    let dir = stored_image_owner_dir(state, owner);
+    delete_stored_image_files(&dir, image_type, image_index).await
+}
+
+async fn stored_image_infos(
+    state: &AppState,
+    owner: ImageOwner<'_>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let dir = stored_image_owner_dir(state, owner);
+    let mut read_dir = match tokio::fs::read_dir(&dir).await {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut infos = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((image_type, image_index, extension)) = parse_stored_image_file_name(file_name)
+        else {
+            continue;
+        };
+        infos.push(serde_json::json!({
+            "ImageType": canonical_image_type(&image_type),
+            "ImageIndex": image_index,
+            "ImageTag": stored_image_tag(&path).await?,
+            "Path": path.to_string_lossy(),
+            "Size": tokio::fs::metadata(&path).await?.len(),
+            "MimeType": image_format_from_extension(extension).content_type,
+        }));
+    }
+    infos.sort_by(|left, right| {
+        let left_type = left
+            .get("ImageType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let right_type = right
+            .get("ImageType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let left_index = left
+            .get("ImageIndex")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let right_index = right
+            .get("ImageIndex")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        left_type
+            .cmp(right_type)
+            .then_with(|| left_index.cmp(&right_index))
+    });
+    Ok(infos)
+}
+
+async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response, ApiError> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("bin");
+    let format = image_format_from_extension(extension);
+    let bytes = tokio::fs::read(&path).await?;
+    let tag = stored_image_tag(&path).await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, format.content_type.parse().unwrap());
+    headers.insert(
+        header::CACHE_CONTROL,
+        "public, max-age=3600".parse().unwrap(),
+    );
+    headers.insert(header::ETAG, tag.parse().unwrap());
+    Ok((headers, bytes).into_response())
+}
+
+async fn find_stored_image(
+    state: &AppState,
+    owner: ImageOwner<'_>,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    let dir = stored_image_owner_dir(state, owner);
+    for format in IMAGE_FORMATS {
+        let path = dir.join(stored_image_file_name(
+            image_type,
+            image_index,
+            format.extension,
+        ));
+        if tokio::fs::metadata(&path)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn stored_image_owner_dir(state: &AppState, owner: ImageOwner<'_>) -> PathBuf {
+    let base = state
+        .log_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(&state.log_dir)
+        .join("metadata")
+        .join("images");
+    let [kind, id] = owner.directory_segments();
+    base.join(kind).join(sanitize_image_path_segment(id))
+}
+
+async fn delete_stored_image_files(
+    dir: &FsPath,
+    image_type: &str,
+    image_index: usize,
+) -> Result<(), ApiError> {
+    for format in IMAGE_FORMATS {
+        let path = dir.join(stored_image_file_name(
+            image_type,
+            image_index,
+            format.extension,
+        ));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn stored_image_file_name(image_type: &str, image_index: usize, extension: &str) -> String {
+    format!(
+        "{}_{}.{}",
+        sanitize_image_path_segment(image_type),
+        image_index,
+        extension
+    )
+}
+
+fn parse_stored_image_file_name(file_name: &str) -> Option<(String, usize, &str)> {
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    let (image_type, image_index) = stem.rsplit_once('_')?;
+    Some((image_type.to_string(), image_index.parse().ok()?, extension))
+}
+
+fn canonical_image_type(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => "Primary".to_string(),
+    }
+}
+
+fn sanitize_image_path_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "image".to_string()
+    } else {
+        sanitized
+    }
+}
+
+async fn stored_image_tag(path: &FsPath) -> Result<String, ApiError> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    Ok(format!("{:x}-{:x}", metadata.len(), modified))
+}
+
+#[derive(Clone, Copy)]
+struct ImageFormat {
+    extension: &'static str,
+    content_type: &'static str,
+}
+
+const IMAGE_FORMATS: &[ImageFormat] = &[
+    ImageFormat {
+        extension: "png",
+        content_type: "image/png",
+    },
+    ImageFormat {
+        extension: "jpg",
+        content_type: "image/jpeg",
+    },
+    ImageFormat {
+        extension: "webp",
+        content_type: "image/webp",
+    },
+    ImageFormat {
+        extension: "gif",
+        content_type: "image/gif",
+    },
+    ImageFormat {
+        extension: "bin",
+        content_type: "application/octet-stream",
+    },
+];
+
+fn image_format_from_bytes(bytes: &[u8]) -> ImageFormat {
+    if bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) {
+        IMAGE_FORMATS[0]
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        IMAGE_FORMATS[1]
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        IMAGE_FORMATS[2]
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        IMAGE_FORMATS[3]
+    } else {
+        IMAGE_FORMATS[4]
+    }
+}
+
+fn image_format_from_extension(extension: &str) -> ImageFormat {
+    IMAGE_FORMATS
+        .iter()
+        .copied()
+        .find(|format| format.extension.eq_ignore_ascii_case(extension))
+        .unwrap_or(IMAGE_FORMATS[4])
+}
+
 async fn update_splashscreen_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    _body: Body,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    store_uploaded_image(&state, ImageOwner::Branding, "Splashscreen", 0, body).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15879,6 +16181,7 @@ async fn delete_splashscreen_image(
     Query(query): Query<AuthQuery>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    delete_stored_image(&state, ImageOwner::Branding, "Splashscreen", 0).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15886,11 +16189,12 @@ async fn update_item_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((item_id, _image_type)): Path<(String, String)>,
-    _body: Body,
+    Path((item_id, image_type)): Path<(String, String)>,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     media_item_or_folder_by_id(&state.db, &item_id).await?;
+    store_uploaded_image(&state, ImageOwner::Item(&item_id), &image_type, 0, body).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15898,10 +16202,11 @@ async fn delete_item_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((item_id, _image_type)): Path<(String, String)>,
+    Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     media_item_or_folder_by_id(&state.db, &item_id).await?;
+    delete_stored_image(&state, ImageOwner::Item(&item_id), &image_type, 0).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15909,12 +16214,20 @@ async fn update_item_image_by_index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
-    _body: Body,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     media_item_or_folder_by_id(&state.db, &item_id).await?;
-    validate_image_index(&image_index)?;
+    let image_index = parse_image_index(&image_index)?;
+    store_uploaded_image(
+        &state,
+        ImageOwner::Item(&item_id),
+        &image_type,
+        image_index,
+        body,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15922,11 +16235,12 @@ async fn delete_item_image_by_index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     media_item_or_folder_by_id(&state.db, &item_id).await?;
-    validate_image_index(&image_index)?;
+    let image_index = parse_image_index(&image_index)?;
+    delete_stored_image(&state, ImageOwner::Item(&item_id), &image_type, image_index).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15946,9 +16260,17 @@ async fn update_current_user_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    _body: Body,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    store_uploaded_image(
+        &state,
+        ImageOwner::User(&user.id.to_string()),
+        "Primary",
+        0,
+        body,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15957,7 +16279,8 @@ async fn delete_current_user_image(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    delete_stored_image(&state, ImageOwner::User(&user.id.to_string()), "Primary", 0).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15965,12 +16288,20 @@ async fn update_user_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
-    _body: Body,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     ensure_user_access(&auth_user, user_id)?;
     user_exists(&state.db, user_id).await?;
+    store_uploaded_image(
+        &state,
+        ImageOwner::User(&user_id.to_string()),
+        &image_type,
+        0,
+        body,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15978,11 +16309,18 @@ async fn delete_user_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    Path((user_id, image_type)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     ensure_user_access(&auth_user, user_id)?;
     user_exists(&state.db, user_id).await?;
+    delete_stored_image(
+        &state,
+        ImageOwner::User(&user_id.to_string()),
+        &image_type,
+        0,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15990,13 +16328,21 @@ async fn update_user_image_by_index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((user_id, _image_type, image_index)): Path<(Uuid, String, String)>,
-    _body: Body,
+    Path((user_id, image_type, image_index)): Path<(Uuid, String, String)>,
+    body: Body,
 ) -> Result<StatusCode, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     ensure_user_access(&auth_user, user_id)?;
     user_exists(&state.db, user_id).await?;
-    validate_image_index(&image_index)?;
+    let image_index = parse_image_index(&image_index)?;
+    store_uploaded_image(
+        &state,
+        ImageOwner::User(&user_id.to_string()),
+        &image_type,
+        image_index,
+        body,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -16004,13 +16350,33 @@ async fn delete_user_image_by_index(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((user_id, _image_type, image_index)): Path<(Uuid, String, String)>,
+    Path((user_id, image_type, image_index)): Path<(Uuid, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     ensure_user_access(&auth_user, user_id)?;
     user_exists(&state.db, user_id).await?;
-    validate_image_index(&image_index)?;
+    let image_index = parse_image_index(&image_index)?;
+    delete_stored_image(
+        &state,
+        ImageOwner::User(&user_id.to_string()),
+        &image_type,
+        image_index,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn item_image_infos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    Ok(Json(
+        stored_image_infos(&state, ImageOwner::Item(&item_id)).await?,
+    ))
 }
 
 async fn item_remote_images(
@@ -16055,9 +16421,12 @@ async fn user_exists(db: &Database, user_id: Uuid) -> Result<(), ApiError> {
 }
 
 fn validate_image_index(image_index: &str) -> Result<(), ApiError> {
+    parse_image_index(image_index).map(|_| ())
+}
+
+fn parse_image_index(image_index: &str) -> Result<usize, ApiError> {
     image_index
         .parse::<usize>()
-        .map(|_| ())
         .map_err(|_| ApiError::bad_request("Invalid image index"))
 }
 
@@ -21761,11 +22130,12 @@ mod tests {
 
     #[tokio::test]
     async fn m1_environment_library_and_image_compat_endpoints_exist() {
+        let storage_root = tempfile::tempdir().unwrap();
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
-            log_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -23452,6 +23822,76 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
 
+        let uploaded_png = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0,
+            5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Image/Items/{item_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(uploaded_png.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let stored_item_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stored_item_images.as_array().unwrap().len(), 1);
+        assert_eq!(stored_item_images[0]["ImageType"], "Primary");
+        assert_eq!(stored_item_images[0]["ImageIndex"], 0);
+        assert_eq!(stored_item_images[0]["MimeType"], "image/png");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), uploaded_png.as_slice());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Image/Items/{item_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
         for (method, endpoint) in [
             (Method::GET, "/Image/UserImage".to_string()),
             (
@@ -23507,6 +23947,71 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Image/UserImage")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(uploaded_png.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Users/{user_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), uploaded_png.as_slice());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Image/Branding/Splashscreen")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(uploaded_png.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Image/Branding/Splashscreen")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), uploaded_png.as_slice());
 
         let response = app
             .clone()
