@@ -735,6 +735,38 @@ pub fn router(state: AppState) -> Router {
             get(audio_hls_legacy_mp3_segment),
         )
         .route(
+            "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/subtitles.m3u8",
+            get(subtitle_playlist),
+        )
+        .route(
+            "/subtitle/videos/{item_id}/{media_source_id}/subtitles/{index}/subtitles.m3u8",
+            get(subtitle_playlist),
+        )
+        .route(
+            "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}",
+            get(subtitle_stream),
+        )
+        .route(
+            "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/stream.{format}",
+            get(subtitle_stream),
+        )
+        .route(
+            "/subtitle/videos/{item_id}/{media_source_id}/subtitles/{index}/stream.{format}",
+            get(subtitle_stream),
+        )
+        .route(
+            "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/{start_position_ticks}/Stream.{format}",
+            get(subtitle_stream_with_ticks),
+        )
+        .route(
+            "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/{start_position_ticks}/stream.{format}",
+            get(subtitle_stream_with_ticks),
+        )
+        .route(
+            "/subtitle/videos/{item_id}/{media_source_id}/subtitles/{index}/{start_position_ticks}/stream.{format}",
+            get(subtitle_stream_with_ticks),
+        )
+        .route(
             "/Trickplay/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
             get(trickplay_playlist),
         )
@@ -7592,6 +7624,370 @@ fn audio_hls_legacy_content_type(container: &str) -> &'static str {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct SubtitlePlaylistQuery {
+    #[serde(alias = "api_key", alias = "apiKey", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(default, alias = "segmentLength", alias = "SegmentLength")]
+    segment_length: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct SubtitleStreamQuery {
+    _api_key: Option<String>,
+    item_id: Option<String>,
+    media_source_id: Option<String>,
+    index: Option<i64>,
+    format: Option<String>,
+    start_position_ticks: Option<i64>,
+    end_position_ticks: Option<i64>,
+    _copy_timestamps: bool,
+    add_vtt_time_map: bool,
+}
+
+#[derive(Debug)]
+struct SubtitleStreamRoute {
+    item_id: String,
+    media_source_id: String,
+    index: i64,
+    start_position_ticks: i64,
+    format: String,
+}
+
+async fn subtitle_playlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((item_id, media_source_id, index)): Path<(String, String, i64)>,
+    Query(query): Query<SubtitlePlaylistQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = subtitle_media_item(&state, &item_id, Some(&media_source_id)).await?;
+    subtitle_stream_info(&item, index)?;
+    let runtime_ticks = item
+        .runtime_ticks
+        .filter(|runtime_ticks| *runtime_ticks > 0)
+        .ok_or_else(|| ApiError::bad_request("HLS Subtitles are not supported for this media"))?;
+    let segment_length = query
+        .segment_length
+        .filter(|segment_length| *segment_length > 0)
+        .ok_or_else(|| ApiError::bad_request("segmentLength is required"))?;
+    let segment_length_ticks = segment_length
+        .checked_mul(10_000_000)
+        .ok_or_else(|| ApiError::bad_request("segmentLength is invalid"))?;
+
+    let mut playlist = String::new();
+    playlist.push_str("#EXTM3U\n");
+    playlist.push_str(&format!("#EXT-X-TARGETDURATION:{segment_length}\n"));
+    playlist.push_str("#EXT-X-VERSION:3\n");
+    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+
+    let mut position_ticks = 0_i64;
+    while position_ticks < runtime_ticks {
+        let end_ticks = runtime_ticks.min(position_ticks.saturating_add(segment_length_ticks));
+        let duration = (end_ticks - position_ticks) as f64 / 10_000_000.0;
+        playlist.push_str(&format!("#EXTINF:{duration},\n"));
+        playlist.push_str(&format!(
+            "stream.vtt?CopyTimestamps=true&AddVttTimeMap=true&StartPositionTicks={position_ticks}&EndPositionTicks={end_ticks}"
+        ));
+        if let Some(api_key) = query
+            .api_key
+            .as_deref()
+            .filter(|api_key| !api_key.trim().is_empty())
+        {
+            playlist.push_str("&ApiKey=");
+            playlist.push_str(api_key);
+        }
+        playlist.push('\n');
+        position_ticks = position_ticks.saturating_add(segment_length_ticks);
+    }
+    playlist.push_str("#EXT-X-ENDLIST\n");
+
+    playlist_response(playlist, true)
+}
+
+async fn subtitle_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((route_item_id, route_media_source_id, route_index, route_format)): Path<(
+        String,
+        String,
+        i64,
+        String,
+    )>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let query = parse_subtitle_stream_query(raw_query.as_deref());
+    subtitle_stream_response(
+        &state,
+        &headers,
+        SubtitleStreamRoute {
+            item_id: route_item_id,
+            media_source_id: route_media_source_id,
+            index: route_index,
+            start_position_ticks: 0,
+            format: route_format,
+        },
+        query,
+    )
+    .await
+}
+
+async fn subtitle_stream_with_ticks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((
+        route_item_id,
+        route_media_source_id,
+        route_index,
+        route_start_position_ticks,
+        route_format,
+    )): Path<(String, String, i64, i64, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let query = parse_subtitle_stream_query(raw_query.as_deref());
+    subtitle_stream_response(
+        &state,
+        &headers,
+        SubtitleStreamRoute {
+            item_id: route_item_id,
+            media_source_id: route_media_source_id,
+            index: route_index,
+            start_position_ticks: route_start_position_ticks,
+            format: route_format,
+        },
+        query,
+    )
+    .await
+}
+
+async fn subtitle_stream_response(
+    state: &AppState,
+    _headers: &HeaderMap,
+    route: SubtitleStreamRoute,
+    query: SubtitleStreamQuery,
+) -> Result<axum::response::Response, ApiError> {
+    let item_id = query.item_id.as_deref().unwrap_or(&route.item_id);
+    let media_source_id = query
+        .media_source_id
+        .as_deref()
+        .unwrap_or(&route.media_source_id);
+    let index = query.index.unwrap_or(route.index);
+    let format = query
+        .format
+        .as_deref()
+        .unwrap_or(&route.format)
+        .trim()
+        .to_ascii_lowercase();
+    let format = if format == "js" { "json" } else { &format };
+    let start_position_ticks = query
+        .start_position_ticks
+        .unwrap_or(route.start_position_ticks)
+        .max(0);
+    let end_position_ticks = query.end_position_ticks.filter(|ticks| *ticks >= 0);
+
+    let item = subtitle_media_item(state, item_id, Some(media_source_id)).await?;
+    let stream = subtitle_stream_info(&item, index)?;
+    let output = if let Some(path) = stream.get("Path").and_then(serde_json::Value::as_str) {
+        subtitle_output_from_external_path(path, format, start_position_ticks, end_position_ticks)
+            .await?
+    } else {
+        subtitle_output_from_ffmpeg(
+            media_item_path(&item),
+            index,
+            format,
+            start_position_ticks,
+            end_position_ticks,
+        )
+        .await?
+    };
+    let output = if format == "vtt" && query.add_vtt_time_map {
+        subtitle_add_vtt_time_map(output)
+    } else {
+        output
+    };
+
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            subtitle_content_type(format).to_string(),
+        )],
+        Body::from(output),
+    )
+        .into_response())
+}
+
+async fn subtitle_media_item(
+    state: &AppState,
+    item_id: &str,
+    media_source_id: Option<&str>,
+) -> Result<MediaItem, ApiError> {
+    let requested_item = media_item_by_id(&state.db, item_id).await?;
+    let item = resolve_media_source_item(&state.db, requested_item, media_source_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Subtitle media source not found"))?;
+    if item.media_type != "Video" {
+        return Err(ApiError::not_found("Subtitle media source not found"));
+    }
+    Ok(item)
+}
+
+fn subtitle_stream_info(item: &MediaItem, index: i64) -> Result<serde_json::Value, ApiError> {
+    media_item_streams(item)
+        .into_iter()
+        .find(|stream| {
+            stream
+                .get("Type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+                && stream.get("Index").and_then(json_value_i64) == Some(index)
+        })
+        .ok_or_else(|| ApiError::not_found("Subtitle stream not found"))
+}
+
+async fn subtitle_output_from_external_path(
+    path: &str,
+    format: &str,
+    start_position_ticks: i64,
+    end_position_ticks: Option<i64>,
+) -> Result<Vec<u8>, ApiError> {
+    let source_path = PathBuf::from(path);
+    if subtitle_path_format(&source_path).as_deref() == Some(format) && start_position_ticks == 0 {
+        let bytes = tokio::fs::read(source_path).await?;
+        return Ok(bytes);
+    }
+    subtitle_output_from_ffmpeg(
+        source_path.as_path(),
+        0,
+        format,
+        start_position_ticks,
+        end_position_ticks,
+    )
+    .await
+}
+
+async fn subtitle_output_from_ffmpeg(
+    input_path: &FsPath,
+    index: i64,
+    format: &str,
+    start_position_ticks: i64,
+    end_position_ticks: Option<i64>,
+) -> Result<Vec<u8>, ApiError> {
+    if !matches!(format, "vtt" | "srt" | "ass" | "ssa") {
+        return Err(ApiError::bad_request("Unsupported subtitle format"));
+    }
+    if index < 0 {
+        return Err(ApiError::bad_request("Invalid subtitle index"));
+    }
+
+    let mut command = Command::new("ffmpeg");
+    command.arg("-hide_banner").arg("-nostdin").arg("-y");
+    if start_position_ticks > 0 {
+        command
+            .arg("-ss")
+            .arg(format_ticks_as_ffmpeg_seconds(start_position_ticks));
+    }
+    command.arg("-i").arg(input_path);
+    if let Some(end_position_ticks) = end_position_ticks
+        && end_position_ticks > start_position_ticks
+    {
+        command
+            .arg("-to")
+            .arg(format_ticks_as_ffmpeg_seconds(end_position_ticks));
+    }
+    command
+        .arg("-map")
+        .arg(format!("0:{index}"))
+        .arg("-f")
+        .arg(subtitle_ffmpeg_format(format))
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command.output().await?;
+    if !output.status.success() {
+        tracing::warn!(
+            index,
+            format,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "ffmpeg failed to extract subtitle stream"
+        );
+        return Err(ApiError::not_found("Subtitle stream not found"));
+    }
+    Ok(output.stdout)
+}
+
+fn subtitle_add_vtt_time_map(output: Vec<u8>) -> Vec<u8> {
+    let text = String::from_utf8_lossy(&output);
+    if text.starts_with("WEBVTT\nX-TIMESTAMP-MAP=")
+        || text.starts_with("WEBVTT\r\nX-TIMESTAMP-MAP=")
+    {
+        return output;
+    }
+    if text.starts_with("WEBVTT") {
+        return text
+            .replacen(
+                "WEBVTT",
+                "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000",
+                1,
+            )
+            .into_bytes();
+    }
+    output
+}
+
+fn parse_subtitle_stream_query(raw_query: Option<&str>) -> SubtitleStreamQuery {
+    let mut query = SubtitleStreamQuery::default();
+    let Some(raw_query) = raw_query else {
+        return query;
+    };
+    for (key, value) in raw_query.split('&').filter_map(|pair| pair.split_once('=')) {
+        match key.to_ascii_lowercase().as_str() {
+            "api_key" | "apikey" => query._api_key = Some(value.to_string()),
+            "itemid" => query.item_id = Some(value.to_string()),
+            "mediasourceid" => query.media_source_id = Some(value.to_string()),
+            "index" => query.index = value.parse().ok(),
+            "format" => query.format = Some(value.to_string()),
+            "startpositionticks" => query.start_position_ticks = value.parse().ok(),
+            "endpositionticks" => query.end_position_ticks = value.parse().ok(),
+            "copytimestamps" => query._copy_timestamps = parse_query_bool(value).unwrap_or(false),
+            "addvtttimemap" => query.add_vtt_time_map = parse_query_bool(value).unwrap_or(false),
+            _ => {}
+        }
+    }
+    query
+}
+
+fn subtitle_path_format(path: &FsPath) -> Option<String> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn subtitle_ffmpeg_format(format: &str) -> &'static str {
+    match format {
+        "vtt" => "webvtt",
+        "srt" => "srt",
+        "ass" | "ssa" => "ass",
+        _ => "webvtt",
+    }
+}
+
+fn subtitle_content_type(format: &str) -> &'static str {
+    match format {
+        "vtt" => "text/vtt; charset=utf-8",
+        "srt" => "application/x-subrip; charset=utf-8",
+        "ass" | "ssa" => "text/plain; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        _ => "text/plain; charset=utf-8",
+    }
+}
+
+fn format_ticks_as_ffmpeg_seconds(ticks: i64) -> String {
+    format!("{:.3}", ticks.max(0) as f64 / 10_000_000.0)
+}
+
 async fn audio_hls_item(
     state: &AppState,
     headers: &HeaderMap,
@@ -10257,11 +10653,11 @@ mod tests {
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_orphan_hls_transcode_dirs,
         cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
-        hls_transcode_dedupe_key, load_countries, load_cultures, media_item_by_id,
-        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
-        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        subscribe_playback_events, transcode_dedupe_lock, transcode_temp_root, trickplay_settings,
-        trickplay_tile_cache_path,
+        hls_transcode_dedupe_key, json_value_i64, load_countries, load_cultures, media_item_by_id,
+        media_item_streams, parse_authorization_token, parse_jellyfin_uuid,
+        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
+        spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -17675,6 +18071,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn subtitle_routes_generate_hls_playlist_and_vtt_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let subtitle = tmp.path().join("captions.srt");
+        tokio::fs::write(
+            &subtitle,
+            b"1\n00:00:00,000 --> 00:00:01,500\nHello from Jellyrin\n\n",
+        )
+        .await
+        .unwrap();
+        let movie = tmp.path().join("Subtitle Source.mkv");
+        let ffmpeg = tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=160x90:rate=1")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("anullsrc=channel_layout=stereo:sample_rate=44100")
+            .arg("-i")
+            .arg(&subtitle)
+            .arg("-t")
+            .arg("3")
+            .arg("-map")
+            .arg("0:v:0")
+            .arg("-map")
+            .arg("1:a:0")
+            .arg("-map")
+            .arg("2:s:0")
+            .arg("-c:v")
+            .arg("mpeg4")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-c:s")
+            .arg("srt")
+            .arg(&movie)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            ffmpeg.status.success(),
+            "ffmpeg failed to create subtitle test video: {}",
+            String::from_utf8_lossy(&ffmpeg.stderr)
+        );
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "subtitle-test-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=SubtitleMovies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let item = test_db.media_items().await.unwrap().remove(0);
+        let item_id = item.id.simple().to_string();
+        let subtitle_index = media_item_streams(&item)
+            .into_iter()
+            .find(|stream| stream["Type"] == "Subtitle")
+            .and_then(|stream| stream.get("Index").and_then(json_value_i64))
+            .expect("subtitle stream index");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2&apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apple.mpegurl"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:2"));
+        assert!(playlist.contains("stream.vtt?CopyTimestamps=true&AddVttTimeMap=true"));
+        assert!(playlist.contains(&format!("ApiKey={api_key}")));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/Stream.vtt?AddVttTimeMap=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/vtt; charset=utf-8"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let vtt = String::from_utf8(body.to_vec()).unwrap();
+        assert!(vtt.starts_with("WEBVTT"));
+        assert!(vtt.contains("X-TIMESTAMP-MAP=MPEGTS:900000"));
+        assert!(vtt.contains("Hello from Jellyrin"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/subtitle/videos/{item_id}/{item_id}/subtitles/{subtitle_index}/10000000/stream.vtt?addVttTimeMap=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
