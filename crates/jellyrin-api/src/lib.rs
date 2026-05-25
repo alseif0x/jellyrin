@@ -14540,20 +14540,21 @@ async fn item_filters(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let metadata_values = item_filter_metadata_values(&state.db, &items).await?;
 
     Ok(Json(serde_json::json!({
-        "Genres": [],
-        "Tags": [],
-        "OfficialRatings": [],
-        "Years": [],
+        "Genres": metadata_values.genres.into_values().collect::<Vec<_>>(),
+        "Tags": metadata_values.tags.into_values().collect::<Vec<_>>(),
+        "OfficialRatings": metadata_values.official_ratings.into_values().collect::<Vec<_>>(),
+        "Years": metadata_values.years.into_values().collect::<Vec<_>>(),
         "Containers": containers,
         "MediaTypes": media_types,
         "VideoTypes": [],
         "SeriesStatuses": [],
         "Staff": [],
-        "Artists": [],
-        "Albums": [],
-        "Studios": [],
+        "Artists": metadata_values.artists.into_values().collect::<Vec<_>>(),
+        "Albums": metadata_values.albums.into_values().collect::<Vec<_>>(),
+        "Studios": metadata_values.studios.into_values().collect::<Vec<_>>(),
         "Trailers": [],
         "Features": []
     })))
@@ -14566,13 +14567,61 @@ async fn query_filters(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let query = parse_items_query(raw_query.as_deref());
-    filtered_items_for_query(&state, &headers, auth_query.api_key.as_deref(), &query).await?;
+    let items =
+        filtered_items_for_query(&state, &headers, auth_query.api_key.as_deref(), &query).await?;
+    let metadata_values = item_filter_metadata_values(&state.db, &items).await?;
     Ok(Json(serde_json::json!({
-        "Genres": [],
-        "Tags": [],
+        "Genres": metadata_values.genres.into_values().collect::<Vec<_>>(),
+        "Tags": metadata_values.tags.into_values().collect::<Vec<_>>(),
         "AudioLanguages": [],
         "SubtitleLanguages": []
     })))
+}
+
+#[derive(Default)]
+struct ItemFilterMetadataValues {
+    albums: BTreeMap<String, String>,
+    artists: BTreeMap<String, String>,
+    genres: BTreeMap<String, String>,
+    official_ratings: BTreeMap<String, String>,
+    studios: BTreeMap<String, String>,
+    tags: BTreeMap<String, String>,
+    years: BTreeMap<String, String>,
+}
+
+async fn item_filter_metadata_values(
+    db: &Database,
+    items: &[MediaItem],
+) -> Result<ItemFilterMetadataValues, ApiError> {
+    if items.is_empty() {
+        return Ok(ItemFilterMetadataValues::default());
+    }
+    let item_ids = items.iter().map(|item| item.id).collect::<HashSet<_>>();
+    let mut values = ItemFilterMetadataValues::default();
+    for metadata in db.media_item_metadata().await? {
+        if item_ids.contains(&metadata.item_id) {
+            collect_item_count_metadata_value(&metadata, "Album", &mut values.albums);
+            collect_item_count_metadata_value(&metadata, "AlbumName", &mut values.albums);
+            collect_item_count_metadata_value(&metadata, "Artists", &mut values.artists);
+            collect_item_count_metadata_value(&metadata, "AlbumArtists", &mut values.artists);
+            collect_item_count_metadata_value(&metadata, "Genres", &mut values.genres);
+            collect_item_count_metadata_value(
+                &metadata,
+                "OfficialRating",
+                &mut values.official_ratings,
+            );
+            collect_item_count_metadata_value(
+                &metadata,
+                "OfficialRatings",
+                &mut values.official_ratings,
+            );
+            collect_item_count_metadata_value(&metadata, "Studios", &mut values.studios);
+            collect_item_count_metadata_value(&metadata, "Tags", &mut values.tags);
+            collect_item_count_metadata_value(&metadata, "ProductionYear", &mut values.years);
+            collect_item_count_metadata_value(&metadata, "Years", &mut values.years);
+        }
+    }
+    Ok(values)
 }
 
 async fn filtered_items_for_query(
@@ -23042,7 +23091,12 @@ mod tests {
                 json!({
                     "Album": "Example Album",
                     "Artists": ["Artist One", "artist one", { "Name": "Artist Two" }],
-                    "AlbumArtists": ["Album Artist"]
+                    "AlbumArtists": ["Album Artist"],
+                    "Genres": ["Drama", "drama", "Thriller"],
+                    "OfficialRating": "PG-13",
+                    "ProductionYear": 2024,
+                    "Studios": ["Studio One", { "Name": "Studio Two" }],
+                    "Tags": ["Library Tag"]
                 }),
             )
             .await
@@ -23191,9 +23245,18 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let filters: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(filters["Genres"].as_array().unwrap().len(), 0);
+        assert_eq!(filters["Genres"], json!(["Drama", "Thriller"]));
+        assert_eq!(filters["Tags"], json!(["Library Tag"]));
+        assert_eq!(filters["OfficialRatings"], json!(["PG-13"]));
+        assert_eq!(filters["Years"], json!(["2024"]));
         assert_eq!(filters["MediaTypes"], json!(["Video"]));
         assert_eq!(filters["Containers"], json!(["mp4"]));
+        assert_eq!(
+            filters["Artists"],
+            json!(["Album Artist", "Artist One", "Artist Two"])
+        );
+        assert_eq!(filters["Albums"], json!(["Example Album"]));
+        assert_eq!(filters["Studios"], json!(["Studio One", "Studio Two"]));
 
         let response = app
             .clone()
@@ -23225,8 +23288,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let filters2: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(filters2["Genres"].as_array().unwrap().len(), 0);
-        assert_eq!(filters2["Tags"].as_array().unwrap().len(), 0);
+        assert_eq!(filters2["Genres"], json!(["Drama", "Thriller"]));
+        assert_eq!(filters2["Tags"], json!(["Library Tag"]));
         assert_eq!(filters2["AudioLanguages"].as_array().unwrap().len(), 0);
         assert_eq!(filters2["SubtitleLanguages"].as_array().unwrap().len(), 0);
 
@@ -23248,6 +23311,7 @@ mod tests {
         let filter_alias: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(filter_alias["MediaTypes"], json!(["Video"]));
         assert_eq!(filter_alias["Containers"], json!(["mp4"]));
+        assert_eq!(filter_alias["Genres"], json!(["Drama", "Thriller"]));
 
         let response = app
             .clone()
@@ -23286,6 +23350,7 @@ mod tests {
         let empty_audio_filter_alias: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(empty_audio_filter_alias["MediaTypes"], json!([]));
         assert_eq!(empty_audio_filter_alias["Containers"], json!([]));
+        assert_eq!(empty_audio_filter_alias["Genres"], json!([]));
 
         let response = app
             .clone()
@@ -23332,7 +23397,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let genres: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(genres["TotalRecordCount"], 0);
+        assert_eq!(genres["TotalRecordCount"], 2);
+        assert_eq!(genres["Items"][0]["Name"], "Drama");
+        assert_eq!(genres["Items"][1]["Name"], "Thriller");
 
         let response = app
             .clone()
