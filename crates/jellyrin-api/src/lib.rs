@@ -181,10 +181,16 @@ pub fn router(state: AppState) -> Router {
             "/web/configurationpages",
             get(dashboard_configuration_pages),
         )
-        .route("/Dashboard/web/ConfigurationPage", get(empty_text))
-        .route("/web/ConfigurationPage", get(empty_text))
-        .route("/dashboard/web/configurationpage", get(empty_text))
-        .route("/web/configurationpage", get(empty_text))
+        .route(
+            "/Dashboard/web/ConfigurationPage",
+            get(dashboard_configuration_page),
+        )
+        .route("/web/ConfigurationPage", get(dashboard_configuration_page))
+        .route(
+            "/dashboard/web/configurationpage",
+            get(dashboard_configuration_page),
+        )
+        .route("/web/configurationpage", get(dashboard_configuration_page))
         .route("/Devices", get(devices))
         .route("/devices", get(devices))
         .route("/Devices/Info", get(device_info))
@@ -5365,6 +5371,79 @@ async fn dashboard_configuration_pages(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     Ok(Json(Vec::new()))
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardConfigurationPageQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "Name", alias = "page", alias = "Page")]
+    name: Option<String>,
+}
+
+async fn dashboard_configuration_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DashboardConfigurationPageQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let name = query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ApiError::bad_request("Configuration page name is required"))?;
+    let relative_path = safe_web_relative_path(name)?;
+    let path = state.web_dir.join(relative_path);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => ApiError::not_found("Configuration page not found"),
+            _ => error.into(),
+        })?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        web_content_type_for_path(&path).parse().unwrap(),
+    );
+    headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+    Ok((headers, bytes).into_response())
+}
+
+fn safe_web_relative_path(name: &str) -> Result<PathBuf, ApiError> {
+    let path = FsPath::new(name);
+    if path.is_absolute() {
+        return Err(ApiError::bad_request("Invalid configuration page name"));
+    }
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => safe.push(part),
+            std::path::Component::CurDir => {}
+            _ => return Err(ApiError::bad_request("Invalid configuration page name")),
+        }
+    }
+    if safe.as_os_str().is_empty() {
+        return Err(ApiError::bad_request("Invalid configuration page name"));
+    }
+    Ok(safe)
+}
+
+fn web_content_type_for_path(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 const LIBRARY_SCAN_TASK_ID: &str = "scan-media-library";
@@ -20433,6 +20512,11 @@ mod tests {
         let log_dir = storage_root.path().join("logs");
         std::fs::create_dir_all(&storage_path).unwrap();
         std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            storage_root.path().join("home.html"),
+            "<main>Dashboard</main>",
+        )
+        .unwrap();
         std::fs::write(log_dir.join("jellyrin.log"), "first line\nsecond line\n").unwrap();
         std::fs::write(log_dir.join("older.log"), "older\n").unwrap();
         std::fs::write(log_dir.join("notes.json"), "{}\n").unwrap();
@@ -20449,7 +20533,7 @@ mod tests {
             .unwrap();
         let app = router(AppState {
             db,
-            web_dir: ".".into(),
+            web_dir: storage_root.path().to_path_buf(),
             log_dir: log_dir.clone(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
@@ -20626,7 +20710,10 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(storage["WebFolder"]["Path"], ".");
+        assert_eq!(
+            storage["WebFolder"]["Path"],
+            storage_root.path().to_string_lossy().to_string()
+        );
         assert_eq!(
             storage["LogFolder"]["Path"],
             log_dir.to_string_lossy().to_string()
@@ -20649,6 +20736,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Dashboard/web/ConfigurationPage?name=home.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Dashboard/web/ConfigurationPage?name=home.html")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(content_type.starts_with("text/html"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<main>Dashboard</main>");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/ConfigurationPage?name=../home.html")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/ConfigurationPage?name=missing.html")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
