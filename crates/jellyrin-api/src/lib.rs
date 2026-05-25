@@ -11462,17 +11462,118 @@ async fn subtitle_fallback_fonts(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(Vec::new()))
+    let Some(font_dir) = fallback_font_directory(&state.db).await? else {
+        return Ok(Json(Vec::new()));
+    };
+    let mut fonts = Vec::new();
+    let mut entries = match tokio::fs::read_dir(&font_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Json(fonts)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => return Ok(Json(fonts)),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !is_supported_font_path(&path) {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let modified = metadata
+            .modified()
+            .ok()
+            .map(OffsetDateTime::from)
+            .map(format_time_for_json);
+        fonts.push(serde_json::json!({
+            "Name": name,
+            "Size": metadata.len(),
+            "DateModified": modified,
+            "MimeType": attachment_content_type(&path)
+        }));
+    }
+    fonts.sort_by_key(|font| {
+        font.get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+    Ok(Json(fonts))
 }
 
 async fn subtitle_fallback_font(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_name): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok((StatusCode::OK, Body::empty()).into_response())
+    let Some(font_dir) = fallback_font_directory(&state.db).await? else {
+        return Ok((StatusCode::OK, Body::empty()).into_response());
+    };
+    let path = fallback_font_path(&font_dir, &name).await?;
+    stream_path(
+        path.clone(),
+        attachment_content_type(&path).to_string(),
+        &headers,
+        true,
+    )
+    .await
+}
+
+async fn fallback_font_directory(db: &Database) -> Result<Option<PathBuf>, ApiError> {
+    let config = db
+        .named_configuration("encoding")
+        .await?
+        .unwrap_or_else(default_encoding_configuration);
+    if !config
+        .get("EnableFallbackFont")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let Some(path) = config
+        .get("FallbackFontPath")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PathBuf::from(path)))
+}
+
+async fn fallback_font_path(font_dir: &FsPath, name: &str) -> Result<PathBuf, ApiError> {
+    if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return Err(ApiError::not_found("Fallback font not found"));
+    }
+    let canonical_dir = tokio::fs::canonicalize(font_dir)
+        .await
+        .map_err(|_| ApiError::not_found("Fallback font not found"))?;
+    let candidate = canonical_dir.join(name);
+    let canonical_candidate = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|_| ApiError::not_found("Fallback font not found"))?;
+    if !canonical_candidate.starts_with(&canonical_dir)
+        || !is_supported_font_path(&canonical_candidate)
+    {
+        return Err(ApiError::not_found("Fallback font not found"));
+    }
+    Ok(canonical_candidate)
+}
+
+fn is_supported_font_path(path: &FsPath) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("ttf" | "otf" | "woff" | "woff2")
+    )
 }
 
 async fn search_remote_subtitles(
@@ -15730,10 +15831,10 @@ mod tests {
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_orphan_hls_transcode_dirs,
         cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
-        hls_transcode_dedupe_key, json_value_i64, load_countries, load_cultures, media_item_by_id,
-        media_item_streams, parse_authorization_token, parse_jellyfin_uuid,
-        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
-        spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
+        encoding_configuration_json, hls_transcode_dedupe_key, json_value_i64, load_countries,
+        load_cultures, media_item_by_id, media_item_streams, parse_authorization_token,
+        parse_jellyfin_uuid, parse_media_browser_pairs, reconcile_transcode_sessions_on_startup,
+        router, spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
@@ -24623,6 +24724,80 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+
+        let font_dir = tmp.path().join("fonts");
+        tokio::fs::create_dir(&font_dir).await.unwrap();
+        tokio::fs::write(font_dir.join("JellyrinSans.ttf"), b"fake ttf font")
+            .await
+            .unwrap();
+        tokio::fs::write(font_dir.join("JellyrinDisplay.woff2"), b"fake woff2 font")
+            .await
+            .unwrap();
+        tokio::fs::write(font_dir.join("ignored.txt"), b"not a font")
+            .await
+            .unwrap();
+        test_db
+            .update_named_configuration(
+                "encoding",
+                encoding_configuration_json(json!({
+                    "EnableFallbackFont": true,
+                    "FallbackFontPath": font_dir.to_string_lossy()
+                })),
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/subtitle/fallbackfont/fonts")
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fonts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fonts.as_array().unwrap().len(), 2);
+        assert_eq!(fonts[0]["Name"], "JellyrinDisplay.woff2");
+        assert_eq!(fonts[0]["MimeType"], "font/woff2");
+        assert_eq!(fonts[1]["Name"], "JellyrinSans.ttf");
+        assert_eq!(fonts[1]["MimeType"], "font/ttf");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Subtitle/FallbackFont/Fonts/JellyrinSans.ttf")
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "font/ttf"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake ttf font");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Subtitle/FallbackFont/Fonts/ignored.txt")
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
