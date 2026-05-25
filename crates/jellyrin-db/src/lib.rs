@@ -155,6 +155,14 @@ pub struct ActiveViewingSession {
 }
 
 #[derive(Debug, Clone)]
+pub struct ActiveSessionUser {
+    pub session_id: String,
+    pub user_id: Uuid,
+    pub user_name: String,
+    pub added_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpsertActivePlaybackSession {
     pub session_id: String,
     pub user_id: Uuid,
@@ -1529,7 +1537,13 @@ impl Database {
                    devices.last_activity_at, devices.capabilities_json
             FROM devices
             INNER JOIN users ON users.id = devices.user_id
-            WHERE users.is_disabled = 0 AND devices.user_id = ?1
+            WHERE users.is_disabled = 0 AND (
+                devices.user_id = ?1 OR EXISTS (
+                    SELECT 1 FROM active_session_users
+                    WHERE active_session_users.session_id = devices.access_token
+                      AND active_session_users.user_id = ?1
+                )
+            )
             ORDER BY devices.last_activity_at DESC
             "#,
         )
@@ -1777,6 +1791,51 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn add_session_user(&self, session_id: &str, user_id: Uuid) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO active_session_users (session_id, user_id, added_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(session_id, user_id) DO UPDATE SET
+                added_at = excluded.added_at
+            "#,
+        )
+        .bind(session_id.trim())
+        .bind(user_id.to_string())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_session_user(&self, session_id: &str, user_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM active_session_users WHERE session_id = ?1 AND user_id = ?2")
+            .bind(session_id.trim())
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn active_session_users(&self) -> anyhow::Result<Vec<ActiveSessionUser>> {
+        let rows = sqlx::query_as::<_, ActiveSessionUserRow>(
+            r#"
+            SELECT active_session_users.session_id,
+                   active_session_users.user_id,
+                   users.name AS user_name,
+                   active_session_users.added_at
+            FROM active_session_users
+            INNER JOIN users ON users.id = active_session_users.user_id
+            WHERE users.is_disabled = 0
+            ORDER BY active_session_users.added_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
@@ -4634,6 +4693,14 @@ struct ActiveViewingSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct ActiveSessionUserRow {
+    session_id: String,
+    user_id: String,
+    user_name: String,
+    added_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct TranscodeSessionRow {
     play_session_id: String,
     dedupe_key: Option<String>,
@@ -4989,6 +5056,19 @@ impl TryFrom<ActiveViewingSessionRow> for ActiveViewingSession {
                 updated_at: parse_time(&row.updated_at)?,
             },
             updated_at: parse_time(&row.viewing_updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<ActiveSessionUserRow> for ActiveSessionUser {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ActiveSessionUserRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session_id: row.session_id,
+            user_id: Uuid::parse_str(&row.user_id).context("invalid active session user id")?,
+            user_name: row.user_name,
+            added_at: parse_time(&row.added_at)?,
         })
     }
 }
@@ -6035,6 +6115,56 @@ mod tests {
             .await
             .unwrap();
         assert!(db.active_viewing_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_session_users_round_trip_and_scope_sessions() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let owner = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+        let guest = db.create_user("guest", Some("secret")).await.unwrap();
+        let (_, token) = db
+            .authenticate_user_by_name(
+                "root",
+                "secret",
+                "device-1",
+                "Firefox",
+                "Jellyfin Web",
+                "dev",
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            db.device_sessions_for_user(guest.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.add_session_user(&token.access_token, guest.id)
+            .await
+            .unwrap();
+        let users = db.active_session_users().await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].session_id, token.access_token);
+        assert_eq!(users[0].user_id, guest.id);
+        assert_eq!(users[0].user_name, "guest");
+        let guest_sessions = db.device_sessions_for_user(guest.id).await.unwrap();
+        assert_eq!(guest_sessions.len(), 1);
+        assert_eq!(guest_sessions[0].user_id, owner.id);
+
+        db.remove_session_user(&token.access_token, guest.id)
+            .await
+            .unwrap();
+        assert!(db.active_session_users().await.unwrap().is_empty());
+        assert!(
+            db.device_sessions_for_user(guest.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

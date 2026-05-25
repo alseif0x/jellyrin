@@ -30,11 +30,11 @@ use jellyrin_core::{
     TranscodeStreamSelection, User, VirtualFolder, build_hls_ffmpeg_command,
 };
 use jellyrin_db::{
-    ActivePlaybackSession, ActiveViewingSession, ActivityLogEntry, ActivityLogFilter,
-    ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database, DeviceSession,
-    MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission, QuickConnectSession,
-    SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
+    ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
+    DeviceSession, MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission,
+    QuickConnectSession, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
+    TrickplayInfo, UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
     UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
@@ -4118,6 +4118,13 @@ async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json:
         .into_iter()
         .map(|session| (session.session_id.clone(), session))
         .collect::<HashMap<_, _>>();
+    let mut additional_users = HashMap::<String, Vec<ActiveSessionUser>>::new();
+    for session_user in db.active_session_users().await? {
+        additional_users
+            .entry(session_user.session_id.clone())
+            .or_default()
+            .push(session_user);
+    }
     let server_id = db.server_state().await?.server_id.to_string();
     Ok(sessions
         .iter()
@@ -4126,6 +4133,10 @@ async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json:
                 session,
                 active_playback.get(&session.access_token),
                 active_viewing.get(&session.access_token),
+                additional_users
+                    .get(&session.access_token)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
                 &server_id,
             )
         })
@@ -6453,7 +6464,7 @@ async fn add_user_to_session(
     Query(auth_query): Query<AuthQuery>,
     Path((session_id, user_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    modify_session_user(state, headers, auth_query, session_id, user_id).await
+    modify_session_user(state, headers, auth_query, session_id, user_id, true).await
 }
 
 async fn remove_user_from_session(
@@ -6462,7 +6473,7 @@ async fn remove_user_from_session(
     Query(auth_query): Query<AuthQuery>,
     Path((session_id, user_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    modify_session_user(state, headers, auth_query, session_id, user_id).await
+    modify_session_user(state, headers, auth_query, session_id, user_id, false).await
 }
 
 async fn modify_session_user(
@@ -6471,6 +6482,7 @@ async fn modify_session_user(
     auth_query: AuthQuery,
     session_id: String,
     user_id: String,
+    add_user: bool,
 ) -> Result<StatusCode, ApiError> {
     let (auth_user, target_session) =
         command_target_session(&state, &headers, &auth_query, &session_id).await?;
@@ -6485,6 +6497,17 @@ async fn modify_session_user(
         .any(|user| user.id == requested_user_id)
     {
         return Err(ApiError::not_found("User not found"));
+    }
+    if add_user {
+        state
+            .db
+            .add_session_user(&target_session.access_token, requested_user_id)
+            .await?;
+    } else {
+        state
+            .db
+            .remove_session_user(&target_session.access_token, requested_user_id)
+            .await?;
     }
     broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -19175,9 +19198,19 @@ fn session_to_json(
     session: &DeviceSession,
     active_playback: Option<&ActivePlaybackSession>,
     active_viewing: Option<&ActiveViewingSession>,
+    additional_users: &[ActiveSessionUser],
     server_id: &str,
 ) -> serde_json::Value {
     let capabilities = session.capabilities.as_ref();
+    let additional_users = additional_users
+        .iter()
+        .map(|user| {
+            serde_json::json!({
+                "UserId": user.user_id,
+                "UserName": user.user_name,
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "Id": session.access_token,
         "UserId": session.user_id,
@@ -19195,6 +19228,7 @@ fn session_to_json(
         "NowPlayingItem": active_playback.map(|playback| media_item_to_json(&playback.item, server_id)),
         "PlayState": active_playback.map(active_playback_state_json),
         "NowViewingItem": active_viewing.map(|viewing| media_item_to_json(&viewing.item, server_id)),
+        "AdditionalUsers": additional_users,
     })
 }
 
@@ -31444,6 +31478,13 @@ mod tests {
             .await
             .unwrap();
         let user_id = user.id.simple().to_string();
+        let guest = db.create_user("guest", Some("secret")).await.unwrap();
+        let guest_key = db
+            .issue_api_key_for_user(guest.id, "guest-key")
+            .await
+            .unwrap();
+        let guest_id = guest.id.simple().to_string();
+        let guest_id_hyphenated = guest.id.to_string();
         let test_db = db.clone();
         let app = router(AppState {
             db,
@@ -32122,21 +32163,43 @@ mod tests {
             next_playback_event_type(&mut playback_events, playback_token, "Browse").await;
         assert_eq!(report_browse_event["Data"]["ItemId"], item_id);
 
-        for method in [Method::POST, Method::DELETE] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(format!("/Session/Sessions/{playback_token}/User/{user_id}"))
-                        .header("X-Emby-Token", &api_key)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Session/Sessions/{playback_token}/User/{guest_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let guest_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(guest_sessions.as_array().unwrap().len(), 1);
+        assert_eq!(guest_sessions[0]["Id"], playback_token);
+        assert_eq!(
+            guest_sessions[0]["AdditionalUsers"][0]["UserId"],
+            guest_id_hyphenated
+        );
+        assert_eq!(guest_sessions[0]["AdditionalUsers"][0]["UserName"], "guest");
 
         let response = app
             .clone()
@@ -32153,6 +32216,10 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let sessions: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(sessions[0]["DeviceId"], "audio-remote-device");
+        assert_eq!(
+            sessions[0]["AdditionalUsers"][0]["UserId"],
+            guest_id_hyphenated
+        );
         assert_eq!(sessions[0]["NowPlayingItem"]["Id"], item_id);
         assert_eq!(sessions[0]["NowViewingItem"]["Id"], item_id);
         assert_eq!(sessions[0]["PlayState"]["PositionTicks"], 123);
@@ -32165,6 +32232,38 @@ mod tests {
         );
         assert_eq!(sessions[0]["PlayState"]["AudioStreamIndex"], 1);
         assert_eq!(sessions[0]["PlayState"]["SubtitleStreamIndex"], -1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/Session/Sessions/{playback_token}/User/{guest_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let guest_sessions_after_remove: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(guest_sessions_after_remove.as_array().unwrap().len(), 0);
 
         let response = app
             .clone()
