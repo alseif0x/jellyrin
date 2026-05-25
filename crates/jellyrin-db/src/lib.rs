@@ -277,6 +277,7 @@ pub struct ActivityLogEntry {
     pub entry_type: String,
     pub severity: String,
     pub user_id: Option<Uuid>,
+    pub item_id: Option<Uuid>,
     pub created_at: OffsetDateTime,
 }
 
@@ -300,6 +301,7 @@ pub enum SortDirection {
 #[derive(Debug, Clone)]
 pub struct ActivityLogFilter {
     pub has_user_id: Option<bool>,
+    pub item_id: Option<Uuid>,
     pub name: Option<String>,
     pub overview: Option<String>,
     pub short_overview: Option<String>,
@@ -315,6 +317,7 @@ impl Default for ActivityLogFilter {
     fn default() -> Self {
         Self {
             has_user_id: None,
+            item_id: None,
             name: None,
             overview: None,
             short_overview: None,
@@ -558,6 +561,26 @@ impl Database {
         entry_type: &str,
         user_id: Option<Uuid>,
     ) -> anyhow::Result<ActivityLogEntry> {
+        self.add_activity_log_entry_with_item(
+            name,
+            overview,
+            short_overview,
+            entry_type,
+            user_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn add_activity_log_entry_with_item(
+        &self,
+        name: &str,
+        overview: Option<&str>,
+        short_overview: Option<&str>,
+        entry_type: &str,
+        user_id: Option<Uuid>,
+        item_id: Option<Uuid>,
+    ) -> anyhow::Result<ActivityLogEntry> {
         let trimmed_name = name.trim();
         let trimmed_type = entry_type.trim();
         anyhow::ensure!(
@@ -573,9 +596,9 @@ impl Database {
         let result = sqlx::query(
             r#"
             INSERT INTO activity_log_entries (
-                name, overview, short_overview, entry_type, severity, user_id, created_at
+                name, overview, short_overview, entry_type, severity, user_id, item_id, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, 'Information', ?5, ?6)
+            VALUES (?1, ?2, ?3, ?4, 'Information', ?5, ?6, ?7)
             "#,
         )
         .bind(trimmed_name)
@@ -583,6 +606,7 @@ impl Database {
         .bind(trimmed_optional_str(short_overview))
         .bind(trimmed_type)
         .bind(user_id.map(|id| id.to_string()))
+        .bind(item_id.map(|id| id.to_string()))
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -611,7 +635,7 @@ impl Database {
             "SELECT activity_log_entries.id, activity_log_entries.name, \
              activity_log_entries.overview, activity_log_entries.short_overview, \
              activity_log_entries.entry_type, activity_log_entries.severity, \
-             activity_log_entries.user_id, activity_log_entries.created_at \
+             activity_log_entries.user_id, activity_log_entries.item_id, activity_log_entries.created_at \
              FROM activity_log_entries",
         );
         push_activity_log_join_and_filters(&mut rows_query, &filter)?;
@@ -3810,7 +3834,7 @@ impl Database {
     async fn activity_log_entry_by_rowid(&self, rowid: i64) -> anyhow::Result<ActivityLogEntry> {
         let row = sqlx::query_as::<_, ActivityLogEntryRow>(
             r#"
-            SELECT id, name, overview, short_overview, entry_type, severity, user_id, created_at
+            SELECT id, name, overview, short_overview, entry_type, severity, user_id, item_id, created_at
             FROM activity_log_entries
             WHERE id = ?1
             "#,
@@ -4171,6 +4195,12 @@ fn push_activity_log_join_and_filters(
         "activity_log_entries.severity",
         &filter.severity,
     );
+
+    if let Some(item_id) = filter.item_id {
+        push_activity_log_where(query, &mut first_filter);
+        query.push("activity_log_entries.item_id = ");
+        query.push_bind(item_id.to_string());
+    }
 
     if let Some(has_user_id) = filter.has_user_id {
         push_activity_log_where(query, &mut first_filter);
@@ -4771,6 +4801,7 @@ struct ActivityLogEntryRow {
     entry_type: String,
     severity: String,
     user_id: Option<String>,
+    item_id: Option<String>,
     created_at: String,
 }
 
@@ -5171,6 +5202,7 @@ impl TryFrom<ActivityLogEntryRow> for ActivityLogEntry {
             entry_type: row.entry_type,
             severity: row.severity,
             user_id: row.user_id.as_deref().map(Uuid::parse_str).transpose()?,
+            item_id: row.item_id.as_deref().map(Uuid::parse_str).transpose()?,
             created_at: parse_time(&row.created_at)?,
         })
     }
@@ -5630,6 +5662,7 @@ mod tests {
     };
     use serde_json::json;
     use time::Duration;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn creates_initial_server_state_once() {
@@ -5822,18 +5855,33 @@ mod tests {
 
     #[tokio::test]
     async fn activity_log_entries_filter_and_sort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Activity Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("root".to_string(), "secret")
             .await
             .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
 
-        db.add_activity_log_entry(
+        db.add_activity_log_entry_with_item(
             "Alpha event",
             Some("First overview"),
             Some("Alpha short"),
             "System",
             Some(user.id),
+            Some(item.id),
         )
         .await
         .unwrap();
@@ -5863,6 +5911,35 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(entries[0].name, "Alpha event");
         assert_eq!(entries[0].user_id, Some(user.id));
+        assert_eq!(entries[0].item_id, Some(item.id));
+
+        let (entries, total) = db
+            .activity_log_entries(
+                0,
+                10,
+                ActivityLogFilter {
+                    item_id: Some(item.id),
+                    ..ActivityLogFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].name, "Alpha event");
+
+        let (entries, total) = db
+            .activity_log_entries(
+                0,
+                10,
+                ActivityLogFilter {
+                    item_id: Some(Uuid::new_v4()),
+                    ..ActivityLogFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 0);
+        assert!(entries.is_empty());
 
         let (entries, total) = db
             .activity_log_entries(

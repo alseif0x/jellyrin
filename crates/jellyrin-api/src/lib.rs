@@ -3956,18 +3956,14 @@ async fn activity_log_entries(
 }
 
 fn activity_log_filter_from_query(query: &ActivityLogQuery) -> Result<ActivityLogFilter, ApiError> {
-    if query
-        .item_id
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Err(ApiError::bad_request(
-            "activity log item filtering is not implemented",
-        ));
-    }
-
     Ok(ActivityLogFilter {
         has_user_id: query.has_user_id,
+        item_id: query
+            .item_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(parse_jellyfin_uuid)
+            .transpose()?,
         name: query.name.clone(),
         overview: query.overview.clone(),
         short_overview: query.short_overview.clone(),
@@ -4074,7 +4070,7 @@ fn activity_log_entry_json(entry: &ActivityLogEntry) -> serde_json::Value {
         "Severity": entry.severity,
         "Date": format_time_for_json(entry.created_at),
         "UserId": entry.user_id.map(|id| id.to_string()),
-        "ItemId": null,
+        "ItemId": entry.item_id.map(|id| id.to_string()),
         "UserPrimaryImageTag": null
     })
 }
@@ -23140,6 +23136,108 @@ mod tests {
         assert_eq!(filtered["TotalRecordCount"], 1);
         assert_eq!(filtered["Items"].as_array().unwrap().len(), 1);
         assert_eq!(filtered["Items"][0]["Name"], "Server configuration updated");
+    }
+
+    #[tokio::test]
+    async fn activity_log_filters_by_item_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Activity Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "activity-item-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        db.add_activity_log_entry_with_item(
+            "Item metadata refreshed",
+            Some("Activity Movie refreshed"),
+            Some("Activity Movie refreshed"),
+            "Library",
+            Some(user.id),
+            Some(item.id),
+        )
+        .await
+        .unwrap();
+        db.add_activity_log_entry(
+            "General library scan",
+            Some("Library scan completed"),
+            Some("Library scan completed"),
+            "Library",
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/System/ActivityLog/Entries?ItemId={}", item.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let activity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(activity["TotalRecordCount"], 1);
+        assert_eq!(activity["Items"][0]["Name"], "Item metadata refreshed");
+        assert_eq!(activity["Items"][0]["ItemId"], item.id.to_string());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/System/ActivityLog/Entries?ItemId={}",
+                        uuid::Uuid::new_v4()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let empty_activity: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(empty_activity["TotalRecordCount"], 0);
+        assert_eq!(empty_activity["Items"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/ActivityLog/Entries?ItemId=not-a-valid-id")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
