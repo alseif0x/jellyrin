@@ -12,13 +12,14 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect},
     routing::{delete, get, head, post},
 };
+use base64::{Engine as _, engine::general_purpose};
 use jellyrin_compat::{
     AuthenticateUserByNameDto, AuthenticationResultDto, CountryDto, CultureDto, HealthResponse,
     LocalizationOptionDto, PublicSystemInfo, SessionInfoDto, StartupConfigurationDto,
@@ -961,6 +962,62 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/hlssegment/audio/{item_id}/hls/{segment_id}/stream.mp3",
             get(audio_hls_legacy_mp3_segment),
+        )
+        .route(
+            "/Subtitle/FallbackFont/Fonts",
+            get(subtitle_fallback_fonts),
+        )
+        .route(
+            "/subtitle/fallbackfont/fonts",
+            get(subtitle_fallback_fonts),
+        )
+        .route(
+            "/Subtitle/FallbackFont/Fonts/{name}",
+            get(subtitle_fallback_font),
+        )
+        .route(
+            "/subtitle/fallbackfont/fonts/{name}",
+            get(subtitle_fallback_font),
+        )
+        .route(
+            "/Subtitle/Items/{item_id}/RemoteSearch/Subtitles/{language}",
+            get(search_remote_subtitles),
+        )
+        .route(
+            "/subtitle/items/{item_id}/remotesearch/subtitles/{language}",
+            get(search_remote_subtitles),
+        )
+        .route(
+            "/Subtitle/Items/{item_id}/RemoteSearch/Subtitles/{language}",
+            post(download_remote_subtitle),
+        )
+        .route(
+            "/subtitle/items/{item_id}/remotesearch/subtitles/{language}",
+            post(download_remote_subtitle),
+        )
+        .route(
+            "/Subtitle/Providers/Subtitles/Subtitles/{subtitle_id}",
+            get(get_remote_subtitle),
+        )
+        .route(
+            "/subtitle/providers/subtitles/subtitles/{subtitle_id}",
+            get(get_remote_subtitle),
+        )
+        .route(
+            "/Subtitle/Videos/{item_id}/Subtitles",
+            post(upload_subtitle),
+        )
+        .route(
+            "/subtitle/videos/{item_id}/subtitles",
+            post(upload_subtitle),
+        )
+        .route(
+            "/Subtitle/Videos/{item_id}/Subtitles/{index}",
+            delete(delete_subtitle),
+        )
+        .route(
+            "/subtitle/videos/{item_id}/subtitles/{index}",
+            delete(delete_subtitle),
         )
         .route(
             "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/subtitles.m3u8",
@@ -9507,6 +9564,300 @@ fn audio_hls_legacy_content_type(container: &str) -> &'static str {
     }
 }
 
+const SUBTITLE_UPLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct UploadSubtitleDto {
+    #[serde(alias = "Data", alias = "data")]
+    data: Option<String>,
+    #[serde(alias = "Format", alias = "format")]
+    format: Option<String>,
+    #[serde(alias = "Language", alias = "language")]
+    language: Option<String>,
+    #[serde(alias = "IsForced", alias = "isForced")]
+    is_forced: Option<bool>,
+    #[serde(alias = "IsHearingImpaired", alias = "isHearingImpaired")]
+    is_hearing_impaired: Option<bool>,
+    #[serde(alias = "FileName", alias = "fileName", alias = "Name", alias = "name")]
+    file_name: Option<String>,
+}
+
+async fn subtitle_fallback_fonts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(Vec::new()))
+}
+
+async fn subtitle_fallback_font(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_name): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok((StatusCode::OK, Body::empty()).into_response())
+}
+
+async fn search_remote_subtitles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _language)): Path<(String, String)>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    subtitle_media_item(&state, &item_id, None).await?;
+    Ok(Json(Vec::new()))
+}
+
+async fn download_remote_subtitle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _subtitle_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    subtitle_media_item(&state, &item_id, None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_remote_subtitle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(_subtitle_id): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Err(ApiError::not_found("Remote subtitle not found"))
+}
+
+async fn upload_subtitle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = subtitle_media_item(&state, &item_id, None).await?;
+    let body = to_bytes(body, SUBTITLE_UPLOAD_LIMIT_BYTES)
+        .await
+        .map_err(|_| ApiError::bad_request("Invalid subtitle upload body"))?;
+    let payload: UploadSubtitleDto = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("Subtitle upload body must be JSON"))?;
+    let format = subtitle_upload_format(&payload)?;
+    let data = payload
+        .data
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("Subtitle upload data is required"))?;
+    let data = decode_upload_subtitle_data(data)?;
+    if data.is_empty() {
+        return Err(ApiError::bad_request("Subtitle upload data is empty"));
+    }
+
+    let item_path = media_item_path(&item);
+    let item_dir = item_path
+        .parent()
+        .ok_or_else(|| ApiError::not_found("Subtitle media source not found"))?;
+    let subtitle_dir = item_dir.join(".jellyrin-subtitles");
+    tokio::fs::create_dir_all(&subtitle_dir).await?;
+
+    let mut streams = media_item_streams(&item);
+    let next_index = next_subtitle_stream_index(&streams);
+    let file_stem = subtitle_upload_file_stem(&payload)
+        .unwrap_or_else(|| format!("{}-{next_index}", item.id.simple()));
+    let subtitle_path = subtitle_dir.join(format!("{file_stem}.{format}"));
+    tokio::fs::write(&subtitle_path, data).await?;
+
+    streams.push(serde_json::json!({
+        "Codec": format,
+        "Language": payload.language.as_deref().filter(|value| !value.trim().is_empty()),
+        "DisplayTitle": subtitle_display_title(&payload, &format),
+        "IsInterlaced": false,
+        "IsDefault": false,
+        "IsForced": payload.is_forced.unwrap_or(false),
+        "Type": "Subtitle",
+        "Index": next_index,
+        "IsExternal": true,
+        "IsTextSubtitleStream": true,
+        "SupportsExternalStream": true,
+        "Path": subtitle_path.to_string_lossy().to_string(),
+        "DeliveryMethod": "External",
+        "IsHearingImpaired": payload.is_hearing_impaired.unwrap_or(false)
+    }));
+    persist_media_streams(&state.db, &item, streams).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_subtitle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, index)): Path<(String, i64)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = subtitle_media_item(&state, &item_id, None).await?;
+    let mut removed_path = None;
+    let mut found = false;
+    let streams = media_item_streams(&item)
+        .into_iter()
+        .filter(|stream| {
+            let is_target = stream
+                .get("Type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+                && stream.get("Index").and_then(json_value_i64) == Some(index);
+            if is_target {
+                found = true;
+                if stream
+                    .get("IsExternal")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    removed_path = stream
+                        .get("Path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(PathBuf::from);
+                }
+            }
+            !is_target
+        })
+        .collect::<Vec<_>>();
+
+    if !found {
+        return Err(ApiError::not_found("Subtitle stream not found"));
+    }
+    if let Some(path) = removed_path
+        && subtitle_sidecar_is_within_item_dir(&item, &path).await?
+    {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    persist_media_streams(&state.db, &item, streams).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn subtitle_upload_format(payload: &UploadSubtitleDto) -> Result<String, ApiError> {
+    let candidate = payload
+        .format
+        .as_deref()
+        .or_else(|| {
+            payload
+                .file_name
+                .as_deref()
+                .and_then(|name| FsPath::new(name).extension().and_then(|ext| ext.to_str()))
+        })
+        .unwrap_or("srt")
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if matches!(candidate.as_str(), "srt" | "vtt" | "ass" | "ssa") {
+        Ok(candidate)
+    } else {
+        Err(ApiError::bad_request("Unsupported subtitle format"))
+    }
+}
+
+fn decode_upload_subtitle_data(value: &str) -> Result<Vec<u8>, ApiError> {
+    let data = value.split_once(',').map_or(value, |(_, data)| data).trim();
+    general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| ApiError::bad_request("Subtitle upload data must be base64"))
+}
+
+fn subtitle_upload_file_stem(payload: &UploadSubtitleDto) -> Option<String> {
+    payload
+        .file_name
+        .as_deref()
+        .and_then(|name| FsPath::new(name).file_stem().and_then(|stem| stem.to_str()))
+        .map(sanitize_file_stem)
+        .filter(|value| !value.is_empty())
+}
+
+fn sanitize_file_stem(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn subtitle_display_title(payload: &UploadSubtitleDto, format: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(language) = payload
+        .language
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(language.to_string());
+    }
+    if payload.is_forced.unwrap_or(false) {
+        parts.push("Forced".to_string());
+    }
+    if payload.is_hearing_impaired.unwrap_or(false) {
+        parts.push("SDH".to_string());
+    }
+    if parts.is_empty() {
+        format.to_ascii_uppercase()
+    } else {
+        parts.join(" - ")
+    }
+}
+
+fn next_subtitle_stream_index(streams: &[serde_json::Value]) -> i64 {
+    streams
+        .iter()
+        .filter_map(|stream| stream.get("Index").and_then(json_value_i64))
+        .max()
+        .map_or(0, |index| index.saturating_add(1))
+}
+
+async fn persist_media_streams(
+    db: &Database,
+    item: &MediaItem,
+    streams: Vec<serde_json::Value>,
+) -> Result<(), ApiError> {
+    db.update_media_item_media_info(
+        item.id,
+        item.runtime_ticks,
+        item.bitrate,
+        item.width,
+        item.height,
+        streams,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn subtitle_sidecar_is_within_item_dir(
+    item: &MediaItem,
+    subtitle_path: &FsPath,
+) -> Result<bool, ApiError> {
+    let item_dir = media_item_path(item)
+        .parent()
+        .ok_or_else(|| ApiError::not_found("Subtitle media source not found"))?
+        .to_path_buf();
+    let canonical_item_dir = tokio::fs::canonicalize(item_dir).await?;
+    let canonical_subtitle = match tokio::fs::canonicalize(subtitle_path).await {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(canonical_subtitle.starts_with(canonical_item_dir))
+}
+
 #[derive(Debug, Deserialize)]
 struct SubtitlePlaylistQuery {
     #[serde(alias = "api_key", alias = "apiKey", alias = "ApiKey")]
@@ -12763,7 +13114,7 @@ fn load_countries() -> Vec<CountryDto> {
 
 #[derive(Debug, Default, Deserialize)]
 struct AuthQuery {
-    #[serde(alias = "api_key", alias = "ApiKey")]
+    #[serde(alias = "api_key", alias = "ApiKey", alias = "apiKey")]
     api_key: Option<String>,
 }
 
@@ -13214,10 +13565,12 @@ mod tests {
         body::Body,
         http::{Method, Request, StatusCode, header},
     };
+    use base64::{Engine as _, engine::general_purpose};
     use http_body_util::BodyExt;
     use jellyrin_core::{FfmpegCommandSpec, MediaItem, TranscodeStreamSelection};
     use jellyrin_db::{Database, UpsertTranscodeSession};
     use serde_json::{Value, json};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -21313,6 +21666,319 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn subtitle_management_routes_cover_p0_contracts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Managed Subtitle Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let admin_key = db
+            .issue_api_key_for_user(admin.id, "subtitle-admin-key")
+            .await
+            .unwrap();
+        let user = db.create_user("viewer", Some("secret")).await.unwrap();
+        let user_key = db
+            .issue_api_key_for_user(user.id, "subtitle-user-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=SubtitleManagement&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let item = test_db.media_items().await.unwrap().remove(0);
+        test_db
+            .update_media_item_media_info(
+                item.id,
+                Some(30_000_000),
+                Some(500_000),
+                Some(320),
+                Some(180),
+                vec![json!({ "Type": "Video", "Index": 0, "Codec": "h264" })],
+            )
+            .await
+            .unwrap();
+        let item_id = item.id.simple().to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Subtitle/FallbackFont/Fonts")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Subtitle/FallbackFont/Fonts")
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fonts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fonts, json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Subtitle/FallbackFont/Fonts/Arial")
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Items/{item_id}/RemoteSearch/Subtitles/eng"
+                    ))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Items/{item_id}/RemoteSearch/Subtitles/eng"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_results, json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Subtitle/Items/{item_id}/RemoteSearch/Subtitles/missing-subtitle"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Subtitle/Providers/Subtitles/Subtitles/missing-subtitle")
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let upload_data = general_purpose::STANDARD
+            .encode(b"1\n00:00:00,000 --> 00:00:01,000\nUploaded Jellyrin subtitle\n\n");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Subtitle/Videos/{item_id}/Subtitles"))
+                    .header("X-Emby-Token", &user_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Data": upload_data,
+                            "Format": "srt",
+                            "Language": "eng",
+                            "IsForced": true,
+                            "FileName": "../unsafe name.srt"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let upload_data = general_purpose::STANDARD
+            .encode(b"1\n00:00:00,000 --> 00:00:01,000\nUploaded Jellyrin subtitle\n\n");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/subtitle/videos/{item_id}/subtitles"))
+                    .header("X-Emby-Token", &admin_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Data": upload_data,
+                            "Format": "srt",
+                            "Language": "eng",
+                            "IsForced": true,
+                            "FileName": "../unsafe name.srt"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let item = test_db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id.simple().to_string() == item_id)
+            .unwrap();
+        let uploaded = media_item_streams(&item)
+            .into_iter()
+            .find(|stream| stream["Type"] == "Subtitle")
+            .expect("uploaded subtitle stream");
+        let subtitle_index = uploaded["Index"].as_i64().unwrap();
+        assert_eq!(uploaded["Language"], "eng");
+        assert_eq!(uploaded["IsForced"], true);
+        assert_eq!(uploaded["IsExternal"], true);
+        let subtitle_path = PathBuf::from(uploaded["Path"].as_str().unwrap());
+        assert!(subtitle_path.exists());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/Stream.srt"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let subtitle_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(subtitle_text.contains("Uploaded Jellyrin subtitle"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/Subtitles/{subtitle_index}"
+                    ))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/Subtitles/{subtitle_index}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(!subtitle_path.exists());
+
+        let item = test_db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id.simple().to_string() == item_id)
+            .unwrap();
+        assert!(
+            media_item_streams(&item)
+                .into_iter()
+                .all(|stream| stream["Type"] != "Subtitle")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/Subtitles/{subtitle_index}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

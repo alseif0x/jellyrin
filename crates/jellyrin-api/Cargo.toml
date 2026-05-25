@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 jellyrin-compat = { path = "../jellyrin-compat" }
 jellyrin-core = { path = "../jellyrin-core" }
 jellyrin-db = { path = "../jellyrin-db" }

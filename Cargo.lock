@@ -904,6 +904,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "http-body-util",
  "jellyrin-compat",
  "jellyrin-core",
