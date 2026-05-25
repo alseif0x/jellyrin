@@ -227,6 +227,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Plugins/{plugin_id}/Manifest", get(plugin_manifest))
         .route("/plugins/{plugin_id}/manifest", get(plugin_manifest))
+        .route("/Plugins/{plugin_id}/Manifest", post(plugin_manifest_post))
+        .route("/plugins/{plugin_id}/manifest", post(plugin_manifest_post))
+        .route(
+            "/Plugins/{plugin_id}/{version}/Image",
+            get(plugin_image),
+        )
+        .route(
+            "/plugins/{plugin_id}/{version}/image",
+            get(plugin_image),
+        )
         .route("/Packages", get(available_packages))
         .route("/packages", get(available_packages))
         .route("/Packages/{name}", get(package_info))
@@ -240,6 +250,28 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/packages/installing/{package_id}",
             delete(cancel_package_installation),
+        )
+        .route("/Package/Packages", get(available_packages))
+        .route("/package/packages", get(available_packages))
+        .route("/Package/Packages/{name}", get(package_info))
+        .route("/package/packages/{name}", get(package_info))
+        .route("/Package/Packages/Installed/{name}", post(install_package))
+        .route("/package/packages/installed/{name}", post(install_package))
+        .route(
+            "/Package/Packages/Installing/{package_id}",
+            delete(cancel_package_installation),
+        )
+        .route(
+            "/package/packages/installing/{package_id}",
+            delete(cancel_package_installation),
+        )
+        .route(
+            "/Package/Repositories",
+            get(package_repositories).post(update_package_repositories),
+        )
+        .route(
+            "/package/repositories",
+            get(package_repositories).post(update_package_repositories),
         )
         .route(
             "/Repositories",
@@ -2387,8 +2419,20 @@ pub fn router(state: AppState) -> Router {
         .route("/years/{year}", get(metadata_year_by_value))
         .route("/Channels", get(channels))
         .route("/channels", get(channels))
+        .route("/Channels/Items/Latest", get(channels))
+        .route("/channels/items/latest", get(channels))
         .route("/Channels/Features", get(authenticated_empty_json_array))
         .route("/channels/features", get(authenticated_empty_json_array))
+        .route(
+            "/Channels/{channel_id}/Features",
+            get(authenticated_empty_json_array),
+        )
+        .route(
+            "/channels/{channel_id}/features",
+            get(authenticated_empty_json_array),
+        )
+        .route("/Channels/{channel_id}/Items", get(channels))
+        .route("/channels/{channel_id}/items", get(channels))
         .route("/Artists", get(metadata_artists))
         .route("/artists", get(metadata_artists))
         .route("/Artists/AlbumArtists", get(metadata_album_artists))
@@ -4172,6 +4216,25 @@ async fn plugin_manifest(
         "Category": "General",
         "Versions": []
     })))
+}
+
+async fn plugin_manifest_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    plugin_manifest(State(state), headers, Query(query), Path(plugin_id)).await
+}
+
+async fn plugin_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((_plugin_id, _version)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(placeholder_png_response())
 }
 
 async fn device_info(
@@ -16450,8 +16513,10 @@ mod tests {
             "/Plugins",
             "/plugins",
             "/Plugins/test-plugin/Manifest",
+            "/Package/Packages",
             "/Packages",
             "/packages",
+            "/Package/Repositories",
             "/Repositories",
             "/repositories",
             "/LiveTv/Info",
@@ -16466,7 +16531,10 @@ mod tests {
             "/LiveTv/SeriesTimers",
             "/Channels?UserId=test-user&StartIndex=3&SupportsMediaDeletion=true",
             "/channels?supportsLatestItems=true&isFavorite=false",
+            "/Channels/Items/Latest?UserId=test-user",
             "/Channels/Features",
+            "/Channels/test-channel/Features",
+            "/channels/test-channel/items",
             "/Localization/ParentalRatings",
             "/localization/parentalratings",
         ] {
@@ -19146,7 +19214,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/Repositories")
+                    .uri("/Package/Repositories")
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -19168,7 +19236,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/repositories")
+                    .uri("/package/repositories")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -19184,6 +19252,102 @@ mod tests {
         assert_eq!(repositories[0]["Enabled"], true);
         assert_eq!(repositories[1]["Name"], "Disabled");
         assert_eq!(repositories[1]["Enabled"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Packages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let packages: Value = serde_json::from_slice(&body).unwrap();
+        assert!(packages.as_array().unwrap().is_empty());
+
+        for endpoint in [
+            "/Package/Packages/MissingPlugin",
+            "/package/packages/MissingPlugin",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Packages/Installed/MissingPlugin")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Package/Packages/Installing/00000000-0000-0000-0000-000000000000")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Plugins/test-plugin/Manifest")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(manifest["Guid"], "test-plugin");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/test-plugin/1.0.0.0/Image")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
 
         let response = app
             .oneshot(
