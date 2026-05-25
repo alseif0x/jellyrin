@@ -344,6 +344,8 @@ pub fn router(state: AppState) -> Router {
             "/library/libraries/availableoptions",
             get(library_available_options),
         )
+        .route("/Libraries/AvailableOptions", get(library_available_options))
+        .route("/libraries/availableoptions", get(library_available_options))
         .route("/ClientLog/Document", post(client_log_document))
         .route("/clientlog/document", post(client_log_document))
         .route("/Startup/Configuration", get(get_startup_configuration))
@@ -1420,6 +1422,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/UserViews/UserViews/GroupingOptions", get(grouping_options))
         .route("/userviews/userviews/groupingoptions", get(grouping_options))
+        .route("/UserViews/GroupingOptions", get(grouping_options))
+        .route("/userviews/groupingoptions", get(grouping_options))
         .route(
             "/UserViews/Users/{user_id}/GroupingOptions",
             get(user_grouping_options_legacy),
@@ -5538,24 +5542,72 @@ async fn library_available_options(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     Ok(Json(serde_json::json!({
-        "LibraryOptions": {
-            "EnablePhotos": true,
-            "EnableRealtimeMonitor": false,
-            "EnableLUFSScan": false,
-            "EnableChapterImageExtraction": false,
-            "ExtractChapterImagesDuringLibraryScan": false,
-            "EnableTrickplayImageExtraction": false,
-            "ExtractTrickplayImagesDuringLibraryScan": false,
-            "SaveLocalMetadata": false,
-            "EnableInternetProviders": false,
-            "EnableAutomaticSeriesGrouping": true,
-            "EnableEmbeddedTitles": false,
-            "EnableEmbeddedEpisodeInfos": false,
-            "SeasonZeroDisplayName": "Specials"
-        },
+        "LibraryOptions": default_library_options_json(),
         "MetadataOptions": [],
-        "TypeOptions": []
+        "MetadataSavers": [],
+        "MetadataReaders": [],
+        "SubtitleFetchers": [],
+        "LyricFetchers": [],
+        "MediaSegmentProviders": [],
+        "TypeOptions": library_type_options_json()
     })))
+}
+
+fn default_library_options_json() -> serde_json::Value {
+    serde_json::json!({
+        "EnablePhotos": true,
+        "EnableRealtimeMonitor": false,
+        "EnableLUFSScan": false,
+        "EnableChapterImageExtraction": false,
+        "ExtractChapterImagesDuringLibraryScan": false,
+        "EnableTrickplayImageExtraction": false,
+        "ExtractTrickplayImagesDuringLibraryScan": false,
+        "SaveLocalMetadata": false,
+        "EnableInternetProviders": false,
+        "EnableAutomaticSeriesGrouping": true,
+        "EnableEmbeddedTitles": false,
+        "EnableEmbeddedEpisodeInfos": false,
+        "AutomaticRefreshIntervalDays": 0,
+        "PreferredMetadataLanguage": null,
+        "MetadataCountryCode": null,
+        "SeasonZeroDisplayName": "Specials"
+    })
+}
+
+fn library_type_options_json() -> Vec<serde_json::Value> {
+    [
+        "movies",
+        "tvshows",
+        "music",
+        "books",
+        "photos",
+        "homevideos",
+        "boxsets",
+    ]
+    .into_iter()
+    .map(|collection_type| {
+        serde_json::json!({
+            "Type": collection_type,
+            "MetadataFetchers": [],
+            "MetadataFetcherOrder": [],
+            "ImageFetchers": [],
+            "ImageFetcherOrder": [],
+            "ImageOptions": [],
+            "DisabledSubtitleFetchers": [],
+            "SubtitleFetcherOrder": [],
+            "SupportedImageTypes": supported_image_types_for_collection(collection_type),
+            "DefaultImageOptions": []
+        })
+    })
+    .collect()
+}
+
+fn supported_image_types_for_collection(collection_type: &str) -> Vec<&'static str> {
+    match collection_type {
+        "music" => vec!["Primary", "Backdrop", "Logo"],
+        "books" | "photos" => vec!["Primary"],
+        _ => vec!["Primary", "Backdrop", "Thumb", "Logo"],
+    }
 }
 
 async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
@@ -8607,55 +8659,137 @@ async fn environment_validate_path(
 async fn user_views_result(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<UserViewsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let auth_user =
+        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    if let Some(user_id) = query.user_id.as_deref().map(resolve_user_id).transpose()? {
+        ensure_user_access(&auth_user, user_id)?;
+    }
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let items = folders
-        .iter()
-        .map(|folder| user_view_to_json(folder, &server_id))
-        .collect::<Vec<_>>();
+    let items = user_views_for_query(&folders, &server_id, &query);
     Ok(Json(query_result(items)))
 }
 
 async fn user_views_result_legacy(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<UserViewsQuery>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let auth_user =
+        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let items = folders
-        .iter()
-        .map(|folder| user_view_to_json(folder, &server_id))
-        .collect::<Vec<_>>();
+    let items = user_views_for_query(&folders, &server_id, &query);
     Ok(Json(query_result(items)))
 }
 
 async fn grouping_options(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<UserViewsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(empty_json_array().await)
+    let auth_user =
+        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    if let Some(user_id) = query.user_id.as_deref().map(resolve_user_id).transpose()? {
+        ensure_user_access(&auth_user, user_id)?;
+    }
+    Ok(Json(grouping_options_for_folders(
+        &state.db.virtual_folders().await?,
+    )))
 }
 
 async fn user_grouping_options_legacy(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<UserViewsQuery>,
     Path(user_id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let auth_user =
+        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    Ok(empty_json_array().await)
+    Ok(Json(grouping_options_for_folders(
+        &state.db.virtual_folders().await?,
+    )))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UserViewsQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "UserId", alias = "userId")]
+    user_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "PresetViews",
+        alias = "presetViews"
+    )]
+    preset_views: Vec<String>,
+    #[serde(alias = "IncludeExternalContent", alias = "includeExternalContent")]
+    _include_external_content: Option<bool>,
+    #[serde(alias = "IncludeHidden", alias = "includeHidden")]
+    _include_hidden: Option<bool>,
+}
+
+fn user_views_for_query(
+    folders: &[VirtualFolder],
+    server_id: &str,
+    query: &UserViewsQuery,
+) -> Vec<serde_json::Value> {
+    let preset_views = csv_values_lowercase(&query.preset_views);
+    folders
+        .iter()
+        .filter(|folder| {
+            preset_views.as_ref().is_none_or(|presets| {
+                folder
+                    .collection_type
+                    .as_deref()
+                    .is_some_and(|collection_type| {
+                        presets
+                            .iter()
+                            .any(|preset| preset.eq_ignore_ascii_case(collection_type))
+                    })
+            })
+        })
+        .map(|folder| user_view_to_json(folder, server_id))
+        .collect()
+}
+
+fn grouping_options_for_folders(folders: &[VirtualFolder]) -> Vec<serde_json::Value> {
+    let mut options = BTreeMap::<String, serde_json::Value>::new();
+    for folder in folders {
+        let Some(collection_type) = folder.collection_type.as_deref() else {
+            continue;
+        };
+        options
+            .entry(collection_type.to_ascii_lowercase())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "Name": special_view_option_name(collection_type),
+                    "Id": collection_type
+                })
+            });
+    }
+    options.into_values().collect()
+}
+
+fn special_view_option_name(collection_type: &str) -> String {
+    match collection_type.to_ascii_lowercase().as_str() {
+        "movies" => "Movies".to_string(),
+        "tvshows" => "Shows".to_string(),
+        "music" => "Music".to_string(),
+        "books" => "Books".to_string(),
+        "photos" => "Photos".to_string(),
+        "homevideos" => "Home Videos".to_string(),
+        "boxsets" => "Collections".to_string(),
+        value => canonical_image_type(value),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -25864,6 +25998,57 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/UserViews?UserId={user_id}&PresetViews=movies"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let preset_user_views: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preset_user_views["TotalRecordCount"], 1);
+        assert_eq!(preset_user_views["Items"][0]["CollectionType"], "movies");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserViews?UserId={user_id}&PresetViews=music"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_user_views: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_user_views["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserViews/GroupingOptions?UserId={user_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let grouping_options: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(grouping_options.as_array().unwrap().len(), 1);
+        assert_eq!(grouping_options[0]["Name"], "Movies");
+        assert_eq!(grouping_options[0]["Id"], "movies");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/Search/Hints?SearchTerm=Example&UserId={user_id}"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -26197,6 +26382,47 @@ mod tests {
         assert_eq!(
             available_options["LibraryOptions"]["EnableAutomaticSeriesGrouping"],
             true
+        );
+        assert!(
+            available_options["MetadataSavers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            available_options["MetadataReaders"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            available_options["TypeOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["Type"] == "movies")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Libraries/AvailableOptions?libraryContentType=movies&isNewLibrary=true")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let canonical_available_options: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            canonical_available_options["TypeOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["Type"] == "movies")
         );
 
         let response = app
