@@ -5072,22 +5072,26 @@ async fn item_playback_info(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    playback_info_response(&state.db, &item_id).await
+    let options = parse_playback_info_options(raw_query.as_deref(), None);
+    playback_info_response(&state.db, &item_id, options).await
 }
 
 async fn post_item_playback_info(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(item_id): Path<String>,
     body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    drop(body);
-    playback_info_response(&state.db, &item_id).await
+    let options =
+        parse_playback_info_options(raw_query.as_deref(), body.as_ref().map(|body| &body.0));
+    playback_info_response(&state.db, &item_id, options).await
 }
 
 async fn instant_mix_from_item(
@@ -5142,16 +5146,122 @@ async fn audio_instant_mix_items(db: &Database, item_id: &str) -> Result<Vec<Med
     Ok(mix_items)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PlaybackInfoOptions {
+    enable_direct_play: bool,
+    enable_direct_stream: bool,
+    enable_transcoding: bool,
+}
+
+impl Default for PlaybackInfoOptions {
+    fn default() -> Self {
+        Self {
+            enable_direct_play: true,
+            enable_direct_stream: true,
+            enable_transcoding: true,
+        }
+    }
+}
+
+fn parse_playback_info_options(
+    raw_query: Option<&str>,
+    body: Option<&serde_json::Value>,
+) -> PlaybackInfoOptions {
+    let mut options = body
+        .map(playback_info_options_from_body)
+        .unwrap_or_default();
+    let Some(raw_query) = raw_query else {
+        return options;
+    };
+
+    for part in raw_query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        let key = percent_decode_query_component(key).to_ascii_lowercase();
+        let value = percent_decode_query_component(value);
+        match key.as_str() {
+            "enabledirectplay" => {
+                if let Some(value) = parse_query_bool(&value) {
+                    options.enable_direct_play = value;
+                }
+            }
+            "enabledirectstream" => {
+                if let Some(value) = parse_query_bool(&value) {
+                    options.enable_direct_stream = value;
+                }
+            }
+            "enabletranscoding" => {
+                if let Some(value) = parse_query_bool(&value) {
+                    options.enable_transcoding = value;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    options
+}
+
+fn playback_info_options_from_body(body: &serde_json::Value) -> PlaybackInfoOptions {
+    let mut options = PlaybackInfoOptions::default();
+    if let Some(value) = json_bool_field(body, "EnableDirectPlay") {
+        options.enable_direct_play = value;
+    }
+    if let Some(value) = json_bool_field(body, "EnableDirectStream") {
+        options.enable_direct_stream = value;
+    }
+    if let Some(value) = json_bool_field(body, "EnableTranscoding") {
+        options.enable_transcoding = value;
+    }
+    options
+}
+
+fn json_bool_field(value: &serde_json::Value, field: &str) -> Option<bool> {
+    value.as_object()?.iter().find_map(|(key, value)| {
+        if key.eq_ignore_ascii_case(field) {
+            value.as_bool()
+        } else {
+            None
+        }
+    })
+}
+
 async fn playback_info_response(
     db: &Database,
     item_id: &str,
+    options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let item = media_item_by_id(db, item_id).await?;
     let server_id = db.server_state().await?.server_id.to_string();
     let item_json = media_item_to_json(&item, &server_id);
+    let play_session_id = Uuid::new_v4().simple().to_string();
+    if !options.enable_direct_play && !options.enable_direct_stream {
+        return Ok(Json(serde_json::json!({
+            "MediaSources": [],
+            "PlaySessionId": play_session_id,
+            "ErrorCode": "NoCompatibleStream",
+        })));
+    }
+
+    let mut media_sources = item_json["MediaSources"].clone();
+    if let Some(media_source) = media_sources
+        .as_array_mut()
+        .and_then(|sources| sources.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        media_source.insert(
+            "SupportsDirectPlay".to_string(),
+            serde_json::json!(options.enable_direct_play),
+        );
+        media_source.insert(
+            "SupportsDirectStream".to_string(),
+            serde_json::json!(options.enable_direct_stream || options.enable_direct_play),
+        );
+        media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(false));
+    }
+
     Ok(Json(serde_json::json!({
-        "MediaSources": item_json["MediaSources"].clone(),
-        "PlaySessionId": Uuid::new_v4().simple().to_string(),
+        "MediaSources": media_sources,
+        "PlaySessionId": play_session_id,
         "ErrorCode": null,
     })))
 }
@@ -12384,6 +12494,66 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?enableDirectPlay=false&enableDirectStream=true&enableTranscoding=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let direct_stream_only_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(direct_stream_only_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            direct_stream_only_info["MediaSources"][0]["SupportsDirectPlay"],
+            false
+        );
+        assert_eq!(
+            direct_stream_only_info["MediaSources"][0]["SupportsDirectStream"],
+            true
+        );
+        assert_eq!(
+            direct_stream_only_info["MediaSources"][0]["SupportsTranscoding"],
+            false
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let transcode_only_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(transcode_only_info["ErrorCode"], "NoCompatibleStream");
+        assert_eq!(
+            transcode_only_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(
+            transcode_only_info["PlaySessionId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!("/Items/{item_id}/PlaybackInfo"))
                     .header("X-Emby-Token", &api_key)
@@ -12400,6 +12570,73 @@ mod tests {
             posted_playback_info["PlaySessionId"]
                 .as_str()
                 .is_some_and(|id| !id.is_empty())
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "EnableDirectPlay": false,
+                            "EnableDirectStream": false,
+                            "EnableTranscoding": true,
+                            "DeviceProfile": {}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let posted_transcode_only_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            posted_transcode_only_info["ErrorCode"],
+            "NoCompatibleStream"
+        );
+        assert_eq!(
+            posted_transcode_only_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectStream=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "EnableDirectPlay": false,
+                            "EnableDirectStream": false,
+                            "EnableTranscoding": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let query_overrides_body_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(query_overrides_body_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            query_overrides_body_info["MediaSources"][0]["SupportsDirectStream"],
+            true
         );
 
         let response = app
