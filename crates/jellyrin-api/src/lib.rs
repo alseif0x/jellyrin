@@ -1569,35 +1569,35 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Items/{item_id}/ThemeSongs",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_songs),
         )
         .route(
             "/items/{item_id}/themesongs",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_songs),
         )
         .route(
             "/Library/Items/{item_id}/ThemeSongs",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_songs),
         )
         .route(
             "/library/items/{item_id}/themesongs",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_songs),
         )
         .route(
             "/Items/{item_id}/ThemeVideos",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_videos),
         )
         .route(
             "/items/{item_id}/themevideos",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_videos),
         )
         .route(
             "/Library/Items/{item_id}/ThemeVideos",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_videos),
         )
         .route(
             "/library/items/{item_id}/themevideos",
-            get(authenticated_item_theme_items),
+            get(authenticated_item_theme_videos),
         )
         .route(
             "/UserLibrary/Items/{item_id}/Intros",
@@ -14765,27 +14765,109 @@ async fn stop_active_encoding(
 async fn authenticated_item_theme_media(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(auth_query): Query<AuthQuery>,
     Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    let source = media_item_by_id(&state.db, &item_id).await?;
+    let theme_videos = theme_items_result(&state.db, &source, requested_user_id, "Video").await?;
+    let theme_songs = theme_items_result(&state.db, &source, requested_user_id, "Audio").await?;
     Ok(Json(serde_json::json!({
-        "ThemeVideosResult": query_result(Vec::new()),
-        "ThemeSongsResult": query_result(Vec::new()),
+        "ThemeVideosResult": theme_videos,
+        "ThemeSongsResult": theme_songs,
         "SoundtrackSongsResult": query_result(Vec::new())
     })))
 }
 
-async fn authenticated_item_theme_items(
+async fn authenticated_item_theme_songs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(auth_query): Query<AuthQuery>,
     Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
-    Ok(empty_items_result().await)
+    authenticated_item_theme_items(state, headers, auth_query, item_id, raw_query, "Audio").await
+}
+
+async fn authenticated_item_theme_videos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authenticated_item_theme_items(state, headers, auth_query, item_id, raw_query, "Video").await
+}
+
+async fn authenticated_item_theme_items(
+    state: AppState,
+    headers: HeaderMap,
+    auth_query: AuthQuery,
+    item_id: String,
+    raw_query: Option<String>,
+    media_type: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    let source = media_item_by_id(&state.db, &item_id).await?;
+    Ok(Json(
+        theme_items_result(&state.db, &source, requested_user_id, media_type).await?,
+    ))
+}
+
+async fn theme_items_result(
+    db: &Database,
+    source: &MediaItem,
+    user_id: Uuid,
+    media_type: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let server_id = db.server_state().await?.server_id.to_string();
+    let mut theme_items = db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| is_theme_item_for_source(source, item, media_type))
+        .collect::<Vec<_>>();
+    theme_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+    let total_record_count = theme_items.len();
+    Ok(query_result_with_total(
+        items_to_json(db, theme_items, &server_id, Some(user_id)).await?,
+        total_record_count,
+        0,
+    ))
+}
+
+fn is_theme_item_for_source(source: &MediaItem, item: &MediaItem, media_type: &str) -> bool {
+    if item.id == source.id || item.media_type != media_type {
+        return false;
+    }
+    let source_parent = media_item_path(source).parent();
+    let item_parent = media_item_path(item).parent();
+    if source_parent != item_parent {
+        return false;
+    }
+    media_item_path(item)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("theme"))
 }
 
 async fn authenticated_similar_items(
@@ -23339,6 +23421,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn theme_media_returns_local_theme_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("Feature Movie.mp4"), b"fake video")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("theme.mp3"), b"fake song")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("theme.mp4"), b"fake theme video")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?SearchTerm=Feature")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items["TotalRecordCount"], 1);
+        let item_id = items["Items"][0]["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/ThemeMedia"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let theme_media: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(theme_media["ThemeSongsResult"]["TotalRecordCount"], 1);
+        assert_eq!(theme_media["ThemeSongsResult"]["Items"][0]["Name"], "theme");
+        assert_eq!(
+            theme_media["ThemeSongsResult"]["Items"][0]["MediaType"],
+            "Audio"
+        );
+        assert_eq!(theme_media["ThemeVideosResult"]["TotalRecordCount"], 1);
+        assert_eq!(
+            theme_media["ThemeVideosResult"]["Items"][0]["Name"],
+            "theme"
+        );
+        assert_eq!(
+            theme_media["ThemeVideosResult"]["Items"][0]["MediaType"],
+            "Video"
+        );
+
+        for (endpoint, media_type) in [
+            (format!("/Items/{item_id}/ThemeSongs"), "Audio"),
+            (format!("/Items/{item_id}/ThemeVideos"), "Video"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let theme_items: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(theme_items["TotalRecordCount"], 1);
+            assert_eq!(theme_items["Items"][0]["Name"], "theme");
+            assert_eq!(theme_items["Items"][0]["MediaType"], media_type);
+        }
     }
 
     #[tokio::test]
