@@ -29606,6 +29606,68 @@ mod tests {
         assert_eq!(song_mix["TotalRecordCount"], 2);
         assert_eq!(song_mix["Items"][0]["Id"], item_id);
 
+        for endpoint in [
+            format!("/InstantMix/Items/{item_id}/InstantMix?Limit=2"),
+            format!("/InstantMix/Songs/{item_id}/InstantMix?Limit=2"),
+            format!("/InstantMix/Albums/{item_id}/InstantMix?Limit=2"),
+            format!("/InstantMix/Artists/{item_id}/InstantMix?Limit=2"),
+            format!("/InstantMix/Playlists/{item_id}/InstantMix?Limit=2"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let route_mix: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(route_mix["TotalRecordCount"], 2);
+            assert_eq!(route_mix["Items"][0]["Id"], item_id);
+            assert_eq!(route_mix["Items"][0]["Type"], "Audio");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/InstantMix/Artists/InstantMix")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for endpoint in [
+            "/InstantMix/Artists/InstantMix",
+            "/InstantMix/MusicGenres/InstantMix",
+            "/InstantMix/MusicGenres/rock/InstantMix",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let empty_mix: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(empty_mix["TotalRecordCount"], 0);
+            assert_eq!(empty_mix["StartIndex"], 0);
+            assert_eq!(empty_mix["Items"], json!([]));
+        }
+
         let response = app
             .clone()
             .oneshot(
