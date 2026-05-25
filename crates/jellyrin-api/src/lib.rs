@@ -5481,6 +5481,18 @@ async fn playback_transcode_info_response(
             .or_else(|| default_audio_stream_index(&streams)),
         subtitle_stream_index: options.subtitle_stream_index,
     };
+    if let Some(session) =
+        reusable_hls_transcode_session(&state.db, user.id, item, &selection).await?
+    {
+        return playback_transcode_session_info_response(
+            item_json,
+            access_token,
+            &item_id,
+            &session.play_session_id,
+            &options,
+        );
+    }
+
     let request = HlsTranscodeRequest::new(
         item.path.clone(),
         layout.media_playlist_path.to_string_lossy().to_string(),
@@ -5508,6 +5520,22 @@ async fn playback_transcode_info_response(
         .await?;
     spawn_hls_transcode_task(state.db.clone(), play_session_id.clone(), command).await;
 
+    playback_transcode_session_info_response(
+        item_json,
+        access_token,
+        &item_id,
+        &play_session_id,
+        &options,
+    )
+}
+
+fn playback_transcode_session_info_response(
+    item_json: serde_json::Value,
+    access_token: &str,
+    item_id: &str,
+    play_session_id: &str,
+    options: &PlaybackInfoOptions,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let mut media_sources = item_json["MediaSources"].clone();
     if let Some(media_source) = media_sources
         .as_array_mut()
@@ -5525,10 +5553,10 @@ async fn playback_transcode_info_response(
         media_source.insert("Container".to_string(), serde_json::json!("ts"));
         media_source.insert(
             "TranscodingUrl".to_string(),
-            serde_json::json!(hls_master_url(&item_id, &play_session_id, access_token)),
+            serde_json::json!(hls_master_url(item_id, play_session_id, access_token)),
         );
         media_source.insert("DirectStreamUrl".to_string(), serde_json::Value::Null);
-        apply_playback_stream_selection(media_source, &options);
+        apply_playback_stream_selection(media_source, options);
     }
 
     Ok(Json(serde_json::json!({
@@ -5536,6 +5564,40 @@ async fn playback_transcode_info_response(
         "PlaySessionId": play_session_id,
         "ErrorCode": null,
     })))
+}
+
+async fn reusable_hls_transcode_session(
+    db: &Database,
+    user_id: Uuid,
+    item: &MediaItem,
+    selection: &TranscodeStreamSelection,
+) -> Result<Option<TranscodeSession>, ApiError> {
+    let sessions = db.transcode_sessions().await?;
+    let item_id = item.id.simple().to_string();
+    for session in sessions {
+        if session.user_id != user_id
+            || session.item.id != item.id
+            || session.media_source_id.as_deref() != Some(item_id.as_str())
+            || session.video_stream_index != selection.video_stream_index
+            || session.audio_stream_index != selection.audio_stream_index
+            || session.subtitle_stream_index != selection.subtitle_stream_index
+            || !matches!(
+                session.status.as_str(),
+                "starting" | "running" | "completed"
+            )
+        {
+            continue;
+        }
+        if session.status == "completed"
+            && !HlsTranscodeLayout::from_media_playlist_path(&session.output_path)
+                .media_playlist_path
+                .exists()
+        {
+            continue;
+        }
+        return Ok(Some(session));
+    }
+    Ok(None)
 }
 
 async fn spawn_hls_transcode_task(
@@ -15828,6 +15890,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn playback_info_reuses_matching_active_hls_transcode_session() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Retry Me.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let transcode_dir = transcode_root.path().join("play-session-reuse");
+        tokio::fs::create_dir_all(&transcode_dir).await.unwrap();
+        let main_playlist = transcode_dir.join("main.m3u8");
+        tokio::fs::write(&main_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "reuse-transcode-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        let item_id = item.id.simple().to_string();
+
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-reuse".to_string(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item_id.clone()),
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            video_stream_index: Some(0),
+            output_path: main_playlist.to_string_lossy().to_string(),
+            process_id: Some(111),
+            status: "running".to_string(),
+            progress_percent: Some(7.0),
+            position_ticks: 0,
+        })
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback_info["PlaySessionId"], "play-session-reuse");
+        assert_eq!(
+            playback_info["MediaSources"][0]["TranscodingUrl"],
+            format!(
+                "/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-reuse&api_key={api_key}"
+            )
+        );
+
+        let sessions = db.transcode_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].play_session_id, "play-session-reuse");
+        assert_eq!(sessions[0].process_id, Some(111));
     }
 
     #[tokio::test]
