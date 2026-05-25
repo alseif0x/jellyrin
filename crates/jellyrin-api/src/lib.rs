@@ -39,6 +39,7 @@ use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
     spawn_transcode_process, wait_for_hls_readiness,
 };
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -3234,29 +3235,158 @@ async fn authenticate_user_by_id(
 #[derive(Debug, Deserialize, Default)]
 struct ForgotPasswordBody {
     #[serde(alias = "EnteredUsername", alias = "Username", alias = "Name")]
-    _entered_username: Option<String>,
+    entered_username: Option<String>,
 }
 
 async fn forgot_password(
-    _body: Option<Json<ForgotPasswordBody>>,
+    State(state): State<AppState>,
+    body: Option<Json<ForgotPasswordBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let entered_username = body
+        .map(|body| body.entered_username.clone())
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let expire_time = OffsetDateTime::now_utc() + Duration::minutes(30);
+    let pin_file = password_reset_file_path(&entered_username);
+
+    if let Some(user) = state
+        .db
+        .users()
+        .await?
+        .into_iter()
+        .find(|user| user.name.eq_ignore_ascii_case(entered_username.trim()))
+    {
+        let pin = generate_password_reset_pin();
+        let reset = serde_json::json!({
+            "ExpirationDate": format_time_for_json(expire_time),
+            "Pin": pin,
+            "PinFile": pin_file.to_string_lossy(),
+            "UserName": user.name
+        });
+        tokio::fs::write(&pin_file, serde_json::to_vec(&reset)?).await?;
+    }
+
     Ok(Json(serde_json::json!({
-        "Action": "ContactAdmin",
-        "PinFile": null,
-        "PinExpirationDate": null
+        "Action": "PinCode",
+        "PinFile": pin_file.to_string_lossy(),
+        "PinExpirationDate": format_time_for_json(expire_time)
     })))
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct ForgotPasswordPinBody {
     #[serde(alias = "Pin")]
-    _pin: Option<String>,
+    pin: Option<String>,
 }
 
 async fn forgot_password_pin(
-    _body: Option<Json<ForgotPasswordPinBody>>,
+    State(state): State<AppState>,
+    body: Option<Json<ForgotPasswordPinBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(serde_json::json!({ "Success": false })))
+    let pin = body
+        .map(|body| body.pin.clone())
+        .unwrap_or_default()
+        .unwrap_or_default();
+    let normalized_pin = normalize_password_reset_pin(&pin);
+    if normalized_pin.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "Success": false,
+            "UsersReset": []
+        })));
+    }
+
+    let mut users_reset = Vec::new();
+    let mut entries = tokio::fs::read_dir(password_reset_dir()).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !is_password_reset_file(&path) {
+            continue;
+        }
+
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
+        };
+        let Ok(reset) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let expiration = reset
+            .get("ExpirationDate")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+
+        if expiration.is_some_and(|expiration| expiration < OffsetDateTime::now_utc()) {
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        }
+
+        let stored_pin = reset
+            .get("Pin")
+            .and_then(serde_json::Value::as_str)
+            .map(normalize_password_reset_pin)
+            .unwrap_or_default();
+        if stored_pin != normalized_pin {
+            continue;
+        }
+
+        let Some(username) = reset.get("UserName").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(user) = state
+            .db
+            .users()
+            .await?
+            .into_iter()
+            .find(|user| user.name.eq_ignore_ascii_case(username))
+        else {
+            continue;
+        };
+
+        state.db.set_user_password(user.id, &pin).await?;
+        users_reset.push(user.name);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "Success": !users_reset.is_empty(),
+        "UsersReset": users_reset
+    })))
+}
+
+fn password_reset_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn password_reset_file_path(username: &str) -> PathBuf {
+    let username = username.trim();
+    let suffix = if username.is_empty() {
+        Uuid::new_v4().simple().to_string()
+    } else {
+        stable_entity_id("passwordreset", username)
+    };
+    password_reset_dir().join(format!("passwordreset{suffix}.json"))
+}
+
+fn is_password_reset_file(path: &FsPath) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("passwordreset") && name.ends_with(".json"))
+}
+
+fn generate_password_reset_pin() -> String {
+    let mut bytes = [0_u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn normalize_password_reset_pin(pin: &str) -> String {
+    pin.chars()
+        .filter(|character| *character != '-')
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 async fn get_current_user(
@@ -29148,30 +29278,56 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        for body in [
-            json!({ "EnteredUsername": "admin" }),
-            json!({ "EnteredUsername": "does-not-exist" }),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri("/Users/ForgotPassword")
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            let forgot: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(forgot["Action"], "ContactAdmin");
-            assert_eq!(forgot["PinFile"], Value::Null);
-        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/ForgotPassword")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "EnteredUsername": "does-not-exist" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let missing_forgot: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(missing_forgot["Action"], "PinCode");
+        assert!(
+            !PathBuf::from(missing_forgot["PinFile"].as_str().unwrap()).exists(),
+            "unknown users should not create reset files"
+        );
 
         let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/users/forgotpassword")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "EnteredUsername": "admin" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let forgot: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(forgot["Action"], "PinCode");
+        assert!(forgot["PinExpirationDate"].as_str().unwrap().ends_with('Z'));
+        let pin_file = PathBuf::from(forgot["PinFile"].as_str().unwrap());
+        assert!(pin_file.exists());
+        let reset_file: Value = serde_json::from_slice(&fs::read(&pin_file).unwrap()).unwrap();
+        assert_eq!(reset_file["UserName"], "admin");
+        let pin = reset_file["Pin"].as_str().unwrap().to_string();
+
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -29184,8 +29340,50 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let pin: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(pin["Success"], false);
+        let invalid_pin_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(invalid_pin_result["Success"], false);
+        assert_eq!(
+            invalid_pin_result["UsersReset"].as_array().unwrap().len(),
+            0
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/users/forgotpassword/pin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Pin": pin }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let pin_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(pin_result["Success"], true);
+        assert_eq!(pin_result["UsersReset"], json!(["admin"]));
+        assert!(!pin_file.exists());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="forgot-password", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": pin }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
