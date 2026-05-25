@@ -5406,6 +5406,7 @@ struct PlaybackInfoOptions {
     media_source_id: Option<String>,
     audio_stream_index: Option<i64>,
     subtitle_stream_index: Option<i64>,
+    start_position_ticks: i64,
     direct_play_profiles: Option<Vec<DirectPlayProfileMatcher>>,
 }
 
@@ -5426,6 +5427,7 @@ impl Default for PlaybackInfoOptions {
             media_source_id: None,
             audio_stream_index: None,
             subtitle_stream_index: None,
+            start_position_ticks: 0,
             direct_play_profiles: None,
         }
     }
@@ -5477,6 +5479,11 @@ fn parse_playback_info_options(
                     options.subtitle_stream_index = Some(value);
                 }
             }
+            "starttimeticks" | "startpositionticks" => {
+                if let Ok(value) = value.parse::<i64>() {
+                    options.start_position_ticks = value.max(0);
+                }
+            }
             _ => {}
         }
     }
@@ -5498,6 +5505,10 @@ fn playback_info_options_from_body(body: &serde_json::Value) -> PlaybackInfoOpti
     options.media_source_id = json_string_field(body, "MediaSourceId");
     options.audio_stream_index = json_i64_field(body, "AudioStreamIndex");
     options.subtitle_stream_index = json_i64_field(body, "SubtitleStreamIndex");
+    options.start_position_ticks = json_i64_field(body, "StartTimeTicks")
+        .or_else(|| json_i64_field(body, "StartPositionTicks"))
+        .unwrap_or_default()
+        .max(0);
     options.direct_play_profiles = parse_direct_play_profiles(body);
     options
 }
@@ -5650,13 +5661,12 @@ async fn playback_transcode_info_response(
             .or_else(|| default_audio_stream_index(&streams)),
         subtitle_stream_index: options.subtitle_stream_index,
     };
-    let dedupe_key = hls_transcode_dedupe_key(user.id, item, &selection);
+    let dedupe_key =
+        hls_transcode_dedupe_key(user.id, item, &selection, options.start_position_ticks);
     let dedupe_lock = transcode_dedupe_lock(&dedupe_key).await;
     let _dedupe_guard = dedupe_lock.lock().await;
 
-    if let Some(session) =
-        reusable_hls_transcode_session(&state.db, user.id, item, &selection).await?
-    {
+    if let Some(session) = reusable_hls_transcode_session(&state.db, &dedupe_key).await? {
         return playback_transcode_session_info_response(
             item_json,
             &token.access_token,
@@ -5668,12 +5678,13 @@ async fn playback_transcode_info_response(
 
     let layout = HlsTranscodeLayout::new(transcode_temp_root(), &play_session_id);
     tokio::fs::create_dir_all(&layout.session_dir).await?;
-    let request = HlsTranscodeRequest::new(
+    let mut request = HlsTranscodeRequest::new(
         item.path.clone(),
         layout.media_playlist_path.to_string_lossy().to_string(),
         layout.segment_pattern_string(),
         selection.clone(),
     );
+    request.start_position_ticks = options.start_position_ticks;
     let command = build_hls_ffmpeg_command(&request);
 
     let (session, claimed_new_session) = state
@@ -5755,9 +5766,10 @@ fn hls_transcode_dedupe_key(
     user_id: Uuid,
     item: &MediaItem,
     selection: &TranscodeStreamSelection,
+    start_position_ticks: i64,
 ) -> String {
     format!(
-        "hls:ts:{}:{}:{}:{}:{}:{}",
+        "hls:ts:{}:{}:{}:{}:{}:{}:{}",
         user_id.simple(),
         item.id.simple(),
         item.id.simple(),
@@ -5769,7 +5781,8 @@ fn hls_transcode_dedupe_key(
             .map_or_else(|| "-".to_string(), |index| index.to_string()),
         selection
             .subtitle_stream_index
-            .map_or_else(|| "-".to_string(), |index| index.to_string())
+            .map_or_else(|| "-".to_string(), |index| index.to_string()),
+        start_position_ticks.max(0)
     )
 }
 
@@ -5787,19 +5800,11 @@ fn transcode_dedupe_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>
 
 async fn reusable_hls_transcode_session(
     db: &Database,
-    user_id: Uuid,
-    item: &MediaItem,
-    selection: &TranscodeStreamSelection,
+    dedupe_key: &str,
 ) -> Result<Option<TranscodeSession>, ApiError> {
     let sessions = db.transcode_sessions().await?;
-    let item_id = item.id.simple().to_string();
     for session in sessions {
-        if session.user_id != user_id
-            || session.item.id != item.id
-            || session.media_source_id.as_deref() != Some(item_id.as_str())
-            || session.video_stream_index != selection.video_stream_index
-            || session.audio_stream_index != selection.audio_stream_index
-            || session.subtitle_stream_index != selection.subtitle_stream_index
+        if session.dedupe_key.as_deref() != Some(dedupe_key)
             || !matches!(
                 session.status.as_str(),
                 "starting" | "running" | "completed"
@@ -8674,10 +8679,10 @@ mod tests {
             audio_stream_index: Some(1),
             subtitle_stream_index: Some(-1),
         };
-        let key = hls_transcode_dedupe_key(user_id, &item, &selection);
+        let key = hls_transcode_dedupe_key(user_id, &item, &selection, 12_345_000_000);
         assert_eq!(
             key,
-            "hls:ts:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0:1:-1"
+            "hls:ts:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0:1:-1:12345000000"
         );
 
         let changed_selection = TranscodeStreamSelection {
@@ -8686,7 +8691,11 @@ mod tests {
         };
         assert_ne!(
             key,
-            hls_transcode_dedupe_key(user_id, &item, &changed_selection)
+            hls_transcode_dedupe_key(user_id, &item, &changed_selection, 12_345_000_000)
+        );
+        assert_ne!(
+            key,
+            hls_transcode_dedupe_key(user_id, &item, &selection, 12_346_000_000)
         );
     }
 
@@ -14382,6 +14391,33 @@ mod tests {
                 .output_path
                 .ends_with(&format!("{transcode_play_session_id}/main.m3u8"))
         );
+        assert_eq!(transcode_session.position_ticks, 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&StartTimeTicks=12345000000"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let seek_transcode_info: Value = serde_json::from_slice(&body).unwrap();
+        let seek_play_session_id =
+            assert_hls_transcode_playback_info(&seek_transcode_info, item_id, &api_key);
+        assert_ne!(seek_play_session_id, transcode_play_session_id);
+        let seek_transcode_session = test_db
+            .transcode_session_by_play_session_id(&seek_play_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seek_transcode_session.position_ticks, 12_345_000_000);
 
         let response = app
             .clone()
@@ -16662,17 +16698,23 @@ mod tests {
         db.scan_virtual_folder_items(folder.id).await.unwrap();
         let item = db.media_items().await.unwrap().remove(0);
         let item_id = item.id.simple().to_string();
+        let selection = TranscodeStreamSelection {
+            video_stream_index: Some(0),
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+        };
+        let dedupe_key = hls_transcode_dedupe_key(user.id, &item, &selection, 0);
 
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-reuse".to_string(),
-            dedupe_key: None,
+            dedupe_key: Some(dedupe_key),
             device_id: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
-            audio_stream_index: None,
-            subtitle_stream_index: None,
-            video_stream_index: Some(0),
+            audio_stream_index: selection.audio_stream_index,
+            subtitle_stream_index: selection.subtitle_stream_index,
+            video_stream_index: selection.video_stream_index,
             output_path: main_playlist.to_string_lossy().to_string(),
             process_id: Some(111),
             status: "running".to_string(),
