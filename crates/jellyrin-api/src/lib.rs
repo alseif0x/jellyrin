@@ -642,6 +642,22 @@ pub fn router(state: AppState) -> Router {
             "/hlssegment/videos/{item_id}/hls/{playlist_id}/{segment_file}",
             get(hls_segment),
         )
+        .route(
+            "/Trickplay/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
+            get(trickplay_playlist),
+        )
+        .route(
+            "/trickplay/videos/{item_id}/trickplay/{width}/tiles.m3u8",
+            get(trickplay_playlist),
+        )
+        .route(
+            "/Trickplay/Videos/{item_id}/Trickplay/{width}/{tile_file}",
+            get(trickplay_tile),
+        )
+        .route(
+            "/trickplay/videos/{item_id}/trickplay/{width}/{tile_file}",
+            get(trickplay_tile),
+        )
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
         .route("/Items/Counts", get(item_counts))
@@ -7012,6 +7028,77 @@ async fn hls_segment_response(
     .await
 }
 
+async fn trickplay_playlist(
+    State(state): State<AppState>,
+    Path((item_id, width)): Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<AuthQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let item = trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
+    let width = parse_positive_u32(&width, "Invalid trickplay width")?;
+    let duration_seconds = item
+        .runtime_ticks
+        .and_then(|ticks| u64::try_from(ticks).ok())
+        .map(|ticks| (ticks as f64 / 10_000_000.0).max(1.0))
+        .unwrap_or(10.0);
+    let target_duration = duration_seconds.ceil().max(1.0) as u64;
+    let playlist = format!(
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-IMAGES-ONLY\n#EXT-X-TILES:RESOLUTION={width}x{width},LAYOUT=\"1x1\",DURATION={duration_seconds:.3}\n#EXTINF:{duration_seconds:.3},\n{}\n#EXT-X-ENDLIST\n",
+        append_query("0.jpg", raw_query.as_deref())
+    );
+    playlist_response(playlist, true)
+}
+
+async fn trickplay_tile(
+    State(state): State<AppState>,
+    Path((item_id, width, tile_file)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
+    parse_positive_u32(&width, "Invalid trickplay width")?;
+    let index = tile_file
+        .strip_suffix(".jpg")
+        .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
+    parse_non_negative_i64(index, "Invalid trickplay index")?;
+    Ok(placeholder_jpeg_response())
+}
+
+async fn trickplay_video_item(
+    state: &AppState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+    item_id: &str,
+) -> Result<MediaItem, ApiError> {
+    require_request_user(&state.db, headers, query_token).await?;
+    let item = media_item_by_id(&state.db, item_id).await?;
+    if item.media_type != "Video" {
+        return Err(ApiError::not_found("Video item not found"));
+    }
+    Ok(item)
+}
+
+fn parse_positive_u32(value: &str, message: &'static str) -> Result<u32, ApiError> {
+    let value = value
+        .parse::<u32>()
+        .map_err(|_| ApiError::bad_request(message))?;
+    if value == 0 {
+        return Err(ApiError::bad_request(message));
+    }
+    Ok(value)
+}
+
+fn parse_non_negative_i64(value: &str, message: &'static str) -> Result<i64, ApiError> {
+    let value = value
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request(message))?;
+    if value < 0 {
+        return Err(ApiError::bad_request(message));
+    }
+    Ok(value)
+}
+
 async fn active_hls_transcode_session(
     state: &AppState,
     headers: &HeaderMap,
@@ -8457,6 +8544,19 @@ fn placeholder_png_response() -> axum::response::Response {
         TRANSPARENT_PNG.to_vec(),
     )
         .into_response()
+}
+
+fn placeholder_jpeg_response() -> axum::response::Response {
+    const WHITE_JPEG: &[u8] = &[
+        255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 1, 1, 1, 0, 72, 0, 72, 0, 0, 255, 219, 0, 67,
+        0, 3, 2, 2, 3, 2, 2, 3, 3, 3, 3, 4, 3, 3, 4, 5, 8, 5, 5, 4, 4, 5, 10, 7, 7, 6, 8, 12, 10,
+        12, 12, 11, 10, 11, 11, 13, 14, 18, 16, 13, 14, 17, 14, 11, 11, 16, 22, 16, 17, 19, 20, 21,
+        21, 21, 12, 15, 23, 24, 22, 20, 24, 18, 20, 21, 20, 255, 192, 0, 11, 8, 0, 1, 0, 1, 1, 1,
+        17, 0, 255, 196, 0, 20, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 255,
+        196, 0, 20, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 218, 0, 8, 1,
+        1, 0, 0, 63, 0, 42, 255, 217,
+    ];
+    ([(header::CONTENT_TYPE, "image/jpeg")], WHITE_JPEG.to_vec()).into_response()
 }
 
 async fn media_item_or_folder_by_id(db: &Database, item_id: &str) -> Result<(), ApiError> {
@@ -14398,6 +14498,77 @@ mod tests {
         assert_eq!(detail["People"].as_array().unwrap().len(), 0);
         assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
         assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Trickplay/Videos/{item_id}/Trickplay/320/tiles.m3u8"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Trickplay/Videos/{item_id}/Trickplay/320/tiles.m3u8?api_key={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apple.mpegurl"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let trickplay_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(trickplay_playlist.contains("#EXT-X-IMAGES-ONLY"));
+        assert!(trickplay_playlist.contains("#EXT-X-TILES:RESOLUTION=320x320"));
+        assert!(trickplay_playlist.contains(&format!("0.jpg?api_key={api_key}")));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/trickplay/videos/{item_id}/trickplay/320/0.jpg"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Trickplay/Videos/{item_id}/Trickplay/0/tiles.m3u8"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
