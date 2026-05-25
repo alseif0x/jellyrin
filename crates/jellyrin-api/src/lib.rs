@@ -26,7 +26,8 @@ use jellyrin_core::{DeviceToken, MediaItem, PlaybackState, StartupConfig, User, 
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
     BackupManifest, BrandingConfig, Database, DeviceSession, SortDirection,
-    SystemConfigurationPayloads, TaskRun, UpsertActivePlaybackSession, UpsertPlaybackState,
+    SystemConfigurationPayloads, TaskRun, TranscodeSession, UpsertActivePlaybackSession,
+    UpsertPlaybackState,
 };
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -481,14 +482,8 @@ pub fn router(state: AppState) -> Router {
         .route("/system/endpoint", get(system_endpoint))
         .route("/Playback/BitrateTest", get(bitrate_test))
         .route("/playback/bitratetest", get(bitrate_test))
-        .route(
-            "/Videos/ActiveEncodings",
-            get(authenticated_empty_json_array),
-        )
-        .route(
-            "/videos/activeencodings",
-            get(authenticated_empty_json_array),
-        )
+        .route("/Videos/ActiveEncodings", get(active_encodings))
+        .route("/videos/activeencodings", get(active_encodings))
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
         .route("/Items/Counts", get(item_counts))
@@ -5889,6 +5884,16 @@ async fn authenticated_empty_json_array(
     Ok(empty_json_array().await)
 }
 
+async fn active_encodings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let sessions = state.db.active_transcode_sessions().await?;
+    Ok(Json(sessions.iter().map(transcode_session_json).collect()))
+}
+
 async fn authenticated_item_empty_json_array(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6323,6 +6328,38 @@ fn user_view_to_json(folder: &VirtualFolder, server_id: &str) -> serde_json::Val
 
 fn media_item_to_json(item: &MediaItem, server_id: &str) -> serde_json::Value {
     media_item_to_json_with_playback(item, server_id, None)
+}
+
+fn transcode_session_json(session: &TranscodeSession) -> serde_json::Value {
+    let item_id = session.item.id.simple().to_string();
+    serde_json::json!({
+        "PlaySessionId": session.play_session_id,
+        "UserId": session.user_id.simple().to_string(),
+        "ItemId": item_id,
+        "MediaSourceId": session.media_source_id.clone().unwrap_or(item_id),
+        "DeviceId": null,
+        "Path": session.output_path,
+        "OutputPath": session.output_path,
+        "Status": session.status,
+        "ProcessId": session.process_id,
+        "ProgressPercentage": session.progress_percent,
+        "CompletionPercentage": session.progress_percent,
+        "TranscodingPositionTicks": session.position_ticks,
+        "TranscodingStartPositionTicks": 0,
+        "Container": media_item_container(&session.item),
+        "VideoCodec": media_item_stream_codec(&session.item, "Video"),
+        "AudioCodec": media_item_stream_codec(&session.item, "Audio"),
+        "Width": session.item.width,
+        "Height": session.item.height,
+        "Bitrate": session.item.bitrate,
+        "VideoStreamIndex": session.video_stream_index,
+        "AudioStreamIndex": session.audio_stream_index,
+        "SubtitleStreamIndex": session.subtitle_stream_index,
+        "TranscodeReasons": [],
+        "IsAudioDirect": false,
+        "IsVideoDirect": false,
+        "UpdatedAt": session.updated_at.to_string(),
+    })
 }
 
 fn media_item_to_json_with_playback(
@@ -7493,7 +7530,7 @@ mod tests {
         http::{Method, Request, StatusCode, header},
     };
     use http_body_util::BodyExt;
-    use jellyrin_db::Database;
+    use jellyrin_db::{Database, UpsertTranscodeSession};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -14766,6 +14803,12 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+        let active_encodings_tmp = tempfile::tempdir().unwrap();
+        let active_encodings_media = active_encodings_tmp.path().join("Transcode Me.mkv");
+        tokio::fs::write(&active_encodings_media, b"fake video")
+            .await
+            .unwrap();
+
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("admin".to_string(), "secret")
@@ -14775,8 +14818,20 @@ mod tests {
             .issue_api_key_for_user(user.id, "active-encoding-test-key")
             .await
             .unwrap();
+        let active_encodings_folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![active_encodings_tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(active_encodings_folder.id)
+            .await
+            .unwrap();
+        let active_encoding_item = db.media_items().await.unwrap().remove(0);
         let active_encodings_app = router(AppState {
-            db,
+            db: db.clone(),
             web_dir: ".".into(),
             log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
@@ -14795,6 +14850,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = active_encodings_app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/videos/activeencodings")
@@ -14808,6 +14864,50 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let active_encodings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(active_encodings, json!([]));
+
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-active".to_string(),
+            user_id: user.id,
+            item_id: active_encoding_item.id,
+            media_source_id: Some(active_encoding_item.id.simple().to_string()),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(-1),
+            video_stream_index: Some(0),
+            output_path: "/tmp/jellyrin-transcodes/play-session-active/main.m3u8".to_string(),
+            process_id: Some(321),
+            status: "starting".to_string(),
+            progress_percent: Some(3.5),
+            position_ticks: 99,
+        })
+        .await
+        .unwrap();
+
+        let response = active_encodings_app
+            .oneshot(
+                Request::builder()
+                    .uri("/Videos/ActiveEncodings")
+                    .header("X-Emby-Token", &active_encodings_api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let active_encodings: Value = serde_json::from_slice(&body).unwrap();
+        let active_encodings = active_encodings.as_array().unwrap();
+        assert_eq!(active_encodings.len(), 1);
+        assert_eq!(active_encodings[0]["PlaySessionId"], "play-session-active");
+        assert_eq!(
+            active_encodings[0]["ItemId"],
+            active_encoding_item.id.simple().to_string()
+        );
+        assert_eq!(active_encodings[0]["Status"], "starting");
+        assert_eq!(active_encodings[0]["ProcessId"], 321);
+        assert_eq!(active_encodings[0]["VideoStreamIndex"], 0);
+        assert_eq!(active_encodings[0]["AudioStreamIndex"], 1);
+        assert_eq!(active_encodings[0]["SubtitleStreamIndex"], -1);
+        assert_eq!(active_encodings[0]["ProgressPercentage"], 3.5);
     }
 
     #[tokio::test]

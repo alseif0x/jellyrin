@@ -115,6 +115,40 @@ pub struct UpsertPlaybackState {
 }
 
 #[derive(Debug, Clone)]
+pub struct TranscodeSession {
+    pub play_session_id: String,
+    pub user_id: Uuid,
+    pub item: MediaItem,
+    pub media_source_id: Option<String>,
+    pub audio_stream_index: Option<i64>,
+    pub subtitle_stream_index: Option<i64>,
+    pub video_stream_index: Option<i64>,
+    pub output_path: String,
+    pub process_id: Option<i64>,
+    pub status: String,
+    pub progress_percent: Option<f64>,
+    pub position_ticks: i64,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertTranscodeSession {
+    pub play_session_id: String,
+    pub user_id: Uuid,
+    pub item_id: Uuid,
+    pub media_source_id: Option<String>,
+    pub audio_stream_index: Option<i64>,
+    pub subtitle_stream_index: Option<i64>,
+    pub video_stream_index: Option<i64>,
+    pub output_path: String,
+    pub process_id: Option<i64>,
+    pub status: String,
+    pub progress_percent: Option<f64>,
+    pub position_ticks: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct ActivityLogEntry {
     pub id: i64,
     pub name: String,
@@ -1299,6 +1333,201 @@ impl Database {
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_transcode_session(
+        &self,
+        session: UpsertTranscodeSession,
+    ) -> anyhow::Result<TranscodeSession> {
+        let play_session_id = session.play_session_id.trim().to_string();
+        let output_path = session.output_path.trim().to_string();
+        let status = session.status.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            !play_session_id.is_empty(),
+            "play session id must not be empty"
+        );
+        anyhow::ensure!(
+            !output_path.is_empty(),
+            "transcode output path must not be empty"
+        );
+        anyhow::ensure!(!status.is_empty(), "transcode status must not be empty");
+
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO transcode_sessions (
+                play_session_id, user_id, item_id, media_source_id, audio_stream_index,
+                subtitle_stream_index, video_stream_index, output_path, process_id, status,
+                progress_percent, position_ticks, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+            ON CONFLICT(play_session_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                item_id = excluded.item_id,
+                media_source_id = excluded.media_source_id,
+                audio_stream_index = excluded.audio_stream_index,
+                subtitle_stream_index = excluded.subtitle_stream_index,
+                video_stream_index = excluded.video_stream_index,
+                output_path = excluded.output_path,
+                process_id = excluded.process_id,
+                status = excluded.status,
+                progress_percent = excluded.progress_percent,
+                position_ticks = excluded.position_ticks,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&play_session_id)
+        .bind(session.user_id.to_string())
+        .bind(session.item_id.to_string())
+        .bind(session.media_source_id)
+        .bind(session.audio_stream_index)
+        .bind(session.subtitle_stream_index)
+        .bind(session.video_stream_index)
+        .bind(&output_path)
+        .bind(session.process_id)
+        .bind(&status)
+        .bind(session.progress_percent)
+        .bind(session.position_ticks.max(0))
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.transcode_session_by_play_session_id(&play_session_id)
+            .await?
+            .context("transcode session missing after upsert")
+    }
+
+    pub async fn transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
+        self.transcode_sessions_with_statuses(&[]).await
+    }
+
+    pub async fn active_transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
+        self.transcode_sessions_with_statuses(&["starting", "running"])
+            .await
+    }
+
+    async fn transcode_sessions_with_statuses(
+        &self,
+        statuses: &[&str],
+    ) -> anyhow::Result<Vec<TranscodeSession>> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT transcode_sessions.play_session_id,
+                   transcode_sessions.user_id,
+                   transcode_sessions.media_source_id,
+                   transcode_sessions.audio_stream_index,
+                   transcode_sessions.subtitle_stream_index,
+                   transcode_sessions.video_stream_index,
+                   transcode_sessions.output_path,
+                   transcode_sessions.process_id,
+                   transcode_sessions.status,
+                   transcode_sessions.progress_percent,
+                   transcode_sessions.position_ticks,
+                   transcode_sessions.created_at AS transcode_created_at,
+                   transcode_sessions.updated_at AS transcode_updated_at,
+                   media_items.id,
+                   media_items.virtual_folder_id,
+                   media_items.name,
+                   media_items.path,
+                   media_items.media_type,
+                   media_items.collection_type,
+                   media_items.file_size,
+                   media_items.runtime_ticks,
+                   media_items.bitrate,
+                   media_items.width,
+                   media_items.height,
+                   media_items.media_streams_json,
+                   media_items.created_at,
+                   media_items.updated_at
+            FROM transcode_sessions
+            INNER JOIN media_items ON media_items.id = transcode_sessions.item_id
+            WHERE media_items.missing_since IS NULL
+            "#,
+        );
+        if !statuses.is_empty() {
+            builder.push(" AND transcode_sessions.status IN (");
+            let mut separated = builder.separated(", ");
+            for status in statuses {
+                separated.push_bind(status);
+            }
+            separated.push_unseparated(")");
+        }
+        builder.push(" ORDER BY transcode_sessions.updated_at DESC");
+
+        let rows = builder
+            .build_query_as::<TranscodeSessionRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn transcode_session_by_play_session_id(
+        &self,
+        play_session_id: &str,
+    ) -> anyhow::Result<Option<TranscodeSession>> {
+        let row = sqlx::query_as::<_, TranscodeSessionRow>(
+            r#"
+            SELECT transcode_sessions.play_session_id,
+                   transcode_sessions.user_id,
+                   transcode_sessions.media_source_id,
+                   transcode_sessions.audio_stream_index,
+                   transcode_sessions.subtitle_stream_index,
+                   transcode_sessions.video_stream_index,
+                   transcode_sessions.output_path,
+                   transcode_sessions.process_id,
+                   transcode_sessions.status,
+                   transcode_sessions.progress_percent,
+                   transcode_sessions.position_ticks,
+                   transcode_sessions.created_at AS transcode_created_at,
+                   transcode_sessions.updated_at AS transcode_updated_at,
+                   media_items.id,
+                   media_items.virtual_folder_id,
+                   media_items.name,
+                   media_items.path,
+                   media_items.media_type,
+                   media_items.collection_type,
+                   media_items.file_size,
+                   media_items.runtime_ticks,
+                   media_items.bitrate,
+                   media_items.width,
+                   media_items.height,
+                   media_items.media_streams_json,
+                   media_items.created_at,
+                   media_items.updated_at
+            FROM transcode_sessions
+            INNER JOIN media_items ON media_items.id = transcode_sessions.item_id
+            WHERE transcode_sessions.play_session_id = ?1
+              AND media_items.missing_since IS NULL
+            "#,
+        )
+        .bind(play_session_id.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn update_transcode_session_status(
+        &self,
+        play_session_id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let status = status.trim().to_ascii_lowercase();
+        anyhow::ensure!(!status.is_empty(), "transcode status must not be empty");
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            UPDATE transcode_sessions
+            SET status = ?1, updated_at = ?2
+            WHERE play_session_id = ?3
+            "#,
+        )
+        .bind(status)
+        .bind(now)
+        .bind(play_session_id.trim())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn start_task_run(&self, task_key: &str) -> anyhow::Result<TaskRun> {
@@ -2718,6 +2947,37 @@ struct ActivePlaybackSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct TranscodeSessionRow {
+    play_session_id: String,
+    user_id: String,
+    media_source_id: Option<String>,
+    audio_stream_index: Option<i64>,
+    subtitle_stream_index: Option<i64>,
+    video_stream_index: Option<i64>,
+    output_path: String,
+    process_id: Option<i64>,
+    status: String,
+    progress_percent: Option<f64>,
+    position_ticks: i64,
+    transcode_created_at: String,
+    transcode_updated_at: String,
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    media_streams_json: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct ActivityLogEntryRow {
     id: i64,
     name: String,
@@ -2869,6 +3129,45 @@ impl TryFrom<ActivePlaybackSessionRow> for ActivePlaybackSession {
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             updated_at: parse_time(&row.playback_updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<TranscodeSessionRow> for TranscodeSession {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TranscodeSessionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            play_session_id: row.play_session_id,
+            user_id: Uuid::parse_str(&row.user_id).context("invalid transcode session user id")?,
+            item: MediaItem {
+                id: Uuid::parse_str(&row.id).context("invalid transcode session item id")?,
+                virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                    .context("invalid transcode session virtual folder id")?,
+                name: row.name,
+                path: row.path,
+                media_type: row.media_type,
+                collection_type: row.collection_type,
+                file_size: row.file_size,
+                runtime_ticks: row.runtime_ticks,
+                bitrate: row.bitrate,
+                width: row.width,
+                height: row.height,
+                media_streams: parse_media_streams_json(&row.media_streams_json)?,
+                created_at: parse_time(&row.created_at)?,
+                updated_at: parse_time(&row.updated_at)?,
+            },
+            media_source_id: row.media_source_id,
+            audio_stream_index: row.audio_stream_index,
+            subtitle_stream_index: row.subtitle_stream_index,
+            video_stream_index: row.video_stream_index,
+            output_path: row.output_path,
+            process_id: row.process_id,
+            status: row.status,
+            progress_percent: row.progress_percent,
+            position_ticks: row.position_ticks,
+            created_at: parse_time(&row.transcode_created_at)?,
+            updated_at: parse_time(&row.transcode_updated_at)?,
         })
     }
 }
@@ -3300,7 +3599,7 @@ mod tests {
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
         SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertPlaybackState,
-        parse_ffprobe_media_info,
+        UpsertTranscodeSession, parse_ffprobe_media_info,
     };
     use serde_json::json;
     use time::Duration;
@@ -3726,6 +4025,82 @@ mod tests {
             .await
             .unwrap();
         assert!(db.active_playback_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcode_sessions_track_active_status_and_media_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Transcoded Movie.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+
+        let session = db
+            .upsert_transcode_session(UpsertTranscodeSession {
+                play_session_id: "play-session-1".to_string(),
+                user_id: user.id,
+                item_id: item.id,
+                media_source_id: Some(item.id.simple().to_string()),
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(-1),
+                video_stream_index: Some(0),
+                output_path: "/tmp/jellyrin-transcodes/play-session-1/main.m3u8".to_string(),
+                process_id: Some(123),
+                status: "RUNNING".to_string(),
+                progress_percent: Some(12.5),
+                position_ticks: 456,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(session.play_session_id, "play-session-1");
+        assert_eq!(session.user_id, user.id);
+        assert_eq!(session.item.id, item.id);
+        assert_eq!(session.status, "running");
+        assert_eq!(session.process_id, Some(123));
+        assert_eq!(session.audio_stream_index, Some(1));
+        assert_eq!(session.subtitle_stream_index, Some(-1));
+        assert_eq!(session.video_stream_index, Some(0));
+        assert_eq!(session.progress_percent, Some(12.5));
+        assert_eq!(session.position_ticks, 456);
+
+        let fetched = db
+            .transcode_session_by_play_session_id("play-session-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.output_path, session.output_path);
+
+        let sessions = db.transcode_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        let active_sessions = db.active_transcode_sessions().await.unwrap();
+        assert_eq!(active_sessions.len(), 1);
+        assert_eq!(active_sessions[0].play_session_id, "play-session-1");
+
+        db.update_transcode_session_status("play-session-1", "Stopped")
+            .await
+            .unwrap();
+        assert!(db.active_transcode_sessions().await.unwrap().is_empty());
+        let stopped = db
+            .transcode_session_by_play_session_id("play-session-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, "stopped");
     }
 
     #[tokio::test]
