@@ -6041,10 +6041,23 @@ async fn playback_info_response(
     item_id: &str,
     options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let item = media_item_by_id(&state.db, item_id).await?;
+    let requested_item = media_item_by_id(&state.db, item_id).await?;
+    let play_session_id = Uuid::new_v4().simple().to_string();
+    let Some(item) = resolve_media_source_item(
+        &state.db,
+        requested_item,
+        options.media_source_id.as_deref(),
+    )
+    .await?
+    else {
+        return Ok(Json(serde_json::json!({
+            "MediaSources": [],
+            "PlaySessionId": play_session_id,
+            "ErrorCode": "NoCompatibleStream",
+        })));
+    };
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_json = media_item_to_json(&item, &server_id);
-    let play_session_id = Uuid::new_v4().simple().to_string();
     let direct_play_supported = playback_direct_play_supported(&item, &options);
     let direct_stream_supported = options.enable_direct_stream || direct_play_supported;
     if !playback_selection_supported(&item, &options) {
@@ -6434,6 +6447,34 @@ fn transcode_stop_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<(
     TRANSCODE_STOPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+async fn resolve_media_source_item(
+    db: &Database,
+    requested_item: MediaItem,
+    media_source_id: Option<&str>,
+) -> Result<Option<MediaItem>, ApiError> {
+    let Some(media_source_id) = media_source_id
+        .map(str::trim)
+        .filter(|media_source_id| !media_source_id.is_empty())
+    else {
+        return Ok(Some(requested_item));
+    };
+    let Ok(media_source_id) = parse_jellyfin_uuid(media_source_id) else {
+        return Ok(None);
+    };
+    if media_source_id == requested_item.id {
+        return Ok(Some(requested_item));
+    }
+    if requested_item.media_type != "Video" {
+        return Ok(None);
+    }
+
+    Ok(db
+        .media_item_versions(requested_item.id)
+        .await?
+        .into_iter()
+        .find(|item| item.id == media_source_id && item.media_type == requested_item.media_type))
+}
+
 fn playback_selection_supported(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
     if let Some(media_source_id) = options.media_source_id.as_deref()
         && parse_jellyfin_uuid(media_source_id).ok() != Some(item.id)
@@ -6587,6 +6628,7 @@ async fn direct_stream_item(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Video",
         true,
     )
@@ -6604,6 +6646,7 @@ async fn direct_stream_item_head(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Video",
         false,
     )
@@ -6755,6 +6798,7 @@ async fn direct_stream_item_by_container(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Video",
         true,
     )
@@ -6772,6 +6816,7 @@ async fn direct_stream_item_by_container_head(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Video",
         false,
     )
@@ -6962,6 +7007,7 @@ async fn direct_stream_audio(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Audio",
         true,
     )
@@ -6979,6 +7025,7 @@ async fn direct_stream_audio_head(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Audio",
         false,
     )
@@ -6996,6 +7043,7 @@ async fn universal_audio(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Audio",
         true,
     )
@@ -7013,6 +7061,7 @@ async fn universal_audio_head(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Audio",
         false,
     )
@@ -7030,6 +7079,7 @@ async fn direct_stream_audio_by_container(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Audio",
         true,
     )
@@ -7047,6 +7097,7 @@ async fn direct_stream_audio_by_container_head(
         &headers,
         query.api_key.as_deref(),
         &item_id,
+        query.media_source_id.as_deref(),
         "Audio",
         false,
     )
@@ -7928,11 +7979,15 @@ async fn direct_stream_media(
     headers: &HeaderMap,
     api_key: Option<&str>,
     item_id: &str,
+    media_source_id: Option<&str>,
     media_type: &str,
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, headers, api_key).await?;
-    let item = media_item_by_id(&state.db, item_id).await?;
+    let requested_item = media_item_by_id(&state.db, item_id).await?;
+    let item = resolve_media_source_item(&state.db, requested_item, media_source_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("{media_type} stream not found")))?;
     if item.media_type != media_type {
         return Err(ApiError::not_found(format!(
             "{media_type} stream not found"
@@ -9514,7 +9569,7 @@ struct StreamQuery {
     #[serde(alias = "Static", alias = "static", alias = "static_")]
     _static_file: Option<bool>,
     #[serde(alias = "MediaSourceId")]
-    _media_source_id: Option<String>,
+    media_source_id: Option<String>,
     #[serde(alias = "DeviceId")]
     _device_id: Option<String>,
     #[serde(alias = "PlaySessionId")]
@@ -16889,6 +16944,53 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?MediaSourceId={second_item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let alternate_playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(alternate_playback_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            alternate_playback_info["MediaSources"][0]["Id"],
+            second_item_id
+        );
+        assert_eq!(
+            alternate_playback_info["MediaSources"][0]["DirectStreamUrl"],
+            format!("/Videos/{second_item_id}/stream")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/stream?MediaSourceId={second_item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "12"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"second video");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::DELETE)
                     .uri(format!("/Videos/{item_id}/AlternateSources"))
                     .header("X-Emby-Token", &api_key)
@@ -16914,6 +17016,31 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let cleared_parts: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(cleared_parts["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?MediaSourceId={second_item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let unmerged_playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unmerged_playback_info["ErrorCode"], "NoCompatibleStream");
+        assert_eq!(
+            unmerged_playback_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
 
         let response = app
             .clone()
