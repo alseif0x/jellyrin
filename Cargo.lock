@@ -972,6 +972,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jellyrin-transcode"
+version = "0.1.0"
+dependencies = [
+ "jellyrin-core",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
