@@ -167,6 +167,20 @@ pub struct TerminalTranscodeSession {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrickplayInfo {
+    pub item_id: Uuid,
+    pub width: i64,
+    pub height: i64,
+    pub tile_width: i64,
+    pub tile_height: i64,
+    pub thumbnail_count: i64,
+    pub interval_ms: i64,
+    pub bandwidth: i64,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActivityLogEntry {
     pub id: i64,
@@ -1499,6 +1513,79 @@ impl Database {
     pub async fn active_transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
         self.transcode_sessions_with_statuses(&["starting", "running"])
             .await
+    }
+
+    pub async fn trickplay_info(
+        &self,
+        item_id: Uuid,
+        width: i64,
+    ) -> anyhow::Result<Option<TrickplayInfo>> {
+        let row = sqlx::query_as::<_, TrickplayInfoRow>(
+            r#"
+            SELECT item_id, width, height, tile_width, tile_height, thumbnail_count,
+                   interval_ms, bandwidth, created_at, updated_at
+            FROM trickplay_infos
+            WHERE item_id = ?1 AND width = ?2
+            "#,
+        )
+        .bind(item_id.to_string())
+        .bind(width)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn upsert_trickplay_info(
+        &self,
+        info: TrickplayInfo,
+    ) -> anyhow::Result<TrickplayInfo> {
+        anyhow::ensure!(info.width > 0, "trickplay width must be positive");
+        anyhow::ensure!(info.height > 0, "trickplay height must be positive");
+        anyhow::ensure!(info.tile_width > 0, "trickplay tile width must be positive");
+        anyhow::ensure!(
+            info.tile_height > 0,
+            "trickplay tile height must be positive"
+        );
+        anyhow::ensure!(
+            info.thumbnail_count > 0,
+            "trickplay thumbnail count must be positive"
+        );
+        anyhow::ensure!(info.interval_ms > 0, "trickplay interval must be positive");
+        let now = format_time(OffsetDateTime::now_utc())?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO trickplay_infos (
+                item_id, width, height, tile_width, tile_height, thumbnail_count,
+                interval_ms, bandwidth, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+            ON CONFLICT(item_id, width) DO UPDATE SET
+                height = excluded.height,
+                tile_width = excluded.tile_width,
+                tile_height = excluded.tile_height,
+                thumbnail_count = excluded.thumbnail_count,
+                interval_ms = excluded.interval_ms,
+                bandwidth = excluded.bandwidth,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(info.item_id.to_string())
+        .bind(info.width)
+        .bind(info.height)
+        .bind(info.tile_width)
+        .bind(info.tile_height)
+        .bind(info.thumbnail_count)
+        .bind(info.interval_ms)
+        .bind(info.bandwidth.max(0))
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.trickplay_info(info.item_id, info.width)
+            .await?
+            .context("trickplay info missing after upsert")
     }
 
     pub async fn active_transcode_session_by_dedupe_key(
@@ -3330,6 +3417,20 @@ struct TerminalTranscodeSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct TrickplayInfoRow {
+    item_id: String,
+    width: i64,
+    height: i64,
+    tile_width: i64,
+    tile_height: i64,
+    thumbnail_count: i64,
+    interval_ms: i64,
+    bandwidth: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct ActivityLogEntryRow {
     id: i64,
     name: String,
@@ -3547,6 +3648,26 @@ impl TryFrom<TerminalTranscodeSessionRow> for TerminalTranscodeSession {
             play_session_id: row.play_session_id,
             output_path: row.output_path,
             status: row.status,
+        })
+    }
+}
+
+impl TryFrom<TrickplayInfoRow> for TrickplayInfo {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TrickplayInfoRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            item_id: Uuid::parse_str(&row.item_id)
+                .context("invalid trickplay info item id in database")?,
+            width: row.width,
+            height: row.height,
+            tile_width: row.tile_width,
+            tile_height: row.tile_height,
+            thumbnail_count: row.thumbnail_count,
+            interval_ms: row.interval_ms,
+            bandwidth: row.bandwidth,
+            created_at: parse_time(&row.created_at)?,
+            updated_at: parse_time(&row.updated_at)?,
         })
     }
 }

@@ -31,8 +31,8 @@ use jellyrin_core::{
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
     BackupManifest, BrandingConfig, Database, DeviceSession, SortDirection,
-    SystemConfigurationPayloads, TaskRun, TranscodeSession, UpsertActivePlaybackSession,
-    UpsertPlaybackState, UpsertTranscodeSession,
+    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    UpsertActivePlaybackSession, UpsertPlaybackState, UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -7533,26 +7533,33 @@ async fn trickplay_playlist(
     State(state): State<AppState>,
     Path((item_id, width)): Path<(String, String)>,
     headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<TrickplayQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let item = trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
+    let item = trickplay_video_item(&state, &headers, &query, &item_id).await?;
     let width = parse_positive_u32(&width, "Invalid trickplay width")?;
     let settings = trickplay_settings(&state.db).await?;
     validate_trickplay_width(width, &settings)?;
-    let duration_seconds = trickplay_duration_seconds(&item);
-    let interval_seconds = settings.interval_seconds;
-    let tile_count = trickplay_tile_count(duration_seconds, interval_seconds);
-    let (tile_width, tile_height) = trickplay_tile_resolution(&item, width);
-    let target_duration = interval_seconds.ceil().max(1.0) as u64;
+    let info = ensure_trickplay_info(&state.db, &item, &settings, width, 0).await?;
+    let thumbnail_duration = (info.interval_ms as f64 / 1000.0).max(1.0);
+    let thumbnails_per_sprite = trickplay_thumbnails_per_sprite(&settings);
+    let sprite_count = trickplay_sprite_count(info.thumbnail_count, thumbnails_per_sprite);
     let mut playlist = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-IMAGES-ONLY\n"
+        "#EXTM3U\n#EXT-X-TARGETDURATION:{sprite_count}\n#EXT-X-VERSION:7\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-IMAGES-ONLY\n"
     );
-    for index in 0..tile_count {
-        let tile_duration = trickplay_tile_duration(duration_seconds, interval_seconds, index);
+    for index in 0..sprite_count {
+        let sprite_duration = trickplay_sprite_duration(
+            info.thumbnail_count,
+            thumbnails_per_sprite,
+            thumbnail_duration,
+            index,
+        );
         playlist.push_str(&format!(
-            "#EXT-X-TILES:RESOLUTION={tile_width}x{tile_height},LAYOUT=\"1x1\",DURATION={tile_duration:.3}\n#EXTINF:{tile_duration:.3},\n{}\n",
-            append_query(&format!("{index}.jpg"), raw_query.as_deref())
+            "#EXTINF:{sprite_duration:.3},\n#EXT-X-TILES:RESOLUTION={}x{},LAYOUT={}x{},DURATION={thumbnail_duration:.3}\n{}\n",
+            info.width,
+            info.height,
+            info.tile_width,
+            info.tile_height,
+            trickplay_tile_uri(index, item.id, query.api_key.as_deref())
         ));
     }
     playlist.push_str("#EXT-X-ENDLIST\n");
@@ -7563,9 +7570,9 @@ async fn trickplay_tile(
     State(state): State<AppState>,
     Path((item_id, width, tile_file)): Path<(String, String, String)>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<TrickplayQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let item = trickplay_video_item(&state, &headers, query.api_key.as_deref(), &item_id).await?;
+    let item = trickplay_video_item(&state, &headers, &query, &item_id).await?;
     let width = parse_positive_u32(&width, "Invalid trickplay width")?;
     let settings = trickplay_settings(&state.db).await?;
     validate_trickplay_width(width, &settings)?;
@@ -7573,18 +7580,22 @@ async fn trickplay_tile(
         .strip_suffix(".jpg")
         .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
     let index = parse_non_negative_i64(index, "Invalid trickplay index")?;
-    let tile_count =
-        trickplay_tile_count(trickplay_duration_seconds(&item), settings.interval_seconds);
+    let info = ensure_trickplay_info(&state.db, &item, &settings, width, 0).await?;
+    let sprite_count = trickplay_sprite_count(
+        info.thumbnail_count,
+        trickplay_thumbnails_per_sprite(&settings),
+    );
     let index =
         u32::try_from(index).map_err(|_| ApiError::not_found("Trickplay tile not found"))?;
-    if index >= tile_count {
+    if i64::from(index) >= sprite_count {
         return Err(ApiError::not_found("Trickplay tile not found"));
     }
-    let tile_path = ensure_trickplay_tile(&item, &settings, width, index).await?;
+    let tile_path = ensure_trickplay_tile(&state.db, &item, &settings, width, index).await?;
     stream_path(tile_path, "image/jpeg".to_string(), &headers, true).await
 }
 
 async fn ensure_trickplay_tile(
+    db: &Database,
     item: &MediaItem,
     settings: &TrickplaySettings,
     width: u32,
@@ -7606,8 +7617,21 @@ async fn ensure_trickplay_tile(
         .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
     tokio::fs::create_dir_all(parent).await?;
     let tmp_path = tile_path.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
-    let seek_seconds = index as f64 * settings.interval_seconds;
+    let thumbnails_per_sprite = trickplay_thumbnails_per_sprite(settings);
+    let first_thumbnail = i64::from(index) * thumbnails_per_sprite;
+    let info = ensure_trickplay_info(db, item, settings, width, 0).await?;
+    let remaining = info.thumbnail_count.saturating_sub(first_thumbnail);
+    let frame_count = remaining.min(thumbnails_per_sprite).max(1);
+    let seek_seconds = first_thumbnail as f64 * settings.interval_seconds;
     let scale_filter = format!("scale='min({width},iw)':-2:force_original_aspect_ratio=decrease");
+    let tile_filter = format!(
+        "tile={}x{}:nb_frames={frame_count}:padding=0:margin=0",
+        settings.tile_width, settings.tile_height
+    );
+    let filter = format!(
+        "fps=1/{:.3},{scale_filter},{tile_filter}",
+        settings.interval_seconds
+    );
     let output = Command::new("ffmpeg")
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -7616,10 +7640,10 @@ async fn ensure_trickplay_tile(
         .arg(format!("{seek_seconds:.3}"))
         .arg("-i")
         .arg(media_item_path(item))
+        .arg("-vf")
+        .arg(filter)
         .arg("-frames:v")
         .arg("1")
-        .arg("-vf")
-        .arg(scale_filter)
         .arg("-threads")
         .arg(settings.process_threads.to_string())
         .arg("-q:v")
@@ -7655,7 +7679,97 @@ async fn ensure_trickplay_tile(
         return Ok(tile_path);
     }
     tokio::fs::rename(&tmp_path, &tile_path).await?;
+    persist_trickplay_info_from_tile(db, item, settings, width, &tile_path, info).await?;
     Ok(tile_path)
+}
+
+async fn ensure_trickplay_info(
+    db: &Database,
+    item: &MediaItem,
+    settings: &TrickplaySettings,
+    width: u32,
+    bandwidth: i64,
+) -> Result<TrickplayInfo, ApiError> {
+    let (thumbnail_width, thumbnail_height) = trickplay_tile_resolution(item, width);
+    if let Some(existing) = db
+        .trickplay_info(item.id, i64::from(thumbnail_width))
+        .await?
+        && existing.height == i64::from(thumbnail_height)
+        && existing.tile_width == i64::from(settings.tile_width)
+        && existing.tile_height == i64::from(settings.tile_height)
+        && existing.interval_ms == settings.interval_ms
+        && existing.thumbnail_count
+            == trickplay_thumbnail_count(
+                trickplay_duration_seconds(item),
+                settings.interval_seconds,
+            )
+    {
+        return Ok(existing);
+    }
+    persist_trickplay_info(
+        db,
+        item.id,
+        thumbnail_width,
+        thumbnail_height,
+        settings,
+        trickplay_thumbnail_count(trickplay_duration_seconds(item), settings.interval_seconds),
+        bandwidth,
+    )
+    .await
+}
+
+async fn persist_trickplay_info_from_tile(
+    db: &Database,
+    item: &MediaItem,
+    settings: &TrickplaySettings,
+    width: u32,
+    tile_path: &FsPath,
+    current: TrickplayInfo,
+) -> Result<TrickplayInfo, ApiError> {
+    let thumbnails_per_sprite = trickplay_thumbnails_per_sprite(settings);
+    let tile_len = tokio::fs::metadata(tile_path)
+        .await
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let bandwidth = ((tile_len.saturating_mul(8)) as f64
+        / thumbnails_per_sprite.max(1) as f64
+        / settings.interval_seconds.max(1.0))
+    .ceil() as i64;
+    persist_trickplay_info(
+        db,
+        item.id,
+        u32::try_from(current.width).unwrap_or(width),
+        u32::try_from(current.height).unwrap_or(width),
+        settings,
+        current.thumbnail_count,
+        bandwidth.max(current.bandwidth),
+    )
+    .await
+}
+
+async fn persist_trickplay_info(
+    db: &Database,
+    item_id: Uuid,
+    width: u32,
+    height: u32,
+    settings: &TrickplaySettings,
+    thumbnail_count: i64,
+    bandwidth: i64,
+) -> Result<TrickplayInfo, ApiError> {
+    db.upsert_trickplay_info(TrickplayInfo {
+        item_id,
+        width: i64::from(width),
+        height: i64::from(height),
+        tile_width: i64::from(settings.tile_width),
+        tile_height: i64::from(settings.tile_height),
+        thumbnail_count,
+        interval_ms: settings.interval_ms,
+        bandwidth: bandwidth.max(0),
+        created_at: OffsetDateTime::now_utc(),
+        updated_at: OffsetDateTime::now_utc(),
+    })
+    .await
+    .map_err(Into::into)
 }
 
 fn trickplay_duration_seconds(item: &MediaItem) -> f64 {
@@ -7665,13 +7779,38 @@ fn trickplay_duration_seconds(item: &MediaItem) -> f64 {
         .unwrap_or(10.0)
 }
 
-fn trickplay_tile_count(duration_seconds: f64, interval_seconds: f64) -> u32 {
-    ((duration_seconds / interval_seconds).ceil() as u32).clamp(1, 10_000)
+fn trickplay_thumbnail_count(duration_seconds: f64, interval_seconds: f64) -> i64 {
+    ((duration_seconds / interval_seconds).ceil() as i64).clamp(1, 100_000)
 }
 
-fn trickplay_tile_duration(duration_seconds: f64, interval_seconds: f64, index: u32) -> f64 {
-    let elapsed = index as f64 * interval_seconds;
-    (duration_seconds - elapsed).clamp(1.0, interval_seconds)
+fn trickplay_thumbnails_per_sprite(settings: &TrickplaySettings) -> i64 {
+    i64::from(settings.tile_width) * i64::from(settings.tile_height)
+}
+
+fn trickplay_sprite_count(thumbnail_count: i64, thumbnails_per_sprite: i64) -> i64 {
+    ((thumbnail_count.max(1) + thumbnails_per_sprite.max(1) - 1) / thumbnails_per_sprite.max(1))
+        .clamp(1, 10_000)
+}
+
+fn trickplay_sprite_duration(
+    thumbnail_count: i64,
+    thumbnails_per_sprite: i64,
+    thumbnail_duration: f64,
+    index: i64,
+) -> f64 {
+    let first_thumbnail = index * thumbnails_per_sprite;
+    let remaining = thumbnail_count.saturating_sub(first_thumbnail);
+    let thumbnails = remaining.min(thumbnails_per_sprite).max(1);
+    thumbnail_duration * thumbnails as f64
+}
+
+fn trickplay_tile_uri(index: i64, item_id: Uuid, api_key: Option<&str>) -> String {
+    let mut uri = format!("{index}.jpg?MediaSourceId={}", item_id.simple());
+    if let Some(api_key) = api_key.filter(|api_key| !api_key.trim().is_empty()) {
+        uri.push_str("&ApiKey=");
+        uri.push_str(api_key);
+    }
+    uri
 }
 
 fn trickplay_tile_resolution(item: &MediaItem, requested_width: u32) -> (u32, u32) {
@@ -7693,8 +7832,11 @@ fn trickplay_tile_resolution(item: &MediaItem, requested_width: u32) -> (u32, u3
 
 #[derive(Debug, Clone)]
 struct TrickplaySettings {
+    interval_ms: i64,
     interval_seconds: f64,
     allowed_widths: Vec<u32>,
+    tile_width: u32,
+    tile_height: u32,
     qscale: u32,
     process_threads: u32,
 }
@@ -7712,20 +7854,27 @@ async fn trickplay_settings(db: &Database) -> Result<TrickplaySettings, ApiError
         .cloned()
         .unwrap_or_else(default_trickplay_options);
     Ok(TrickplaySettings {
+        interval_ms: trickplay_interval_ms_from_options(&options),
         interval_seconds: trickplay_interval_seconds_from_options(&options),
         allowed_widths: trickplay_width_resolutions_from_options(&options),
+        tile_width: trickplay_tile_dimension_from_options(&options, "TileWidth"),
+        tile_height: trickplay_tile_dimension_from_options(&options, "TileHeight"),
         qscale: trickplay_qscale_from_options(&options),
         process_threads: trickplay_process_threads_from_options(&options),
     })
 }
 
-fn trickplay_interval_seconds_from_options(options: &serde_json::Value) -> f64 {
+fn trickplay_interval_ms_from_options(options: &serde_json::Value) -> i64 {
     options
         .get("Interval")
         .and_then(serde_json::Value::as_i64)
         .filter(|interval_ms| *interval_ms > 0)
-        .map(|interval_ms| (interval_ms as f64 / 1000.0).max(1.0))
-        .unwrap_or(10.0)
+        .map(|interval_ms| interval_ms.max(1000))
+        .unwrap_or(10_000)
+}
+
+fn trickplay_interval_seconds_from_options(options: &serde_json::Value) -> f64 {
+    trickplay_interval_ms_from_options(options) as f64 / 1000.0
 }
 
 fn trickplay_width_resolutions_from_options(options: &serde_json::Value) -> Vec<u32> {
@@ -7754,6 +7903,15 @@ fn trickplay_qscale_from_options(options: &serde_json::Value) -> u32 {
         .and_then(positive_u32)
         .map(|qscale| qscale.clamp(2, 31))
         .unwrap_or(4)
+}
+
+fn trickplay_tile_dimension_from_options(options: &serde_json::Value, key: &str) -> u32 {
+    options
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .and_then(positive_u32)
+        .map(|dimension| dimension.clamp(1, 100))
+        .unwrap_or(10)
 }
 
 fn trickplay_process_threads_from_options(options: &serde_json::Value) -> u32 {
@@ -7800,8 +7958,12 @@ fn trickplay_cache_revision(item: &MediaItem, settings: &TrickplaySettings) -> S
         .or_else(|| item.file_size.and_then(|size| u64::try_from(size).ok()))
         .unwrap_or(0);
     format!(
-        "mtime-{modified}-len-{len}-interval-{:.3}-q{}-threads{}",
-        settings.interval_seconds, settings.qscale, settings.process_threads
+        "mtime-{modified}-len-{len}-interval-{}-tile-{}x{}-q{}-threads{}",
+        settings.interval_ms,
+        settings.tile_width,
+        settings.tile_height,
+        settings.qscale,
+        settings.process_threads
     )
 }
 
@@ -7824,11 +7986,16 @@ async fn trickplay_tile_lock(tile_path: &FsPath) -> Arc<Mutex<()>> {
 async fn trickplay_video_item(
     state: &AppState,
     headers: &HeaderMap,
-    query_token: Option<&str>,
+    query: &TrickplayQuery,
     item_id: &str,
 ) -> Result<MediaItem, ApiError> {
-    require_request_user(&state.db, headers, query_token).await?;
-    let item = media_item_by_id(&state.db, item_id).await?;
+    require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
+    let selected_item_id = query
+        .media_source_id
+        .as_deref()
+        .filter(|media_source_id| !media_source_id.trim().is_empty())
+        .unwrap_or(item_id);
+    let item = media_item_by_id(&state.db, selected_item_id).await?;
     if item.media_type != "Video" {
         return Err(ApiError::not_found("Video item not found"));
     }
@@ -9564,6 +9731,18 @@ fn load_countries() -> Vec<CountryDto> {
 struct AuthQuery {
     #[serde(alias = "api_key", alias = "ApiKey")]
     api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrickplayQuery {
+    #[serde(alias = "api_key", alias = "ApiKey", alias = "apiKey")]
+    api_key: Option<String>,
+    #[serde(
+        alias = "MediaSourceId",
+        alias = "mediaSourceId",
+        alias = "media_source_id"
+    )]
+    media_source_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -15305,11 +15484,18 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let trickplay_playlist = String::from_utf8(body.to_vec()).unwrap();
-        assert!(trickplay_playlist.contains("#EXT-X-TARGETDURATION:10"));
+        assert!(trickplay_playlist.contains("#EXT-X-TARGETDURATION:1"));
+        assert!(trickplay_playlist.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+        assert!(trickplay_playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(trickplay_playlist.contains("#EXT-X-IMAGES-ONLY"));
-        assert!(trickplay_playlist.contains("#EXT-X-TILES:RESOLUTION=320x180"));
-        assert!(trickplay_playlist.contains(&format!("0.jpg?api_key={api_key}")));
-        assert!(trickplay_playlist.contains(&format!("9.jpg?api_key={api_key}")));
+        assert!(
+            trickplay_playlist
+                .contains("#EXT-X-TILES:RESOLUTION=320x180,LAYOUT=10x10,DURATION=10.000")
+        );
+        assert!(
+            trickplay_playlist.contains(&format!("0.jpg?MediaSourceId={item_id}&ApiKey={api_key}"))
+        );
+        assert!(!trickplay_playlist.contains("1.jpg?"));
 
         let cached_item = media_item_by_id(&test_db, item_id).await.unwrap();
         let trickplay_settings = trickplay_settings(&test_db).await.unwrap();
@@ -17215,7 +17401,7 @@ mod tests {
             .arg("-i")
             .arg("testsrc=size=160x90:rate=1")
             .arg("-t")
-            .arg("1")
+            .arg("3")
             .arg("-pix_fmt")
             .arg("yuv420p")
             .arg("-c:v")
@@ -17240,6 +17426,21 @@ mod tests {
             .await
             .unwrap();
         let test_db = db.clone();
+        let mut payloads = test_db.system_configuration_payloads().await.unwrap();
+        payloads.server_options = json!({
+            "TrickplayOptions": {
+                "Interval": 1000,
+                "WidthResolutions": [320],
+                "TileWidth": 2,
+                "TileHeight": 2,
+                "Qscale": 4,
+                "ProcessThreads": 1
+            }
+        });
+        test_db
+            .update_system_configuration_payloads(payloads)
+            .await
+            .unwrap();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -17282,7 +17483,7 @@ mod tests {
         let item_id = result["Items"][0]["Id"].as_str().unwrap();
         assert_eq!(
             result["Items"][0]["MediaSources"][0]["RunTimeTicks"],
-            10_000_000
+            30_000_000
         );
         assert_eq!(
             result["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Width"],
@@ -17309,8 +17510,12 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let playlist = String::from_utf8(body.to_vec()).unwrap();
         assert!(playlist.contains("#EXT-X-IMAGES-ONLY"));
-        assert!(playlist.contains("#EXT-X-TILES:RESOLUTION=160x90"));
-        assert!(playlist.contains(&format!("0.jpg?api_key={api_key}")));
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:1"));
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+        assert!(playlist.contains("#EXTINF:3.000,"));
+        assert!(playlist.contains("#EXT-X-TILES:RESOLUTION=160x90,LAYOUT=2x2,DURATION=1.000"));
+        assert!(playlist.contains(&format!("0.jpg?MediaSourceId={item_id}&ApiKey={api_key}")));
+        assert!(!playlist.contains("1.jpg?"));
 
         let response = app
             .clone()
@@ -17359,6 +17564,30 @@ mod tests {
             .modified()
             .unwrap();
         assert_eq!(second_modified, first_modified);
+
+        let info = test_db
+            .trickplay_info(parse_jellyfin_uuid(item_id).unwrap(), 160)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.height, 90);
+        assert_eq!(info.tile_width, 2);
+        assert_eq!(info.tile_height, 2);
+        assert_eq!(info.thumbnail_count, 3);
+        assert_eq!(info.interval_ms, 1000);
+        assert!(info.bandwidth > 0);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Trickplay/Videos/{item_id}/Trickplay/320/1.jpg"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
