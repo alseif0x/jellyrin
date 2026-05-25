@@ -18408,6 +18408,26 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
+                        "/DynamicHls/Audio/{item_id}/hls1/main/0.aac?apiKey={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/aac"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake aac");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
                         "/HlsSegment/Audio/{item_id}/hls/0/stream.mp3?apiKey={api_key}"
                     ))
                     .body(Body::empty())
