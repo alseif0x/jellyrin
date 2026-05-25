@@ -23429,6 +23429,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn userlibrary_root_and_empty_item_children_validate_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("Feature Movie.mp4"), b"fake video")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let viewer = db.create_user("viewer", Some("secret")).await.unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "test-key")
+            .await
+            .unwrap();
+        let viewer_key = db
+            .issue_api_key_for_user(viewer.id, "viewer-key")
+            .await
+            .unwrap();
+        let admin_id = admin.id.simple().to_string();
+        let viewer_id = viewer.id.simple().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserLibrary/Items/Root")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserLibrary/Items/Root")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let root: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(root["Name"], "Root");
+        assert_eq!(root["Type"], "Folder");
+        assert_eq!(root["IsFolder"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserLibrary/Users/{admin_id}/Items/Root"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserLibrary/Users/{admin_id}/Items/Root"))
+                    .header("X-Emby-Token", &viewer_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?SearchTerm=Feature")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let items: Value = serde_json::from_slice(&body).unwrap();
+        let item_id = items["Items"][0]["Id"].as_str().unwrap();
+
+        for endpoint in [
+            format!("/UserLibrary/Items/{item_id}/Intros"),
+            format!("/UserLibrary/Items/{item_id}/LocalTrailers"),
+            format!("/UserLibrary/Items/{item_id}/SpecialFeatures"),
+            format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/Intros"),
+            format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/LocalTrailers"),
+            format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/SpecialFeatures"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["TotalRecordCount"], 0);
+            assert_eq!(result["StartIndex"], 0);
+            assert_eq!(result["Items"].as_array().unwrap().len(), 0);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserLibrary/Items/{item_id}/Intros"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserLibrary/Items/00000000-0000-0000-0000-000000000000/SpecialFeatures")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/UserLibrary/Users/{admin_id}/Items/{item_id}/LocalTrailers"
+                    ))
+                    .header("X-Emby-Token", &viewer_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_ne!(admin_id, viewer_id);
+    }
+
+    #[tokio::test]
     async fn library_mediafolders_physicalpaths_and_refresh_scan() {
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tempfile::tempdir().unwrap();
