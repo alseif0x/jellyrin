@@ -85,6 +85,8 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(ready))
         .route("/System/Info/Public", get(system_info_public))
         .route("/System/Info", get(system_info))
+        .route("/TimeSync/GetUtcTime", get(time_sync_utc_time))
+        .route("/timesync/getutctime", get(time_sync_utc_time))
         .route("/System/Ping", get(ping))
         .route("/System/Ping", post(ping))
         .route("/system/ping", get(ping))
@@ -1324,6 +1326,8 @@ pub fn router(state: AppState) -> Router {
             "/instantmix/musicgenres/{name}/instantmix",
             get(authenticated_empty_items),
         )
+        .route("/MediaSegments/{item_id}", get(media_segments))
+        .route("/mediasegments/{item_id}", get(media_segments))
         .route("/Videos/{item_id}/stream", get(direct_stream_item))
         .route("/videos/{item_id}/stream", get(direct_stream_item))
         .route("/Videos/{item_id}/stream", head(direct_stream_item_head))
@@ -1407,6 +1411,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/videos/{item_id}/alternatesources",
             delete(delete_video_alternate_sources),
+        )
+        .route(
+            "/Videos/{video_id}/{media_source_id}/Attachments/{index}",
+            get(video_attachment),
+        )
+        .route(
+            "/videos/{video_id}/{media_source_id}/attachments/{index}",
+            get(video_attachment),
         )
         .route("/Audio/{item_id}/stream", get(direct_stream_audio))
         .route("/audio/{item_id}/stream", get(direct_stream_audio))
@@ -2106,6 +2118,14 @@ async fn system_info(
 ) -> Result<Json<PublicSystemInfo>, ApiError> {
     require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     system_info_public(State(state)).await
+}
+
+async fn time_sync_utc_time() -> Json<serde_json::Value> {
+    let now = format_time_for_json(OffsetDateTime::now_utc());
+    Json(serde_json::json!({
+        "RequestReceptionTime": now,
+        "ResponseTransmissionTime": now
+    }))
 }
 
 async fn get_startup_configuration(
@@ -8794,6 +8814,57 @@ async fn video_additional_parts(
     Ok(Json(query_result_with_total(items, total_record_count, 0)))
 }
 
+async fn media_segments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let metadata = state
+        .db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .find(|metadata| metadata.item_id == item.id)
+        .map(|metadata| metadata.payload)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let segments = metadata
+        .get("MediaSegments")
+        .and_then(serde_json::Value::as_array)
+        .map(|segments| {
+            segments
+                .iter()
+                .enumerate()
+                .filter_map(|(index, segment)| media_segment_json(&item, index, segment))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Json(query_result(segments)))
+}
+
+fn media_segment_json(
+    item: &MediaItem,
+    index: usize,
+    segment: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let start_ticks = json_i64_field(segment, "StartTicks")
+        .or_else(|| json_i64_field(segment, "StartPositionTicks"))?;
+    let end_ticks =
+        json_i64_field(segment, "EndTicks").or_else(|| json_i64_field(segment, "EndPositionTicks"));
+    let segment_type = json_string_field(segment, "Type").unwrap_or_else(|| "Unknown".to_string());
+    Some(serde_json::json!({
+        "Id": json_string_field(segment, "Id").unwrap_or_else(|| format!("{}-{index}", item.id.simple())),
+        "ItemId": item.id.simple().to_string(),
+        "Type": segment_type,
+        "StartTicks": start_ticks,
+        "EndTicks": end_ticks,
+        "SegmentProviderId": json_string_field(segment, "SegmentProviderId"),
+        "Status": json_string_field(segment, "Status").unwrap_or_else(|| "Succeeded".to_string())
+    }))
+}
+
 async fn delete_video_alternate_sources(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8807,6 +8878,79 @@ async fn delete_video_alternate_sources(
     }
     state.db.clear_media_item_versions(item.id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn video_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((video_id, media_source_id, index)): Path<(String, String, i64)>,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_item = media_item_by_id(&state.db, &video_id).await?;
+    let item = resolve_media_source_item(&state.db, requested_item, Some(&media_source_id))
+        .await?
+        .ok_or_else(|| ApiError::not_found("Video attachment not found"))?;
+    if item.media_type != "Video" {
+        return Err(ApiError::not_found("Video attachment not found"));
+    }
+    let attachment = item
+        .media_streams
+        .iter()
+        .find(|stream| {
+            json_string_field(stream, "Type")
+                .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Attachment"))
+                && json_i64_field(stream, "Index") == Some(index)
+        })
+        .ok_or_else(|| ApiError::not_found("Video attachment not found"))?;
+    let path = attachment_path(&item, attachment).await?;
+    let content_type = json_string_field(attachment, "MimeType")
+        .or_else(|| json_string_field(attachment, "ContentType"))
+        .unwrap_or_else(|| attachment_content_type(&path).to_string());
+    stream_path(path, content_type, &headers, true).await
+}
+
+async fn attachment_path(
+    item: &MediaItem,
+    attachment: &serde_json::Value,
+) -> Result<PathBuf, ApiError> {
+    let raw_path = json_string_field(attachment, "Path")
+        .or_else(|| json_string_field(attachment, "FileName"))
+        .ok_or_else(|| ApiError::not_found("Video attachment not found"))?;
+    let item_dir = media_item_path(item)
+        .parent()
+        .ok_or_else(|| ApiError::not_found("Video attachment not found"))?
+        .to_path_buf();
+    let path = PathBuf::from(raw_path);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        item_dir.join(path)
+    };
+    let canonical_item_dir = tokio::fs::canonicalize(item_dir).await?;
+    let canonical_candidate = tokio::fs::canonicalize(candidate).await?;
+    if !canonical_candidate.starts_with(canonical_item_dir) {
+        return Err(ApiError::forbidden(
+            "Video attachment path is outside item directory",
+        ));
+    }
+    Ok(canonical_candidate)
+}
+
+fn attachment_content_type(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ass" | "ssa") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn direct_stream_audio(
@@ -24950,5 +25094,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn time_sync_media_segments_and_video_attachments_cover_p0() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Segmented Movie.mp4");
+        let font = tmp.path().join("subtitle-font.ttf");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+        tokio::fs::write(&font, b"fake font").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "test-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/TimeSync/GetUtcTime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let time_sync: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            time_sync["RequestReceptionTime"]
+                .as_str()
+                .unwrap()
+                .contains('T')
+        );
+        assert!(
+            time_sync["ResponseTransmissionTime"]
+                .as_str()
+                .unwrap()
+                .contains('T')
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let item = test_db.media_items().await.unwrap().remove(0);
+        test_db
+            .update_media_item_media_info(
+                item.id,
+                Some(1_000_000_000),
+                Some(1_000_000),
+                Some(1280),
+                Some(720),
+                vec![
+                    json!({ "Type": "Video", "Index": 0, "Codec": "h264" }),
+                    json!({
+                        "Type": "Attachment",
+                        "Index": 5,
+                        "Codec": "ttf",
+                        "FileName": "subtitle-font.ttf",
+                        "MimeType": "font/ttf"
+                    }),
+                ],
+            )
+            .await
+            .unwrap();
+        test_db
+            .update_media_item_metadata(
+                item.id,
+                json!({
+                    "MediaSegments": [{
+                        "Id": "intro-1",
+                        "Type": "Intro",
+                        "StartTicks": 0,
+                        "EndTicks": 120000000,
+                        "SegmentProviderId": "jellyrin-test",
+                        "Status": "Succeeded"
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        let item_id = item.id.simple().to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/MediaSegments/{item_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/MediaSegments/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let segments: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(segments["TotalRecordCount"], 1);
+        assert_eq!(segments["Items"][0]["Id"], "intro-1");
+        assert_eq!(segments["Items"][0]["ItemId"], item_id);
+        assert_eq!(segments["Items"][0]["Type"], "Intro");
+        assert_eq!(segments["Items"][0]["StartTicks"], 0);
+        assert_eq!(segments["Items"][0]["EndTicks"], 120000000);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/{item_id}/Attachments/5"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/{item_id}/Attachments/5"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "font/ttf"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake font");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/{item_id}/Attachments/99"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
