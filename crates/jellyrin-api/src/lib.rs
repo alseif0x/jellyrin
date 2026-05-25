@@ -11771,21 +11771,23 @@ async fn search_remote_subtitles(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((item_id, _language)): Path<(String, String)>,
+    Path((item_id, language)): Path<(String, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    subtitle_media_item(&state, &item_id, None).await?;
-    Ok(Json(Vec::new()))
+    let item = subtitle_media_item(&state, &item_id, None).await?;
+    Ok(Json(remote_subtitle_candidates(&item, &language).await?))
 }
 
 async fn download_remote_subtitle(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((item_id, _subtitle_id)): Path<(String, String)>,
+    Path((item_id, subtitle_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    subtitle_media_item(&state, &item_id, None).await?;
+    let item = subtitle_media_item(&state, &item_id, None).await?;
+    let remote_path = remote_subtitle_path_from_id(&subtitle_id).await?;
+    install_remote_subtitle(&state.db, item, &remote_path).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -11793,10 +11795,213 @@ async fn get_remote_subtitle(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_subtitle_id): Path<String>,
+    Path(subtitle_id): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Remote subtitle not found"))
+    let path = remote_subtitle_path_from_id(&subtitle_id).await?;
+    let format = subtitle_path_format(&path).unwrap_or_else(|| "srt".to_string());
+    stream_path(
+        path,
+        subtitle_content_type(&format).to_string(),
+        &headers,
+        true,
+    )
+    .await
+}
+
+async fn remote_subtitle_candidates(
+    item: &MediaItem,
+    language: &str,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let Some(item_dir) = media_item_path(item).parent() else {
+        return Ok(Vec::new());
+    };
+    let remote_dir = item_dir.join(".jellyrin-remote-subtitles");
+    let mut entries = match tokio::fs::read_dir(&remote_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut subtitles = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !is_supported_subtitle_path(&path) || !remote_subtitle_matches_language(&path, language)
+        {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
+        let canonical_path = tokio::fs::canonicalize(path).await?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let format = subtitle_path_format(&canonical_path).unwrap_or_else(|| "srt".to_string());
+        let detected_language =
+            remote_subtitle_language_from_path(&canonical_path).unwrap_or_else(|| {
+                language
+                    .trim()
+                    .to_ascii_lowercase()
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .collect()
+            });
+        subtitles.push(serde_json::json!({
+            "ThreeLetterISOLanguageName": detected_language,
+            "Id": remote_subtitle_id_for_path(&canonical_path),
+            "ProviderName": "Local cache",
+            "Name": name,
+            "Format": format,
+            "Author": null,
+            "Comment": null,
+            "DateCreated": metadata.modified().ok().map(OffsetDateTime::from).map(format_time_for_json),
+            "CommunityRating": null,
+            "DownloadCount": null,
+            "IsHashMatch": false
+        }));
+    }
+    subtitles.sort_by_key(|subtitle| {
+        subtitle
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+    Ok(subtitles)
+}
+
+async fn install_remote_subtitle(
+    db: &Database,
+    item: MediaItem,
+    remote_path: &FsPath,
+) -> Result<(), ApiError> {
+    let bytes = tokio::fs::read(remote_path).await?;
+    if bytes.is_empty() {
+        return Err(ApiError::bad_request("Remote subtitle file is empty"));
+    }
+    if bytes.len() > SUBTITLE_UPLOAD_LIMIT_BYTES {
+        return Err(ApiError::bad_request("Remote subtitle file is too large"));
+    }
+
+    let item_path = media_item_path(&item);
+    let item_dir = item_path
+        .parent()
+        .ok_or_else(|| ApiError::not_found("Subtitle media source not found"))?;
+    let subtitle_dir = item_dir.join(".jellyrin-subtitles");
+    tokio::fs::create_dir_all(&subtitle_dir).await?;
+
+    let mut streams = media_item_streams(&item);
+    let next_index = next_subtitle_stream_index(&streams);
+    let format = subtitle_path_format(remote_path).unwrap_or_else(|| "srt".to_string());
+    let source_stem = remote_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(sanitize_file_stem)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| format!("remote-{}", item.id.simple()));
+    let subtitle_path = subtitle_dir.join(format!("{source_stem}-{next_index}.{format}"));
+    tokio::fs::write(&subtitle_path, bytes).await?;
+
+    let language = remote_subtitle_language_from_path(remote_path);
+    let payload = UploadSubtitleDto {
+        data: None,
+        format: Some(format.clone()),
+        language: language.clone(),
+        is_forced: Some(false),
+        is_hearing_impaired: Some(false),
+        file_name: remote_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string),
+    };
+    streams.push(serde_json::json!({
+        "Codec": format,
+        "Language": language,
+        "DisplayTitle": subtitle_display_title(&payload, &format),
+        "IsInterlaced": false,
+        "IsDefault": false,
+        "IsForced": false,
+        "Type": "Subtitle",
+        "Index": next_index,
+        "IsExternal": true,
+        "IsTextSubtitleStream": true,
+        "SupportsExternalStream": true,
+        "Path": subtitle_path.to_string_lossy().to_string(),
+        "DeliveryMethod": "External",
+        "IsHearingImpaired": false,
+        "ProviderName": "Local cache"
+    }));
+    persist_media_streams(db, &item, streams).await
+}
+
+fn remote_subtitle_id_for_path(path: &FsPath) -> String {
+    format!(
+        "local-cache:{}",
+        general_purpose::URL_SAFE_NO_PAD.encode(path.to_string_lossy().as_bytes())
+    )
+}
+
+async fn remote_subtitle_path_from_id(subtitle_id: &str) -> Result<PathBuf, ApiError> {
+    let encoded = subtitle_id
+        .strip_prefix("local-cache:")
+        .ok_or_else(|| ApiError::not_found("Remote subtitle not found"))?;
+    let bytes = general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError::not_found("Remote subtitle not found"))?;
+    let path =
+        String::from_utf8(bytes).map_err(|_| ApiError::not_found("Remote subtitle not found"))?;
+    let canonical_path = tokio::fs::canonicalize(PathBuf::from(path))
+        .await
+        .map_err(|_| ApiError::not_found("Remote subtitle not found"))?;
+    if !is_supported_subtitle_path(&canonical_path)
+        || !path_contains_component(&canonical_path, ".jellyrin-remote-subtitles")
+    {
+        return Err(ApiError::not_found("Remote subtitle not found"));
+    }
+    Ok(canonical_path)
+}
+
+fn is_supported_subtitle_path(path: &FsPath) -> bool {
+    matches!(
+        subtitle_path_format(path).as_deref(),
+        Some("srt" | "vtt" | "ass" | "ssa")
+    )
+}
+
+fn path_contains_component(path: &FsPath, component: &str) -> bool {
+    path.components().any(|path_component| {
+        path_component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|value| value == component)
+    })
+}
+
+fn remote_subtitle_matches_language(path: &FsPath, language: &str) -> bool {
+    let language = language.trim().to_ascii_lowercase();
+    if language.is_empty() || language == "any" {
+        return true;
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| {
+            stem.to_ascii_lowercase()
+                .split(['.', '-', '_', ' '])
+                .any(|part| part == language)
+        })
+}
+
+fn remote_subtitle_language_from_path(path: &FsPath) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| {
+            stem.to_ascii_lowercase()
+                .split(['.', '-', '_', ' '])
+                .find(|part| part.len() == 3 && part.chars().all(|ch| ch.is_ascii_alphabetic()))
+                .map(str::to_string)
+        })
 }
 
 const LYRICS_UPLOAD_LIMIT_BYTES: usize = 4 * 1024 * 1024;
@@ -25052,6 +25257,63 @@ mod tests {
         let remote_results: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(remote_results, json!([]));
 
+        let remote_dir = tmp.path().join(".jellyrin-remote-subtitles");
+        tokio::fs::create_dir(&remote_dir).await.unwrap();
+        let remote_subtitle = remote_dir.join("Managed Subtitle Movie.eng.srt");
+        tokio::fs::write(
+            &remote_subtitle,
+            b"1\n00:00:00,000 --> 00:00:01,000\nRemote Jellyrin subtitle\n\n",
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Items/{item_id}/RemoteSearch/Subtitles/eng"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_results.as_array().unwrap().len(), 1);
+        assert_eq!(remote_results[0]["ThreeLetterISOLanguageName"], "eng");
+        assert_eq!(remote_results[0]["ProviderName"], "Local cache");
+        assert_eq!(remote_results[0]["Format"], "srt");
+        let remote_subtitle_id = remote_results[0]["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Providers/Subtitles/Subtitles/{remote_subtitle_id}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/x-subrip; charset=utf-8"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("Remote Jellyrin subtitle")
+        );
+
         let response = app
             .clone()
             .oneshot(
@@ -25066,7 +25328,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
@@ -25080,6 +25342,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/subtitle/items/{item_id}/remotesearch/subtitles/{remote_subtitle_id}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let item = test_db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id.simple().to_string() == item_id)
+            .unwrap();
+        let downloaded = media_item_streams(&item)
+            .into_iter()
+            .find(|stream| stream["ProviderName"] == "Local cache")
+            .expect("downloaded remote subtitle stream");
+        assert_eq!(downloaded["Language"], "eng");
+        assert_eq!(downloaded["IsExternal"], true);
+        let downloaded_path = PathBuf::from(downloaded["Path"].as_str().unwrap());
+        assert!(downloaded_path.exists());
+        assert!(
+            fs::read_to_string(downloaded_path)
+                .unwrap()
+                .contains("Remote Jellyrin subtitle")
+        );
 
         let upload_data = general_purpose::STANDARD
             .encode(b"1\n00:00:00,000 --> 00:00:01,000\nUploaded Jellyrin subtitle\n\n");
@@ -25142,7 +25441,7 @@ mod tests {
             .unwrap();
         let uploaded = media_item_streams(&item)
             .into_iter()
-            .find(|stream| stream["Type"] == "Subtitle")
+            .find(|stream| stream["Type"] == "Subtitle" && stream["IsForced"] == true)
             .expect("uploaded subtitle stream");
         let subtitle_index = uploaded["Index"].as_i64().unwrap();
         assert_eq!(uploaded["Language"], "eng");
@@ -25208,11 +25507,14 @@ mod tests {
             .into_iter()
             .find(|item| item.id.simple().to_string() == item_id)
             .unwrap();
-        assert!(
-            media_item_streams(&item)
-                .into_iter()
-                .all(|stream| stream["Type"] != "Subtitle")
-        );
+        let remaining_streams = media_item_streams(&item);
+        assert!(remaining_streams.iter().all(|stream| {
+            stream["Type"] != "Subtitle"
+                || stream.get("Index").and_then(json_value_i64) != Some(subtitle_index)
+        }));
+        assert!(remaining_streams.iter().any(|stream| {
+            stream["Type"] == "Subtitle" && stream["ProviderName"] == "Local cache"
+        }));
 
         let response = app
             .oneshot(
