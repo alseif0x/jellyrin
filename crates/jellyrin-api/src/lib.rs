@@ -308,14 +308,24 @@ pub fn router(state: AppState) -> Router {
         .route("/library/refresh", post(refresh_library))
         .route("/Library/Library/Refresh", post(refresh_library))
         .route("/library/library/refresh", post(refresh_library))
+        .route("/Library/Media/Updated", post(updated_media))
+        .route("/library/media/updated", post(updated_media))
         .route("/Library/Library/Media/Updated", post(updated_media))
         .route("/library/library/media/updated", post(updated_media))
+        .route("/Library/Movies/Added", post(updated_media))
+        .route("/library/movies/added", post(updated_media))
         .route("/Library/Library/Movies/Added", post(updated_media))
         .route("/library/library/movies/added", post(updated_media))
+        .route("/Library/Movies/Updated", post(updated_media))
+        .route("/library/movies/updated", post(updated_media))
         .route("/Library/Library/Movies/Updated", post(updated_media))
         .route("/library/library/movies/updated", post(updated_media))
+        .route("/Library/Series/Added", post(updated_media))
+        .route("/library/series/added", post(updated_media))
         .route("/Library/Library/Series/Added", post(updated_media))
         .route("/library/library/series/added", post(updated_media))
+        .route("/Library/Series/Updated", post(updated_media))
+        .route("/library/series/updated", post(updated_media))
         .route("/Library/Library/Series/Updated", post(updated_media))
         .route("/library/library/series/updated", post(updated_media))
         .route("/Library/MediaFolders", get(user_views_result))
@@ -5489,7 +5499,18 @@ async fn updated_media(
     Query(query): Query<AuthQuery>,
     _body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let scanned = scan_all_library_items(&state.db).await?;
+    record_activity(
+        &state.db,
+        "Library media updated",
+        Some(&format!(
+            "Library media update notification scanned {scanned} item(s)."
+        )),
+        "Library",
+        Some(user.id),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -23836,21 +23857,6 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .method(Method::POST)
-                    .uri("/Library/Library/Media/Updated")
-                    .header("X-Emby-Token", &api_key)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
                     .uri(format!(
                         "/Trickplay/Videos/{item_id}/Trickplay/320/tiles.m3u8"
                     ))
@@ -26198,6 +26204,101 @@ mod tests {
         let intros: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(intros["TotalRecordCount"], 0);
         assert_eq!(intros["Items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn library_media_notifications_trigger_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "notification-test-key")
+            .await
+            .unwrap();
+        db.upsert_virtual_folder(
+            "Movies",
+            Some("movies"),
+            vec![tmp.path().to_string_lossy().to_string()],
+        )
+        .await
+        .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let discovered_after_notification = tmp.path().join("Discovered After Notification.mp4");
+        tokio::fs::write(&discovered_after_notification, b"fake video")
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Library/Media/Updated")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items?SearchTerm=Discovered")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let discovered_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(discovered_items["TotalRecordCount"], 1);
+        assert_eq!(
+            discovered_items["Items"][0]["Path"],
+            discovered_after_notification.to_string_lossy().as_ref()
+        );
+
+        for notification_route in [
+            "/Library/Movies/Added",
+            "/Library/Movies/Updated",
+            "/Library/Series/Added",
+            "/Library/Series/Updated",
+            "/Library/Library/Media/Updated",
+            "/Library/Library/Movies/Added",
+            "/Library/Library/Movies/Updated",
+            "/Library/Library/Series/Added",
+            "/Library/Library/Series/Updated",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(notification_route)
+                        .header("X-Emby-Token", &api_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
     }
 
     #[tokio::test]
