@@ -249,8 +249,32 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Library/Refresh", post(refresh_library))
         .route("/library/refresh", post(refresh_library))
+        .route("/Library/Library/Refresh", post(refresh_library))
+        .route("/library/library/refresh", post(refresh_library))
+        .route("/Library/Library/Media/Updated", post(updated_media))
+        .route("/library/library/media/updated", post(updated_media))
+        .route("/Library/Library/Movies/Added", post(updated_media))
+        .route("/library/library/movies/added", post(updated_media))
+        .route("/Library/Library/Movies/Updated", post(updated_media))
+        .route("/library/library/movies/updated", post(updated_media))
+        .route("/Library/Library/Series/Added", post(updated_media))
+        .route("/library/library/series/added", post(updated_media))
+        .route("/Library/Library/Series/Updated", post(updated_media))
+        .route("/library/library/series/updated", post(updated_media))
         .route("/Library/MediaFolders", get(user_views_result))
         .route("/library/mediafolders", get(user_views_result))
+        .route("/Library/Library/MediaFolders", get(user_views_result))
+        .route("/library/library/mediafolders", get(user_views_result))
+        .route("/Library/Library/PhysicalPaths", get(library_physical_paths))
+        .route("/library/library/physicalpaths", get(library_physical_paths))
+        .route(
+            "/Library/Libraries/AvailableOptions",
+            get(library_available_options),
+        )
+        .route(
+            "/library/libraries/availableoptions",
+            get(library_available_options),
+        )
         .route("/Startup/Configuration", get(get_startup_configuration))
         .route("/Startup/Configuration", post(post_startup_configuration))
         .route("/Startup/RemoteAccess", post(post_startup_remote_access))
@@ -952,12 +976,38 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
+        .route("/UserViews/UserViews", get(user_views_result))
+        .route("/userviews/userviews", get(user_views_result))
+        .route(
+            "/UserViews/Users/{user_id}/Views",
+            get(user_views_result_legacy),
+        )
+        .route(
+            "/userviews/users/{user_id}/views",
+            get(user_views_result_legacy),
+        )
+        .route("/UserViews/UserViews/GroupingOptions", get(grouping_options))
+        .route("/userviews/userviews/groupingoptions", get(grouping_options))
+        .route(
+            "/UserViews/Users/{user_id}/GroupingOptions",
+            get(user_grouping_options_legacy),
+        )
+        .route(
+            "/userviews/users/{user_id}/groupingoptions",
+            get(user_grouping_options_legacy),
+        )
         .route("/Items/Counts", get(item_counts))
         .route("/items/counts", get(item_counts))
+        .route("/Library/Items/Counts", get(item_counts))
+        .route("/library/items/counts", get(item_counts))
         .route("/Items", get(items_result))
         .route("/items", get(items_result))
+        .route("/Items/Items", get(items_result))
+        .route("/items/items", get(items_result))
         .route("/Items/Latest", get(latest_items))
         .route("/items/latest", get(latest_items))
+        .route("/UserLibrary/Items/Latest", get(latest_items))
+        .route("/userlibrary/items/latest", get(latest_items))
         .route("/Items/Filters", get(item_filters))
         .route("/items/filters", get(item_filters))
         .route("/Items/Filters2", get(query_filters))
@@ -968,12 +1018,62 @@ pub fn router(state: AppState) -> Router {
         .route("/filter/items/filters2", get(query_filters))
         .route("/Items/{item_id}/Ancestors", get(item_ancestors))
         .route("/items/{item_id}/ancestors", get(item_ancestors))
+        .route("/Library/Items/{item_id}/Ancestors", get(item_ancestors))
+        .route("/library/items/{item_id}/ancestors", get(item_ancestors))
         .route(
             "/Items/{item_id}/Similar",
             get(authenticated_item_empty_items),
         )
         .route(
             "/items/{item_id}/similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/Library/Items/{item_id}/Similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/library/items/{item_id}/similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/Library/Albums/{item_id}/Similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/library/albums/{item_id}/similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/Library/Artists/{item_id}/Similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/library/artists/{item_id}/similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/Library/Movies/{item_id}/Similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/library/movies/{item_id}/similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/Library/Shows/{item_id}/Similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/library/shows/{item_id}/similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/Library/Trailers/{item_id}/Similar",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/library/trailers/{item_id}/similar",
             get(authenticated_item_empty_items),
         )
         .route(
@@ -1033,11 +1133,27 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_item_theme_media),
         )
         .route(
+            "/Library/Items/{item_id}/ThemeMedia",
+            get(authenticated_item_theme_media),
+        )
+        .route(
+            "/library/items/{item_id}/thememedia",
+            get(authenticated_item_theme_media),
+        )
+        .route(
             "/Items/{item_id}/ThemeSongs",
             get(authenticated_item_theme_items),
         )
         .route(
             "/items/{item_id}/themesongs",
+            get(authenticated_item_theme_items),
+        )
+        .route(
+            "/Library/Items/{item_id}/ThemeSongs",
+            get(authenticated_item_theme_items),
+        )
+        .route(
+            "/library/items/{item_id}/themesongs",
             get(authenticated_item_theme_items),
         )
         .route(
@@ -1047,6 +1163,38 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/items/{item_id}/themevideos",
             get(authenticated_item_theme_items),
+        )
+        .route(
+            "/Library/Items/{item_id}/ThemeVideos",
+            get(authenticated_item_theme_items),
+        )
+        .route(
+            "/library/items/{item_id}/themevideos",
+            get(authenticated_item_theme_items),
+        )
+        .route(
+            "/UserLibrary/Items/{item_id}/Intros",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/userlibrary/items/{item_id}/intros",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/UserLibrary/Items/{item_id}/LocalTrailers",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/userlibrary/items/{item_id}/localtrailers",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/UserLibrary/Items/{item_id}/SpecialFeatures",
+            get(authenticated_item_empty_items),
+        )
+        .route(
+            "/userlibrary/items/{item_id}/specialfeatures",
+            get(authenticated_item_empty_items),
         )
         .route("/Items/{item_id}/PlaybackInfo", get(item_playback_info))
         .route("/items/{item_id}/playbackinfo", get(item_playback_info))
@@ -1078,6 +1226,70 @@ pub fn router(state: AppState) -> Router {
         .route("/items/{item_id}/instantmix", get(instant_mix_from_item))
         .route("/Songs/{item_id}/InstantMix", get(instant_mix_from_item))
         .route("/songs/{item_id}/instantmix", get(instant_mix_from_item))
+        .route(
+            "/InstantMix/Items/{item_id}/InstantMix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/instantmix/items/{item_id}/instantmix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/InstantMix/Songs/{item_id}/InstantMix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/instantmix/songs/{item_id}/instantmix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/InstantMix/Albums/{item_id}/InstantMix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/instantmix/albums/{item_id}/instantmix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/InstantMix/Artists/{item_id}/InstantMix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/instantmix/artists/{item_id}/instantmix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/InstantMix/Playlists/{item_id}/InstantMix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/instantmix/playlists/{item_id}/instantmix",
+            get(instant_mix_from_item),
+        )
+        .route(
+            "/InstantMix/Artists/InstantMix",
+            get(authenticated_empty_items),
+        )
+        .route(
+            "/instantmix/artists/instantmix",
+            get(authenticated_empty_items),
+        )
+        .route(
+            "/InstantMix/MusicGenres/InstantMix",
+            get(authenticated_empty_items),
+        )
+        .route(
+            "/instantmix/musicgenres/instantmix",
+            get(authenticated_empty_items),
+        )
+        .route(
+            "/InstantMix/MusicGenres/{name}/InstantMix",
+            get(authenticated_empty_items),
+        )
+        .route(
+            "/instantmix/musicgenres/{name}/instantmix",
+            get(authenticated_empty_items),
+        )
         .route("/Videos/{item_id}/stream", get(direct_stream_item))
         .route("/videos/{item_id}/stream", get(direct_stream_item))
         .route("/Videos/{item_id}/stream", head(direct_stream_item_head))
@@ -1204,8 +1416,128 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Items/{item_id}", get(item_detail))
         .route("/items/{item_id}", get(item_detail))
+        .route("/UserLibrary/Items/Root", get(root_folder))
+        .route("/userlibrary/items/root", get(root_folder))
+        .route("/UserLibrary/Items/{item_id}", get(item_detail))
+        .route("/userlibrary/items/{item_id}", get(item_detail))
+        .route("/Library/Items/{item_id}/Download", get(direct_stream_item))
+        .route("/library/items/{item_id}/download", get(direct_stream_item))
+        .route("/Library/Items/{item_id}/File", get(direct_stream_item))
+        .route("/library/items/{item_id}/file", get(direct_stream_item))
+        .route("/Library/Items", delete(delete_library_items))
+        .route("/library/items", delete(delete_library_items))
+        .route("/Library/Items/{item_id}", delete(delete_library_item))
+        .route("/library/items/{item_id}", delete(delete_library_item))
+        .route(
+            "/Items/UserItems/{item_id}/UserData",
+            get(authenticated_item_user_data).post(update_authenticated_item_user_data),
+        )
+        .route(
+            "/items/useritems/{item_id}/userdata",
+            get(authenticated_item_user_data).post(update_authenticated_item_user_data),
+        )
+        .route(
+            "/Items/Users/{user_id}/Items/{item_id}/UserData",
+            get(user_item_user_data).post(update_user_item_user_data),
+        )
+        .route(
+            "/items/users/{user_id}/items/{item_id}/userdata",
+            get(user_item_user_data).post(update_user_item_user_data),
+        )
         .route("/Users/{user_id}/Items/{item_id}", get(user_item_detail))
         .route("/users/{user_id}/items/{item_id}", get(user_item_detail))
+        .route("/Items/Users/{user_id}/Items", get(user_items_result))
+        .route("/items/users/{user_id}/items", get(user_items_result))
+        .route(
+            "/Items/Users/{user_id}/Items/Resume",
+            get(user_resume_items),
+        )
+        .route(
+            "/items/users/{user_id}/items/resume",
+            get(user_resume_items),
+        )
+        .route("/Items/UserItems/Resume", get(resume_items))
+        .route("/items/useritems/resume", get(resume_items))
+        .route(
+            "/UserLibrary/Users/{user_id}/Items/{item_id}",
+            get(user_item_detail),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/items/{item_id}",
+            get(user_item_detail),
+        )
+        .route(
+            "/UserLibrary/Users/{user_id}/Items/Latest",
+            get(user_latest_items),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/items/latest",
+            get(user_latest_items),
+        )
+        .route(
+            "/UserLibrary/Users/{user_id}/Items/Root",
+            get(user_root_folder),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/items/root",
+            get(user_root_folder),
+        )
+        .route(
+            "/UserLibrary/Users/{user_id}/Items/{item_id}/Intros",
+            get(user_item_empty_items),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/items/{item_id}/intros",
+            get(user_item_empty_items),
+        )
+        .route(
+            "/UserLibrary/Users/{user_id}/Items/{item_id}/LocalTrailers",
+            get(user_item_empty_items),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/items/{item_id}/localtrailers",
+            get(user_item_empty_items),
+        )
+        .route(
+            "/UserLibrary/Users/{user_id}/Items/{item_id}/SpecialFeatures",
+            get(user_item_empty_items),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/items/{item_id}/specialfeatures",
+            get(user_item_empty_items),
+        )
+        .route(
+            "/UserLibrary/UserFavoriteItems/{item_id}",
+            post(mark_authenticated_item_favorite).delete(unmark_authenticated_item_favorite),
+        )
+        .route(
+            "/userlibrary/userfavoriteitems/{item_id}",
+            post(mark_authenticated_item_favorite).delete(unmark_authenticated_item_favorite),
+        )
+        .route(
+            "/UserLibrary/Users/{user_id}/FavoriteItems/{item_id}",
+            post(mark_user_item_favorite).delete(unmark_user_item_favorite),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/favoriteitems/{item_id}",
+            post(mark_user_item_favorite).delete(unmark_user_item_favorite),
+        )
+        .route(
+            "/UserLibrary/UserItems/{item_id}/Rating",
+            post(update_authenticated_item_rating).delete(delete_authenticated_item_rating),
+        )
+        .route(
+            "/userlibrary/useritems/{item_id}/rating",
+            post(update_authenticated_item_rating).delete(delete_authenticated_item_rating),
+        )
+        .route(
+            "/UserLibrary/Users/{user_id}/Items/{item_id}/Rating",
+            post(update_user_item_rating).delete(delete_user_item_rating),
+        )
+        .route(
+            "/userlibrary/users/{user_id}/items/{item_id}/rating",
+            post(update_user_item_rating).delete(delete_user_item_rating),
+        )
         .route(
             "/Users/{user_id}/PlayedItems/{item_id}",
             post(mark_item_played),
@@ -1480,6 +1812,42 @@ pub fn router(state: AppState) -> Router {
         .route("/shows/nextup", get(authenticated_empty_items))
         .route("/Shows/Upcoming", get(authenticated_empty_items))
         .route("/shows/upcoming", get(authenticated_empty_items))
+        .route(
+            "/Shows/{series_id}/Episodes",
+            get(series_empty_items),
+        )
+        .route(
+            "/shows/{series_id}/episodes",
+            get(series_empty_items),
+        )
+        .route(
+            "/Shows/{series_id}/Seasons",
+            get(series_empty_items),
+        )
+        .route(
+            "/shows/{series_id}/seasons",
+            get(series_empty_items),
+        )
+        .route("/Search/Hints", get(search_hints))
+        .route("/search/hints", get(search_hints))
+        .route(
+            "/Suggestions/Items/Suggestions",
+            get(authenticated_empty_items),
+        )
+        .route(
+            "/suggestions/items/suggestions",
+            get(authenticated_empty_items),
+        )
+        .route(
+            "/Suggestions/Users/{user_id}/Suggestions",
+            get(user_suggestions),
+        )
+        .route(
+            "/suggestions/users/{user_id}/suggestions",
+            get(user_suggestions),
+        )
+        .route("/Trailers", get(authenticated_empty_items))
+        .route("/trailers", get(authenticated_empty_items))
         .route(
             "/Movies/Recommendations",
             get(authenticated_empty_json_array),
@@ -4273,6 +4641,61 @@ async fn refresh_library(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn updated_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    _body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn library_physical_paths(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let paths = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .flat_map(|folder| folder.locations)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(Json(paths))
+}
+
+async fn library_available_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "LibraryOptions": {
+            "EnablePhotos": true,
+            "EnableRealtimeMonitor": false,
+            "EnableLUFSScan": false,
+            "EnableChapterImageExtraction": false,
+            "ExtractChapterImagesDuringLibraryScan": false,
+            "EnableTrickplayImageExtraction": false,
+            "ExtractTrickplayImagesDuringLibraryScan": false,
+            "SaveLocalMetadata": false,
+            "EnableInternetProviders": false,
+            "EnableAutomaticSeriesGrouping": true,
+            "EnableEmbeddedTitles": false,
+            "EnableEmbeddedEpisodeInfos": false,
+            "SeasonZeroDisplayName": "Specials"
+        },
+        "MetadataOptions": [],
+        "TypeOptions": []
+    })))
+}
+
 async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
     let folders = db.virtual_folders().await?;
     let mut scanned = 0usize;
@@ -5978,6 +6401,45 @@ async fn user_views_result(
     Ok(Json(query_result(items)))
 }
 
+async fn user_views_result_legacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    let folders = state.db.virtual_folders().await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let items = folders
+        .iter()
+        .map(|folder| user_view_to_json(folder, &server_id))
+        .collect::<Vec<_>>();
+    Ok(Json(query_result(items)))
+}
+
+async fn grouping_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(empty_json_array().await)
+}
+
+async fn user_grouping_options_legacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    Ok(empty_json_array().await)
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct ItemsQuery {
     #[serde(alias = "UserId", alias = "userId")]
@@ -6379,6 +6841,43 @@ async fn user_resume_items(
     Ok(Json(query_result(items)))
 }
 
+async fn root_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(root_folder_json(&state.db).await?))
+}
+
+async fn user_root_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    Ok(Json(root_folder_json(&state.db).await?))
+}
+
+async fn root_folder_json(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let server = db.server_state().await?;
+    Ok(serde_json::json!({
+        "Name": "Root",
+        "ServerId": server.server_id.to_string(),
+        "Id": server.server_id.simple().to_string(),
+        "Type": "Folder",
+        "IsFolder": true,
+        "Path": null,
+        "ParentId": null,
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": {},
+        "BackdropImageTags": []
+    }))
+}
+
 async fn item_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6425,6 +6924,134 @@ async fn user_item_detail(
         &server_id,
         playback.as_ref(),
     )))
+}
+
+async fn authenticated_item_user_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    item_user_data_json(&state.db, user.id, &item_id)
+        .await
+        .map(Json)
+}
+
+async fn user_item_user_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    item_user_data_json(&state.db, requested_user_id, &item_id)
+        .await
+        .map(Json)
+}
+
+async fn update_authenticated_item_user_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    update_item_user_data_inner(&state.db, user.id, &item_id, body.map(|body| body.0)).await
+}
+
+async fn update_user_item_user_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    update_item_user_data_inner(
+        &state.db,
+        requested_user_id,
+        &item_id,
+        body.map(|body| body.0),
+    )
+    .await
+}
+
+async fn update_item_user_data_inner(
+    db: &Database,
+    user_id: Uuid,
+    item_id: &str,
+    body: Option<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let item = media_item_by_id(db, item_id).await?;
+    let current = db.playback_state_for_item(user_id, item.id).await?;
+    let played = json_value_bool_field(body.as_ref(), &["Played", "played"])
+        .unwrap_or_else(|| current.as_ref().is_some_and(|state| state.played));
+    let position_ticks = json_value_i64_field(
+        body.as_ref(),
+        &["PlaybackPositionTicks", "playbackPositionTicks"],
+    )
+    .unwrap_or_else(|| current.as_ref().map_or(0, |state| state.position_ticks));
+    db.upsert_playback_state(UpsertPlaybackState {
+        user_id,
+        item_id: item.id,
+        media_source_id: current
+            .as_ref()
+            .and_then(|state| state.media_source_id.clone()),
+        audio_stream_index: current.as_ref().and_then(|state| state.audio_stream_index),
+        subtitle_stream_index: current
+            .as_ref()
+            .and_then(|state| state.subtitle_stream_index),
+        position_ticks,
+        is_paused: current.as_ref().is_some_and(|state| state.is_paused),
+        played,
+    })
+    .await?;
+    item_user_data_json(db, user_id, item_id).await.map(Json)
+}
+
+async fn item_user_data_json(
+    db: &Database,
+    user_id: Uuid,
+    item_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let item = media_item_by_id(db, item_id).await?;
+    let playback = db.playback_state_for_item(user_id, item.id).await?;
+    let item_id = item.id.simple().to_string();
+    let playback_position_ticks = playback.as_ref().map_or(0, |state| state.position_ticks);
+    let played = playback.as_ref().is_some_and(|state| state.played);
+    let play_count = i64::from(played);
+    Ok(serde_json::json!({
+        "PlaybackPositionTicks": playback_position_ticks,
+        "PlayCount": play_count,
+        "IsFavorite": false,
+        "Played": played,
+        "Key": item_id,
+        "ItemId": item_id,
+        "PlayedPercentage": null,
+        "LastPlayedDate": null,
+        "UnplayedItemCount": null,
+        "Rating": null
+    }))
+}
+
+fn json_value_bool_field(value: Option<&serde_json::Value>, names: &[&str]) -> Option<bool> {
+    let object = value.and_then(|value| value.as_object())?;
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(|value| value.as_bool()))
+}
+
+fn json_value_i64_field(value: Option<&serde_json::Value>, names: &[&str]) -> Option<i64> {
+    let object = value.and_then(|value| value.as_object())?;
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(|value| value.as_i64()))
 }
 
 async fn mark_item_played(
@@ -6507,6 +7134,126 @@ async fn set_item_played(
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn mark_authenticated_item_favorite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    item_user_data_json(&state.db, user.id, &item_id)
+        .await
+        .map(Json)
+}
+
+async fn unmark_authenticated_item_favorite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    item_user_data_json(&state.db, user.id, &item_id)
+        .await
+        .map(Json)
+}
+
+async fn mark_user_item_favorite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user_item_favorite_inner(state, headers, query, user_id, item_id).await
+}
+
+async fn unmark_user_item_favorite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user_item_favorite_inner(state, headers, query, user_id, item_id).await
+}
+
+async fn user_item_favorite_inner(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    user_id: String,
+    item_id: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    media_item_by_id(&state.db, &item_id).await?;
+    item_user_data_json(&state.db, requested_user_id, &item_id)
+        .await
+        .map(Json)
+}
+
+async fn update_authenticated_item_rating(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    item_user_data_json(&state.db, user.id, &item_id)
+        .await
+        .map(Json)
+}
+
+async fn delete_authenticated_item_rating(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    item_user_data_json(&state.db, user.id, &item_id)
+        .await
+        .map(Json)
+}
+
+async fn update_user_item_rating(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user_item_rating_inner(state, headers, query, user_id, item_id).await
+}
+
+async fn delete_user_item_rating(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user_item_rating_inner(state, headers, query, user_id, item_id).await
+}
+
+async fn user_item_rating_inner(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    user_id: String,
+    item_id: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    media_item_by_id(&state.db, &item_id).await?;
+    item_user_data_json(&state.db, requested_user_id, &item_id)
+        .await
+        .map(Json)
 }
 
 fn resolve_user_id(user_id: &str) -> Result<Uuid, ApiError> {
@@ -9430,6 +10177,88 @@ async fn authenticated_empty_items(
     Ok(empty_items_result().await)
 }
 
+async fn user_suggestions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_user_id = resolve_user_id(&user_id)?;
+    ensure_user_access(&auth_user, requested_user_id)?;
+    Ok(empty_items_result().await)
+}
+
+async fn series_empty_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(series_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &series_id).await?;
+    Ok(empty_items_result().await)
+}
+
+async fn search_hints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+    let items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        requested_user_id,
+        &state.db,
+    )
+    .await?;
+    let total_record_count = items.len();
+    let search_hints = items
+        .into_iter()
+        .take(query.limit.unwrap_or(20).min(100))
+        .map(|item| {
+            serde_json::json!({
+                "ItemId": item.id.simple().to_string(),
+                "Id": item.id.simple().to_string(),
+                "Name": item.name,
+                "MatchedTerm": item.name,
+                "IndexNumber": null,
+                "ProductionYear": null,
+                "ParentIndexNumber": null,
+                "PrimaryImageTag": "placeholder",
+                "ThumbImageTag": null,
+                "ThumbImageItemId": null,
+                "BackdropImageTag": null,
+                "BackdropImageItemId": null,
+                "Type": media_item_type(&item),
+                "IsFolder": false,
+                "RunTimeTicks": item.runtime_ticks,
+                "MediaType": item.media_type,
+                "StartDate": null,
+                "EndDate": null,
+                "Series": null,
+                "Status": null,
+                "Album": null,
+                "AlbumId": null,
+                "AlbumArtist": null,
+                "Artists": []
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "SearchHints": search_hints,
+        "TotalRecordCount": total_record_count
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 struct ChannelsQuery {
     #[serde(flatten)]
@@ -9483,6 +10312,26 @@ async fn user_item_empty_items(
     ensure_user_access(&auth_user, user_id)?;
     media_item_by_id(&state.db, &item_id).await?;
     Ok(empty_items_result().await)
+}
+
+async fn delete_library_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_library_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn authenticated_empty_json_array(
@@ -16945,6 +17794,241 @@ mod tests {
         assert_eq!(detail["People"].as_array().unwrap().len(), 0);
         assert_eq!(detail["Studios"].as_array().unwrap().len(), 0);
         assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Items?UserId={user_id}&IncludeItemTypes=Movie"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let legacy_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(legacy_items["TotalRecordCount"], 1);
+        assert_eq!(legacy_items["Items"][0]["Id"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Library/Items/{item_id}/Ancestors"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let ancestors: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ancestors.as_array().unwrap().len(), 1);
+        assert_eq!(ancestors[0]["Id"], parent_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Library/Items/{item_id}/ThemeMedia"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let theme_media: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(theme_media["ThemeVideosResult"]["TotalRecordCount"], 0);
+        assert_eq!(theme_media["ThemeSongsResult"]["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserLibrary/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_library_detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_library_detail["Id"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserViews/UserViews")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_views: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_views["TotalRecordCount"], 1);
+        assert_eq!(user_views["Items"][0]["Id"], parent_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserViews/Users/{user_id}/Views"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let legacy_user_views: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(legacy_user_views["TotalRecordCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Search/Hints?SearchTerm=Example&UserId={user_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let search_hints: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(search_hints["TotalRecordCount"], 1);
+        assert_eq!(search_hints["SearchHints"][0]["ItemId"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/UserItems/{item_id}/UserData"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_data["Played"], false);
+        assert_eq!(user_data["PlaybackPositionTicks"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/Users/{user_id}/Items/{item_id}/UserData"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "PlaybackPositionTicks": 321, "Played": true }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_user_data["Played"], true);
+        assert_eq!(updated_user_data["PlaybackPositionTicks"], 321);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Library/Items/{item_id}/File"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake video");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Library/Library/PhysicalPaths")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Library/Library/PhysicalPaths")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let physical_paths: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(physical_paths.as_array().unwrap().len(), 1);
+        assert_eq!(physical_paths[0], tmp.path().to_string_lossy().as_ref());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Library/Libraries/AvailableOptions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let available_options: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            available_options["LibraryOptions"]["EnableAutomaticSeriesGrouping"],
+            true
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Library/Library/Media/Updated")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
