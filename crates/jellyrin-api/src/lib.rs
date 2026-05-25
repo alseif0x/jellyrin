@@ -618,6 +618,20 @@ pub fn router(state: AppState) -> Router {
         .route("/Branding/Css.css", get(branding_css))
         .route("/Branding/Splashscreen", get(empty_text))
         .route("/branding/splashscreen", get(empty_text))
+        .route(
+            "/Image/Branding/Splashscreen",
+            get(splashscreen_placeholder_image)
+                .head(splashscreen_placeholder_image)
+                .post(update_splashscreen_image)
+                .delete(delete_splashscreen_image),
+        )
+        .route(
+            "/image/branding/splashscreen",
+            get(splashscreen_placeholder_image)
+                .head(splashscreen_placeholder_image)
+                .post(update_splashscreen_image)
+                .delete(delete_splashscreen_image),
+        )
         .route("/Library/VirtualFolders", get(get_virtual_folders))
         .route("/Library/VirtualFolders", post(add_virtual_folder))
         .route("/Library/VirtualFolders", delete(delete_virtual_folder))
@@ -979,6 +993,38 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_item_empty_json_array),
         )
         .route(
+            "/Image/Items/{item_id}/Images",
+            get(authenticated_item_empty_json_array),
+        )
+        .route(
+            "/image/items/{item_id}/images",
+            get(authenticated_item_empty_json_array),
+        )
+        .route(
+            "/RemoteImage/Items/{item_id}/RemoteImages",
+            get(item_remote_images),
+        )
+        .route(
+            "/remoteimage/items/{item_id}/remoteimages",
+            get(item_remote_images),
+        )
+        .route(
+            "/RemoteImage/Items/{item_id}/RemoteImages/Providers",
+            get(item_remote_image_providers),
+        )
+        .route(
+            "/remoteimage/items/{item_id}/remoteimages/providers",
+            get(item_remote_image_providers),
+        )
+        .route(
+            "/RemoteImage/Items/{item_id}/RemoteImages/Download",
+            post(download_remote_image),
+        )
+        .route(
+            "/remoteimage/items/{item_id}/remoteimages/download",
+            post(download_remote_image),
+        )
+        .route(
             "/Items/{item_id}/ThemeMedia",
             get(authenticated_item_theme_media),
         )
@@ -1265,12 +1311,170 @@ pub fn router(state: AppState) -> Router {
             get(item_placeholder_image),
         )
         .route(
+            "/Image/Items/{item_id}/Images/{image_type}",
+            get(item_placeholder_image)
+                .head(item_placeholder_image)
+                .post(update_item_image)
+                .delete(delete_item_image),
+        )
+        .route(
+            "/image/items/{item_id}/images/{image_type}",
+            get(item_placeholder_image)
+                .head(item_placeholder_image)
+                .post(update_item_image)
+                .delete(delete_item_image),
+        )
+        .route(
+            "/Image/Items/{item_id}/Images/{image_type}/{image_index}",
+            get(item_placeholder_image_by_index)
+                .head(item_placeholder_image_by_index)
+                .post(update_item_image_by_index)
+                .delete(delete_item_image_by_index),
+        )
+        .route(
+            "/image/items/{item_id}/images/{image_type}/{image_index}",
+            get(item_placeholder_image_by_index)
+                .head(item_placeholder_image_by_index)
+                .post(update_item_image_by_index)
+                .delete(delete_item_image_by_index),
+        )
+        .route(
+            "/Image/Items/{item_id}/Images/{image_type}/{image_index}/Index",
+            post(update_item_image_index),
+        )
+        .route(
+            "/image/items/{item_id}/images/{image_type}/{image_index}/index",
+            post(update_item_image_index),
+        )
+        .route(
+            "/Image/Items/{item_id}/Images/{image_type}/{image_index}/{tag}/{format}/{max_width}/{max_height}/{percent_played}/{unplayed_count}",
+            get(item_placeholder_image_extended).head(item_placeholder_image_extended),
+        )
+        .route(
+            "/image/items/{item_id}/images/{image_type}/{image_index}/{tag}/{format}/{max_width}/{max_height}/{percent_played}/{unplayed_count}",
+            get(item_placeholder_image_extended).head(item_placeholder_image_extended),
+        )
+        .route(
             "/Users/{user_id}/Images/{image_type}",
             get(user_placeholder_image),
         )
         .route(
             "/users/{user_id}/images/{image_type}",
             get(user_placeholder_image),
+        )
+        .route(
+            "/Image/UserImage",
+            get(current_user_placeholder_image)
+                .head(current_user_placeholder_image)
+                .post(update_current_user_image)
+                .delete(delete_current_user_image),
+        )
+        .route(
+            "/image/userimage",
+            get(current_user_placeholder_image)
+                .head(current_user_placeholder_image)
+                .post(update_current_user_image)
+                .delete(delete_current_user_image),
+        )
+        .route(
+            "/Image/Users/{user_id}/Images/{image_type}",
+            get(user_placeholder_image)
+                .head(user_placeholder_image)
+                .post(update_user_image)
+                .delete(delete_user_image),
+        )
+        .route(
+            "/image/users/{user_id}/images/{image_type}",
+            get(user_placeholder_image)
+                .head(user_placeholder_image)
+                .post(update_user_image)
+                .delete(delete_user_image),
+        )
+        .route(
+            "/Image/Users/{user_id}/Images/{image_type}/{image_index}",
+            get(user_placeholder_image_by_index)
+                .head(user_placeholder_image_by_index)
+                .post(update_user_image_by_index)
+                .delete(delete_user_image_by_index),
+        )
+        .route(
+            "/image/users/{user_id}/images/{image_type}/{image_index}",
+            get(user_placeholder_image_by_index)
+                .head(user_placeholder_image_by_index)
+                .post(update_user_image_by_index)
+                .delete(delete_user_image_by_index),
+        )
+        .route(
+            "/Image/Genres/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/image/genres/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/Image/Genres/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/image/genres/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/Image/MusicGenres/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/image/musicgenres/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/Image/MusicGenres/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/image/musicgenres/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/Image/Persons/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/image/persons/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/Image/Persons/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/image/persons/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/Image/Studios/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/image/studios/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/Image/Studios/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/image/studios/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/Image/Artists/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/image/artists/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route("/Shows/NextUp", get(authenticated_empty_items))
         .route("/shows/nextup", get(authenticated_empty_items))
@@ -10431,20 +10635,87 @@ async fn item_placeholder_image(
     Ok(placeholder_png_response())
 }
 
+async fn item_placeholder_image_by_index(
+    State(state): State<AppState>,
+    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(placeholder_png_response())
+}
+
+type ExtendedItemImagePath = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+async fn item_placeholder_image_extended(
+    State(state): State<AppState>,
+    Path((
+        item_id,
+        _image_type,
+        image_index,
+        _tag,
+        _format,
+        _max_width,
+        _max_height,
+        _percent_played,
+        _unplayed_count,
+    )): Path<ExtendedItemImagePath>,
+) -> Result<axum::response::Response, ApiError> {
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(placeholder_png_response())
+}
+
 async fn user_placeholder_image(
     State(state): State<AppState>,
     Path((user_id, _image_type)): Path<(Uuid, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    if !state
-        .db
-        .users()
-        .await?
-        .into_iter()
-        .any(|user| user.id == user_id)
-    {
-        return Err(ApiError::not_found("User not found"));
-    }
+    user_exists(&state.db, user_id).await?;
     Ok(placeholder_png_response())
+}
+
+async fn user_placeholder_image_by_index(
+    State(state): State<AppState>,
+    Path((user_id, _image_type, image_index)): Path<(Uuid, String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    user_exists(&state.db, user_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(placeholder_png_response())
+}
+
+async fn current_user_placeholder_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(placeholder_png_response())
+}
+
+async fn named_placeholder_image(
+    Path((_name, _image_type)): Path<(String, String)>,
+) -> axum::response::Response {
+    placeholder_png_response()
+}
+
+async fn named_placeholder_image_by_index(
+    Path((_name, _image_type, image_index)): Path<(String, String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    validate_image_index(&image_index)?;
+    Ok(placeholder_png_response())
+}
+
+async fn splashscreen_placeholder_image() -> axum::response::Response {
+    placeholder_png_response()
 }
 
 fn placeholder_png_response() -> axum::response::Response {
@@ -10458,6 +10729,204 @@ fn placeholder_png_response() -> axum::response::Response {
         TRANSPARENT_PNG.to_vec(),
     )
         .into_response()
+}
+
+async fn update_splashscreen_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    _body: Body,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_splashscreen_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_item_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _image_type)): Path<(String, String)>,
+    _body: Body,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_item_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _image_type)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_item_image_by_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
+    _body: Body,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_item_image_by_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_item_image_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_current_user_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    _body: Body,
+) -> Result<StatusCode, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_current_user_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_user_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, _image_type)): Path<(Uuid, String)>,
+    _body: Body,
+) -> Result<StatusCode, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    ensure_user_access(&auth_user, user_id)?;
+    user_exists(&state.db, user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_user_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, _image_type)): Path<(Uuid, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    ensure_user_access(&auth_user, user_id)?;
+    user_exists(&state.db, user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_user_image_by_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, _image_type, image_index)): Path<(Uuid, String, String)>,
+    _body: Body,
+) -> Result<StatusCode, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    ensure_user_access(&auth_user, user_id)?;
+    user_exists(&state.db, user_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_user_image_by_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, _image_type, image_index)): Path<(Uuid, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    ensure_user_access(&auth_user, user_id)?;
+    user_exists(&state.db, user_id).await?;
+    validate_image_index(&image_index)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn item_remote_images(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    Ok(Json(query_result(Vec::new())))
+}
+
+async fn item_remote_image_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    Ok(empty_json_array().await)
+}
+
+async fn download_remote_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn user_exists(db: &Database, user_id: Uuid) -> Result<(), ApiError> {
+    if db.users().await?.into_iter().any(|user| user.id == user_id) {
+        Ok(())
+    } else {
+        Err(ApiError::not_found("User not found"))
+    }
+}
+
+fn validate_image_index(image_index: &str) -> Result<(), ApiError> {
+    image_index
+        .parse::<usize>()
+        .map(|_| ())
+        .map_err(|_| ApiError::bad_request("Invalid image index"))
 }
 
 async fn media_item_or_folder_by_id(db: &Database, item_id: &str) -> Result<(), ApiError> {
@@ -16789,6 +17258,239 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prefixed_item_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(prefixed_item_images.as_array().unwrap().len(), 0);
+
+        for (method, endpoint) in [
+            (
+                Method::GET,
+                format!("/Image/Items/{item_id}/Images/Primary"),
+            ),
+            (
+                Method::HEAD,
+                format!("/Image/Items/{item_id}/Images/Primary/0"),
+            ),
+            (
+                Method::GET,
+                format!("/Image/Items/{item_id}/Images/Primary/0/tag/png/320/180/0/0"),
+            ),
+            (
+                Method::GET,
+                "/Image/Genres/Drama/Images/Primary".to_string(),
+            ),
+            (
+                Method::HEAD,
+                "/Image/MusicGenres/Rock/Images/Primary/0".to_string(),
+            ),
+            (
+                Method::GET,
+                "/Image/Persons/Example/Images/Primary".to_string(),
+            ),
+            (
+                Method::HEAD,
+                "/Image/Studios/Example/Images/Primary/0".to_string(),
+            ),
+            (
+                Method::GET,
+                "/Image/Artists/Example/Images/Primary/0".to_string(),
+            ),
+            (Method::GET, "/Image/Branding/Splashscreen".to_string()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method:?}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/png"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Image/Items/{item_id}/Images/Primary/not-an-index"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        for (method, endpoint) in [
+            (
+                Method::POST,
+                format!("/Image/Items/{item_id}/Images/Primary"),
+            ),
+            (
+                Method::DELETE,
+                format!("/Image/Items/{item_id}/Images/Primary/0"),
+            ),
+            (
+                Method::POST,
+                format!("/Image/Items/{item_id}/Images/Primary/0/Index"),
+            ),
+            (Method::POST, "/Image/Branding/Splashscreen".to_string()),
+            (Method::DELETE, "/Image/Branding/Splashscreen".to_string()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(endpoint.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::from("fake image"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        for (method, endpoint) in [
+            (Method::GET, "/Image/UserImage".to_string()),
+            (
+                Method::HEAD,
+                format!("/Image/Users/{user_id}/Images/Primary"),
+            ),
+            (
+                Method::GET,
+                format!("/Image/Users/{user_id}/Images/Primary/0"),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/png"
+            );
+        }
+
+        for (method, endpoint) in [
+            (Method::POST, "/Image/UserImage".to_string()),
+            (
+                Method::DELETE,
+                format!("/Image/Users/{user_id}/Images/Primary"),
+            ),
+            (
+                Method::POST,
+                format!("/Image/Users/{user_id}/Images/Primary/0"),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::from("fake image"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/RemoteImage/Items/{item_id}/RemoteImages"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_images["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages/Providers"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_providers: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_providers.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages/Download"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
