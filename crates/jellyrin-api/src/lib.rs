@@ -481,6 +481,14 @@ pub fn router(state: AppState) -> Router {
         .route("/system/endpoint", get(system_endpoint))
         .route("/Playback/BitrateTest", get(bitrate_test))
         .route("/playback/bitratetest", get(bitrate_test))
+        .route(
+            "/Videos/ActiveEncodings",
+            get(authenticated_empty_json_array),
+        )
+        .route(
+            "/videos/activeencodings",
+            get(authenticated_empty_json_array),
+        )
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
         .route("/Items/Counts", get(item_counts))
@@ -13681,6 +13689,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let active_encodings_api_key = db
+            .issue_api_key_for_user(user.id, "active-encoding-test-key")
+            .await
+            .unwrap();
+        let active_encodings_app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = active_encodings_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Videos/ActiveEncodings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = active_encodings_app
+            .oneshot(
+                Request::builder()
+                    .uri("/videos/activeencodings")
+                    .header("X-Emby-Token", &active_encodings_api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let active_encodings: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(active_encodings, json!([]));
     }
 
     #[tokio::test]
