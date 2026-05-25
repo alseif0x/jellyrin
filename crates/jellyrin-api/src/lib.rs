@@ -9264,17 +9264,18 @@ async fn resume_items(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let server_id = state.db.server_state().await?.server_id.to_string();
-    let items = state
-        .db
-        .resume_items_for_user(user.id, 20)
-        .await?
-        .iter()
-        .map(|(item, playback)| media_item_to_json_with_playback(item, &server_id, Some(playback)))
-        .collect();
-    Ok(Json(query_result(items)))
+    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let items_query = parse_items_query(raw_query.as_deref());
+    let requested_user_id = items_query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    resume_items_result(&state.db, requested_user_id, &items_query).await
 }
 
 async fn user_resume_items(
@@ -9282,19 +9283,51 @@ async fn user_resume_items(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Path(user_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    let server_id = state.db.server_state().await?.server_id.to_string();
-    let items = state
-        .db
-        .resume_items_for_user(requested_user_id, 20)
-        .await?
+    let items_query = parse_items_query(raw_query.as_deref());
+    resume_items_result(&state.db, requested_user_id, &items_query).await
+}
+
+async fn resume_items_result(
+    db: &Database,
+    user_id: Uuid,
+    query: &ItemsQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let resume_items = db.resume_items_for_user(user_id, i64::MAX).await?;
+    let resume_order = resume_items
         .iter()
-        .map(|(item, playback)| media_item_to_json_with_playback(item, &server_id, Some(playback)))
-        .collect();
-    Ok(Json(query_result(items)))
+        .enumerate()
+        .map(|(index, (item, _))| (item.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut items = filtered_media_items(
+        resume_items.into_iter().map(|(item, _)| item).collect(),
+        query,
+        Some(user_id),
+        db,
+    )
+    .await?;
+    if query.sort_by.is_none() {
+        items.sort_by_key(|item| resume_order.get(&item.id).copied().unwrap_or(usize::MAX));
+    }
+    let total_record_count = items.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let server_id = db.server_state().await?.server_id.to_string();
+    let items = items_to_json(
+        db,
+        paged_media_items(items, query),
+        &server_id,
+        Some(user_id),
+    )
+    .await?;
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        start_index,
+    )))
 }
 
 async fn root_folder(
@@ -30437,6 +30470,32 @@ mod tests {
         let second_item_id = second_audio.id.simple().to_string();
         let parent_id = first_audio.virtual_folder_id.simple().to_string();
         test_db
+            .upsert_playback_state(UpsertPlaybackState {
+                user_id: user.id,
+                item_id: first_audio.id,
+                media_source_id: Some(first_audio.id.simple().to_string()),
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                position_ticks: 111_000_000,
+                is_paused: false,
+                played: false,
+            })
+            .await
+            .unwrap();
+        test_db
+            .upsert_playback_state(UpsertPlaybackState {
+                user_id: user.id,
+                item_id: second_audio.id,
+                media_source_id: Some(second_audio.id.simple().to_string()),
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                position_ticks: 222_000_000,
+                is_paused: false,
+                played: false,
+            })
+            .await
+            .unwrap();
+        test_db
             .update_media_item_metadata(
                 first_audio.id,
                 json!({ "MusicGenres": ["Rock"], "Genres": ["Audio Genre"] }),
@@ -30464,6 +30523,68 @@ mod tests {
         let counts: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(counts["SongCount"], 2);
         assert_eq!(counts["ItemCount"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/UserItems/Resume?IncludeItemTypes=Audio&SortBy=SortName&StartIndex=1&Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let paged_resume: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged_resume["TotalRecordCount"], 2);
+        assert_eq!(paged_resume["StartIndex"], 1);
+        assert_eq!(paged_resume["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(paged_resume["Items"][0]["Id"], second_item_id);
+        assert_eq!(
+            paged_resume["Items"][0]["UserData"]["PlaybackPositionTicks"],
+            222_000_000
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Users/{user_id}/Items/Resume?MediaTypes=Audio&SortBy=SortName&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_resume: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_resume["TotalRecordCount"], 2);
+        assert_eq!(user_resume["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(user_resume["Items"][0]["Id"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/UserItems/Resume?UserId={user_id}&SearchTerm=Second&Limit=5"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let searched_resume: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(searched_resume["TotalRecordCount"], 1);
+        assert_eq!(searched_resume["Items"][0]["Id"], second_item_id);
 
         let response = app
             .clone()
