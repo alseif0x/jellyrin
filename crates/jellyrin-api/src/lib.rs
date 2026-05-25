@@ -1436,8 +1436,8 @@ pub fn router(state: AppState) -> Router {
         .route("/items/items", get(items_result))
         .route("/Items/Latest", get(latest_items))
         .route("/items/latest", get(latest_items))
-        .route("/UserLibrary/Items/Latest", get(latest_items))
-        .route("/userlibrary/items/latest", get(latest_items))
+        .route("/UserLibrary/Items/Latest", get(current_user_latest_items))
+        .route("/userlibrary/items/latest", get(current_user_latest_items))
         .route("/Items/Filters", get(item_filters))
         .route("/items/filters", get(item_filters))
         .route("/Items/Filters2", get(query_filters))
@@ -1966,8 +1966,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/UserLibrary/Items/Root", get(root_folder))
         .route("/userlibrary/items/root", get(root_folder))
-        .route("/UserLibrary/Items/{item_id}", get(item_detail))
-        .route("/userlibrary/items/{item_id}", get(item_detail))
+        .route("/UserLibrary/Items/{item_id}", get(current_user_item_detail))
+        .route("/userlibrary/items/{item_id}", get(current_user_item_detail))
         .route("/Library/Items/{item_id}/Download", get(direct_stream_item))
         .route("/library/items/{item_id}/download", get(direct_stream_item))
         .route("/Library/Items/{item_id}/File", get(direct_stream_item))
@@ -8980,6 +8980,49 @@ async fn latest_items(
     ))
 }
 
+async fn current_user_latest_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let mut filtered_items = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    filtered_items.sort_by(|left, right| {
+        compare_media_items(
+            right,
+            left,
+            &[SortField::DateLastMediaAdded, SortField::SortName],
+        )
+    });
+    let limit = query.limit.unwrap_or(20).min(100);
+    Ok(Json(
+        items_to_json(
+            &state.db,
+            filtered_items.into_iter().take(limit).collect(),
+            &server_id,
+            Some(requested_user_id),
+        )
+        .await?,
+    ))
+}
+
 async fn user_latest_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9312,6 +9355,47 @@ async fn item_detail(
         .find(|item| item.id == requested_id)
         .ok_or_else(|| ApiError::not_found("Item not found"))?;
     Ok(Json(media_item_to_json(&item, &server_id)))
+}
+
+async fn current_user_item_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let query = parse_items_query(raw_query.as_deref());
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(folder) = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == requested_id)
+    {
+        return Ok(Json(user_view_to_json(&folder, &server_id)));
+    }
+
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let playback = state
+        .db
+        .playback_state_for_item(requested_user_id, item.id)
+        .await?;
+    Ok(Json(media_item_to_json_with_playback(
+        &item,
+        &server_id,
+        playback.as_ref(),
+    )))
 }
 
 async fn user_item_detail(
@@ -23899,6 +23983,51 @@ mod tests {
         let updated_user_data: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(updated_user_data["Played"], true);
         assert_eq!(updated_user_data["PlaybackPositionTicks"], 321);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserLibrary/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let current_user_library_detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(current_user_library_detail["Id"], item_id);
+        assert_eq!(current_user_library_detail["UserData"]["Played"], true);
+        assert_eq!(
+            current_user_library_detail["UserData"]["PlaybackPositionTicks"],
+            321
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/UserLibrary/Items/Latest?ParentId={parent_id}&IncludeItemTypes=Movie&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let current_user_latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(current_user_latest.as_array().unwrap().len(), 1);
+        assert_eq!(current_user_latest[0]["Id"], item_id);
+        assert_eq!(current_user_latest[0]["UserData"]["Played"], true);
+        assert_eq!(
+            current_user_latest[0]["UserData"]["PlaybackPositionTicks"],
+            321
+        );
 
         let response = app
             .clone()
