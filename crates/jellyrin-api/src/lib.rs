@@ -54,6 +54,7 @@ const DEFAULT_AUTHENTICATION_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider";
 const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
+const SYNCPLAY_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
@@ -61,6 +62,7 @@ const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
 static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
 static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AppState {
@@ -74,6 +76,23 @@ pub struct AppState {
 struct PlaybackEvent {
     session_id: String,
     message: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct SyncPlayGroup {
+    id: String,
+    name: String,
+    owner_user_id: Uuid,
+    participants: BTreeMap<String, SyncPlayParticipant>,
+    state: serde_json::Value,
+    updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+struct SyncPlayParticipant {
+    user_id: Uuid,
+    user_name: String,
+    session_id: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -597,8 +616,50 @@ pub fn router(state: AppState) -> Router {
             "/users/authenticatewithquickconnect",
             post(authenticate_with_quick_connect),
         )
-        .route("/SyncPlay/List", get(empty_json_array))
-        .route("/syncplay/list", get(empty_json_array))
+        .route("/SyncPlay/List", get(syncplay_list))
+        .route("/syncplay/list", get(syncplay_list))
+        .route("/SyncPlay/New", post(syncplay_new))
+        .route("/syncplay/new", post(syncplay_new))
+        .route("/SyncPlay/Join", post(syncplay_join))
+        .route("/syncplay/join", post(syncplay_join))
+        .route("/SyncPlay/Leave", post(syncplay_leave))
+        .route("/syncplay/leave", post(syncplay_leave))
+        .route("/SyncPlay/Ping", post(syncplay_ping))
+        .route("/syncplay/ping", post(syncplay_ping))
+        .route("/SyncPlay/Buffering", post(syncplay_group_command))
+        .route("/syncplay/buffering", post(syncplay_group_command))
+        .route("/SyncPlay/MovePlaylistItem", post(syncplay_group_command))
+        .route("/syncplay/moveplaylistitem", post(syncplay_group_command))
+        .route("/SyncPlay/NextItem", post(syncplay_group_command))
+        .route("/syncplay/nextitem", post(syncplay_group_command))
+        .route("/SyncPlay/Pause", post(syncplay_group_command))
+        .route("/syncplay/pause", post(syncplay_group_command))
+        .route("/SyncPlay/PreviousItem", post(syncplay_group_command))
+        .route("/syncplay/previousitem", post(syncplay_group_command))
+        .route("/SyncPlay/Queue", post(syncplay_group_command))
+        .route("/syncplay/queue", post(syncplay_group_command))
+        .route("/SyncPlay/Ready", post(syncplay_group_command))
+        .route("/syncplay/ready", post(syncplay_group_command))
+        .route("/SyncPlay/RemoveFromPlaylist", post(syncplay_group_command))
+        .route("/syncplay/removefromplaylist", post(syncplay_group_command))
+        .route("/SyncPlay/Seek", post(syncplay_group_command))
+        .route("/syncplay/seek", post(syncplay_group_command))
+        .route("/SyncPlay/SetIgnoreWait", post(syncplay_group_command))
+        .route("/syncplay/setignorewait", post(syncplay_group_command))
+        .route("/SyncPlay/SetNewQueue", post(syncplay_group_command))
+        .route("/syncplay/setnewqueue", post(syncplay_group_command))
+        .route("/SyncPlay/SetPlaylistItem", post(syncplay_group_command))
+        .route("/syncplay/setplaylistitem", post(syncplay_group_command))
+        .route("/SyncPlay/SetRepeatMode", post(syncplay_group_command))
+        .route("/syncplay/setrepeatmode", post(syncplay_group_command))
+        .route("/SyncPlay/SetShuffleMode", post(syncplay_group_command))
+        .route("/syncplay/setshufflemode", post(syncplay_group_command))
+        .route("/SyncPlay/Stop", post(syncplay_group_command))
+        .route("/syncplay/stop", post(syncplay_group_command))
+        .route("/SyncPlay/Unpause", post(syncplay_group_command))
+        .route("/syncplay/unpause", post(syncplay_group_command))
+        .route("/SyncPlay/{id}", get(syncplay_group))
+        .route("/syncplay/{id}", get(syncplay_group))
         .route("/LiveTv/Info", get(live_tv_info))
         .route("/livetv/info", get(live_tv_info))
         .route("/LiveTv/GuideInfo", get(live_tv_guide_info))
@@ -6297,6 +6358,190 @@ fn quick_connect_json(session: &QuickConnectSession) -> serde_json::Value {
 
 async fn empty_json_array() -> Json<Vec<serde_json::Value>> {
     Json(Vec::new())
+}
+
+fn syncplay_groups() -> &'static Mutex<HashMap<String, SyncPlayGroup>> {
+    SYNCPLAY_GROUPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn optional_json_body(body: Body) -> Result<serde_json::Value, ApiError> {
+    let bytes = to_bytes(body, SYNCPLAY_REQUEST_LIMIT_BYTES).await?;
+    if bytes.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ApiError::bad_request("Invalid JSON body"))
+}
+
+fn json_string_any_field(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        payload
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn syncplay_participant(user: &User, token: &DeviceToken) -> SyncPlayParticipant {
+    SyncPlayParticipant {
+        user_id: user.id,
+        user_name: user.name.clone(),
+        session_id: token.access_token.clone(),
+    }
+}
+
+fn syncplay_group_json(group: &SyncPlayGroup) -> serde_json::Value {
+    let participants = group
+        .participants
+        .values()
+        .map(|participant| {
+            serde_json::json!({
+                "UserId": participant.user_id,
+                "UserName": participant.user_name,
+                "SessionId": participant.session_id,
+                "IsGroupOwner": participant.user_id == group.owner_user_id
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "GroupId": group.id,
+        "Id": group.id,
+        "Name": group.name,
+        "Participants": participants,
+        "State": group.state,
+        "LastActivityDate": format_time_for_json(group.updated_at)
+    })
+}
+
+async fn syncplay_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let groups = syncplay_groups().lock().await;
+    Ok(Json(groups.values().map(syncplay_group_json).collect()))
+}
+
+async fn syncplay_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let groups = syncplay_groups().lock().await;
+    let group = groups
+        .get(id.trim())
+        .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
+    Ok(Json(syncplay_group_json(group)))
+}
+
+async fn syncplay_new(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    body: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let payload = optional_json_body(body).await?;
+    let group_id = json_string_any_field(&payload, &["GroupId", "Id"])
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let name = json_string_any_field(&payload, &["Name", "GroupName"])
+        .unwrap_or_else(|| format!("{}'s group", user.name));
+    let participant = syncplay_participant(&user, &token);
+    let mut participants = BTreeMap::new();
+    participants.insert(participant.session_id.clone(), participant);
+    let group = SyncPlayGroup {
+        id: group_id.clone(),
+        name,
+        owner_user_id: user.id,
+        participants,
+        state: serde_json::json!({
+            "PlayState": "Idle",
+            "PositionTicks": 0,
+            "IsPaused": false,
+            "Queue": []
+        }),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let response = syncplay_group_json(&group);
+    syncplay_groups().lock().await.insert(group_id, group);
+    Ok(Json(response))
+}
+
+async fn syncplay_join(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    body: Body,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let payload = optional_json_body(body).await?;
+    let group_id = json_string_any_field(&payload, &["GroupId", "Id"])
+        .ok_or_else(|| ApiError::bad_request("SyncPlay group id is required"))?;
+    let mut groups = syncplay_groups().lock().await;
+    let group = groups
+        .get_mut(group_id.trim())
+        .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
+    let participant = syncplay_participant(&user, &token);
+    group
+        .participants
+        .insert(participant.session_id.clone(), participant);
+    group.updated_at = OffsetDateTime::now_utc();
+    Ok(Json(syncplay_group_json(group)))
+}
+
+async fn syncplay_leave(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    let (_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let mut groups = syncplay_groups().lock().await;
+    let mut empty_groups = Vec::new();
+    for group in groups.values_mut() {
+        group.participants.remove(&token.access_token);
+        group.updated_at = OffsetDateTime::now_utc();
+        if group.participants.is_empty() {
+            empty_groups.push(group.id.clone());
+        }
+    }
+    for group_id in empty_groups {
+        groups.remove(&group_id);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn syncplay_ping(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn syncplay_group_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    let (_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let payload = optional_json_body(body).await?;
+    let mut groups = syncplay_groups().lock().await;
+    let group = groups
+        .values_mut()
+        .find(|group| group.participants.contains_key(&token.access_token))
+        .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
+    group.state = serde_json::json!({
+        "LastCommand": payload,
+        "LastCommandDate": format_time_for_json(OffsetDateTime::now_utc())
+    });
+    group.updated_at = OffsetDateTime::now_utc();
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn live_tv_info() -> Json<serde_json::Value> {
@@ -15319,6 +15564,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     fn assert_hls_transcode_playback_info(info: &Value, item_id: &str, api_key: &str) -> String {
         assert_eq!(info["ErrorCode"], Value::Null);
@@ -20441,6 +20687,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/items/00000000-0000-0000-0000-000000000000/images/Primary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn syncplay_routes_manage_in_memory_group_shell() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "syncplay-key")
+            .await
+            .unwrap();
+        db.complete_startup_wizard().await.unwrap();
+        let group_id = Uuid::new_v4().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -20450,15 +20728,147 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(
+                        json!({ "GroupId": group_id, "Name": "Rust sync shell" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let syncplay: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(syncplay.as_array().unwrap().len(), 0);
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["GroupId"], group_id);
+        assert_eq!(created["Name"], "Rust sync shell");
+        assert_eq!(created["Participants"].as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/syncplay/list")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let groups: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            groups
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group["GroupId"] == group_id)
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fetched: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched["Id"], group_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/syncplay/join")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Ping")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        for endpoint in [
+            "/SyncPlay/Buffering",
+            "/SyncPlay/MovePlaylistItem",
+            "/SyncPlay/NextItem",
+            "/syncplay/pause",
+            "/SyncPlay/PreviousItem",
+            "/SyncPlay/Queue",
+            "/SyncPlay/Ready",
+            "/SyncPlay/RemoveFromPlaylist",
+            "/SyncPlay/Seek",
+            "/SyncPlay/SetIgnoreWait",
+            "/SyncPlay/SetNewQueue",
+            "/SyncPlay/SetPlaylistItem",
+            "/SyncPlay/SetRepeatMode",
+            "/SyncPlay/SetShuffleMode",
+            "/SyncPlay/Stop",
+            "/SyncPlay/Unpause",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::from(json!({ "PositionTicks": 100 }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Leave")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/items/00000000-0000-0000-0000-000000000000/images/Primary")
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
