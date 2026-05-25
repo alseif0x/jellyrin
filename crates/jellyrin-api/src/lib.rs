@@ -1507,11 +1507,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Users/{user_id}/Items/{item_id}/Intros",
-            get(user_item_empty_items),
+            get(user_item_intros),
         )
         .route(
             "/users/{user_id}/items/{item_id}/intros",
-            get(user_item_empty_items),
+            get(user_item_intros),
         )
         .route(
             "/Items/{item_id}/Images",
@@ -1603,27 +1603,27 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/UserLibrary/Items/{item_id}/Intros",
-            get(authenticated_item_empty_items),
+            get(authenticated_item_intros),
         )
         .route(
             "/userlibrary/items/{item_id}/intros",
-            get(authenticated_item_empty_items),
+            get(authenticated_item_intros),
         )
         .route(
             "/UserLibrary/Items/{item_id}/LocalTrailers",
-            get(authenticated_item_empty_items),
+            get(authenticated_item_local_trailers),
         )
         .route(
             "/userlibrary/items/{item_id}/localtrailers",
-            get(authenticated_item_empty_items),
+            get(authenticated_item_local_trailers),
         )
         .route(
             "/UserLibrary/Items/{item_id}/SpecialFeatures",
-            get(authenticated_item_empty_items),
+            get(authenticated_item_special_features),
         )
         .route(
             "/userlibrary/items/{item_id}/specialfeatures",
-            get(authenticated_item_empty_items),
+            get(authenticated_item_special_features),
         )
         .route("/Items/{item_id}/PlaybackInfo", get(item_playback_info))
         .route("/items/{item_id}/playbackinfo", get(item_playback_info))
@@ -2031,27 +2031,27 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/UserLibrary/Users/{user_id}/Items/{item_id}/Intros",
-            get(user_item_empty_items),
+            get(user_item_intros),
         )
         .route(
             "/userlibrary/users/{user_id}/items/{item_id}/intros",
-            get(user_item_empty_items),
+            get(user_item_intros),
         )
         .route(
             "/UserLibrary/Users/{user_id}/Items/{item_id}/LocalTrailers",
-            get(user_item_empty_items),
+            get(user_item_local_trailers),
         )
         .route(
             "/userlibrary/users/{user_id}/items/{item_id}/localtrailers",
-            get(user_item_empty_items),
+            get(user_item_local_trailers),
         )
         .route(
             "/UserLibrary/Users/{user_id}/Items/{item_id}/SpecialFeatures",
-            get(user_item_empty_items),
+            get(user_item_special_features),
         )
         .route(
             "/userlibrary/users/{user_id}/items/{item_id}/specialfeatures",
-            get(user_item_empty_items),
+            get(user_item_special_features),
         )
         .route(
             "/UserLibrary/UserFavoriteItems/{item_id}",
@@ -11359,7 +11359,16 @@ async fn video_additional_parts(
         return Err(ApiError::not_found("Video item not found"));
     }
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let versions = state.db.media_item_versions(item.id).await?;
+    let mut versions = state.db.media_item_versions(item.id).await?;
+    let discovered_parts =
+        local_sidecar_items(&state.db, &item, SidecarKind::AdditionalPart).await?;
+    let mut seen_ids = versions.iter().map(|item| item.id).collect::<HashSet<_>>();
+    for part in discovered_parts {
+        if seen_ids.insert(part.id) {
+            versions.push(part);
+        }
+    }
+    versions.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
     let total_record_count = versions.len();
     let items = items_to_json(&state.db, versions, &server_id, Some(user.id)).await?;
     Ok(Json(query_result_with_total(items, total_record_count, 0)))
@@ -14981,28 +14990,234 @@ async fn channels(
     )))
 }
 
-async fn authenticated_item_empty_items(
+async fn authenticated_item_intros(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
-    Ok(empty_items_result().await)
+    authenticated_item_sidecars(state, headers, query, item_id, SidecarKind::Intro).await
 }
 
-async fn user_item_empty_items(
+async fn authenticated_item_local_trailers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authenticated_item_sidecars(state, headers, query, item_id, SidecarKind::LocalTrailer).await
+}
+
+async fn authenticated_item_special_features(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authenticated_item_sidecars(state, headers, query, item_id, SidecarKind::SpecialFeature).await
+}
+
+async fn user_item_intros(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    user_item_sidecars(state, headers, query, user_id, item_id, SidecarKind::Intro).await
+}
+
+async fn user_item_local_trailers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user_item_sidecars(
+        state,
+        headers,
+        query,
+        user_id,
+        item_id,
+        SidecarKind::LocalTrailer,
+    )
+    .await
+}
+
+async fn user_item_special_features(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((user_id, item_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    user_item_sidecars(
+        state,
+        headers,
+        query,
+        user_id,
+        item_id,
+        SidecarKind::SpecialFeature,
+    )
+    .await
+}
+
+async fn authenticated_item_sidecars(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    item_id: String,
+    kind: SidecarKind,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    local_sidecar_result(&state.db, &item, user.id, kind).await
+}
+
+async fn user_item_sidecars(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    user_id: String,
+    item_id: String,
+    kind: SidecarKind,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, user_id)?;
-    media_item_by_id(&state.db, &item_id).await?;
-    Ok(empty_items_result().await)
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    local_sidecar_result(&state.db, &item, user_id, kind).await
+}
+
+async fn local_sidecar_result(
+    db: &Database,
+    source: &MediaItem,
+    user_id: Uuid,
+    kind: SidecarKind,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let server_id = db.server_state().await?.server_id.to_string();
+    let items = local_sidecar_items(db, source, kind).await?;
+    let total_record_count = items.len();
+    Ok(Json(query_result_with_total(
+        items_to_json(db, items, &server_id, Some(user_id)).await?,
+        total_record_count,
+        0,
+    )))
+}
+
+#[derive(Clone, Copy)]
+enum SidecarKind {
+    Intro,
+    LocalTrailer,
+    SpecialFeature,
+    AdditionalPart,
+}
+
+async fn local_sidecar_items(
+    db: &Database,
+    source: &MediaItem,
+    kind: SidecarKind,
+) -> Result<Vec<MediaItem>, ApiError> {
+    let mut items = db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| is_local_sidecar_item(source, item, kind))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+    Ok(items)
+}
+
+fn is_local_sidecar_item(source: &MediaItem, item: &MediaItem, kind: SidecarKind) -> bool {
+    if item.id == source.id || item.virtual_folder_id != source.virtual_folder_id {
+        return false;
+    }
+    if item.media_type != "Video" {
+        return false;
+    }
+    let source_path = media_item_path(source);
+    let item_path = media_item_path(item);
+    let source_parent = source_path.parent();
+    let item_parent = item_path.parent();
+    let source_stem = normalized_path_stem(source_path);
+    let item_stem = normalized_path_stem(item_path);
+    let parent_name = item_parent
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .map(normalized_sidecar_text)
+        .unwrap_or_default();
+
+    match kind {
+        SidecarKind::Intro => {
+            is_same_or_child_parent(source_parent, item_parent)
+                && (parent_name == "intros"
+                    || parent_name == "intro"
+                    || item_stem == "intro"
+                    || item_stem == "intros")
+        }
+        SidecarKind::LocalTrailer => {
+            is_same_or_child_parent(source_parent, item_parent)
+                && (parent_name == "trailers"
+                    || parent_name == "trailer"
+                    || item_stem == "trailer"
+                    || item_stem == format!("{source_stem} trailer")
+                    || item_stem == format!("{source_stem} local trailer")
+                    || item_stem.ends_with(" trailer")
+                    || item_stem.ends_with(" local trailer"))
+        }
+        SidecarKind::SpecialFeature => {
+            is_same_or_child_parent(source_parent, item_parent)
+                && (matches!(
+                    parent_name.as_str(),
+                    "extras"
+                        | "specials"
+                        | "special features"
+                        | "featurettes"
+                        | "deleted scenes"
+                        | "behind the scenes"
+                ) || item_stem.ends_with(" featurette")
+                    || item_stem.ends_with(" special feature")
+                    || item_stem.ends_with(" deleted scene")
+                    || item_stem.ends_with(" behind the scenes")
+                    || item_stem.ends_with(" interview")
+                    || item_stem.ends_with(" extra"))
+        }
+        SidecarKind::AdditionalPart => {
+            source_parent == item_parent
+                && (item_stem.starts_with(&format!("{source_stem} part "))
+                    || item_stem.starts_with(&format!("{source_stem} cd"))
+                    || item_stem.starts_with(&format!("{source_stem} disc"))
+                    || item_stem.starts_with(&format!("{source_stem} disk"))
+                    || item_stem.starts_with(&format!("{source_stem} pt ")))
+        }
+    }
+}
+
+fn is_same_or_child_parent(
+    source_parent: Option<&std::path::Path>,
+    item_parent: Option<&std::path::Path>,
+) -> bool {
+    match (source_parent, item_parent) {
+        (Some(source_parent), Some(item_parent)) => {
+            item_parent == source_parent || item_parent.parent() == Some(source_parent)
+        }
+        _ => false,
+    }
+}
+
+fn normalized_path_stem(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(normalized_sidecar_text)
+        .unwrap_or_default()
+}
+
+fn normalized_sidecar_text(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-', '.'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn delete_library_items(
@@ -23978,12 +24193,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn userlibrary_root_and_empty_item_children_validate_contract() {
+    async fn userlibrary_root_and_local_item_children_validate_contract() {
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("Feature Movie.mp4"), b"fake video")
+        let movie = tmp.path().join("Feature Movie - main.mp4");
+        tokio::fs::write(&movie, b"fake source video")
             .await
             .unwrap();
+        tokio::fs::write(
+            tmp.path().join("Feature Movie - main - trailer.mp4"),
+            b"fake local trailer",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("Feature Movie - main - featurette.mp4"),
+            b"fake local special featurette",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tmp.path().join("Feature Movie - main - part 2.mp4"),
+            b"fake additional part video",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir(tmp.path().join("intros"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("intros").join("intro.mp4"),
+            b"fake intro preroll clip",
+        )
+        .await
+        .unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let admin = db
@@ -23999,6 +24242,7 @@ mod tests {
             .issue_api_key_for_user(viewer.id, "viewer-key")
             .await
             .unwrap();
+        let test_db = db.clone();
         let admin_id = admin.id.simple().to_string();
         let viewer_id = viewer.id.simple().to_string();
         let app = router(AppState {
@@ -24081,29 +24325,46 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Items?SearchTerm=Feature")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let items: Value = serde_json::from_slice(&body).unwrap();
-        let item_id = items["Items"][0]["Id"].as_str().unwrap();
+        let scanned_items = test_db.media_items().await.unwrap();
+        let item_id = scanned_items
+            .iter()
+            .find(|item| {
+                item.path == movie.to_string_lossy().as_ref() || item.name == "Feature Movie"
+            })
+            .map(|item| item.id.simple().to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Feature Movie item not scanned. Items: {:?}",
+                    scanned_items
+                        .iter()
+                        .map(|item| (&item.name, &item.path))
+                        .collect::<Vec<_>>()
+                )
+            });
 
-        for endpoint in [
-            format!("/UserLibrary/Items/{item_id}/Intros"),
-            format!("/UserLibrary/Items/{item_id}/LocalTrailers"),
-            format!("/UserLibrary/Items/{item_id}/SpecialFeatures"),
-            format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/Intros"),
-            format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/LocalTrailers"),
-            format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/SpecialFeatures"),
+        for (endpoint, expected_name) in [
+            (format!("/UserLibrary/Items/{item_id}/Intros"), "intro"),
+            (
+                format!("/UserLibrary/Items/{item_id}/LocalTrailers"),
+                "Feature Movie - main - trailer",
+            ),
+            (
+                format!("/UserLibrary/Items/{item_id}/SpecialFeatures"),
+                "Feature Movie - main - featurette",
+            ),
+            (
+                format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/Intros"),
+                "intro",
+            ),
+            (
+                format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/LocalTrailers"),
+                "Feature Movie - main - trailer",
+            ),
+            (
+                format!("/UserLibrary/Users/{admin_id}/Items/{item_id}/SpecialFeatures"),
+                "Feature Movie - main - featurette",
+            ),
+            (format!("/Users/{admin_id}/Items/{item_id}/Intros"), "intro"),
         ] {
             let response = app
                 .clone()
@@ -24119,10 +24380,32 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let result: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(result["TotalRecordCount"], 0);
+            assert_eq!(result["TotalRecordCount"], 1);
             assert_eq!(result["StartIndex"], 0);
-            assert_eq!(result["Items"].as_array().unwrap().len(), 0);
+            assert_eq!(result["Items"].as_array().unwrap().len(), 1);
+            assert_eq!(result["Items"][0]["Name"], expected_name);
+            assert_eq!(result["Items"][0]["MediaType"], "Video");
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/AdditionalParts"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let additional_parts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(additional_parts["TotalRecordCount"], 1);
+        assert_eq!(
+            additional_parts["Items"][0]["Name"],
+            "Feature Movie - main - part 2"
+        );
 
         let response = app
             .clone()
