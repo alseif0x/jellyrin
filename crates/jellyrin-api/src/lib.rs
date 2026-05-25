@@ -577,6 +577,10 @@ pub fn router(state: AppState) -> Router {
         .route("/audio/{item_id}/stream", get(direct_stream_audio))
         .route("/Audio/{item_id}/stream", head(direct_stream_audio_head))
         .route("/audio/{item_id}/stream", head(direct_stream_audio_head))
+        .route("/Audio/{item_id}/universal", get(universal_audio))
+        .route("/audio/{item_id}/universal", get(universal_audio))
+        .route("/Audio/{item_id}/universal", head(universal_audio_head))
+        .route("/audio/{item_id}/universal", head(universal_audio_head))
         .route(
             "/Audio/{item_id}/stream.{container}",
             get(direct_stream_audio_by_container),
@@ -5230,6 +5234,40 @@ async fn direct_stream_audio(
 }
 
 async fn direct_stream_audio_head(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Audio",
+        false,
+    )
+    .await
+}
+
+async fn universal_audio(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<StreamQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    direct_stream_media(
+        &state,
+        &headers,
+        query.api_key.as_deref(),
+        &item_id,
+        "Audio",
+        true,
+    )
+    .await
+}
+
+async fn universal_audio_head(
     State(state): State<AppState>,
     Path(item_id): Path<String>,
     headers: HeaderMap,
@@ -13030,6 +13068,7 @@ mod tests {
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        let user_id = user.id.simple().to_string();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -13556,6 +13595,56 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"fake");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Audio/{item_id}/universal?UserId={user_id}&DeviceId=test-device&MaxStreamingBitrate=128000"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=5-9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 5-9/10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"audio");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/audio/{item_id}/universal?Static=true"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
 
         let response = app
             .clone()
