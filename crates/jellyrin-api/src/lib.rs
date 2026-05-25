@@ -6788,20 +6788,68 @@ async fn merge_video_versions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     body: Option<Json<MergeVersionsBody>>,
 ) -> Result<StatusCode, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    if let Some(Json(body)) = body {
-        for item_id in body.ids {
-            let item = media_item_by_id(&state.db, &item_id).await?;
-            if item.media_type != "Video" {
-                return Err(ApiError::bad_request(
-                    "MergeVersions only supports video items",
-                ));
-            }
+    let mut video_ids: Vec<MediaItem> = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let requested_ids = merge_version_ids(raw_query.as_deref(), body.map(|body| body.0));
+    for item_id in requested_ids {
+        let item = media_item_by_id(&state.db, &item_id).await?;
+        if !seen_ids.insert(item.id) {
+            continue;
         }
+        if item.media_type != "Video" {
+            return Err(ApiError::bad_request(
+                "MergeVersions only supports video items",
+            ));
+        }
+        if let Some(first_item) = video_ids.first()
+            && item.virtual_folder_id != first_item.virtual_folder_id
+        {
+            return Err(ApiError::bad_request(
+                "MergeVersions only supports items in the same library",
+            ));
+        }
+        video_ids.push(item);
     }
+    if video_ids.len() < 2 {
+        return Err(ApiError::bad_request(
+            "MergeVersions requires at least two video ids",
+        ));
+    }
+    let primary_id = video_ids[0].id;
+    let alternate_ids = video_ids.iter().skip(1).map(|item| item.id).collect();
+    state
+        .db
+        .merge_media_item_versions(primary_id, alternate_ids)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn merge_version_ids(raw_query: Option<&str>, body: Option<MergeVersionsBody>) -> Vec<String> {
+    let query_ids = raw_query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(key, value)| key.eq_ignore_ascii_case("ids").then_some(value))
+        .map(split_comma_separated_ids)
+        .unwrap_or_default();
+    if query_ids.is_empty() {
+        body.map(|body| body.ids).unwrap_or_default()
+    } else {
+        query_ids
+    }
+}
+
+fn split_comma_separated_ids(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -6876,12 +6924,16 @@ async fn video_additional_parts(
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
     if item.media_type != "Video" {
         return Err(ApiError::not_found("Video item not found"));
     }
-    Ok(empty_items_result().await)
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let versions = state.db.media_item_versions(item.id).await?;
+    let total_record_count = versions.len();
+    let items = items_to_json(&state.db, versions, &server_id, Some(user.id)).await?;
+    Ok(Json(query_result_with_total(items, total_record_count, 0)))
 }
 
 async fn delete_video_alternate_sources(
@@ -6895,6 +6947,7 @@ async fn delete_video_alternate_sources(
     if item.media_type != "Video" {
         return Err(ApiError::not_found("Video item not found"));
     }
+    state.db.clear_media_item_versions(item.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15322,7 +15375,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
@@ -16798,6 +16851,69 @@ mod tests {
         let filtered_items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(filtered_items["TotalRecordCount"], 1);
         assert_eq!(filtered_items["Items"][0]["Id"], second_item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Videos/MergeVersions?ids={item_id},{second_item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/AdditionalParts"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let merged_parts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(merged_parts["TotalRecordCount"], 1);
+        assert_eq!(merged_parts["Items"][0]["Id"], second_item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Videos/{item_id}/AlternateSources"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{item_id}/AdditionalParts"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let cleared_parts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cleared_parts["TotalRecordCount"], 0);
 
         let response = app
             .clone()

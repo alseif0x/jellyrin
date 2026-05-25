@@ -2047,6 +2047,115 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn media_item_versions(&self, item_id: Uuid) -> anyhow::Result<Vec<MediaItem>> {
+        let item_id = item_id.to_string();
+        let links = sqlx::query_as::<_, MediaItemVersionRow>(
+            r#"
+            SELECT primary_item_id, alternate_item_id
+            FROM media_item_versions
+            WHERE primary_item_id = ?1 OR alternate_item_id = ?1
+            "#,
+        )
+        .bind(&item_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if links.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ids = HashSet::new();
+        for link in links {
+            ids.insert(link.primary_item_id);
+            ids.insert(link.alternate_item_id);
+        }
+        ids.remove(&item_id);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, virtual_folder_id, name, path, media_type, collection_type, \
+             file_size, runtime_ticks, bitrate, width, height, media_streams_json, \
+             created_at, updated_at \
+             FROM media_items \
+             WHERE missing_since IS NULL AND id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(") ORDER BY name COLLATE NOCASE");
+        let rows = query
+            .build_query_as::<MediaItemRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn merge_media_item_versions(
+        &self,
+        primary_item_id: Uuid,
+        alternate_item_ids: Vec<Uuid>,
+    ) -> anyhow::Result<()> {
+        let primary_item_id = primary_item_id.to_string();
+        let mut ids = Vec::new();
+        ids.push(primary_item_id.clone());
+        ids.extend(
+            alternate_item_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .filter(|id| id != &primary_item_id),
+        );
+        ids.sort();
+        ids.dedup();
+
+        let mut tx = self.pool.begin().await?;
+        for id in &ids {
+            sqlx::query(
+                r#"
+                DELETE FROM media_item_versions
+                WHERE primary_item_id = ?1 OR alternate_item_id = ?1
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let now = format_time(OffsetDateTime::now_utc())?;
+        for alternate_id in ids.iter().filter(|id| *id != &primary_item_id) {
+            sqlx::query(
+                r#"
+                INSERT INTO media_item_versions (primary_item_id, alternate_item_id, created_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(primary_item_id, alternate_item_id) DO NOTHING
+                "#,
+            )
+            .bind(&primary_item_id)
+            .bind(alternate_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn clear_media_item_versions(&self, item_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM media_item_versions
+            WHERE primary_item_id = ?1 OR alternate_item_id = ?1
+            "#,
+        )
+        .bind(item_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn latest_media_items(&self, limit: i64) -> anyhow::Result<Vec<MediaItem>> {
         let rows = sqlx::query_as::<_, MediaItemRow>(
             r#"
@@ -3092,6 +3201,12 @@ struct MediaItemRow {
 #[derive(sqlx::FromRow)]
 struct MediaItemIdRow {
     id: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MediaItemVersionRow {
+    primary_item_id: String,
+    alternate_item_id: String,
 }
 
 #[derive(sqlx::FromRow)]
