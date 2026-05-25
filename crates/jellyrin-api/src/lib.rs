@@ -627,6 +627,38 @@ pub fn router(state: AppState) -> Router {
             get(hls_segment),
         )
         .route(
+            "/DynamicHls/Audio/{item_id}/master.m3u8",
+            get(audio_hls_master_playlist),
+        )
+        .route(
+            "/dynamichls/audio/{item_id}/master.m3u8",
+            get(audio_hls_master_playlist),
+        )
+        .route(
+            "/DynamicHls/Audio/{item_id}/master.m3u8",
+            head(audio_hls_master_playlist_head),
+        )
+        .route(
+            "/dynamichls/audio/{item_id}/master.m3u8",
+            head(audio_hls_master_playlist_head),
+        )
+        .route(
+            "/DynamicHls/Audio/{item_id}/main.m3u8",
+            get(audio_hls_media_playlist),
+        )
+        .route(
+            "/dynamichls/audio/{item_id}/main.m3u8",
+            get(audio_hls_media_playlist),
+        )
+        .route(
+            "/DynamicHls/Audio/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(audio_hls_dynamic_segment),
+        )
+        .route(
+            "/dynamichls/audio/{item_id}/hls1/{playlist_id}/{segment_file}",
+            get(audio_hls_dynamic_segment),
+        )
+        .route(
             "/HlsSegment/Videos/{item_id}/hls/{playlist_id}/stream.m3u8",
             get(hls_legacy_media_playlist),
         )
@@ -641,6 +673,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/hlssegment/videos/{item_id}/hls/{playlist_id}/{segment_file}",
             get(hls_segment),
+        )
+        .route(
+            "/HlsSegment/Audio/{item_id}/hls/{segment_id}/stream.aac",
+            get(audio_hls_legacy_aac_segment),
+        )
+        .route(
+            "/hlssegment/audio/{item_id}/hls/{segment_id}/stream.aac",
+            get(audio_hls_legacy_aac_segment),
+        )
+        .route(
+            "/HlsSegment/Audio/{item_id}/hls/{segment_id}/stream.mp3",
+            get(audio_hls_legacy_mp3_segment),
+        )
+        .route(
+            "/hlssegment/audio/{item_id}/hls/{segment_id}/stream.mp3",
+            get(audio_hls_legacy_mp3_segment),
         )
         .route(
             "/Trickplay/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
@@ -7026,6 +7074,168 @@ async fn hls_segment_response(
         include_body,
     )
     .await
+}
+
+async fn audio_hls_master_playlist(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    audio_hls_master_playlist_response(
+        &state,
+        &headers,
+        &item_id,
+        query,
+        raw_query.as_deref(),
+        true,
+    )
+    .await
+}
+
+async fn audio_hls_master_playlist_head(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    audio_hls_master_playlist_response(
+        &state,
+        &headers,
+        &item_id,
+        query,
+        raw_query.as_deref(),
+        false,
+    )
+    .await
+}
+
+async fn audio_hls_media_playlist(
+    State(state): State<AppState>,
+    Path(item_id): Path<String>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    audio_hls_media_playlist_response(&state, &headers, &item_id, query, raw_query.as_deref()).await
+}
+
+async fn audio_hls_dynamic_segment(
+    State(state): State<AppState>,
+    Path((item_id, playlist_id, segment_file)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    if playlist_id != "main" {
+        return Err(ApiError::not_found("Audio HLS segment not found"));
+    }
+    let (segment_id, container) = parse_hls_segment_file(&segment_file)?;
+    audio_hls_segment_response(&state, &headers, &item_id, segment_id, container, query).await
+}
+
+async fn audio_hls_legacy_aac_segment(
+    State(state): State<AppState>,
+    Path((item_id, segment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let segment_id = parse_non_negative_i64(&segment_id, "Invalid audio HLS segment")?;
+    audio_hls_segment_response(&state, &headers, &item_id, segment_id, "aac", query).await
+}
+
+async fn audio_hls_legacy_mp3_segment(
+    State(state): State<AppState>,
+    Path((item_id, segment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HlsQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let segment_id = parse_non_negative_i64(&segment_id, "Invalid audio HLS segment")?;
+    audio_hls_segment_response(&state, &headers, &item_id, segment_id, "mp3", query).await
+}
+
+async fn audio_hls_master_playlist_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    query: HlsQuery,
+    raw_query: Option<&str>,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let item = audio_hls_item(state, headers, query.api_key.as_deref(), item_id).await?;
+    let playlist = render_hls_master_playlist(&HlsVariantInfo {
+        uri: append_query(HLS_MEDIA_PLAYLIST_NAME, raw_query),
+        bandwidth: item.bitrate.and_then(positive_u32).unwrap_or(192_000),
+        resolution: None,
+        codecs: hls_codecs(&item),
+    });
+    playlist_response(playlist, include_body)
+}
+
+async fn audio_hls_media_playlist_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    query: HlsQuery,
+    raw_query: Option<&str>,
+) -> Result<axum::response::Response, ApiError> {
+    let item = audio_hls_item(state, headers, query.api_key.as_deref(), item_id).await?;
+    let container = audio_hls_segment_container(&item)?;
+    let duration_seconds = item
+        .runtime_ticks
+        .and_then(|ticks| u64::try_from(ticks).ok())
+        .map(|ticks| (ticks as f64 / 10_000_000.0).max(1.0))
+        .unwrap_or(10.0);
+    let target_duration = duration_seconds.ceil().max(1.0) as u64;
+    let playlist = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:{duration_seconds:.3},\n{}\n#EXT-X-ENDLIST\n",
+        append_query(&format!("hls1/main/0.{container}"), raw_query)
+    );
+    playlist_response(playlist, true)
+}
+
+async fn audio_hls_segment_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: &str,
+    segment_id: i64,
+    container: &str,
+    query: HlsQuery,
+) -> Result<axum::response::Response, ApiError> {
+    if segment_id != 0 {
+        return Err(ApiError::not_found("Audio HLS segment not found"));
+    }
+    let item = audio_hls_item(state, headers, query.api_key.as_deref(), item_id).await?;
+    let item_container = audio_hls_segment_container(&item)?;
+    if !item_container.eq_ignore_ascii_case(container) {
+        return Err(ApiError::not_found("Audio HLS segment not found"));
+    }
+    stream_media_item(item, headers, true).await
+}
+
+async fn audio_hls_item(
+    state: &AppState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+    item_id: &str,
+) -> Result<MediaItem, ApiError> {
+    require_request_user(&state.db, headers, query_token).await?;
+    let item = media_item_by_id(&state.db, item_id).await?;
+    if item.media_type != "Audio" {
+        return Err(ApiError::not_found("Audio HLS item not found"));
+    }
+    Ok(item)
+}
+
+fn audio_hls_segment_container(item: &MediaItem) -> Result<String, ApiError> {
+    let container = media_item_container(item)
+        .ok_or_else(|| ApiError::not_found("Audio HLS segment not found"))?;
+    if matches!(container.as_str(), "aac" | "mp3") {
+        Ok(container)
+    } else {
+        Err(ApiError::not_found("Audio HLS segment not found"))
+    }
 }
 
 async fn trickplay_playlist(
@@ -16834,6 +17044,137 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"audio");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/DynamicHls/Audio/{item_id}/master.m3u8"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Audio/{item_id}/master.m3u8?PlaySessionId=audio-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.apple.mpegurl"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let audio_master = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            audio_master,
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=192000\nmain.m3u8?PlaySessionId=audio-hls\n"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/dynamichls/audio/{item_id}/master.m3u8"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DynamicHls/Audio/{item_id}/main.m3u8?api_key={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let audio_media_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(audio_media_playlist.contains("#EXT-X-TARGETDURATION:10"));
+        assert!(audio_media_playlist.contains(&format!("hls1/main/0.mp3?api_key={api_key}")));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/DynamicHls/Audio/{item_id}/hls1/main/0.mp3"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake audio");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/HlsSegment/Audio/{item_id}/hls/0/stream.mp3"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake audio");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/HlsSegment/Audio/{item_id}/hls/0/stream.aac"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/DynamicHls/Audio/{item_id}/hls1/main/1.mp3"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
