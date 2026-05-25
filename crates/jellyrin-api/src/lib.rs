@@ -2381,8 +2381,8 @@ pub fn router(state: AppState) -> Router {
             "/suggestions/users/{user_id}/suggestions",
             get(user_suggestions),
         )
-        .route("/Trailers", get(authenticated_empty_items))
-        .route("/trailers", get(authenticated_empty_items))
+        .route("/Trailers", get(remote_trailers))
+        .route("/trailers", get(remote_trailers))
         .route(
             "/Movies/Recommendations",
             get(movie_recommendations),
@@ -14377,6 +14377,73 @@ async fn metadata_years(
     .await
 }
 
+async fn remote_trailers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let mut scope_query = query.clone();
+    scope_query.search_term = None;
+    scope_query.name_starts_with = None;
+    scope_query.name_starts_with_or_greater = None;
+    scope_query.name_less_than = None;
+    scope_query.is_folder = None;
+    scope_query.filters = metadata_scope_filters(&query.filters);
+    scope_query.start_index = None;
+    scope_query.limit = None;
+    scope_query.sort_by = None;
+    scope_query.sort_order = None;
+    let scoped_items = filtered_items_for_query(
+        &state,
+        &headers,
+        auth_query.api_key.as_deref(),
+        &scope_query,
+    )
+    .await?;
+    let item_by_id = scoped_items
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<HashMap<_, _>>();
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let mut trailers = Vec::new();
+    for metadata in state.db.media_item_metadata().await? {
+        let Some(item) = item_by_id.get(&metadata.item_id) else {
+            continue;
+        };
+        trailers.extend(metadata_remote_trailers(
+            &metadata.payload,
+            item,
+            &server_id,
+        ));
+    }
+    trailers.retain(|trailer| remote_trailer_matches_query(trailer, &query));
+    trailers.sort_by(|left, right| {
+        left["SortName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .cmp(
+                &right["SortName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+    });
+    if metadata_sort_descending("Trailer", &query) {
+        trailers.reverse();
+    }
+    let total = trailers.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    Ok(Json(query_result_with_total(
+        trailers.into_iter().skip(start_index).take(limit).collect(),
+        total,
+        start_index,
+    )))
+}
+
 async fn metadata_genre_by_name(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -14543,6 +14610,110 @@ fn metadata_scope_filters(filters: &[String]) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+fn metadata_remote_trailers(
+    metadata: &serde_json::Value,
+    item: &MediaItem,
+    server_id: &str,
+) -> Vec<serde_json::Value> {
+    let mut trailers = Vec::new();
+    for key in ["RemoteTrailers", "Trailers"] {
+        if let Some(value) = metadata.get(key) {
+            collect_remote_trailer_values(value, item, server_id, &mut trailers);
+        }
+    }
+    trailers
+}
+
+fn collect_remote_trailer_values(
+    value: &serde_json::Value,
+    item: &MediaItem,
+    server_id: &str,
+    trailers: &mut Vec<serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_remote_trailer_values(value, item, server_id, trailers);
+            }
+        }
+        serde_json::Value::String(url) => {
+            if let Some(url) = non_empty_json_string(url) {
+                trailers.push(remote_trailer_json(item, server_id, url, None));
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let url = object
+                .get("Url")
+                .or_else(|| object.get("url"))
+                .or_else(|| object.get("Path"))
+                .or_else(|| object.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(non_empty_json_string);
+            if let Some(url) = url {
+                let name = object
+                    .get("Name")
+                    .or_else(|| object.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(non_empty_json_string);
+                trailers.push(remote_trailer_json(item, server_id, url, name));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn non_empty_json_string(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn remote_trailer_json(
+    item: &MediaItem,
+    server_id: &str,
+    url: &str,
+    name: Option<&str>,
+) -> serde_json::Value {
+    let source_id = item.id.simple().to_string();
+    let display_name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} Trailer", item.name));
+    serde_json::json!({
+        "Name": display_name,
+        "OriginalTitle": null,
+        "ServerId": server_id,
+        "Id": stable_entity_id("Trailer", &format!("{source_id}:{url}")),
+        "Etag": null,
+        "DateCreated": item.created_at.to_string(),
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": display_name,
+        "ForcedSortName": null,
+        "ExternalUrls": [{ "Name": "Trailer", "Url": url }],
+        "Path": url,
+        "Overview": "",
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [{ "Name": display_name, "Url": url }],
+        "ProviderIds": {},
+        "IsFolder": false,
+        "ParentId": source_id,
+        "Type": "Trailer",
+        "MediaType": "Video",
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "LocationType": "Remote"
+    })
+}
+
+fn remote_trailer_matches_query(trailer: &serde_json::Value, query: &ItemsQuery) -> bool {
+    let name = trailer["Name"].as_str().unwrap_or_default();
+    metadata_value_matches_query(name, query)
 }
 
 async fn metadata_entity_by_name(
@@ -33434,6 +33605,10 @@ mod tests {
                     "Album": "Example Album",
                     "AlbumName": "example album",
                     "Albums": ["Second Album"],
+                    "RemoteTrailers": [
+                        { "Name": "Main Trailer", "Url": "https://trailers.example/main.mp4" },
+                        "https://trailers.example/secondary.mp4"
+                    ],
                     "People": [{ "Name": "Jane Composer" }, "John Williams"],
                     "Studios": ["Studio One", { "Name": "Studio Two" }],
                     "ProductionYear": [1984, 1999]
@@ -33447,7 +33622,8 @@ mod tests {
                 json!({
                     "Genres": ["Other Genre"],
                     "Artists": ["Other Artist"],
-                    "Album": "Other Album"
+                    "Album": "Other Album",
+                    "RemoteTrailers": [{ "Name": "Other Trailer", "Url": "https://trailers.example/other.mp4" }]
                 }),
             )
             .await
@@ -33566,6 +33742,66 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let root_album_artists: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(root_album_artists, album_artists);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Trailers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        for (endpoint, expected_total, expected_first) in [
+            (
+                "/Trailers?SearchTerm=trailer&StartIndex=0&Limit=1".to_string(),
+                3,
+                "Main Trailer",
+            ),
+            (
+                "/trailers?SearchTerm=trailer&StartIndex=0&Limit=1".to_string(),
+                3,
+                "Main Trailer",
+            ),
+            (
+                format!("/Trailers?ParentId={parent_id}&SearchTerm=trailer"),
+                2,
+                "Main Trailer",
+            ),
+            (
+                format!("/Trailers?ParentId={other_parent_id}&SearchTerm=trailer"),
+                1,
+                "Other Trailer",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let trailers: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(trailers["TotalRecordCount"], expected_total);
+            assert_eq!(trailers["Items"][0]["Name"], expected_first);
+            assert_eq!(trailers["Items"][0]["Type"], "Trailer");
+            assert_eq!(trailers["Items"][0]["MediaType"], "Video");
+            assert!(
+                trailers["Items"][0]["RemoteTrailers"][0]["Url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("https://trailers.example/")
+            );
+        }
 
         let response = app
             .clone()
