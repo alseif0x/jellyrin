@@ -14017,7 +14017,14 @@ async fn search_hints(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
+    let mut query = parse_items_query(raw_query.as_deref());
+    let search_term = query
+        .search_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    query.search_term = None;
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
@@ -14031,18 +14038,32 @@ async fn search_hints(
         &state.db,
     )
     .await?;
+    let metadata = search_hint_metadata_values(&state.db, &items).await?;
+    let items = items
+        .into_iter()
+        .filter(|item| {
+            search_term
+                .as_deref()
+                .is_none_or(|term| search_hint_matches(item, metadata.get(&item.id), term))
+        })
+        .collect::<Vec<_>>();
     let total_record_count = items.len();
     let search_hints = items
         .into_iter()
         .take(query.limit.unwrap_or(20).min(100))
         .map(|item| {
+            let metadata = metadata.get(&item.id).cloned().unwrap_or_default();
+            let matched_term = search_term
+                .as_deref()
+                .and_then(|term| search_hint_matched_term(&item, &metadata, term))
+                .unwrap_or_else(|| item.name.clone());
             serde_json::json!({
                 "ItemId": item.id.simple().to_string(),
                 "Id": item.id.simple().to_string(),
                 "Name": item.name,
-                "MatchedTerm": item.name,
+                "MatchedTerm": matched_term,
                 "IndexNumber": null,
-                "ProductionYear": null,
+                "ProductionYear": metadata.production_year,
                 "ParentIndexNumber": null,
                 "PrimaryImageTag": "placeholder",
                 "ThumbImageTag": null,
@@ -14055,12 +14076,12 @@ async fn search_hints(
                 "MediaType": item.media_type,
                 "StartDate": null,
                 "EndDate": null,
-                "Series": null,
+                "Series": metadata.series,
                 "Status": null,
-                "Album": null,
+                "Album": metadata.album,
                 "AlbumId": null,
-                "AlbumArtist": null,
-                "Artists": []
+                "AlbumArtist": metadata.album_artist,
+                "Artists": metadata.artists
             })
         })
         .collect::<Vec<_>>();
@@ -14068,6 +14089,94 @@ async fn search_hints(
         "SearchHints": search_hints,
         "TotalRecordCount": total_record_count
     })))
+}
+
+#[derive(Clone, Default)]
+struct SearchHintMetadata {
+    album: Option<String>,
+    album_artist: Option<String>,
+    artists: Vec<String>,
+    production_year: Option<i32>,
+    series: Option<String>,
+}
+
+async fn search_hint_metadata_values(
+    db: &Database,
+    items: &[MediaItem],
+) -> Result<HashMap<Uuid, SearchHintMetadata>, ApiError> {
+    if items.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let item_ids = items.iter().map(|item| item.id).collect::<HashSet<_>>();
+    let mut values = HashMap::<Uuid, SearchHintMetadata>::new();
+    for metadata in db.media_item_metadata().await? {
+        if !item_ids.contains(&metadata.item_id) {
+            continue;
+        }
+        values.insert(
+            metadata.item_id,
+            SearchHintMetadata {
+                album: first_metadata_string(&metadata, &["Album", "AlbumName"]),
+                album_artist: first_metadata_string(&metadata, &["AlbumArtist", "AlbumArtists"]),
+                artists: metadata_strings(&metadata, &["Artists"]),
+                production_year: first_metadata_string(&metadata, &["ProductionYear", "Year"])
+                    .and_then(|value| value.parse::<i32>().ok()),
+                series: first_metadata_string(&metadata, &["SeriesName", "Series"]),
+            },
+        );
+    }
+    Ok(values)
+}
+
+fn metadata_strings(metadata: &MediaItemMetadata, keys: &[&str]) -> Vec<String> {
+    let mut values = BTreeMap::<String, String>::new();
+    for key in keys {
+        collect_item_count_metadata_value(metadata, key, &mut values);
+    }
+    values.into_values().collect()
+}
+
+fn first_metadata_string(metadata: &MediaItemMetadata, keys: &[&str]) -> Option<String> {
+    metadata_strings(metadata, keys).into_iter().next()
+}
+
+fn search_hint_matches(
+    item: &MediaItem,
+    metadata: Option<&SearchHintMetadata>,
+    search_term: &str,
+) -> bool {
+    metadata
+        .and_then(|metadata| search_hint_matched_term(item, metadata, search_term))
+        .or_else(|| {
+            let metadata = SearchHintMetadata::default();
+            search_hint_matched_term(item, &metadata, search_term)
+        })
+        .is_some()
+}
+
+fn search_hint_matched_term(
+    item: &MediaItem,
+    metadata: &SearchHintMetadata,
+    search_term: &str,
+) -> Option<String> {
+    let needle = search_term.to_ascii_lowercase();
+    [
+        Some(item.name.as_str()),
+        metadata.album.as_deref(),
+        metadata.album_artist.as_deref(),
+        metadata.series.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| value.to_ascii_lowercase().contains(&needle))
+    .map(ToOwned::to_owned)
+    .or_else(|| {
+        metadata
+            .artists
+            .iter()
+            .find(|value| value.to_ascii_lowercase().contains(&needle))
+            .cloned()
+    })
 }
 
 async fn metadata_genres(
@@ -23713,6 +23822,45 @@ mod tests {
         let search_hints: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(search_hints["TotalRecordCount"], 1);
         assert_eq!(search_hints["SearchHints"][0]["ItemId"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Search/Hints?SearchTerm=Artist%20Two&UserId={user_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metadata_search_hints: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metadata_search_hints["TotalRecordCount"], 1);
+        assert_eq!(metadata_search_hints["SearchHints"][0]["ItemId"], item_id);
+        assert_eq!(
+            metadata_search_hints["SearchHints"][0]["MatchedTerm"],
+            "Artist Two"
+        );
+        assert_eq!(
+            metadata_search_hints["SearchHints"][0]["Album"],
+            "Example Album"
+        );
+        assert_eq!(
+            metadata_search_hints["SearchHints"][0]["AlbumArtist"],
+            "Album Artist"
+        );
+        assert_eq!(
+            metadata_search_hints["SearchHints"][0]["Artists"],
+            json!(["Artist One", "Artist Two"])
+        );
+        assert_eq!(
+            metadata_search_hints["SearchHints"][0]["ProductionYear"],
+            2024
+        );
 
         let response = app
             .clone()
