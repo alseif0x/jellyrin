@@ -2356,6 +2356,72 @@ impl Database {
         Ok(())
     }
 
+    pub async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> anyhow::Result<bool> {
+        let trimmed_name = name.trim();
+        let trimmed_new_name = new_name.trim();
+        anyhow::ensure!(
+            !trimmed_name.is_empty(),
+            "virtual folder name must not be empty"
+        );
+        anyhow::ensure!(
+            !trimmed_new_name.is_empty(),
+            "virtual folder new name must not be empty"
+        );
+        let Some(folder) = self.virtual_folder_by_name(trimmed_name).await? else {
+            return Ok(false);
+        };
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            UPDATE virtual_folders
+            SET name = ?1, updated_at = ?2
+            WHERE id = ?3
+            "#,
+        )
+        .bind(trimmed_new_name)
+        .bind(now)
+        .bind(folder.id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_virtual_folder_path(
+        &self,
+        name: &str,
+        path: &str,
+        new_path: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(mut folder) = self.virtual_folder_by_name(name).await? else {
+            return Ok(false);
+        };
+        let trimmed_path = path.trim();
+        let trimmed_new_path = new_path.trim();
+        anyhow::ensure!(
+            !trimmed_path.is_empty(),
+            "virtual folder path must not be empty"
+        );
+        anyhow::ensure!(
+            !trimmed_new_path.is_empty(),
+            "virtual folder new path must not be empty"
+        );
+        let Some(index) = folder
+            .locations
+            .iter()
+            .position(|location| location == trimmed_path)
+        else {
+            return Ok(false);
+        };
+        folder.locations[index] = trimmed_new_path.to_string();
+        self.upsert_virtual_folder(
+            &folder.name,
+            folder.collection_type.as_deref(),
+            folder.locations,
+        )
+        .await?;
+        Ok(true)
+    }
+
     pub async fn remove_virtual_folder_path(&self, name: &str, path: &str) -> anyhow::Result<bool> {
         let Some(mut folder) = self.virtual_folder_by_name(name).await? else {
             return Ok(false);

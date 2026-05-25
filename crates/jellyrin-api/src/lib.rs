@@ -278,6 +278,8 @@ pub fn router(state: AppState) -> Router {
             "/library/libraries/availableoptions",
             get(library_available_options),
         )
+        .route("/ClientLog/Document", post(client_log_document))
+        .route("/clientlog/document", post(client_log_document))
         .route("/Startup/Configuration", get(get_startup_configuration))
         .route("/Startup/Configuration", post(post_startup_configuration))
         .route("/Startup/RemoteAccess", post(post_startup_remote_access))
@@ -774,6 +776,18 @@ pub fn router(state: AppState) -> Router {
             "/Library/VirtualFolders/Paths",
             delete(delete_virtual_folder_path),
         )
+        .route(
+            "/Library/VirtualFolders/LibraryOptions",
+            post(update_virtual_folder_library_options),
+        )
+        .route(
+            "/Library/VirtualFolders/Name",
+            post(rename_virtual_folder),
+        )
+        .route(
+            "/Library/VirtualFolders/Paths/Update",
+            post(update_virtual_folder_path),
+        )
         .route("/library/virtualfolders", get(get_virtual_folders))
         .route("/library/virtualfolders", post(add_virtual_folder))
         .route("/library/virtualfolders", delete(delete_virtual_folder))
@@ -784,6 +798,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/library/virtualfolders/paths",
             delete(delete_virtual_folder_path),
+        )
+        .route(
+            "/library/virtualfolders/libraryoptions",
+            post(update_virtual_folder_library_options),
+        )
+        .route("/library/virtualfolders/name", post(rename_virtual_folder))
+        .route(
+            "/library/virtualfolders/paths/update",
+            post(update_virtual_folder_path),
         )
         .route("/Environment/Drives", get(environment_drives))
         .route("/environment/drives", get(environment_drives))
@@ -6528,6 +6551,40 @@ async fn empty_text() -> &'static str {
     ""
 }
 
+const CLIENT_LOG_DOCUMENT_LIMIT_BYTES: usize = 1024 * 1024;
+
+async fn client_log_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let body = to_bytes(body, CLIENT_LOG_DOCUMENT_LIMIT_BYTES)
+        .await
+        .map_err(|_| ApiError::bad_request("Invalid client log document body"))?;
+    tokio::fs::create_dir_all(&state.log_dir).await?;
+    let path = state.log_dir.join("clientlog.log");
+    let timestamp = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let message = String::from_utf8_lossy(&body).replace('\0', "");
+    let line = serde_json::json!({
+        "Timestamp": timestamp,
+        "UserId": user.id.simple().to_string(),
+        "UserName": user.name,
+        "Document": message
+    })
+    .to_string();
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn get_virtual_folders(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6550,6 +6607,8 @@ struct AddVirtualFolderQuery {
 
 #[derive(Debug, Deserialize)]
 struct AddVirtualFolderBody {
+    #[serde(alias = "Id")]
+    id: Option<String>,
     #[serde(alias = "LibraryOptions")]
     library_options: Option<LibraryOptionsBody>,
 }
@@ -6558,12 +6617,18 @@ struct AddVirtualFolderBody {
 struct LibraryOptionsBody {
     #[serde(alias = "PathInfos")]
     path_infos: Option<Vec<MediaPathInfoBody>>,
+    #[serde(alias = "CollectionType", alias = "ContentType")]
+    collection_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MediaPathInfoBody {
     #[serde(alias = "Path")]
     path: Option<String>,
+    #[serde(alias = "OldPath")]
+    old_path: Option<String>,
+    #[serde(alias = "NewPath")]
+    new_path: Option<String>,
 }
 
 async fn add_virtual_folder(
@@ -6724,6 +6789,235 @@ async fn delete_virtual_folder_path(
     } else {
         Err(ApiError::not_found("Virtual folder path not found"))
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateVirtualFolderLibraryOptionsQuery {
+    #[serde(alias = "Name", alias = "name")]
+    name: Option<String>,
+}
+
+async fn update_virtual_folder_library_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<UpdateVirtualFolderLibraryOptionsQuery>,
+    Json(payload): Json<AddVirtualFolderBody>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_admin_or_startup_incomplete_user(
+        &state.db,
+        &headers,
+        auth_query.api_key.as_deref(),
+    )
+    .await?;
+    let folders = state.db.virtual_folders().await?;
+    let existing = resolve_virtual_folder_from_name_or_id(
+        &folders,
+        query.name.as_deref(),
+        payload.id.as_deref(),
+    )?;
+    let library_options = payload.library_options.unwrap_or(LibraryOptionsBody {
+        path_infos: None,
+        collection_type: None,
+    });
+    let locations = library_options
+        .path_infos
+        .map_or(existing.locations.clone(), |paths| {
+            paths
+                .into_iter()
+                .filter_map(|path_info| path_info.path)
+                .collect()
+        });
+    let collection_type = library_options
+        .collection_type
+        .as_deref()
+        .or(existing.collection_type.as_deref());
+    let folder = state
+        .db
+        .upsert_virtual_folder(&existing.name, collection_type, locations)
+        .await?;
+    state.db.scan_virtual_folder_items(folder.id).await?;
+    record_activity(
+        &state.db,
+        "Library options updated",
+        Some(&format!(
+            "Library options were updated for {}.",
+            folder.name
+        )),
+        "Library",
+        user.map(|user| user.id),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameVirtualFolderQuery {
+    #[serde(alias = "Name", alias = "name")]
+    name: String,
+    #[serde(alias = "NewName", alias = "newName")]
+    new_name: String,
+    #[serde(alias = "RefreshLibrary", alias = "refreshLibrary")]
+    _refresh_library: Option<bool>,
+}
+
+async fn rename_virtual_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<RenameVirtualFolderQuery>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_admin_or_startup_incomplete_user(
+        &state.db,
+        &headers,
+        auth_query.api_key.as_deref(),
+    )
+    .await?;
+    let folders = state.db.virtual_folders().await?;
+    let Some(existing) = folders
+        .iter()
+        .find(|folder| folder.name.eq_ignore_ascii_case(&query.name))
+    else {
+        return Err(ApiError::not_found("Virtual folder not found"));
+    };
+    if folders
+        .iter()
+        .any(|folder| folder.name.eq_ignore_ascii_case(&query.new_name) && folder.id != existing.id)
+    {
+        return Err(ApiError::conflict("Virtual folder already exists"));
+    }
+    if state
+        .db
+        .rename_virtual_folder(&query.name, &query.new_name)
+        .await?
+    {
+        record_activity(
+            &state.db,
+            "Library renamed",
+            Some(&format!(
+                "Library {} was renamed to {}.",
+                query.name, query.new_name
+            )),
+            "Library",
+            user.map(|user| user.id),
+        )
+        .await?;
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Virtual folder not found"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMediaPathBody {
+    #[serde(alias = "Name", alias = "name")]
+    name: String,
+    #[serde(alias = "Path", alias = "path")]
+    path: Option<String>,
+    #[serde(alias = "OldPath", alias = "oldPath")]
+    old_path: Option<String>,
+    #[serde(alias = "NewPath", alias = "newPath")]
+    new_path: Option<String>,
+    #[serde(alias = "PathInfo")]
+    path_info: Option<MediaPathInfoBody>,
+}
+
+async fn update_virtual_folder_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<UpdateMediaPathBody>,
+) -> Result<StatusCode, ApiError> {
+    let user =
+        require_admin_or_startup_incomplete_user(&state.db, &headers, query.api_key.as_deref())
+            .await?;
+    let folder = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
+        .ok_or_else(|| ApiError::not_found("Virtual folder not found"))?;
+    let old_path = payload
+        .old_path
+        .or(payload.path)
+        .or_else(|| {
+            payload
+                .path_info
+                .as_ref()
+                .and_then(|path_info| path_info.old_path.clone())
+        })
+        .or_else(|| {
+            if folder.locations.len() == 1 {
+                folder.locations.first().cloned()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| ApiError::bad_request("Path is required"))?;
+    let new_path = payload
+        .new_path
+        .or_else(|| {
+            payload
+                .path_info
+                .as_ref()
+                .and_then(|path_info| path_info.new_path.clone())
+        })
+        .or_else(|| {
+            payload
+                .path_info
+                .as_ref()
+                .and_then(|path_info| path_info.path.clone())
+        })
+        .ok_or_else(|| ApiError::bad_request("NewPath is required"))?;
+    if state
+        .db
+        .update_virtual_folder_path(&payload.name, &old_path, &new_path)
+        .await?
+    {
+        let folder = state
+            .db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
+            .ok_or_else(|| ApiError::not_found("Virtual folder not found"))?;
+        state.db.scan_virtual_folder_items(folder.id).await?;
+        record_activity(
+            &state.db,
+            "Library path updated",
+            Some(&format!("A path was updated for library {}.", folder.name)),
+            "Library",
+            user.map(|user| user.id),
+        )
+        .await?;
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Virtual folder path not found"))
+    }
+}
+
+fn resolve_virtual_folder_from_name_or_id<'a>(
+    folders: &'a [VirtualFolder],
+    name: Option<&str>,
+    id: Option<&str>,
+) -> Result<&'a VirtualFolder, ApiError> {
+    if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+        let requested_id = parse_jellyfin_uuid(id)?;
+        return folders
+            .iter()
+            .find(|folder| folder.id == requested_id)
+            .ok_or_else(|| ApiError::not_found("Virtual folder not found"));
+    }
+    if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+        return folders
+            .iter()
+            .find(|folder| folder.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| ApiError::not_found("Virtual folder not found"));
+    }
+    Err(ApiError::bad_request(
+        "Virtual folder Id or Name is required",
+    ))
 }
 
 fn comma_delimited_paths(paths: Option<&str>) -> Vec<String> {
@@ -15376,6 +15670,40 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::POST)
+                    .uri("/ClientLog/Document")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "message": "unauthorized" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ClientLog/Document")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "message": "client failed" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
+        assert!(client_log.contains("client failed"));
+        assert!(client_log.contains(user.id.simple().to_string().as_str()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/System/Configuration")
                     .body(Body::empty())
                     .unwrap(),
@@ -15531,8 +15859,9 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let logs: Value = serde_json::from_slice(&body).unwrap();
         let logs = logs.as_array().unwrap();
-        assert_eq!(logs.len(), 2);
+        assert_eq!(logs.len(), 3);
         assert!(logs.iter().any(|log| log["Name"] == "jellyrin.log"));
+        assert!(logs.iter().any(|log| log["Name"] == "clientlog.log"));
         assert!(!logs.iter().any(|log| log["Name"] == "notes.json"));
         assert!(!logs.iter().any(|log| log["Name"] == "passwd.log"));
         assert!(logs.iter().all(|log| log["Size"].as_u64().unwrap() > 0));
@@ -19185,6 +19514,80 @@ mod tests {
         let folders: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(folders[0]["Name"], "Movies");
         assert_eq!(folders[0]["Locations"][0], "/media/movies");
+        let folder_id = folders[0]["ItemId"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Library/VirtualFolders/LibraryOptions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": folder_id,
+                            "LibraryOptions": {
+                                "PathInfos": [{ "Path": "/media/movies-updated" }]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Library/VirtualFolders/Name?Name=Movies&NewName=Films")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Library/VirtualFolders/Paths/Update")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Name": "Films",
+                            "PathInfo": {
+                                "Path": "/media/films"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/library/virtualfolders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let folders: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(folders[0]["Name"], "Films");
+        assert_eq!(folders[0]["Locations"][0], "/media/films");
 
         let response = app
             .clone()
@@ -19194,7 +19597,7 @@ mod tests {
                     .uri("/Library/VirtualFolders/Paths")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        json!({ "Name": "Movies", "Path": "/media/more-movies" }).to_string(),
+                        json!({ "Name": "Films", "Path": "/media/more-movies" }).to_string(),
                     ))
                     .unwrap(),
             )
@@ -19207,7 +19610,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri("/Library/VirtualFolders/Paths?Name=Movies&Path=/media/more-movies")
+                    .uri("/Library/VirtualFolders/Paths?Name=Films&Path=/media/more-movies")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -19220,7 +19623,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri("/Library/VirtualFolders?Name=Movies")
+                    .uri("/Library/VirtualFolders?Name=Films")
                     .body(Body::empty())
                     .unwrap(),
             )
