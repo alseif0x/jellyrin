@@ -14979,58 +14979,136 @@ async fn metadata_genre_by_name(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_entity_by_name(state, headers, query, name, "Genre", None).await
+    metadata_entity_by_name(
+        state,
+        headers,
+        query,
+        raw_query,
+        name,
+        MetadataEntitySpec {
+            item_type: "Genre",
+            metadata_keys: &["Genres"],
+            production_year: None,
+        },
+    )
+    .await
 }
 
 async fn metadata_music_genre_by_name(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_entity_by_name(state, headers, query, name, "MusicGenre", None).await
+    metadata_entity_by_name(
+        state,
+        headers,
+        query,
+        raw_query,
+        name,
+        MetadataEntitySpec {
+            item_type: "MusicGenre",
+            metadata_keys: &["MusicGenres"],
+            production_year: None,
+        },
+    )
+    .await
 }
 
 async fn metadata_artist_by_name(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_entity_by_name(state, headers, query, name, "MusicArtist", None).await
+    metadata_entity_by_name(
+        state,
+        headers,
+        query,
+        raw_query,
+        name,
+        MetadataEntitySpec {
+            item_type: "MusicArtist",
+            metadata_keys: &["Artists"],
+            production_year: None,
+        },
+    )
+    .await
 }
 
 async fn metadata_person_by_name(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_entity_by_name(state, headers, query, name, "Person", None).await
+    metadata_entity_by_name(
+        state,
+        headers,
+        query,
+        raw_query,
+        name,
+        MetadataEntitySpec {
+            item_type: "Person",
+            metadata_keys: &["People"],
+            production_year: None,
+        },
+    )
+    .await
 }
 
 async fn metadata_studio_by_name(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_entity_by_name(state, headers, query, name, "Studio", None).await
+    metadata_entity_by_name(
+        state,
+        headers,
+        query,
+        raw_query,
+        name,
+        MetadataEntitySpec {
+            item_type: "Studio",
+            metadata_keys: &["Studios"],
+            production_year: None,
+        },
+    )
+    .await
 }
 
 async fn metadata_year_by_value(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     Path(year): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let year = year
         .trim()
         .parse::<i32>()
         .map_err(|_| ApiError::bad_request("Year must be a number"))?;
-    metadata_entity_by_name(state, headers, query, year.to_string(), "Year", Some(year)).await
+    metadata_entity_by_name(
+        state,
+        headers,
+        query,
+        raw_query,
+        year.to_string(),
+        MetadataEntitySpec {
+            item_type: "Year",
+            metadata_keys: &["ProductionYear"],
+            production_year: Some(year),
+        },
+    )
+    .await
 }
 
 async fn metadata_collection(
@@ -15247,27 +15325,59 @@ fn remote_trailer_matches_query(trailer: &serde_json::Value, query: &ItemsQuery)
     metadata_value_matches_query(name, query)
 }
 
+struct MetadataEntitySpec {
+    item_type: &'static str,
+    metadata_keys: &'static [&'static str],
+    production_year: Option<i32>,
+}
+
 async fn metadata_entity_by_name(
     state: AppState,
     headers: HeaderMap,
-    query: AuthQuery,
+    auth_query: AuthQuery,
+    raw_query: Option<String>,
     name: String,
-    item_type: &'static str,
-    production_year: Option<i32>,
+    spec: MetadataEntitySpec,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let name = name.trim();
     if name.is_empty() {
         return Err(ApiError::bad_request(
             "Metadata entity name must not be empty",
         ));
     }
+    let query = parse_items_query(raw_query.as_deref());
+    let mut scope_query = query.clone();
+    scope_query.ids = None;
+    scope_query.search_term = None;
+    scope_query.name_starts_with = None;
+    scope_query.name_starts_with_or_greater = None;
+    scope_query.name_less_than = None;
+    scope_query.is_folder = None;
+    scope_query.filters = metadata_scope_filters(&query.filters);
+    scope_query.start_index = None;
+    scope_query.limit = None;
+    scope_query.sort_by = None;
+    scope_query.sort_order = None;
+    let scoped_items = filtered_items_for_query(
+        &state,
+        &headers,
+        auth_query.api_key.as_deref(),
+        &scope_query,
+    )
+    .await?;
+    let exists = metadata_values_for_keys(&state.db, spec.metadata_keys, &scoped_items)
+        .await?
+        .into_iter()
+        .any(|value| value.eq_ignore_ascii_case(name));
+    if !exists {
+        return Err(ApiError::not_found("Metadata entity not found"));
+    }
     let server_id = state.db.server_state().await?.server_id.to_string();
     Ok(Json(metadata_entity_json(
         &server_id,
         name,
-        item_type,
-        production_year,
+        spec.item_type,
+        spec.production_year,
     )))
 }
 
@@ -36134,6 +36244,68 @@ mod tests {
             assert_eq!(entity["ImageTags"], json!({}));
             assert_eq!(entity["Id"].as_str().unwrap().len(), 32);
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Artists/Artist%20One?UserId={}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let user_scoped_artist: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(user_scoped_artist["Name"], "Artist One");
+        assert_eq!(user_scoped_artist["Type"], "MusicArtist");
+
+        for endpoint in [
+            "/Artists/Missing%20Artist".to_string(),
+            format!("/Artists/Artist%20One?ParentId={other_parent_id}"),
+            "/Years/1977".to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Artists/Artist%20One?UserId=not-a-user-id")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Genres/Drama?UserId={}", admin.id))
+                    .header("X-Emby-Token", &editor_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let response = app
             .clone()
