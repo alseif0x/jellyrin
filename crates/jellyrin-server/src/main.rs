@@ -3,7 +3,8 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use clap::Parser;
 use jellyrin_api::{
-    AppState, reconcile_transcode_sessions_on_startup, router, spawn_periodic_transcode_cleanup,
+    AppState, cleanup_stale_hls_transcodes, reconcile_transcode_sessions_on_startup, router,
+    spawn_periodic_transcode_cleanup,
 };
 use jellyrin_db::Database;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -69,6 +70,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(
             count = stopped_transcodes,
             "stopped stale transcode sessions from previous run"
+        );
+    }
+    let cleaned_transcode_outputs = cleanup_stale_hls_transcodes(&db)
+        .await
+        .context("failed to clean stale transcode outputs")?;
+    if cleaned_transcode_outputs > 0 {
+        tracing::info!(
+            count = cleaned_transcode_outputs,
+            "cleaned stale transcode outputs on startup"
         );
     }
     let address: SocketAddr = format!("{}:{}", args.host, args.port)

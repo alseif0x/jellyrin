@@ -1416,6 +1416,13 @@ impl Database {
         self.transcode_sessions_with_statuses(&[]).await
     }
 
+    pub async fn transcode_session_output_paths(&self) -> anyhow::Result<Vec<String>> {
+        sqlx::query_scalar("SELECT output_path FROM transcode_sessions")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn active_transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
         self.transcode_sessions_with_statuses(&["starting", "running"])
             .await
@@ -4234,6 +4241,10 @@ mod tests {
 
         let sessions = db.transcode_sessions().await.unwrap();
         assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            db.transcode_session_output_paths().await.unwrap(),
+            vec![session.output_path.clone()]
+        );
         let active_sessions = db.active_transcode_sessions().await.unwrap();
         assert_eq!(active_sessions.len(), 1);
         assert_eq!(active_sessions[0].play_session_id, "play-session-1");

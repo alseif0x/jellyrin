@@ -2,10 +2,11 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, OnceLock},
+    time::SystemTime,
 };
 
 use axum::{
@@ -758,21 +759,13 @@ pub async fn reconcile_transcode_sessions_on_startup(db: &Database) -> anyhow::R
 pub fn spawn_periodic_transcode_cleanup(db: Database) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match cleanup_terminal_hls_transcodes(
-                &db,
-                Duration::hours(TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS),
-            )
-            .await
-            {
+            match cleanup_stale_hls_transcodes(&db).await {
                 Ok(cleaned_count) if cleaned_count > 0 => {
-                    tracing::info!(
-                        count = cleaned_count,
-                        "cleaned terminal HLS transcode outputs"
-                    );
+                    tracing::info!(count = cleaned_count, "cleaned stale HLS transcode outputs");
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(%error, "failed to clean terminal HLS transcode outputs");
+                    tracing::warn!(%error, "failed to clean stale HLS transcode outputs");
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(
@@ -783,6 +776,14 @@ pub fn spawn_periodic_transcode_cleanup(db: Database) -> tokio::task::JoinHandle
     })
 }
 
+pub async fn cleanup_stale_hls_transcodes(db: &Database) -> anyhow::Result<usize> {
+    let retention = Duration::hours(TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS);
+    let terminal_count = cleanup_terminal_hls_transcodes(db, retention).await?;
+    let orphan_count =
+        cleanup_orphan_hls_transcode_dirs(db, transcode_temp_root(), retention).await?;
+    Ok(terminal_count + orphan_count)
+}
+
 pub async fn cleanup_terminal_hls_transcodes(
     db: &Database,
     older_than: Duration,
@@ -790,11 +791,84 @@ pub async fn cleanup_terminal_hls_transcodes(
     let sessions = db
         .terminal_transcode_sessions_older_than(older_than)
         .await?;
-    let count = sessions.len();
+    let mut count = 0;
     for session in sessions {
-        cleanup_hls_transcode_files(&session.output_path).await;
+        if cleanup_hls_transcode_files(&session.output_path).await {
+            count += 1;
+        }
     }
     Ok(count)
+}
+
+pub async fn cleanup_orphan_hls_transcode_dirs(
+    db: &Database,
+    root: impl AsRef<FsPath>,
+    older_than: Duration,
+) -> anyhow::Result<usize> {
+    let root = root.as_ref();
+    let mut known_session_dirs = HashSet::new();
+    for output_path in db.transcode_session_output_paths().await? {
+        known_session_dirs
+            .insert(HlsTranscodeLayout::from_media_playlist_path(output_path).session_dir);
+    }
+
+    let mut cleaned_count = 0;
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() || known_session_dirs.contains(&path) {
+            continue;
+        }
+        if !hls_transcode_dir_is_cleanup_candidate(&path).await {
+            continue;
+        }
+        if !hls_transcode_dir_is_old_enough(&path, older_than).await {
+            continue;
+        }
+        if cleanup_hls_transcode_dir(&path).await {
+            cleaned_count += 1;
+        }
+    }
+    Ok(cleaned_count)
+}
+
+async fn hls_transcode_dir_is_cleanup_candidate(path: &FsPath) -> bool {
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    let mut is_empty = true;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        is_empty = false;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name == HLS_MEDIA_PLAYLIST_NAME
+            || (file_name.starts_with("segment_") && file_name.ends_with(".ts"))
+        {
+            return true;
+        }
+    }
+    is_empty
+}
+
+async fn hls_transcode_dir_is_old_enough(path: &FsPath, older_than: Duration) -> bool {
+    if older_than <= Duration::ZERO {
+        return true;
+    }
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified_at)
+        .is_ok_and(|age| age >= older_than.unsigned_abs())
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -7307,19 +7381,26 @@ fn hls_master_url(item_id: &str, play_session_id: &str, access_token: &str) -> S
     format!("/Videos/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}")
 }
 
-async fn cleanup_hls_transcode_files(output_path: &str) {
+async fn cleanup_hls_transcode_files(output_path: &str) -> bool {
     let session_dir = HlsTranscodeLayout::from_media_playlist_path(output_path).session_dir;
+    cleanup_hls_transcode_dir(&session_dir).await
+}
+
+async fn cleanup_hls_transcode_dir(session_dir: &FsPath) -> bool {
     if session_dir.as_os_str().is_empty() {
-        return;
+        return false;
     }
-    if let Err(error) = tokio::fs::remove_dir_all(&session_dir).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            path = %session_dir.display(),
-            %error,
-            "failed to remove HLS transcode directory"
-        );
+    match tokio::fs::remove_dir_all(session_dir).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(
+                path = %session_dir.display(),
+                %error,
+                "failed to remove HLS transcode directory"
+            );
+            false
+        }
     }
 }
 
@@ -8446,11 +8527,11 @@ mod tests {
 
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
-        DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_subtitle_stream_index, hls_transcode_dedupe_key,
-        load_countries, load_cultures, parse_authorization_token, parse_jellyfin_uuid,
-        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
-        spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
+        DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
+        hls_transcode_dedupe_key, load_countries, load_cultures, parse_authorization_token,
+        parse_jellyfin_uuid, parse_media_browser_pairs, reconcile_transcode_sessions_on_startup,
+        router, spawn_hls_transcode_task, subscribe_playback_events, transcode_dedupe_lock,
     };
     use axum::{
         body::Body,
@@ -16335,6 +16416,103 @@ mod tests {
         assert_eq!(cleaned, 1);
         assert!(!completed_dir.exists());
         assert!(running_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_transcode_cleanup_preserves_db_backed_dirs() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Known.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let known_dir = transcode_root.path().join("play-session-known");
+        tokio::fs::create_dir_all(&known_dir).await.unwrap();
+        let known_playlist = known_dir.join("main.m3u8");
+        tokio::fs::write(&known_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+        let orphan_dir = transcode_root.path().join("play-session-orphan");
+        tokio::fs::create_dir_all(&orphan_dir).await.unwrap();
+        tokio::fs::write(orphan_dir.join("main.m3u8"), b"#EXTM3U\n")
+            .await
+            .unwrap();
+        let non_hls_dir = transcode_root.path().join("debug-not-hls");
+        tokio::fs::create_dir_all(&non_hls_dir).await.unwrap();
+        tokio::fs::write(non_hls_dir.join("notes.txt"), b"keep")
+            .await
+            .unwrap();
+        let root_file = transcode_root.path().join("README.txt");
+        tokio::fs::write(&root_file, b"keep").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-known".to_string(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item.id.simple().to_string()),
+            audio_stream_index: Some(0),
+            subtitle_stream_index: Some(-1),
+            video_stream_index: Some(0),
+            output_path: known_playlist.to_string_lossy().to_string(),
+            process_id: None,
+            status: "completed".to_string(),
+            progress_percent: None,
+            position_ticks: 0,
+        })
+        .await
+        .unwrap();
+
+        let cleaned =
+            cleanup_orphan_hls_transcode_dirs(&db, transcode_root.path(), time::Duration::ZERO)
+                .await
+                .unwrap();
+        assert_eq!(cleaned, 1);
+        assert!(known_dir.exists());
+        assert!(!orphan_dir.exists());
+        assert!(non_hls_dir.exists());
+        assert!(root_file.exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_transcode_cleanup_ignores_missing_and_recent_roots() {
+        let transcode_root = tempfile::tempdir().unwrap();
+        let missing_root = transcode_root.path().join("missing");
+        let recent_dir = transcode_root.path().join("recent-orphan");
+        tokio::fs::create_dir_all(&recent_dir).await.unwrap();
+        tokio::fs::write(recent_dir.join("main.m3u8"), b"#EXTM3U\n")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let missing_cleaned =
+            cleanup_orphan_hls_transcode_dirs(&db, &missing_root, time::Duration::ZERO)
+                .await
+                .unwrap();
+        assert_eq!(missing_cleaned, 0);
+
+        let recent_cleaned = cleanup_orphan_hls_transcode_dirs(
+            &db,
+            transcode_root.path(),
+            time::Duration::hours(24),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recent_cleaned, 0);
+        assert!(recent_dir.exists());
     }
 
     #[tokio::test]
