@@ -1660,6 +1660,114 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/Items/{item_id}", get(item_detail))
         .route("/items/{item_id}", get(item_detail))
+        .route("/Items/{item_id}/Refresh", post(refresh_item))
+        .route("/items/{item_id}/refresh", post(refresh_item))
+        .route("/ItemUpdate/Items/{item_id}", post(update_item_metadata))
+        .route("/itemupdate/items/{item_id}", post(update_item_metadata))
+        .route(
+            "/ItemUpdate/Items/{item_id}/ContentType",
+            post(update_item_content_type),
+        )
+        .route(
+            "/itemupdate/items/{item_id}/contenttype",
+            post(update_item_content_type),
+        )
+        .route(
+            "/ItemUpdate/Items/{item_id}/MetadataEditor",
+            get(item_metadata_editor),
+        )
+        .route(
+            "/itemupdate/items/{item_id}/metadataeditor",
+            get(item_metadata_editor),
+        )
+        .route(
+            "/ItemLookup/Items/{item_id}/ExternalIdInfos",
+            get(item_external_id_infos),
+        )
+        .route(
+            "/itemlookup/items/{item_id}/externalidinfos",
+            get(item_external_id_infos),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/Apply/{item_id}",
+            post(apply_remote_item_search),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/apply/{item_id}",
+            post(apply_remote_item_search),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/Book",
+            post(remote_search_book),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/book",
+            post(remote_search_book),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/BoxSet",
+            post(remote_search_box_set),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/boxset",
+            post(remote_search_box_set),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/Movie",
+            post(remote_search_movie),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/movie",
+            post(remote_search_movie),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/MusicAlbum",
+            post(remote_search_music_album),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/musicalbum",
+            post(remote_search_music_album),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/MusicArtist",
+            post(remote_search_music_artist),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/musicartist",
+            post(remote_search_music_artist),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/MusicVideo",
+            post(remote_search_music_video),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/musicvideo",
+            post(remote_search_music_video),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/Person",
+            post(remote_search_person),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/person",
+            post(remote_search_person),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/Series",
+            post(remote_search_series),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/series",
+            post(remote_search_series),
+        )
+        .route(
+            "/ItemLookup/Items/RemoteSearch/Trailer",
+            post(remote_search_trailer),
+        )
+        .route(
+            "/itemlookup/items/remotesearch/trailer",
+            post(remote_search_trailer),
+        )
         .route("/UserLibrary/Items/Root", get(root_folder))
         .route("/userlibrary/items/root", get(root_folder))
         .route("/UserLibrary/Items/{item_id}", get(item_detail))
@@ -8214,6 +8322,228 @@ async fn user_item_detail(
         &server_id,
         playback.as_ref(),
     )))
+}
+
+async fn refresh_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    media_item_by_id(&state.db, &item_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_item_metadata(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    if let Some(Json(payload)) = body {
+        merge_item_metadata_update(&mut metadata, payload)?;
+    }
+    state
+        .db
+        .update_media_item_metadata(item.id, metadata)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateItemContentTypeQuery {
+    #[serde(alias = "ContentType", alias = "contentType")]
+    content_type: Option<String>,
+}
+
+async fn update_item_content_type(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Query(query): Query<UpdateItemContentTypeQuery>,
+    Path(item_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    let content_type = query.content_type.or_else(|| {
+        body.as_ref()
+            .and_then(|Json(body)| json_string_field(body, "ContentType"))
+    });
+    if let Some(content_type) = content_type {
+        metadata["ContentType"] = serde_json::Value::String(content_type);
+    }
+    state
+        .db
+        .update_media_item_metadata(item.id, metadata)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn item_metadata_editor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(Json(serde_json::json!({
+        "Item": media_item_to_json(&item, &server_id),
+        "Metadata": metadata,
+        "ExternalIdInfos": external_id_infos_for_item_type(media_item_type(&item)),
+        "Cultures": load_cultures(),
+        "Countries": load_countries()
+    })))
+}
+
+async fn item_external_id_infos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    Ok(Json(external_id_infos_for_item_type(media_item_type(
+        &item,
+    ))))
+}
+
+async fn apply_remote_item_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let Some(Json(payload)) = body else {
+        return Err(ApiError::not_found("Remote search result not found"));
+    };
+    let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    merge_remote_search_result_metadata(&mut metadata, payload)?;
+    state
+        .db
+        .update_media_item_metadata(item.id, metadata)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+macro_rules! remote_search_handler {
+    ($name:ident, $item_type:literal, $admin_only:literal) => {
+        async fn $name(
+            State(state): State<AppState>,
+            headers: HeaderMap,
+            Query(query): Query<AuthQuery>,
+        ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+            if $admin_only {
+                require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            } else {
+                require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+            }
+            let _ = $item_type;
+            Ok(Json(Vec::new()))
+        }
+    };
+}
+
+remote_search_handler!(remote_search_book, "Book", false);
+remote_search_handler!(remote_search_box_set, "BoxSet", false);
+remote_search_handler!(remote_search_movie, "Movie", false);
+remote_search_handler!(remote_search_music_album, "MusicAlbum", false);
+remote_search_handler!(remote_search_music_artist, "MusicArtist", false);
+remote_search_handler!(remote_search_music_video, "MusicVideo", false);
+remote_search_handler!(remote_search_person, "Person", true);
+remote_search_handler!(remote_search_series, "Series", false);
+remote_search_handler!(remote_search_trailer, "Trailer", false);
+
+async fn metadata_payload_for_item(
+    db: &Database,
+    item_id: Uuid,
+) -> Result<serde_json::Value, ApiError> {
+    Ok(db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .find(|metadata| metadata.item_id == item_id)
+        .map(|metadata| metadata.payload)
+        .unwrap_or_else(|| serde_json::json!({})))
+}
+
+fn merge_item_metadata_update(
+    metadata: &mut serde_json::Value,
+    payload: serde_json::Value,
+) -> Result<(), ApiError> {
+    let serde_json::Value::Object(payload) = payload else {
+        return Err(ApiError::bad_request("Item update body must be an object"));
+    };
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+    let Some(target) = metadata.as_object_mut() else {
+        return Err(ApiError::bad_request("Item metadata must be an object"));
+    };
+    for (key, value) in payload {
+        if key.eq_ignore_ascii_case("Id") {
+            continue;
+        }
+        target.insert(key, value);
+    }
+    Ok(())
+}
+
+fn merge_remote_search_result_metadata(
+    metadata: &mut serde_json::Value,
+    payload: serde_json::Value,
+) -> Result<(), ApiError> {
+    let candidate = json_field_case_insensitive(&payload, "SearchResult")
+        .or_else(|| json_field_case_insensitive(&payload, "Result"))
+        .or_else(|| json_field_case_insensitive(&payload, "Item"))
+        .cloned()
+        .unwrap_or(payload);
+    merge_item_metadata_update(metadata, candidate)
+}
+
+fn external_id_infos_for_item_type(item_type: &str) -> Vec<serde_json::Value> {
+    let mut infos = vec![serde_json::json!({
+        "Name": "IMDb",
+        "Key": "Imdb",
+        "Type": "String",
+        "UrlFormatString": "https://www.imdb.com/title/{0}",
+        "SupportsMultiple": false
+    })];
+    match item_type {
+        "Movie" | "Series" | "Episode" => {
+            infos.push(serde_json::json!({
+                "Name": "TheMovieDb",
+                "Key": "Tmdb",
+                "Type": "String",
+                "UrlFormatString": "https://www.themoviedb.org/{0}",
+                "SupportsMultiple": false
+            }));
+        }
+        "Audio" | "MusicAlbum" | "MusicArtist" => {
+            infos.push(serde_json::json!({
+                "Name": "MusicBrainz",
+                "Key": "MusicBrainz",
+                "Type": "String",
+                "UrlFormatString": "",
+                "SupportsMultiple": false
+            }));
+        }
+        _ => {}
+    }
+    infos
 }
 
 async fn authenticated_item_user_data(
@@ -27520,6 +27850,11 @@ mod tests {
             .issue_api_key_for_user(admin.id, "test-key")
             .await
             .unwrap();
+        let editor = db.create_user("editor", Some("secret")).await.unwrap();
+        let editor_key = db
+            .issue_api_key_for_user(editor.id, "editor-key")
+            .await
+            .unwrap();
         let test_db = db.clone();
         let app = router(AppState {
             db,
@@ -27546,6 +27881,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let item = test_db.media_items().await.unwrap().remove(0);
+        let item_id = item.id.simple().to_string();
         test_db
             .update_media_item_metadata(
                 item.id,
@@ -27591,6 +27927,184 @@ mod tests {
         assert_eq!(album_artists["TotalRecordCount"], 1);
         assert_eq!(album_artists["Items"][0]["Name"], "Album Artist");
         assert_eq!(album_artists["Items"][0]["Type"], "MusicArtist");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/Refresh"))
+                    .header("X-Emby-Token", &editor_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/Refresh"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ItemLookup/Items/{item_id}/ExternalIdInfos"))
+                    .header("X-Emby-Token", &editor_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ItemLookup/Items/{item_id}/ExternalIdInfos"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let external_infos: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            external_infos
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|info| info["Key"] == "Imdb")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ItemLookup/Items/RemoteSearch/Movie")
+                    .header("X-Emby-Token", &editor_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Name": "Metadata Movie" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_results, json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ItemLookup/Items/RemoteSearch/Person")
+                    .header("X-Emby-Token", &editor_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Name": "John Williams" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/ItemLookup/Items/RemoteSearch/Apply/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "SearchResult": {
+                                "ProviderIds": { "Imdb": "tt1234567" },
+                                "Overview": "Remote overview"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/ItemUpdate/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Overview": "Manual overview",
+                            "ProviderIds": { "Tmdb": "9876" },
+                            "Tags": ["Edited"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/ItemUpdate/Items/{item_id}/ContentType?ContentType=Movie"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ItemUpdate/Items/{item_id}/MetadataEditor"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let editor_payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(editor_payload["Item"]["Id"], item_id);
+        assert_eq!(editor_payload["Metadata"]["Overview"], "Manual overview");
+        assert_eq!(editor_payload["Metadata"]["ProviderIds"]["Tmdb"], "9876");
+        assert_eq!(editor_payload["Metadata"]["ContentType"], "Movie");
+        assert_eq!(editor_payload["ExternalIdInfos"][0]["Key"], "Imdb");
+        assert!(editor_payload["Cultures"].as_array().unwrap().len() > 100);
 
         let response = app
             .clone()
