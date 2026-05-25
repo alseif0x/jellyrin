@@ -2344,10 +2344,10 @@ pub fn router(state: AppState) -> Router {
             "/image/artists/{name}/images/{image_type}/{image_index}",
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
-        .route("/Shows/NextUp", get(authenticated_empty_items))
-        .route("/shows/nextup", get(authenticated_empty_items))
-        .route("/Shows/Upcoming", get(authenticated_empty_items))
-        .route("/shows/upcoming", get(authenticated_empty_items))
+        .route("/Shows/NextUp", get(shows_next_up))
+        .route("/shows/nextup", get(shows_next_up))
+        .route("/Shows/Upcoming", get(shows_upcoming))
+        .route("/shows/upcoming", get(shows_upcoming))
         .route(
             "/Shows/{series_id}/Episodes",
             get(series_empty_items),
@@ -8968,6 +8968,137 @@ async fn movie_recommendations(
     })]))
 }
 
+async fn shows_next_up(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    if query.include_item_types.is_empty() {
+        query.include_item_types.push("Episode".to_string());
+    }
+    if query.is_played.is_none() && query_filters_played_value(&query.filters).is_none() {
+        query.is_played = Some(false);
+    }
+
+    let episodes = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    let mut next_by_series = BTreeMap::<String, MediaItem>::new();
+    for episode in episodes.into_iter().filter(is_tv_episode) {
+        let key = tv_episode_series_key(&episode);
+        match next_by_series.get(&key) {
+            Some(existing) if compare_tv_episodes(existing, &episode) != Ordering::Greater => {}
+            _ => {
+                next_by_series.insert(key, episode);
+            }
+        }
+    }
+    let mut next_up = next_by_series.into_values().collect::<Vec<_>>();
+    next_up.sort_by(compare_tv_episodes);
+    let total_record_count = next_up.len();
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let items = items_to_json(
+        &state.db,
+        paged_media_items(next_up, &query),
+        &server_id,
+        Some(requested_user_id),
+    )
+    .await?;
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        query.start_index.unwrap_or(0),
+    )))
+}
+
+async fn shows_upcoming(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+    if query.include_item_types.is_empty() {
+        query.include_item_types.push("Episode".to_string());
+    }
+
+    let metadata_by_id = state
+        .db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .map(|metadata| (metadata.item_id, metadata.payload))
+        .collect::<HashMap<_, _>>();
+    let now = OffsetDateTime::now_utc();
+    let mut upcoming = filtered_media_items(
+        state.db.media_items().await?,
+        &query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?
+    .into_iter()
+    .filter(is_tv_episode)
+    .filter(|episode| {
+        metadata_by_id
+            .get(&episode.id)
+            .and_then(metadata_premiere_date)
+            .is_some_and(|premiere_date| premiere_date > now)
+    })
+    .collect::<Vec<_>>();
+    upcoming.sort_by(|left, right| {
+        let left_date = metadata_by_id
+            .get(&left.id)
+            .and_then(metadata_premiere_date)
+            .unwrap_or(left.created_at);
+        let right_date = metadata_by_id
+            .get(&right.id)
+            .and_then(metadata_premiere_date)
+            .unwrap_or(right.created_at);
+        left_date
+            .cmp(&right_date)
+            .then_with(|| compare_tv_episodes(left, right))
+    });
+    let total_record_count = upcoming.len();
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let items = items_to_json(
+        &state.db,
+        paged_media_items(upcoming, &query),
+        &server_id,
+        Some(requested_user_id),
+    )
+    .await?;
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        query.start_index.unwrap_or(0),
+    )))
+}
+
 async fn resume_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -14648,6 +14779,30 @@ fn media_item_to_json_with_playback(
     } else {
         serde_json::Value::Null
     };
+    let episode_info = tv_episode_info(item);
+    let series_name = episode_info
+        .as_ref()
+        .map(|info| serde_json::json!(info.series_name))
+        .unwrap_or(serde_json::Value::Null);
+    let series_id = episode_info
+        .as_ref()
+        .map(|info| serde_json::json!(stable_entity_id("Series", &info.series_name)))
+        .unwrap_or(serde_json::Value::Null);
+    let season_name = episode_info
+        .as_ref()
+        .and_then(|info| info.season_number.map(|season| format!("Season {season}")))
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+    let parent_index_number = episode_info
+        .as_ref()
+        .and_then(|info| info.season_number)
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    let index_number = episode_info
+        .as_ref()
+        .and_then(|info| info.episode_number)
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
 
     let media_source = serde_json::json!({
         "Protocol": "File",
@@ -14686,6 +14841,11 @@ fn media_item_to_json_with_playback(
         "OriginalTitle": null,
         "ServerId": server_id,
         "Id": item_id,
+        "SeriesName": series_name,
+        "SeriesId": series_id,
+        "SeasonName": season_name,
+        "ParentIndexNumber": parent_index_number,
+        "IndexNumber": index_number,
         "Etag": null,
         "DateCreated": item.created_at.to_string(),
         "DateLastMediaAdded": item.updated_at.to_string(),
@@ -15101,12 +15261,165 @@ fn parse_range_header(headers: &HeaderMap, total_len: u64) -> Result<Option<(u64
 fn media_item_type(item: &MediaItem) -> &'static str {
     match (item.media_type.as_str(), item.collection_type.as_deref()) {
         ("Video", Some("movies")) => "Movie",
+        ("Video", Some("tvshows" | "tvshow" | "series")) => "Episode",
         ("Video", _) => "Video",
         ("Audio", _) => "Audio",
         ("Photo", _) => "Photo",
         ("Book", _) => "Book",
         _ => "BaseItem",
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TvEpisodeInfo {
+    series_name: String,
+    season_number: Option<i32>,
+    episode_number: Option<i32>,
+}
+
+fn is_tv_episode(item: &MediaItem) -> bool {
+    media_item_type(item) == "Episode"
+}
+
+fn tv_episode_info(item: &MediaItem) -> Option<TvEpisodeInfo> {
+    if !is_tv_episode(item) {
+        return None;
+    }
+    let path = media_item_path(item);
+    let components = path
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .filter(|component| !component.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let season_component_index = components
+        .iter()
+        .rposition(|component| parse_season_component(component).is_some());
+    let season_number = season_component_index
+        .and_then(|index| components.get(index))
+        .and_then(|component| parse_season_component(component))
+        .or_else(|| parse_sxe_numbers(&item.name).map(|(season, _)| season));
+    let episode_number = parse_sxe_numbers(&item.name).map(|(_, episode)| episode);
+    let series_name = season_component_index
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| components.get(index))
+        .cloned()
+        .or_else(|| components.last().cloned())
+        .unwrap_or_else(|| item.name.clone());
+    Some(TvEpisodeInfo {
+        series_name,
+        season_number,
+        episode_number,
+    })
+}
+
+fn tv_episode_series_key(item: &MediaItem) -> String {
+    tv_episode_info(item)
+        .map(|info| info.series_name.to_ascii_lowercase())
+        .unwrap_or_else(|| item.virtual_folder_id.to_string())
+}
+
+fn compare_tv_episodes(left: &MediaItem, right: &MediaItem) -> Ordering {
+    let left_info = tv_episode_info(left);
+    let right_info = tv_episode_info(right);
+    let left_series = left_info
+        .as_ref()
+        .map(|info| info.series_name.to_ascii_lowercase())
+        .unwrap_or_else(|| left.name.to_ascii_lowercase());
+    let right_series = right_info
+        .as_ref()
+        .map(|info| info.series_name.to_ascii_lowercase())
+        .unwrap_or_else(|| right.name.to_ascii_lowercase());
+    left_series
+        .cmp(&right_series)
+        .then_with(|| {
+            left_info
+                .as_ref()
+                .and_then(|info| info.season_number)
+                .unwrap_or(i32::MAX)
+                .cmp(
+                    &right_info
+                        .as_ref()
+                        .and_then(|info| info.season_number)
+                        .unwrap_or(i32::MAX),
+                )
+        })
+        .then_with(|| {
+            left_info
+                .as_ref()
+                .and_then(|info| info.episode_number)
+                .unwrap_or(i32::MAX)
+                .cmp(
+                    &right_info
+                        .as_ref()
+                        .and_then(|info| info.episode_number)
+                        .unwrap_or(i32::MAX),
+                )
+        })
+        .then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn parse_season_component(value: &str) -> Option<i32> {
+    let value = value.trim().to_ascii_lowercase();
+    let digits = value
+        .strip_prefix("season")
+        .or_else(|| value.strip_prefix("series"))
+        .map(str::trim)?
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn parse_sxe_numbers(value: &str) -> Option<(i32, i32)> {
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len().saturating_sub(3) {
+        if !bytes[index].eq_ignore_ascii_case(&b's') {
+            continue;
+        }
+        let mut cursor = index + 1;
+        let season_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if season_start == cursor
+            || cursor >= bytes.len()
+            || !bytes[cursor].eq_ignore_ascii_case(&b'e')
+        {
+            continue;
+        }
+        let episode_start = cursor + 1;
+        cursor = episode_start;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if episode_start == cursor {
+            continue;
+        }
+        let season = value[season_start..episode_start - 1].parse().ok()?;
+        let episode = value[episode_start..cursor].parse().ok()?;
+        return Some((season, episode));
+    }
+    None
+}
+
+fn metadata_premiere_date(metadata: &serde_json::Value) -> Option<OffsetDateTime> {
+    metadata
+        .get("PremiereDate")
+        .or_else(|| metadata.get("AirDate"))
+        .or_else(|| metadata.get("DateCreated"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
 }
 
 #[derive(Debug, Deserialize)]
@@ -16251,7 +16564,7 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose};
     use http_body_util::BodyExt;
     use jellyrin_core::{FfmpegCommandSpec, MediaItem, TranscodeStreamSelection};
-    use jellyrin_db::{Database, UpsertTranscodeSession};
+    use jellyrin_db::{Database, UpsertPlaybackState, UpsertTranscodeSession};
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -24679,6 +24992,137 @@ mod tests {
         let intros: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(intros["TotalRecordCount"], 0);
         assert_eq!(intros["Items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tv_show_next_up_and_upcoming_use_scanned_episode_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let season_dir = tmp.path().join("Example Show").join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await.unwrap();
+        tokio::fs::write(season_dir.join("Example Show S01E01.mp4"), b"episode 1")
+            .await
+            .unwrap();
+        tokio::fs::write(season_dir.join("Example Show S01E02.mp4"), b"episode 22")
+            .await
+            .unwrap();
+        tokio::fs::write(season_dir.join("Example Show S01E03.mp4"), b"episode 333")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "shows-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Shows",
+                Some("tvshows"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let episodes = db.media_items().await.unwrap();
+        assert_eq!(episodes.len(), 3);
+        let first = episodes
+            .iter()
+            .find(|episode| episode.name.contains("S01E01"))
+            .unwrap();
+        let second = episodes
+            .iter()
+            .find(|episode| episode.name.contains("S01E02"))
+            .unwrap();
+        let third = episodes
+            .iter()
+            .find(|episode| episode.name.contains("S01E03"))
+            .unwrap();
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: first.id,
+            media_source_id: None,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: 0,
+            is_paused: false,
+            played: true,
+        })
+        .await
+        .unwrap();
+        db.update_media_item_metadata(
+            third.id,
+            json!({
+                "PremiereDate": super::format_time_for_json(
+                    time::OffsetDateTime::now_utc() + time::Duration::days(7)
+                )
+            }),
+        )
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Shows/NextUp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/shows/nextup?UserId={}&Limit=1", user.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let next_up: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(next_up["TotalRecordCount"], 1);
+        assert_eq!(next_up["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(next_up["Items"][0]["Id"], second.id.simple().to_string());
+        assert_eq!(next_up["Items"][0]["Type"], "Episode");
+        assert_eq!(next_up["Items"][0]["SeriesName"], "Example Show");
+        assert_eq!(next_up["Items"][0]["ParentIndexNumber"], 1);
+        assert_eq!(next_up["Items"][0]["IndexNumber"], 2);
+        assert_eq!(next_up["Items"][0]["UserData"]["Played"], false);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Shows/Upcoming?UserId={}", user.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let upcoming: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(upcoming["TotalRecordCount"], 1);
+        assert_eq!(upcoming["Items"][0]["Id"], third.id.simple().to_string());
+        assert_eq!(upcoming["Items"][0]["Type"], "Episode");
+        assert_eq!(upcoming["Items"][0]["IndexNumber"], 3);
     }
 
     #[tokio::test]
