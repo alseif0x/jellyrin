@@ -147,6 +147,14 @@ pub struct ActivePlaybackSession {
 }
 
 #[derive(Debug, Clone)]
+pub struct ActiveViewingSession {
+    pub session_id: String,
+    pub user_id: Uuid,
+    pub item: MediaItem,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpsertActivePlaybackSession {
     pub session_id: String,
     pub user_id: Uuid,
@@ -156,6 +164,13 @@ pub struct UpsertActivePlaybackSession {
     pub subtitle_stream_index: Option<i64>,
     pub position_ticks: i64,
     pub is_paused: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertActiveViewingSession {
+    pub session_id: String,
+    pub user_id: Uuid,
+    pub item_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -1431,6 +1446,20 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        sqlx::query(
+            r#"
+            DELETE FROM active_viewing_sessions
+            WHERE session_id IN (
+                SELECT access_token FROM devices
+                WHERE user_id = ?1 AND access_token != ?2
+            )
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(keep_token)
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query("DELETE FROM devices WHERE user_id = ?1 AND access_token != ?2")
             .bind(user_id.to_string())
             .bind(keep_token)
@@ -1443,6 +1472,18 @@ impl Database {
         sqlx::query(
             r#"
             DELETE FROM active_playback_sessions
+            WHERE session_id IN (
+                SELECT access_token FROM devices WHERE access_token = ?1 OR device_id = ?1
+            )
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM active_viewing_sessions
             WHERE session_id IN (
                 SELECT access_token FROM devices WHERE access_token = ?1 OR device_id = ?1
             )
@@ -1662,6 +1703,75 @@ impl Database {
             INNER JOIN media_items ON media_items.id = active_playback_sessions.item_id
             WHERE media_items.missing_since IS NULL
             ORDER BY active_playback_sessions.updated_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn upsert_active_viewing_session(
+        &self,
+        viewing: UpsertActiveViewingSession,
+    ) -> anyhow::Result<()> {
+        let trimmed_session_id = viewing.session_id.trim();
+        anyhow::ensure!(
+            !trimmed_session_id.is_empty(),
+            "session id must not be empty"
+        );
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO active_viewing_sessions (session_id, user_id, item_id, updated_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(session_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                item_id = excluded.item_id,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(trimmed_session_id)
+        .bind(viewing.user_id.to_string())
+        .bind(viewing.item_id.to_string())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_active_viewing_session(&self, session_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM active_viewing_sessions WHERE session_id = ?1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn active_viewing_sessions(&self) -> anyhow::Result<Vec<ActiveViewingSession>> {
+        let rows = sqlx::query_as::<_, ActiveViewingSessionRow>(
+            r#"
+            SELECT active_viewing_sessions.session_id,
+                   active_viewing_sessions.user_id,
+                   active_viewing_sessions.updated_at AS viewing_updated_at,
+                   media_items.id,
+                   media_items.virtual_folder_id,
+                   media_items.name,
+                   media_items.path,
+                   media_items.media_type,
+                   media_items.collection_type,
+                   media_items.file_size,
+                   media_items.runtime_ticks,
+                   media_items.bitrate,
+                   media_items.width,
+                   media_items.height,
+                   media_items.media_streams_json,
+                   media_items.created_at,
+                   media_items.updated_at
+            FROM active_viewing_sessions
+            INNER JOIN media_items ON media_items.id = active_viewing_sessions.item_id
+            WHERE media_items.missing_since IS NULL
+            ORDER BY active_viewing_sessions.updated_at DESC
             "#,
         )
         .fetch_all(&self.pool)
@@ -2560,6 +2670,8 @@ impl Database {
         }
 
         self.delete_from_item_ref_table("active_playback_sessions", "item_id", &visible_ids)
+            .await?;
+        self.delete_from_item_ref_table("active_viewing_sessions", "item_id", &visible_ids)
             .await?;
         self.delete_from_item_ref_table("transcode_sessions", "item_id", &visible_ids)
             .await?;
@@ -4501,6 +4613,27 @@ struct ActivePlaybackSessionRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct ActiveViewingSessionRow {
+    session_id: String,
+    user_id: String,
+    viewing_updated_at: String,
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    media_streams_json: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct TranscodeSessionRow {
     play_session_id: String,
     dedupe_key: Option<String>,
@@ -4827,6 +4960,35 @@ impl TryFrom<ActivePlaybackSessionRow> for ActivePlaybackSession {
             position_ticks: row.position_ticks,
             is_paused: row.is_paused,
             updated_at: parse_time(&row.playback_updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<ActiveViewingSessionRow> for ActiveViewingSession {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ActiveViewingSessionRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session_id: row.session_id,
+            user_id: Uuid::parse_str(&row.user_id).context("invalid active viewing user id")?,
+            item: MediaItem {
+                id: Uuid::parse_str(&row.id).context("invalid active viewing item id")?,
+                virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                    .context("invalid active viewing virtual folder id")?,
+                name: row.name,
+                path: row.path,
+                media_type: row.media_type,
+                collection_type: row.collection_type,
+                file_size: row.file_size,
+                runtime_ticks: row.runtime_ticks,
+                bitrate: row.bitrate,
+                width: row.width,
+                height: row.height,
+                media_streams: parse_media_streams_json(&row.media_streams_json)?,
+                created_at: parse_time(&row.created_at)?,
+                updated_at: parse_time(&row.updated_at)?,
+            },
+            updated_at: parse_time(&row.viewing_updated_at)?,
         })
     }
 }
@@ -5383,8 +5545,8 @@ fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
-        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertPlaybackState,
-        UpsertTranscodeSession, parse_ffprobe_media_info,
+        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertActiveViewingSession,
+        UpsertPlaybackState, UpsertTranscodeSession, parse_ffprobe_media_info,
     };
     use serde_json::json;
     use time::Duration;
@@ -5810,6 +5972,69 @@ mod tests {
             .await
             .unwrap();
         assert!(db.active_playback_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_viewing_sessions_track_and_clear_now_viewing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Example Movie.mp4");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        let (_, token) = db
+            .authenticate_user_by_name(
+                "root",
+                "secret",
+                "device-1",
+                "Firefox",
+                "Jellyfin Web",
+                "dev",
+            )
+            .await
+            .unwrap();
+
+        db.upsert_active_viewing_session(UpsertActiveViewingSession {
+            session_id: token.access_token.clone(),
+            user_id: user.id,
+            item_id: item.id,
+        })
+        .await
+        .unwrap();
+        let sessions = db.active_viewing_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, token.access_token);
+        assert_eq!(sessions[0].user_id, user.id);
+        assert_eq!(sessions[0].item.id, item.id);
+
+        db.upsert_active_viewing_session(UpsertActiveViewingSession {
+            session_id: token.access_token.clone(),
+            user_id: user.id,
+            item_id: item.id,
+        })
+        .await
+        .unwrap();
+        let sessions = db.active_viewing_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].item.id, item.id);
+
+        db.clear_active_viewing_session(&token.access_token)
+            .await
+            .unwrap();
+        assert!(db.active_viewing_sessions().await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -30,11 +30,12 @@ use jellyrin_core::{
     TranscodeStreamSelection, User, VirtualFolder, build_hls_ffmpeg_command,
 };
 use jellyrin_db::{
-    ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
-    BackupManifest, BrandingConfig, Database, DeviceSession, MediaItemMetadata, MediaList,
-    MediaListItem, MediaListUserPermission, QuickConnectSession, SortDirection,
-    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    UpsertActivePlaybackSession, UpsertPlaybackState, UpsertTranscodeSession,
+    ActivePlaybackSession, ActiveViewingSession, ActivityLogEntry, ActivityLogFilter,
+    ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database, DeviceSession,
+    MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission, QuickConnectSession,
+    SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -4111,6 +4112,12 @@ async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json:
         .into_iter()
         .map(|session| (session.session_id.clone(), session))
         .collect::<HashMap<_, _>>();
+    let active_viewing = db
+        .active_viewing_sessions()
+        .await?
+        .into_iter()
+        .map(|session| (session.session_id.clone(), session))
+        .collect::<HashMap<_, _>>();
     let server_id = db.server_state().await?.server_id.to_string();
     Ok(sessions
         .iter()
@@ -4118,6 +4125,7 @@ async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json:
             session_to_json(
                 session,
                 active_playback.get(&session.access_token),
+                active_viewing.get(&session.access_token),
                 &server_id,
             )
         })
@@ -6259,6 +6267,7 @@ async fn display_content(
         command_target_session(&state, &headers, &query.auth, &session_id).await?;
     let body = body.map(|Json(value)| value);
     let payload = display_content_payload(&state.db, query, body).await?;
+    persist_session_viewing(&state.db, &target_session, &payload).await?;
     broadcast_session_message(
         &target_session.access_token,
         serde_json::json!({
@@ -6319,6 +6328,7 @@ async fn report_viewing(
         body,
     )
     .await?;
+    persist_session_viewing(&state.db, &target_session, &payload).await?;
     broadcast_session_message(
         &target_session.access_token,
         serde_json::json!({
@@ -6332,6 +6342,25 @@ async fn report_viewing(
         }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn persist_session_viewing(
+    db: &Database,
+    target_session: &DeviceSession,
+    payload: &DisplayContentPayload,
+) -> Result<(), ApiError> {
+    let Some(item_id) = payload.item_id.as_deref() else {
+        db.clear_active_viewing_session(&target_session.access_token)
+            .await?;
+        return Ok(());
+    };
+    db.upsert_active_viewing_session(UpsertActiveViewingSession {
+        session_id: target_session.access_token.clone(),
+        user_id: target_session.user_id,
+        item_id: parse_jellyfin_uuid(item_id)?,
+    })
+    .await?;
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -19145,6 +19174,7 @@ async fn authentication_result_to_dto(
 fn session_to_json(
     session: &DeviceSession,
     active_playback: Option<&ActivePlaybackSession>,
+    active_viewing: Option<&ActiveViewingSession>,
     server_id: &str,
 ) -> serde_json::Value {
     let capabilities = session.capabilities.as_ref();
@@ -19164,7 +19194,7 @@ fn session_to_json(
         "SupportedCommands": capability_array(capabilities, "SupportedCommands"),
         "NowPlayingItem": active_playback.map(|playback| media_item_to_json(&playback.item, server_id)),
         "PlayState": active_playback.map(active_playback_state_json),
-        "NowViewingItem": null,
+        "NowViewingItem": active_viewing.map(|viewing| media_item_to_json(&viewing.item, server_id)),
     })
 }
 
@@ -32057,6 +32087,26 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", playback_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let viewing_sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(viewing_sessions[0]["NowViewingItem"]["Id"], item_id);
+        assert_eq!(
+            viewing_sessions[0]["NowViewingItem"]["Name"],
+            "Example Song"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!(
                         "/Session/Sessions/Viewing?SessionId={playback_token}&ItemId={item_id}"
@@ -32104,6 +32154,7 @@ mod tests {
         let sessions: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(sessions[0]["DeviceId"], "audio-remote-device");
         assert_eq!(sessions[0]["NowPlayingItem"]["Id"], item_id);
+        assert_eq!(sessions[0]["NowViewingItem"]["Id"], item_id);
         assert_eq!(sessions[0]["PlayState"]["PositionTicks"], 123);
         assert_eq!(
             sessions[0]["PlayState"]["MediaSourceId"]
