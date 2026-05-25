@@ -1556,6 +1556,36 @@ impl Database {
         Ok(())
     }
 
+    pub async fn update_transcode_session_progress(
+        &self,
+        play_session_id: &str,
+        progress_percent: Option<f64>,
+        position_ticks: i64,
+    ) -> anyhow::Result<()> {
+        let play_session_id = play_session_id.trim();
+        anyhow::ensure!(
+            !play_session_id.is_empty(),
+            "play session id must not be empty"
+        );
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            UPDATE transcode_sessions
+            SET progress_percent = COALESCE(?1, progress_percent),
+                position_ticks = ?2,
+                updated_at = ?3
+            WHERE play_session_id = ?4
+            "#,
+        )
+        .bind(progress_percent)
+        .bind(position_ticks.max(0))
+        .bind(now)
+        .bind(play_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn start_task_run(&self, task_key: &str) -> anyhow::Result<TaskRun> {
         let trimmed_key = task_key.trim();
         anyhow::ensure!(!trimmed_key.is_empty(), "task key must not be empty");
@@ -4124,6 +4154,28 @@ mod tests {
         assert_eq!(session.video_stream_index, Some(0));
         assert_eq!(session.progress_percent, Some(12.5));
         assert_eq!(session.position_ticks, 456);
+
+        db.update_transcode_session_progress("play-session-1", Some(25.0), 789)
+            .await
+            .unwrap();
+        let progressed = db
+            .transcode_session_by_play_session_id("play-session-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progressed.progress_percent, Some(25.0));
+        assert_eq!(progressed.position_ticks, 789);
+
+        db.update_transcode_session_progress("play-session-1", None, 1000)
+            .await
+            .unwrap();
+        let progressed = db
+            .transcode_session_by_play_session_id("play-session-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progressed.progress_percent, Some(25.0));
+        assert_eq!(progressed.position_ticks, 1000);
 
         let fetched = db
             .transcode_session_by_play_session_id("play-session-1")

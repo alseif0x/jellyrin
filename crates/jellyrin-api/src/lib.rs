@@ -5676,12 +5676,15 @@ async fn spawn_hls_transcode_task(
             }
         };
 
+        let progress_rx = process.subscribe_progress();
         let process_id = process.process_id().map(i64::from);
+        let mut runtime_ticks = None;
         match db
             .transcode_session_by_play_session_id(&play_session_id)
             .await
         {
             Ok(Some(session)) => {
+                runtime_ticks = session.item.runtime_ticks;
                 let _ = db
                     .upsert_transcode_session(UpsertTranscodeSession {
                         play_session_id: play_session_id.clone(),
@@ -5707,6 +5710,13 @@ async fn spawn_hls_transcode_task(
             }
         }
 
+        let progress_task = spawn_transcode_progress_persistence_task(
+            db.clone(),
+            play_session_id.clone(),
+            progress_rx,
+            runtime_ticks,
+        );
+
         let mut stopped = false;
         let exit = tokio::select! {
             exit = process.wait() => exit,
@@ -5724,6 +5734,8 @@ async fn spawn_hls_transcode_task(
                 "failed"
             }
         };
+        drop(process);
+        let _ = progress_task.await;
         let session = db
             .transcode_session_by_play_session_id(&play_session_id)
             .await
@@ -5740,6 +5752,45 @@ async fn spawn_hls_transcode_task(
             cleanup_hls_transcode_files(&session.output_path).await;
         }
     });
+}
+
+fn spawn_transcode_progress_persistence_task(
+    db: Database,
+    play_session_id: String,
+    mut progress_rx: tokio::sync::broadcast::Receiver<jellyrin_core::FfmpegProgress>,
+    runtime_ticks: Option<i64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_position_ticks = None;
+        while let Ok(progress) = progress_rx.recv().await {
+            let Some(position_ticks) = progress.position_ticks() else {
+                continue;
+            };
+            if last_position_ticks == Some(position_ticks) {
+                continue;
+            }
+            last_position_ticks = Some(position_ticks);
+            let progress_percent = transcode_progress_percent(position_ticks, runtime_ticks);
+            if let Err(error) = db
+                .update_transcode_session_progress(
+                    &play_session_id,
+                    progress_percent,
+                    position_ticks,
+                )
+                .await
+            {
+                tracing::warn!(%play_session_id, %error, "failed to persist HLS transcode progress");
+            }
+        }
+    })
+}
+
+fn transcode_progress_percent(position_ticks: i64, runtime_ticks: Option<i64>) -> Option<f64> {
+    let runtime_ticks = runtime_ticks?;
+    if runtime_ticks <= 0 || position_ticks < 0 {
+        return None;
+    }
+    Some(((position_ticks as f64 / runtime_ticks as f64) * 100.0).clamp(0.0, 100.0))
 }
 
 fn transcode_stop_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<()>>> {
@@ -8354,15 +8405,15 @@ mod tests {
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, default_audio_stream_index,
         default_subtitle_stream_index, hls_transcode_dedupe_key, load_countries, load_cultures,
         parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
-        reconcile_transcode_sessions_on_startup, router, subscribe_playback_events,
-        transcode_dedupe_lock,
+        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
+        subscribe_playback_events, transcode_dedupe_lock,
     };
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode, header},
     };
     use http_body_util::BodyExt;
-    use jellyrin_core::{MediaItem, TranscodeStreamSelection};
+    use jellyrin_core::{FfmpegCommandSpec, MediaItem, TranscodeStreamSelection};
     use jellyrin_db::{Database, UpsertTranscodeSession};
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -16085,6 +16136,83 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, "completed");
         assert!(db.active_transcode_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn hls_transcode_task_persists_incremental_progress() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Progress.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+        db.update_media_item_media_info(item.id, Some(20_000), None, None, None, vec![])
+            .await
+            .unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let playlist = transcode_root
+            .path()
+            .join("play-session-progress/main.m3u8");
+        tokio::fs::create_dir_all(playlist.parent().unwrap())
+            .await
+            .unwrap();
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-progress".to_string(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item.id.simple().to_string()),
+            audio_stream_index: Some(0),
+            subtitle_stream_index: Some(-1),
+            video_stream_index: Some(0),
+            output_path: playlist.to_string_lossy().to_string(),
+            process_id: None,
+            status: "starting".to_string(),
+            progress_percent: None,
+            position_ticks: 0,
+        })
+        .await
+        .unwrap();
+
+        let command = FfmpegCommandSpec::new(
+            "sh",
+            vec![
+                "-c".to_string(),
+                "printf 'out_time_us=1000\\nprogress=continue\\nout_time_us=2000\\nprogress=end\\n' >&2"
+                    .to_string(),
+            ],
+        );
+        spawn_hls_transcode_task(db.clone(), "play-session-progress".to_string(), command).await;
+
+        let mut session = None;
+        for _ in 0..100 {
+            let current = db
+                .transcode_session_by_play_session_id("play-session-progress")
+                .await
+                .unwrap()
+                .unwrap();
+            if current.status == "completed" {
+                session = Some(current);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let session = session.expect("transcode process did not complete");
+        assert_eq!(session.position_ticks, 20_000);
+        assert_eq!(session.progress_percent, Some(100.0));
     }
 
     #[tokio::test]
