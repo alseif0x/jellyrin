@@ -39,7 +39,7 @@ use jellyrin_transcode::{
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_util::io::ReaderStream;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use uuid::Uuid;
@@ -53,6 +53,7 @@ const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
+static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AppState {
@@ -491,6 +492,16 @@ pub fn router(state: AppState) -> Router {
         .route("/playback/bitratetest", get(bitrate_test))
         .route("/Videos/ActiveEncodings", get(active_encodings))
         .route("/videos/activeencodings", get(active_encodings))
+        .route("/Videos/ActiveEncodings", delete(stop_active_encoding))
+        .route("/videos/activeencodings", delete(stop_active_encoding))
+        .route(
+            "/HlsSegment/Videos/ActiveEncodings",
+            delete(stop_active_encoding),
+        )
+        .route(
+            "/hlssegment/videos/activeencodings",
+            delete(stop_active_encoding),
+        )
         .route("/UserViews", get(user_views_result))
         .route("/userviews", get(user_views_result))
         .route("/Items/Counts", get(item_counts))
@@ -5495,7 +5506,7 @@ async fn playback_transcode_info_response(
             position_ticks: request.start_position_ticks,
         })
         .await?;
-    spawn_hls_transcode_task(state.db.clone(), play_session_id.clone(), command);
+    spawn_hls_transcode_task(state.db.clone(), play_session_id.clone(), command).await;
 
     let mut media_sources = item_json["MediaSources"].clone();
     if let Some(media_source) = media_sources
@@ -5527,11 +5538,20 @@ async fn playback_transcode_info_response(
     })))
 }
 
-fn spawn_hls_transcode_task(
+async fn spawn_hls_transcode_task(
     db: Database,
     play_session_id: String,
     command: jellyrin_core::FfmpegCommandSpec,
 ) {
+    let (stop_tx, stop_rx) = oneshot::channel();
+    if let Some(previous_stop) = transcode_stop_registry()
+        .lock()
+        .await
+        .insert(play_session_id.clone(), stop_tx)
+    {
+        let _ = previous_stop.send(());
+    }
+
     tokio::spawn(async move {
         let mut process = match spawn_transcode_process(&command) {
             Ok(process) => process,
@@ -5575,8 +5595,16 @@ fn spawn_hls_transcode_task(
             }
         }
 
-        let exit = process.wait().await;
+        let mut stopped = false;
+        let exit = tokio::select! {
+            exit = process.wait() => exit,
+            _ = stop_rx => {
+                stopped = true;
+                process.stop().await
+            }
+        };
         let final_status = match exit {
+            Ok(_) if stopped => "stopped",
             Ok(exit) if exit.success => "completed",
             Ok(_) => "failed",
             Err(error) => {
@@ -5584,10 +5612,26 @@ fn spawn_hls_transcode_task(
                 "failed"
             }
         };
+        let session = db
+            .transcode_session_by_play_session_id(&play_session_id)
+            .await
+            .ok()
+            .flatten();
         let _ = db
             .update_transcode_session_status(&play_session_id, final_status)
             .await;
+        transcode_stop_registry()
+            .lock()
+            .await
+            .remove(&play_session_id);
+        if stopped && let Some(session) = session {
+            cleanup_hls_transcode_files(&session.output_path).await;
+        }
     });
+}
+
+fn transcode_stop_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<()>>> {
+    TRANSCODE_STOPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn playback_selection_supported(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
@@ -6413,6 +6457,51 @@ async fn active_encodings(
     Ok(Json(sessions.iter().map(transcode_session_json).collect()))
 }
 
+async fn stop_active_encoding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<StopEncodingQuery>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let play_session_id = query
+        .play_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
+    let session = state
+        .db
+        .transcode_session_by_play_session_id(play_session_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Transcode session not found"))?;
+    if session.user_id != user.id && !user.is_administrator {
+        return Err(ApiError::forbidden("Transcode session access denied"));
+    }
+
+    let already_terminal = matches!(session.status.as_str(), "stopped" | "completed" | "failed");
+    let stop_sender = transcode_stop_registry()
+        .lock()
+        .await
+        .remove(play_session_id);
+    if let Some(stop_sender) = stop_sender {
+        state
+            .db
+            .update_transcode_session_status(play_session_id, "stopping")
+            .await?;
+        let _ = stop_sender.send(());
+    } else if !already_terminal {
+        state
+            .db
+            .update_transcode_session_status(play_session_id, "stopped")
+            .await?;
+        cleanup_hls_transcode_files(&session.output_path).await;
+    } else {
+        cleanup_hls_transcode_files(&session.output_path).await;
+    }
+
+    Ok(StatusCode::OK)
+}
+
 async fn authenticated_item_empty_json_array(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7009,6 +7098,22 @@ fn transcode_temp_root() -> PathBuf {
 
 fn hls_master_url(item_id: &str, play_session_id: &str, access_token: &str) -> String {
     format!("/Videos/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}")
+}
+
+async fn cleanup_hls_transcode_files(output_path: &str) {
+    let session_dir = HlsTranscodeLayout::from_media_playlist_path(output_path).session_dir;
+    if session_dir.as_os_str().is_empty() {
+        return;
+    }
+    if let Err(error) = tokio::fs::remove_dir_all(&session_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %session_dir.display(),
+            %error,
+            "failed to remove HLS transcode directory"
+        );
+    }
 }
 
 fn first_stream_index(media_streams: &[serde_json::Value], stream_type: &str) -> Option<i64> {
@@ -7744,6 +7849,16 @@ struct HlsQuery {
     api_key: Option<String>,
     #[serde(alias = "PlaySessionId", alias = "playSessionId")]
     play_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StopEncodingQuery {
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(alias = "PlaySessionId", alias = "playSessionId")]
+    play_session_id: Option<String>,
+    #[serde(alias = "DeviceId", alias = "deviceId")]
+    _device_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -15555,6 +15670,164 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let active_encodings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(active_encodings, json!([]));
+    }
+
+    #[tokio::test]
+    async fn stop_active_encoding_marks_session_stopped_and_removes_hls_files() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Stop Me.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let transcode_dir = transcode_root.path().join("play-session-stop");
+        tokio::fs::create_dir_all(&transcode_dir).await.unwrap();
+        let main_playlist = transcode_dir.join("main.m3u8");
+        tokio::fs::write(&main_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(transcode_dir.join("segment_00000.ts"), b"zero")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "stop-encoding-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-stop".to_string(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item.id.simple().to_string()),
+            audio_stream_index: Some(0),
+            subtitle_stream_index: Some(-1),
+            video_stream_index: Some(0),
+            output_path: main_playlist.to_string_lossy().to_string(),
+            process_id: Some(999),
+            status: "running".to_string(),
+            progress_percent: Some(12.0),
+            position_ticks: 42,
+        })
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(
+                        "/Videos/ActiveEncodings?PlaySessionId=play-session-stop&DeviceId=device-1",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Videos/ActiveEncodings")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(
+                        "/Videos/ActiveEncodings?playSessionId=play-session-stop&deviceId=device-1",
+                    )
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!transcode_dir.exists());
+
+        let session = db
+            .transcode_session_by_play_session_id("play-session-stop")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "stopped");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Videos/ActiveEncodings?PlaySessionId=play-session-stop")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Videos/ActiveEncodings")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let active_encodings: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(active_encodings, json!([]));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/videos/activeencodings?PlaySessionId=missing")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
