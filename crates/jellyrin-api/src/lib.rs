@@ -522,6 +522,10 @@ pub fn router(state: AppState) -> Router {
         .route("/playback/bitratetest", get(bitrate_test))
         .route("/MediaInfo/Playback/BitrateTest", get(bitrate_test))
         .route("/mediainfo/playback/bitratetest", get(bitrate_test))
+        .route("/MediaInfo/LiveStreams/Open", post(open_live_stream))
+        .route("/mediainfo/livestreams/open", post(open_live_stream))
+        .route("/MediaInfo/LiveStreams/Close", post(close_live_stream))
+        .route("/mediainfo/livestreams/close", post(close_live_stream))
         .route("/Videos/ActiveEncodings", get(active_encodings))
         .route("/videos/activeencodings", get(active_encodings))
         .route("/Videos/ActiveEncodings", delete(stop_active_encoding))
@@ -6718,6 +6722,72 @@ async fn merge_video_versions(
                 ));
             }
         }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenLiveStreamBody {
+    #[serde(alias = "ItemId")]
+    item_id: Option<String>,
+    #[serde(alias = "OpenToken")]
+    open_token: Option<String>,
+    #[serde(alias = "MediaSourceId")]
+    media_source_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloseLiveStreamBody {
+    #[serde(alias = "LiveStreamId")]
+    live_stream_id: Option<String>,
+    #[serde(alias = "MediaSourceId")]
+    media_source_id: Option<String>,
+}
+
+async fn open_live_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    body: Option<Json<OpenLiveStreamBody>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let body = body.map(|body| body.0).unwrap_or(OpenLiveStreamBody {
+        item_id: None,
+        open_token: None,
+        media_source_id: None,
+    });
+    let item_id = body
+        .item_id
+        .or(body.media_source_id)
+        .or(body.open_token)
+        .ok_or_else(|| ApiError::bad_request("ItemId is required"))?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let item_json = media_item_to_json(&item, &server_id);
+    let media_source = item_json["MediaSources"]
+        .as_array()
+        .and_then(|sources| sources.first())
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("Media source not found"))?;
+    let live_stream_id = item.id.simple().to_string();
+    Ok(Json(serde_json::json!({
+        "MediaSource": media_source,
+        "LiveStreamId": live_stream_id,
+        "MediaSourceId": live_stream_id,
+    })))
+}
+
+async fn close_live_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    body: Option<Json<CloseLiveStreamBody>>,
+) -> Result<StatusCode, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(Json(body)) = body
+        && let Some(item_id) = body.live_stream_id.or(body.media_source_id)
+    {
+        media_item_by_id(&state.db, &item_id).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -14720,6 +14790,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.len(), 8);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/MediaInfo/LiveStreams/Open")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ItemId": item_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let live_stream: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(live_stream["LiveStreamId"], item_id);
+        assert_eq!(live_stream["MediaSourceId"], item_id);
+        assert_eq!(live_stream["MediaSource"]["Id"], item_id);
+        assert_eq!(live_stream["MediaSource"]["SupportsDirectPlay"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/MediaInfo/LiveStreams/Close")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "LiveStreamId": item_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
