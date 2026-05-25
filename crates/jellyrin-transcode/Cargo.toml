@@ -11,3 +11,5 @@ jellyrin-core = { path = "../jellyrin-core" }
 serde.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true

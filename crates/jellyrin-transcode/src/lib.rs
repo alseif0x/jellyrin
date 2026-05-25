@@ -1,13 +1,26 @@
-use std::{io, process::Stdio};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
-use jellyrin_core::{FfmpegCommandSpec, FfmpegProgress, parse_ffmpeg_progress_line};
+use jellyrin_core::{
+    DEFAULT_HLS_SEGMENT_PATTERN, FfmpegCommandSpec, FfmpegProgress, parse_ffmpeg_progress_line,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
+    fs,
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
     sync::broadcast,
     task::JoinHandle,
+    time::{Instant, sleep},
 };
+
+pub const HLS_MASTER_PLAYLIST_NAME: &str = "master.m3u8";
+pub const HLS_MEDIA_PLAYLIST_NAME: &str = "main.m3u8";
+pub const DEFAULT_HLS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscodeProcessExit {
@@ -15,11 +28,73 @@ pub struct TranscodeProcessExit {
     pub success: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HlsTranscodeLayout {
+    pub session_dir: PathBuf,
+    pub master_playlist_path: PathBuf,
+    pub media_playlist_path: PathBuf,
+    pub segment_pattern_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HlsVariantInfo {
+    pub uri: String,
+    pub bandwidth: u32,
+    pub resolution: Option<(u32, u32)>,
+    pub codecs: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HlsSegment {
+    pub duration_seconds: f64,
+    pub uri: String,
+}
+
 pub struct TranscodeProcess {
     child: Option<Child>,
     progress_tx: broadcast::Sender<FfmpegProgress>,
     stderr_task: Option<JoinHandle<io::Result<()>>>,
     exit: Option<TranscodeProcessExit>,
+}
+
+impl HlsTranscodeLayout {
+    pub fn new(root: impl AsRef<Path>, play_session_id: &str) -> Self {
+        let session_dir = root
+            .as_ref()
+            .join(sanitize_hls_path_component(play_session_id));
+        Self::from_session_dir(session_dir)
+    }
+
+    pub fn from_media_playlist_path(media_playlist_path: impl AsRef<Path>) -> Self {
+        let media_playlist_path = media_playlist_path.as_ref().to_path_buf();
+        let session_dir = media_playlist_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            master_playlist_path: session_dir.join(HLS_MASTER_PLAYLIST_NAME),
+            segment_pattern_path: session_dir.join(DEFAULT_HLS_SEGMENT_PATTERN),
+            media_playlist_path,
+            session_dir,
+        }
+    }
+
+    fn from_session_dir(session_dir: PathBuf) -> Self {
+        Self {
+            master_playlist_path: session_dir.join(HLS_MASTER_PLAYLIST_NAME),
+            media_playlist_path: session_dir.join(HLS_MEDIA_PLAYLIST_NAME),
+            segment_pattern_path: session_dir.join(DEFAULT_HLS_SEGMENT_PATTERN),
+            session_dir,
+        }
+    }
+
+    pub fn segment_path(&self, index: u32) -> PathBuf {
+        self.session_dir.join(format!("segment_{index:05}.ts"))
+    }
+
+    pub fn segment_pattern_string(&self) -> String {
+        self.segment_pattern_path.to_string_lossy().to_string()
+    }
 }
 
 pub fn spawn_transcode_process(command: &FfmpegCommandSpec) -> io::Result<TranscodeProcess> {
@@ -43,6 +118,72 @@ pub fn spawn_transcode_process(command: &FfmpegCommandSpec) -> io::Result<Transc
         stderr_task: Some(stderr_task),
         exit: None,
     })
+}
+
+pub fn render_hls_master_playlist(variant: &HlsVariantInfo) -> String {
+    let mut attributes = vec![format!("BANDWIDTH={}", variant.bandwidth)];
+    if let Some((width, height)) = variant.resolution {
+        attributes.push(format!("RESOLUTION={width}x{height}"));
+    }
+    if let Some(codecs) = variant
+        .codecs
+        .as_deref()
+        .filter(|codecs| !codecs.is_empty())
+    {
+        attributes.push(format!("CODECS=\"{}\"", escape_hls_attribute(codecs)));
+    }
+
+    format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:{}\n{}\n",
+        attributes.join(","),
+        variant.uri
+    )
+}
+
+pub fn render_hls_media_playlist(
+    target_duration_seconds: u32,
+    media_sequence: u64,
+    segments: &[HlsSegment],
+    end_list: bool,
+) -> String {
+    let mut playlist = format!(
+        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{}\n",
+        target_duration_seconds.max(1),
+        media_sequence
+    );
+    for segment in segments {
+        playlist.push_str(&format!(
+            "#EXTINF:{:.3},\n{}\n",
+            segment.duration_seconds.max(0.0),
+            segment.uri
+        ));
+    }
+    if end_list {
+        playlist.push_str("#EXT-X-ENDLIST\n");
+    }
+    playlist
+}
+
+pub async fn wait_for_hls_readiness(
+    media_playlist_path: impl AsRef<Path>,
+    first_segment_path: impl AsRef<Path>,
+    timeout: Duration,
+) -> io::Result<bool> {
+    let media_playlist_path = media_playlist_path.as_ref();
+    let first_segment_path = first_segment_path.as_ref();
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if non_empty_file_exists(media_playlist_path).await?
+            && non_empty_file_exists(first_segment_path).await?
+        {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        sleep(DEFAULT_HLS_POLL_INTERVAL).await;
+    }
 }
 
 impl TranscodeProcess {
@@ -97,6 +238,33 @@ impl TranscodeProcess {
     }
 }
 
+fn sanitize_hls_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| match character {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' => character,
+            _ => '_',
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn escape_hls_attribute(value: &str) -> String {
+    value.replace('"', "\\\"")
+}
+
+async fn non_empty_file_exists(path: &Path) -> io::Result<bool> {
+    match fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 async fn read_ffmpeg_progress<R>(
     reader: R,
     progress_tx: broadcast::Sender<FfmpegProgress>,
@@ -142,7 +310,157 @@ mod tests {
     use jellyrin_core::FfmpegCommandSpec;
     use tokio::time::{Duration, timeout};
 
-    use super::spawn_transcode_process;
+    use super::{
+        HLS_MASTER_PLAYLIST_NAME, HLS_MEDIA_PLAYLIST_NAME, HlsSegment, HlsTranscodeLayout,
+        HlsVariantInfo, render_hls_master_playlist, render_hls_media_playlist,
+        spawn_transcode_process, wait_for_hls_readiness,
+    };
+
+    #[test]
+    fn hls_layout_uses_sanitized_session_directory_and_expected_names() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = HlsTranscodeLayout::new(root.path(), "../play session:1");
+
+        assert_eq!(layout.session_dir, root.path().join("___play_session_1"));
+        assert_eq!(
+            layout.master_playlist_path,
+            layout.session_dir.join(HLS_MASTER_PLAYLIST_NAME)
+        );
+        assert_eq!(
+            layout.media_playlist_path,
+            layout.session_dir.join(HLS_MEDIA_PLAYLIST_NAME)
+        );
+        assert_eq!(
+            layout.segment_pattern_path,
+            layout.session_dir.join("segment_%05d.ts")
+        );
+        assert_eq!(
+            layout.segment_path(7),
+            layout.session_dir.join("segment_00007.ts")
+        );
+    }
+
+    #[test]
+    fn hls_layout_can_be_derived_from_persisted_output_path() {
+        let root = tempfile::tempdir().unwrap();
+        let output_path = root.path().join("play-1").join(HLS_MEDIA_PLAYLIST_NAME);
+        let layout = HlsTranscodeLayout::from_media_playlist_path(&output_path);
+
+        assert_eq!(layout.session_dir, root.path().join("play-1"));
+        assert_eq!(layout.media_playlist_path, output_path);
+        assert_eq!(
+            layout.master_playlist_path,
+            root.path().join("play-1").join(HLS_MASTER_PLAYLIST_NAME)
+        );
+        assert_eq!(
+            layout.segment_pattern_path,
+            root.path().join("play-1").join("segment_%05d.ts")
+        );
+    }
+
+    #[test]
+    fn renders_hls_master_playlist_snapshot() {
+        let playlist = render_hls_master_playlist(&HlsVariantInfo {
+            uri: HLS_MEDIA_PLAYLIST_NAME.to_string(),
+            bandwidth: 4_000_000,
+            resolution: Some((1280, 720)),
+            codecs: Some("avc1.4d401f,mp4a.40.2".to_string()),
+        });
+
+        assert_eq!(
+            playlist,
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=4000000,RESOLUTION=1280x720,CODECS=\"avc1.4d401f,mp4a.40.2\"\n\
+             main.m3u8\n"
+        );
+    }
+
+    #[test]
+    fn renders_hls_media_playlist_snapshot() {
+        let playlist = render_hls_media_playlist(
+            3,
+            0,
+            &[
+                HlsSegment {
+                    duration_seconds: 3.003,
+                    uri: "segment_00000.ts".to_string(),
+                },
+                HlsSegment {
+                    duration_seconds: 2.5,
+                    uri: "segment_00001.ts".to_string(),
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(
+            playlist,
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-TARGETDURATION:3\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXTINF:3.003,\n\
+             segment_00000.ts\n\
+             #EXTINF:2.500,\n\
+             segment_00001.ts\n\
+             #EXT-X-ENDLIST\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_readiness_waits_for_playlist_and_first_segment() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = HlsTranscodeLayout::new(root.path(), "play-1");
+        tokio::fs::create_dir_all(&layout.session_dir)
+            .await
+            .unwrap();
+        let media_playlist_path = layout.media_playlist_path.clone();
+        let first_segment_path = layout.segment_path(0);
+
+        let write_playlist = media_playlist_path.clone();
+        let write_segment = first_segment_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::fs::write(write_playlist, b"#EXTM3U\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::fs::write(write_segment, b"ts").await.unwrap();
+        });
+
+        assert!(
+            wait_for_hls_readiness(
+                &media_playlist_path,
+                &first_segment_path,
+                Duration::from_secs(5)
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_readiness_times_out_without_first_segment() {
+        let root = tempfile::tempdir().unwrap();
+        let layout = HlsTranscodeLayout::new(root.path(), "play-1");
+        tokio::fs::create_dir_all(&layout.session_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(&layout.media_playlist_path, b"#EXTM3U\n")
+            .await
+            .unwrap();
+
+        assert!(
+            !wait_for_hls_readiness(
+                &layout.media_playlist_path,
+                layout.segment_path(0),
+                Duration::from_millis(100)
+            )
+            .await
+            .unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn transcode_process_streams_progress_and_waits_for_exit() {
