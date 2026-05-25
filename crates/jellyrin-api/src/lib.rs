@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path as FsPath, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use axum::{
@@ -54,6 +54,7 @@ const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
 static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
+static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct AppState {
@@ -5470,8 +5471,6 @@ async fn playback_transcode_info_response(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let play_session_id = Uuid::new_v4().simple().to_string();
     let item_id = item.id.simple().to_string();
-    let layout = HlsTranscodeLayout::new(transcode_temp_root(), &play_session_id);
-    tokio::fs::create_dir_all(&layout.session_dir).await?;
 
     let streams = media_item_streams(item);
     let selection = TranscodeStreamSelection {
@@ -5481,6 +5480,10 @@ async fn playback_transcode_info_response(
             .or_else(|| default_audio_stream_index(&streams)),
         subtitle_stream_index: options.subtitle_stream_index,
     };
+    let dedupe_key = hls_transcode_dedupe_key(user.id, item, &selection);
+    let dedupe_lock = transcode_dedupe_lock(&dedupe_key).await;
+    let _dedupe_guard = dedupe_lock.lock().await;
+
     if let Some(session) =
         reusable_hls_transcode_session(&state.db, user.id, item, &selection).await?
     {
@@ -5493,6 +5496,8 @@ async fn playback_transcode_info_response(
         );
     }
 
+    let layout = HlsTranscodeLayout::new(transcode_temp_root(), &play_session_id);
+    tokio::fs::create_dir_all(&layout.session_dir).await?;
     let request = HlsTranscodeRequest::new(
         item.path.clone(),
         layout.media_playlist_path.to_string_lossy().to_string(),
@@ -5564,6 +5569,40 @@ fn playback_transcode_session_info_response(
         "PlaySessionId": play_session_id,
         "ErrorCode": null,
     })))
+}
+
+fn hls_transcode_dedupe_key(
+    user_id: Uuid,
+    item: &MediaItem,
+    selection: &TranscodeStreamSelection,
+) -> String {
+    format!(
+        "hls:ts:{}:{}:{}:{}:{}:{}",
+        user_id.simple(),
+        item.id.simple(),
+        item.id.simple(),
+        selection
+            .video_stream_index
+            .map_or_else(|| "-".to_string(), |index| index.to_string()),
+        selection
+            .audio_stream_index
+            .map_or_else(|| "-".to_string(), |index| index.to_string()),
+        selection
+            .subtitle_stream_index
+            .map_or_else(|| "-".to_string(), |index| index.to_string())
+    )
+}
+
+async fn transcode_dedupe_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = transcode_dedupe_registry().lock().await;
+    locks
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn transcode_dedupe_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    TRANSCODE_DEDUPE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 async fn reusable_hls_transcode_session(
@@ -8302,16 +8341,19 @@ mod tests {
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, default_audio_stream_index,
-        default_subtitle_stream_index, load_countries, load_cultures, parse_authorization_token,
-        parse_jellyfin_uuid, parse_media_browser_pairs, router, subscribe_playback_events,
+        default_subtitle_stream_index, hls_transcode_dedupe_key, load_countries, load_cultures,
+        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs, router,
+        subscribe_playback_events, transcode_dedupe_lock,
     };
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode, header},
     };
     use http_body_util::BodyExt;
+    use jellyrin_core::{MediaItem, TranscodeStreamSelection};
     use jellyrin_db::{Database, UpsertTranscodeSession};
     use serde_json::{Value, json};
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     fn assert_hls_transcode_playback_info(info: &Value, item_id: &str, api_key: &str) -> String {
@@ -8352,6 +8394,57 @@ mod tests {
             ),
             Some("tok".to_string())
         );
+    }
+
+    #[test]
+    fn hls_transcode_dedupe_key_tracks_user_item_and_stream_selection() {
+        let user_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let item = MediaItem {
+            id: uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            virtual_folder_id: uuid::Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc")
+                .unwrap(),
+            name: "Movie".to_string(),
+            path: "/media/Movie.mkv".to_string(),
+            media_type: "Video".to_string(),
+            collection_type: Some("movies".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let selection = TranscodeStreamSelection {
+            video_stream_index: Some(0),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(-1),
+        };
+        let key = hls_transcode_dedupe_key(user_id, &item, &selection);
+        assert_eq!(
+            key,
+            "hls:ts:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:0:1:-1"
+        );
+
+        let changed_selection = TranscodeStreamSelection {
+            audio_stream_index: Some(2),
+            ..selection
+        };
+        assert_ne!(
+            key,
+            hls_transcode_dedupe_key(user_id, &item, &changed_selection)
+        );
+    }
+
+    #[tokio::test]
+    async fn hls_transcode_dedupe_lock_is_shared_per_key() {
+        let first = transcode_dedupe_lock("same-key").await;
+        let second = transcode_dedupe_lock("same-key").await;
+        let other = transcode_dedupe_lock("other-key").await;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     #[test]
