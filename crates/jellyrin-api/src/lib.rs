@@ -31,10 +31,10 @@ use jellyrin_core::{
 };
 use jellyrin_db::{
     ActivePlaybackSession, ActivityLogEntry, ActivityLogFilter, ActivityLogSortField, ApiKey,
-    BackupManifest, BrandingConfig, Database, DeviceSession, MediaList, MediaListItem,
-    MediaListUserPermission, QuickConnectSession, SortDirection, SystemConfigurationPayloads,
-    TaskRun, TranscodeSession, TrickplayInfo, UpsertActivePlaybackSession, UpsertPlaybackState,
-    UpsertTranscodeSession,
+    BackupManifest, BrandingConfig, Database, DeviceSession, MediaItemMetadata, MediaList,
+    MediaListItem, MediaListUserPermission, QuickConnectSession, SortDirection,
+    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    UpsertActivePlaybackSession, UpsertPlaybackState, UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -8894,7 +8894,7 @@ async fn item_counts(
         &state.db,
     )
     .await?;
-    Ok(Json(item_counts_json(&filtered_items)))
+    Ok(Json(item_counts_json(&state.db, &filtered_items).await?))
 }
 
 async fn user_item_counts(
@@ -8916,7 +8916,7 @@ async fn user_item_counts(
         &state.db,
     )
     .await?;
-    Ok(Json(item_counts_json(&filtered_items)))
+    Ok(Json(item_counts_json(&state.db, &filtered_items).await?))
 }
 
 async fn latest_items(
@@ -15228,9 +15228,13 @@ fn json_value_i64(value: &serde_json::Value) -> Option<i64> {
     }
 }
 
-fn item_counts_json(items: &[MediaItem]) -> serde_json::Value {
+async fn item_counts_json(
+    db: &Database,
+    items: &[MediaItem],
+) -> Result<serde_json::Value, ApiError> {
     let mut movie_count = 0;
     let mut series_count = 0;
+    let mut synthetic_series = BTreeSet::new();
     let mut episode_count = 0;
     let mut song_count = 0;
     let mut album_count = 0;
@@ -15241,7 +15245,10 @@ fn item_counts_json(items: &[MediaItem]) -> serde_json::Value {
         match media_item_type(item) {
             "Movie" => movie_count += 1,
             "Series" => series_count += 1,
-            "Episode" => episode_count += 1,
+            "Episode" => {
+                episode_count += 1;
+                synthetic_series.insert(tv_episode_series_key(item));
+            }
             "Audio" => song_count += 1,
             "MusicAlbum" => album_count += 1,
             "Book" => book_count += 1,
@@ -15249,12 +15256,16 @@ fn item_counts_json(items: &[MediaItem]) -> serde_json::Value {
             _ => {}
         }
     }
+    series_count += synthetic_series.len();
+    let metadata_counts = item_count_metadata_values(db, items).await?;
+    let artist_count = metadata_counts.artist_values.len();
+    album_count += metadata_counts.album_values.len();
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "MovieCount": movie_count,
         "SeriesCount": series_count,
         "EpisodeCount": episode_count,
-        "ArtistCount": 0,
+        "ArtistCount": artist_count,
         "ProgramCount": 0,
         "TrailerCount": 0,
         "SongCount": song_count,
@@ -15263,7 +15274,43 @@ fn item_counts_json(items: &[MediaItem]) -> serde_json::Value {
         "BoxSetCount": 0,
         "BookCount": book_count,
         "ItemCount": items.len(),
-    })
+    }))
+}
+
+#[derive(Default)]
+struct ItemCountMetadataValues {
+    album_values: BTreeMap<String, String>,
+    artist_values: BTreeMap<String, String>,
+}
+
+async fn item_count_metadata_values(
+    db: &Database,
+    items: &[MediaItem],
+) -> Result<ItemCountMetadataValues, ApiError> {
+    if items.is_empty() {
+        return Ok(ItemCountMetadataValues::default());
+    }
+    let item_ids = items.iter().map(|item| item.id).collect::<HashSet<_>>();
+    let mut values = ItemCountMetadataValues::default();
+    for metadata in db.media_item_metadata().await? {
+        if item_ids.contains(&metadata.item_id) {
+            collect_item_count_metadata_value(&metadata, "Album", &mut values.album_values);
+            collect_item_count_metadata_value(&metadata, "AlbumName", &mut values.album_values);
+            collect_item_count_metadata_value(&metadata, "Artists", &mut values.artist_values);
+            collect_item_count_metadata_value(&metadata, "AlbumArtists", &mut values.artist_values);
+        }
+    }
+    Ok(values)
+}
+
+fn collect_item_count_metadata_value(
+    metadata: &MediaItemMetadata,
+    key: &str,
+    values: &mut BTreeMap<String, String>,
+) {
+    if let Some(value) = metadata.payload.get(key) {
+        collect_metadata_value(value, values);
+    }
 }
 
 fn media_item_path(item: &MediaItem) -> &FsPath {
@@ -22989,6 +23036,17 @@ mod tests {
             )
             .await
             .unwrap();
+        test_db
+            .update_media_item_metadata(
+                parse_jellyfin_uuid(item_id).unwrap(),
+                json!({
+                    "Album": "Example Album",
+                    "Artists": ["Artist One", "artist one", { "Name": "Artist Two" }],
+                    "AlbumArtists": ["Album Artist"]
+                }),
+            )
+            .await
+            .unwrap();
 
         let response = app
             .clone()
@@ -23007,6 +23065,8 @@ mod tests {
         assert_eq!(counts["MovieCount"], 1);
         assert_eq!(counts["ItemCount"], 1);
         assert_eq!(counts["SongCount"], 0);
+        assert_eq!(counts["ArtistCount"], 3);
+        assert_eq!(counts["AlbumCount"], 1);
         assert_eq!(counts["BookCount"], 0);
 
         let response = app
@@ -23027,6 +23087,8 @@ mod tests {
         let filtered_counts: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(filtered_counts["MovieCount"], 1);
         assert_eq!(filtered_counts["ItemCount"], 1);
+        assert_eq!(filtered_counts["ArtistCount"], 3);
+        assert_eq!(filtered_counts["AlbumCount"], 1);
 
         let response = app
             .clone()
@@ -26183,6 +26245,45 @@ mod tests {
         assert_eq!(next_up["Items"][0]["IndexNumber"], 2);
         assert_eq!(next_up["Items"][0]["UserData"]["Played"], false);
         let series_id = next_up["Items"][0]["SeriesId"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/Counts?UserId={}", user.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(counts["SeriesCount"], 1);
+        assert_eq!(counts["EpisodeCount"], 3);
+        assert_eq!(counts["ItemCount"], 3);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Users/{}/Items/Counts?Filters=IsUnplayed",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let unplayed_counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unplayed_counts["SeriesCount"], 1);
+        assert_eq!(unplayed_counts["EpisodeCount"], 2);
+        assert_eq!(unplayed_counts["ItemCount"], 2);
 
         let response = app
             .clone()
