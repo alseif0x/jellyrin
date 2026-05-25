@@ -5146,11 +5146,20 @@ async fn audio_instant_mix_items(db: &Database, item_id: &str) -> Result<Vec<Med
     Ok(mix_items)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PlaybackInfoOptions {
     enable_direct_play: bool,
     enable_direct_stream: bool,
     enable_transcoding: bool,
+    direct_play_profiles: Option<Vec<DirectPlayProfileMatcher>>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectPlayProfileMatcher {
+    profile_type: Option<String>,
+    containers: Vec<String>,
+    video_codecs: Vec<String>,
+    audio_codecs: Vec<String>,
 }
 
 impl Default for PlaybackInfoOptions {
@@ -5159,6 +5168,7 @@ impl Default for PlaybackInfoOptions {
             enable_direct_play: true,
             enable_direct_stream: true,
             enable_transcoding: true,
+            direct_play_profiles: None,
         }
     }
 }
@@ -5212,6 +5222,7 @@ fn playback_info_options_from_body(body: &serde_json::Value) -> PlaybackInfoOpti
     if let Some(value) = json_bool_field(body, "EnableTranscoding") {
         options.enable_transcoding = value;
     }
+    options.direct_play_profiles = parse_direct_play_profiles(body);
     options
 }
 
@@ -5225,6 +5236,64 @@ fn json_bool_field(value: &serde_json::Value, field: &str) -> Option<bool> {
     })
 }
 
+fn json_field_case_insensitive<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    value.as_object()?.iter().find_map(|(key, value)| {
+        if key.eq_ignore_ascii_case(field) {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    json_field_case_insensitive(value, field).and_then(|value| match value {
+        serde_json::Value::String(value) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    })
+}
+
+fn parse_direct_play_profiles(body: &serde_json::Value) -> Option<Vec<DirectPlayProfileMatcher>> {
+    let device_profile = json_field_case_insensitive(body, "DeviceProfile")?;
+    let profiles = json_field_case_insensitive(device_profile, "DirectPlayProfiles")?
+        .as_array()?
+        .iter()
+        .filter_map(parse_direct_play_profile)
+        .collect::<Vec<_>>();
+    Some(profiles)
+}
+
+fn parse_direct_play_profile(profile: &serde_json::Value) -> Option<DirectPlayProfileMatcher> {
+    if !profile.is_object() {
+        return None;
+    }
+
+    Some(DirectPlayProfileMatcher {
+        profile_type: json_string_field(profile, "Type"),
+        containers: json_csv_field(profile, "Container"),
+        video_codecs: json_csv_field(profile, "VideoCodec"),
+        audio_codecs: json_csv_field(profile, "AudioCodec"),
+    })
+}
+
+fn json_csv_field(value: &serde_json::Value, field: &str) -> Vec<String> {
+    json_string_field(value, field)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn playback_info_response(
     db: &Database,
     item_id: &str,
@@ -5234,7 +5303,9 @@ async fn playback_info_response(
     let server_id = db.server_state().await?.server_id.to_string();
     let item_json = media_item_to_json(&item, &server_id);
     let play_session_id = Uuid::new_v4().simple().to_string();
-    if !options.enable_direct_play && !options.enable_direct_stream {
+    let direct_play_supported = playback_direct_play_supported(&item, &options);
+    let direct_stream_supported = options.enable_direct_stream || direct_play_supported;
+    if !direct_play_supported && !direct_stream_supported {
         return Ok(Json(serde_json::json!({
             "MediaSources": [],
             "PlaySessionId": play_session_id,
@@ -5250,11 +5321,11 @@ async fn playback_info_response(
     {
         media_source.insert(
             "SupportsDirectPlay".to_string(),
-            serde_json::json!(options.enable_direct_play),
+            serde_json::json!(direct_play_supported),
         );
         media_source.insert(
             "SupportsDirectStream".to_string(),
-            serde_json::json!(options.enable_direct_stream || options.enable_direct_play),
+            serde_json::json!(direct_stream_supported),
         );
         media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(false));
     }
@@ -5264,6 +5335,83 @@ async fn playback_info_response(
         "PlaySessionId": play_session_id,
         "ErrorCode": null,
     })))
+}
+
+fn playback_direct_play_supported(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
+    if !options.enable_direct_play {
+        return false;
+    }
+
+    let Some(profiles) = options.direct_play_profiles.as_ref() else {
+        return true;
+    };
+
+    profiles
+        .iter()
+        .any(|profile| direct_play_profile_matches(item, profile))
+}
+
+fn direct_play_profile_matches(item: &MediaItem, profile: &DirectPlayProfileMatcher) -> bool {
+    if let Some(profile_type) = profile.profile_type.as_deref()
+        && !profile_type.eq_ignore_ascii_case(item.media_type.as_str())
+    {
+        return false;
+    }
+
+    let Some(container) = media_item_container(item) else {
+        return false;
+    };
+    if !profile.containers.is_empty()
+        && !profile
+            .containers
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&container))
+    {
+        return false;
+    }
+
+    if !profile.video_codecs.is_empty() {
+        let Some(video_codec) = media_item_stream_codec(item, "Video") else {
+            return false;
+        };
+        if !profile
+            .video_codecs
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&video_codec))
+        {
+            return false;
+        }
+    }
+
+    if !profile.audio_codecs.is_empty() {
+        let Some(audio_codec) = media_item_stream_codec(item, "Audio") else {
+            return false;
+        };
+        if !profile
+            .audio_codecs
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&audio_codec))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn media_item_stream_codec(item: &MediaItem, stream_type: &str) -> Option<String> {
+    item.media_streams.iter().find_map(|stream| {
+        let stream = stream.as_object()?;
+        let type_matches = stream.get("Type").and_then(serde_json::Value::as_str)?;
+        if !type_matches.eq_ignore_ascii_case(stream_type) {
+            return None;
+        }
+        stream
+            .get("Codec")
+            .and_then(serde_json::Value::as_str)
+            .filter(|codec| !codec.trim().is_empty())
+            .map(|codec| codec.trim().to_string())
+    })
 }
 
 async fn direct_stream_item(
@@ -12646,6 +12794,163 @@ mod tests {
             posted_playback_info["PlaySessionId"]
                 .as_str()
                 .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(
+            posted_playback_info["MediaSources"][0]["SupportsDirectPlay"],
+            true
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "DeviceProfile": {
+                                "DirectPlayProfiles": [
+                                    {
+                                        "Type": "Video",
+                                        "Container": "mp4,m4v",
+                                        "VideoCodec": "h264",
+                                        "AudioCodec": "aac"
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let matching_profile_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(matching_profile_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            matching_profile_info["MediaSources"][0]["SupportsDirectPlay"],
+            true
+        );
+        assert_eq!(
+            matching_profile_info["MediaSources"][0]["SupportsDirectStream"],
+            true
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "EnableDirectStream": false,
+                            "DeviceProfile": {
+                                "DirectPlayProfiles": [
+                                    {
+                                        "Type": "Video",
+                                        "Container": "mkv",
+                                        "VideoCodec": "hevc",
+                                        "AudioCodec": "opus"
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let mismatching_profile_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(mismatching_profile_info["ErrorCode"], "NoCompatibleStream");
+        assert_eq!(
+            mismatching_profile_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "EnableDirectStream": false,
+                            "DeviceProfile": {
+                                "DirectPlayProfiles": []
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let empty_profiles_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(empty_profiles_info["ErrorCode"], "NoCompatibleStream");
+        assert_eq!(
+            empty_profiles_info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "DeviceProfile": {
+                                "DirectPlayProfiles": [
+                                    {
+                                        "Type": "Video",
+                                        "Container": "mkv",
+                                        "VideoCodec": "hevc",
+                                        "AudioCodec": "opus"
+                                    }
+                                ]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let mismatching_but_direct_stream_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(mismatching_but_direct_stream_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            mismatching_but_direct_stream_info["MediaSources"][0]["SupportsDirectPlay"],
+            false
+        );
+        assert_eq!(
+            mismatching_but_direct_stream_info["MediaSources"][0]["SupportsDirectStream"],
+            true
         );
 
         let response = app
