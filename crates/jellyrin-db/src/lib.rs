@@ -118,6 +118,7 @@ pub struct UpsertPlaybackState {
 pub struct TranscodeSession {
     pub play_session_id: String,
     pub dedupe_key: Option<String>,
+    pub device_id: Option<String>,
     pub user_id: Uuid,
     pub item: MediaItem,
     pub media_source_id: Option<String>,
@@ -137,6 +138,7 @@ pub struct TranscodeSession {
 pub struct UpsertTranscodeSession {
     pub play_session_id: String,
     pub dedupe_key: Option<String>,
+    pub device_id: Option<String>,
     pub user_id: Uuid,
     pub item_id: Uuid,
     pub media_source_id: Option<String>,
@@ -1373,13 +1375,14 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO transcode_sessions (
-                play_session_id, dedupe_key, user_id, item_id, media_source_id, audio_stream_index,
+                play_session_id, dedupe_key, device_id, user_id, item_id, media_source_id, audio_stream_index,
                 subtitle_stream_index, video_stream_index, output_path, process_id, status,
                 progress_percent, position_ticks, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
             ON CONFLICT(play_session_id) DO UPDATE SET
                 dedupe_key = excluded.dedupe_key,
+                device_id = excluded.device_id,
                 user_id = excluded.user_id,
                 item_id = excluded.item_id,
                 media_source_id = excluded.media_source_id,
@@ -1396,6 +1399,7 @@ impl Database {
         )
         .bind(&play_session_id)
         .bind(session.dedupe_key)
+        .bind(session.device_id)
         .bind(session.user_id.to_string())
         .bind(session.item_id.to_string())
         .bind(session.media_source_id)
@@ -1441,15 +1445,16 @@ impl Database {
         let result = sqlx::query(
             r#"
             INSERT OR IGNORE INTO transcode_sessions (
-                play_session_id, dedupe_key, user_id, item_id, media_source_id, audio_stream_index,
+                play_session_id, dedupe_key, device_id, user_id, item_id, media_source_id, audio_stream_index,
                 subtitle_stream_index, video_stream_index, output_path, process_id, status,
                 progress_percent, position_ticks, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
             "#,
         )
         .bind(&play_session_id)
         .bind(dedupe_key)
+        .bind(session.device_id)
         .bind(session.user_id.to_string())
         .bind(session.item_id.to_string())
         .bind(session.media_source_id)
@@ -1504,6 +1509,7 @@ impl Database {
             r#"
             SELECT transcode_sessions.play_session_id,
                    transcode_sessions.dedupe_key,
+                   transcode_sessions.device_id,
                    transcode_sessions.user_id,
                    transcode_sessions.media_source_id,
                    transcode_sessions.audio_stream_index,
@@ -1594,6 +1600,7 @@ impl Database {
             r#"
             SELECT transcode_sessions.play_session_id,
                    transcode_sessions.dedupe_key,
+                   transcode_sessions.device_id,
                    transcode_sessions.user_id,
                    transcode_sessions.media_source_id,
                    transcode_sessions.audio_stream_index,
@@ -1650,6 +1657,7 @@ impl Database {
             r#"
             SELECT transcode_sessions.play_session_id,
                    transcode_sessions.dedupe_key,
+                   transcode_sessions.device_id,
                    transcode_sessions.user_id,
                    transcode_sessions.media_source_id,
                    transcode_sessions.audio_stream_index,
@@ -3162,6 +3170,7 @@ struct ActivePlaybackSessionRow {
 struct TranscodeSessionRow {
     play_session_id: String,
     dedupe_key: Option<String>,
+    device_id: Option<String>,
     user_id: String,
     media_source_id: Option<String>,
     audio_stream_index: Option<i64>,
@@ -3368,6 +3377,7 @@ impl TryFrom<TranscodeSessionRow> for TranscodeSession {
         Ok(Self {
             play_session_id: row.play_session_id,
             dedupe_key: row.dedupe_key,
+            device_id: row.device_id,
             user_id: Uuid::parse_str(&row.user_id).context("invalid transcode session user id")?,
             item: MediaItem {
                 id: Uuid::parse_str(&row.id).context("invalid transcode session item id")?,
@@ -4307,6 +4317,7 @@ mod tests {
             .upsert_transcode_session(UpsertTranscodeSession {
                 play_session_id: "play-session-1".to_string(),
                 dedupe_key: Some("dedupe:play-session-1".to_string()),
+                device_id: Some("device-1".to_string()),
                 user_id: user.id,
                 item_id: item.id,
                 media_source_id: Some(item.id.simple().to_string()),
@@ -4324,6 +4335,7 @@ mod tests {
 
         assert_eq!(session.play_session_id, "play-session-1");
         assert_eq!(session.dedupe_key.as_deref(), Some("dedupe:play-session-1"));
+        assert_eq!(session.device_id.as_deref(), Some("device-1"));
         assert_eq!(session.user_id, user.id);
         assert_eq!(session.item.id, item.id);
         assert_eq!(session.status, "running");
@@ -4379,6 +4391,7 @@ mod tests {
                 UpsertTranscodeSession {
                     play_session_id: "play-session-2".to_string(),
                     dedupe_key: None,
+                    device_id: Some("device-2".to_string()),
                     user_id: user.id,
                     item_id: item.id,
                     media_source_id: Some(item.id.simple().to_string()),

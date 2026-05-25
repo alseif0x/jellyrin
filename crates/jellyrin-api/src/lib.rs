@@ -5281,7 +5281,7 @@ async fn item_playback_info(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let options = parse_playback_info_options(raw_query.as_deref(), None);
-    playback_info_response(&state, &user, &token.access_token, &item_id, options).await
+    playback_info_response(&state, &user, &token, &item_id, options).await
 }
 
 async fn post_item_playback_info(
@@ -5295,7 +5295,7 @@ async fn post_item_playback_info(
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let options =
         parse_playback_info_options(raw_query.as_deref(), body.as_ref().map(|body| &body.0));
-    playback_info_response(&state, &user, &token.access_token, &item_id, options).await
+    playback_info_response(&state, &user, &token, &item_id, options).await
 }
 
 async fn instant_mix_from_item(
@@ -5529,7 +5529,7 @@ fn json_csv_field(value: &serde_json::Value, field: &str) -> Vec<String> {
 async fn playback_info_response(
     state: &AppState,
     user: &User,
-    access_token: &str,
+    token: &DeviceToken,
     item_id: &str,
     options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -5548,15 +5548,8 @@ async fn playback_info_response(
     }
     if !direct_play_supported && !direct_stream_supported {
         if options.enable_transcoding && item.media_type == "Video" {
-            return playback_transcode_info_response(
-                state,
-                user,
-                access_token,
-                &item,
-                item_json,
-                options,
-            )
-            .await;
+            return playback_transcode_info_response(state, user, token, &item, item_json, options)
+                .await;
         }
         return Ok(Json(serde_json::json!({
             "MediaSources": [],
@@ -5593,7 +5586,7 @@ async fn playback_info_response(
 async fn playback_transcode_info_response(
     state: &AppState,
     user: &User,
-    access_token: &str,
+    token: &DeviceToken,
     item: &MediaItem,
     item_json: serde_json::Value,
     options: PlaybackInfoOptions,
@@ -5618,7 +5611,7 @@ async fn playback_transcode_info_response(
     {
         return playback_transcode_session_info_response(
             item_json,
-            access_token,
+            &token.access_token,
             &item_id,
             &session.play_session_id,
             &options,
@@ -5642,6 +5635,7 @@ async fn playback_transcode_info_response(
             UpsertTranscodeSession {
                 play_session_id: play_session_id.clone(),
                 dedupe_key: Some(dedupe_key.clone()),
+                device_id: Some(token.device_id.clone()),
                 user_id: user.id,
                 item_id: item.id,
                 media_source_id: Some(item_id.clone()),
@@ -5665,7 +5659,7 @@ async fn playback_transcode_info_response(
 
     playback_transcode_session_info_response(
         item_json,
-        access_token,
+        &token.access_token,
         &item_id,
         &play_session_id,
         &options,
@@ -5816,6 +5810,7 @@ async fn spawn_hls_transcode_task(
                     .upsert_transcode_session(UpsertTranscodeSession {
                         play_session_id: play_session_id.clone(),
                         dedupe_key: session.dedupe_key,
+                        device_id: session.device_id,
                         user_id: session.user_id,
                         item_id: session.item.id,
                         media_source_id: session.media_source_id,
@@ -6767,6 +6762,18 @@ async fn stop_active_encoding(
         .ok_or_else(|| ApiError::not_found("Transcode session not found"))?;
     if session.user_id != user.id && !user.is_administrator {
         return Err(ApiError::forbidden("Transcode session access denied"));
+    }
+    if let Some(query_device_id) = query
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && session
+            .device_id
+            .as_deref()
+            .is_some_and(|session_device_id| session_device_id != query_device_id)
+    {
+        return Err(ApiError::forbidden("Transcode session device mismatch"));
     }
 
     let already_terminal = matches!(session.status.as_str(), "stopped" | "completed" | "failed");
@@ -8156,7 +8163,7 @@ struct StopEncodingQuery {
     #[serde(alias = "PlaySessionId", alias = "playSessionId")]
     play_session_id: Option<String>,
     #[serde(alias = "DeviceId", alias = "deviceId")]
-    _device_id: Option<String>,
+    device_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -14315,6 +14322,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            transcode_session.device_id.as_deref(),
+            Some("api-key:test-key")
+        );
         assert_eq!(transcode_session.item.id.simple().to_string(), item_id);
         assert_eq!(transcode_session.audio_stream_index, Some(1));
         assert_eq!(transcode_session.video_stream_index, Some(0));
@@ -15941,6 +15952,7 @@ mod tests {
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-active".to_string(),
             dedupe_key: None,
+            device_id: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16066,6 +16078,7 @@ mod tests {
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-stop".to_string(),
             dedupe_key: None,
+            device_id: Some("device-1".to_string()),
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16116,6 +16129,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(
+                        "/Videos/ActiveEncodings?PlaySessionId=play-session-stop&DeviceId=other-device",
+                    )
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(transcode_dir.exists());
 
         let response = app
             .clone()
@@ -16240,6 +16270,7 @@ mod tests {
             db.upsert_transcode_session(UpsertTranscodeSession {
                 play_session_id: play_session_id.to_string(),
                 dedupe_key: None,
+                device_id: None,
                 user_id: user.id,
                 item_id: item.id,
                 media_source_id: Some(item.id.simple().to_string()),
@@ -16311,6 +16342,7 @@ mod tests {
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-progress".to_string(),
             dedupe_key: None,
+            device_id: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16409,6 +16441,7 @@ mod tests {
             db.upsert_transcode_session(UpsertTranscodeSession {
                 play_session_id: play_session_id.to_string(),
                 dedupe_key: None,
+                device_id: None,
                 user_id: user.id,
                 item_id: item.id,
                 media_source_id: Some(item.id.simple().to_string()),
@@ -16477,6 +16510,7 @@ mod tests {
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-known".to_string(),
             dedupe_key: None,
+            device_id: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item.id.simple().to_string()),
@@ -16569,6 +16603,7 @@ mod tests {
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-reuse".to_string(),
             dedupe_key: None,
+            device_id: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
@@ -16668,6 +16703,7 @@ mod tests {
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-hls".to_string(),
             dedupe_key: None,
+            device_id: None,
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
