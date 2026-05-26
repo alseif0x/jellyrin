@@ -6786,6 +6786,7 @@ async fn display_content(
             }
         }),
     );
+    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6847,6 +6848,7 @@ async fn report_viewing(
             }
         }),
     );
+    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -28427,7 +28429,8 @@ mod tests {
         let fetched: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(fetched["Id"], group_id);
 
-        let mut syncplay_events = subscribe_playback_events();
+        let mut join_owner_events = subscribe_playback_events();
+        let mut join_guest_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -28446,7 +28449,7 @@ mod tests {
         assert_eq!(joined_group["Participants"].as_array().unwrap().len(), 2);
         tokio::task::yield_now().await;
         let join_owner_event =
-            next_playback_event_type(&mut syncplay_events, &api_key, "SyncPlayGroupUpdate").await;
+            next_playback_event_type(&mut join_owner_events, &api_key, "SyncPlayGroupUpdate").await;
         assert_eq!(join_owner_event["Data"]["Reason"], "Join");
         assert_eq!(join_owner_event["Data"]["GroupId"], group_id);
         assert_eq!(
@@ -28457,9 +28460,11 @@ mod tests {
             2
         );
         let join_guest_event =
-            next_playback_event_type(&mut syncplay_events, &guest_key, "SyncPlayGroupUpdate").await;
+            next_playback_event_type(&mut join_guest_events, &guest_key, "SyncPlayGroupUpdate")
+                .await;
         assert_eq!(join_guest_event["Data"]["Reason"], "Join");
 
+        let mut leave_owner_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -28474,7 +28479,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let leave_owner_event =
-            next_playback_event_type(&mut syncplay_events, &api_key, "SyncPlayGroupUpdate").await;
+            next_playback_event_type(&mut leave_owner_events, &api_key, "SyncPlayGroupUpdate")
+                .await;
         assert_eq!(leave_owner_event["Data"]["Reason"], "Leave");
         assert_eq!(
             leave_owner_event["Data"]["Group"]["Participants"]
@@ -28516,6 +28522,7 @@ mod tests {
             "/SyncPlay/Stop",
             "/SyncPlay/Unpause",
         ] {
+            let mut command_events = subscribe_playback_events();
             let response = app
                 .clone()
                 .oneshot(
@@ -28530,7 +28537,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
             let event =
-                next_playback_event_type(&mut syncplay_events, &api_key, "SyncPlayCommand").await;
+                next_playback_event_type(&mut command_events, &api_key, "SyncPlayCommand").await;
             let command = endpoint.rsplit('/').next().unwrap();
             assert_eq!(event["Data"]["GroupId"], group_id, "{endpoint}");
             assert_eq!(event["Data"]["Command"], command, "{endpoint}");
@@ -36150,6 +36157,17 @@ mod tests {
         assert_eq!(browse_event["Data"]["ItemId"], item_id);
         assert_eq!(browse_event["Data"]["ItemName"], "Example Song");
         assert_eq!(browse_event["Data"]["ItemType"], "Audio");
+        let viewing_sessions_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Sessions").await;
+        assert_eq!(viewing_sessions_event["Data"][0]["Id"], playback_token);
+        assert_eq!(
+            viewing_sessions_event["Data"][0]["NowViewingItem"]["Id"],
+            item_id
+        );
+        assert_eq!(
+            viewing_sessions_event["Data"][0]["NowViewingItem"]["Name"],
+            "Example Song"
+        );
 
         let response = app
             .clone()
@@ -36189,6 +36207,13 @@ mod tests {
         let report_browse_event =
             next_playback_event_type(&mut playback_events, playback_token, "Browse").await;
         assert_eq!(report_browse_event["Data"]["ItemId"], item_id);
+        let report_sessions_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Sessions").await;
+        assert_eq!(report_sessions_event["Data"][0]["Id"], playback_token);
+        assert_eq!(
+            report_sessions_event["Data"][0]["NowViewingItem"]["Id"],
+            item_id
+        );
 
         let response = app
             .clone()
