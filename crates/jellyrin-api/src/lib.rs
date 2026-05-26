@@ -423,8 +423,8 @@ pub fn router(state: AppState) -> Router {
             "/users/{user_id}/configuration",
             post(update_user_configuration_for_path),
         )
-        .route("/Users/{user_id}/Views", get(user_views_result))
-        .route("/users/{user_id}/views", get(user_views_result))
+        .route("/Users/{user_id}/Views", get(user_views_result_legacy))
+        .route("/users/{user_id}/views", get(user_views_result_legacy))
         .route("/Users/{user_id}/Items", get(user_items_result))
         .route("/users/{user_id}/items", get(user_items_result))
         .route("/Users/{user_id}/Items/Counts", get(user_item_counts))
@@ -23131,6 +23131,76 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let readiness: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(readiness["Status"], "Ready");
+    }
+
+    #[tokio::test]
+    async fn users_views_path_validates_requested_user_access() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let admin_key = db
+            .issue_api_key_for_user(admin.id, "users-views-admin-key")
+            .await
+            .unwrap();
+        let viewer = db.create_user("viewer", Some("secret")).await.unwrap();
+        let viewer_key = db
+            .issue_api_key_for_user(viewer.id, "users-views-viewer-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for uri in [
+            format!("/Users/{}/Views", viewer.id),
+            format!("/users/{}/views", viewer.id),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("X-Emby-Token", &viewer_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let views: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(views["TotalRecordCount"], 0);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}/Views", admin.id))
+                    .header("X-Emby-Token", &viewer_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}/Views", viewer.id))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
