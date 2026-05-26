@@ -4495,40 +4495,75 @@ async fn enable_plugin(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((_plugin_id, _version)): Path<(String, String)>,
+    Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Plugin not found"))
+    known_catalog_plugin_or_not_found(&state.db, &plugin_id, Some(&version)).await?;
+    Err(ApiError::conflict(format!(
+        "Plugin enable is not implemented in Jellyrin yet: {plugin_id}"
+    )))
 }
 
 async fn disable_plugin(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((_plugin_id, _version)): Path<(String, String)>,
+    Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Plugin not found"))
+    known_catalog_plugin_or_not_found(&state.db, &plugin_id, Some(&version)).await?;
+    Err(ApiError::conflict(format!(
+        "Plugin disable is not implemented in Jellyrin yet: {plugin_id}"
+    )))
 }
 
 async fn uninstall_plugin_by_version(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((_plugin_id, _version)): Path<(String, String)>,
+    Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Plugin not found"))
+    known_catalog_plugin_or_not_found(&state.db, &plugin_id, Some(&version)).await?;
+    Err(ApiError::conflict(format!(
+        "Plugin uninstall is not implemented in Jellyrin yet: {plugin_id}"
+    )))
 }
 
 async fn uninstall_plugin(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_plugin_id): Path<String>,
+    Path(plugin_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Plugin not found"))
+    known_catalog_plugin_or_not_found(&state.db, &plugin_id, None).await?;
+    Err(ApiError::conflict(format!(
+        "Plugin uninstall is not implemented in Jellyrin yet: {plugin_id}"
+    )))
+}
+
+async fn known_catalog_plugin_or_not_found(
+    db: &Database,
+    plugin_id: &str,
+    version: Option<&str>,
+) -> Result<serde_json::Value, ApiError> {
+    package_infos_from_repositories(
+        &db.system_configuration_payloads()
+            .await?
+            .plugin_repositories,
+    )
+    .into_iter()
+    .find(|package| {
+        package_matches_plugin_id(package, plugin_id)
+            && version.is_none_or(|version| {
+                package_versions(package).iter().any(|candidate| {
+                    json_string_field(candidate, "Version")
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(version.trim()))
+                })
+            })
+    })
+    .ok_or_else(|| ApiError::not_found("Plugin not found"))
 }
 
 async fn plugin_manifest(
@@ -26497,6 +26532,94 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), plugin_image_bytes.as_slice());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/1.0.0.0/Enable")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["Message"]
+                .as_str()
+                .unwrap()
+                .contains("Plugin enable is not implemented")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/1.0.0.0/Disable")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["Message"]
+                .as_str()
+                .unwrap()
+                .contains("Plugin disable is not implemented")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/1.0.0.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["Message"]
+                .as_str()
+                .unwrap()
+                .contains("Plugin uninstall is not implemented")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["Message"]
+                .as_str()
+                .unwrap()
+                .contains("Plugin uninstall is not implemented")
+        );
 
         let response = app
             .oneshot(
