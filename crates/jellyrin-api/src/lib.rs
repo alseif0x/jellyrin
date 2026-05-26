@@ -3021,7 +3021,7 @@ async fn delete_user(
 struct UpdateUserQuery {
     #[serde(flatten)]
     auth: AuthQuery,
-    #[serde(alias = "UserId", alias = "userId")]
+    #[serde(alias = "UserId", alias = "userId", alias = "user_id")]
     user_id: Option<String>,
 }
 
@@ -10663,7 +10663,9 @@ struct UserViewsQuery {
         default,
         deserialize_with = "deserialize_csv_values",
         alias = "PresetViews",
-        alias = "presetViews"
+        alias = "presetViews",
+        alias = "presetviews",
+        alias = "preset_views"
     )]
     preset_views: Vec<String>,
     #[serde(alias = "IncludeExternalContent", alias = "includeExternalContent")]
@@ -31933,6 +31935,22 @@ mod tests {
         let preset_user_views: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(preset_user_views["TotalRecordCount"], 1);
         assert_eq!(preset_user_views["Items"][0]["CollectionType"], "movies");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/UserViews?user_id={user_id}&preset_views=movies"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let snake_case_user_views: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snake_case_user_views, preset_user_views);
 
         let response = app
             .clone()
