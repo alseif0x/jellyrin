@@ -12574,16 +12574,32 @@ async fn item_ancestors(
     Path(item_id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    let folders = state.db.virtual_folders().await?;
+    let root = root_folder_json(&state.db).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let folder = state
+    let root_id = root["Id"].as_str().unwrap_or_default().to_string();
+
+    if folders.iter().any(|folder| folder.id == requested_id) {
+        return Ok(Json(vec![root]));
+    }
+
+    let item = state
         .db
-        .virtual_folders()
+        .media_items()
         .await?
         .into_iter()
+        .find(|item| item.id == requested_id)
+        .ok_or_else(|| ApiError::not_found("Item not found"))?;
+    let folder = folders
+        .iter()
         .find(|folder| folder.id == item.virtual_folder_id)
         .ok_or_else(|| ApiError::not_found("Parent folder not found"))?;
-    Ok(Json(vec![user_view_to_json(&folder, &server_id)]))
+    let mut folder_json = user_view_to_json(folder, &server_id);
+    if let Some(object) = folder_json.as_object_mut() {
+        object.insert("ParentId".to_string(), serde_json::json!(root_id));
+    }
+    Ok(Json(vec![folder_json, root]))
 }
 
 async fn item_playback_info(
@@ -30659,8 +30675,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let ancestors: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(ancestors.as_array().unwrap().len(), 1);
+        assert_eq!(ancestors.as_array().unwrap().len(), 2);
         assert_eq!(ancestors[0]["Id"], parent_id);
+        assert_eq!(ancestors[0]["ParentId"], ancestors[1]["Id"]);
+        assert_eq!(ancestors[1]["Type"], "Folder");
 
         let response = app
             .clone()
@@ -32049,10 +32067,29 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let ancestors: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(ancestors.as_array().unwrap().len(), 1);
+        assert_eq!(ancestors.as_array().unwrap().len(), 2);
         assert_eq!(ancestors[0]["Id"], parent_id);
         assert_eq!(ancestors[0]["Type"], "CollectionFolder");
         assert_eq!(ancestors[0]["ImageTags"]["Primary"], "placeholder");
+        assert_eq!(ancestors[0]["ParentId"], ancestors[1]["Id"]);
+        assert_eq!(ancestors[1]["Type"], "Folder");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Library/Items/{parent_id}/Ancestors"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let folder_ancestors: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(folder_ancestors.as_array().unwrap().len(), 1);
+        assert_eq!(folder_ancestors[0]["Type"], "Folder");
 
         let response = app
             .clone()
