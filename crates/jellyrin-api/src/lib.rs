@@ -798,18 +798,18 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/LiveTv/Programs",
-            get(live_tv_empty_items).post(live_tv_post_empty_items),
+            get(live_tv_programs).post(live_tv_programs_post),
         )
         .route(
             "/livetv/programs",
-            get(live_tv_empty_items).post(live_tv_post_empty_items),
+            get(live_tv_programs).post(live_tv_programs_post),
         )
-        .route("/LiveTv/Programs/{programId}", get(live_tv_missing_item))
-        .route("/livetv/programs/{programId}", get(live_tv_missing_item))
-        .route("/LiveTv/RecommendedPrograms", get(live_tv_empty_items))
-        .route("/livetv/recommendedprograms", get(live_tv_empty_items))
-        .route("/LiveTv/Programs/Recommended", get(live_tv_empty_items))
-        .route("/livetv/programs/recommended", get(live_tv_empty_items))
+        .route("/LiveTv/Programs/{programId}", get(live_tv_program))
+        .route("/livetv/programs/{programId}", get(live_tv_program))
+        .route("/LiveTv/RecommendedPrograms", get(live_tv_programs))
+        .route("/livetv/recommendedprograms", get(live_tv_programs))
+        .route("/LiveTv/Programs/Recommended", get(live_tv_programs))
+        .route("/livetv/programs/recommended", get(live_tv_programs))
         .route("/LiveTv/Recordings", get(live_tv_empty_items))
         .route("/livetv/recordings", get(live_tv_empty_items))
         .route("/LiveTv/Recordings/Folders", get(live_tv_empty_items))
@@ -7563,14 +7563,81 @@ async fn live_tv_channel(
     Ok(Json(channel))
 }
 
-async fn live_tv_post_empty_items(
+#[derive(Debug, Default, Deserialize)]
+struct LiveTvProgramsQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "ChannelIds", alias = "channelIds", alias = "channel_ids")]
+    channel_ids: Option<String>,
+}
+
+async fn live_tv_programs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveTvProgramsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let channel_ids = query
+        .channel_ids
+        .as_deref()
+        .map(comma_delimited_values)
+        .unwrap_or_default();
+    live_tv_program_result(&state.db, &channel_ids).await
+}
+
+async fn live_tv_programs_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Json(_payload): Json<serde_json::Value>,
+    body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(query_result(Vec::new())))
+    let payload = optional_json_body(body).await?;
+    let channel_ids = json_string_list_field(&payload, "ChannelIds").unwrap_or_default();
+    live_tv_program_result(&state.db, &channel_ids).await
+}
+
+async fn live_tv_program(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(program_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let program = live_tv_program_items(&config)
+        .into_iter()
+        .find(|program| {
+            json_string_field(program, "Id")
+                .is_some_and(|id| id.eq_ignore_ascii_case(program_id.trim()))
+        })
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    Ok(Json(program))
+}
+
+async fn live_tv_program_result(
+    db: &Database,
+    channel_ids: &[String],
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let mut programs = live_tv_program_items(&config);
+    if !channel_ids.is_empty() {
+        programs.retain(|program| {
+            json_string_field(program, "ChannelId").is_some_and(|channel_id| {
+                channel_ids
+                    .iter()
+                    .any(|requested| requested.eq_ignore_ascii_case(&channel_id))
+            })
+        });
+    }
+    Ok(Json(query_result(programs)))
 }
 
 async fn live_tv_missing_item(
@@ -7611,6 +7678,32 @@ async fn live_tv_delete_missing_recording(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     Err(ApiError::not_found("Live TV recording not found"))
+}
+
+fn comma_delimited_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn json_string_list_field(value: &serde_json::Value, field: &str) -> Option<Vec<String>> {
+    let value = json_field_case_insensitive(value, field)?;
+    match value {
+        serde_json::Value::Array(values) => Some(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+        ),
+        serde_json::Value::String(value) => Some(comma_delimited_values(value)),
+        _ => None,
+    }
 }
 
 fn live_tv_channel_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -7703,6 +7796,123 @@ fn live_tv_channel_item(
     base["LocationType"] = serde_json::json!("Remote");
     base["RunTimeTicks"] = serde_json::Value::Null;
     base["CurrentProgram"] = serde_json::Value::Null;
+    Some(base)
+}
+
+fn live_tv_program_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
+    let channels = live_tv_channel_items(config);
+    let mut programs = Vec::new();
+    collect_live_tv_programs(config, "ListingProviders", &channels, &mut programs);
+    collect_live_tv_programs(config, "TunerHosts", &channels, &mut programs);
+    programs.sort_by(|left, right| {
+        let left_start = json_string_field(left, "StartDate").unwrap_or_default();
+        let right_start = json_string_field(right, "StartDate").unwrap_or_default();
+        left_start.cmp(&right_start).then_with(|| {
+            json_string_field(left, "Name")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .cmp(
+                    &json_string_field(right, "Name")
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                )
+        })
+    });
+    programs
+}
+
+fn collect_live_tv_programs(
+    config: &serde_json::Value,
+    collection_key: &str,
+    channels: &[serde_json::Value],
+    programs: &mut Vec<serde_json::Value>,
+) {
+    let Some(sources) = config
+        .get(collection_key)
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for (source_index, source) in sources.iter().enumerate() {
+        let source_id = json_string_field(source, "Id")
+            .unwrap_or_else(|| format!("{collection_key}-{source_index}"));
+        let Some(source_programs) = source.get("Programs").and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for (program_index, program) in source_programs.iter().enumerate() {
+            if let Some(program) =
+                live_tv_program_item(&source_id, channels, program, program_index)
+            {
+                programs.push(program);
+            }
+        }
+    }
+}
+
+fn live_tv_program_item(
+    source_id: &str,
+    channels: &[serde_json::Value],
+    program: &serde_json::Value,
+    index: usize,
+) -> Option<serde_json::Value> {
+    let (mut base, raw_name) = match program {
+        serde_json::Value::Object(fields) => (serde_json::Value::Object(fields.clone()), None),
+        serde_json::Value::String(name) => (serde_json::json!({}), Some(name.trim().to_string())),
+        _ => return None,
+    };
+    let name = json_string_field(&base, "Name")
+        .or_else(|| json_string_field(&base, "Title"))
+        .or(raw_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("Program {}", index + 1));
+    let channel_id = json_string_field(&base, "ChannelId")
+        .or_else(|| json_string_field(&base, "Channel"))
+        .or_else(|| {
+            channels
+                .first()
+                .and_then(|channel| json_string_field(channel, "Id"))
+        })
+        .unwrap_or_default();
+    let channel_name = channels
+        .iter()
+        .find(|channel| {
+            json_string_field(channel, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
+        })
+        .and_then(|channel| json_string_field(channel, "Name"));
+    let id = json_string_field(&base, "Id")
+        .or_else(|| json_string_field(&base, "ProgramId"))
+        .unwrap_or_else(|| format!("{source_id}-program-{}", index + 1));
+
+    base["Id"] = serde_json::json!(id);
+    base["Name"] = serde_json::json!(name.clone());
+    base["SortName"] = serde_json::json!(name);
+    base["Type"] = serde_json::json!("Program");
+    base["MediaType"] = serde_json::json!("Video");
+    base["ChannelId"] = serde_json::json!(channel_id);
+    base["ChannelName"] = channel_name
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+    base["IsFolder"] = serde_json::json!(false);
+    base["IsLive"] = base
+        .get("IsLive")
+        .cloned()
+        .unwrap_or(serde_json::Value::Bool(false));
+    base["StartDate"] = base
+        .get("StartDate")
+        .cloned()
+        .or_else(|| base.get("Start").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    base["EndDate"] = base
+        .get("EndDate")
+        .cloned()
+        .or_else(|| base.get("End").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    base["Overview"] = base
+        .get("Overview")
+        .cloned()
+        .or_else(|| base.get("Description").cloned())
+        .unwrap_or_else(|| serde_json::json!(""));
     Some(base)
 }
 
@@ -22551,7 +22761,27 @@ mod tests {
                     { "Id": "channel-2", "Name": "Movies", "Number": "2" }
                 ]
             }],
-            "ListingProviders": [{ "Id": "provider-1", "Type": "xmltv" }],
+            "ListingProviders": [{
+                "Id": "provider-1",
+                "Type": "xmltv",
+                "Programs": [
+                    {
+                        "Id": "program-1",
+                        "Name": "Morning News",
+                        "ChannelId": "channel-1",
+                        "StartDate": "2026-05-26T08:00:00Z",
+                        "EndDate": "2026-05-26T09:00:00Z",
+                        "Overview": "Local guide news"
+                    },
+                    {
+                        "Id": "program-2",
+                        "Name": "Movie Hour",
+                        "ChannelId": "channel-2",
+                        "StartDate": "2026-05-26T09:00:00Z",
+                        "EndDate": "2026-05-26T10:00:00Z"
+                    }
+                ]
+            }],
             "PrePaddingSeconds": 300,
             "PostPaddingSeconds": 600,
             "MediaLocationsCreated": ["/srv/recordings"],
@@ -23221,10 +23451,79 @@ mod tests {
         assert_eq!(channel["Name"], "Movies");
         assert_eq!(channel["Number"], "2");
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/livetv/programs?ChannelIds=channel-1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let programs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(programs["TotalRecordCount"], 1);
+        assert_eq!(programs["Items"][0]["Id"], "program-1");
+        assert_eq!(programs["Items"][0]["ChannelName"], "News HD");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/Programs")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ChannelIds": ["channel-2"] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let programs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(programs["TotalRecordCount"], 1);
+        assert_eq!(programs["Items"][0]["Name"], "Movie Hour");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Programs/program-1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let program: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(program["Name"], "Morning News");
+        assert_eq!(program["Type"], "Program");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Programs/Recommended")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let recommended: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recommended["TotalRecordCount"], 2);
+
         for endpoint in [
-            "/livetv/programs",
-            "/LiveTv/RecommendedPrograms",
-            "/LiveTv/Programs/Recommended",
             "/LiveTv/Recordings",
             "/LiveTv/RecordingGroups",
             "/LiveTv/Recordings/Folders",
