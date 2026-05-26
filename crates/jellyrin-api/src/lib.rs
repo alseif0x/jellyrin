@@ -9353,6 +9353,14 @@ async fn client_log_document(
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let file_name = headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(content_disposition_filename);
     let body = to_bytes(body, CLIENT_LOG_DOCUMENT_LIMIT_BYTES)
         .await
         .map_err(|_| ApiError::bad_request("Invalid client log document body"))?;
@@ -9364,7 +9372,9 @@ async fn client_log_document(
         "Timestamp": timestamp,
         "UserId": user.id.simple().to_string(),
         "UserName": user.name,
-        "Document": message
+        "Document": message,
+        "ContentType": content_type,
+        "FileName": file_name
     })
     .to_string();
     let mut file = tokio::fs::OpenOptions::new()
@@ -9376,6 +9386,21 @@ async fn client_log_document(
     file.write_all(line.as_bytes()).await?;
     file.write_all(b"\n").await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn content_disposition_filename(value: &str) -> Option<String> {
+    value.split(';').find_map(|part| {
+        let (name, raw_value) = part.trim().split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("filename") {
+            return None;
+        }
+        let file_name = raw_value.trim().trim_matches('"').replace('\0', "");
+        let file_name = std::path::Path::new(&file_name)
+            .file_name()?
+            .to_str()?
+            .trim();
+        (!file_name.is_empty()).then(|| file_name.to_string())
+    })
 }
 
 async fn get_virtual_folders(
@@ -24035,6 +24060,34 @@ mod tests {
         let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
         assert!(client_log.contains("client failed"));
         assert!(client_log.contains(user.id.simple().to_string().as_str()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/clientlog/document")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .header(
+                        header::CONTENT_DISPOSITION,
+                        "form-data; name=\"file\"; filename=\"web.log\"",
+                    )
+                    .body(Body::from("browser log\0entry"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
+        let uploaded_log: Value = serde_json::from_str(client_log.lines().last().unwrap()).unwrap();
+        assert_eq!(uploaded_log["Document"], "browser logentry");
+        assert_eq!(uploaded_log["ContentType"], "text/plain");
+        assert_eq!(uploaded_log["FileName"], "web.log");
+        assert_eq!(
+            uploaded_log["UserId"],
+            user.id.simple().to_string().as_str()
+        );
 
         let response = app
             .clone()
