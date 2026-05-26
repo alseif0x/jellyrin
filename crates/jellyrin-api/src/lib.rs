@@ -810,24 +810,24 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/recommendedprograms", get(live_tv_programs))
         .route("/LiveTv/Programs/Recommended", get(live_tv_programs))
         .route("/livetv/programs/recommended", get(live_tv_programs))
-        .route("/LiveTv/Recordings", get(live_tv_empty_items))
-        .route("/livetv/recordings", get(live_tv_empty_items))
-        .route("/LiveTv/Recordings/Folders", get(live_tv_empty_items))
-        .route("/livetv/recordings/folders", get(live_tv_empty_items))
-        .route("/LiveTv/Recordings/Groups", get(live_tv_empty_items))
-        .route("/livetv/recordings/groups", get(live_tv_empty_items))
-        .route("/LiveTv/Recordings/Series", get(live_tv_empty_items))
-        .route("/livetv/recordings/series", get(live_tv_empty_items))
+        .route("/LiveTv/Recordings", get(live_tv_recordings))
+        .route("/livetv/recordings", get(live_tv_recordings))
+        .route("/LiveTv/Recordings/Folders", get(live_tv_recording_folders))
+        .route("/livetv/recordings/folders", get(live_tv_recording_folders))
+        .route("/LiveTv/Recordings/Groups", get(live_tv_recording_groups))
+        .route("/livetv/recordings/groups", get(live_tv_recording_groups))
+        .route("/LiveTv/Recordings/Series", get(live_tv_recording_series))
+        .route("/livetv/recordings/series", get(live_tv_recording_series))
         .route(
             "/LiveTv/Recordings/{recordingId}",
-            get(live_tv_missing_item).delete(live_tv_delete_missing_recording),
+            get(live_tv_recording).delete(delete_live_tv_recording),
         )
         .route(
             "/livetv/recordings/{recordingId}",
-            get(live_tv_missing_item).delete(live_tv_delete_missing_recording),
+            get(live_tv_recording).delete(delete_live_tv_recording),
         )
-        .route("/LiveTv/RecordingGroups", get(live_tv_empty_items))
-        .route("/livetv/recordinggroups", get(live_tv_empty_items))
+        .route("/LiveTv/RecordingGroups", get(live_tv_recording_groups))
+        .route("/livetv/recordinggroups", get(live_tv_recording_groups))
         .route(
             "/LiveTv/Timers",
             get(live_tv_timers).post(create_live_tv_timer),
@@ -5088,6 +5088,7 @@ fn default_live_tv_configuration() -> serde_json::Value {
         "ListingProviders": [],
         "Timers": [],
         "SeriesTimers": [],
+        "Recordings": [],
         "PrePaddingSeconds": 180,
         "PostPaddingSeconds": 180,
         "MediaLocationsCreated": [],
@@ -5137,6 +5138,7 @@ fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     merge_known_network_value(&mut config, &payload, "ListingProviders");
     merge_known_network_value(&mut config, &payload, "Timers");
     merge_known_network_value(&mut config, &payload, "SeriesTimers");
+    merge_known_network_value(&mut config, &payload, "Recordings");
     merge_known_network_value(&mut config, &payload, "PrePaddingSeconds");
     merge_known_network_value(&mut config, &payload, "PostPaddingSeconds");
     merge_known_network_value(&mut config, &payload, "MediaLocationsCreated");
@@ -7518,15 +7520,6 @@ async fn live_tv_schedules_direct_countries(
     })))
 }
 
-async fn live_tv_empty_items(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(query_result(Vec::new())))
-}
-
 async fn live_tv_channels(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7640,16 +7633,6 @@ async fn live_tv_program_result(
     Ok(Json(query_result(programs)))
 }
 
-async fn live_tv_missing_item(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path(_id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Live TV item not found"))
-}
-
 async fn live_tv_missing_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7670,14 +7653,98 @@ async fn live_tv_missing_container_stream(
     Err(ApiError::not_found("Live TV stream not found"))
 }
 
-async fn live_tv_delete_missing_recording(
+async fn live_tv_recordings(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_recording_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(Json(query_result(live_tv_recording_items(&config))))
+}
+
+async fn live_tv_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(recording_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let recording = live_tv_recording_items(&config)
+        .into_iter()
+        .find(|recording| {
+            json_string_field(recording, "Id")
+                .is_some_and(|id| id.eq_ignore_ascii_case(recording_id.trim()))
+        })
+        .ok_or_else(|| ApiError::not_found("Live TV recording not found"))?;
+    Ok(Json(recording))
+}
+
+async fn live_tv_recording_folders(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(Json(query_result(live_tv_recording_group_items(
+        &config, "Folder",
+    ))))
+}
+
+async fn live_tv_recording_groups(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(Json(query_result(live_tv_recording_group_items(
+        &config, "Group",
+    ))))
+}
+
+async fn live_tv_recording_series(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(Json(query_result(live_tv_recording_group_items(
+        &config, "Series",
+    ))))
+}
+
+async fn delete_live_tv_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(recording_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Live TV recording not found"))
+    delete_persisted_live_tv_recording(&state.db, &recording_id).await
 }
 
 fn comma_delimited_values(value: &str) -> Vec<String> {
@@ -7914,6 +7981,172 @@ fn live_tv_program_item(
         .or_else(|| base.get("Description").cloned())
         .unwrap_or_else(|| serde_json::json!(""));
     Some(base)
+}
+
+fn live_tv_recording_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
+    let channels = live_tv_channel_items(config);
+    let mut recordings = config
+        .get("Recordings")
+        .and_then(serde_json::Value::as_array)
+        .map(|recordings| {
+            recordings
+                .iter()
+                .enumerate()
+                .filter_map(|(index, recording)| {
+                    live_tv_recording_item(recording, index, &channels)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    recordings.sort_by(|left, right| {
+        json_string_field(right, "DateCreated")
+            .unwrap_or_default()
+            .cmp(&json_string_field(left, "DateCreated").unwrap_or_default())
+            .then_with(|| {
+                json_string_field(left, "Name")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .cmp(
+                        &json_string_field(right, "Name")
+                            .unwrap_or_default()
+                            .to_ascii_lowercase(),
+                    )
+            })
+    });
+    recordings
+}
+
+fn live_tv_recording_item(
+    recording: &serde_json::Value,
+    index: usize,
+    channels: &[serde_json::Value],
+) -> Option<serde_json::Value> {
+    let serde_json::Value::Object(fields) = recording else {
+        return None;
+    };
+    let mut item = serde_json::Value::Object(fields.clone());
+    let name = json_string_field(&item, "Name")
+        .or_else(|| json_string_field(&item, "Title"))
+        .unwrap_or_else(|| format!("Recording {}", index + 1));
+    let id = json_string_field(&item, "Id")
+        .or_else(|| json_string_field(&item, "RecordingId"))
+        .unwrap_or_else(|| format!("recording-{}", index + 1));
+    let channel_id = json_string_field(&item, "ChannelId").unwrap_or_default();
+    let channel_name = channels
+        .iter()
+        .find(|channel| {
+            json_string_field(channel, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
+        })
+        .and_then(|channel| json_string_field(channel, "Name"));
+
+    item["Id"] = serde_json::json!(id);
+    item["Name"] = serde_json::json!(name.clone());
+    item["SortName"] = serde_json::json!(name);
+    item["Type"] = serde_json::json!("Recording");
+    item["MediaType"] = serde_json::json!("Video");
+    item["ChannelId"] = serde_json::json!(channel_id);
+    item["ChannelName"] = channel_name
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+    item["IsFolder"] = serde_json::json!(false);
+    item["IsLive"] = serde_json::json!(false);
+    item["Status"] = item
+        .get("Status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("Completed"));
+    item["DateCreated"] = item
+        .get("DateCreated")
+        .cloned()
+        .or_else(|| item.get("StartDate").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    item["SeriesName"] = item
+        .get("SeriesName")
+        .cloned()
+        .or_else(|| item.get("Series").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    item["RecordingType"] = item
+        .get("RecordingType")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("Manual"));
+    Some(item)
+}
+
+fn live_tv_recording_group_items(
+    config: &serde_json::Value,
+    group_type: &'static str,
+) -> Vec<serde_json::Value> {
+    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
+    for recording in live_tv_recording_items(config) {
+        let key = match group_type {
+            "Folder" => json_string_field(&recording, "FolderName")
+                .or_else(|| json_string_field(&recording, "Category"))
+                .unwrap_or_else(|| "Recordings".to_string()),
+            "Series" => json_string_field(&recording, "SeriesName")
+                .or_else(|| json_string_field(&recording, "Name"))
+                .unwrap_or_else(|| "Recordings".to_string()),
+            _ => json_string_field(&recording, "GroupName")
+                .or_else(|| json_string_field(&recording, "SeriesName"))
+                .or_else(|| json_string_field(&recording, "Name"))
+                .unwrap_or_else(|| "Recordings".to_string()),
+        };
+        *groups.entry(key).or_insert(0) += 1;
+    }
+    groups
+        .into_iter()
+        .map(|(name, count)| {
+            serde_json::json!({
+                "Id": sanitize_live_tv_group_id(&name),
+                "Name": name,
+                "Type": format!("Recording{group_type}"),
+                "IsFolder": true,
+                "ChildCount": count,
+                "RecordingCount": count
+            })
+        })
+        .collect()
+}
+
+fn sanitize_live_tv_group_id(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+async fn delete_persisted_live_tv_recording(
+    db: &Database,
+    recording_id: &str,
+) -> Result<StatusCode, ApiError> {
+    let mut config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let mut recordings = config
+        .get("Recordings")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let before = recordings.len();
+    recordings.retain(|recording| {
+        json_string_field(recording, "Id")
+            .or_else(|| json_string_field(recording, "RecordingId"))
+            .is_none_or(|id| !id.eq_ignore_ascii_case(recording_id))
+    });
+    if recordings.len() == before {
+        return Err(ApiError::not_found("Live TV recording not found"));
+    }
+    config["Recordings"] = serde_json::json!(recordings);
+    db.update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn live_tv_channel_mapping_option(channel: serde_json::Value) -> serde_json::Value {
@@ -22785,6 +23018,30 @@ mod tests {
             "PrePaddingSeconds": 300,
             "PostPaddingSeconds": 600,
             "MediaLocationsCreated": ["/srv/recordings"],
+            "Recordings": [
+                {
+                    "Id": "recording-1",
+                    "Name": "Morning News",
+                    "SeriesName": "Morning News",
+                    "FolderName": "News",
+                    "GroupName": "Morning News",
+                    "ChannelId": "channel-1",
+                    "StartDate": "2026-05-26T08:00:00Z",
+                    "EndDate": "2026-05-26T09:00:00Z",
+                    "Path": "/srv/recordings/Morning News.ts"
+                },
+                {
+                    "Id": "recording-2",
+                    "Name": "Movie Hour",
+                    "SeriesName": "Movie Hour",
+                    "FolderName": "Movies",
+                    "GroupName": "Movie Hour",
+                    "ChannelId": "channel-2",
+                    "StartDate": "2026-05-26T09:00:00Z",
+                    "EndDate": "2026-05-26T10:00:00Z",
+                    "Path": "/srv/recordings/Movie Hour.ts"
+                }
+            ],
             "RecordingPostProcessor": "/usr/local/bin/process-recording",
             "RecordingPostProcessorArguments": "{path}",
             "SaveRecordingNFO": true,
@@ -22836,6 +23093,7 @@ mod tests {
         assert_eq!(config["SaveRecordingImages"], true);
         assert_eq!(config["TunerHosts"].as_array().unwrap().len(), 1);
         assert_eq!(config["ListingProviders"].as_array().unwrap().len(), 1);
+        assert_eq!(config["Recordings"].as_array().unwrap().len(), 2);
         assert!(config.get("UnknownLiveTvField").is_none());
 
         let response = app
@@ -23523,15 +23781,86 @@ mod tests {
         let recommended: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(recommended["TotalRecordCount"], 2);
 
-        for endpoint in [
-            "/LiveTv/Recordings",
-            "/LiveTv/RecordingGroups",
-            "/LiveTv/Recordings/Folders",
-            "/livetv/recordings/groups",
-            "/LiveTv/Recordings/Series",
-            "/LiveTv/Timers",
-            "/LiveTv/SeriesTimers",
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Recordings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Recordings")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let recordings: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recordings["TotalRecordCount"], 2);
+        assert_eq!(recordings["Items"][0]["Id"], "recording-2");
+        assert_eq!(recordings["Items"][0]["Type"], "Recording");
+        assert_eq!(recordings["Items"][0]["ChannelName"], "Movies");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/livetv/recordings/recording-1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let recording: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recording["Name"], "Morning News");
+        assert_eq!(recording["Status"], "Completed");
+
+        for (endpoint, expected_name) in [
+            ("/LiveTv/Recordings/Folders", "Movies"),
+            ("/livetv/recordings/groups", "Morning News"),
+            ("/LiveTv/Recordings/Series", "Morning News"),
+            ("/LiveTv/RecordingGroups", "Morning News"),
         ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let groups: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(groups["TotalRecordCount"], 2, "{endpoint}");
+            assert!(
+                groups["Items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group["Name"] == expected_name),
+                "{endpoint}"
+            );
+        }
+
+        for endpoint in ["/LiveTv/Timers", "/LiveTv/SeriesTimers"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -23606,7 +23935,6 @@ mod tests {
         for endpoint in [
             "/LiveTv/Channels/channel-missing",
             "/LiveTv/Programs/program-missing",
-            "/LiveTv/Recordings/recording-missing",
             "/LiveTv/Timers/timer-missing",
             "/livetv/seriestimers/timer-missing",
             "/LiveTv/LiveRecordings/recording-missing/stream",
@@ -23645,6 +23973,50 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/LiveTv/Recordings/recording-2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/LiveTv/Recordings/recording-2")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Recordings")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let recordings: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(recordings["TotalRecordCount"], 1);
+        assert_eq!(recordings["Items"][0]["Id"], "recording-1");
 
         let response = app
             .clone()
