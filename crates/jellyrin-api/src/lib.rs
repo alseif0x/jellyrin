@@ -6976,10 +6976,26 @@ async fn send_message_command(
     let payload = body
         .map(|Json(value)| value)
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-    let mut data = payload
+    let object = payload
         .as_object()
-        .cloned()
         .ok_or_else(|| ApiError::bad_request("Message body must be an object"))?;
+    let message = message_command_payload(object)?;
+    let mut data = serde_json::Map::new();
+    data.insert(
+        "Header".to_string(),
+        message
+            .header
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    data.insert("Text".to_string(), serde_json::Value::String(message.text));
+    data.insert(
+        "TimeoutMs".to_string(),
+        message
+            .timeout_ms
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+    );
     data.insert(
         "ControllingUserId".to_string(),
         serde_json::Value::String(auth_user.id.simple().to_string()),
@@ -6992,6 +7008,49 @@ async fn send_message_command(
         }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+struct MessageCommandPayload {
+    header: Option<String>,
+    text: String,
+    timeout_ms: Option<serde_json::Number>,
+}
+
+fn message_command_payload(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<MessageCommandPayload, ApiError> {
+    let header = json_object_string_field(object, &["Header", "header"]);
+    let text = json_object_string_field(object, &["Text", "text"])
+        .ok_or_else(|| ApiError::bad_request("Text is required"))?;
+    let timeout_ms = object
+        .get("TimeoutMs")
+        .or_else(|| object.get("timeoutMs"))
+        .or_else(|| object.get("Timeout"))
+        .or_else(|| object.get("timeout"))
+        .map(json_value_non_negative_i64)
+        .transpose()?
+        .map(serde_json::Number::from);
+    Ok(MessageCommandPayload {
+        header,
+        text,
+        timeout_ms,
+    })
+}
+
+fn json_value_non_negative_i64(value: &serde_json::Value) -> Result<i64, ApiError> {
+    let parsed = if let Some(value) = value.as_i64() {
+        Some(value)
+    } else if let Some(value) = value.as_str() {
+        value.trim().parse::<i64>().ok()
+    } else {
+        None
+    };
+    match parsed {
+        Some(value) if value >= 0 => Ok(value),
+        _ => Err(ApiError::bad_request(
+            "TimeoutMs must be a non-negative integer",
+        )),
+    }
 }
 
 async fn add_user_to_session(
@@ -36192,6 +36251,50 @@ mod tests {
             next_playback_event_type(&mut playback_events, playback_token, "MessageCommand").await;
         assert_eq!(message_event["Data"]["Header"], "Heads up");
         assert_eq!(message_event["Data"]["Text"], "Testing");
+        assert_eq!(message_event["Data"]["TimeoutMs"], 1000);
+        assert_eq!(message_event["Data"]["ControllingUserId"], user_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/session/sessions/{playback_token}/message"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "header": "Alias header",
+                            "text": "Alias body",
+                            "timeoutMs": "2500"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let alias_message_event =
+            next_playback_event_type(&mut playback_events, playback_token, "MessageCommand").await;
+        assert_eq!(alias_message_event["Data"]["Header"], "Alias header");
+        assert_eq!(alias_message_event["Data"]["Text"], "Alias body");
+        assert_eq!(alias_message_event["Data"]["TimeoutMs"], 2500);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Session/Sessions/{playback_token}/Message"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Header": "No text" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
