@@ -1510,11 +1510,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Library/Trailers/{item_id}/Similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_trailer_items),
         )
         .route(
             "/library/trailers/{item_id}/similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_trailer_items),
         )
         .route(
             "/Users/{user_id}/Items/{item_id}/Intros",
@@ -18728,6 +18728,109 @@ async fn authenticated_similar_show_items(
     }
     episodes.sort_by(compare_tv_episodes);
     paged_similar_items_response(&state, &query, requested_user_id, episodes).await
+}
+
+async fn authenticated_similar_trailer_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+
+    match similar_items_for_media_source(&state, &query, requested_user_id, &item_id).await {
+        Ok(response) => return Ok(response),
+        Err(error) if error.status == StatusCode::NOT_FOUND => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut scope_query = query.clone();
+    scope_query.ids = None;
+    scope_query.search_term = None;
+    scope_query.name_starts_with = None;
+    scope_query.name_starts_with_or_greater = None;
+    scope_query.name_less_than = None;
+    scope_query.is_folder = None;
+    scope_query.filters = metadata_scope_filters(&query.filters);
+    scope_query.start_index = None;
+    scope_query.limit = None;
+    scope_query.sort_by = None;
+    scope_query.sort_order = None;
+    let scoped_items = filtered_media_items(
+        state.db.media_items().await?,
+        &scope_query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    let item_by_id = scoped_items
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<HashMap<_, _>>();
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let mut trailers = Vec::new();
+    for metadata in state.db.media_item_metadata().await? {
+        let Some(item) = item_by_id.get(&metadata.item_id) else {
+            continue;
+        };
+        trailers.extend(metadata_remote_trailers(
+            &metadata.payload,
+            item,
+            &server_id,
+        ));
+    }
+    let parent_id = trailers
+        .iter()
+        .find(|trailer| {
+            trailer["Id"]
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&item_id))
+        })
+        .and_then(|trailer| trailer["ParentId"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::not_found("Similar source not found"))?;
+    trailers.retain(|trailer| {
+        trailer["ParentId"]
+            .as_str()
+            .is_some_and(|candidate_parent_id| candidate_parent_id == parent_id)
+            && trailer["Id"]
+                .as_str()
+                .is_some_and(|candidate_id| !candidate_id.eq_ignore_ascii_case(&item_id))
+            && remote_trailer_matches_query(trailer, &query)
+    });
+    trailers.sort_by(|left, right| {
+        left["SortName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .cmp(
+                &right["SortName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+    });
+    if metadata_sort_descending("Trailer", &query) {
+        trailers.reverse();
+    }
+    let total_record_count = trailers.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(20).min(100);
+    Ok(Json(query_result_with_total(
+        trailers.into_iter().skip(start_index).take(limit).collect(),
+        total_record_count,
+        start_index,
+    )))
 }
 
 async fn similar_items_from_metadata_entity(
@@ -41314,6 +41417,57 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .starts_with("https://trailers.example/")
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Trailers?ParentId={parent_id}&SortBy=SortName"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let source_trailers: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(source_trailers["TotalRecordCount"], 2);
+        let trailer_id = source_trailers["Items"][0]["Id"].as_str().unwrap();
+
+        for endpoint in [
+            format!("/Library/Trailers/{trailer_id}/Similar?Limit=1"),
+            format!(
+                "/library/trailers/{trailer_id}/similar?UserId={}&Limit=1",
+                admin.id
+            ),
+        ] {
+            let endpoint = endpoint.as_str();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let similar_trailers: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(similar_trailers["TotalRecordCount"], 1, "{endpoint}");
+            assert_ne!(similar_trailers["Items"][0]["Id"], trailer_id, "{endpoint}");
+            assert_eq!(
+                similar_trailers["Items"][0]["Type"], "Trailer",
+                "{endpoint}"
+            );
+            assert_eq!(
+                similar_trailers["Items"][0]["ParentId"], item_id,
+                "{endpoint}"
             );
         }
 
