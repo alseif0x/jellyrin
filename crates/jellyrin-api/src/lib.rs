@@ -1502,11 +1502,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Library/Shows/{item_id}/Similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_show_items),
         )
         .route(
             "/library/shows/{item_id}/similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_show_items),
         )
         .route(
             "/Library/Trailers/{item_id}/Similar",
@@ -18675,6 +18675,61 @@ async fn authenticated_similar_artist_items(
     .await
 }
 
+async fn authenticated_similar_show_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+
+    match similar_items_for_media_source(&state, &query, requested_user_id, &item_id).await {
+        Ok(response) => return Ok(response),
+        Err(error) if error.status == StatusCode::NOT_FOUND => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut items_query = query.clone();
+    if items_query.include_item_types.is_empty() {
+        items_query.include_item_types.push("Episode".to_string());
+    }
+    items_query.ids = None;
+    items_query.search_term = None;
+    items_query.name_starts_with = None;
+    items_query.name_starts_with_or_greater = None;
+    items_query.name_less_than = None;
+    items_query.start_index = None;
+    items_query.limit = None;
+    items_query.sort_by = None;
+    items_query.sort_order = None;
+
+    let mut episodes = filtered_media_items(
+        state.db.media_items().await?,
+        &items_query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?
+    .into_iter()
+    .filter(|item| tv_episode_matches_series(item, &item_id))
+    .collect::<Vec<_>>();
+    if episodes.is_empty() {
+        return Err(ApiError::not_found("Similar source not found"));
+    }
+    episodes.sort_by(compare_tv_episodes);
+    paged_similar_items_response(&state, &query, requested_user_id, episodes).await
+}
+
 async fn similar_items_from_metadata_entity(
     state: AppState,
     headers: HeaderMap,
@@ -34044,6 +34099,49 @@ mod tests {
             episodes_result["Items"][2]["Id"],
             third.id.simple().to_string()
         );
+
+        for (endpoint, expected_id, expected_start_index) in [
+            (
+                format!(
+                    "/Library/Shows/{series_id}/Similar?UserId={}&Limit=1",
+                    user.id
+                ),
+                first.id.simple().to_string(),
+                0,
+            ),
+            (
+                format!("/library/shows/{series_id}/similar?StartIndex=1&Limit=1"),
+                second.id.simple().to_string(),
+                1,
+            ),
+        ] {
+            let endpoint = endpoint.as_str();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let similar_show: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(similar_show["TotalRecordCount"], 3, "{endpoint}");
+            assert_eq!(
+                similar_show["StartIndex"], expected_start_index,
+                "{endpoint}"
+            );
+            assert_eq!(similar_show["Items"][0]["Id"], expected_id, "{endpoint}");
+            assert_eq!(similar_show["Items"][0]["Type"], "Episode", "{endpoint}");
+            assert_eq!(
+                similar_show["Items"][0]["SeriesId"], series_id,
+                "{endpoint}"
+            );
+        }
 
         let response = app
             .oneshot(
