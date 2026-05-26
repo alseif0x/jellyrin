@@ -23097,6 +23097,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_and_readiness_routes_report_service_status() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for uri in ["/health", "/healthz"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let health: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(health["Status"], "Healthy");
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let readiness: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(readiness["Status"], "Ready");
+    }
+
+    #[tokio::test]
     async fn startup_wizard_and_login_http_flow() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let app = router(AppState {
