@@ -6227,17 +6227,37 @@ async fn report_playback_stopped(
 struct PathPlaybackReportQuery {
     #[serde(alias = "api_key", alias = "ApiKey")]
     api_key: Option<String>,
-    #[serde(alias = "MediaSourceId")]
+    #[serde(
+        alias = "MediaSourceId",
+        alias = "mediaSourceId",
+        alias = "mediasourceid"
+    )]
     media_source_id: Option<String>,
-    #[serde(alias = "AudioStreamIndex")]
+    #[serde(
+        alias = "AudioStreamIndex",
+        alias = "audioStreamIndex",
+        alias = "audiostreamindex"
+    )]
     audio_stream_index: Option<i64>,
-    #[serde(alias = "SubtitleStreamIndex")]
+    #[serde(
+        alias = "SubtitleStreamIndex",
+        alias = "subtitleStreamIndex",
+        alias = "subtitlestreamindex"
+    )]
     subtitle_stream_index: Option<i64>,
-    #[serde(alias = "PositionTicks")]
+    #[serde(
+        alias = "PositionTicks",
+        alias = "positionTicks",
+        alias = "positionticks"
+    )]
     position_ticks: Option<i64>,
-    #[serde(alias = "StartPositionTicks")]
+    #[serde(
+        alias = "StartPositionTicks",
+        alias = "startPositionTicks",
+        alias = "startpositionticks"
+    )]
     start_position_ticks: Option<i64>,
-    #[serde(alias = "IsPaused")]
+    #[serde(alias = "IsPaused", alias = "isPaused", alias = "ispaused")]
     is_paused: Option<bool>,
 }
 
@@ -6380,6 +6400,7 @@ async fn report_playback(
             .clear_active_playback_session(&token.access_token)
             .await?;
     }
+    broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -31661,7 +31682,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/Playstate/PlayingItems/{item_id}?PositionTicks=123&AudioStreamIndex=1&SubtitleStreamIndex=-1"
+                        "/Playstate/PlayingItems/{item_id}?positionTicks=123&audioStreamIndex=1&subtitleStreamIndex=-1"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -31685,7 +31706,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/Playstate/PlayingItems/{item_id}/Progress?PositionTicks=456"
+                        "/Playstate/PlayingItems/{item_id}/Progress?positionticks=456"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -32276,6 +32297,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let login: Value = serde_json::from_slice(&body).unwrap();
         let playback_token = login["AccessToken"].as_str().unwrap();
+        let mut playback_report_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -32301,6 +32323,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let progress_sessions_event =
+            next_playback_event_type(&mut playback_report_events, playback_token, "Sessions").await;
+        assert_eq!(progress_sessions_event["Data"][0]["Id"], playback_token);
+        assert_eq!(
+            progress_sessions_event["Data"][0]["NowPlayingItem"]["Id"],
+            item_id
+        );
+        assert_eq!(
+            progress_sessions_event["Data"][0]["PlayState"]["PositionTicks"],
+            25_000_000
+        );
         let playback_state = test_db
             .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
             .await
@@ -32353,6 +32386,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let stopped_sessions_event =
+            next_playback_event_type(&mut playback_report_events, playback_token, "Sessions").await;
+        assert_eq!(stopped_sessions_event["Data"][0]["Id"], playback_token);
+        assert_eq!(
+            stopped_sessions_event["Data"][0]["NowPlayingItem"],
+            Value::Null
+        );
 
         let response = app
             .clone()
