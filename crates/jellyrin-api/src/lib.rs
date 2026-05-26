@@ -21415,6 +21415,86 @@ async fn delete_stored_image(
     delete_stored_image_files(&dir, image_type, image_index).await
 }
 
+async fn reorder_stored_images(
+    state: &AppState,
+    owner: ImageOwner<'_>,
+    image_type: &str,
+    old_index: usize,
+    new_index: usize,
+) -> Result<(), ApiError> {
+    let dir = stored_image_owner_dir(state, owner);
+    let mut images = stored_images_for_type(&dir, image_type).await?;
+    let Some(old_position) = images.iter().position(|image| image.index == old_index) else {
+        return Err(ApiError::not_found("Image not found"));
+    };
+    if new_index >= images.len() {
+        return Err(ApiError::bad_request("New image index is out of range"));
+    }
+    if old_position == new_index {
+        return Ok(());
+    }
+
+    let moved = images.remove(old_position);
+    images.insert(new_index, moved);
+    let batch_id = Uuid::new_v4().simple().to_string();
+    let mut staged = Vec::with_capacity(images.len());
+    for (position, image) in images.into_iter().enumerate() {
+        let temp_path = dir.join(format!(
+            ".jellyrin-image-reorder-{batch_id}-{position}.{}",
+            image.extension
+        ));
+        tokio::fs::rename(&image.path, &temp_path).await?;
+        staged.push((temp_path, position, image.extension));
+    }
+    for (temp_path, position, extension) in staged {
+        let final_path = dir.join(stored_image_file_name(image_type, position, &extension));
+        tokio::fs::rename(temp_path, final_path).await?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StoredImageFile {
+    index: usize,
+    extension: String,
+    path: PathBuf,
+}
+
+async fn stored_images_for_type(
+    dir: &FsPath,
+    image_type: &str,
+) -> Result<Vec<StoredImageFile>, ApiError> {
+    let mut read_dir = match tokio::fs::read_dir(dir).await {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let target_type = sanitize_image_path_segment(image_type);
+    let mut images = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((stored_type, index, extension)) = parse_stored_image_file_name(file_name) else {
+            continue;
+        };
+        if stored_type != target_type {
+            continue;
+        }
+        images.push(StoredImageFile {
+            index,
+            extension: extension.to_string(),
+            path,
+        });
+    }
+    images.sort_by(|left, right| left.index.cmp(&right.index));
+    Ok(images)
+}
+
 async fn stored_image_infos(
     state: &AppState,
     owner: ImageOwner<'_>,
@@ -21731,15 +21811,35 @@ async fn delete_item_image_by_index(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct UpdateImageIndexQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "NewIndex", alias = "newIndex", alias = "new_index")]
+    new_index: Option<String>,
+}
+
 async fn update_item_image_index(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path((item_id, _image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<UpdateImageIndexQuery>,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     media_item_or_folder_by_id(&state.db, &item_id).await?;
-    validate_image_index(&image_index)?;
+    let image_index = parse_image_index(&image_index)?;
+    let Some(new_index) = query.new_index.as_deref() else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let new_index = parse_image_index(new_index)?;
+    reorder_stored_images(
+        &state,
+        ImageOwner::Item(&item_id),
+        &image_type,
+        image_index,
+        new_index,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -22096,10 +22196,6 @@ async fn user_exists(db: &Database, user_id: Uuid) -> Result<(), ApiError> {
     } else {
         Err(ApiError::not_found("User not found"))
     }
-}
-
-fn validate_image_index(image_index: &str) -> Result<(), ApiError> {
-    parse_image_index(image_index).map(|_| ())
 }
 
 fn parse_image_index(image_index: &str) -> Result<usize, ApiError> {
@@ -29827,6 +29923,178 @@ mod tests {
         assert_eq!(similar["BaselineItemName"], "Played Baseline");
         assert_eq!(similar["Items"][0]["Id"], related_id.simple().to_string());
         assert_eq!(similar["Items"][0]["UserData"]["Played"], false);
+    }
+
+    #[tokio::test]
+    async fn item_image_index_reorders_stored_item_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("Image Reorder Movie.mp4"), b"fake video")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "image-index-test-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let item_id = test_db.media_items().await.unwrap()[0]
+            .id
+            .simple()
+            .to_string();
+
+        for (index, bytes) in [
+            (0, b"backdrop zero".as_slice()),
+            (1, b"backdrop one".as_slice()),
+            (2, b"backdrop two".as_slice()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/Image/Items/{item_id}/Images/Backdrop/{index}"))
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::from(bytes.to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Image/Items/{item_id}/Images/Backdrop/2/Index?newIndex=0"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Image/Items/{item_id}/Images/Backdrop/2/Index?newIndex=invalid"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Image/Items/{item_id}/Images/Backdrop/9/Index?newIndex=0"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Image/Items/{item_id}/Images/Backdrop/2/Index?newIndex=0"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        for (index, expected) in [
+            (0, b"backdrop two".as_slice()),
+            (1, b"backdrop zero".as_slice()),
+            (2, b"backdrop one".as_slice()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/Image/Items/{item_id}/Images/Backdrop/{index}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), expected);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let image_infos: Value = serde_json::from_slice(&body).unwrap();
+        let indexes = image_infos
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == "Backdrop")
+            .map(|image| image["ImageIndex"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(indexes, vec![0, 1, 2]);
     }
 
     #[tokio::test]
