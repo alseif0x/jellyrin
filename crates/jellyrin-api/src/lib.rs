@@ -6987,15 +6987,11 @@ async fn modify_session_user(
     let requested_user_id = Uuid::parse_str(&user_id)
         .or_else(|_| Uuid::parse_str(&hyphenate_uuid(&user_id)))
         .map_err(|_| ApiError::bad_request("Invalid user id"))?;
-    if !state
+    let requested_user = state
         .db
-        .users()
-        .await?
-        .into_iter()
-        .any(|user| user.id == requested_user_id)
-    {
-        return Err(ApiError::not_found("User not found"));
-    }
+        .user_by_id(requested_user_id)
+        .await
+        .map_err(|_| ApiError::not_found("User not found"))?;
     if add_user {
         state
             .db
@@ -7008,6 +7004,12 @@ async fn modify_session_user(
             .await?;
     }
     broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
+    broadcast_sessions_message_to_user_owned_sessions(
+        &state.db,
+        &requested_user,
+        Some(&target_session.access_token),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -21123,6 +21125,32 @@ async fn broadcast_sessions_message(
     Ok(())
 }
 
+async fn broadcast_sessions_message_to_user_owned_sessions(
+    db: &Database,
+    user: &User,
+    exclude_session_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let data = session_list_json(db, user).await?;
+    for session in db
+        .device_sessions()
+        .await?
+        .into_iter()
+        .filter(|session| session.user_id == user.id)
+    {
+        if exclude_session_id.is_some_and(|excluded| excluded == session.access_token) {
+            continue;
+        }
+        broadcast_session_message(
+            &session.access_token,
+            serde_json::json!({
+                "MessageType": "Sessions",
+                "Data": data.clone()
+            }),
+        );
+    }
+    Ok(())
+}
+
 async fn websocket(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -21961,7 +21989,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
         let response = app
             .clone()
             .oneshot(
@@ -35448,6 +35475,17 @@ mod tests {
             .issue_api_key_for_user(guest.id, "guest-key")
             .await
             .unwrap();
+        let (_, guest_device_token) = db
+            .issue_device_token_for_user(
+                guest.id,
+                "guest-remote-device",
+                "Guest Remote",
+                "Jellyfin Web",
+                "dev",
+            )
+            .await
+            .unwrap();
+        let guest_session_token = guest_device_token.access_token.clone();
         let guest_id = guest.id.simple().to_string();
         let guest_id_hyphenated = guest.id.to_string();
         let test_db = db.clone();
@@ -36215,6 +36253,8 @@ mod tests {
             item_id
         );
 
+        let mut add_owner_events = subscribe_playback_events();
+        let mut add_guest_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -36230,6 +36270,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let add_owner_event =
+            next_playback_event_type(&mut add_owner_events, playback_token, "Sessions").await;
+        assert_eq!(
+            add_owner_event["Data"][0]["AdditionalUsers"][0]["UserId"],
+            guest_id_hyphenated
+        );
+        let add_guest_event =
+            next_playback_event_type(&mut add_guest_events, &guest_session_token, "Sessions").await;
+        assert!(
+            add_guest_event["Data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["Id"] == playback_token)
+        );
 
         let response = app
             .clone()
@@ -36245,14 +36300,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let guest_sessions: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(guest_sessions.as_array().unwrap().len(), 1);
-        assert_eq!(guest_sessions[0]["Id"], playback_token);
+        let shared_guest_session = guest_sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["Id"] == playback_token)
+            .unwrap();
         assert_eq!(
-            guest_sessions[0]["AdditionalUsers"][0]["UserId"],
+            shared_guest_session["AdditionalUsers"][0]["UserId"],
             guest_id_hyphenated
         );
-        assert_eq!(guest_sessions[0]["AdditionalUsers"][0]["UserName"], "guest");
+        assert_eq!(
+            shared_guest_session["AdditionalUsers"][0]["UserName"],
+            "guest"
+        );
 
+        let mut remove_owner_events = subscribe_playback_events();
+        let mut remove_guest_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -36300,6 +36364,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let remove_owner_event =
+            next_playback_event_type(&mut remove_owner_events, playback_token, "Sessions").await;
+        assert_eq!(
+            remove_owner_event["Data"][0]["AdditionalUsers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let remove_guest_event =
+            next_playback_event_type(&mut remove_guest_events, &guest_session_token, "Sessions")
+                .await;
+        assert!(
+            !remove_guest_event["Data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["Id"] == playback_token)
+        );
 
         let response = app
             .clone()
@@ -36315,7 +36398,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let guest_sessions_after_remove: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(guest_sessions_after_remove.as_array().unwrap().len(), 0);
+        assert!(
+            !guest_sessions_after_remove
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["Id"] == playback_token)
+        );
 
         let response = app
             .clone()
