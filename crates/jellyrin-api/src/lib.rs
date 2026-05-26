@@ -14586,7 +14586,18 @@ async fn media_segments(
             .unwrap_or_default()
             .cmp(&right["StartTicks"].as_i64().unwrap_or_default())
     });
-    Ok(Json(query_result(segments)))
+    let total_record_count = segments.len();
+    let start_index = query_string_value(raw_query.as_deref(), &["StartIndex", "startIndex"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let limit = query_string_value(raw_query.as_deref(), &["Limit", "limit"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    Ok(Json(query_result_with_total(
+        segments.into_iter().skip(start_index).take(limit).collect(),
+        total_record_count,
+        start_index,
+    )))
 }
 
 fn media_segment_json(
@@ -43075,6 +43086,27 @@ mod tests {
         assert_eq!(filtered_segments["Items"].as_array().unwrap().len(), 2);
         assert_eq!(filtered_segments["Items"][0]["Id"], "intro-1");
         assert_eq!(filtered_segments["Items"][1]["Id"], "preview-1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/MediaSegments/{item_id}?IncludeSegmentTypes=Preview&IncludeSegmentTypes=Intro&StartIndex=1&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let paged_segments: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged_segments["TotalRecordCount"], 2);
+        assert_eq!(paged_segments["StartIndex"], 1);
+        assert_eq!(paged_segments["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(paged_segments["Items"][0]["Id"], "preview-1");
 
         let response = app
             .clone()
