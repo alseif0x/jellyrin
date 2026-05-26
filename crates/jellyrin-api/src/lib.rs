@@ -2430,20 +2430,20 @@ pub fn router(state: AppState) -> Router {
         .route("/years/{year}", get(metadata_year_by_value))
         .route("/Channels", get(channels))
         .route("/channels", get(channels))
-        .route("/Channels/Items/Latest", get(channels))
-        .route("/channels/items/latest", get(channels))
-        .route("/Channels/Features", get(authenticated_empty_json_array))
-        .route("/channels/features", get(authenticated_empty_json_array))
+        .route("/Channels/Items/Latest", get(channel_latest_items))
+        .route("/channels/items/latest", get(channel_latest_items))
+        .route("/Channels/Features", get(channel_features))
+        .route("/channels/features", get(channel_features))
         .route(
             "/Channels/{channel_id}/Features",
-            get(authenticated_empty_json_array),
+            get(channel_features_by_id),
         )
         .route(
             "/channels/{channel_id}/features",
-            get(authenticated_empty_json_array),
+            get(channel_features_by_id),
         )
-        .route("/Channels/{channel_id}/Items", get(channels))
-        .route("/channels/{channel_id}/items", get(channels))
+        .route("/Channels/{channel_id}/Items", get(channel_items))
+        .route("/channels/{channel_id}/items", get(channel_items))
         .route("/Artists", get(metadata_artists))
         .route("/artists", get(metadata_artists))
         .route("/Artists/AlbumArtists", get(metadata_album_artists))
@@ -6908,10 +6908,6 @@ fn quick_connect_json(session: &QuickConnectSession) -> serde_json::Value {
         "Authenticated": session.authorized,
         "UserId": session.user_id.map(|id| id.simple().to_string())
     })
-}
-
-async fn empty_json_array() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
 }
 
 fn syncplay_groups() -> &'static Mutex<HashMap<String, SyncPlayGroup>> {
@@ -17176,9 +17172,9 @@ struct ChannelsQuery {
     #[serde(alias = "startIndex", alias = "StartIndex")]
     start_index: Option<usize>,
     #[serde(alias = "limit", alias = "Limit")]
-    _limit: Option<usize>,
+    limit: Option<usize>,
     #[serde(alias = "supportsLatestItems", alias = "SupportsLatestItems")]
-    _supports_latest_items: Option<bool>,
+    supports_latest_items: Option<bool>,
     #[serde(alias = "supportsMediaDeletion", alias = "SupportsMediaDeletion")]
     _supports_media_deletion: Option<bool>,
     #[serde(alias = "isFavorite", alias = "IsFavorite")]
@@ -17191,11 +17187,190 @@ async fn channels(
     Query(query): Query<ChannelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let mut items = channel_provider_items(&state.db).await?;
+    if query.supports_latest_items.unwrap_or(false) {
+        items.retain(|channel| json_bool_field(channel, "SupportsLatestItems").unwrap_or(false));
+    }
+    let total = items.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
     Ok(Json(query_result_with_total(
-        Vec::new(),
-        0,
-        query.start_index.unwrap_or(0),
+        items.into_iter().skip(start_index).take(limit).collect(),
+        total,
+        start_index,
     )))
+}
+
+async fn channel_latest_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChannelsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let mut items = channel_content_items(&state.db, None).await?;
+    items.sort_by(|left, right| {
+        let left_sort = json_string_field(left, "SortName")
+            .or_else(|| json_string_field(left, "Name"))
+            .unwrap_or_default();
+        let right_sort = json_string_field(right, "SortName")
+            .or_else(|| json_string_field(right, "Name"))
+            .unwrap_or_default();
+        left_sort
+            .to_ascii_lowercase()
+            .cmp(&right_sort.to_ascii_lowercase())
+    });
+    let total = items.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(20).min(100);
+    Ok(Json(query_result_with_total(
+        items.into_iter().skip(start_index).take(limit).collect(),
+        total,
+        start_index,
+    )))
+}
+
+async fn channel_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ChannelsQuery>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let mut items = channel_content_items(&state.db, Some(&channel_id)).await?;
+    let total = items.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    Ok(Json(query_result_with_total(
+        items.drain(..).skip(start_index).take(limit).collect(),
+        total,
+        start_index,
+    )))
+}
+
+async fn channel_features(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(channel_feature_items(&state.db, None).await?))
+}
+
+async fn channel_features_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(
+        channel_feature_items(&state.db, Some(&channel_id)).await?,
+    ))
+}
+
+async fn channel_provider_items(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
+    let live_tv_channels = configured_live_tv_channel_items(db).await?;
+    if live_tv_channels.is_empty() {
+        return Ok(Vec::new());
+    }
+    let server_id = db.server_state().await?.server_id.to_string();
+    Ok(vec![channel_provider_json(
+        &server_id,
+        "livetv",
+        "Live TV",
+        live_tv_channels.len(),
+    )])
+}
+
+async fn channel_content_items(
+    db: &Database,
+    channel_id: Option<&str>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut items = configured_live_tv_channel_items(db).await?;
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    if channel_id.is_some_and(|channel_id| !channel_id.eq_ignore_ascii_case("livetv")) {
+        return Err(ApiError::not_found("Channel not found"));
+    }
+    for item in &mut items {
+        item["ChannelId"] = serde_json::json!("livetv");
+    }
+    Ok(items)
+}
+
+async fn channel_feature_items(
+    db: &Database,
+    channel_id: Option<&str>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    if configured_live_tv_channel_items(db).await?.is_empty() {
+        return Ok(Vec::new());
+    }
+    if channel_id.is_some_and(|channel_id| !channel_id.eq_ignore_ascii_case("livetv")) {
+        return Err(ApiError::not_found("Channel not found"));
+    }
+    Ok(vec![serde_json::json!({
+        "Name": "Live TV",
+        "Id": "livetv",
+        "ChannelId": "livetv",
+        "ContentType": "TvChannel",
+        "MediaTypes": ["Video"],
+        "SupportsLatestItems": true,
+        "SupportsMediaDeletion": false,
+        "SupportsSortOrderToggle": true,
+        "SupportsFavoriteItems": false,
+        "SupportsContentDownloading": false,
+        "AutoRefreshLevels": 0,
+        "DefaultSortFields": ["SortName"],
+    })])
+}
+
+async fn configured_live_tv_channel_items(
+    db: &Database,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(live_tv_channel_items(&config))
+}
+
+fn channel_provider_json(
+    server_id: &str,
+    id: &str,
+    name: &str,
+    child_count: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "Name": name,
+        "ServerId": server_id,
+        "Id": id,
+        "Etag": null,
+        "DateCreated": null,
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": name,
+        "ExternalUrls": [],
+        "Path": null,
+        "Overview": "",
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": id,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": { "JellyrinLocal": id },
+        "IsFolder": true,
+        "ParentId": null,
+        "Type": "Channel",
+        "MediaType": null,
+        "ChildCount": child_count,
+        "SupportsLatestItems": true,
+        "SupportsMediaDeletion": false,
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "LocationType": "Virtual"
+    })
 }
 
 async fn authenticated_item_intros(
@@ -17462,15 +17637,6 @@ async fn delete_library_item(
         return Err(ApiError::not_found("Item not found"));
     }
     Ok(StatusCode::NO_CONTENT)
-}
-
-async fn authenticated_empty_json_array(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(empty_json_array().await)
 }
 
 async fn active_encodings(
@@ -24200,6 +24366,81 @@ mod tests {
         let channel: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channel["Name"], "Movies");
         assert_eq!(channel["Number"], "2");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels?SupportsLatestItems=true")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels_root: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels_root["TotalRecordCount"], 1);
+        assert_eq!(channels_root["Items"][0]["Id"], "livetv");
+        assert_eq!(channels_root["Items"][0]["Type"], "Channel");
+        assert_eq!(channels_root["Items"][0]["ChildCount"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/channels/livetv/items?StartIndex=1&Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channel_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channel_items["TotalRecordCount"], 2);
+        assert_eq!(channel_items["StartIndex"], 1);
+        assert_eq!(channel_items["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(channel_items["Items"][0]["ChannelId"], "livetv");
+        assert_eq!(channel_items["Items"][0]["Type"], "TvChannel");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels/Items/Latest?Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let latest_channel_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(latest_channel_items["TotalRecordCount"], 2);
+        assert_eq!(latest_channel_items["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(latest_channel_items["Items"][0]["ChannelId"], "livetv");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels/livetv/Features")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channel_features: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channel_features.as_array().unwrap().len(), 1);
+        assert_eq!(channel_features[0]["ChannelId"], "livetv");
+        assert_eq!(channel_features[0]["SupportsLatestItems"], true);
 
         let response = app
             .clone()
