@@ -4221,10 +4221,23 @@ async fn install_package(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<PackageQuery>,
-    Path(_name): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Package not found"))
+    let package = package_infos_from_repositories(
+        &state
+            .db
+            .system_configuration_payloads()
+            .await?
+            .plugin_repositories,
+    )
+    .into_iter()
+    .find(|package| package_matches_query(package, &name, &query))
+    .ok_or_else(|| ApiError::not_found("Package not found"))?;
+    let package_name = json_string_field(&package, "Name").unwrap_or(name);
+    Err(ApiError::conflict(format!(
+        "Package installation is not implemented in Jellyrin yet: {package_name}"
+    )))
 }
 
 async fn cancel_package_installation(
@@ -26375,6 +26388,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Packages/Installed/Example%20Plugin?Version=1.0.0.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["Message"]
+                .as_str()
+                .unwrap()
+                .contains("Package installation is not implemented")
+        );
 
         let response = app
             .clone()
