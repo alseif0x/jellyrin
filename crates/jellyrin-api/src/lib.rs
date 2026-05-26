@@ -3298,6 +3298,8 @@ async fn forgot_password(
 struct ForgotPasswordPinBody {
     #[serde(alias = "Pin")]
     pin: Option<String>,
+    #[serde(alias = "Password", alias = "NewPassword", alias = "NewPw")]
+    password: Option<String>,
 }
 
 async fn forgot_password_pin(
@@ -3305,10 +3307,17 @@ async fn forgot_password_pin(
     body: Option<Json<ForgotPasswordPinBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let pin = body
-        .map(|body| body.pin.clone())
-        .unwrap_or_default()
+        .as_ref()
+        .and_then(|body| body.pin.clone())
         .unwrap_or_default();
     let normalized_pin = normalize_password_reset_pin(&pin);
+    let new_password = body
+        .as_ref()
+        .and_then(|body| body.password.as_deref())
+        .map(str::trim)
+        .filter(|password| !password.is_empty())
+        .unwrap_or(pin.trim())
+        .to_string();
     if normalized_pin.is_empty() {
         return Ok(Json(serde_json::json!({
             "Success": false,
@@ -3362,7 +3371,7 @@ async fn forgot_password_pin(
             continue;
         };
 
-        state.db.set_user_password(user.id, &pin).await?;
+        state.db.set_user_password(user.id, &new_password).await?;
         users_reset.push(user.name);
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -40968,7 +40977,9 @@ mod tests {
                     .method(Method::POST)
                     .uri("/users/forgotpassword/pin")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({ "Pin": pin }).to_string()))
+                    .body(Body::from(
+                        json!({ "Pin": pin, "NewPassword": "reset-secret" }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -40991,7 +41002,7 @@ mod tests {
                         r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="forgot-password", Version="dev""#,
                     )
                     .body(Body::from(
-                        json!({ "Username": "admin", "Pw": pin }).to_string(),
+                        json!({ "Username": "admin", "Pw": "reset-secret" }).to_string(),
                     ))
                     .unwrap(),
             )
