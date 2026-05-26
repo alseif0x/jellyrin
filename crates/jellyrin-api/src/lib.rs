@@ -6663,13 +6663,9 @@ async fn send_system_command(
 ) -> Result<StatusCode, ApiError> {
     let (auth_user, target_session) =
         command_target_session(&state, &headers, &auth_query, &session_id).await?;
-    ensure_session_supports_command(&target_session, &command)?;
-    broadcast_general_command(
-        &target_session,
-        &auth_user,
-        &command,
-        serde_json::Map::new(),
-    );
+    let command = canonical_general_command_type(&command)?;
+    ensure_session_supports_command(&target_session, command)?;
+    broadcast_general_command(&target_session, &auth_user, command, serde_json::Map::new());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6725,6 +6721,55 @@ fn ensure_session_supports_command(
         Ok(())
     } else {
         Err(ApiError::bad_request("Command is not supported by session"))
+    }
+}
+
+fn canonical_general_command_type(command: &str) -> Result<&'static str, ApiError> {
+    match command.to_ascii_lowercase().as_str() {
+        "back" => Ok("Back"),
+        "channeldown" => Ok("ChannelDown"),
+        "channelup" => Ok("ChannelUp"),
+        "displaycontent" => Ok("DisplayContent"),
+        "displaymessage" => Ok("DisplayMessage"),
+        "gohome" => Ok("GoHome"),
+        "gotosearch" => Ok("GoToSearch"),
+        "gotosettings" => Ok("GoToSettings"),
+        "guide" => Ok("Guide"),
+        "movedown" => Ok("MoveDown"),
+        "moveleft" => Ok("MoveLeft"),
+        "moveright" => Ok("MoveRight"),
+        "moveup" => Ok("MoveUp"),
+        "mute" => Ok("Mute"),
+        "nextletter" => Ok("NextLetter"),
+        "pagedown" => Ok("PageDown"),
+        "pageup" => Ok("PageUp"),
+        "play" => Ok("Play"),
+        "playmediasource" => Ok("PlayMediaSource"),
+        "playnext" => Ok("PlayNext"),
+        "playstate" => Ok("PlayState"),
+        "playtrailers" => Ok("PlayTrailers"),
+        "previousletter" => Ok("PreviousLetter"),
+        "select" => Ok("Select"),
+        "sendkey" => Ok("SendKey"),
+        "sendstring" => Ok("SendString"),
+        "setaudiostreamindex" => Ok("SetAudioStreamIndex"),
+        "setmaxstreamingbitrate" => Ok("SetMaxStreamingBitrate"),
+        "setplaybackorder" => Ok("SetPlaybackOrder"),
+        "setrepeatmode" => Ok("SetRepeatMode"),
+        "setshufflequeue" => Ok("SetShuffleQueue"),
+        "setsubtitlestreamindex" => Ok("SetSubtitleStreamIndex"),
+        "setvolume" => Ok("SetVolume"),
+        "takescreenshot" => Ok("TakeScreenshot"),
+        "togglecontextmenu" => Ok("ToggleContextMenu"),
+        "togglefullscreen" => Ok("ToggleFullscreen"),
+        "togglemute" => Ok("ToggleMute"),
+        "toggleosd" => Ok("ToggleOsd"),
+        "toggleosdmenu" => Ok("ToggleOsdMenu"),
+        "togglestats" => Ok("ToggleStats"),
+        "unmute" => Ok("Unmute"),
+        "volumedown" => Ok("VolumeDown"),
+        "volumeup" => Ok("VolumeUp"),
+        _ => Err(ApiError::bad_request("Unsupported GeneralCommandType")),
     }
 }
 
@@ -36214,7 +36259,9 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/Session/Sessions/{playback_token}/System/Wake"))
+                    .uri(format!(
+                        "/Session/Sessions/{playback_token}/System/ToggleFullscreen"
+                    ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -36224,7 +36271,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let system_event =
             next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
-        assert_eq!(system_event["Data"]["Name"], "Wake");
+        assert_eq!(system_event["Data"]["Name"], "ToggleFullscreen");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/session/sessions/{playback_token}/system/volumeup"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let lowercase_system_event =
+            next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
+        assert_eq!(lowercase_system_event["Data"]["Name"], "VolumeUp");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Session/Sessions/{playback_token}/System/NotACommand"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
