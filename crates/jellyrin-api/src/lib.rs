@@ -20957,9 +20957,9 @@ fn metadata_premiere_date(metadata: &serde_json::Value) -> Option<OffsetDateTime
 struct DisplayPreferencesQuery {
     #[serde(flatten)]
     auth: AuthQuery,
-    #[serde(alias = "UserId")]
+    #[serde(alias = "UserId", alias = "userId", alias = "user_id")]
     user_id: Option<String>,
-    #[serde(alias = "Client")]
+    #[serde(alias = "Client", alias = "client")]
     client: Option<String>,
 }
 
@@ -28453,6 +28453,54 @@ mod tests {
         assert_eq!(preferences["SortBy"], "DateCreated,SortName");
         assert_eq!(preferences["RememberIndexing"], true);
         assert_eq!(preferences["CustomPrefs"]["landing-livetv"], "false");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/displaypreferences/usersettings?userId={}&client=mobile",
+                        user.id.simple()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "client-sent-id",
+                            "ViewType": "Thumb",
+                            "SortBy": "DatePlayed",
+                            "CustomPrefs": { "landing-home": "true" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/DisplayPreferences/usersettings?userId={}&client=mobile",
+                        user.id.simple()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let mobile_preferences: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(mobile_preferences["Id"], "usersettings");
+        assert_eq!(mobile_preferences["ViewType"], "Thumb");
+        assert_eq!(mobile_preferences["SortBy"], "DatePlayed");
+        assert_eq!(mobile_preferences["CustomPrefs"]["landing-home"], "true");
 
         let response = app
             .oneshot(
