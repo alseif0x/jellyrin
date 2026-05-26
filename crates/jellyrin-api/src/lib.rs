@@ -1708,11 +1708,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/InstantMix/Artists/InstantMix",
-            get(authenticated_empty_items),
+            get(instant_mix_from_artist_by_id),
         )
         .route(
             "/instantmix/artists/instantmix",
-            get(authenticated_empty_items),
+            get(instant_mix_from_artist_by_id),
         )
         .route(
             "/InstantMix/MusicGenres/InstantMix",
@@ -12617,6 +12617,29 @@ async fn instant_mix_from_artist(
     .await
 }
 
+async fn instant_mix_from_artist_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let artist_id = query_string_values(raw_query.as_deref(), &["Id"])
+        .into_iter()
+        .find(|id| !id.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("Artist Id is required"))?;
+    instant_mix_from_metadata_entity(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        artist_id.trim().to_string(),
+        "MusicArtist",
+        &["Artists", "AlbumArtists"],
+    )
+    .await
+}
+
 async fn instant_mix_from_playlist(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -16880,19 +16903,6 @@ async fn media_item_by_id(db: &Database, item_id: &str) -> Result<MediaItem, Api
         .into_iter()
         .find(|item| item.id == requested_id)
         .ok_or_else(|| ApiError::not_found("Item not found"))
-}
-
-async fn empty_items_result() -> Json<serde_json::Value> {
-    Json(query_result(Vec::new()))
-}
-
-async fn authenticated_empty_items(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(empty_items_result().await)
 }
 
 async fn item_suggestions(
@@ -36335,12 +36345,40 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/InstantMix/Artists/InstantMix?Id=missing")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/instantmix/artists/instantmix?Id={artist_id}&StartIndex=1&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let empty_mix: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(empty_mix["TotalRecordCount"], 0);
-        assert_eq!(empty_mix["StartIndex"], 0);
-        assert_eq!(empty_mix["Items"], json!([]));
+        let artist_id_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(artist_id_mix["TotalRecordCount"], 2);
+        assert_eq!(artist_id_mix["StartIndex"], 1);
+        assert_eq!(artist_id_mix["Items"][0]["Id"], second_item_id);
 
         let response = app
             .clone()
