@@ -18917,8 +18917,10 @@ async fn authenticated_item_theme_media(
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
     let source = media_item_by_id(&state.db, &item_id).await?;
-    let theme_videos = theme_items_result(&state.db, &source, requested_user_id, "Video").await?;
-    let theme_songs = theme_items_result(&state.db, &source, requested_user_id, "Audio").await?;
+    let theme_videos =
+        theme_items_result(&state.db, &source, requested_user_id, "Video", &query).await?;
+    let theme_songs =
+        theme_items_result(&state.db, &source, requested_user_id, "Audio", &query).await?;
     Ok(Json(serde_json::json!({
         "ThemeVideosResult": theme_videos,
         "ThemeSongsResult": theme_songs,
@@ -18966,7 +18968,7 @@ async fn authenticated_item_theme_items(
     ensure_user_access(&auth_user, requested_user_id)?;
     let source = media_item_by_id(&state.db, &item_id).await?;
     Ok(Json(
-        theme_items_result(&state.db, &source, requested_user_id, media_type).await?,
+        theme_items_result(&state.db, &source, requested_user_id, media_type, &query).await?,
     ))
 }
 
@@ -18975,6 +18977,7 @@ async fn theme_items_result(
     source: &MediaItem,
     user_id: Uuid,
     media_type: &str,
+    query: &ItemsQuery,
 ) -> Result<serde_json::Value, ApiError> {
     let server_id = db.server_state().await?.server_id.to_string();
     let mut theme_items = db
@@ -18986,9 +18989,15 @@ async fn theme_items_result(
     theme_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
     let total_record_count = theme_items.len();
     Ok(query_result_with_total(
-        items_to_json(db, theme_items, &server_id, Some(user_id)).await?,
+        items_to_json(
+            db,
+            paged_media_items(theme_items, query),
+            &server_id,
+            Some(user_id),
+        )
+        .await?,
         total_record_count,
-        0,
+        query.start_index.unwrap_or(0),
     ))
 }
 
@@ -30539,6 +30548,9 @@ mod tests {
         tokio::fs::write(tmp.path().join("theme.mp3"), b"fake song")
             .await
             .unwrap();
+        tokio::fs::write(tmp.path().join("theme.flac"), b"fake second song")
+            .await
+            .unwrap();
         tokio::fs::write(tmp.path().join("theme.mp4"), b"fake theme video")
             .await
             .unwrap();
@@ -30607,7 +30619,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let theme_media: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(theme_media["ThemeSongsResult"]["TotalRecordCount"], 1);
+        assert_eq!(theme_media["ThemeSongsResult"]["TotalRecordCount"], 2);
         assert_eq!(theme_media["ThemeSongsResult"]["Items"][0]["Name"], "theme");
         assert_eq!(
             theme_media["ThemeSongsResult"]["Items"][0]["MediaType"],
@@ -30621,6 +30633,44 @@ mod tests {
         assert_eq!(
             theme_media["ThemeVideosResult"]["Items"][0]["MediaType"],
             "Video"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Library/Items/{item_id}/ThemeMedia?StartIndex=1&Limit=1"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let paged_theme_media: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged_theme_media["ThemeSongsResult"]["TotalRecordCount"], 2);
+        assert_eq!(paged_theme_media["ThemeSongsResult"]["StartIndex"], 1);
+        assert_eq!(
+            paged_theme_media["ThemeSongsResult"]["Items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            paged_theme_media["ThemeVideosResult"]["TotalRecordCount"],
+            1
+        );
+        assert_eq!(paged_theme_media["ThemeVideosResult"]["StartIndex"], 1);
+        assert_eq!(
+            paged_theme_media["ThemeVideosResult"]["Items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
         );
 
         for (endpoint, media_type) in [
@@ -30641,10 +30691,29 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let theme_items: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(theme_items["TotalRecordCount"], 1);
+            let expected_total = if media_type == "Audio" { 2 } else { 1 };
+            assert_eq!(theme_items["TotalRecordCount"], expected_total);
             assert_eq!(theme_items["Items"][0]["Name"], "theme");
             assert_eq!(theme_items["Items"][0]["MediaType"], media_type);
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/ThemeSongs?StartIndex=1&Limit=1"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let paged_theme_songs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paged_theme_songs["TotalRecordCount"], 2);
+        assert_eq!(paged_theme_songs["StartIndex"], 1);
+        assert_eq!(paged_theme_songs["Items"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
