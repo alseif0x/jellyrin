@@ -28035,6 +28035,8 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[137, 80, 78, 71]));
 
         let response = app
             .clone()
@@ -32391,6 +32393,8 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[137, 80, 78, 71]));
 
         let response = app
             .clone()
@@ -32407,6 +32411,8 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[137, 80, 78, 71]));
 
         let response = app
             .clone()
@@ -32424,6 +32430,8 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[137, 80, 78, 71]));
 
         let response = app
             .clone()
@@ -32466,6 +32474,8 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(&[137, 80, 78, 71]));
 
         let response = app
             .clone()
