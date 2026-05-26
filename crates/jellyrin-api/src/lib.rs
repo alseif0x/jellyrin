@@ -28003,8 +28003,12 @@ mod tests {
         receiver: &mut tokio::sync::broadcast::Receiver<super::PlaybackEvent>,
         session_id: &str,
     ) -> Value {
-        for _ in 0..10 {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let event = tokio::time::timeout(remaining, receiver.recv())
                 .await
                 .expect("timed out waiting for playback websocket event")
                 .expect("playback event channel closed");
@@ -32064,8 +32068,11 @@ mod tests {
 
         for (endpoint, position_ticks) in [
             ("/Sessions/Playing", 0_i64),
+            ("/sessions/playing", 10_000_000_i64),
             ("/Sessions/Playing/Progress", 50_000_000_i64),
+            ("/sessions/playing/progress", 60_000_000_i64),
             ("/Sessions/Playing/Stopped", 50_000_000_i64),
+            ("/sessions/playing/stopped", 60_000_000_i64),
         ] {
             let response = app
                 .clone()
@@ -32112,7 +32119,7 @@ mod tests {
         assert_eq!(resume["Items"][0]["Id"], item_id);
         assert_eq!(
             resume["Items"][0]["UserData"]["PlaybackPositionTicks"],
-            50_000_000
+            60_000_000
         );
         assert_eq!(resume["Items"][0]["UserData"]["Played"], false);
         assert_eq!(
