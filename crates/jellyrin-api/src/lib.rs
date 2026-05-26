@@ -1684,27 +1684,27 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/InstantMix/Albums/{item_id}/InstantMix",
-            get(instant_mix_from_item),
+            get(instant_mix_from_album),
         )
         .route(
             "/instantmix/albums/{item_id}/instantmix",
-            get(instant_mix_from_item),
+            get(instant_mix_from_album),
         )
         .route(
             "/InstantMix/Artists/{item_id}/InstantMix",
-            get(instant_mix_from_item),
+            get(instant_mix_from_artist),
         )
         .route(
             "/instantmix/artists/{item_id}/instantmix",
-            get(instant_mix_from_item),
+            get(instant_mix_from_artist),
         )
         .route(
             "/InstantMix/Playlists/{item_id}/InstantMix",
-            get(instant_mix_from_item),
+            get(instant_mix_from_playlist),
         )
         .route(
             "/instantmix/playlists/{item_id}/instantmix",
-            get(instant_mix_from_item),
+            get(instant_mix_from_playlist),
         )
         .route(
             "/InstantMix/Artists/InstantMix",
@@ -12576,6 +12576,198 @@ async fn instant_mix_from_item(
     }
 
     let mix_items = audio_instant_mix_items(&state.db, &item_id).await?;
+    instant_mix_items_response(&state, &query, requested_user_id, mix_items).await
+}
+
+async fn instant_mix_from_album(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    instant_mix_from_metadata_entity(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        item_id,
+        "MusicAlbum",
+        &["Album", "AlbumName", "Albums"],
+    )
+    .await
+}
+
+async fn instant_mix_from_artist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    instant_mix_from_metadata_entity(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        item_id,
+        "MusicArtist",
+        &["Artists", "AlbumArtists"],
+    )
+    .await
+}
+
+async fn instant_mix_from_playlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
+    Path(item_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+
+    if let Ok(playlist_id) = parse_jellyfin_uuid(&item_id)
+        && let Ok(playlist) = ensure_media_list_kind(&state.db, playlist_id, "playlist").await
+    {
+        ensure_media_list_read_access(&state.db, &auth_user, &playlist).await?;
+        let mix_items = state
+            .db
+            .media_list_items(playlist.id)
+            .await?
+            .into_iter()
+            .map(|entry| entry.item)
+            .filter(|item| item.media_type == "Audio")
+            .collect::<Vec<_>>();
+        return instant_mix_items_response(&state, &query, requested_user_id, mix_items).await;
+    }
+
+    let mix_items = audio_instant_mix_items(&state.db, &item_id).await?;
+    instant_mix_items_response(&state, &query, requested_user_id, mix_items).await
+}
+
+async fn instant_mix_from_metadata_entity(
+    state: AppState,
+    headers: HeaderMap,
+    auth_query: AuthQuery,
+    raw_query: Option<String>,
+    item_id: String,
+    entity_type: &'static str,
+    metadata_keys: &'static [&'static str],
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(requested_user_id) = requested_user_id {
+        ensure_user_access(&auth_user, requested_user_id)?;
+    }
+
+    let mut items_query = query.clone();
+    items_query.include_item_types = vec!["Audio".to_string()];
+    items_query.search_term = None;
+    items_query.name_starts_with = None;
+    items_query.name_starts_with_or_greater = None;
+    items_query.name_less_than = None;
+    items_query.start_index = None;
+    items_query.limit = None;
+    items_query.sort_by = Some("SortName".to_string());
+    items_query.sort_order = None;
+    let candidates = filtered_media_items(
+        state.db.media_items().await?,
+        &items_query,
+        requested_user_id,
+        &state.db,
+    )
+    .await?;
+    let metadata_by_item = state
+        .db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .map(|metadata| (metadata.item_id, metadata))
+        .collect::<HashMap<_, _>>();
+
+    if let Some(source) = candidates.iter().find(|item| {
+        parse_jellyfin_uuid(&item_id).is_ok_and(|requested_id| requested_id == item.id)
+    }) {
+        if let Some(entity_name) = metadata_by_item
+            .get(&source.id)
+            .and_then(|metadata| first_metadata_string_in_key_order(metadata, metadata_keys))
+        {
+            let mix_items = metadata_entity_audio_items(
+                candidates,
+                &metadata_by_item,
+                metadata_keys,
+                &entity_name,
+            );
+            return instant_mix_items_response(&state, &query, requested_user_id, mix_items).await;
+        }
+        return instant_mix_items_response(
+            &state,
+            &query,
+            requested_user_id,
+            audio_instant_mix_items(&state.db, &item_id).await?,
+        )
+        .await;
+    }
+
+    let entity_name = metadata_values_for_keys(&state.db, metadata_keys, &candidates)
+        .await?
+        .into_iter()
+        .find(|name| stable_entity_id(entity_type, name).eq_ignore_ascii_case(&item_id))
+        .ok_or_else(|| ApiError::not_found("Instant mix source not found"))?;
+    let mix_items =
+        metadata_entity_audio_items(candidates, &metadata_by_item, metadata_keys, &entity_name);
+    instant_mix_items_response(&state, &query, requested_user_id, mix_items).await
+}
+
+fn metadata_entity_audio_items(
+    mut candidates: Vec<MediaItem>,
+    metadata_by_item: &HashMap<Uuid, MediaItemMetadata>,
+    metadata_keys: &[&str],
+    entity_name: &str,
+) -> Vec<MediaItem> {
+    let entity_name = entity_name.trim().to_ascii_lowercase();
+    candidates.retain(|item| {
+        metadata_by_item
+            .get(&item.id)
+            .is_some_and(|metadata| metadata_has_value(metadata, metadata_keys, &entity_name))
+    });
+    candidates.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+    candidates
+}
+
+fn metadata_has_value(
+    metadata: &MediaItemMetadata,
+    metadata_keys: &[&str],
+    expected_name: &str,
+) -> bool {
+    metadata_strings(metadata, metadata_keys)
+        .into_iter()
+        .any(|value| value.eq_ignore_ascii_case(expected_name))
+}
+
+fn first_metadata_string_in_key_order(
+    metadata: &MediaItemMetadata,
+    metadata_keys: &[&str],
+) -> Option<String> {
+    metadata_keys
+        .iter()
+        .find_map(|key| metadata_strings(metadata, &[*key]).into_iter().next())
+}
+
+async fn instant_mix_items_response(
+    state: &AppState,
+    query: &ItemsQuery,
+    requested_user_id: Option<Uuid>,
+    mix_items: Vec<MediaItem>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     if mix_items.is_empty() {
         return Ok(Json(query_result(Vec::new())));
     }
@@ -35825,14 +36017,38 @@ mod tests {
         test_db
             .update_media_item_metadata(
                 first_audio.id,
-                json!({ "MusicGenres": ["Rock"], "Genres": ["Audio Genre"] }),
+                json!({
+                    "Album": "Example Album",
+                    "Artists": ["Artist One"],
+                    "AlbumArtists": ["Album Artist"],
+                    "MusicGenres": ["Rock"],
+                    "Genres": ["Audio Genre"]
+                }),
             )
             .await
             .unwrap();
         test_db
-            .update_media_item_metadata(second_audio.id, json!({ "MusicGenres": ["rock", "Jazz"] }))
+            .update_media_item_metadata(
+                second_audio.id,
+                json!({
+                    "AlbumName": "Example Album",
+                    "Artists": ["Artist One", "Second Artist"],
+                    "MusicGenres": ["rock", "Jazz"]
+                }),
+            )
             .await
             .unwrap();
+        let playlist = test_db
+            .create_media_list(
+                "playlist",
+                "Instant Mix Playlist",
+                Some("playlists"),
+                Some(user.id),
+                vec![second_audio.id, first_audio.id],
+            )
+            .await
+            .unwrap();
+        let playlist_id = playlist.id.simple().to_string();
 
         let response = app
             .clone()
@@ -36002,6 +36218,7 @@ mod tests {
             format!("/InstantMix/Artists/{item_id}/InstantMix?Limit=2"),
             format!("/InstantMix/Playlists/{item_id}/InstantMix?Limit=2"),
         ] {
+            let endpoint = endpoint.as_str();
             let response = app
                 .clone()
                 .oneshot(
@@ -36016,10 +36233,84 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let route_mix: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(route_mix["TotalRecordCount"], 2);
-            assert_eq!(route_mix["Items"][0]["Id"], item_id);
-            assert_eq!(route_mix["Items"][0]["Type"], "Audio");
+            assert_eq!(route_mix["TotalRecordCount"], 2, "{endpoint}");
+            assert_eq!(route_mix["Items"][0]["Id"], item_id, "{endpoint}");
+            assert_eq!(route_mix["Items"][0]["Type"], "Audio", "{endpoint}");
         }
+
+        let album_id = stable_entity_id("MusicAlbum", "Example Album");
+        for (endpoint, expected_total, expected_first_id) in [
+            (
+                format!("/InstantMix/Albums/{album_id}/InstantMix?Limit=2"),
+                2,
+                item_id,
+            ),
+            (
+                format!("/instantmix/albums/{album_id}/instantmix?StartIndex=1&Limit=1"),
+                2,
+                second_item_id.as_str(),
+            ),
+        ] {
+            let endpoint = endpoint.as_str();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let album_mix: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(album_mix["TotalRecordCount"], expected_total);
+            assert_eq!(album_mix["Items"][0]["Id"], expected_first_id);
+            assert_eq!(album_mix["Items"][0]["Type"], "Audio");
+        }
+
+        let artist_id = stable_entity_id("MusicArtist", "Artist One");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/InstantMix/Artists/{artist_id}/InstantMix?Limit=2"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let artist_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(artist_mix["TotalRecordCount"], 2);
+        assert_eq!(artist_mix["Items"][0]["Id"], item_id);
+        assert_eq!(artist_mix["Items"][1]["Id"], second_item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/InstantMix/Playlists/{playlist_id}/InstantMix?Limit=2"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playlist_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playlist_mix["TotalRecordCount"], 2);
+        assert_eq!(playlist_mix["Items"][0]["Id"], second_item_id);
+        assert_eq!(playlist_mix["Items"][1]["Id"], item_id);
 
         let response = app
             .clone()
