@@ -886,8 +886,8 @@ pub fn router(state: AppState) -> Router {
         .route("/branding/configuration", get(branding_configuration))
         .route("/Branding/Css", get(branding_css))
         .route("/Branding/Css.css", get(branding_css))
-        .route("/Branding/Splashscreen", get(empty_text))
-        .route("/branding/splashscreen", get(empty_text))
+        .route("/Branding/Splashscreen", get(splashscreen_placeholder_image))
+        .route("/branding/splashscreen", get(splashscreen_placeholder_image))
         .route(
             "/Image/Branding/Splashscreen",
             get(splashscreen_placeholder_image)
@@ -7688,10 +7688,6 @@ async fn branding_css(State(state): State<AppState>) -> Result<String, ApiError>
         .await?
         .custom_css
         .unwrap_or_default())
-}
-
-async fn empty_text() -> &'static str {
-    ""
 }
 
 const CLIENT_LOG_DOCUMENT_LIMIT_BYTES: usize = 1024 * 1024;
@@ -28046,6 +28042,24 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/Image/Branding/Splashscreen")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), uploaded_png.as_slice());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Branding/Splashscreen")
                     .body(Body::empty())
                     .unwrap(),
             )
