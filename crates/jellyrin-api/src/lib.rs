@@ -7314,16 +7314,23 @@ async fn syncplay_join(
     let payload = optional_json_body(body).await?;
     let group_id = json_string_any_field(&payload, &["GroupId", "Id"])
         .ok_or_else(|| ApiError::bad_request("SyncPlay group id is required"))?;
-    let mut groups = syncplay_groups().lock().await;
-    let group = groups
-        .get_mut(group_id.trim())
-        .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
-    let participant = syncplay_participant(&user, &token);
-    group
-        .participants
-        .insert(participant.session_id.clone(), participant);
-    group.updated_at = OffsetDateTime::now_utc();
-    Ok(Json(syncplay_group_json(group)))
+    let (group_json, participant_session_ids) = {
+        let mut groups = syncplay_groups().lock().await;
+        let group = groups
+            .get_mut(group_id.trim())
+            .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
+        let participant = syncplay_participant(&user, &token);
+        group
+            .participants
+            .insert(participant.session_id.clone(), participant);
+        group.updated_at = OffsetDateTime::now_utc();
+        (
+            syncplay_group_json(group),
+            group.participants.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+    broadcast_syncplay_group_update(&participant_session_ids, &group_json, "Join");
+    Ok(Json(group_json))
 }
 
 async fn syncplay_leave(
@@ -7332,17 +7339,29 @@ async fn syncplay_leave(
     Query(query): Query<AuthQuery>,
 ) -> Result<StatusCode, ApiError> {
     let (_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let mut groups = syncplay_groups().lock().await;
-    let mut empty_groups = Vec::new();
-    for group in groups.values_mut() {
-        group.participants.remove(&token.access_token);
-        group.updated_at = OffsetDateTime::now_utc();
-        if group.participants.is_empty() {
-            empty_groups.push(group.id.clone());
+    let mut updates = Vec::new();
+    {
+        let mut groups = syncplay_groups().lock().await;
+        let mut empty_groups = Vec::new();
+        for group in groups.values_mut() {
+            if group.participants.remove(&token.access_token).is_some() {
+                group.updated_at = OffsetDateTime::now_utc();
+                if group.participants.is_empty() {
+                    empty_groups.push(group.id.clone());
+                } else {
+                    updates.push((
+                        syncplay_group_json(group),
+                        group.participants.keys().cloned().collect::<Vec<_>>(),
+                    ));
+                }
+            }
+        }
+        for group_id in empty_groups {
+            groups.remove(&group_id);
         }
     }
-    for group_id in empty_groups {
-        groups.remove(&group_id);
+    for (group_json, participant_session_ids) in updates {
+        broadcast_syncplay_group_update(&participant_session_ids, &group_json, "Leave");
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -7400,6 +7419,26 @@ async fn syncplay_group_command(
         );
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn broadcast_syncplay_group_update(
+    participant_session_ids: &[String],
+    group: &serde_json::Value,
+    reason: &str,
+) {
+    for session_id in participant_session_ids {
+        broadcast_session_message(
+            session_id,
+            serde_json::json!({
+                "MessageType": "SyncPlayGroupUpdate",
+                "Data": {
+                    "Reason": reason,
+                    "GroupId": group["GroupId"].clone(),
+                    "Group": group.clone()
+                }
+            }),
+        );
+    }
 }
 
 fn syncplay_command_from_uri(uri: &Uri) -> String {
@@ -21662,8 +21701,8 @@ mod tests {
         json_value_i64, load_countries, load_cultures, media_item_by_id, media_item_streams,
         parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
         reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        stable_entity_id, subscribe_playback_events, transcode_dedupe_lock, transcode_temp_root,
-        trickplay_settings, trickplay_tile_cache_path,
+        stable_entity_id, subscribe_playback_events, syncplay_groups, transcode_dedupe_lock,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -28229,17 +28268,23 @@ mod tests {
 
     #[tokio::test]
     async fn syncplay_routes_manage_in_memory_group_shell() {
+        syncplay_groups().lock().await.clear();
+        let group_id = Uuid::new_v4().to_string();
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("admin".to_string(), "secret")
             .await
             .unwrap();
         let api_key = db
-            .issue_api_key_for_user(user.id, "syncplay-key")
+            .issue_api_key_for_user(user.id, &format!("syncplay-key-{group_id}"))
+            .await
+            .unwrap();
+        let guest = db.create_user("guest", Some("secret")).await.unwrap();
+        let guest_key = db
+            .issue_api_key_for_user(guest.id, &format!("syncplay-guest-key-{group_id}"))
             .await
             .unwrap();
         db.complete_startup_wizard().await.unwrap();
-        let group_id = Uuid::new_v4().to_string();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -28318,19 +28363,62 @@ mod tests {
         let fetched: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(fetched["Id"], group_id);
 
+        let mut syncplay_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri("/syncplay/join")
-                    .header("X-Emby-Token", &api_key)
+                    .header("X-Emby-Token", &guest_key)
                     .body(Body::from(json!({ "GroupId": group_id }).to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let joined_group: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(joined_group["Participants"].as_array().unwrap().len(), 2);
+        tokio::task::yield_now().await;
+        let join_owner_event =
+            next_playback_event_type(&mut syncplay_events, &api_key, "SyncPlayGroupUpdate").await;
+        assert_eq!(join_owner_event["Data"]["Reason"], "Join");
+        assert_eq!(join_owner_event["Data"]["GroupId"], group_id);
+        assert_eq!(
+            join_owner_event["Data"]["Group"]["Participants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let join_guest_event =
+            next_playback_event_type(&mut syncplay_events, &guest_key, "SyncPlayGroupUpdate").await;
+        assert_eq!(join_guest_event["Data"]["Reason"], "Join");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/syncplay/leave")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let leave_owner_event =
+            next_playback_event_type(&mut syncplay_events, &api_key, "SyncPlayGroupUpdate").await;
+        assert_eq!(leave_owner_event["Data"]["Reason"], "Leave");
+        assert_eq!(
+            leave_owner_event["Data"]["Group"]["Participants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
 
         let response = app
             .clone()
@@ -28346,7 +28434,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        let mut syncplay_events = subscribe_playback_events();
         for endpoint in [
             "/SyncPlay/Buffering",
             "/SyncPlay/MovePlaylistItem",
