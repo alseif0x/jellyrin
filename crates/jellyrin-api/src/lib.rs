@@ -4176,7 +4176,13 @@ async fn available_packages(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(Vec::new()))
+    Ok(Json(package_infos_from_repositories(
+        &state
+            .db
+            .system_configuration_payloads()
+            .await?
+            .plugin_repositories,
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4184,21 +4190,31 @@ struct PackageQuery {
     #[serde(flatten)]
     auth: AuthQuery,
     #[serde(alias = "AssemblyGuid")]
-    _assembly_guid: Option<String>,
+    assembly_guid: Option<String>,
     #[serde(alias = "Version")]
-    _version: Option<String>,
+    version: Option<String>,
     #[serde(alias = "RepositoryUrl")]
-    _repository_url: Option<String>,
+    repository_url: Option<String>,
 }
 
 async fn package_info(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<PackageQuery>,
-    Path(_name): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Package not found"))
+    package_infos_from_repositories(
+        &state
+            .db
+            .system_configuration_payloads()
+            .await?
+            .plugin_repositories,
+    )
+    .into_iter()
+    .find(|package| package_matches_query(package, &name, &query))
+    .map(Json)
+    .ok_or_else(|| ApiError::not_found("Package not found"))
 }
 
 async fn install_package(
@@ -4295,11 +4311,144 @@ fn normalize_repository_info(value: serde_json::Value) -> Option<serde_json::Val
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
 
-    Some(serde_json::json!({
+    let mut normalized = serde_json::json!({
         "Name": name,
         "Url": url,
         "Enabled": enabled
-    }))
+    });
+    if let Some(packages) = repository
+        .get("Packages")
+        .or_else(|| repository.get("packages"))
+        .and_then(serde_json::Value::as_array)
+    {
+        normalized["Packages"] = serde_json::Value::Array(
+            packages
+                .iter()
+                .filter_map(|package| normalize_package_info(package, Some(url)))
+                .collect(),
+        );
+    }
+    Some(normalized)
+}
+
+fn package_infos_from_repositories(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut packages = BTreeMap::<String, serde_json::Value>::new();
+    let serde_json::Value::Array(repositories) = value else {
+        return Vec::new();
+    };
+    for repository in repositories {
+        if json_bool_field(repository, "Enabled") == Some(false) {
+            continue;
+        }
+        let repository_url = json_string_field(repository, "Url");
+        let Some(repository_packages) = json_field_case_insensitive(repository, "Packages")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for package in repository_packages {
+            if let Some(package) = normalize_package_info(package, repository_url.as_deref()) {
+                let key = json_string_field(&package, "Name")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                packages.entry(key).or_insert(package);
+            }
+        }
+    }
+    packages.into_values().collect()
+}
+
+fn normalize_package_info(
+    value: &serde_json::Value,
+    repository_url: Option<&str>,
+) -> Option<serde_json::Value> {
+    let name = json_string_field(value, "Name")?;
+    let guid = json_string_field(value, "Guid")
+        .or_else(|| json_string_field(value, "Id"))
+        .or_else(|| json_string_field(value, "AssemblyGuid"));
+    let overview = json_string_field(value, "Overview")
+        .or_else(|| json_string_field(value, "Description"))
+        .unwrap_or_default();
+    let description = json_string_field(value, "Description").unwrap_or_else(|| overview.clone());
+    let owner = json_string_field(value, "Owner").unwrap_or_else(|| "Jellyrin".to_string());
+    let category = json_string_field(value, "Category").unwrap_or_else(|| "General".to_string());
+    let image_url =
+        json_string_field(value, "ImageUrl").or_else(|| json_string_field(value, "ThumbImage"));
+    let versions = normalized_package_versions(value, repository_url);
+    let mut package = serde_json::json!({
+        "Name": name,
+        "Guid": guid,
+        "Overview": overview,
+        "Description": description,
+        "Owner": owner,
+        "Category": category,
+        "Versions": versions
+    });
+    if let Some(image_url) = image_url {
+        package["ImageUrl"] = serde_json::json!(image_url);
+    }
+    Some(package)
+}
+
+fn normalized_package_versions(
+    value: &serde_json::Value,
+    repository_url: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let Some(versions) =
+        json_field_case_insensitive(value, "Versions").and_then(serde_json::Value::as_array)
+    else {
+        return vec![normalize_package_version(value, repository_url)];
+    };
+    versions
+        .iter()
+        .map(|version| normalize_package_version(version, repository_url))
+        .collect()
+}
+
+fn normalize_package_version(
+    value: &serde_json::Value,
+    repository_url: Option<&str>,
+) -> serde_json::Value {
+    let version = json_string_field(value, "Version").unwrap_or_else(|| "0.0.0.0".to_string());
+    serde_json::json!({
+        "Version": version,
+        "Changelog": json_string_field(value, "Changelog").unwrap_or_default(),
+        "SourceUrl": json_string_field(value, "SourceUrl")
+            .or_else(|| json_string_field(value, "Url"))
+            .or_else(|| repository_url.map(ToOwned::to_owned)),
+        "Checksum": json_string_field(value, "Checksum"),
+        "TargetAbi": json_string_field(value, "TargetAbi").unwrap_or_default(),
+        "Timestamp": json_string_field(value, "Timestamp"),
+    })
+}
+
+fn package_matches_query(package: &serde_json::Value, name: &str, query: &PackageQuery) -> bool {
+    let matches_name = json_string_field(package, "Name")
+        .is_some_and(|package_name| package_name.eq_ignore_ascii_case(name.trim()));
+    let matches_guid = query.assembly_guid.as_ref().is_none_or(|assembly_guid| {
+        json_string_field(package, "Guid")
+            .is_some_and(|guid| guid.eq_ignore_ascii_case(assembly_guid.trim()))
+    });
+    let matches_repository = query.repository_url.as_ref().is_none_or(|repository_url| {
+        package_versions(package).iter().any(|version| {
+            json_string_field(version, "SourceUrl")
+                .is_some_and(|source_url| source_url.eq_ignore_ascii_case(repository_url.trim()))
+        })
+    });
+    let matches_version = query.version.as_ref().is_none_or(|requested_version| {
+        package_versions(package).iter().any(|version| {
+            json_string_field(version, "Version")
+                .is_some_and(|version| version.eq_ignore_ascii_case(requested_version.trim()))
+        })
+    });
+    matches_name && matches_guid && matches_repository && matches_version
+}
+
+fn package_versions(package: &serde_json::Value) -> Vec<serde_json::Value> {
+    json_field_case_insensitive(package, "Versions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 async fn plugin_configuration(
@@ -25990,7 +26139,25 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!([
-                            { "Name": "Stable", "Url": "https://repo.example/manifest.json", "Enabled": true },
+                            {
+                                "Name": "Stable",
+                                "Url": "https://repo.example/manifest.json",
+                                "Enabled": true,
+                                "Packages": [{
+                                    "Name": "Example Plugin",
+                                    "Guid": "11111111-1111-1111-1111-111111111111",
+                                    "Overview": "Example package from a configured local repository",
+                                    "Description": "Example package",
+                                    "Owner": "Jellyrin",
+                                    "Category": "General",
+                                    "Versions": [{
+                                        "Version": "1.0.0.0",
+                                        "TargetAbi": "12.0.0.0",
+                                        "SourceUrl": "https://repo.example/packages/example.zip",
+                                        "Checksum": "abc123"
+                                    }]
+                                }]
+                            },
                             { "name": "Disabled", "url": "https://disabled.example/manifest.json", "enabled": false },
                             { "Name": "Missing URL" },
                             "invalid"
@@ -26038,7 +26205,31 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let packages: Value = serde_json::from_slice(&body).unwrap();
-        assert!(packages.as_array().unwrap().is_empty());
+        assert_eq!(packages.as_array().unwrap().len(), 1);
+        assert_eq!(packages[0]["Name"], "Example Plugin");
+        assert_eq!(packages[0]["Guid"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(packages[0]["Versions"][0]["Version"], "1.0.0.0");
+        assert_eq!(
+            packages[0]["Versions"][0]["SourceUrl"],
+            "https://repo.example/packages/example.zip"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Packages/Example%20Plugin?Version=1.0.0.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let package: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(package["Name"], "Example Plugin");
+        assert_eq!(package["Versions"][0]["Checksum"], "abc123");
 
         for endpoint in [
             "/Package/Packages/MissingPlugin",
