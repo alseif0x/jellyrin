@@ -782,19 +782,19 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/channels/{channelId}", get(live_tv_channel))
         .route(
             "/LiveTv/LiveRecordings/{recordingId}/stream",
-            get(live_tv_missing_stream),
+            get(live_tv_recording_stream),
         )
         .route(
             "/livetv/liverecordings/{recordingId}/stream",
-            get(live_tv_missing_stream),
+            get(live_tv_recording_stream),
         )
         .route(
             "/LiveTv/LiveStreamFiles/{streamId}/stream.{container}",
-            get(live_tv_missing_container_stream),
+            get(live_tv_stream_file),
         )
         .route(
             "/livetv/livestreamfiles/{streamId}/stream.{container}",
-            get(live_tv_missing_container_stream),
+            get(live_tv_stream_file),
         )
         .route(
             "/LiveTv/Programs",
@@ -7633,24 +7633,34 @@ async fn live_tv_program_result(
     Ok(Json(query_result(programs)))
 }
 
-async fn live_tv_missing_stream(
+async fn live_tv_recording_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+    Path(recording_id): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Live TV stream not found"))
+    let recording = live_tv_recording_by_id(&state.db, &recording_id).await?;
+    stream_live_tv_recording(recording, &headers).await
 }
 
-async fn live_tv_missing_container_stream(
+async fn live_tv_stream_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((_stream_id, _container)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
+    Path((stream_id, container)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Live TV stream not found"))
+    let recording = live_tv_recording_by_id(&state.db, &stream_id).await?;
+    let path = live_tv_recording_path(&recording)?;
+    let path_container = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if !path_container.eq_ignore_ascii_case(container.trim()) {
+        return Err(ApiError::not_found("Live TV stream not found"));
+    }
+    stream_live_tv_recording(recording, &headers).await
 }
 
 async fn live_tv_recordings(
@@ -7687,6 +7697,32 @@ async fn live_tv_recording(
         })
         .ok_or_else(|| ApiError::not_found("Live TV recording not found"))?;
     Ok(Json(recording))
+}
+
+async fn live_tv_recording_by_id(
+    db: &Database,
+    recording_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    live_tv_recording_items(&config)
+        .into_iter()
+        .find(|recording| {
+            json_string_field(recording, "Id")
+                .is_some_and(|id| id.eq_ignore_ascii_case(recording_id.trim()))
+        })
+        .ok_or_else(|| ApiError::not_found("Live TV recording not found"))
+}
+
+async fn stream_live_tv_recording(
+    recording: serde_json::Value,
+    headers: &HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let path = live_tv_recording_path(&recording)?;
+    let content_type = live_tv_recording_content_type(&path).to_string();
+    stream_path(path, content_type, headers, true).await
 }
 
 async fn live_tv_recording_folders(
@@ -8069,6 +8105,29 @@ fn live_tv_recording_item(
         .cloned()
         .unwrap_or_else(|| serde_json::json!("Manual"));
     Some(item)
+}
+
+fn live_tv_recording_path(recording: &serde_json::Value) -> Result<PathBuf, ApiError> {
+    json_string_field(recording, "Path")
+        .or_else(|| json_string_field(recording, "MediaPath"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| ApiError::not_found("Live TV stream not found"))
+}
+
+fn live_tv_recording_content_type(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("ts") => "video/mp2t",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mkv") => "video/x-matroska",
+        Some("webm") => "video/webm",
+        _ => "application/octet-stream",
+    }
 }
 
 fn live_tv_recording_group_items(
@@ -22928,6 +22987,12 @@ mod tests {
 
     #[tokio::test]
     async fn live_tv_named_configuration_round_trips_dashboard_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recording_file = tmp.path().join("Morning News.ts");
+        tokio::fs::write(&recording_file, b"recorded transport stream")
+            .await
+            .unwrap();
+
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("admin".to_string(), "secret")
@@ -23028,7 +23093,7 @@ mod tests {
                     "ChannelId": "channel-1",
                     "StartDate": "2026-05-26T08:00:00Z",
                     "EndDate": "2026-05-26T09:00:00Z",
-                    "Path": "/srv/recordings/Morning News.ts"
+                    "Path": recording_file.to_string_lossy()
                 },
                 {
                     "Id": "recording-2",
@@ -24017,6 +24082,70 @@ mod tests {
         let recordings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(recordings["TotalRecordCount"], 1);
         assert_eq!(recordings["Items"][0]["Id"], "recording-1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveRecordings/recording-1/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveRecordings/recording-1/stream")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"recorded transport stream");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveStreamFiles/recording-1/stream.ts")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=0-7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-7/25"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"recorded");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveStreamFiles/recording-1/stream.mp4")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .clone()
