@@ -2781,18 +2781,19 @@ async fn password_reset_providers(
 struct BackupManifestQuery {
     #[serde(flatten)]
     auth: AuthQuery,
+    #[serde(alias = "Path")]
     path: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct BackupOptionsBody {
-    #[serde(alias = "Metadata")]
+    #[serde(alias = "Metadata", alias = "metadata")]
     metadata: Option<bool>,
-    #[serde(alias = "Trickplay")]
+    #[serde(alias = "Trickplay", alias = "trickplay")]
     trickplay: Option<bool>,
-    #[serde(alias = "Subtitles")]
+    #[serde(alias = "Subtitles", alias = "subtitles")]
     subtitles: Option<bool>,
-    #[serde(alias = "Database")]
+    #[serde(alias = "Database", alias = "database")]
     database: Option<bool>,
 }
 
@@ -23692,6 +23693,37 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::POST)
+                    .uri("/backup/create")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "metadata": false,
+                            "subtitles": true,
+                            "trickplay": false,
+                            "database": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_created: Value = serde_json::from_slice(&body).unwrap();
+        let lowercase_path = lowercase_created["Path"].as_str().unwrap();
+        assert_ne!(lowercase_path, path);
+        assert_eq!(lowercase_created["Options"]["Metadata"], false);
+        assert_eq!(lowercase_created["Options"]["Trickplay"], false);
+        assert_eq!(lowercase_created["Options"]["Subtitles"], true);
+        assert_eq!(lowercase_created["Options"]["Database"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Backup")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -23701,8 +23733,21 @@ mod tests {
             .unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let backups: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(backups.as_array().unwrap().len(), 1);
-        assert_eq!(backups[0]["Path"], path);
+        assert_eq!(backups.as_array().unwrap().len(), 2);
+        assert!(
+            backups
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|backup| backup["Path"] == path)
+        );
+        assert!(
+            backups
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|backup| backup["Path"] == lowercase_path)
+        );
 
         let response = app
             .clone()
@@ -23719,6 +23764,22 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let manifest: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(manifest["Path"], path);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/backup/manifest?Path={lowercase_path}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(manifest["Path"], lowercase_path);
 
         let response = app
             .clone()
