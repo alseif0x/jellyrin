@@ -36207,6 +36207,51 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!(
+                        "/Audio/{item_id}/universal?api_key={api_key}&DeviceId=test-device"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "10"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/UniversalAudio/Audio/{item_id}/universal?api_key={api_key}&UserId={user_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "audio/mpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"fake audio");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/DynamicHls/Audio/{item_id}/master.m3u8"))
                     .body(Body::empty())
                     .unwrap(),
