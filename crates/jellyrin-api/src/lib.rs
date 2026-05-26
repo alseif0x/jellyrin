@@ -23212,7 +23212,6 @@ mod tests {
             log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
-
         let response = app
             .clone()
             .oneshot(
@@ -27722,6 +27721,31 @@ mod tests {
             log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
+        let repository_payload = json!([
+            {
+                "Name": "Stable",
+                "Url": "https://repo.example/manifest.json",
+                "Enabled": true,
+                "Packages": [{
+                    "Name": "Example Plugin",
+                    "Guid": "11111111-1111-1111-1111-111111111111",
+                    "Overview": "Example package from a configured local repository",
+                    "Description": "Example package",
+                    "Owner": "Jellyrin",
+                    "Category": "General",
+                    "Versions": [{
+                        "Version": "1.0.0.0",
+                        "TargetAbi": "12.0.0.0",
+                        "SourceUrl": "https://repo.example/packages/example.zip",
+                        "Checksum": "abc123",
+                        "ImagePath": plugin_image.to_string_lossy()
+                    }]
+                }]
+            },
+            { "name": "Disabled", "url": "https://disabled.example/manifest.json", "enabled": false },
+            { "Name": "Missing URL" },
+            "invalid"
+        ]);
 
         let response = app
             .clone()
@@ -27743,34 +27767,22 @@ mod tests {
                     .uri("/Package/Repositories")
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!([
-                            {
-                                "Name": "Stable",
-                                "Url": "https://repo.example/manifest.json",
-                                "Enabled": true,
-                                "Packages": [{
-                                    "Name": "Example Plugin",
-                                    "Guid": "11111111-1111-1111-1111-111111111111",
-                                    "Overview": "Example package from a configured local repository",
-                                    "Description": "Example package",
-                                    "Owner": "Jellyrin",
-                                    "Category": "General",
-                                    "Versions": [{
-                                        "Version": "1.0.0.0",
-                                        "TargetAbi": "12.0.0.0",
-                                        "SourceUrl": "https://repo.example/packages/example.zip",
-                                        "Checksum": "abc123",
-                                        "ImagePath": plugin_image.to_string_lossy()
-                                    }]
-                                }]
-                            },
-                            { "name": "Disabled", "url": "https://disabled.example/manifest.json", "enabled": false },
-                            { "Name": "Missing URL" },
-                            "invalid"
-                        ])
-                        .to_string(),
-                    ))
+                    .body(Body::from(repository_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(repository_payload.to_string()))
                     .unwrap(),
             )
             .await
@@ -27802,6 +27814,22 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let local_repositories: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(local_repositories, repositories);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Package/Packages")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -27825,6 +27853,22 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/Packages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let local_packages: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(local_packages, packages);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Package/Packages/Example%20Plugin?Version=1.0.0.0")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -27837,6 +27881,22 @@ mod tests {
         let package: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(package["Name"], "Example Plugin");
         assert_eq!(package["Versions"][0]["Checksum"], "abc123");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Packages/Example%20Plugin?Version=1.0.0.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let local_package: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(local_package, package);
 
         for endpoint in [
             "/Package/Packages/MissingPlugin",
@@ -27942,6 +28002,22 @@ mod tests {
         assert_eq!(manifest["Name"], "Example Plugin");
         assert_eq!(manifest["Versions"][0]["Version"], "1.0.0.0");
         assert_eq!(manifest["Versions"][0]["Checksum"], "abc123");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/Manifest")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let local_manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(local_manifest, manifest);
 
         let response = app
             .clone()
