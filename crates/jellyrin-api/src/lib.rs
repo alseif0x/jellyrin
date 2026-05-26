@@ -4374,6 +4374,8 @@ fn normalize_package_info(
     let category = json_string_field(value, "Category").unwrap_or_else(|| "General".to_string());
     let image_url =
         json_string_field(value, "ImageUrl").or_else(|| json_string_field(value, "ThumbImage"));
+    let image_path =
+        json_string_field(value, "ImagePath").or_else(|| json_string_field(value, "Path"));
     let versions = normalized_package_versions(value, repository_url);
     let mut package = serde_json::json!({
         "Name": name,
@@ -4386,6 +4388,9 @@ fn normalize_package_info(
     });
     if let Some(image_url) = image_url {
         package["ImageUrl"] = serde_json::json!(image_url);
+    }
+    if let Some(image_path) = image_path {
+        package["ImagePath"] = serde_json::json!(image_path);
     }
     Some(package)
 }
@@ -4418,6 +4423,7 @@ fn normalize_package_version(
             .or_else(|| repository_url.map(ToOwned::to_owned)),
         "Checksum": json_string_field(value, "Checksum"),
         "TargetAbi": json_string_field(value, "TargetAbi").unwrap_or_default(),
+        "ImagePath": json_string_field(value, "ImagePath").or_else(|| json_string_field(value, "Path")),
         "Timestamp": json_string_field(value, "Timestamp"),
     })
 }
@@ -4580,10 +4586,53 @@ async fn plugin_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((_plugin_id, _version)): Path<(String, String)>,
+    Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(path) = plugin_image_path_from_catalog(
+        &state
+            .db
+            .system_configuration_payloads()
+            .await?
+            .plugin_repositories,
+        &plugin_id,
+        &version,
+    ) && tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        let content_type = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| image_format_from_extension(extension).content_type)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        return stream_path(path, content_type, &headers, true).await;
+    }
     Ok(placeholder_png_response())
+}
+
+fn plugin_image_path_from_catalog(
+    repositories: &serde_json::Value,
+    plugin_id: &str,
+    version: &str,
+) -> Option<PathBuf> {
+    package_infos_from_repositories(repositories)
+        .into_iter()
+        .find(|package| package_matches_plugin_id(package, plugin_id))
+        .and_then(|package| {
+            let version_path = package_versions(&package)
+                .into_iter()
+                .find(|candidate| {
+                    json_string_field(candidate, "Version")
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(version.trim()))
+                })
+                .and_then(|candidate| json_string_field(&candidate, "ImagePath"));
+            version_path
+                .or_else(|| json_string_field(&package, "ImagePath"))
+                .map(PathBuf::from)
+        })
 }
 
 async fn device_info(
@@ -26163,6 +26212,16 @@ mod tests {
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_image = tmp.path().join("plugin.png");
+        let plugin_image_bytes = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0,
+            5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        tokio::fs::write(&plugin_image, &plugin_image_bytes)
+            .await
+            .unwrap();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -26207,7 +26266,8 @@ mod tests {
                                         "Version": "1.0.0.0",
                                         "TargetAbi": "12.0.0.0",
                                         "SourceUrl": "https://repo.example/packages/example.zip",
-                                        "Checksum": "abc123"
+                                        "Checksum": "abc123",
+                                        "ImagePath": plugin_image.to_string_lossy()
                                     }]
                                 }]
                             },
@@ -26383,6 +26443,25 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/1.0.0.0/Image")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), plugin_image_bytes.as_slice());
 
         let response = app
             .oneshot(
