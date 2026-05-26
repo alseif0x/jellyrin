@@ -8575,7 +8575,51 @@ async fn live_tv_discover_tuners(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(Vec::new()))
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(Json(live_tv_discovered_tuners(&config)))
+}
+
+fn live_tv_discovered_tuners(config: &serde_json::Value) -> Vec<serde_json::Value> {
+    config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .map(|tuners| {
+            tuners
+                .iter()
+                .enumerate()
+                .map(|(index, tuner)| {
+                    let id = json_string_field(tuner, "Id")
+                        .unwrap_or_else(|| format!("tuner-{}", index + 1));
+                    let name = json_string_field(tuner, "FriendlyName")
+                        .or_else(|| json_string_field(tuner, "Name"))
+                        .or_else(|| json_string_field(tuner, "Url"))
+                        .unwrap_or_else(|| id.clone());
+                    let tuner_type =
+                        json_string_field(tuner, "Type").unwrap_or_else(|| "m3u".to_string());
+                    let channel_count = tuner
+                        .get("Channels")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|channels| channels.len())
+                        .unwrap_or_default();
+                    let device_id = json_string_field(tuner, "DeviceId").unwrap_or(id.clone());
+                    serde_json::json!({
+                        "Id": id,
+                        "Name": name,
+                        "Type": tuner_type,
+                        "Url": json_string_field(tuner, "Url"),
+                        "FriendlyName": json_string_field(tuner, "FriendlyName"),
+                        "DeviceId": device_id,
+                        "ChannelCount": channel_count,
+                        "IsConfigured": true
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn live_tv_reset_tuner(
@@ -24338,7 +24382,11 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let discovered: Value = serde_json::from_slice(&body).unwrap();
-            assert!(discovered.as_array().unwrap().is_empty(), "{endpoint}");
+            assert_eq!(discovered.as_array().unwrap().len(), 1, "{endpoint}");
+            assert_eq!(discovered[0]["Id"], "tuner-1");
+            assert_eq!(discovered[0]["Name"], "Primary tuner");
+            assert_eq!(discovered[0]["ChannelCount"], 2);
+            assert_eq!(discovered[0]["IsConfigured"], true);
         }
 
         let response = app
