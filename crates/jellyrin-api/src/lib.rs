@@ -41308,39 +41308,46 @@ mod tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
         }
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Session/Auth/Providers")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let providers: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(providers[0]["Name"], "Default");
-        assert_eq!(providers[0]["Id"], DEFAULT_AUTHENTICATION_PROVIDER_ID);
+        for endpoint in ["/Auth/Providers", "/Session/Auth/Providers"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let providers: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(providers[0]["Name"], "Default");
+            assert_eq!(providers[0]["Id"], DEFAULT_AUTHENTICATION_PROVIDER_ID);
+        }
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Auth/PasswordResetProviders")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let providers: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(providers[0]["Name"], "Default");
-        assert_eq!(providers[0]["Id"], DEFAULT_PASSWORD_RESET_PROVIDER_ID);
+        for endpoint in [
+            "/Auth/PasswordResetProviders",
+            "/Session/Auth/PasswordResetProviders",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let providers: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(providers[0]["Name"], "Default");
+            assert_eq!(providers[0]["Id"], DEFAULT_PASSWORD_RESET_PROVIDER_ID);
+        }
 
         let response = app
             .clone()
