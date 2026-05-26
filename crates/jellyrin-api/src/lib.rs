@@ -26511,12 +26511,44 @@ mod tests {
         assert_eq!(recording["Name"], "Morning News");
         assert_eq!(recording["Status"], "Completed");
 
-        for (endpoint, expected_name) in [
-            ("/LiveTv/Recordings/Folders", "Movies"),
-            ("/livetv/recordings/groups", "Morning News"),
-            ("/LiveTv/Recordings/Series", "Morning News"),
-            ("/LiveTv/RecordingGroups", "Morning News"),
+        for (endpoint, expected_name, expected_type, expected_id) in [
+            (
+                "/LiveTv/Recordings/Folders",
+                "Movies",
+                "RecordingFolder",
+                "movies",
+            ),
+            (
+                "/livetv/recordings/groups",
+                "Morning News",
+                "RecordingGroup",
+                "morning-news",
+            ),
+            (
+                "/LiveTv/Recordings/Series",
+                "Morning News",
+                "RecordingSeries",
+                "morning-news",
+            ),
+            (
+                "/LiveTv/RecordingGroups",
+                "Morning News",
+                "RecordingGroup",
+                "morning-news",
+            ),
         ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
             let response = app
                 .clone()
                 .oneshot(
@@ -26532,14 +26564,17 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let groups: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(groups["TotalRecordCount"], 2, "{endpoint}");
-            assert!(
-                groups["Items"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|group| group["Name"] == expected_name),
-                "{endpoint}"
-            );
+            let group = groups["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|group| group["Name"] == expected_name)
+                .unwrap_or_else(|| panic!("{endpoint} missing {expected_name}"));
+            assert_eq!(group["Id"], expected_id, "{endpoint}");
+            assert_eq!(group["Type"], expected_type, "{endpoint}");
+            assert_eq!(group["IsFolder"], true, "{endpoint}");
+            assert_eq!(group["ChildCount"], 1, "{endpoint}");
+            assert_eq!(group["RecordingCount"], 1, "{endpoint}");
         }
 
         for endpoint in ["/LiveTv/Timers", "/LiveTv/SeriesTimers"] {
