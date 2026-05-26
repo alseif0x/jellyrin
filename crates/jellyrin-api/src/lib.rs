@@ -6,7 +6,10 @@ use std::{
     fs,
     path::{Path as FsPath, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -64,6 +67,8 @@ const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
+static SYSTEM_LIFECYCLE: OnceLock<broadcast::Sender<SystemLifecycleCommand>> = OnceLock::new();
+static SYSTEM_LIFECYCLE_LAST: AtomicU8 = AtomicU8::new(0);
 static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
 static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLock::new();
@@ -74,6 +79,12 @@ pub struct AppState {
     pub web_dir: PathBuf,
     pub log_dir: PathBuf,
     pub local_address: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SystemLifecycleCommand {
+    Restart,
+    Shutdown,
 }
 
 #[derive(Debug, Clone)]
@@ -115,10 +126,10 @@ pub fn router(state: AppState) -> Router {
         .route("/System/Ping", post(ping))
         .route("/system/ping", get(ping))
         .route("/system/ping", post(ping))
-        .route("/System/Restart", post(system_admin_noop))
-        .route("/system/restart", post(system_admin_noop))
-        .route("/System/Shutdown", post(system_admin_noop))
-        .route("/system/shutdown", post(system_admin_noop))
+        .route("/System/Restart", post(system_restart))
+        .route("/system/restart", post(system_restart))
+        .route("/System/Shutdown", post(system_shutdown))
+        .route("/system/shutdown", post(system_shutdown))
         .route("/Backup", get(backups))
         .route("/backup", get(backups))
         .route("/Backup/Create", post(create_backup))
@@ -3666,13 +3677,54 @@ async fn ping() -> &'static str {
     "Jellyfin Server"
 }
 
-async fn system_admin_noop(
+async fn system_restart(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    publish_system_lifecycle_command(SystemLifecycleCommand::Restart);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn system_shutdown(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    publish_system_lifecycle_command(SystemLifecycleCommand::Shutdown);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub fn subscribe_system_lifecycle_commands() -> broadcast::Receiver<SystemLifecycleCommand> {
+    system_lifecycle_sender().subscribe()
+}
+
+pub fn last_system_lifecycle_command() -> Option<SystemLifecycleCommand> {
+    match SYSTEM_LIFECYCLE_LAST.load(AtomicOrdering::SeqCst) {
+        1 => Some(SystemLifecycleCommand::Restart),
+        2 => Some(SystemLifecycleCommand::Shutdown),
+        _ => None,
+    }
+}
+
+fn publish_system_lifecycle_command(command: SystemLifecycleCommand) {
+    SYSTEM_LIFECYCLE_LAST.store(
+        match command {
+            SystemLifecycleCommand::Restart => 1,
+            SystemLifecycleCommand::Shutdown => 2,
+        },
+        AtomicOrdering::SeqCst,
+    );
+    let _ = system_lifecycle_sender().send(command);
+}
+
+fn system_lifecycle_sender() -> &'static broadcast::Sender<SystemLifecycleCommand> {
+    SYSTEM_LIFECYCLE.get_or_init(|| {
+        let (sender, _) = broadcast::channel(16);
+        sender
+    })
 }
 
 async fn system_storage(
@@ -22442,13 +22494,15 @@ mod tests {
 
     use super::{
         AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
-        DEFAULT_PASSWORD_RESET_PROVIDER_ID, cleanup_orphan_hls_transcode_dirs,
-        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
-        default_user_configuration, encoding_configuration_json, hls_transcode_dedupe_key,
-        json_value_i64, load_countries, load_cultures, media_item_by_id, media_item_streams,
-        parse_authorization_token, parse_jellyfin_uuid, parse_media_browser_pairs,
-        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        stable_entity_id, subscribe_playback_events, syncplay_groups, transcode_dedupe_lock,
+        DEFAULT_PASSWORD_RESET_PROVIDER_ID, SystemLifecycleCommand,
+        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
+        encoding_configuration_json, hls_transcode_dedupe_key, json_value_i64,
+        last_system_lifecycle_command, load_countries, load_cultures, media_item_by_id,
+        media_item_streams, parse_authorization_token, parse_jellyfin_uuid,
+        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
@@ -23463,7 +23517,11 @@ mod tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
         }
 
-        for endpoint in ["/System/Restart", "/system/shutdown"] {
+        let mut lifecycle = subscribe_system_lifecycle_commands();
+        for (endpoint, expected_command) in [
+            ("/System/Restart", SystemLifecycleCommand::Restart),
+            ("/system/shutdown", SystemLifecycleCommand::Shutdown),
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -23477,6 +23535,16 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+            assert_eq!(
+                last_system_lifecycle_command(),
+                Some(expected_command),
+                "{endpoint}"
+            );
+            let command = tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(command, expected_command, "{endpoint}");
         }
 
         let response = app

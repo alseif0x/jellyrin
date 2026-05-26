@@ -3,8 +3,9 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use clap::Parser;
 use jellyrin_api::{
-    AppState, cleanup_stale_hls_transcodes, reconcile_transcode_sessions_on_startup, router,
-    spawn_periodic_transcode_cleanup,
+    AppState, SystemLifecycleCommand, cleanup_stale_hls_transcodes, last_system_lifecycle_command,
+    reconcile_transcode_sessions_on_startup, router, spawn_periodic_transcode_cleanup,
+    subscribe_system_lifecycle_commands,
 };
 use jellyrin_db::Database;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -103,6 +104,9 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server failed")?;
+    if last_system_lifecycle_command() == Some(SystemLifecycleCommand::Restart) {
+        anyhow::bail!("restart requested");
+    }
 
     Ok(())
 }
@@ -151,6 +155,7 @@ async fn prepare_dirs(args: &Args) -> anyhow::Result<()> {
 }
 
 async fn shutdown_signal() {
+    let mut lifecycle = subscribe_system_lifecycle_commands();
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -170,5 +175,10 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+        command = lifecycle.recv() => {
+            if let Ok(command) = command {
+                tracing::warn!(?command, "received system lifecycle command");
+            }
+        },
     }
 }
