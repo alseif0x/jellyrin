@@ -13396,29 +13396,48 @@ async fn search_remote_lyrics(
     Path(item_id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    lyrics_audio_item(&state.db, &item_id).await?;
-    Ok(Json(Vec::new()))
+    let item = lyrics_audio_item(&state.db, &item_id).await?;
+    let Some(lyrics) = state.db.media_item_lyrics(item.id).await? else {
+        return Ok(Json(Vec::new()));
+    };
+    Ok(Json(vec![remote_lyrics_result(&item, &lyrics.payload)]))
 }
 
 async fn download_remote_lyrics(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path((item_id, _lyric_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Path((item_id, lyric_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    lyrics_audio_item(&state.db, &item_id).await?;
-    Err(ApiError::not_found("Remote lyrics not found"))
+    let item = lyrics_audio_item(&state.db, &item_id).await?;
+    let requested_id = remote_lyrics_id_for_item(item.id);
+    if lyric_id != requested_id {
+        return Err(ApiError::not_found("Remote lyrics not found"));
+    }
+    state
+        .db
+        .media_item_lyrics(item.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Remote lyrics not found"))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_remote_lyrics(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_lyric_id): Path<String>,
+    Path(lyric_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Remote lyrics not found"))
+    let item_id = remote_lyrics_item_id(&lyric_id)?;
+    let item = lyrics_audio_item(&state.db, &item_id.simple().to_string()).await?;
+    let lyrics = state
+        .db
+        .media_item_lyrics(item.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Remote lyrics not found"))?;
+    Ok(Json(lyrics.payload))
 }
 
 async fn lyrics_audio_item(db: &Database, item_id: &str) -> Result<MediaItem, ApiError> {
@@ -13469,6 +13488,42 @@ fn parse_lyrics_text(
         },
         "Lyrics": lines
     }))
+}
+
+fn remote_lyrics_result(item: &MediaItem, lyrics: &serde_json::Value) -> serde_json::Value {
+    let metadata = lyrics.get("Metadata");
+    let format = metadata
+        .and_then(|metadata| metadata.get("Format"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("lrc");
+    let file_name = metadata
+        .and_then(|metadata| metadata.get("FileName"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("local lyrics");
+    serde_json::json!({
+        "Id": remote_lyrics_id_for_item(item.id),
+        "ProviderName": "Local cache",
+        "Name": file_name,
+        "Format": format,
+        "Author": null,
+        "AlbumArtist": null,
+        "Artist": null,
+        "Album": null,
+        "Title": item.name,
+        "Duration": null,
+        "IsPerfectMatch": true
+    })
+}
+
+fn remote_lyrics_id_for_item(item_id: Uuid) -> String {
+    format!("local-cache:{}", item_id.simple())
+}
+
+fn remote_lyrics_item_id(lyric_id: &str) -> Result<Uuid, ApiError> {
+    let encoded = lyric_id
+        .strip_prefix("local-cache:")
+        .ok_or_else(|| ApiError::not_found("Remote lyrics not found"))?;
+    parse_jellyfin_uuid(encoded).map_err(|_| ApiError::not_found("Remote lyrics not found"))
 }
 
 fn parse_plain_lyrics_lines(text: &str) -> Vec<serde_json::Value> {
@@ -32509,7 +32564,45 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let remote_results: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(remote_results, json!([]));
+        assert_eq!(remote_results.as_array().unwrap().len(), 1);
+        assert_eq!(remote_results[0]["ProviderName"], "Local cache");
+        assert_eq!(remote_results[0]["Name"], "song.lrc");
+        assert_eq!(remote_results[0]["Format"], "lrc");
+        assert_eq!(remote_results[0]["Title"], "Lyric Song");
+        assert_eq!(remote_results[0]["IsPerfectMatch"], true);
+        let remote_lyric_id = remote_results[0]["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Lyrics/Providers/Lyrics/{remote_lyric_id}"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_lyrics: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_lyrics, lyrics);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics/{remote_lyric_id}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
