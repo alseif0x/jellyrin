@@ -4519,6 +4519,18 @@ async fn plugin_manifest(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(package) = package_infos_from_repositories(
+        &state
+            .db
+            .system_configuration_payloads()
+            .await?
+            .plugin_repositories,
+    )
+    .into_iter()
+    .find(|package| package_matches_plugin_id(package, &plugin_id))
+    {
+        return Ok(Json(plugin_manifest_from_package(package)));
+    }
     Ok(Json(serde_json::json!({
         "Guid": plugin_id,
         "Name": plugin_id,
@@ -4537,6 +4549,31 @@ async fn plugin_manifest_post(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     plugin_manifest(State(state), headers, Query(query), Path(plugin_id)).await
+}
+
+fn package_matches_plugin_id(package: &serde_json::Value, plugin_id: &str) -> bool {
+    let plugin_id = plugin_id.trim();
+    json_string_field(package, "Guid").is_some_and(|guid| guid.eq_ignore_ascii_case(plugin_id))
+        || json_string_field(package, "Name").is_some_and(|name| {
+            name.eq_ignore_ascii_case(plugin_id)
+                || name.replace(' ', "").eq_ignore_ascii_case(plugin_id)
+        })
+}
+
+fn plugin_manifest_from_package(package: serde_json::Value) -> serde_json::Value {
+    let name = json_string_field(&package, "Name").unwrap_or_else(|| "Plugin".to_string());
+    let guid =
+        json_string_field(&package, "Guid").unwrap_or_else(|| stable_entity_id("Plugin", &name));
+    serde_json::json!({
+        "Guid": guid,
+        "Name": name,
+        "Overview": json_string_field(&package, "Overview").unwrap_or_default(),
+        "Description": json_string_field(&package, "Description").unwrap_or_default(),
+        "Owner": json_string_field(&package, "Owner").unwrap_or_else(|| "Jellyrin".to_string()),
+        "Category": json_string_field(&package, "Category").unwrap_or_else(|| "General".to_string()),
+        "ImageUrl": json_string_field(&package, "ImageUrl"),
+        "Versions": package_versions(&package)
+    })
 }
 
 async fn plugin_image(
@@ -26309,6 +26346,26 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let manifest: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(manifest["Guid"], "test-plugin");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/Manifest")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let manifest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(manifest["Guid"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(manifest["Name"], "Example Plugin");
+        assert_eq!(manifest["Versions"][0]["Version"], "1.0.0.0");
+        assert_eq!(manifest["Versions"][0]["Checksum"], "abc123");
 
         let response = app
             .clone()
