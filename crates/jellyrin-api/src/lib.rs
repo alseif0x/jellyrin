@@ -11217,12 +11217,19 @@ async fn movie_recommendations(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    let category_limit =
+        query_string_value(raw_query.as_deref(), &["CategoryLimit", "categoryLimit"])
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(5)
+            .clamp(1, 20);
+    let item_limit = query_string_value(raw_query.as_deref(), &["ItemLimit", "itemLimit"])
+        .and_then(|value| value.parse::<usize>().ok())
+        .or(query.limit)
+        .unwrap_or(8)
+        .clamp(1, 50);
 
     if query.include_item_types.is_empty() {
         query.include_item_types.push("Movie".to_string());
-    }
-    if query.is_played.is_none() && query_filters_played_value(&query.filters).is_none() {
-        query.is_played = Some(false);
     }
     if query.sort_by.is_none() {
         query.sort_by = Some("DateCreated,SortName".to_string());
@@ -11234,6 +11241,76 @@ async fn movie_recommendations(
         query.limit = Some(20);
     }
 
+    let mut all_query = query.clone();
+    all_query.start_index = None;
+    all_query.limit = None;
+    all_query.is_played = None;
+    all_query.filters = metadata_scope_filters(&all_query.filters);
+    let all_movies = filtered_media_items(
+        state.db.media_items().await?,
+        &all_query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    let metadata_by_item = state
+        .db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .map(|metadata| (metadata.item_id, metadata.payload))
+        .collect::<HashMap<_, _>>();
+    let mut recently_played = Vec::<(MediaItem, PlaybackState)>::new();
+    let mut liked = Vec::<(MediaItem, PlaybackState)>::new();
+    for item in &all_movies {
+        let Some(playback) = state
+            .db
+            .playback_state_for_item(requested_user_id, item.id)
+            .await?
+        else {
+            continue;
+        };
+        if playback.played {
+            recently_played.push((item.clone(), playback.clone()));
+        }
+        if playback.is_favorite || playback.rating.is_some_and(|rating| rating > 0.0) {
+            liked.push((item.clone(), playback));
+        }
+    }
+    recently_played.sort_by(|(_, left), (_, right)| right.updated_at.cmp(&left.updated_at));
+    liked.sort_by(|(_, left), (_, right)| right.updated_at.cmp(&left.updated_at));
+
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let recommendation_context = MovieRecommendationContext {
+        state: &state,
+        server_id: &server_id,
+        user_id: requested_user_id,
+        movies: &all_movies,
+        metadata_by_item: &metadata_by_item,
+        item_limit,
+    };
+    let mut categories = movie_recommendation_categories(
+        &recommendation_context,
+        recently_played.iter().map(|(item, _)| item).collect(),
+        liked.iter().map(|(item, _)| item).collect(),
+        category_limit,
+    )
+    .await?;
+    if !categories.is_empty() {
+        categories.sort_by(|left, right| {
+            left["RecommendationType"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["RecommendationType"].as_str().unwrap_or_default())
+        });
+        categories.truncate(category_limit);
+        return Ok(Json(categories));
+    }
+
+    if query.is_played.is_none() && query_filters_played_value(&query.filters).is_none() {
+        query.is_played = Some(false);
+    }
+    query.limit = Some(item_limit);
     let filtered_items = filtered_media_items(
         state.db.media_items().await?,
         &query,
@@ -11241,7 +11318,6 @@ async fn movie_recommendations(
         &state.db,
     )
     .await?;
-    let server_id = state.db.server_state().await?.server_id.to_string();
     let items = items_to_json(
         &state.db,
         paged_media_items(filtered_items, &query),
@@ -11260,6 +11336,233 @@ async fn movie_recommendations(
         "RecommendationType": "Latest",
         "Items": items,
     })]))
+}
+
+struct MovieRecommendationContext<'a> {
+    state: &'a AppState,
+    server_id: &'a str,
+    user_id: Uuid,
+    movies: &'a [MediaItem],
+    metadata_by_item: &'a HashMap<Uuid, serde_json::Value>,
+    item_limit: usize,
+}
+
+async fn movie_recommendation_categories(
+    context: &MovieRecommendationContext<'_>,
+    recently_played: Vec<&MediaItem>,
+    liked: Vec<&MediaItem>,
+    category_limit: usize,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut categories = Vec::new();
+    let mut seen_categories = HashSet::<String>::new();
+    for (baseline, recommendation_type) in recently_played
+        .iter()
+        .take(6)
+        .map(|item| (*item, "SimilarToRecentlyPlayed"))
+        .chain(
+            liked
+                .iter()
+                .take(10)
+                .map(|item| (*item, "SimilarToLikedItem")),
+        )
+    {
+        if categories.len() >= category_limit {
+            break;
+        }
+        if let Some(category) =
+            movie_similarity_recommendation_category(context, baseline, recommendation_type).await?
+            && seen_categories.insert(movie_recommendation_category_key(&category))
+        {
+            categories.push(category);
+        }
+    }
+
+    let recent_metadata = recently_played
+        .iter()
+        .take(6)
+        .filter_map(|item| context.metadata_by_item.get(&item.id))
+        .collect::<Vec<_>>();
+    for (name, recommendation_type, person_type) in movie_recommendation_people(&recent_metadata) {
+        if categories.len() >= category_limit {
+            break;
+        }
+        if let Some(category) =
+            movie_person_recommendation_category(context, &name, &person_type, &recommendation_type)
+                .await?
+            && seen_categories.insert(movie_recommendation_category_key(&category))
+        {
+            categories.push(category);
+        }
+    }
+
+    Ok(categories)
+}
+
+async fn movie_similarity_recommendation_category(
+    context: &MovieRecommendationContext<'_>,
+    baseline: &MediaItem,
+    recommendation_type: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(baseline_metadata) = context.metadata_by_item.get(&baseline.id) else {
+        return Ok(None);
+    };
+    let baseline_terms = movie_recommendation_terms(baseline_metadata);
+    if baseline_terms.is_empty() {
+        return Ok(None);
+    }
+    let mut scored = context
+        .movies
+        .iter()
+        .filter(|item| item.id != baseline.id)
+        .filter_map(|item| {
+            let metadata = context.metadata_by_item.get(&item.id)?;
+            let score = movie_recommendation_terms(metadata)
+                .intersection(&baseline_terms)
+                .count();
+            (score > 0).then_some((score, item.clone()))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| compare_media_items(left, right, &[SortField::SortName]))
+    });
+    let items = scored
+        .into_iter()
+        .take(context.item_limit)
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let items = items_to_json(
+        &context.state.db,
+        items,
+        context.server_id,
+        Some(context.user_id),
+    )
+    .await?;
+    Ok(Some(serde_json::json!({
+        "BaselineItemName": baseline.name,
+        "CategoryId": baseline.id.simple().to_string(),
+        "RecommendationType": recommendation_type,
+        "Items": items,
+    })))
+}
+
+async fn movie_person_recommendation_category(
+    context: &MovieRecommendationContext<'_>,
+    person_name: &str,
+    person_type: &str,
+    recommendation_type: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let mut items = context
+        .movies
+        .iter()
+        .filter(|item| {
+            context
+                .metadata_by_item
+                .get(&item.id)
+                .is_some_and(|metadata| {
+                    metadata_people_by_type(metadata, person_type)
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(person_name))
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+    items.truncate(context.item_limit);
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let items = items_to_json(
+        &context.state.db,
+        items,
+        context.server_id,
+        Some(context.user_id),
+    )
+    .await?;
+    Ok(Some(serde_json::json!({
+        "BaselineItemName": person_name,
+        "CategoryId": stable_entity_id("Recommendation", &format!("{recommendation_type}:{person_name}")),
+        "RecommendationType": recommendation_type,
+        "Items": items,
+    })))
+}
+
+fn movie_recommendation_terms(metadata: &serde_json::Value) -> HashSet<String> {
+    metadata_values_from_json(metadata, &["Genres", "Studios", "Tags", "People", "Cast"])
+        .into_iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect()
+}
+
+fn movie_recommendation_people(
+    metadata_values: &[&serde_json::Value],
+) -> Vec<(String, String, String)> {
+    let mut people = BTreeMap::<String, (String, String, String)>::new();
+    for metadata in metadata_values {
+        for director in metadata_people_by_type(metadata, "Director") {
+            people
+                .entry(format!("director:{}", director.to_ascii_lowercase()))
+                .or_insert((
+                    director,
+                    "HasDirectorFromRecentlyPlayed".to_string(),
+                    "Director".to_string(),
+                ));
+        }
+        for actor in metadata_people_by_type(metadata, "Actor") {
+            people
+                .entry(format!("actor:{}", actor.to_ascii_lowercase()))
+                .or_insert((
+                    actor,
+                    "HasActorFromRecentlyPlayed".to_string(),
+                    "Actor".to_string(),
+                ));
+        }
+    }
+    people.into_values().collect()
+}
+
+fn metadata_people_by_type(metadata: &serde_json::Value, person_type: &str) -> Vec<String> {
+    let Some(people) = json_field_case_insensitive(metadata, "People")
+        .or_else(|| json_field_case_insensitive(metadata, "Cast"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut values = BTreeMap::<String, String>::new();
+    for person in people {
+        match person {
+            serde_json::Value::String(name) if person_type.eq_ignore_ascii_case("Actor") => {
+                insert_metadata_value(name, &mut values);
+            }
+            serde_json::Value::Object(object) => {
+                let matches_type = object
+                    .get("Type")
+                    .or_else(|| object.get("PersonType"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| value.eq_ignore_ascii_case(person_type))
+                    .unwrap_or_else(|| person_type.eq_ignore_ascii_case("Actor"));
+                if matches_type
+                    && let Some(name) = object.get("Name").and_then(serde_json::Value::as_str)
+                {
+                    insert_metadata_value(name, &mut values);
+                }
+            }
+            _ => {}
+        }
+    }
+    values.into_values().collect()
+}
+
+fn movie_recommendation_category_key(category: &serde_json::Value) -> String {
+    format!(
+        "{}:{}",
+        category["RecommendationType"].as_str().unwrap_or_default(),
+        category["CategoryId"].as_str().unwrap_or_default()
+    )
 }
 
 async fn shows_next_up(
@@ -29363,6 +29666,167 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn movie_recommendations_use_history_people_and_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("Played Baseline.mp4", b"baseline video".as_slice()),
+            ("Related By Metadata.mp4", b"related video bytes".as_slice()),
+            (
+                "Unrelated Movie.mp4",
+                b"unrelated video bytes here".as_slice(),
+            ),
+        ] {
+            tokio::fs::write(tmp.path().join(name), bytes)
+                .await
+                .unwrap();
+        }
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "movie-rec-test-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let items = test_db.media_items().await.unwrap();
+        let id_for_name = |name: &str| {
+            items
+                .iter()
+                .find(|item| item.name == name)
+                .map(|item| item.id)
+                .unwrap_or_else(|| panic!("{name} not scanned. Items: {items:?}"))
+        };
+        let baseline_id = id_for_name("Played Baseline");
+        let related_id = id_for_name("Related By Metadata");
+        let unrelated_id = id_for_name("Unrelated Movie");
+
+        for (item_id, metadata) in [
+            (
+                baseline_id,
+                json!({
+                    "Genres": ["Noir"],
+                    "People": [
+                        { "Name": "Director One", "Type": "Director" },
+                        { "Name": "Actor One", "Type": "Actor" }
+                    ],
+                    "Studios": ["Studio One"]
+                }),
+            ),
+            (
+                related_id,
+                json!({
+                    "Genres": ["Noir"],
+                    "People": [
+                        { "Name": "Director One", "Type": "Director" },
+                        { "Name": "Actor One", "Type": "Actor" }
+                    ],
+                    "Studios": ["Studio One"]
+                }),
+            ),
+            (
+                unrelated_id,
+                json!({
+                    "Genres": ["Comedy"],
+                    "People": [
+                        { "Name": "Other Director", "Type": "Director" },
+                        { "Name": "Other Actor", "Type": "Actor" }
+                    ],
+                    "Studios": ["Other Studio"]
+                }),
+            ),
+        ] {
+            test_db
+                .update_media_item_metadata(item_id, metadata)
+                .await
+                .unwrap();
+        }
+        test_db
+            .upsert_playback_state(UpsertPlaybackState {
+                user_id: user.id,
+                item_id: baseline_id,
+                media_source_id: None,
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                position_ticks: 0,
+                is_paused: false,
+                played: true,
+            })
+            .await
+            .unwrap();
+        test_db
+            .set_item_favorite(user.id, baseline_id, true)
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Movies/Recommendations?UserId={}&CategoryLimit=5&ItemLimit=2",
+                        user.id.simple()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let recommendations: Value = serde_json::from_slice(&body).unwrap();
+        let recommendations = recommendations.as_array().unwrap();
+        assert!(
+            recommendations.iter().any(|category| {
+                category["RecommendationType"] == "HasActorFromRecentlyPlayed"
+                    && category["BaselineItemName"] == "Actor One"
+            }),
+            "{recommendations:#?}"
+        );
+        assert!(
+            recommendations.iter().any(|category| {
+                category["RecommendationType"] == "HasDirectorFromRecentlyPlayed"
+                    && category["BaselineItemName"] == "Director One"
+            }),
+            "{recommendations:#?}"
+        );
+        let similar = recommendations
+            .iter()
+            .find(|category| category["RecommendationType"] == "SimilarToRecentlyPlayed")
+            .unwrap();
+        assert_eq!(similar["BaselineItemName"], "Played Baseline");
+        assert_eq!(similar["Items"][0]["Id"], related_id.simple().to_string());
+        assert_eq!(similar["Items"][0]["UserData"]["Played"], false);
     }
 
     #[tokio::test]
