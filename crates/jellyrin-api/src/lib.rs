@@ -26447,21 +26447,62 @@ mod tests {
         assert_eq!(program["Name"], "Morning News");
         assert_eq!(program["Type"], "Program");
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/LiveTv/Programs/Recommended")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let recommended: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(recommended["TotalRecordCount"], 2);
+        for endpoint in [
+            "/LiveTv/Programs/Recommended",
+            "/livetv/programs/recommended",
+            "/LiveTv/RecommendedPrograms",
+            "/livetv/recommendedprograms",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let recommended: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(recommended["TotalRecordCount"], 2, "{endpoint}");
+            assert_eq!(recommended["Items"][0]["Id"], "program-1", "{endpoint}");
+            assert_eq!(
+                recommended["Items"][0]["Name"], "Morning News",
+                "{endpoint}"
+            );
+            assert_eq!(recommended["Items"][0]["Type"], "Program", "{endpoint}");
+            assert_eq!(
+                recommended["Items"][0]["ChannelId"], "channel-1",
+                "{endpoint}"
+            );
+            assert_eq!(
+                recommended["Items"][0]["ChannelName"], "News HD",
+                "{endpoint}"
+            );
+            assert_eq!(
+                recommended["Items"][0]["StartDate"], "2026-05-26T08:00:00Z",
+                "{endpoint}"
+            );
+            assert_eq!(
+                recommended["Items"][0]["EndDate"], "2026-05-26T09:00:00Z",
+                "{endpoint}"
+            );
+        }
 
         let response = app
             .clone()
