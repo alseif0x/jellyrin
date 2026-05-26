@@ -6638,16 +6638,20 @@ async fn send_general_command(
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path((session_id, command)): Path<(String, String)>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     let (auth_user, target_session) =
         command_target_session(&state, &headers, &auth_query, &session_id).await?;
     ensure_session_supports_command(&target_session, &command)?;
-    broadcast_general_command(
-        &target_session,
-        &auth_user,
-        &command,
-        serde_json::Map::new(),
-    );
+    let arguments = body
+        .map(|Json(value)| value)
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    broadcast_general_command(&target_session, &auth_user, &command, arguments.clone());
+    apply_general_command_side_effect(&state.db, &target_session, &auth_user, &command, &arguments)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6694,7 +6698,9 @@ async fn send_full_general_command(
         .cloned()
         .unwrap_or_default();
 
-    broadcast_general_command(&target_session, &auth_user, &command, arguments);
+    broadcast_general_command(&target_session, &auth_user, &command, arguments.clone());
+    apply_general_command_side_effect(&state.db, &target_session, &auth_user, &command, &arguments)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6748,6 +6754,38 @@ fn broadcast_general_command(
             "Data": data
         }),
     );
+}
+
+async fn apply_general_command_side_effect(
+    db: &Database,
+    target_session: &DeviceSession,
+    auth_user: &User,
+    command: &str,
+    arguments: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ApiError> {
+    if !command.eq_ignore_ascii_case("DisplayContent") {
+        return Ok(());
+    }
+    let payload = display_content_payload(
+        db,
+        DisplayContentQuery::default(),
+        Some(serde_json::Value::Object(arguments.clone())),
+    )
+    .await?;
+    persist_session_viewing(db, target_session, &payload).await?;
+    broadcast_session_message(
+        &target_session.access_token,
+        serde_json::json!({
+            "MessageType": "Browse",
+            "Data": {
+                "ItemId": payload.item_id,
+                "ItemName": payload.item_name,
+                "ItemType": payload.item_type,
+                "ControllingUserId": auth_user.id.simple().to_string()
+            }
+        }),
+    );
+    broadcast_sessions_message(db, &target_session.access_token, auth_user).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -36062,6 +36100,55 @@ mod tests {
             next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
         assert_eq!(full_command_event["Data"]["Name"], "DisplayContent");
         assert_eq!(full_command_event["Data"]["Arguments"]["ItemId"], item_id);
+        let full_command_browse_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Browse").await;
+        assert_eq!(full_command_browse_event["Data"]["ItemId"], item_id);
+        assert_eq!(
+            full_command_browse_event["Data"]["ItemName"],
+            "Example Song"
+        );
+        let full_command_sessions_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Sessions").await;
+        assert_eq!(
+            full_command_sessions_event["Data"][0]["NowViewingItem"]["Id"],
+            item_id
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Session/Sessions/{playback_token}/Command/DisplayContent"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ItemId": item_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let named_display_command_event =
+            next_playback_event_type(&mut playback_events, playback_token, "GeneralCommand").await;
+        assert_eq!(
+            named_display_command_event["Data"]["Name"],
+            "DisplayContent"
+        );
+        assert_eq!(
+            named_display_command_event["Data"]["Arguments"]["ItemId"],
+            item_id
+        );
+        let named_display_browse_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Browse").await;
+        assert_eq!(named_display_browse_event["Data"]["ItemId"], item_id);
+        let named_display_sessions_event =
+            next_playback_event_type(&mut playback_events, playback_token, "Sessions").await;
+        assert_eq!(
+            named_display_sessions_event["Data"][0]["NowViewingItem"]["Id"],
+            item_id
+        );
 
         let response = app
             .clone()
