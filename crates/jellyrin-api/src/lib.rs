@@ -33750,6 +33750,66 @@ mod tests {
         assert_eq!(similar["Items"][0]["Id"], second_item_id);
         assert_eq!(similar["Items"][0]["UserData"]["Played"], false);
 
+        for (endpoint, expected_start_index, expected_len) in [
+            (
+                format!("/Library/Items/{item_id}/Similar?UserId={user_id}&Limit=1"),
+                0,
+                1,
+            ),
+            (
+                format!("/library/items/{item_id}/similar?StartIndex=1&Limit=1"),
+                1,
+                0,
+            ),
+            (
+                format!("/Library/Movies/{item_id}/Similar?UserId={user_id}&Limit=1"),
+                0,
+                1,
+            ),
+            (
+                format!("/library/movies/{item_id}/similar?StartIndex=1&Limit=1"),
+                1,
+                0,
+            ),
+        ] {
+            let endpoint = endpoint.as_str();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let route_similar: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(route_similar["TotalRecordCount"], 1, "{endpoint}");
+            assert_eq!(
+                route_similar["StartIndex"], expected_start_index,
+                "{endpoint}"
+            );
+            assert_eq!(
+                route_similar["Items"].as_array().unwrap().len(),
+                expected_len,
+                "{endpoint}"
+            );
+            if expected_len == 1 {
+                assert_eq!(
+                    route_similar["Items"][0]["Id"], second_item_id,
+                    "{endpoint}"
+                );
+                assert_eq!(route_similar["Items"][0]["Type"], "Movie", "{endpoint}");
+                assert_eq!(
+                    route_similar["Items"][0]["UserData"]["Played"], false,
+                    "{endpoint}"
+                );
+            }
+        }
+
         let response = app
             .oneshot(
                 Request::builder()
