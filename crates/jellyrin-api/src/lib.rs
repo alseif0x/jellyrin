@@ -11423,7 +11423,23 @@ async fn remote_search_local_results(
                 }
             }
         }
-        "BoxSet" => {}
+        "BoxSet" => {
+            for collection in db.media_lists("collection").await? {
+                if !request.matches_name(&collection.name) {
+                    continue;
+                }
+                let mut result =
+                    remote_search_result_from_name(&server_id, &collection.name, item_type, None);
+                result["ProviderIds"] = serde_json::json!({
+                    "JellyrinLocal": collection.id.simple().to_string()
+                });
+                result["ItemId"] = serde_json::json!(collection.id.simple().to_string());
+                results.insert(
+                    remote_search_result_key(item_type, &collection.name),
+                    result,
+                );
+            }
+        }
         _ => {}
     }
 
@@ -39131,6 +39147,24 @@ mod tests {
         let item_id = item.id.simple().to_string();
         let parent_id = item.virtual_folder_id.simple().to_string();
         let other_parent_id = other_item.virtual_folder_id.simple().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Collections?name=Metadata%20Collection&ids={item_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let collection: Value = serde_json::from_slice(&body).unwrap();
+        let collection_id = collection["Id"].as_str().unwrap().to_string();
         test_db
             .update_media_item_metadata(
                 item.id,
@@ -39436,6 +39470,12 @@ mod tests {
 
         for (endpoint, request_name, expected_name, expected_type) in [
             (
+                "/ItemLookup/Items/RemoteSearch/BoxSet",
+                "Metadata Collection",
+                "Metadata Collection",
+                "BoxSet",
+            ),
+            (
                 "/ItemLookup/Items/RemoteSearch/MusicAlbum",
                 "example album",
                 "Example Album",
@@ -39477,6 +39517,12 @@ mod tests {
                 remote_results[0]["SearchProviderName"], "Jellyrin Local Library",
                 "{endpoint}"
             );
+            if expected_type == "BoxSet" {
+                assert_eq!(
+                    remote_results[0]["ProviderIds"]["JellyrinLocal"], collection_id,
+                    "{endpoint}"
+                );
+            }
         }
 
         let response = app
