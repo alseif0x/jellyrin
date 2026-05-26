@@ -1478,19 +1478,19 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Library/Albums/{item_id}/Similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_album_items),
         )
         .route(
             "/library/albums/{item_id}/similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_album_items),
         )
         .route(
             "/Library/Artists/{item_id}/Similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_artist_items),
         )
         .route(
             "/library/artists/{item_id}/similar",
-            get(authenticated_similar_items),
+            get(authenticated_similar_artist_items),
         )
         .route(
             "/Library/Movies/{item_id}/Similar",
@@ -18634,9 +18634,120 @@ async fn authenticated_similar_items(
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
 
-    let source = media_item_by_id(&state.db, &item_id).await?;
+    similar_items_for_media_source(&state, &query, requested_user_id, &item_id).await
+}
+
+async fn authenticated_similar_album_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    similar_items_from_metadata_entity(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        item_id,
+        "MusicAlbum",
+        &["Album", "AlbumName", "Albums"],
+    )
+    .await
+}
+
+async fn authenticated_similar_artist_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    similar_items_from_metadata_entity(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        item_id,
+        "MusicArtist",
+        &["Artists", "AlbumArtists"],
+    )
+    .await
+}
+
+async fn similar_items_from_metadata_entity(
+    state: AppState,
+    headers: HeaderMap,
+    auth_query: AuthQuery,
+    raw_query: Option<String>,
+    item_id: String,
+    entity_type: &'static str,
+    metadata_keys: &'static [&'static str],
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let query = parse_items_query(raw_query.as_deref());
+    let auth_user =
+        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query
+        .user_id
+        .as_deref()
+        .map(resolve_user_id)
+        .transpose()?
+        .unwrap_or(auth_user.id);
+    ensure_user_access(&auth_user, requested_user_id)?;
+
+    match similar_items_for_media_source(&state, &query, requested_user_id, &item_id).await {
+        Ok(response) => return Ok(response),
+        Err(error) if error.status == StatusCode::NOT_FOUND => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut items_query = query.clone();
+    if items_query.include_item_types.is_empty() {
+        items_query.include_item_types.push("Audio".to_string());
+    }
+    items_query.ids = None;
+    items_query.search_term = None;
+    items_query.name_starts_with = None;
+    items_query.name_starts_with_or_greater = None;
+    items_query.name_less_than = None;
+    items_query.start_index = None;
+    items_query.limit = None;
+    items_query.sort_by = Some("SortName".to_string());
+    items_query.sort_order = None;
+
+    let candidates = filtered_media_items(
+        state.db.media_items().await?,
+        &items_query,
+        Some(requested_user_id),
+        &state.db,
+    )
+    .await?;
+    let metadata_by_item = state
+        .db
+        .media_item_metadata()
+        .await?
+        .into_iter()
+        .map(|metadata| (metadata.item_id, metadata))
+        .collect::<HashMap<_, _>>();
+    let entity_name = metadata_values_for_keys(&state.db, metadata_keys, &candidates)
+        .await?
+        .into_iter()
+        .find(|name| stable_entity_id(entity_type, name).eq_ignore_ascii_case(&item_id))
+        .ok_or_else(|| ApiError::not_found("Similar source not found"))?;
+    let items =
+        metadata_entity_audio_items(candidates, &metadata_by_item, metadata_keys, &entity_name);
+    paged_similar_items_response(&state, &query, requested_user_id, items).await
+}
+
+async fn similar_items_for_media_source(
+    state: &AppState,
+    query: &ItemsQuery,
+    requested_user_id: Uuid,
+    item_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let source = media_item_by_id(&state.db, item_id).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let mut items_query = query;
+    let mut items_query = query.clone();
     if items_query.include_item_types.is_empty() {
         items_query
             .include_item_types
@@ -18690,6 +18801,29 @@ async fn authenticated_similar_items(
         .collect::<Vec<_>>();
     Ok(Json(query_result_with_total(
         items_to_json(&state.db, items, &server_id, Some(requested_user_id)).await?,
+        total_record_count,
+        start_index,
+    )))
+}
+
+async fn paged_similar_items_response(
+    state: &AppState,
+    query: &ItemsQuery,
+    requested_user_id: Uuid,
+    items: Vec<MediaItem>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let total_record_count = items.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(20).min(100);
+    Ok(Json(query_result_with_total(
+        items_to_json(
+            &state.db,
+            items.into_iter().skip(start_index).take(limit).collect(),
+            &server_id,
+            Some(requested_user_id),
+        )
+        .await?,
         total_record_count,
         start_index,
     )))
@@ -36301,6 +36435,76 @@ mod tests {
         assert_eq!(artist_mix["TotalRecordCount"], 2);
         assert_eq!(artist_mix["Items"][0]["Id"], item_id);
         assert_eq!(artist_mix["Items"][1]["Id"], second_item_id);
+
+        for (endpoint, expected_first_id, expected_start_index) in [
+            (
+                format!("/Library/Albums/{album_id}/Similar?Limit=1"),
+                item_id,
+                0,
+            ),
+            (
+                format!("/library/albums/{album_id}/similar?StartIndex=1&Limit=1"),
+                second_item_id.as_str(),
+                1,
+            ),
+        ] {
+            let endpoint = endpoint.as_str();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let album_similar: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(album_similar["TotalRecordCount"], 2, "{endpoint}");
+            assert_eq!(
+                album_similar["StartIndex"], expected_start_index,
+                "{endpoint}"
+            );
+            assert_eq!(
+                album_similar["Items"][0]["Id"], expected_first_id,
+                "{endpoint}"
+            );
+            assert_eq!(album_similar["Items"][0]["Type"], "Audio", "{endpoint}");
+        }
+
+        for endpoint in [
+            format!("/Library/Artists/{artist_id}/Similar?Limit=2"),
+            format!("/library/artists/{artist_id}/similar?UserId={user_id}&Limit=2"),
+        ] {
+            let endpoint = endpoint.as_str();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let artist_similar: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(artist_similar["TotalRecordCount"], 2, "{endpoint}");
+            assert_eq!(artist_similar["Items"][0]["Id"], item_id, "{endpoint}");
+            assert_eq!(
+                artist_similar["Items"][1]["Id"], second_item_id,
+                "{endpoint}"
+            );
+            assert_eq!(
+                artist_similar["Items"][0]["UserData"]["PlaybackPositionTicks"], 111_000_000,
+                "{endpoint}"
+            );
+        }
 
         let response = app
             .clone()
