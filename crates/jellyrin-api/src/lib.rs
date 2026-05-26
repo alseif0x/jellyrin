@@ -11157,14 +11157,16 @@ macro_rules! remote_search_handler {
             State(state): State<AppState>,
             headers: HeaderMap,
             Query(query): Query<AuthQuery>,
+            body: Option<Json<serde_json::Value>>,
         ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
             if $admin_only {
                 require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
             } else {
                 require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
             }
-            let _ = $item_type;
-            Ok(Json(Vec::new()))
+            remote_search_local_results(&state.db, $item_type, body.map(|Json(value)| value))
+                .await
+                .map(Json)
         }
     };
 }
@@ -11178,6 +11180,269 @@ remote_search_handler!(remote_search_music_video, "MusicVideo", false);
 remote_search_handler!(remote_search_person, "Person", true);
 remote_search_handler!(remote_search_series, "Series", false);
 remote_search_handler!(remote_search_trailer, "Trailer", false);
+
+async fn remote_search_local_results(
+    db: &Database,
+    item_type: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let request = RemoteSearchRequest::from_payload(payload.as_ref());
+    let items = db.media_items().await?;
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    let server_id = db.server_state().await?.server_id.to_string();
+    let mut results = BTreeMap::<String, serde_json::Value>::new();
+
+    match item_type {
+        "Movie" | "MusicVideo" | "Book" => {
+            for item in items
+                .iter()
+                .filter(|item| media_item_type(item) == item_type)
+            {
+                let metadata = metadata_by_item.get(&item.id);
+                if !request.matches_media_item(item, metadata) {
+                    continue;
+                }
+                let result = remote_search_result_from_media_item(item, metadata);
+                results.insert(remote_search_result_key(item_type, &item.name), result);
+            }
+        }
+        "Series" => {
+            for item in items
+                .iter()
+                .filter(|item| media_item_type(item) == "Episode")
+            {
+                let Some(series) = tv_episode_info(item).map(|info| info.series_name) else {
+                    continue;
+                };
+                if !request.matches_name(&series) {
+                    continue;
+                }
+                results
+                    .entry(remote_search_result_key(item_type, &series))
+                    .or_insert_with(|| {
+                        remote_search_result_from_name(&server_id, &series, item_type, None)
+                    });
+            }
+        }
+        "MusicAlbum" => {
+            collect_remote_search_metadata_entities(
+                &server_id,
+                item_type,
+                &["Album", "AlbumName", "Albums"],
+                &items,
+                &metadata_by_item,
+                &request,
+                &mut results,
+            );
+        }
+        "MusicArtist" => {
+            collect_remote_search_metadata_entities(
+                &server_id,
+                item_type,
+                &["Artists", "AlbumArtists", "ArtistItems"],
+                &items,
+                &metadata_by_item,
+                &request,
+                &mut results,
+            );
+        }
+        "Person" => {
+            collect_remote_search_metadata_entities(
+                &server_id,
+                item_type,
+                &["People", "Cast"],
+                &items,
+                &metadata_by_item,
+                &request,
+                &mut results,
+            );
+        }
+        "Trailer" => {
+            for item in &items {
+                let Some(metadata) = metadata_by_item.get(&item.id) else {
+                    continue;
+                };
+                for trailer in metadata_remote_trailers(metadata, item, &server_id) {
+                    let name = trailer["Name"].as_str().unwrap_or_default();
+                    if !request.matches_name(name) {
+                        continue;
+                    }
+                    let mut result =
+                        remote_search_result_from_name(&server_id, name, item_type, None);
+                    result["RemoteTrailers"] = trailer["RemoteTrailers"].clone();
+                    result["ProviderIds"] = serde_json::json!({
+                        "JellyrinLocal": trailer["Id"].clone()
+                    });
+                    results.insert(remote_search_result_key(item_type, name), result);
+                }
+            }
+        }
+        "BoxSet" => {}
+        _ => {}
+    }
+
+    Ok(results.into_values().collect())
+}
+
+#[derive(Default)]
+struct RemoteSearchRequest {
+    name: Option<String>,
+    year: Option<i32>,
+}
+
+impl RemoteSearchRequest {
+    fn from_payload(payload: Option<&serde_json::Value>) -> Self {
+        let Some(payload) = payload else {
+            return Self::default();
+        };
+        let search_info = json_field_case_insensitive(payload, "SearchInfo");
+        Self {
+            name: json_string_field(payload, "Name")
+                .or_else(|| json_string_field(payload, "SearchTerm"))
+                .or_else(|| search_info.and_then(|value| json_string_field(value, "Name")))
+                .or_else(|| search_info.and_then(|value| json_string_field(value, "SearchTerm"))),
+            year: json_i64_field(payload, "Year")
+                .or_else(|| json_i64_field(payload, "ProductionYear"))
+                .or_else(|| search_info.and_then(|value| json_i64_field(value, "Year")))
+                .or_else(|| search_info.and_then(|value| json_i64_field(value, "ProductionYear")))
+                .and_then(|year| i32::try_from(year).ok()),
+        }
+    }
+
+    fn matches_media_item(&self, item: &MediaItem, metadata: Option<&serde_json::Value>) -> bool {
+        self.matches_name(&item.name)
+            && self
+                .year
+                .is_none_or(|year| remote_search_metadata_year(metadata) == Some(year))
+    }
+
+    fn matches_name(&self, candidate: &str) -> bool {
+        self.name.as_ref().is_none_or(|name| {
+            candidate
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+        })
+    }
+}
+
+fn collect_remote_search_metadata_entities(
+    server_id: &str,
+    item_type: &str,
+    metadata_keys: &[&str],
+    items: &[MediaItem],
+    metadata_by_item: &HashMap<Uuid, serde_json::Value>,
+    request: &RemoteSearchRequest,
+    results: &mut BTreeMap<String, serde_json::Value>,
+) {
+    let item_ids = items.iter().map(|item| item.id).collect::<HashSet<_>>();
+    let mut names = BTreeMap::<String, String>::new();
+    for (item_id, metadata) in metadata_by_item {
+        if !item_ids.contains(item_id) {
+            continue;
+        }
+        for key in metadata_keys {
+            if let Some(value) = json_field_case_insensitive(metadata, key) {
+                collect_metadata_value(value, &mut names);
+            }
+        }
+    }
+    for name in names
+        .into_values()
+        .filter(|name| request.matches_name(name))
+    {
+        results.insert(
+            remote_search_result_key(item_type, &name),
+            remote_search_result_from_name(server_id, &name, item_type, None),
+        );
+    }
+}
+
+fn remote_search_result_from_media_item(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let item_type = media_item_type(item);
+    let overview = metadata
+        .and_then(|metadata| first_metadata_value_from_json(metadata, &["Overview", "overview"]))
+        .unwrap_or_default();
+    let provider_ids = metadata
+        .and_then(|metadata| {
+            json_field_case_insensitive(metadata, "ProviderIds")
+                .or_else(|| json_field_case_insensitive(metadata, "ProviderId"))
+        })
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "JellyrinLocal": item.id.simple().to_string()
+            })
+        });
+    serde_json::json!({
+        "Name": item.name,
+        "ProviderIds": provider_ids,
+        "ProductionYear": remote_search_metadata_year(metadata),
+        "IndexNumber": null,
+        "IndexNumberEnd": null,
+        "ParentIndexNumber": null,
+        "PremiereDate": metadata.and_then(|metadata| first_metadata_value_from_json(metadata, &["PremiereDate", "AirDate", "DateCreated"])),
+        "ImageUrl": null,
+        "SearchProviderName": "Jellyrin Local Library",
+        "Overview": overview,
+        "Type": item_type,
+        "ItemId": item.id.simple().to_string()
+    })
+}
+
+fn remote_search_result_from_name(
+    server_id: &str,
+    name: &str,
+    item_type: &str,
+    production_year: Option<i32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "Name": name,
+        "ProviderIds": {
+            "JellyrinLocal": stable_entity_id(item_type, &format!("{server_id}:{name}"))
+        },
+        "ProductionYear": production_year,
+        "IndexNumber": null,
+        "IndexNumberEnd": null,
+        "ParentIndexNumber": null,
+        "PremiereDate": null,
+        "ImageUrl": null,
+        "SearchProviderName": "Jellyrin Local Library",
+        "Overview": "",
+        "Type": item_type
+    })
+}
+
+fn remote_search_metadata_year(metadata: Option<&serde_json::Value>) -> Option<i32> {
+    let metadata = metadata?;
+    for key in ["ProductionYear", "Year"] {
+        if let Some(value) = json_field_case_insensitive(metadata, key)
+            && let Some(year) = remote_search_json_i32(value)
+        {
+            return Some(year);
+        }
+    }
+    None
+}
+
+fn remote_search_json_i32(value: &serde_json::Value) -> Option<i32> {
+    match value {
+        serde_json::Value::Number(value) => {
+            value.as_i64().and_then(|value| i32::try_from(value).ok())
+        }
+        serde_json::Value::String(value) => value.parse::<i32>().ok(),
+        serde_json::Value::Array(values) => values.iter().find_map(remote_search_json_i32),
+        _ => None,
+    }
+}
+
+fn remote_search_result_key(item_type: &str, name: &str) -> String {
+    format!("{item_type}:{}", name.trim().to_ascii_lowercase())
+}
 
 async fn metadata_payload_for_item(
     db: &Database,
@@ -38714,7 +38979,9 @@ mod tests {
                     .uri("/ItemLookup/Items/RemoteSearch/Movie")
                     .header("X-Emby-Token", &editor_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({ "Name": "Metadata Movie" }).to_string()))
+                    .body(Body::from(
+                        json!({ "Name": "Metadata Movie", "Year": 1984 }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -38722,7 +38989,63 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let remote_results: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(remote_results, json!([]));
+        assert_eq!(remote_results.as_array().unwrap().len(), 1);
+        assert_eq!(remote_results[0]["Name"], "Metadata Movie");
+        assert_eq!(remote_results[0]["Type"], "Movie");
+        assert_eq!(
+            remote_results[0]["SearchProviderName"],
+            "Jellyrin Local Library"
+        );
+        assert_eq!(remote_results[0]["ProductionYear"], 1984);
+        assert_eq!(
+            remote_results[0]["ProviderIds"]["JellyrinLocal"],
+            item.id.simple().to_string()
+        );
+
+        for (endpoint, request_name, expected_name, expected_type) in [
+            (
+                "/ItemLookup/Items/RemoteSearch/MusicAlbum",
+                "example album",
+                "Example Album",
+                "MusicAlbum",
+            ),
+            (
+                "/ItemLookup/Items/RemoteSearch/MusicArtist",
+                "Artist One",
+                "Artist One",
+                "MusicArtist",
+            ),
+            (
+                "/ItemLookup/Items/RemoteSearch/Trailer",
+                "Main Trailer",
+                "Main Trailer",
+                "Trailer",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &editor_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(json!({ "Name": request_name }).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let remote_results: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(remote_results.as_array().unwrap().len(), 1, "{endpoint}");
+            assert_eq!(remote_results[0]["Name"], expected_name, "{endpoint}");
+            assert_eq!(remote_results[0]["Type"], expected_type, "{endpoint}");
+            assert_eq!(
+                remote_results[0]["SearchProviderName"], "Jellyrin Local Library",
+                "{endpoint}"
+            );
+        }
 
         let response = app
             .clone()
@@ -38738,6 +39061,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ItemLookup/Items/RemoteSearch/Person")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Name": "John Williams" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_person_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_person_results.as_array().unwrap().len(), 1);
+        assert_eq!(remote_person_results[0]["Name"], "John Williams");
+        assert_eq!(remote_person_results[0]["Type"], "Person");
 
         let response = app
             .clone()
