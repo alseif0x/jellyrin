@@ -31562,6 +31562,26 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/items/{item_id}/playbackinfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let local_alias_playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(local_alias_playback_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            local_alias_playback_info["MediaSources"][0]["SupportsDirectPlay"],
+            true
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/MediaInfo/Playback/BitrateTest?Size=8")
                     .body(Body::empty())
                     .unwrap(),
@@ -32010,6 +32030,39 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
+                    .uri(format!("/items/{item_id}/playbackinfo"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "DeviceProfile": {},
+                            "EnableDirectPlay": false,
+                            "EnableDirectStream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let posted_alias_playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(posted_alias_playback_info["ErrorCode"], Value::Null);
+        assert_eq!(
+            posted_alias_playback_info["MediaSources"][0]["SupportsDirectPlay"],
+            false
+        );
+        assert_eq!(
+            posted_alias_playback_info["MediaSources"][0]["SupportsDirectStream"],
+            true
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
                     .uri(format!("/Items/{item_id}/PlaybackInfo"))
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -32248,6 +32301,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!playback_state.played);
 
         let response = app
             .clone()
