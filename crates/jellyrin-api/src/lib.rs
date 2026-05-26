@@ -15,7 +15,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     extract::{Path, Query, RawQuery, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Redirect},
     routing::{delete, get, head, post},
 };
@@ -7360,21 +7360,56 @@ async fn syncplay_group_command(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    uri: Uri,
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     let (_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let payload = optional_json_body(body).await?;
-    let mut groups = syncplay_groups().lock().await;
-    let group = groups
-        .values_mut()
-        .find(|group| group.participants.contains_key(&token.access_token))
-        .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
-    group.state = serde_json::json!({
-        "LastCommand": payload,
-        "LastCommandDate": format_time_for_json(OffsetDateTime::now_utc())
-    });
-    group.updated_at = OffsetDateTime::now_utc();
+    let command = syncplay_command_from_uri(&uri);
+    let now = OffsetDateTime::now_utc();
+    let (group_id, group_json, participant_session_ids) = {
+        let mut groups = syncplay_groups().lock().await;
+        let group = groups
+            .values_mut()
+            .find(|group| group.participants.contains_key(&token.access_token))
+            .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
+        group.state = serde_json::json!({
+            "LastCommand": payload,
+            "LastCommandName": command,
+            "LastCommandDate": format_time_for_json(now)
+        });
+        group.updated_at = now;
+        (
+            group.id.clone(),
+            syncplay_group_json(group),
+            group.participants.keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+    for session_id in participant_session_ids {
+        broadcast_session_message(
+            &session_id,
+            serde_json::json!({
+                "MessageType": "SyncPlayCommand",
+                "Data": {
+                    "GroupId": group_id,
+                    "Command": command.clone(),
+                    "Payload": payload.clone(),
+                    "Group": group_json.clone()
+                }
+            }),
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn syncplay_command_from_uri(uri: &Uri) -> String {
+    uri.path()
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "Command".to_string())
 }
 
 async fn live_tv_info() -> Json<serde_json::Value> {
@@ -28311,6 +28346,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+        let mut syncplay_events = subscribe_playback_events();
         for endpoint in [
             "/SyncPlay/Buffering",
             "/SyncPlay/MovePlaylistItem",
@@ -28342,7 +28378,30 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+            let event =
+                next_playback_event_type(&mut syncplay_events, &api_key, "SyncPlayCommand").await;
+            let command = endpoint.rsplit('/').next().unwrap();
+            assert_eq!(event["Data"]["GroupId"], group_id, "{endpoint}");
+            assert_eq!(event["Data"]["Command"], command, "{endpoint}");
+            assert_eq!(event["Data"]["Payload"]["PositionTicks"], 100, "{endpoint}");
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_group: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_group["State"]["LastCommandName"], "Unpause");
+        assert_eq!(updated_group["State"]["LastCommand"]["PositionTicks"], 100);
 
         let response = app
             .clone()
