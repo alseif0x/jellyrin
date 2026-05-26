@@ -11202,7 +11202,13 @@ async fn resume_items_result(
     user_id: Uuid,
     query: &ItemsQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let resume_items = db.resume_items_for_user(user_id, i64::MAX).await?;
+    let resume_policy = resume_policy(db).await?;
+    let resume_items = db
+        .resume_items_for_user(user_id, i64::MAX)
+        .await?
+        .into_iter()
+        .filter(|(item, playback)| item_matches_resume_policy(item, playback, resume_policy))
+        .collect::<Vec<_>>();
     let resume_order = resume_items
         .iter()
         .enumerate()
@@ -11233,6 +11239,60 @@ async fn resume_items_result(
         total_record_count,
         start_index,
     )))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResumePolicy {
+    min_pct: i64,
+    max_pct: i64,
+    min_duration_ticks: i64,
+}
+
+async fn resume_policy(db: &Database) -> Result<ResumePolicy, ApiError> {
+    let mut server_options = default_server_configuration_options();
+    if let serde_json::Value::Object(current) =
+        db.system_configuration_payloads().await?.server_options
+    {
+        for (key, value) in current {
+            server_options[key] = value;
+        }
+    }
+
+    let min_pct = server_options_i64(&server_options, "MinResumePct", 5).clamp(0, 100);
+    let max_pct = server_options_i64(&server_options, "MaxResumePct", 90).clamp(min_pct, 100);
+    let min_duration_seconds =
+        server_options_i64(&server_options, "MinResumeDurationSeconds", 300).max(0);
+
+    Ok(ResumePolicy {
+        min_pct,
+        max_pct,
+        min_duration_ticks: min_duration_seconds.saturating_mul(10_000_000),
+    })
+}
+
+fn server_options_i64(options: &serde_json::Value, key: &str, default: i64) -> i64 {
+    options
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(default)
+}
+
+fn item_matches_resume_policy(
+    item: &MediaItem,
+    playback: &PlaybackState,
+    policy: ResumePolicy,
+) -> bool {
+    let Some(runtime_ticks) = item
+        .runtime_ticks
+        .filter(|runtime_ticks| *runtime_ticks > 0)
+    else {
+        return true;
+    };
+    if runtime_ticks < policy.min_duration_ticks {
+        return false;
+    }
+    let played_pct = playback.position_ticks as f64 * 100.0 / runtime_ticks as f64;
+    played_pct >= policy.min_pct as f64 && played_pct < policy.max_pct as f64
 }
 
 async fn root_folder(
@@ -28003,7 +28063,7 @@ mod tests {
         receiver: &mut tokio::sync::broadcast::Receiver<super::PlaybackEvent>,
         session_id: &str,
     ) -> Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 break;
@@ -29175,6 +29235,15 @@ mod tests {
             .await
             .unwrap();
         let user_id = user.id.simple().to_string();
+        let mut payloads = db.system_configuration_payloads().await.unwrap();
+        payloads.server_options = json!({
+            "MinResumePct": 0,
+            "MaxResumePct": 100,
+            "MinResumeDurationSeconds": 0
+        });
+        db.update_system_configuration_payloads(payloads)
+            .await
+            .unwrap();
         let test_db = db.clone();
         let app = router(AppState {
             db,
@@ -35217,6 +35286,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn resume_items_honor_server_resume_thresholds() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (index, name) in [
+            "Early Movie.mp4",
+            "Keep Movie.mp4",
+            "Late Movie.mp4",
+            "Short Movie.mp4",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tokio::fs::write(tmp.path().join(name), "fake video".repeat(index + 1))
+                .await
+                .unwrap();
+        }
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "resume-policy-key")
+            .await
+            .unwrap();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=ResumePolicy&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "MinResumePct": 5,
+                            "MaxResumePct": 90,
+                            "MinResumeDurationSeconds": 300
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let items = test_db.media_items().await.unwrap();
+        assert_eq!(items.len(), 4);
+        for item in &items {
+            let runtime_ticks = if item.name == "Short Movie" {
+                2_000_000_000_i64
+            } else {
+                10_000_000_000_i64
+            };
+            sqlx::query("UPDATE media_items SET runtime_ticks = ?1 WHERE id = ?2")
+                .bind(runtime_ticks)
+                .bind(item.id.to_string())
+                .execute(test_db.pool())
+                .await
+                .unwrap();
+            let position_ticks = match item.name.as_str() {
+                "Early Movie" => 200_000_000_i64,
+                "Keep Movie" => 1_000_000_000_i64,
+                "Late Movie" => 9_500_000_000_i64,
+                "Short Movie" => 1_000_000_000_i64,
+                _ => unreachable!(),
+            };
+            test_db
+                .upsert_playback_state(UpsertPlaybackState {
+                    user_id: user.id,
+                    item_id: item.id,
+                    media_source_id: Some(item.id.simple().to_string()),
+                    audio_stream_index: None,
+                    subtitle_stream_index: None,
+                    position_ticks,
+                    is_paused: false,
+                    played: false,
+                })
+                .await
+                .unwrap();
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/UserItems/Resume?SortBy=SortName")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resume: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resume["TotalRecordCount"], 1);
+        assert_eq!(resume["Items"][0]["Name"], "Keep Movie");
+        assert_eq!(
+            resume["Items"][0]["UserData"]["PlaybackPositionTicks"],
+            1_000_000_000
+        );
     }
 
     #[tokio::test]
