@@ -776,10 +776,10 @@ pub fn router(state: AppState) -> Router {
             "/livetv/listingproviders/schedulesdirect/countries",
             get(live_tv_schedules_direct_countries),
         )
-        .route("/LiveTv/Channels", get(live_tv_empty_items))
-        .route("/livetv/channels", get(live_tv_empty_items))
-        .route("/LiveTv/Channels/{channelId}", get(live_tv_missing_item))
-        .route("/livetv/channels/{channelId}", get(live_tv_missing_item))
+        .route("/LiveTv/Channels", get(live_tv_channels))
+        .route("/livetv/channels", get(live_tv_channels))
+        .route("/LiveTv/Channels/{channelId}", get(live_tv_channel))
+        .route("/livetv/channels/{channelId}", get(live_tv_channel))
         .route(
             "/LiveTv/LiveRecordings/{recordingId}/stream",
             get(live_tv_missing_stream),
@@ -7145,9 +7145,14 @@ async fn live_tv_channel_mapping_options(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let tuner_channels = live_tv_channel_items(&config)
+        .into_iter()
+        .map(live_tv_channel_mapping_option)
+        .collect::<Vec<_>>();
+    let provider_channels = live_tv_provider_channels(provider);
     Ok(Json(serde_json::json!({
-        "TunerChannels": [],
-        "ProviderChannels": [],
+        "TunerChannels": tuner_channels,
+        "ProviderChannels": provider_channels,
         "Mappings": mappings,
         "ProviderName": live_tv_provider_name(provider)
     })))
@@ -7522,6 +7527,42 @@ async fn live_tv_empty_items(
     Ok(Json(query_result(Vec::new())))
 }
 
+async fn live_tv_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    Ok(Json(query_result(live_tv_channel_items(&config))))
+}
+
+async fn live_tv_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let channel = live_tv_channel_items(&config)
+        .into_iter()
+        .find(|channel| {
+            json_string_field(channel, "Id")
+                .is_some_and(|id| id.eq_ignore_ascii_case(channel_id.trim()))
+        })
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    Ok(Json(channel))
+}
+
 async fn live_tv_post_empty_items(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7570,6 +7611,165 @@ async fn live_tv_delete_missing_recording(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     Err(ApiError::not_found("Live TV recording not found"))
+}
+
+fn live_tv_channel_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut channels = Vec::new();
+    let Some(tuner_hosts) = config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return channels;
+    };
+
+    for (tuner_index, tuner) in tuner_hosts.iter().enumerate() {
+        let tuner_id =
+            json_string_field(tuner, "Id").unwrap_or_else(|| format!("tuner-{tuner_index}"));
+        let tuner_name = json_string_field(tuner, "FriendlyName")
+            .or_else(|| json_string_field(tuner, "Name"))
+            .or_else(|| json_string_field(tuner, "Url"))
+            .unwrap_or_else(|| tuner_id.clone());
+        let Some(tuner_channels) = tuner.get("Channels").and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for (channel_index, channel) in tuner_channels.iter().enumerate() {
+            if let Some(channel) =
+                live_tv_channel_item(&tuner_id, &tuner_name, channel, channel_index)
+            {
+                channels.push(channel);
+            }
+        }
+    }
+    channels.sort_by(|left, right| {
+        let left_sort = json_string_field(left, "SortName")
+            .or_else(|| json_string_field(left, "Name"))
+            .unwrap_or_default();
+        let right_sort = json_string_field(right, "SortName")
+            .or_else(|| json_string_field(right, "Name"))
+            .unwrap_or_default();
+        left_sort
+            .to_ascii_lowercase()
+            .cmp(&right_sort.to_ascii_lowercase())
+    });
+    channels
+}
+
+fn live_tv_channel_item(
+    tuner_id: &str,
+    tuner_name: &str,
+    channel: &serde_json::Value,
+    index: usize,
+) -> Option<serde_json::Value> {
+    let (mut base, raw_name) = match channel {
+        serde_json::Value::Object(fields) => (serde_json::Value::Object(fields.clone()), None),
+        serde_json::Value::String(name) => (serde_json::json!({}), Some(name.trim().to_string())),
+        _ => return None,
+    };
+    let name = json_string_field(&base, "Name")
+        .or_else(|| json_string_field(&base, "DisplayName"))
+        .or(raw_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("Channel {}", index + 1));
+    let number = json_string_field(&base, "Number")
+        .or_else(|| json_string_field(&base, "ChannelNumber"))
+        .or_else(|| json_string_field(&base, "GuideNumber"));
+    let id = json_string_field(&base, "Id")
+        .or_else(|| json_string_field(&base, "ChannelId"))
+        .or_else(|| number.clone())
+        .unwrap_or_else(|| format!("{tuner_id}-{}", index + 1));
+
+    base["Id"] = serde_json::json!(id);
+    base["ChannelId"] = base["Id"].clone();
+    base["Name"] = serde_json::json!(name);
+    base["SortName"] = serde_json::json!(
+        number
+            .clone()
+            .unwrap_or_else(|| { base["Name"].as_str().unwrap_or_default().to_string() })
+    );
+    base["Number"] = number
+        .map(serde_json::Value::String)
+        .unwrap_or(serde_json::Value::Null);
+    base["TunerHostId"] = serde_json::json!(tuner_id);
+    base["TunerHostName"] = serde_json::json!(tuner_name);
+    base["Type"] = serde_json::json!("TvChannel");
+    base["MediaType"] = serde_json::json!("Video");
+    base["ChannelType"] = base
+        .get("ChannelType")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("TV"));
+    base["IsFolder"] = serde_json::json!(false);
+    base["IsLive"] = serde_json::json!(true);
+    base["LocationType"] = serde_json::json!("Remote");
+    base["RunTimeTicks"] = serde_json::Value::Null;
+    base["CurrentProgram"] = serde_json::Value::Null;
+    Some(base)
+}
+
+fn live_tv_channel_mapping_option(channel: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Id": json_string_field(&channel, "Id").unwrap_or_default(),
+        "Name": json_string_field(&channel, "Name").unwrap_or_default(),
+        "Number": json_string_field(&channel, "Number"),
+        "ChannelId": json_string_field(&channel, "ChannelId").unwrap_or_default()
+    })
+}
+
+fn live_tv_provider_channels(provider: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let Some(channels) = provider
+        .get("Channels")
+        .and_then(serde_json::Value::as_array)
+    {
+        return channels
+            .iter()
+            .enumerate()
+            .filter_map(|channel| live_tv_provider_channel(channel.1, channel.0))
+            .collect();
+    }
+    provider
+        .get("ChannelMappings")
+        .and_then(serde_json::Value::as_array)
+        .map(|mappings| {
+            mappings
+                .iter()
+                .filter_map(|mapping| {
+                    let value = json_string_field(mapping, "Value")?;
+                    Some(serde_json::json!({
+                        "Id": value,
+                        "Name": value,
+                        "Number": null
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn live_tv_provider_channel(
+    channel: &serde_json::Value,
+    index: usize,
+) -> Option<serde_json::Value> {
+    match channel {
+        serde_json::Value::Object(_) => {
+            let name = json_string_field(channel, "Name")
+                .or_else(|| json_string_field(channel, "DisplayName"))
+                .unwrap_or_else(|| format!("Provider Channel {}", index + 1));
+            let id = json_string_field(channel, "Id")
+                .or_else(|| json_string_field(channel, "ChannelId"))
+                .unwrap_or_else(|| name.clone());
+            Some(serde_json::json!({
+                "Id": id,
+                "Name": name,
+                "Number": json_string_field(channel, "Number").or_else(|| json_string_field(channel, "ChannelNumber"))
+            }))
+        }
+        serde_json::Value::String(name) if !name.trim().is_empty() => Some(serde_json::json!({
+            "Id": name.trim(),
+            "Name": name.trim(),
+            "Number": null
+        })),
+        _ => None,
+    }
 }
 
 async fn live_tv_timers(
@@ -22342,7 +22542,15 @@ mod tests {
             "SeriesRecordingPath": "/srv/recordings/series",
             "EnableRecordingSubfolders": true,
             "EnableOriginalAudioWithEncodedRecordings": true,
-            "TunerHosts": [{ "Id": "tuner-1", "Url": "http://192.0.2.10" }],
+            "TunerHosts": [{
+                "Id": "tuner-1",
+                "Url": "http://192.0.2.10",
+                "FriendlyName": "Primary tuner",
+                "Channels": [
+                    { "Id": "channel-1", "Name": "News HD", "Number": "1" },
+                    { "Id": "channel-2", "Name": "Movies", "Number": "2" }
+                ]
+            }],
             "ListingProviders": [{ "Id": "provider-1", "Type": "xmltv" }],
             "PrePaddingSeconds": 300,
             "PostPaddingSeconds": 600,
@@ -22498,7 +22706,11 @@ mod tests {
                             "Id": "tuner-2",
                             "Type": "m3u",
                             "Url": "http://example.test/replaced.m3u",
-                            "FriendlyName": "Updated tuner"
+                            "FriendlyName": "Updated tuner",
+                            "Channels": [
+                                { "Id": "channel-1", "Name": "News HD", "Number": "1" },
+                                { "Id": "channel-2", "Name": "Movies", "Number": "2" }
+                            ]
                         })
                         .to_string(),
                     ))
@@ -22845,7 +23057,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let options: Value = serde_json::from_slice(&body).unwrap();
-        assert!(options["TunerChannels"].as_array().unwrap().is_empty());
+        assert_eq!(options["TunerChannels"].as_array().unwrap().len(), 2);
+        assert_eq!(options["TunerChannels"][0]["Id"], "channel-1");
         assert!(options["ProviderChannels"].as_array().unwrap().is_empty());
         assert!(options["Mappings"].as_array().unwrap().is_empty());
         assert_eq!(options["ProviderName"], "xmltv");
@@ -22960,8 +23173,55 @@ mod tests {
         let options: Value = serde_json::from_slice(&body).unwrap();
         assert!(options["Mappings"].as_array().unwrap().is_empty());
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Channels?UserId=test-user")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Channels?UserId=test-user")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels["TotalRecordCount"], 2);
+        assert_eq!(channels["Items"][0]["Id"], "channel-1");
+        assert_eq!(channels["Items"][0]["Type"], "TvChannel");
+        assert_eq!(channels["Items"][0]["TunerHostId"], "tuner-1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/livetv/channels/channel-2")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channel: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channel["Name"], "Movies");
+        assert_eq!(channel["Number"], "2");
+
         for endpoint in [
-            "/LiveTv/Channels?UserId=test-user",
             "/livetv/programs",
             "/LiveTv/RecommendedPrograms",
             "/LiveTv/Programs/Recommended",
