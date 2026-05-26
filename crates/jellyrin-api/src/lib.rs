@@ -37405,6 +37405,17 @@ mod tests {
         tokio::fs::write(transcode_dir.join("segment_00000.ts"), b"zero")
             .await
             .unwrap();
+        let hls_alias_transcode_dir = transcode_root.path().join("play-session-hls-stop");
+        tokio::fs::create_dir_all(&hls_alias_transcode_dir)
+            .await
+            .unwrap();
+        let hls_alias_playlist = hls_alias_transcode_dir.join("main.m3u8");
+        tokio::fs::write(&hls_alias_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(hls_alias_transcode_dir.join("segment_00000.ts"), b"zero")
+            .await
+            .unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -37441,6 +37452,24 @@ mod tests {
             status: "running".to_string(),
             progress_percent: Some(12.0),
             position_ticks: 42,
+        })
+        .await
+        .unwrap();
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-hls-stop".to_string(),
+            dedupe_key: None,
+            device_id: Some("device-2".to_string()),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item.id.simple().to_string()),
+            audio_stream_index: Some(0),
+            subtitle_stream_index: Some(-1),
+            video_stream_index: Some(0),
+            output_path: hls_alias_playlist.to_string_lossy().to_string(),
+            process_id: Some(1000),
+            status: "running".to_string(),
+            progress_percent: Some(13.0),
+            position_ticks: 43,
         })
         .await
         .unwrap();
@@ -37521,6 +37550,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(session.status, "stopped");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(
+                        "/HlsSegment/Videos/ActiveEncodings?PlaySessionId=play-session-hls-stop&DeviceId=device-2",
+                    )
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!hls_alias_transcode_dir.exists());
+        let hls_alias_session = db
+            .transcode_session_by_play_session_id("play-session-hls-stop")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hls_alias_session.status, "stopped");
 
         let response = app
             .clone()
