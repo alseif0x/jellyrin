@@ -5364,21 +5364,37 @@ async fn default_metadata_options() -> Json<serde_json::Value> {
     }))
 }
 
-async fn dashboard_configuration_pages(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(Vec::new()))
-}
-
 #[derive(Debug, Deserialize)]
 struct DashboardConfigurationPageQuery {
     #[serde(flatten)]
     auth: AuthQuery,
     #[serde(alias = "Name", alias = "page", alias = "Page")]
     name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardConfigurationPagesQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "enableInMainMenu", alias = "EnableInMainMenu")]
+    enable_in_main_menu: Option<bool>,
+}
+
+async fn dashboard_configuration_pages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DashboardConfigurationPagesQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let mut pages = discover_dashboard_configuration_pages(&state.web_dir).await?;
+    if query.enable_in_main_menu == Some(true) {
+        pages.retain(|page| {
+            page.get("EnableInMainMenu")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
+    }
+    Ok(Json(pages))
 }
 
 async fn dashboard_configuration_page(
@@ -5408,6 +5424,94 @@ async fn dashboard_configuration_page(
     );
     headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
     Ok((headers, bytes).into_response())
+}
+
+async fn discover_dashboard_configuration_pages(
+    web_dir: &FsPath,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut read_dir = match tokio::fs::read_dir(web_dir).await {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut pages = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_dashboard_configuration_page_name(file_name) {
+            continue;
+        }
+        pages.push(dashboard_configuration_page_json(file_name));
+    }
+    pages.sort_by(|left, right| {
+        let left = left
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let right = right
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        left.cmp(right)
+    });
+    Ok(pages)
+}
+
+fn is_dashboard_configuration_page_name(file_name: &str) -> bool {
+    let path = FsPath::new(file_name);
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase()),
+        Some(extension) if extension == "html" || extension == "htm"
+    )
+}
+
+fn dashboard_configuration_page_json(file_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "Name": file_name,
+        "DisplayName": dashboard_configuration_page_display_name(file_name),
+        "PluginId": null,
+        "EnableInMainMenu": dashboard_configuration_page_in_main_menu(file_name),
+        "MenuSection": "server",
+        "MenuIcon": "settings",
+        "EmbeddedResourcePath": null
+    })
+}
+
+fn dashboard_configuration_page_in_main_menu(file_name: &str) -> bool {
+    matches!(
+        FsPath::new(file_name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| stem.to_ascii_lowercase()),
+        Some(stem) if stem == "home" || stem == "dashboard"
+    )
+}
+
+fn dashboard_configuration_page_display_name(file_name: &str) -> String {
+    let stem = FsPath::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(file_name);
+    stem.split(['-', '_', '.'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn safe_web_relative_path(name: &str) -> Result<PathBuf, ApiError> {
@@ -20517,6 +20621,12 @@ mod tests {
             "<main>Dashboard</main>",
         )
         .unwrap();
+        std::fs::write(
+            storage_root.path().join("metadata-editor.html"),
+            "<main>Metadata</main>",
+        )
+        .unwrap();
+        std::fs::write(storage_root.path().join("readme.txt"), "not a page").unwrap();
         std::fs::write(log_dir.join("jellyrin.log"), "first line\nsecond line\n").unwrap();
         std::fs::write(log_dir.join("older.log"), "older\n").unwrap();
         std::fs::write(log_dir.join("notes.json"), "{}\n").unwrap();
@@ -20736,6 +20846,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/ConfigurationPages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let pages: Value = serde_json::from_slice(&body).unwrap();
+        let pages = pages.as_array().unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0]["Name"], "home.html");
+        assert_eq!(pages[0]["DisplayName"], "Home");
+        assert_eq!(pages[0]["EnableInMainMenu"], true);
+        assert_eq!(pages[1]["Name"], "metadata-editor.html");
+        assert_eq!(pages[1]["DisplayName"], "Metadata Editor");
+        assert_eq!(pages[1]["EnableInMainMenu"], false);
+        assert!(!pages.iter().any(|page| page["Name"] == "readme.txt"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/ConfigurationPages?enableInMainMenu=true")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let main_menu_pages: Value = serde_json::from_slice(&body).unwrap();
+        let main_menu_pages = main_menu_pages.as_array().unwrap();
+        assert_eq!(main_menu_pages.len(), 1);
+        assert_eq!(main_menu_pages[0]["Name"], "home.html");
 
         let response = app
             .clone()
