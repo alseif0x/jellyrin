@@ -830,45 +830,45 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/recordinggroups", get(live_tv_empty_items))
         .route(
             "/LiveTv/Timers",
-            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+            get(live_tv_timers).post(create_live_tv_timer),
         )
         .route(
             "/livetv/timers",
-            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+            get(live_tv_timers).post(create_live_tv_timer),
         )
         .route("/LiveTv/Timers/Defaults", get(live_tv_timer_defaults))
         .route("/livetv/timers/defaults", get(live_tv_timer_defaults))
         .route(
             "/LiveTv/Timers/{timerId}",
-            get(live_tv_missing_item)
-                .post(live_tv_management_item_not_implemented)
-                .delete(live_tv_delete_missing_timer),
+            get(live_tv_timer)
+                .post(update_live_tv_timer)
+                .delete(delete_live_tv_timer),
         )
         .route(
             "/livetv/timers/{timerId}",
-            get(live_tv_missing_item)
-                .post(live_tv_management_item_not_implemented)
-                .delete(live_tv_delete_missing_timer),
+            get(live_tv_timer)
+                .post(update_live_tv_timer)
+                .delete(delete_live_tv_timer),
         )
         .route(
             "/LiveTv/SeriesTimers",
-            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+            get(live_tv_series_timers).post(create_live_tv_series_timer),
         )
         .route(
             "/livetv/seriestimers",
-            get(live_tv_empty_items).post(live_tv_management_not_implemented),
+            get(live_tv_series_timers).post(create_live_tv_series_timer),
         )
         .route(
             "/LiveTv/SeriesTimers/{timerId}",
-            get(live_tv_missing_item)
-                .post(live_tv_management_item_not_implemented)
-                .delete(live_tv_delete_missing_timer),
+            get(live_tv_series_timer)
+                .post(update_live_tv_series_timer)
+                .delete(delete_live_tv_series_timer),
         )
         .route(
             "/livetv/seriestimers/{timerId}",
-            get(live_tv_missing_item)
-                .post(live_tv_management_item_not_implemented)
-                .delete(live_tv_delete_missing_timer),
+            get(live_tv_series_timer)
+                .post(update_live_tv_series_timer)
+                .delete(delete_live_tv_series_timer),
         )
         .route("/LiveTv/Tuners/Discover", get(live_tv_discover_tuners))
         .route("/livetv/tuners/discover", get(live_tv_discover_tuners))
@@ -5086,6 +5086,8 @@ fn default_live_tv_configuration() -> serde_json::Value {
         "EnableOriginalAudioWithEncodedRecordings": false,
         "TunerHosts": [],
         "ListingProviders": [],
+        "Timers": [],
+        "SeriesTimers": [],
         "PrePaddingSeconds": 180,
         "PostPaddingSeconds": 180,
         "MediaLocationsCreated": [],
@@ -5133,6 +5135,8 @@ fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     );
     merge_known_network_value(&mut config, &payload, "TunerHosts");
     merge_known_network_value(&mut config, &payload, "ListingProviders");
+    merge_known_network_value(&mut config, &payload, "Timers");
+    merge_known_network_value(&mut config, &payload, "SeriesTimers");
     merge_known_network_value(&mut config, &payload, "PrePaddingSeconds");
     merge_known_network_value(&mut config, &payload, "PostPaddingSeconds");
     merge_known_network_value(&mut config, &payload, "MediaLocationsCreated");
@@ -7568,35 +7572,264 @@ async fn live_tv_delete_missing_recording(
     Err(ApiError::not_found("Live TV recording not found"))
 }
 
-async fn live_tv_delete_missing_timer(
+async fn live_tv_timers(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_timer_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Live TV timer not found"))
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    live_tv_timer_list(&state.db, "Timers").await
 }
 
-async fn live_tv_management_not_implemented(
+async fn live_tv_series_timers(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Json(_payload): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(StatusCode::NOT_IMPLEMENTED)
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    live_tv_timer_list(&state.db, "SeriesTimers").await
 }
 
-async fn live_tv_management_item_not_implemented(
+async fn live_tv_timer(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_timer_id): Path<String>,
-    Json(_payload): Json<serde_json::Value>,
+    Path(timer_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    live_tv_timer_by_id(&state.db, "Timers", &timer_id).await
+}
+
+async fn live_tv_series_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(timer_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    live_tv_timer_by_id(&state.db, "SeriesTimers", &timer_id).await
+}
+
+async fn create_live_tv_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    upsert_live_tv_timer(&state.db, "Timers", None, payload).await
+}
+
+async fn create_live_tv_series_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    upsert_live_tv_timer(&state.db, "SeriesTimers", None, payload).await
+}
+
+async fn update_live_tv_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(timer_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    upsert_live_tv_timer(&state.db, "Timers", Some(&timer_id), payload).await
+}
+
+async fn update_live_tv_series_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(timer_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    upsert_live_tv_timer(&state.db, "SeriesTimers", Some(&timer_id), payload).await
+}
+
+async fn delete_live_tv_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(timer_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(StatusCode::NOT_IMPLEMENTED)
+    delete_persisted_live_tv_timer(&state.db, "Timers", &timer_id).await
+}
+
+async fn delete_live_tv_series_timer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(timer_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    delete_persisted_live_tv_timer(&state.db, "SeriesTimers", &timer_id).await
+}
+
+async fn live_tv_timer_list(
+    db: &Database,
+    key: &'static str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let items = live_tv_timer_items(&config, key);
+    Ok(Json(query_result(items)))
+}
+
+async fn live_tv_timer_by_id(
+    db: &Database,
+    key: &'static str,
+    timer_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let timer = live_tv_timer_items(&config, key)
+        .into_iter()
+        .find(|timer| {
+            timer
+                .get("Id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.eq_ignore_ascii_case(timer_id))
+        })
+        .ok_or_else(|| ApiError::not_found("Live TV timer not found"))?;
+    Ok(Json(timer))
+}
+
+async fn upsert_live_tv_timer(
+    db: &Database,
+    key: &'static str,
+    path_timer_id: Option<&str>,
+    payload: serde_json::Value,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !payload.is_object() {
+        return Err(ApiError::bad_request("Live TV timer must be an object"));
+    }
+    let mut config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let mut timer = normalize_live_tv_timer(payload, path_timer_id, key == "SeriesTimers");
+    let timer_id = timer
+        .get("Id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut timers = config
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(existing) = timers.iter_mut().find(|existing| {
+        existing
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
+    }) {
+        *existing = timer.clone();
+    } else {
+        timers.push(timer.clone());
+    }
+    config[key] = serde_json::json!(timers);
+    db.update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await?;
+    Ok(Json(std::mem::take(&mut timer)))
+}
+
+async fn delete_persisted_live_tv_timer(
+    db: &Database,
+    key: &'static str,
+    timer_id: &str,
+) -> Result<StatusCode, ApiError> {
+    let mut config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let mut timers = config
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let before = timers.len();
+    timers.retain(|timer| {
+        timer
+            .get("Id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|id| !id.eq_ignore_ascii_case(timer_id))
+    });
+    if timers.len() == before {
+        return Err(ApiError::not_found("Live TV timer not found"));
+    }
+    config[key] = serde_json::json!(timers);
+    db.update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn live_tv_timer_items(config: &serde_json::Value, key: &'static str) -> Vec<serde_json::Value> {
+    config
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn normalize_live_tv_timer(
+    payload: serde_json::Value,
+    path_timer_id: Option<&str>,
+    is_series: bool,
+) -> serde_json::Value {
+    let mut timer = serde_json::json!({
+        "Id": Uuid::new_v4().simple().to_string(),
+        "ProgramId": null,
+        "ChannelId": null,
+        "Name": "",
+        "Overview": "",
+        "StartDate": null,
+        "EndDate": null,
+        "PrePaddingSeconds": 0,
+        "PostPaddingSeconds": 0,
+        "Priority": 0,
+        "IsPrePaddingRequired": false,
+        "IsPostPaddingRequired": false,
+        "KeepUntil": "UntilDeleted",
+        "RecordAnyTime": false,
+        "SkipEpisodesInLibrary": false,
+        "RecordAnyChannel": false,
+        "NewOnly": false,
+        "Days": [],
+        "IsSeries": is_series
+    });
+    if let serde_json::Value::Object(fields) = payload {
+        for (key, value) in fields {
+            timer[key] = value;
+        }
+    }
+    if let Some(path_timer_id) = path_timer_id
+        .map(str::trim)
+        .filter(|timer_id| !timer_id.is_empty())
+    {
+        timer["Id"] = serde_json::json!(path_timer_id);
+    } else if timer
+        .get("Id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .is_none()
+    {
+        timer["Id"] = serde_json::json!(Uuid::new_v4().simple().to_string());
+    }
+    timer["IsSeries"] = serde_json::json!(is_series);
+    timer
 }
 
 async fn live_tv_timer_defaults(
@@ -22799,26 +23032,168 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
         }
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/Timers")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ProgramId": "program-1", "Name": "Unauthorized Timer" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/Timers")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "timer-1",
+                            "ProgramId": "program-1",
+                            "ChannelId": "channel-1",
+                            "Name": "Evening News",
+                            "PrePaddingSeconds": 30
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let timer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(timer["Id"], "timer-1");
+        assert_eq!(timer["Name"], "Evening News");
+        assert_eq!(timer["IsSeries"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Timers")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let timers: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(timers["TotalRecordCount"], 1);
+        assert_eq!(timers["Items"][0]["Id"], "timer-1");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/Timers/timer-1")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Name": "Late News",
+                            "ProgramId": "program-2",
+                            "PostPaddingSeconds": 45
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_timer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_timer["Id"], "timer-1");
+        assert_eq!(updated_timer["Name"], "Late News");
+        assert_eq!(updated_timer["PostPaddingSeconds"], 45);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Timers/timer-1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fetched_timer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fetched_timer["Name"], "Late News");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/SeriesTimers")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Id": "series-timer-1", "Name": "Daily Show", "RecordAnyTime": true })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let series_timer: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(series_timer["Id"], "series-timer-1");
+        assert_eq!(series_timer["IsSeries"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/SeriesTimers")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let series_timers: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(series_timers["TotalRecordCount"], 1);
+        assert_eq!(series_timers["Items"][0]["Id"], "series-timer-1");
+
         for endpoint in [
-            "/LiveTv/Timers",
-            "/LiveTv/Timers/timer-missing",
-            "/LiveTv/SeriesTimers",
-            "/LiveTv/SeriesTimers/timer-missing",
+            "/LiveTv/Timers/timer-1",
+            "/LiveTv/SeriesTimers/series-timer-1",
         ] {
             let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .method(Method::POST)
+                        .method(Method::DELETE)
                         .uri(endpoint)
                         .header("X-Emby-Token", &api_key)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(json!({ "ProgramId": "missing" }).to_string()))
+                        .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{endpoint}");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
         }
 
         let response = app
