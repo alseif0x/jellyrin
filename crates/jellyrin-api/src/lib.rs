@@ -7556,6 +7556,23 @@ async fn live_tv_channel(
     Ok(Json(channel))
 }
 
+async fn live_tv_channel_by_id(
+    db: &Database,
+    channel_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    live_tv_channel_items(&config)
+        .into_iter()
+        .find(|channel| {
+            json_string_field(channel, "Id")
+                .is_some_and(|id| id.eq_ignore_ascii_case(channel_id.trim()))
+        })
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct LiveTvProgramsQuery {
     #[serde(flatten)]
@@ -7651,8 +7668,19 @@ async fn live_tv_stream_file(
     Path((stream_id, container)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let recording = live_tv_recording_by_id(&state.db, &stream_id).await?;
-    let path = live_tv_recording_path(&recording)?;
+    if let Ok(recording) = live_tv_recording_by_id(&state.db, &stream_id).await {
+        let path = live_tv_recording_path(&recording)?;
+        let path_container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        if !path_container.eq_ignore_ascii_case(container.trim()) {
+            return Err(ApiError::not_found("Live TV stream not found"));
+        }
+        return stream_live_tv_recording(recording, &headers).await;
+    }
+    let channel = live_tv_channel_by_id(&state.db, &stream_id).await?;
+    let path = live_tv_channel_path(&channel)?;
     let path_container = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -7660,7 +7688,7 @@ async fn live_tv_stream_file(
     if !path_container.eq_ignore_ascii_case(container.trim()) {
         return Err(ApiError::not_found("Live TV stream not found"));
     }
-    stream_live_tv_recording(recording, &headers).await
+    stream_live_tv_channel(channel, &headers).await
 }
 
 async fn live_tv_recordings(
@@ -7721,6 +7749,15 @@ async fn stream_live_tv_recording(
     headers: &HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
     let path = live_tv_recording_path(&recording)?;
+    let content_type = live_tv_recording_content_type(&path).to_string();
+    stream_path(path, content_type, headers, true).await
+}
+
+async fn stream_live_tv_channel(
+    channel: serde_json::Value,
+    headers: &HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let path = live_tv_channel_path(&channel)?;
     let content_type = live_tv_recording_content_type(&path).to_string();
     stream_path(path, content_type, headers, true).await
 }
@@ -7899,7 +7936,64 @@ fn live_tv_channel_item(
     base["LocationType"] = serde_json::json!("Remote");
     base["RunTimeTicks"] = serde_json::Value::Null;
     base["CurrentProgram"] = serde_json::Value::Null;
+    if live_tv_channel_path(&base).is_ok()
+        && let Ok(media_source) = live_tv_channel_media_source(&base)
+    {
+        base["MediaSources"] = serde_json::json!([media_source]);
+    }
     Some(base)
+}
+
+fn live_tv_channel_path(channel: &serde_json::Value) -> Result<PathBuf, ApiError> {
+    json_string_field(channel, "Path")
+        .or_else(|| json_string_field(channel, "MediaPath"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| ApiError::not_found("Live TV stream not found"))
+}
+
+fn live_tv_channel_media_source(
+    channel: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let channel_id = json_string_field(channel, "Id")
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    let name = json_string_field(channel, "Name").unwrap_or_else(|| channel_id.clone());
+    let path = live_tv_channel_path(channel)?;
+    let container = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "ts".to_string());
+    Ok(serde_json::json!({
+        "Protocol": "File",
+        "Id": channel_id,
+        "Path": path.to_string_lossy().to_string(),
+        "Type": "Default",
+        "Container": container,
+        "Name": name,
+        "IsRemote": false,
+        "DirectStreamUrl": format!("/LiveTv/LiveStreamFiles/{channel_id}/stream.{container}"),
+        "ETag": null,
+        "RunTimeTicks": null,
+        "ReadAtNativeFramerate": true,
+        "SupportsTranscoding": false,
+        "SupportsDirectStream": true,
+        "SupportsDirectPlay": true,
+        "IsInfiniteStream": true,
+        "RequiresOpening": false,
+        "RequiresClosing": true,
+        "RequiresLooping": false,
+        "SupportsProbing": false,
+        "VideoType": "VideoFile",
+        "MediaStreams": [{
+            "Codec": container,
+            "Type": "Video",
+            "Index": 0,
+            "IsInterlaced": false
+        }],
+        "Formats": [],
+        "Bitrate": null
+    }))
 }
 
 fn live_tv_program_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -12921,6 +13015,15 @@ async fn open_live_stream(
         .or(body.media_source_id)
         .or(body.open_token)
         .ok_or_else(|| ApiError::bad_request("ItemId is required"))?;
+    if let Ok(channel) = live_tv_channel_by_id(&state.db, &item_id).await {
+        let media_source = live_tv_channel_media_source(&channel)?;
+        let live_stream_id = json_string_field(&channel, "Id").unwrap_or(item_id);
+        return Ok(Json(serde_json::json!({
+            "MediaSource": media_source,
+            "LiveStreamId": live_stream_id,
+            "MediaSourceId": live_stream_id,
+        })));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_json = media_item_to_json(&item, &server_id);
@@ -12946,6 +13049,7 @@ async fn close_live_stream(
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     if let Some(Json(body)) = body
         && let Some(item_id) = body.live_stream_id.or(body.media_source_id)
+        && live_tv_channel_by_id(&state.db, &item_id).await.is_err()
     {
         media_item_by_id(&state.db, &item_id).await?;
     }
@@ -23036,6 +23140,10 @@ mod tests {
         tokio::fs::write(&recording_file, b"recorded transport stream")
             .await
             .unwrap();
+        let live_channel_file = tmp.path().join("News HD.ts");
+        tokio::fs::write(&live_channel_file, b"live channel bytes")
+            .await
+            .unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -23099,7 +23207,12 @@ mod tests {
                 "Url": "http://192.0.2.10",
                 "FriendlyName": "Primary tuner",
                 "Channels": [
-                    { "Id": "channel-1", "Name": "News HD", "Number": "1" },
+                    {
+                        "Id": "channel-1",
+                        "Name": "News HD",
+                        "Number": "1",
+                        "Path": live_channel_file.to_string_lossy()
+                    },
                     { "Id": "channel-2", "Name": "Movies", "Number": "2" }
                 ]
             }],
@@ -23800,6 +23913,11 @@ mod tests {
         assert_eq!(channels["Items"][0]["Id"], "channel-1");
         assert_eq!(channels["Items"][0]["Type"], "TvChannel");
         assert_eq!(channels["Items"][0]["TunerHostId"], "tuner-1");
+        assert_eq!(channels["Items"][0]["MediaSources"][0]["Id"], "channel-1");
+        assert_eq!(
+            channels["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
+            "/LiveTv/LiveStreamFiles/channel-1/stream.ts"
+        );
 
         let response = app
             .clone()
@@ -23817,6 +23935,95 @@ mod tests {
         let channel: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channel["Name"], "Movies");
         assert_eq!(channel["Number"], "2");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/MediaInfo/LiveStreams/Open")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ItemId": "channel-1" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let live_stream: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(live_stream["LiveStreamId"], "channel-1");
+        assert_eq!(live_stream["MediaSource"]["Id"], "channel-1");
+        assert_eq!(live_stream["MediaSource"]["SupportsDirectPlay"], true);
+        assert_eq!(
+            live_stream["MediaSource"]["DirectStreamUrl"],
+            "/LiveTv/LiveStreamFiles/channel-1/stream.ts"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveStreamFiles/channel-1/stream.ts")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp2t"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"live channel bytes");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveStreamFiles/channel-1/stream.ts")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=5-11")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"channel");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveStreamFiles/channel-2/stream.ts")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/MediaInfo/LiveStreams/Close")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "LiveStreamId": "channel-1" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
