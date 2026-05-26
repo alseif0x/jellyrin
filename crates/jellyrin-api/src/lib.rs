@@ -19870,16 +19870,23 @@ async fn system_endpoint() -> Json<serde_json::Value> {
 
 #[derive(Debug, Deserialize)]
 struct BitrateQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
     #[serde(alias = "Size")]
     size: Option<usize>,
 }
 
-async fn bitrate_test(Query(query): Query<BitrateQuery>) -> impl IntoResponse {
+async fn bitrate_test(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BitrateQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let size = query.size.unwrap_or_default().min(1_000_000);
-    (
+    Ok((
         [(header::CONTENT_TYPE, "application/octet-stream")],
         vec![0u8; size],
-    )
+    ))
 }
 
 async fn item_placeholder_image(
@@ -31116,9 +31123,36 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/MediaInfo/Playback/BitrateTest?Size=8")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.len(), 8);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playback/BitrateTest?Size=4&api_key={api_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 4);
 
         let response = app
             .clone()
