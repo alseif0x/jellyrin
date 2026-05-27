@@ -2638,9 +2638,50 @@ async fn system_info(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-) -> Result<Json<PublicSystemInfo>, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     require_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    system_info_public(State(state)).await
+    let server = state.db.server_state().await?;
+    let data_root = state
+        .log_dir
+        .parent()
+        .unwrap_or(state.log_dir.as_path())
+        .to_string_lossy()
+        .to_string();
+    let web_path = state.web_dir.to_string_lossy().to_string();
+    let log_path = state.log_dir.to_string_lossy().to_string();
+    Ok(Json(serde_json::json!({
+        "Id": server.server_id,
+        "ServerName": server.server_name,
+        "Version": COMPATIBLE_SERVER_VERSION,
+        "ProductName": COMPATIBLE_PRODUCT_NAME,
+        "OperatingSystem": "Linux",
+        "OperatingSystemDisplayName": "Linux",
+        "LocalAddress": state.local_address,
+        "StartupWizardCompleted": server.startup_wizard_completed,
+        "CachePath": data_root,
+        "CanLaunchWebBrowser": false,
+        "CanSelfRestart": false,
+        "CastReceiverApplications": [
+            {
+                "Id": "F007D354-F27D-4D8B-A3DD-2A3DE3CFC6DA",
+                "Name": "Stable"
+            }
+        ],
+        "CompletedInstallations": [],
+        "EncoderLocation": "System",
+        "HasPendingRestart": false,
+        "HasUpdateAvailable": false,
+        "InternalMetadataPath": data_root,
+        "IsShuttingDown": false,
+        "ItemsByNamePath": data_root,
+        "LogPath": log_path,
+        "ProgramDataPath": data_root,
+        "SupportsLibraryMonitor": true,
+        "SystemArchitecture": std::env::consts::ARCH,
+        "TranscodingTempPath": data_root,
+        "WebPath": web_path,
+        "WebSocketPortNumber": 0
+    })))
 }
 
 async fn time_sync_utc_time() -> Json<serde_json::Value> {
@@ -3667,9 +3708,8 @@ fn merge_user_configuration(
 
 fn default_user_configuration() -> serde_json::Value {
     serde_json::json!({
-        "AudioLanguagePreference": null,
         "PlayDefaultAudioTrack": true,
-        "SubtitleLanguagePreference": null,
+        "SubtitleLanguagePreference": "",
         "DisplayMissingEpisodes": false,
         "GroupedFolders": [],
         "SubtitleMode": "Default",
@@ -3682,7 +3722,7 @@ fn default_user_configuration() -> serde_json::Value {
         "RememberAudioSelections": true,
         "RememberSubtitleSelections": true,
         "EnableNextEpisodeAutoPlay": true,
-        "CastReceiverId": null
+        "CastReceiverId": "F007D354-F27D-4D8B-A3DD-2A3DE3CFC6DA"
     })
 }
 
@@ -4482,13 +4522,18 @@ async fn package_repositories(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(repository_infos_from_config(
+    let repositories = repository_infos_from_config(
         state
             .db
             .system_configuration_payloads()
             .await?
             .plugin_repositories,
-    )))
+    );
+    Ok(Json(if repositories.is_empty() {
+        default_plugin_repositories()
+    } else {
+        repositories
+    }))
 }
 
 async fn update_package_repositories(
@@ -4568,6 +4613,14 @@ fn normalize_repository_info(value: serde_json::Value) -> Option<serde_json::Val
         );
     }
     Some(normalized)
+}
+
+fn default_plugin_repositories() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "Name": "Jellyfin Stable",
+        "Url": "https://repo.jellyfin.org/releases/plugin/manifest-stable.json",
+        "Enabled": true
+    })]
 }
 
 fn package_infos_from_repositories(value: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -6350,16 +6403,15 @@ async fn library_scan_task_json(db: &Database) -> Result<serde_json::Value, ApiE
     Ok(serde_json::json!({
         "Name": "Scan Media Library",
         "State": state,
-        "CurrentProgressPercentage": null,
         "Id": LIBRARY_SCAN_TASK_ID,
-        "LastExecutionResult": last_result.as_ref().map(task_run_result_json),
+        "LastExecutionResult": last_result
+            .as_ref()
+            .map(task_run_result_json)
+            .unwrap_or_else(default_library_scan_task_result_json),
         "Triggers": [
             {
                 "Type": "IntervalTrigger",
-                "TimeOfDayTicks": null,
                 "IntervalTicks": 43_200_000_000_i64,
-                "DayOfWeek": null,
-                "MaxRuntimeTicks": null,
             }
         ],
         "Description": "Scans configured Jellyrin media libraries.",
@@ -6386,9 +6438,19 @@ fn task_run_result_json(run: &TaskRun) -> serde_json::Value {
         "Id": run.id.to_string(),
         "Status": status,
         "StartTimeUtc": format_time_for_json(run.started_at),
-        "EndTimeUtc": run.completed_at.map(format_time_for_json),
-        "ErrorMessage": run.error_message.clone(),
-        "Result": run.result_json.clone(),
+        "EndTimeUtc": run.completed_at.map(format_time_for_json)
+            .unwrap_or_else(|| format_time_for_json(run.updated_at)),
+    })
+}
+
+fn default_library_scan_task_result_json() -> serde_json::Value {
+    serde_json::json!({
+        "Name": "Scan Media Library",
+        "Key": LIBRARY_SCAN_TASK_KEY,
+        "Id": "00000000-0000-0000-0000-000000000000",
+        "Status": "Completed",
+        "StartTimeUtc": "1970-01-01T00:00:00Z",
+        "EndTimeUtc": "1970-01-01T00:00:00Z",
     })
 }
 
@@ -22788,6 +22850,8 @@ async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<User
         id: user.id,
         name: user.name.clone(),
         server_id,
+        last_activity_date: format_time_for_json(user.updated_at),
+        last_login_date: format_time_for_json(user.updated_at),
         has_password: has_configured_password,
         has_configured_password,
         has_configured_easy_password: false,
@@ -22797,12 +22861,15 @@ async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<User
             is_administrator: user.is_administrator,
             is_disabled: user.is_disabled,
             is_hidden: false,
+            invalid_login_attempt_count: 0,
             enable_all_devices: true,
+            enabled_devices: Vec::new(),
             enable_remote_control_of_other_users: user.is_administrator,
             enable_shared_device_control: true,
             enable_remote_access: true,
             enable_collection_management: user.is_administrator,
             enable_subtitle_management: user.is_administrator,
+            enable_lyric_management: user.is_administrator,
             enable_content_downloading: true,
             enable_live_tv_management: user.is_administrator,
             enable_live_tv_access: true,
@@ -22813,6 +22880,20 @@ async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<User
             force_remote_source_transcoding: false,
             enable_content_deletion: false,
             enable_content_deletion_from_folders: Vec::new(),
+            enable_media_conversion: true,
+            enable_sync_transcoding: true,
+            enable_public_sharing: true,
+            enable_user_preference_access: true,
+            enable_all_channels: true,
+            enabled_channels: Vec::new(),
+            blocked_channels: Vec::new(),
+            enable_all_folders: true,
+            enabled_folders: Vec::new(),
+            blocked_media_folders: Vec::new(),
+            allowed_tags: Vec::new(),
+            blocked_tags: Vec::new(),
+            block_unrated_items: Vec::new(),
+            access_schedules: Vec::new(),
             remote_client_bitrate_limit: 0,
             login_attempts_before_lockout: -1,
             max_active_sessions: 0,
@@ -24978,7 +25059,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let repositories: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(repositories.as_array().unwrap().len(), 0);
+        assert_eq!(repositories.as_array().unwrap().len(), 1);
+        assert_eq!(repositories[0]["Name"], "Jellyfin Stable");
+        assert_eq!(repositories[0]["Enabled"], true);
 
         let response = app
             .clone()

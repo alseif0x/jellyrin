@@ -20,12 +20,12 @@ const publicCases = [
 
 const authenticatedCases = [
   { name: 'system-info', method: 'GET', path: '/System/Info' },
-  { name: 'users-me', method: 'GET', path: '/Users/Me' },
+  { name: 'users-me', method: 'GET', path: '/Users/Me', requiresUserToken: true },
   { name: 'users', method: 'GET', path: '/Users' },
   { name: 'views', method: 'GET', path: ({ userId }) => `/UserViews?UserId=${encodeURIComponent(userId)}` },
   { name: 'items-movies-first-page', method: 'GET', path: ({ userId }) => `/Items?UserId=${encodeURIComponent(userId)}&IncludeItemTypes=Movie&StartIndex=0&Limit=5` },
-  { name: 'item-detail-movie', method: 'GET', requiresMovie: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}` },
-  { name: 'item-playback-info-movie', method: 'GET', requiresMovie: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo` },
+  { name: 'item-detail-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}` },
+  { name: 'item-playback-info-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo` },
   { name: 'sessions', method: 'GET', path: '/Sessions' },
   { name: 'scheduled-tasks', method: 'GET', path: '/ScheduledTasks' },
   { name: 'repositories', method: 'GET', path: '/Repositories' },
@@ -34,7 +34,7 @@ const authenticatedCases = [
 async function main() {
   const upstreamAuth = await authenticateFromEnv('JELLYFIN', upstreamBaseUrl);
   const jellyrinAuth = await authenticateFromEnv('JELLYRIN', jellyrinBaseUrl);
-  const runAuthenticated = upstreamAuth && jellyrinAuth;
+  const runAuthenticated = Boolean(upstreamAuth && jellyrinAuth);
   const upstreamContext = runAuthenticated
     ? await buildAuthenticatedContext(upstreamBaseUrl, upstreamAuth)
     : {};
@@ -61,6 +61,20 @@ async function main() {
       });
       continue;
     }
+    if (
+      testCase.requiresUserToken
+      && (upstreamAuth?.method === 'api_key' || jellyrinAuth?.method === 'api_key')
+    ) {
+      results.push({
+        name: testCase.name,
+        method: testCase.method,
+        path: typeof testCase.path === 'function' ? '<dynamic>' : testCase.path,
+        authenticated: Boolean(testCase.authenticated),
+        skipped: true,
+        comparison: { ok: true, reason: 'skipped because API-key auth has no current user token' },
+      });
+      continue;
+    }
     const upstream = await requestCase(upstreamBaseUrl, testCase, upstreamAuth, upstreamContext);
     const jellyrin = await requestCase(jellyrinBaseUrl, testCase, jellyrinAuth, jellyrinContext);
     const comparison = compareResponses(upstream, jellyrin);
@@ -81,6 +95,9 @@ async function main() {
     failed: results.filter((result) => !result.comparison.ok).length,
     skipped: results.filter((result) => result.skipped).length,
     authenticated: runAuthenticated,
+    authMethods: runAuthenticated
+      ? { upstream: upstreamAuth.method, jellyrin: jellyrinAuth.method }
+      : null,
   };
   const report = {
     generatedAt: new Date().toISOString(),
@@ -104,6 +121,15 @@ async function main() {
 }
 
 async function authenticateFromEnv(prefix, baseUrl) {
+  const apiKey = process.env[`${prefix}_API_KEY`];
+  if (apiKey) {
+    return {
+      accessToken: apiKey,
+      userId: null,
+      method: 'api_key',
+    };
+  }
+
   const username = process.env[`${prefix}_ADMIN_USER`];
   const password = process.env[`${prefix}_ADMIN_PASSWORD`];
   if (!username || !password) {
@@ -124,6 +150,7 @@ async function authenticateFromEnv(prefix, baseUrl) {
   return {
     accessToken: body.AccessToken,
     userId: body.User?.Id,
+    method: 'password',
   };
 }
 
@@ -132,8 +159,20 @@ async function buildAuthenticatedContext(baseUrl, auth) {
     userId: auth.userId,
     movieItemId: null,
   };
+  if (!context.userId) {
+    const usersResponse = await fetch(`${baseUrl}/Users`, {
+      headers: { 'X-Emby-Token': auth.accessToken },
+    });
+    if (usersResponse.ok && usersResponse.headers.get('content-type')?.includes('application/json')) {
+      const users = await usersResponse.json();
+      context.userId = users?.[0]?.Id || null;
+    }
+  }
+  if (!context.userId) {
+    return context;
+  }
   const response = await fetch(
-    `${baseUrl}/Items?UserId=${encodeURIComponent(auth.userId)}&IncludeItemTypes=Movie&StartIndex=0&Limit=1`,
+    `${baseUrl}/Items?UserId=${encodeURIComponent(context.userId)}&IncludeItemTypes=Movie&StartIndex=0&Limit=1`,
     { headers: { 'X-Emby-Token': auth.accessToken } },
   );
   if (response.ok && response.headers.get('content-type')?.includes('application/json')) {
