@@ -2820,9 +2820,16 @@ async fn create_backup(
     Json(payload): Json<Option<BackupOptionsBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let options = backup_options_json(payload);
+    let restore_snapshot = backup_restore_snapshot_json(&state.db).await?;
     let manifest = state
         .db
-        .create_backup_manifest(COMPATIBLE_SERVER_VERSION, "1", backup_options_json(payload))
+        .create_backup_manifest(
+            COMPATIBLE_SERVER_VERSION,
+            "1",
+            options,
+            Some(restore_snapshot),
+        )
         .await?;
     record_activity(
         &state.db,
@@ -2855,19 +2862,30 @@ async fn restore_backup(
     Query(query): Query<AuthQuery>,
     Json(payload): Json<BackupRestoreBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let archive = payload.archive_file_name.trim();
     if archive.is_empty() {
         return Err(ApiError::bad_request("ArchiveFileName must not be empty"));
     }
-    state
+    let manifest = state
         .db
         .backup_manifest(archive)
         .await?
         .ok_or_else(|| ApiError::not_found("Backup manifest not found"))?;
-    Err(ApiError::conflict(
-        "Backup restore is not implemented in Jellyrin yet",
-    ))
+    let snapshot = manifest
+        .restore_snapshot
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("Backup manifest does not contain restore data"))?;
+    restore_backup_data(&state.db, snapshot).await?;
+    record_activity(
+        &state.db,
+        "Backup restored",
+        Some(&format!("Backup manifest {archive} was restored.")),
+        "System",
+        Some(user.id),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn backup_options_json(payload: Option<BackupOptionsBody>) -> serde_json::Value {
@@ -2883,6 +2901,116 @@ fn backup_options_json(payload: Option<BackupOptionsBody>) -> serde_json::Value 
         "Subtitles": payload.subtitles.unwrap_or(false),
         "Database": payload.database.unwrap_or(true)
     })
+}
+
+async fn backup_restore_snapshot_json(db: &Database) -> Result<serde_json::Value, ApiError> {
+    Ok(serde_json::json!({
+        "Version": 1,
+        "StartupConfig": db.startup_config().await?,
+        "SystemConfigurationPayloads": system_configuration_payloads_backup_json(
+            db.system_configuration_payloads().await?
+        ),
+        "BrandingConfiguration": branding_backup_json(db.branding_config().await?)
+    }))
+}
+
+async fn restore_backup_data(db: &Database, snapshot: &serde_json::Value) -> Result<(), ApiError> {
+    let version = snapshot
+        .get("Version")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| ApiError::bad_request("Backup snapshot version is missing"))?;
+    if version != 1 {
+        return Err(ApiError::bad_request(format!(
+            "Unsupported backup snapshot version {version}"
+        )));
+    }
+    let startup = snapshot.get("StartupConfig").ok_or_else(|| {
+        ApiError::bad_request("Backup manifest does not contain startup configuration")
+    })?;
+    let system_payloads = snapshot.get("SystemConfigurationPayloads").ok_or_else(|| {
+        ApiError::bad_request("Backup manifest does not contain system configuration")
+    })?;
+    let branding = snapshot.get("BrandingConfiguration").ok_or_else(|| {
+        ApiError::bad_request("Backup manifest does not contain branding configuration")
+    })?;
+
+    db.update_startup_config(startup_config_from_backup(startup)?)
+        .await?;
+    db.update_system_configuration_payloads(system_configuration_payloads_from_backup(
+        system_payloads,
+    )?)
+    .await?;
+    db.update_branding_config(branding_from_backup(branding)?)
+        .await?;
+    Ok(())
+}
+
+fn startup_config_from_backup(value: &serde_json::Value) -> Result<StartupConfig, ApiError> {
+    serde_json::from_value(value.clone()).map_err(|error| {
+        ApiError::bad_request(format!("Invalid backup startup configuration: {error}"))
+    })
+}
+
+fn system_configuration_payloads_backup_json(
+    payloads: SystemConfigurationPayloads,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ContentTypes": payloads.content_types,
+        "MetadataOptions": payloads.metadata_options,
+        "PathSubstitutions": payloads.path_substitutions,
+        "PluginRepositories": payloads.plugin_repositories,
+        "ServerOptions": payloads.server_options
+    })
+}
+
+fn system_configuration_payloads_from_backup(
+    value: &serde_json::Value,
+) -> Result<SystemConfigurationPayloads, ApiError> {
+    Ok(SystemConfigurationPayloads {
+        content_types: required_backup_value(value, "ContentTypes")?,
+        metadata_options: required_backup_value(value, "MetadataOptions")?,
+        path_substitutions: required_backup_value(value, "PathSubstitutions")?,
+        plugin_repositories: required_backup_value(value, "PluginRepositories")?,
+        server_options: required_backup_value(value, "ServerOptions")?,
+    })
+}
+
+fn branding_backup_json(config: BrandingConfig) -> serde_json::Value {
+    serde_json::json!({
+        "LoginDisclaimer": config.login_disclaimer,
+        "CustomCss": config.custom_css,
+        "SplashscreenEnabled": config.splashscreen_enabled
+    })
+}
+
+fn branding_from_backup(value: &serde_json::Value) -> Result<BrandingConfig, ApiError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("Backup branding configuration must be an object"))?;
+    Ok(BrandingConfig {
+        login_disclaimer: object
+            .get("LoginDisclaimer")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        custom_css: object
+            .get("CustomCss")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        splashscreen_enabled: object
+            .get("SplashscreenEnabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn required_backup_value(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<serde_json::Value, ApiError> {
+    value
+        .get(field)
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request(format!("Backup restore data is missing {field}")))
 }
 
 fn backup_manifest_json(manifest: &BackupManifest) -> serde_json::Value {
@@ -23017,8 +23145,11 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose};
     use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
-    use jellyrin_core::{FfmpegCommandSpec, MediaItem, TranscodeStreamSelection};
-    use jellyrin_db::{Database, UpsertPlaybackState, UpsertTranscodeSession};
+    use jellyrin_core::{FfmpegCommandSpec, MediaItem, StartupConfig, TranscodeStreamSelection};
+    use jellyrin_db::{
+        BrandingConfig, Database, SystemConfigurationPayloads, UpsertPlaybackState,
+        UpsertTranscodeSession,
+    };
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -23657,6 +23788,34 @@ mod tests {
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        db.update_system_configuration_payloads(SystemConfigurationPayloads {
+            content_types: json!([{ "Name": "Movies", "DefaultView": "Poster" }]),
+            metadata_options: json!([{ "ItemType": "Movie", "DisabledMetadataSavers": [] }]),
+            path_substitutions: json!([{ "From": "/media", "To": "/mnt/media" }]),
+            plugin_repositories: json!([{ "Name": "Stable", "Url": "https://repo.example/manifest.json", "Enabled": true }]),
+            server_options: json!({ "EnableMetrics": true }),
+        })
+        .await
+        .unwrap();
+        db.update_startup_config(StartupConfig {
+            server_name: "Snapshot Server".to_string(),
+            ui_culture: "es-ES".to_string(),
+            metadata_country_code: "ES".to_string(),
+            preferred_metadata_language: "es".to_string(),
+            dummy_chapter_duration: 42,
+            chapter_image_resolution: "720p".to_string(),
+            enable_remote_access: true,
+        })
+        .await
+        .unwrap();
+        db.update_branding_config(BrandingConfig {
+            login_disclaimer: Some("Snapshot disclaimer".to_string()),
+            custom_css: Some(".snapshot { color: green; }".to_string()),
+            splashscreen_enabled: true,
+        })
+        .await
+        .unwrap();
+        let db_for_assertions = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -23724,6 +23883,7 @@ mod tests {
         assert_eq!(created["Options"]["Trickplay"], true);
         assert_eq!(created["Options"]["Subtitles"], false);
         assert_eq!(created["Options"]["Database"], true);
+        assert!(created["Options"].get("RestoreData").is_none());
 
         let response = app
             .clone()
@@ -23847,6 +24007,37 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+        db_for_assertions
+            .update_startup_config(StartupConfig {
+                server_name: "Changed Server".to_string(),
+                ui_culture: "en-US".to_string(),
+                metadata_country_code: "US".to_string(),
+                preferred_metadata_language: "en".to_string(),
+                dummy_chapter_duration: 7,
+                chapter_image_resolution: "480p".to_string(),
+                enable_remote_access: false,
+            })
+            .await
+            .unwrap();
+        db_for_assertions
+            .update_system_configuration_payloads(SystemConfigurationPayloads {
+                content_types: json!([{ "Name": "Changed" }]),
+                metadata_options: json!([]),
+                path_substitutions: json!([]),
+                plugin_repositories: json!([]),
+                server_options: json!({ "EnableMetrics": false }),
+            })
+            .await
+            .unwrap();
+        db_for_assertions
+            .update_branding_config(BrandingConfig {
+                login_disclaimer: Some("Changed disclaimer".to_string()),
+                custom_css: Some(".changed { color: red; }".to_string()),
+                splashscreen_enabled: false,
+            })
+            .await
+            .unwrap();
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -23859,7 +24050,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let restored_payloads = db_for_assertions
+            .system_configuration_payloads()
+            .await
+            .unwrap();
+        assert_eq!(restored_payloads.content_types[0]["Name"], "Movies");
+        assert_eq!(restored_payloads.path_substitutions[0]["To"], "/mnt/media");
+        assert_eq!(restored_payloads.server_options["EnableMetrics"], true);
+        let restored_startup = db_for_assertions.startup_config().await.unwrap();
+        assert_eq!(restored_startup.server_name, "Snapshot Server");
+        assert_eq!(restored_startup.ui_culture, "es-ES");
+        assert_eq!(restored_startup.metadata_country_code, "ES");
+        assert_eq!(restored_startup.preferred_metadata_language, "es");
+        assert_eq!(restored_startup.dummy_chapter_duration, 42);
+        assert_eq!(restored_startup.chapter_image_resolution, "720p");
+        assert!(restored_startup.enable_remote_access);
+        let restored_branding = db_for_assertions.branding_config().await.unwrap();
+        assert_eq!(
+            restored_branding.login_disclaimer.as_deref(),
+            Some("Snapshot disclaimer")
+        );
+        assert_eq!(
+            restored_branding.custom_css.as_deref(),
+            Some(".snapshot { color: green; }")
+        );
+        assert!(restored_branding.splashscreen_enabled);
     }
 
     #[tokio::test]

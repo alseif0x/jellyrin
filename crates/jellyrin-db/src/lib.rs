@@ -65,6 +65,7 @@ pub struct BackupManifest {
     pub server_version: String,
     pub backup_engine_version: String,
     pub options: Value,
+    pub restore_snapshot: Option<Value>,
     pub created_at: OffsetDateTime,
 }
 
@@ -411,6 +412,7 @@ impl Database {
     }
 
     pub async fn update_startup_config(&self, config: StartupConfig) -> anyhow::Result<()> {
+        let _ = self.server_state().await?;
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
@@ -1391,7 +1393,7 @@ impl Database {
     pub async fn backup_manifests(&self) -> anyhow::Result<Vec<BackupManifest>> {
         let rows = sqlx::query_as::<_, BackupManifestRow>(
             r#"
-            SELECT path, server_version, backup_engine_version, options_json, created_at
+            SELECT path, server_version, backup_engine_version, options_json, restore_snapshot_json, created_at
             FROM backup_manifests
             ORDER BY created_at DESC, path
             "#,
@@ -1405,7 +1407,7 @@ impl Database {
     pub async fn backup_manifest(&self, path: &str) -> anyhow::Result<Option<BackupManifest>> {
         let row = sqlx::query_as::<_, BackupManifestRow>(
             r#"
-            SELECT path, server_version, backup_engine_version, options_json, created_at
+            SELECT path, server_version, backup_engine_version, options_json, restore_snapshot_json, created_at
             FROM backup_manifests
             WHERE path = ?1
             "#,
@@ -1422,6 +1424,7 @@ impl Database {
         server_version: &str,
         backup_engine_version: &str,
         options: Value,
+        restore_snapshot: Option<Value>,
     ) -> anyhow::Result<BackupManifest> {
         let now = OffsetDateTime::now_utc();
         let created_at = format_time(now)?;
@@ -1429,15 +1432,16 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO backup_manifests (
-                path, server_version, backup_engine_version, options_json, created_at
+                path, server_version, backup_engine_version, options_json, restore_snapshot_json, created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
         )
         .bind(&path)
         .bind(server_version)
         .bind(backup_engine_version)
         .bind(serde_json::to_string(&options)?)
+        .bind(restore_snapshot.as_ref().map(serde_json::to_string).transpose()?)
         .bind(created_at)
         .execute(&self.pool)
         .await?;
@@ -1447,6 +1451,7 @@ impl Database {
             server_version: server_version.to_string(),
             backup_engine_version: backup_engine_version.to_string(),
             options,
+            restore_snapshot,
             created_at: now,
         })
     }
@@ -4525,6 +4530,7 @@ struct BackupManifestRow {
     server_version: String,
     backup_engine_version: String,
     options_json: String,
+    restore_snapshot_json: Option<String>,
     created_at: String,
 }
 
@@ -5314,6 +5320,10 @@ impl TryFrom<BackupManifestRow> for BackupManifest {
             server_version: row.server_version,
             backup_engine_version: row.backup_engine_version,
             options: serde_json::from_str(&row.options_json).context("invalid backup options")?,
+            restore_snapshot: row
+                .restore_snapshot_json
+                .map(|snapshot| serde_json::from_str(&snapshot).context("invalid backup snapshot"))
+                .transpose()?,
             created_at: parse_time(&row.created_at)?,
         })
     }
@@ -6001,6 +6011,7 @@ mod tests {
                     "Trickplay": true,
                     "Database": true
                 }),
+                Some(json!({ "Version": 1 })),
             )
             .await
             .unwrap();
@@ -6008,6 +6019,7 @@ mod tests {
         assert_eq!(created.server_version, "12.0.0");
         assert_eq!(created.backup_engine_version, "1");
         assert_eq!(created.options["Database"], true);
+        assert_eq!(created.restore_snapshot.as_ref().unwrap()["Version"], 1);
 
         let manifests = db.backup_manifests().await.unwrap();
         assert_eq!(manifests.len(), 1);
@@ -6016,6 +6028,7 @@ mod tests {
         let manifest = db.backup_manifest(&created.path).await.unwrap().unwrap();
         assert_eq!(manifest.path, created.path);
         assert_eq!(manifest.options["Metadata"], true);
+        assert_eq!(manifest.restore_snapshot.as_ref().unwrap()["Version"], 1);
         assert!(db.backup_manifest("missing.zip").await.unwrap().is_none());
     }
 
