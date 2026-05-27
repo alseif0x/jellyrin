@@ -31014,23 +31014,33 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Library/MediaFolders")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let media_folders: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(media_folders["TotalRecordCount"], 1);
-        assert_eq!(media_folders["Items"][0]["Name"], "Movies");
-        assert_eq!(media_folders["Items"][0]["CollectionType"], "movies");
+        for endpoint in [
+            "/Library/MediaFolders",
+            "/library/mediafolders",
+            "/Library/Library/MediaFolders",
+            "/library/library/mediafolders",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let media_folders: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(media_folders["TotalRecordCount"], 1, "{endpoint}");
+            assert_eq!(media_folders["Items"][0]["Name"], "Movies", "{endpoint}");
+            assert_eq!(
+                media_folders["Items"][0]["CollectionType"], "movies",
+                "{endpoint}"
+            );
+        }
 
         let response = app
             .clone()
@@ -31044,7 +31054,12 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        for endpoint in ["/Library/PhysicalPaths", "/Library/Library/PhysicalPaths"] {
+        for endpoint in [
+            "/Library/PhysicalPaths",
+            "/library/physicalpaths",
+            "/Library/Library/PhysicalPaths",
+            "/library/library/physicalpaths",
+        ] {
             let response = app
                 .clone()
                 .oneshot(
@@ -31079,19 +31094,26 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/Library/Refresh")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        for endpoint in [
+            "/Library/Refresh",
+            "/library/refresh",
+            "/Library/Library/Refresh",
+            "/library/library/refresh",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
 
         let response = app
             .clone()
