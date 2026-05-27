@@ -22982,6 +22982,7 @@ mod tests {
         http::{Method, Request, StatusCode, header},
     };
     use base64::{Engine as _, engine::general_purpose};
+    use futures_util::{SinkExt, StreamExt};
     use http_body_util::BodyExt;
     use jellyrin_core::{FfmpegCommandSpec, MediaItem, TranscodeStreamSelection};
     use jellyrin_db::{Database, UpsertPlaybackState, UpsertTranscodeSession};
@@ -29868,6 +29869,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn websocket_negotiates_upgrade_and_serves_sessions_messages() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Startup/User")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Name": "admin", "Password": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Firefox", DeviceId="socket-test", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        let token = result["AccessToken"].as_str().unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (mut socket, response) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/socket?api_key={token}&deviceId=socket-test"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        let text = socket
+            .next()
+            .await
+            .expect("expected ForceKeepAlive message")
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let message: Value = serde_json::from_str(text.as_ref()).unwrap();
+        assert_eq!(message["MessageType"], "ForceKeepAlive");
+        assert_eq!(message["Data"], 60);
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({ "MessageType": "SessionsStart" }).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        let text = socket
+            .next()
+            .await
+            .expect("expected Sessions message")
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let message: Value = serde_json::from_str(text.as_ref()).unwrap();
+        assert_eq!(message["MessageType"], "Sessions");
+        assert!(
+            message["Data"]
+                .as_array()
+                .is_some_and(|sessions| !sessions.is_empty())
+        );
+
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     fn websocket_request(uri: &str) -> axum::http::request::Builder {
