@@ -5,6 +5,7 @@ const path = require('node:path');
 
 const upstreamBaseUrl = trimTrailingSlash(process.env.JELLYFIN_UPSTREAM_URL || 'http://127.0.0.1:8096');
 const jellyrinBaseUrl = trimTrailingSlash(process.env.JELLYRIN_URL || 'http://127.0.0.1:8097');
+const goldenMode = process.env.JELLYRIN_GOLDEN_MODE || 'smoke';
 const outputPath = process.env.JELLYRIN_GOLDEN_OUT
   || path.resolve(__dirname, '../../../../plans/generated/golden-traces/api-parity-latest.json');
 
@@ -32,6 +33,10 @@ const authenticatedCases = [
 ];
 
 async function main() {
+  if (!['smoke', 'strict'].includes(goldenMode)) {
+    throw new Error(`Unsupported JELLYRIN_GOLDEN_MODE: ${goldenMode}`);
+  }
+
   const upstreamAuth = await authenticateFromEnv('JELLYFIN', upstreamBaseUrl);
   const jellyrinAuth = await authenticateFromEnv('JELLYRIN', jellyrinBaseUrl);
   const runAuthenticated = Boolean(upstreamAuth && jellyrinAuth);
@@ -90,7 +95,7 @@ async function main() {
       });
       continue;
     }
-    const comparison = compareResponses(upstream, jellyrin);
+    const comparison = compareResponses(testCase, upstream, jellyrin);
     results.push({
       name: testCase.name,
       method: testCase.method,
@@ -107,6 +112,8 @@ async function main() {
     passed: results.filter((result) => result.comparison.ok && !result.skipped).length,
     failed: results.filter((result) => !result.comparison.ok).length,
     skipped: results.filter((result) => result.skipped).length,
+    mode: goldenMode,
+    strictEvaluated: results.filter((result) => result.comparison.strict?.evaluated).length,
     authenticated: runAuthenticated,
     authMethods: runAuthenticated
       ? { upstream: upstreamAuth.method, jellyrin: jellyrinAuth.method }
@@ -114,6 +121,7 @@ async function main() {
   };
   const report = {
     generatedAt: new Date().toISOString(),
+    mode: goldenMode,
     upstreamBaseUrl,
     jellyrinBaseUrl,
     summary,
@@ -217,12 +225,12 @@ async function requestCase(baseUrl, testCase, auth, context = {}) {
   };
 }
 
-function compareResponses(upstream, jellyrin) {
+function compareResponses(testCase, upstream, jellyrin) {
   if (upstream.status !== jellyrin.status) {
     return { ok: false, reason: `status ${upstream.status} != ${jellyrin.status}` };
   }
   if (upstream.status >= 400) {
-    return { ok: true, reason: 'matched error status' };
+    return { ok: true, reason: 'matched error status', strict: { evaluated: false } };
   }
   const upstreamShape = shapeOf(upstream.body);
   const jellyrinShape = shapeOf(jellyrin.body);
@@ -232,7 +240,178 @@ function compareResponses(upstream, jellyrin) {
       reason: `shape mismatch upstream=${JSON.stringify(upstreamShape)} jellyrin=${JSON.stringify(jellyrinShape)}`,
     };
   }
-  return { ok: true, reason: 'matched status and normalized shape' };
+  const strict = goldenMode === 'strict'
+    ? strictCompare(testCase.name, upstream.body, jellyrin.body)
+    : { evaluated: false };
+  if (!strict.ok) {
+    return { ok: false, reason: strict.reason, strict };
+  }
+  return {
+    ok: true,
+    reason: strict.evaluated
+      ? 'matched status, normalized shape and strict critical fields'
+      : 'matched status and normalized shape',
+    strict,
+  };
+}
+
+function strictCompare(caseName, upstreamBody, jellyrinBody) {
+  const assertions = strictAssertions(caseName);
+  if (assertions.length === 0) {
+    return { evaluated: false, ok: true };
+  }
+  const failures = assertions
+    .map((assertion) => assertion(upstreamBody, jellyrinBody))
+    .filter(Boolean);
+  return {
+    evaluated: true,
+    ok: failures.length === 0,
+    reason: failures.join('; '),
+  };
+}
+
+function strictAssertions(caseName) {
+  switch (caseName) {
+    case 'public-info':
+      return [
+        sameField('ProductName'),
+        sameField('Version'),
+        sameField('StartupWizardCompleted'),
+      ];
+    case 'branding-configuration':
+      return [
+        sameType('SplashscreenEnabled'),
+      ];
+    case 'branding-css':
+      return [
+        sameValue((body) => body, 'css text'),
+      ];
+    case 'system-info':
+      return [
+        sameField('ProductName'),
+        sameField('Version'),
+        sameField('StartupWizardCompleted'),
+        sameType('HasPendingRestart'),
+        sameType('IsShuttingDown'),
+        sameType('SupportsLibraryMonitor'),
+        sameType('CompletedInstallations'),
+        sameType('CastReceiverApplications'),
+      ];
+    case 'users':
+      return [
+        arrayItemsHaveFields(['Name', 'Id', 'ServerId', 'HasPassword', 'Policy', 'Configuration']),
+        firstArrayItemHasFields(['Policy.IsAdministrator', 'Policy.EnableMediaPlayback', 'Policy.SyncPlayAccess']),
+      ];
+    case 'items-movies-first-page':
+      return [
+        queryResultHasFields(['Items', 'TotalRecordCount', 'StartIndex']),
+        firstItemHasFields(['Id', 'Name', 'Type', 'ImageTags', 'UserData']),
+      ];
+    case 'scheduled-tasks':
+      return [
+        arrayContainsFieldValue('Key', 'RefreshLibrary'),
+        arrayItemsHaveFields(['Name', 'State', 'Id', 'Key', 'Category', 'IsHidden']),
+      ];
+    case 'repositories':
+      return [
+        arrayContainsFieldValue('Name', 'Jellyfin Stable'),
+        arrayItemsHaveFields(['Name', 'Url', 'Enabled']),
+      ];
+    default:
+      return [];
+  }
+}
+
+function sameField(pathExpression) {
+  return (upstreamBody, jellyrinBody) => {
+    const upstreamValue = getPath(upstreamBody, pathExpression);
+    const jellyrinValue = getPath(jellyrinBody, pathExpression);
+    return JSON.stringify(upstreamValue) === JSON.stringify(jellyrinValue)
+      ? null
+      : `${pathExpression} strict mismatch upstream=${JSON.stringify(upstreamValue)} jellyrin=${JSON.stringify(jellyrinValue)}`;
+  };
+}
+
+function sameType(pathExpression) {
+  return (upstreamBody, jellyrinBody) => {
+    const upstreamValue = getPath(upstreamBody, pathExpression);
+    const jellyrinValue = getPath(jellyrinBody, pathExpression);
+    return JSON.stringify(shapeOf(upstreamValue)) === JSON.stringify(shapeOf(jellyrinValue))
+      ? null
+      : `${pathExpression} strict type mismatch upstream=${JSON.stringify(shapeOf(upstreamValue))} jellyrin=${JSON.stringify(shapeOf(jellyrinValue))}`;
+  };
+}
+
+function sameValue(projector, label) {
+  return (upstreamBody, jellyrinBody) => {
+    const upstreamValue = projector(upstreamBody);
+    const jellyrinValue = projector(jellyrinBody);
+    return upstreamValue === jellyrinValue
+      ? null
+      : `${label} strict mismatch`;
+  };
+}
+
+function arrayItemsHaveFields(fieldPaths) {
+  return (_upstreamBody, jellyrinBody) => {
+    if (!Array.isArray(jellyrinBody)) {
+      return 'expected Jellyrin body to be an array';
+    }
+    const missing = [];
+    for (const [index, item] of jellyrinBody.entries()) {
+      for (const fieldPath of fieldPaths) {
+        if (getPath(item, fieldPath) === undefined) {
+          missing.push(`[${index}].${fieldPath}`);
+        }
+      }
+    }
+    return missing.length === 0 ? null : `missing strict fields: ${missing.join(', ')}`;
+  };
+}
+
+function firstArrayItemHasFields(fieldPaths) {
+  return (_upstreamBody, jellyrinBody) => {
+    if (!Array.isArray(jellyrinBody) || jellyrinBody.length === 0) {
+      return 'expected Jellyrin body to contain at least one item';
+    }
+    const missing = fieldPaths.filter((fieldPath) => getPath(jellyrinBody[0], fieldPath) === undefined);
+    return missing.length === 0 ? null : `first item missing strict fields: ${missing.join(', ')}`;
+  };
+}
+
+function queryResultHasFields(fieldPaths) {
+  return (_upstreamBody, jellyrinBody) => {
+    const missing = fieldPaths.filter((fieldPath) => getPath(jellyrinBody, fieldPath) === undefined);
+    return missing.length === 0 ? null : `query result missing strict fields: ${missing.join(', ')}`;
+  };
+}
+
+function firstItemHasFields(fieldPaths) {
+  return (_upstreamBody, jellyrinBody) => {
+    const first = jellyrinBody?.Items?.[0];
+    if (!first) {
+      return null;
+    }
+    const missing = fieldPaths.filter((fieldPath) => getPath(first, fieldPath) === undefined);
+    return missing.length === 0 ? null : `first query item missing strict fields: ${missing.join(', ')}`;
+  };
+}
+
+function arrayContainsFieldValue(fieldPath, expectedValue) {
+  return (_upstreamBody, jellyrinBody) => {
+    if (!Array.isArray(jellyrinBody)) {
+      return 'expected Jellyrin body to be an array';
+    }
+    return jellyrinBody.some((item) => getPath(item, fieldPath) === expectedValue)
+      ? null
+      : `missing array item where ${fieldPath}=${JSON.stringify(expectedValue)}`;
+  };
+}
+
+function getPath(value, pathExpression) {
+  return pathExpression
+    .split('.')
+    .reduce((current, part) => (current == null ? undefined : current[part]), value);
 }
 
 function hasOnlyOneEmptyList(upstreamBody, jellyrinBody) {
