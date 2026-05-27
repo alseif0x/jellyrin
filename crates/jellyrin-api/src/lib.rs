@@ -28102,17 +28102,24 @@ mod tests {
             "invalid"
         ]);
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Repositories")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for endpoint in [
+            "/Package/Repositories",
+            "/package/repositories",
+            "/Repositories",
+            "/repositories",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+        }
 
         let response = app
             .clone()
@@ -28134,6 +28141,21 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
+                    .uri("/package/repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(repository_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
                     .uri("/Repositories")
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -28148,38 +28170,50 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/package/repositories")
+                    .method(Method::POST)
+                    .uri("/repositories")
                     .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(repository_payload.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let repositories: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let mut repository_variants = Vec::new();
+        for endpoint in [
+            "/Package/Repositories",
+            "/package/repositories",
+            "/Repositories",
+            "/repositories",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            repository_variants.push(serde_json::from_slice::<Value>(&body).unwrap());
+        }
+
+        let repositories = repository_variants.remove(0);
+        for variant in repository_variants {
+            assert_eq!(variant, repositories);
+        }
         assert_eq!(repositories.as_array().unwrap().len(), 2);
         assert_eq!(repositories[0]["Name"], "Stable");
         assert_eq!(repositories[0]["Url"], "https://repo.example/manifest.json");
         assert_eq!(repositories[0]["Enabled"], true);
         assert_eq!(repositories[1]["Name"], "Disabled");
         assert_eq!(repositories[1]["Enabled"], false);
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Repositories")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let local_repositories: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(local_repositories, repositories);
 
         let response = app
             .clone()
