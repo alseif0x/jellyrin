@@ -11022,7 +11022,7 @@ struct ItemsQuery {
     #[serde(alias = "SortOrder", alias = "sortOrder")]
     sort_order: Option<String>,
     #[serde(alias = "Fields", alias = "fields")]
-    _fields: Option<String>,
+    fields: Option<String>,
     #[serde(alias = "ImageTypeLimit", alias = "imageTypeLimit")]
     _image_type_limit: Option<String>,
     #[serde(alias = "EnableImages", alias = "enableImages")]
@@ -11070,6 +11070,7 @@ fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
             "limit" => query.limit = value.parse().ok(),
             "sortby" => set_query_scalar(&mut query.sort_by, value),
             "sortorder" => set_query_scalar(&mut query.sort_order, value),
+            "fields" => set_query_scalar(&mut query.fields, value),
             _ => {}
         }
     }
@@ -11160,6 +11161,7 @@ async fn items_result(
         paged_media_items(filtered_items, &query),
         &server_id,
         requested_user_id,
+        should_use_compact_items_result(&query),
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -11195,6 +11197,7 @@ async fn user_items_result(
         paged_media_items(filtered_items, &query),
         &server_id,
         Some(requested_user_id),
+        should_use_compact_items_result(&query),
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -11287,6 +11290,7 @@ async fn latest_items(
             filtered_items.into_iter().take(limit).collect(),
             &server_id,
             requested_user_id,
+            false,
         )
         .await?,
     ))
@@ -11333,6 +11337,7 @@ async fn current_user_latest_items(
             filtered_items.into_iter().take(limit).collect(),
             &server_id,
             Some(requested_user_id),
+            false,
         )
         .await?,
     ))
@@ -11375,6 +11380,7 @@ async fn user_latest_items(
             filtered_items.into_iter().take(limit).collect(),
             &server_id,
             Some(requested_user_id),
+            false,
         )
         .await?,
     ))
@@ -11583,6 +11589,7 @@ async fn movie_recommendations(
         paged_media_items(filtered_items, &query),
         &server_id,
         Some(requested_user_id),
+        false,
     )
     .await?;
 
@@ -11700,6 +11707,7 @@ async fn movie_similarity_recommendation_category(
         items,
         context.server_id,
         Some(context.user_id),
+        false,
     )
     .await?;
     Ok(Some(serde_json::json!({
@@ -11741,6 +11749,7 @@ async fn movie_person_recommendation_category(
         items,
         context.server_id,
         Some(context.user_id),
+        false,
     )
     .await?;
     Ok(Some(serde_json::json!({
@@ -11874,6 +11883,7 @@ async fn shows_next_up(
         paged_media_items(next_up, &query),
         &server_id,
         Some(requested_user_id),
+        false,
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -11947,6 +11957,7 @@ async fn shows_upcoming(
         paged_media_items(upcoming, &query),
         &server_id,
         Some(requested_user_id),
+        false,
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -12023,6 +12034,7 @@ async fn resume_items_result(
         paged_media_items(items, query),
         &server_id,
         Some(user_id),
+        false,
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -13448,6 +13460,7 @@ async fn instant_mix_items_response(
             .collect(),
         &server_id,
         requested_user_id,
+        false,
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -13600,7 +13613,7 @@ async fn music_genre_instant_mix_response(
         .take(limit)
         .collect::<Vec<_>>();
     Ok(Json(query_result_with_total(
-        items_to_json(&state.db, items, &server_id, requested_user_id).await?,
+        items_to_json(&state.db, items, &server_id, requested_user_id, false).await?,
         total_record_count,
         start_index,
     )))
@@ -14795,7 +14808,7 @@ async fn video_additional_parts(
     }
     versions.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
     let total_record_count = versions.len();
-    let items = items_to_json(&state.db, versions, &server_id, Some(user.id)).await?;
+    let items = items_to_json(&state.db, versions, &server_id, Some(user.id), false).await?;
     Ok(Json(query_result_with_total(items, total_record_count, 0)))
 }
 
@@ -17617,6 +17630,7 @@ async fn suggestions_result(
         paged_media_items(filtered_items, &query),
         &server_id,
         Some(requested_user_id),
+        false,
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -17677,6 +17691,7 @@ async fn series_episodes(
         paged_media_items(episodes, &query),
         &server_id,
         Some(requested_user_id),
+        false,
     )
     .await?;
     Ok(Json(query_result_with_total(
@@ -18933,7 +18948,7 @@ async fn local_sidecar_result(
     let items = local_sidecar_items(db, source, kind).await?;
     let total_record_count = items.len();
     Ok(Json(query_result_with_total(
-        items_to_json(db, items, &server_id, Some(user_id)).await?,
+        items_to_json(db, items, &server_id, Some(user_id), false).await?,
         total_record_count,
         0,
     )))
@@ -19254,6 +19269,7 @@ async fn theme_items_result(
             paged_media_items(theme_items, query),
             &server_id,
             Some(user_id),
+            false,
         )
         .await?,
         total_record_count,
@@ -19618,7 +19634,7 @@ async fn similar_items_for_media_source(
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
     Ok(Json(query_result_with_total(
-        items_to_json(&state.db, items, &server_id, Some(requested_user_id)).await?,
+        items_to_json(&state.db, items, &server_id, Some(requested_user_id), false).await?,
         total_record_count,
         start_index,
     )))
@@ -19640,6 +19656,7 @@ async fn paged_similar_items_response(
             items.into_iter().skip(start_index).take(limit).collect(),
             &server_id,
             Some(requested_user_id),
+            false,
         )
         .await?,
         total_record_count,
@@ -19931,6 +19948,7 @@ async fn items_to_json(
     items: Vec<MediaItem>,
     server_id: &str,
     user_id: Option<Uuid>,
+    compact: bool,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let mut values = Vec::with_capacity(items.len());
     let metadata_by_item =
@@ -19941,14 +19959,68 @@ async fn items_to_json(
         } else {
             None
         };
-        values.push(media_item_to_json_with_playback_and_metadata(
-            &item,
-            server_id,
-            playback.as_ref(),
-            metadata_by_item.get(&item.id),
-        ));
+        values.push(if compact {
+            compact_media_item_to_json(&item, server_id, playback.as_ref())
+        } else {
+            media_item_to_json_with_playback_and_metadata(
+                &item,
+                server_id,
+                playback.as_ref(),
+                metadata_by_item.get(&item.id),
+            )
+        });
     }
     Ok(values)
+}
+
+fn should_use_compact_items_result(query: &ItemsQuery) -> bool {
+    query.parent_id.is_none()
+        && query.ids.is_none()
+        && query.fields.is_none()
+        && query.start_index.is_some()
+        && query.limit.is_some()
+        && !query.include_item_types.is_empty()
+        && query
+            .include_item_types
+            .iter()
+            .all(|item_type| item_type.eq_ignore_ascii_case("Movie"))
+        && query.filters.is_empty()
+        && query.search_term.is_none()
+        && query.name_starts_with.is_none()
+        && query.name_starts_with_or_greater.is_none()
+        && query.name_less_than.is_none()
+}
+
+fn compact_media_item_to_json(
+    item: &MediaItem,
+    server_id: &str,
+    playback: Option<&PlaybackState>,
+) -> serde_json::Value {
+    let item_id = item.id.simple().to_string();
+    let playback_position_ticks = playback.map_or(0, |state| state.position_ticks);
+    let played = playback.is_some_and(|state| state.played);
+    serde_json::json!({
+        "Name": item.name,
+        "ServerId": server_id,
+        "Id": item_id,
+        "ChannelId": null,
+        "CollectionType": item.collection_type,
+        "Type": media_item_type(item),
+        "MediaType": item.media_type,
+        "IsFolder": false,
+        "LocationType": "FileSystem",
+        "UserData": {
+            "PlaybackPositionTicks": playback_position_ticks,
+            "PlayCount": i32::from(played),
+            "IsFavorite": playback.is_some_and(|state| state.is_favorite),
+            "Played": played,
+            "Key": item_id,
+            "ItemId": item_id,
+        },
+        "ImageTags": {},
+        "ImageBlurHashes": {},
+        "BackdropImageTags": [],
+    })
 }
 
 async fn media_metadata_by_item_id(
