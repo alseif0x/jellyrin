@@ -33312,26 +33312,40 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=3600"
+        );
+        assert!(response.headers().contains_key(header::ETAG));
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), uploaded_png.as_slice());
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Branding/Splashscreen")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
-        );
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body.as_ref(), uploaded_png.as_slice());
+        for endpoint in ["/Branding/Splashscreen", "/branding/splashscreen"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/png",
+                "{endpoint}"
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "public, max-age=3600",
+                "{endpoint}"
+            );
+            assert!(response.headers().contains_key(header::ETAG), "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), uploaded_png.as_slice(), "{endpoint}");
+        }
 
         let remote_image_dir = tmp.path().join(".jellyrin-remote-images");
         tokio::fs::create_dir_all(&remote_image_dir).await.unwrap();
