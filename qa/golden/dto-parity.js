@@ -94,6 +94,8 @@ function buildContexts(apiParity, browser) {
     users: apiArrayFirstContext(apiByName.users, 'golden-traces/api-parity-latest.json users body[0]'),
     queryResult: apiBodyContext(apiByName.views || apiByName['items-movies-first-page'], 'golden-traces/api-parity-latest.json QueryResult body'),
     scheduledTask: apiArrayFirstContext(apiByName['scheduled-tasks'], 'golden-traces/api-parity-latest.json scheduled-tasks body[0]'),
+    playbackInfoPostRequest: apiRequestBodyContext(apiByName['item-playback-info-post-movie'], 'golden-traces/api-parity-latest.json item-playback-info-post-movie requestBody'),
+    playbackInfoPostResponse: apiBodyContext(apiByName['item-playback-info-post-movie'], 'golden-traces/api-parity-latest.json item-playback-info-post-movie body'),
     activityLogEntry: apiQueryResultFirstContext(apiByName['activity-log-entries'], 'golden-traces/api-parity-latest.json activity-log-entries body.Items[0]'),
     imageInfo: apiArrayFirstContext(apiByName['item-images-movie'], 'golden-traces/api-parity-latest.json item-images-movie body[0]'),
   };
@@ -111,6 +113,14 @@ function apiBodyContext(result, source) {
   return {
     upstream: result?.upstream?.body,
     jellyrin: result?.jellyrin?.body,
+    source,
+  };
+}
+
+function apiRequestBodyContext(result, source) {
+  return {
+    upstream: result?.upstream?.requestBody,
+    jellyrin: result?.jellyrin?.requestBody,
     source,
   };
 }
@@ -172,14 +182,14 @@ function evaluateField(field, contexts) {
 function ruleFor(field) {
   const name = `${field.dto_family}.${field.field}`;
   const exact = {
-    'PlaybackInfoRequest.EnableDirectPlay': ['playbackInfoRequest', ['EnableDirectPlay']],
-    'PlaybackInfoRequest.EnableDirectStream': ['playbackInfoRequest', ['EnableDirectStream']],
-    'PlaybackInfoRequest.EnableTranscoding': ['playbackInfoRequest', ['EnableTranscoding']],
+    'PlaybackInfoRequest.EnableDirectPlay': ['playbackInfoPostRequest', ['EnableDirectPlay']],
+    'PlaybackInfoRequest.EnableDirectStream': ['playbackInfoPostRequest', ['EnableDirectStream']],
+    'PlaybackInfoRequest.EnableTranscoding': ['playbackInfoPostRequest', ['EnableTranscoding']],
     'PlaybackInfoRequest.MediaSourceId': ['playbackInfoRequest', ['MediaSourceId']],
     'PlaybackInfoRequest.AudioStreamIndex': ['playbackInfoRequest', ['AudioStreamIndex']],
     'PlaybackInfoRequest.SubtitleStreamIndex': ['playbackInfoRequest', ['SubtitleStreamIndex']],
     'PlaybackInfoRequest.StartTimeTicks': ['playbackInfoRequest', ['StartTimeTicks']],
-    'PlaybackInfoRequest.StartPositionTicks': ['playbackInfoRequest', ['StartPositionTicks']],
+    'PlaybackInfoRequest.StartPositionTicks': ['playbackInfoPostRequest', ['StartPositionTicks']],
     'PlaybackInfoRequest.DeviceProfile.DirectPlayProfiles': ['playbackInfoRequest', ['DeviceProfile.DirectPlayProfiles']],
     'PlaybackInfoResponse.ErrorCode': ['playbackInfoResponse', ['ErrorCode']],
     'PlaybackInfoResponse.PlaySessionId': ['playbackInfoResponse', ['PlaySessionId']],
@@ -199,8 +209,8 @@ function ruleFor(field) {
     'MediaStream.Codec': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].Codec']],
     'MediaStream.Width': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].Width']],
     'MediaStream.Height': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].Height']],
-    'MediaStream.Channels': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].Channels']],
-    'MediaStream.SampleRate': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].SampleRate']],
+    'MediaStream.Channels': ['playbackInfoPostResponse', ['MediaSources.[].MediaStreams.[].Channels']],
+    'MediaStream.SampleRate': ['playbackInfoPostResponse', ['MediaSources.[].MediaStreams.[].SampleRate']],
     'MediaStream.FrameRate': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].AverageFrameRate', 'MediaSources.[].MediaStreams.[].RealFrameRate']],
     'MediaStream.Profile': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].Profile']],
     'MediaStream.PixelFormat': ['mediaSourceInfo', ['MediaSources.[].MediaStreams.[].PixelFormat']],

@@ -31,6 +31,22 @@ const authenticatedCases = [
   { name: 'items-movies-first-page', method: 'GET', path: ({ userId }) => `/Items?UserId=${encodeURIComponent(userId)}&IncludeItemTypes=Movie&StartIndex=0&Limit=5` },
   { name: 'item-detail-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}` },
   { name: 'item-playback-info-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo` },
+  {
+    name: 'item-playback-info-post-movie',
+    method: 'POST',
+    requiresMovie: true,
+    shapeMode: 'strict-only',
+    path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo`,
+    body: ({ movieItemId }) => ({
+      MediaSourceId: movieItemId,
+      AudioStreamIndex: 1,
+      SubtitleStreamIndex: -1,
+      EnableDirectPlay: false,
+      EnableDirectStream: true,
+      EnableTranscoding: true,
+      StartPositionTicks: 50_000_000,
+    }),
+  },
   { name: 'activity-log-entries', method: 'GET', path: '/System/ActivityLog/Entries?StartIndex=0&Limit=5', shapeMode: 'strict-only' },
   { name: 'item-images-movie', method: 'GET', requiresMovie: true, ensureMovieImage: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/Images`, shapeMode: 'strict-only' },
   { name: 'sessions', method: 'GET', dataDependentList: true, shapeMode: 'strict-only', path: '/Sessions' },
@@ -260,8 +276,18 @@ async function requestCase(baseUrl, testCase, auth, context = {}) {
   const requestPath = typeof testCase.path === 'function'
     ? testCase.path(context)
     : testCase.path;
+  const requestBody = typeof testCase.body === 'function'
+    ? testCase.body(context)
+    : testCase.body;
+  if (requestBody !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
   const url = `${baseUrl}${requestPath}`;
-  const response = await fetch(url, { method: testCase.method, headers });
+  const response = await fetch(url, {
+    method: testCase.method,
+    headers,
+    body: requestBody === undefined ? undefined : JSON.stringify(requestBody),
+  });
   const contentType = response.headers.get('content-type') || '';
   const body = testCase.text || !contentType.includes('application/json')
     ? await response.text()
@@ -270,6 +296,7 @@ async function requestCase(baseUrl, testCase, auth, context = {}) {
     path: requestPath,
     status: response.status,
     contentType,
+    requestBody: requestBody === undefined ? undefined : normalizeBody(requestBody),
     body: normalizeBody(body),
   };
 }
@@ -292,7 +319,7 @@ function compareResponses(testCase, upstream, jellyrin) {
     }
   }
   const strict = goldenMode === 'strict'
-    ? strictCompare(testCase.name, upstream.body, jellyrin.body)
+    ? strictCompare(testCase.name, upstream.body, jellyrin.body, upstream.requestBody, jellyrin.requestBody)
     : { evaluated: false };
   if (strict.evaluated && !strict.ok) {
     return { ok: false, reason: strict.reason, strict };
@@ -306,13 +333,13 @@ function compareResponses(testCase, upstream, jellyrin) {
   };
 }
 
-function strictCompare(caseName, upstreamBody, jellyrinBody) {
+function strictCompare(caseName, upstreamBody, jellyrinBody, upstreamRequestBody, jellyrinRequestBody) {
   const assertions = strictAssertions(caseName);
   if (assertions.length === 0) {
     return { evaluated: false, ok: true };
   }
   const failures = assertions
-    .map((assertion) => assertion(upstreamBody, jellyrinBody))
+    .map((assertion) => assertion(upstreamBody, jellyrinBody, upstreamRequestBody, jellyrinRequestBody))
     .filter(Boolean);
   return {
     evaluated: true,
@@ -357,6 +384,27 @@ function strictAssertions(caseName) {
       return [
         queryResultHasFields(['Items', 'TotalRecordCount', 'StartIndex']),
         firstItemHasFields(['Id', 'Name', 'Type', 'ImageTags', 'UserData']),
+      ];
+    case 'item-playback-info-post-movie':
+      return [
+        requestBodyHasFields([
+          'MediaSourceId',
+          'AudioStreamIndex',
+          'SubtitleStreamIndex',
+          'EnableDirectPlay',
+          'EnableDirectStream',
+          'EnableTranscoding',
+          'StartPositionTicks',
+        ]),
+        queryResultHasFields(['MediaSources', 'PlaySessionId', 'ErrorCode']),
+        firstMediaSourceHasFields([
+          'SupportsDirectPlay',
+          'SupportsDirectStream',
+          'SupportsTranscoding',
+          'MediaStreams',
+          'MediaStreams.[].Channels',
+          'MediaStreams.[].SampleRate',
+        ]),
       ];
     case 'activity-log-entries':
       return [
@@ -457,6 +505,34 @@ function firstItemHasFields(fieldPaths) {
   };
 }
 
+function requestBodyHasFields(fieldPaths) {
+  return (_upstreamBody, _jellyrinBody, upstreamRequestBody, jellyrinRequestBody) => {
+    const missing = [];
+    for (const [label, body] of [
+      ['upstream', upstreamRequestBody],
+      ['jellyrin', jellyrinRequestBody],
+    ]) {
+      for (const fieldPath of fieldPaths) {
+        if (getPath(body, fieldPath) === undefined) {
+          missing.push(`${label}.${fieldPath}`);
+        }
+      }
+    }
+    return missing.length === 0 ? null : `request body missing strict fields: ${missing.join(', ')}`;
+  };
+}
+
+function firstMediaSourceHasFields(fieldPaths) {
+  return (_upstreamBody, jellyrinBody) => {
+    const first = jellyrinBody?.MediaSources?.[0];
+    if (!first) {
+      return 'expected Jellyrin response to contain at least one media source';
+    }
+    const missing = fieldPaths.filter((fieldPath) => !hasPath(first, fieldPath.split('.')));
+    return missing.length === 0 ? null : `first media source missing strict fields: ${missing.join(', ')}`;
+  };
+}
+
 function arrayContainsFieldValue(fieldPath, expectedValue) {
   return (_upstreamBody, jellyrinBody) => {
     if (!Array.isArray(jellyrinBody)) {
@@ -472,6 +548,23 @@ function getPath(value, pathExpression) {
   return pathExpression
     .split('.')
     .reduce((current, part) => (current == null ? undefined : current[part]), value);
+}
+
+function hasPath(value, parts) {
+  if (parts.length === 0) {
+    return value !== undefined;
+  }
+  const [part, ...rest] = parts;
+  if (part === '[]') {
+    return Array.isArray(value) && value.some((child) => hasPath(child, rest));
+  }
+  if (Array.isArray(value)) {
+    return value.some((child) => hasPath(child, parts));
+  }
+  if (!value || typeof value !== 'object' || !(part in value)) {
+    return false;
+  }
+  return hasPath(value[part], rest);
 }
 
 function hasOnlyOneEmptyList(upstreamBody, jellyrinBody) {
@@ -520,7 +613,7 @@ function normalizeBody(body) {
   }
   const normalized = {};
   for (const [key, value] of Object.entries(body)) {
-    if (['Id', 'ServerId', 'LocalAddress', 'ServerName'].includes(key)) {
+    if (['Id', 'ServerId', 'LocalAddress', 'ServerName', 'MediaSourceId'].includes(key)) {
       normalized[key] = '<dynamic>';
     } else if (key === 'Items' && Array.isArray(value)) {
       normalized[key] = value.map(normalizeBody);
