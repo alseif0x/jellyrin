@@ -26474,22 +26474,56 @@ mod tests {
         assert_eq!(programs["TotalRecordCount"], 1);
         assert_eq!(programs["Items"][0]["Name"], "Movie Hour");
 
+        for endpoint in ["/LiveTv/Programs/program-1", "/livetv/programs/PROGRAM-1"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let program: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(program["Id"], "program-1", "{endpoint}");
+            assert_eq!(program["Name"], "Morning News", "{endpoint}");
+            assert_eq!(program["Type"], "Program", "{endpoint}");
+            assert_eq!(program["MediaType"], "Video", "{endpoint}");
+            assert_eq!(program["ChannelId"], "channel-1", "{endpoint}");
+            assert_eq!(program["ChannelName"], "News HD", "{endpoint}");
+            assert_eq!(program["StartDate"], "2026-05-26T08:00:00Z", "{endpoint}");
+            assert_eq!(program["EndDate"], "2026-05-26T09:00:00Z", "{endpoint}");
+            assert_eq!(program["Overview"], "Local guide news", "{endpoint}");
+        }
+
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/LiveTv/Programs/program-1")
+                    .uri("/LiveTv/Programs/program-missing")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let program: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(program["Name"], "Morning News");
-        assert_eq!(program["Type"], "Program");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         for endpoint in [
             "/LiveTv/Programs/Recommended",
