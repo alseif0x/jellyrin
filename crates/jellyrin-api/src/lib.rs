@@ -2730,6 +2730,9 @@ async fn post_startup_complete(State(state): State<AppState>) -> Result<StatusCo
 
 async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
     let server = state.db.server_state().await?;
+    if server.startup_wizard_completed {
+        return Ok(Json(Vec::new()));
+    }
     let users = state.db.users().await?;
     let mut dtos = Vec::with_capacity(users.len());
     for user in &users {
@@ -5858,6 +5861,12 @@ fn branding_configuration_json(config: BrandingConfig) -> serde_json::Value {
     serde_json::json!({
         "LoginDisclaimer": config.login_disclaimer,
         "CustomCss": config.custom_css,
+        "SplashscreenEnabled": config.splashscreen_enabled
+    })
+}
+
+fn public_branding_configuration_json(config: BrandingConfig) -> serde_json::Value {
+    serde_json::json!({
         "SplashscreenEnabled": config.splashscreen_enabled
     })
 }
@@ -9492,7 +9501,7 @@ async fn live_tv_reset_tuner(
 async fn branding_configuration(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    Ok(Json(branding_configuration_json(
+    Ok(Json(public_branding_configuration_json(
         state.db.branding_config().await?,
     )))
 }
@@ -22585,8 +22594,13 @@ fn should_send_sessions_message(text: &str) -> bool {
         .is_some_and(|message_type| message_type.eq_ignore_ascii_case("SessionsStart"))
 }
 
-async fn localization_options() -> Json<Vec<LocalizationOptionDto>> {
-    Json(vec![
+async fn localization_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<LocalizationOptionDto>>, ApiError> {
+    require_user_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(vec![
         LocalizationOptionDto {
             name: "English".to_string(),
             value: "en-US".to_string(),
@@ -22595,15 +22609,25 @@ async fn localization_options() -> Json<Vec<LocalizationOptionDto>> {
             name: "Espanol".to_string(),
             value: "es-ES".to_string(),
         },
-    ])
+    ]))
 }
 
-async fn localization_cultures() -> Json<Vec<CultureDto>> {
-    Json(load_cultures())
+async fn localization_cultures(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<CultureDto>>, ApiError> {
+    require_user_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(load_cultures()))
 }
 
-async fn localization_countries() -> Json<Vec<CountryDto>> {
-    Json(load_countries())
+async fn localization_countries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<CountryDto>>, ApiError> {
+    require_user_or_startup_incomplete(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(load_countries()))
 }
 
 async fn parental_ratings(
@@ -28877,8 +28901,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let defaults: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(defaults["LoginDisclaimer"], Value::Null);
-        assert_eq!(defaults["CustomCss"], Value::Null);
+        assert_eq!(defaults.get("LoginDisclaimer"), None);
+        assert_eq!(defaults.get("CustomCss"), None);
         assert_eq!(defaults["SplashscreenEnabled"], true);
 
         let response = app
@@ -28926,7 +28950,24 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        for endpoint in ["/Branding/Configuration", "/System/Configuration/branding"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Branding/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let public_branding: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(public_branding.get("LoginDisclaimer"), None);
+        assert_eq!(public_branding.get("CustomCss"), None);
+        assert_eq!(public_branding["SplashscreenEnabled"], false);
+
+        for endpoint in ["/System/Configuration/branding"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -28986,8 +29027,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let branding: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(branding["LoginDisclaimer"], Value::Null);
-        assert_eq!(branding["CustomCss"], "body { color: rgb(1, 2, 3); }");
+        assert_eq!(branding.get("LoginDisclaimer"), None);
+        assert_eq!(branding.get("CustomCss"), None);
         assert_eq!(branding["SplashscreenEnabled"], false);
     }
 
@@ -42237,7 +42278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_users_lists_all_configured_users() {
+    async fn public_users_hides_configured_users_after_startup() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let admin = db
             .update_first_user("admin".to_string(), "admin-secret")
@@ -42250,6 +42291,8 @@ mod tests {
         db.upsert_admin_user("jellyrin-e2e-admin", "e2e-secret")
             .await
             .unwrap();
+        let _ = db.server_state().await.unwrap();
+        db.complete_startup_wizard().await.unwrap();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -42270,14 +42313,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let users: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(users.as_array().unwrap().len(), 2);
-        assert!(
-            users
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|user| user["Name"] == "jellyrin-e2e-admin")
-        );
+        assert_eq!(users.as_array().unwrap().len(), 0);
 
         let response = app
             .clone()
