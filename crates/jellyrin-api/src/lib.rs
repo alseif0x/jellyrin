@@ -37059,6 +37059,22 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/playlists/{playlist_id}"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_playlist: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_playlist, playlist);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/Playlists/{playlist_id}/Items?Limit=1"))
                     .header("X-Emby-Token", &admin_key)
                     .body(Body::empty())
@@ -37110,6 +37126,22 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/playlists/{playlist_id}/items"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_playlist_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_playlist_items, playlist_items);
 
         let response = app
             .clone()
@@ -37177,6 +37209,22 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/playlists/{playlist_id}/users"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_users: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_users, users);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!(
                         "/Playlists/{playlist_id}/Users/{}",
@@ -37228,6 +37276,25 @@ mod tests {
         let playlist_user: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(playlist_user["UserId"], viewer.id.simple().to_string());
         assert_eq!(playlist_user["CanEdit"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/playlists/{playlist_id}/users/{}",
+                        viewer.id.simple()
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_playlist_user: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_playlist_user, playlist_user);
 
         let response = app
             .clone()
@@ -37342,6 +37409,20 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
+                    .uri(format!("/collections/{collection_id}/items?ids={first_id}"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
                     .uri(format!(
                         "/Collections/{collection_id}/Items?ids={second_id}"
                     ))
@@ -37357,7 +37438,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(format!("/Collections/{collection_id}/Items?ids={first_id}"))
+                    .uri(format!("/collections/{collection_id}/items?ids={first_id}"))
                     .header("X-Emby-Token", &admin_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -37691,6 +37772,25 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!(
+                        "/displaypreferences/customview?UserId={}&Client=emby",
+                        user.id.simple()
+                    ))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_prefs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_prefs, prefs);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!(
                         "/Library/VirtualFolders?name=LyricsMusic&collectionType=music&paths={}",
@@ -37900,7 +38000,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics"))
+                    .uri(format!("/lyrics/audio/{item_id}/lyrics"))
                     .header("X-Emby-Token", &user_key)
                     .body(Body::empty())
                     .unwrap(),
