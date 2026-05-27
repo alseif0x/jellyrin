@@ -24009,6 +24009,11 @@ mod tests {
             "<main>Metadata</main>",
         )
         .unwrap();
+        std::fs::write(
+            storage_root.path().join("advanced_settings.htm"),
+            "<main>Advanced</main>",
+        )
+        .unwrap();
         std::fs::write(storage_root.path().join("readme.txt"), "not a page").unwrap();
         std::fs::write(log_dir.join("jellyrin.log"), "first line\nsecond line\n").unwrap();
         std::fs::write(log_dir.join("older.log"), "older\n").unwrap();
@@ -24272,47 +24277,67 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/web/ConfigurationPages")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let pages: Value = serde_json::from_slice(&body).unwrap();
-        let pages = pages.as_array().unwrap();
-        assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0]["Name"], "home.html");
-        assert_eq!(pages[0]["DisplayName"], "Home");
-        assert_eq!(pages[0]["EnableInMainMenu"], true);
-        assert_eq!(pages[1]["Name"], "metadata-editor.html");
-        assert_eq!(pages[1]["DisplayName"], "Metadata Editor");
-        assert_eq!(pages[1]["EnableInMainMenu"], false);
-        assert!(!pages.iter().any(|page| page["Name"] == "readme.txt"));
+        for endpoint in [
+            "/web/ConfigurationPages",
+            "/Dashboard/web/ConfigurationPages",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let pages: Value = serde_json::from_slice(&body).unwrap();
+            let pages = pages.as_array().unwrap();
+            assert_eq!(pages.len(), 3, "{endpoint}");
+            assert_eq!(pages[0]["Name"], "advanced_settings.htm", "{endpoint}");
+            assert_eq!(pages[0]["DisplayName"], "Advanced Settings", "{endpoint}");
+            assert_eq!(pages[0]["PluginId"], Value::Null, "{endpoint}");
+            assert_eq!(pages[0]["EnableInMainMenu"], false, "{endpoint}");
+            assert_eq!(pages[0]["MenuSection"], "server", "{endpoint}");
+            assert_eq!(pages[0]["MenuIcon"], "settings", "{endpoint}");
+            assert_eq!(pages[0]["EmbeddedResourcePath"], Value::Null, "{endpoint}");
+            assert_eq!(pages[1]["Name"], "home.html", "{endpoint}");
+            assert_eq!(pages[1]["DisplayName"], "Home", "{endpoint}");
+            assert_eq!(pages[1]["EnableInMainMenu"], true, "{endpoint}");
+            assert_eq!(pages[2]["Name"], "metadata-editor.html", "{endpoint}");
+            assert_eq!(pages[2]["DisplayName"], "Metadata Editor", "{endpoint}");
+            assert_eq!(pages[2]["EnableInMainMenu"], false, "{endpoint}");
+            assert!(
+                !pages.iter().any(|page| page["Name"] == "readme.txt"),
+                "{endpoint}"
+            );
+        }
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/web/ConfigurationPages?enableInMainMenu=true")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let main_menu_pages: Value = serde_json::from_slice(&body).unwrap();
-        let main_menu_pages = main_menu_pages.as_array().unwrap();
-        assert_eq!(main_menu_pages.len(), 1);
-        assert_eq!(main_menu_pages[0]["Name"], "home.html");
+        for endpoint in [
+            "/web/ConfigurationPages?enableInMainMenu=true",
+            "/web/configurationpages?EnableInMainMenu=true",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let main_menu_pages: Value = serde_json::from_slice(&body).unwrap();
+            let main_menu_pages = main_menu_pages.as_array().unwrap();
+            assert_eq!(main_menu_pages.len(), 1, "{endpoint}");
+            assert_eq!(main_menu_pages[0]["Name"], "home.html", "{endpoint}");
+        }
 
         let response = app
             .clone()
@@ -24346,6 +24371,25 @@ mod tests {
         assert!(content_type.starts_with("text/html"));
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"<main>Dashboard</main>");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/configurationpage?Name=metadata-editor.html")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<main>Metadata</main>");
 
         let response = app
             .clone()
