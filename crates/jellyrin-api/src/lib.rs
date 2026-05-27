@@ -26613,22 +26613,63 @@ mod tests {
         assert_eq!(recordings["Items"][0]["Type"], "Recording");
         assert_eq!(recordings["Items"][0]["ChannelName"], "Movies");
 
+        for endpoint in [
+            "/LiveTv/Recordings/recording-1",
+            "/livetv/recordings/RECORDING-1",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let recording: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(recording["Id"], "recording-1", "{endpoint}");
+            assert_eq!(recording["Name"], "Morning News", "{endpoint}");
+            assert_eq!(recording["Type"], "Recording", "{endpoint}");
+            assert_eq!(recording["MediaType"], "Video", "{endpoint}");
+            assert_eq!(recording["ChannelId"], "channel-1", "{endpoint}");
+            assert_eq!(recording["ChannelName"], "News HD", "{endpoint}");
+            assert_eq!(recording["Status"], "Completed", "{endpoint}");
+            assert_eq!(recording["SeriesName"], "Morning News", "{endpoint}");
+            assert_eq!(recording["RecordingType"], "Manual", "{endpoint}");
+            assert_eq!(
+                recording["DateCreated"], "2026-05-26T08:00:00Z",
+                "{endpoint}"
+            );
+        }
+
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/livetv/recordings/recording-1")
+                    .uri("/LiveTv/Recordings/recording-missing")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let recording: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(recording["Name"], "Morning News");
-        assert_eq!(recording["Status"], "Completed");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         for (endpoint, expected_name, expected_type, expected_id) in [
             (
