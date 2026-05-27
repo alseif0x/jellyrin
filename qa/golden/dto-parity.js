@@ -94,6 +94,8 @@ function buildContexts(apiParity, browser) {
     users: apiArrayFirstContext(apiByName.users, 'golden-traces/api-parity-latest.json users body[0]'),
     queryResult: apiBodyContext(apiByName.views || apiByName['items-movies-first-page'], 'golden-traces/api-parity-latest.json QueryResult body'),
     scheduledTask: apiArrayFirstContext(apiByName['scheduled-tasks'], 'golden-traces/api-parity-latest.json scheduled-tasks body[0]'),
+    activityLogEntry: apiQueryResultFirstContext(apiByName['activity-log-entries'], 'golden-traces/api-parity-latest.json activity-log-entries body.Items[0]'),
+    imageInfo: apiArrayFirstContext(apiByName['item-images-movie'], 'golden-traces/api-parity-latest.json item-images-movie body[0]'),
   };
 }
 
@@ -115,10 +117,26 @@ function apiBodyContext(result, source) {
 
 function apiArrayFirstContext(result, source) {
   return {
-    upstream: Array.isArray(result?.upstream?.body) ? result.upstream.body[0] : undefined,
-    jellyrin: Array.isArray(result?.jellyrin?.body) ? result.jellyrin.body[0] : undefined,
+    upstream: bestArrayEvidence(result?.upstream?.body),
+    jellyrin: bestArrayEvidence(result?.jellyrin?.body),
     source,
   };
+}
+
+function apiQueryResultFirstContext(result, source) {
+  return {
+    upstream: result?.upstream?.body?.Items?.[0],
+    jellyrin: result?.jellyrin?.body?.Items?.[0],
+    source,
+  };
+}
+
+function bestArrayEvidence(value) {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  return value.find((item) => item && typeof item === 'object' && 'ImageIndex' in item)
+    || value[0];
 }
 
 function findRequest(trace, target, predicate) {
@@ -230,6 +248,16 @@ function ruleFor(field) {
     'BaseItemDto.MediaSources': ['itemDetail', ['MediaSources']],
     'BaseItemDto.ImageTags': ['itemDetail', ['ImageTags']],
     'BaseItemDto.UserData': ['itemDetail', ['UserData']],
+    'ActivityLogEntry.Id': ['activityLogEntry', ['Id']],
+    'ActivityLogEntry.Name': ['activityLogEntry', ['Name']],
+    'ActivityLogEntry.Severity': ['activityLogEntry', ['Severity']],
+    'ActivityLogEntry.Date': ['activityLogEntry', ['Date']],
+    'ActivityLogEntry.UserId': ['activityLogEntry', ['UserId']],
+    'ActivityLogEntry.ShortOverview': ['activityLogEntry', ['ShortOverview']],
+    'ImageInfo.ImageType': ['imageInfo', ['ImageType']],
+    'ImageInfo.ImageIndex': ['imageInfo', ['ImageIndex']],
+    'ImageInfo.ImageTag': ['imageInfo', ['ImageTag']],
+    'ImageInfo.Path': ['imageInfo', ['Path']],
   };
   const value = exact[name];
   return value ? { context: value[0], paths: value[1] } : null;

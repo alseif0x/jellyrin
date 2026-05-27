@@ -21743,7 +21743,24 @@ async fn store_uploaded_image(
     if bytes.is_empty() {
         return Err(ApiError::bad_request("Image upload body is empty"));
     }
-    store_image_bytes(state, owner, image_type, image_index, bytes.to_vec()).await
+    let bytes = decode_jellyfin_image_upload_body(&bytes);
+    store_image_bytes(state, owner, image_type, image_index, bytes).await
+}
+
+fn decode_jellyfin_image_upload_body(bytes: &[u8]) -> Vec<u8> {
+    let trimmed = bytes
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    if trimmed.is_empty() {
+        return bytes.to_vec();
+    }
+    general_purpose::STANDARD
+        .decode(&trimmed)
+        .ok()
+        .filter(|decoded| image_format_from_bytes(decoded).extension != "bin")
+        .unwrap_or_else(|| bytes.to_vec())
 }
 
 async fn store_image_bytes(
@@ -23379,6 +23396,25 @@ mod tests {
                 r#"MediaBrowser Client="Jellyfin Web", DeviceId="abc", Token="tok""#
             ),
             Some("tok".to_string())
+        );
+    }
+
+    #[test]
+    fn decodes_jellyfin_base64_image_upload_body() {
+        let png = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0,
+            5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        let encoded = general_purpose::STANDARD.encode(&png);
+
+        assert_eq!(
+            super::decode_jellyfin_image_upload_body(encoded.as_bytes()),
+            png
+        );
+        assert_eq!(
+            super::decode_jellyfin_image_upload_body(b"fake image"),
+            b"fake image"
         );
     }
 

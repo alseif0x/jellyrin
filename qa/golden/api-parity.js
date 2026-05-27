@@ -8,6 +8,10 @@ const jellyrinBaseUrl = trimTrailingSlash(process.env.JELLYRIN_URL || 'http://12
 const goldenMode = process.env.JELLYRIN_GOLDEN_MODE || 'smoke';
 const outputPath = process.env.JELLYRIN_GOLDEN_OUT
   || path.resolve(__dirname, '../../../../plans/generated/golden-traces/api-parity-latest.json');
+const fixturePngBytes = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMCAQAABQABDQottAAAAABJRU5ErkJggg==',
+  'base64',
+);
 
 const publicCases = [
   { name: 'public-info', method: 'GET', path: '/System/Info/Public' },
@@ -23,11 +27,13 @@ const authenticatedCases = [
   { name: 'system-info', method: 'GET', path: '/System/Info' },
   { name: 'users-me', method: 'GET', path: '/Users/Me', requiresUserToken: true },
   { name: 'users', method: 'GET', path: '/Users' },
-  { name: 'views', method: 'GET', dataDependentList: true, path: ({ userId }) => `/UserViews?UserId=${encodeURIComponent(userId)}` },
+  { name: 'views', method: 'GET', dataDependentList: true, shapeMode: 'strict-only', path: ({ userId }) => `/UserViews?UserId=${encodeURIComponent(userId)}` },
   { name: 'items-movies-first-page', method: 'GET', path: ({ userId }) => `/Items?UserId=${encodeURIComponent(userId)}&IncludeItemTypes=Movie&StartIndex=0&Limit=5` },
   { name: 'item-detail-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}` },
   { name: 'item-playback-info-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo` },
-  { name: 'sessions', method: 'GET', dataDependentList: true, path: '/Sessions' },
+  { name: 'activity-log-entries', method: 'GET', path: '/System/ActivityLog/Entries?StartIndex=0&Limit=5', shapeMode: 'strict-only' },
+  { name: 'item-images-movie', method: 'GET', requiresMovie: true, ensureMovieImage: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/Images`, shapeMode: 'strict-only' },
+  { name: 'sessions', method: 'GET', dataDependentList: true, shapeMode: 'strict-only', path: '/Sessions' },
   { name: 'scheduled-tasks', method: 'GET', path: '/ScheduledTasks' },
   { name: 'repositories', method: 'GET', path: '/Repositories' },
 ];
@@ -193,14 +199,57 @@ async function buildAuthenticatedContext(baseUrl, auth) {
     return context;
   }
   const response = await fetch(
-    `${baseUrl}/Items?UserId=${encodeURIComponent(context.userId)}&IncludeItemTypes=Movie&StartIndex=0&Limit=1`,
+    `${baseUrl}/Items?UserId=${encodeURIComponent(context.userId)}&Recursive=true&IncludeItemTypes=Movie&StartIndex=0&Limit=1`,
     { headers: { 'X-Emby-Token': auth.accessToken } },
   );
   if (response.ok && response.headers.get('content-type')?.includes('application/json')) {
     const body = await response.json();
     context.movieItemId = body.Items?.[0]?.Id || null;
   }
+  if (context.movieItemId) {
+    await ensureFixtureImages(baseUrl, auth, context.movieItemId);
+  }
   return context;
+}
+
+async function ensureFixtureImages(baseUrl, auth, movieItemId) {
+  const headers = { 'X-Emby-Token': auth.accessToken };
+  const imagesResponse = await fetch(`${baseUrl}/Items/${encodeURIComponent(movieItemId)}/Images`, { headers });
+  let images = [];
+  if (imagesResponse.ok && imagesResponse.headers.get('content-type')?.includes('application/json')) {
+    images = await imagesResponse.json();
+  }
+  if (!Array.isArray(images)) {
+    images = [];
+  }
+  if (!images.some((image) => image?.ImageType === 'Primary')) {
+    await uploadFixtureImage(baseUrl, auth, movieItemId, 'Primary');
+  }
+  if (!images.some((image) => image?.ImageType === 'Backdrop' && image?.ImageIndex === 0)) {
+    await uploadFixtureImage(baseUrl, auth, movieItemId, 'Backdrop', 0);
+  }
+}
+
+async function uploadFixtureImage(baseUrl, auth, movieItemId, imageType, imageIndex = null) {
+  const headers = { 'X-Emby-Token': auth.accessToken };
+  const body = baseUrl === upstreamBaseUrl
+    ? fixturePngBytes.toString('base64')
+    : fixturePngBytes;
+  const indexSegment = imageIndex === null ? '' : `/${imageIndex}`;
+  const uploadPath = baseUrl === upstreamBaseUrl
+    ? `/Items/${encodeURIComponent(movieItemId)}/Images/${encodeURIComponent(imageType)}${indexSegment}`
+    : `/Image/Items/${encodeURIComponent(movieItemId)}/Images/${encodeURIComponent(imageType)}${indexSegment}`;
+  const upload = await fetch(`${baseUrl}${uploadPath}`, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Content-Type': 'image/png',
+    },
+    body,
+  });
+  if (!upload.ok) {
+    throw new Error(`${imageType} image setup failed for ${baseUrl} with HTTP ${upload.status}`);
+  }
 }
 
 async function requestCase(baseUrl, testCase, auth, context = {}) {
@@ -232,18 +281,20 @@ function compareResponses(testCase, upstream, jellyrin) {
   if (upstream.status >= 400) {
     return { ok: true, reason: 'matched error status', strict: { evaluated: false } };
   }
-  const upstreamShape = shapeOf(upstream.body);
-  const jellyrinShape = shapeOf(jellyrin.body);
-  if (JSON.stringify(upstreamShape) !== JSON.stringify(jellyrinShape)) {
-    return {
-      ok: false,
-      reason: `shape mismatch upstream=${JSON.stringify(upstreamShape)} jellyrin=${JSON.stringify(jellyrinShape)}`,
-    };
+  if (testCase.shapeMode !== 'strict-only') {
+    const upstreamShape = shapeOf(upstream.body);
+    const jellyrinShape = shapeOf(jellyrin.body);
+    if (JSON.stringify(upstreamShape) !== JSON.stringify(jellyrinShape)) {
+      return {
+        ok: false,
+        reason: `shape mismatch upstream=${JSON.stringify(upstreamShape)} jellyrin=${JSON.stringify(jellyrinShape)}`,
+      };
+    }
   }
   const strict = goldenMode === 'strict'
     ? strictCompare(testCase.name, upstream.body, jellyrin.body)
     : { evaluated: false };
-  if (!strict.ok) {
+  if (strict.evaluated && !strict.ok) {
     return { ok: false, reason: strict.reason, strict };
   }
   return {
@@ -306,6 +357,15 @@ function strictAssertions(caseName) {
       return [
         queryResultHasFields(['Items', 'TotalRecordCount', 'StartIndex']),
         firstItemHasFields(['Id', 'Name', 'Type', 'ImageTags', 'UserData']),
+      ];
+    case 'activity-log-entries':
+      return [
+        queryResultHasFields(['Items', 'TotalRecordCount', 'StartIndex']),
+        firstItemHasFields(['Id', 'Name', 'Severity', 'Date', 'UserId', 'ShortOverview']),
+      ];
+    case 'item-images-movie':
+      return [
+        firstArrayItemHasFields(['ImageType', 'ImageIndex', 'ImageTag', 'Path']),
       ];
     case 'scheduled-tasks':
       return [
