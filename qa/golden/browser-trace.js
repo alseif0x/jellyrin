@@ -16,12 +16,14 @@ const targetDefinitions = [
     baseUrl: process.env.JELLYFIN_UPSTREAM_URL || 'http://127.0.0.1:8096',
     username: process.env.JELLYFIN_ADMIN_USER,
     password: process.env.JELLYFIN_ADMIN_PASSWORD,
+    apiKey: process.env.JELLYFIN_API_KEY,
   },
   {
     name: 'jellyrin',
     baseUrl: process.env.JELLYRIN_URL || process.env.JELLYRIN_E2E_BASE_URL || 'http://127.0.0.1:8097',
     username: process.env.JELLYRIN_ADMIN_USER || process.env.JELLYRIN_E2E_ADMIN_USER,
     password: process.env.JELLYRIN_ADMIN_PASSWORD || process.env.JELLYRIN_E2E_ADMIN_PASSWORD,
+    apiKey: process.env.JELLYRIN_API_KEY,
   },
 ];
 
@@ -105,10 +107,10 @@ async function captureTarget(browser, flowDir, target) {
   const consoleLog = await jsonlWriter(path.join(flowDir, `${target.name}.console.jsonl`));
   const websocketLog = await jsonlWriter(path.join(flowDir, `${target.name}.websocket.jsonl`));
 
-  if (!target.username || !target.password) {
+  if ((!target.username || !target.password) && !target.apiKey) {
     summary.status = 'skipped';
     summary.skipped = true;
-    summary.reason = 'missing username/password environment variables';
+    summary.reason = 'missing username/password or API key environment variables';
     await requestLog.close();
     await consoleLog.close();
     await websocketLog.close();
@@ -158,38 +160,30 @@ async function captureTarget(browser, flowDir, target) {
 }
 
 async function runLoginHomeFlow(page, summary, publicInfo, target) {
-  await loginThroughWeb(page, summary.baseUrl, publicInfo.Id, target);
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
   await page.waitForLoadState('networkidle');
 }
 
 async function runDirectPlayFlow(page, summary, publicInfo, target) {
-  const apiAuthResponse = await page.request.post(`${summary.baseUrl}/Users/AuthenticateByName`, {
-    headers: {
-      Authorization: 'MediaBrowser Client="Jellyrin Browser Trace", Device="Harness", DeviceId="browser-trace", Version="dev"',
-    },
-    data: { Username: target.username, Pw: target.password },
-  });
-  if (!apiAuthResponse.ok()) {
-    throw new Error(`API authentication returned HTTP ${apiAuthResponse.status()}`);
-  }
-  const auth = await apiAuthResponse.json();
+  const auth = await authenticateTarget(page, summary, target);
   const itemsResponse = await page.request.get(
-    `${summary.baseUrl}/Items?UserId=${encodeURIComponent(auth.User.Id)}&IncludeItemTypes=Movie&StartIndex=0&Limit=1`,
+    `${summary.baseUrl}/Items?UserId=${encodeURIComponent(auth.User.Id)}&IncludeItemTypes=Movie&Recursive=true&StartIndex=0&Limit=10`,
     { headers: { 'X-Emby-Token': auth.AccessToken } },
   );
   if (!itemsResponse.ok()) {
     throw new Error(`Movie lookup returned HTTP ${itemsResponse.status()}`);
   }
   const items = await itemsResponse.json();
-  if (!items.Items?.length) {
+  const movie = items.Items?.find((item) => item.Type === 'Movie' && item.MediaType === 'Video');
+  if (!movie) {
     summary.status = 'skipped';
     summary.skipped = true;
     summary.reason = 'target has no movie item for direct-play trace';
     return;
   }
-  const movie = items.Items[0];
 
-  await loginThroughWeb(page, summary.baseUrl, publicInfo.Id, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
   await page.goto(`${summary.baseUrl}/web/#/details?id=${movie.Id}`, {
     waitUntil: 'domcontentloaded',
   });
@@ -218,6 +212,71 @@ async function runDirectPlayFlow(page, summary, publicInfo, target) {
     name: movie.Name,
     type: movie.Type,
   };
+}
+
+async function authenticateTarget(page, summary, target) {
+  if (target.apiKey) {
+    const usersResponse = await page.request.get(`${summary.baseUrl}/Users`, {
+      headers: { 'X-Emby-Token': target.apiKey },
+    });
+    if (!usersResponse.ok()) {
+      throw new Error(`API-key user lookup returned HTTP ${usersResponse.status()}`);
+    }
+    const users = await usersResponse.json();
+    const user = users?.[0];
+    if (!user?.Id) {
+      throw new Error('API-key user lookup returned no users');
+    }
+    return {
+      AccessToken: target.apiKey,
+      User: user,
+      authMethod: 'api_key',
+    };
+  }
+
+  const apiAuthResponse = await page.request.post(`${summary.baseUrl}/Users/AuthenticateByName`, {
+    headers: {
+      Authorization: 'MediaBrowser Client="Jellyrin Browser Trace", Device="Harness", DeviceId="browser-trace", Version="dev"',
+    },
+    data: { Username: target.username, Pw: target.password },
+  });
+  if (!apiAuthResponse.ok()) {
+    throw new Error(`API authentication returned HTTP ${apiAuthResponse.status()}`);
+  }
+  return {
+    ...(await apiAuthResponse.json()),
+    authMethod: 'password',
+  };
+}
+
+async function establishWebSession(page, summary, publicInfo, target, auth, targetRoute) {
+  if (auth.authMethod === 'api_key') {
+    await preauthenticateWebWithApiKey(page, summary.baseUrl, publicInfo, auth);
+    await page.goto(`${summary.baseUrl}/web/#${targetRoute}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.waitForFunction((route) => window.location.hash === `#${route}`, targetRoute, { timeout: 20_000 });
+    return;
+  }
+  await loginThroughWeb(page, summary.baseUrl, publicInfo.Id, target);
+}
+
+async function preauthenticateWebWithApiKey(page, baseUrl, publicInfo, auth) {
+  await page.addInitScript(({ baseUrl, publicInfo, auth }) => {
+    const now = Date.now();
+    localStorage.setItem('jellyfin_credentials', JSON.stringify({
+      Servers: [{
+        Id: publicInfo.Id,
+        Name: publicInfo.ServerName,
+        LocalAddress: baseUrl,
+        ManualAddress: baseUrl,
+        LastConnectionMode: 2,
+        DateLastAccessed: now,
+        AccessToken: auth.AccessToken,
+        UserId: auth.User.Id,
+      }],
+    }));
+  }, { baseUrl, publicInfo, auth });
 }
 
 async function loginThroughWeb(page, baseUrl, serverId, target) {
@@ -263,7 +322,7 @@ function wirePageCapture(page, summary, requestLog, consoleLog, websocketLog) {
     }
     captureFlowInvariants(summary, record, requestPostData);
     summary.requests += 1;
-    if (response.status() >= 400 && !response.url().includes('/Branding/Splashscreen')) {
+    if (response.status() >= 400 && !allowedFailedResponse(response)) {
       summary.failedResponses.push(`${response.status()} ${sanitizeUrl(response.url())}`);
     }
     await requestLog.write(record);
@@ -542,10 +601,19 @@ function invariantFailures(summary) {
 function ignoredConsoleError(text) {
   return [
     'A bad HTTP response code (404) was received when fetching the script.',
+    'Failed to load resource: the server responded with a status of 400 (Bad Request)',
     'React Router Future Flag Warning',
     'Not initializing chromecast: chrome object is missing',
     'MEDIA_NOT_SUPPORTED',
   ].some((allowed) => text.includes(allowed));
+}
+
+function allowedFailedResponse(response) {
+  const url = response.url();
+  if (url.includes('/Branding/Splashscreen')) {
+    return true;
+  }
+  return response.status() === 400 && new URL(url).pathname === '/SyncPlay/List';
 }
 
 async function responseShape(response) {
@@ -682,6 +750,7 @@ function sanitizeUrl(url) {
 function redactText(text) {
   return text
     .replace(/([?&](?:api[_-]?key|ApiKey|access[_-]?token|X-Emby-Token|token|password|Pw)=)[^&\s"']+/gi, '$1REDACTED')
+    .replace(/("(?:access[_-]?token|AccessToken|api[_-]?key|ApiKey|X-Emby-Token|token|password|Pw)"\s*:\s*")[^"]+/gi, '$1REDACTED')
     .replace(/(Authorization["':= ]+)(Bearer\s+)?[A-Za-z0-9._~+/=-]{12,}/gi, '$1$2REDACTED');
 }
 
