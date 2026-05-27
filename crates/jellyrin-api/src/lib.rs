@@ -31709,6 +31709,27 @@ mod tests {
         assert_eq!(filtered_counts["AlbumCount"], 1);
         assert_eq!(filtered_counts["TrailerCount"], 1);
 
+        for endpoint in [
+            format!("/Users/{user_id}/Items/Counts?ParentId={parent_id}&IncludeItemTypes=Movie"),
+            format!("/users/{user_id}/items/counts?ParentId={parent_id}&IncludeItemTypes=Movie"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.as_str())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let user_filtered_counts: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(user_filtered_counts, filtered_counts, "{endpoint}");
+        }
+
         let response = app
             .clone()
             .oneshot(
@@ -31744,6 +31765,31 @@ mod tests {
         let latest: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(latest.as_array().unwrap().len(), 1);
         assert_eq!(latest[0]["Name"], "Example Movie");
+
+        for endpoint in [
+            format!(
+                "/Users/{user_id}/Items/Latest?ParentId={parent_id}&IncludeItemTypes=Movie&Limit=1"
+            ),
+            format!(
+                "/users/{user_id}/items/latest?ParentId={parent_id}&IncludeItemTypes=Movie&Limit=1"
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.as_str())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let user_latest: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(user_latest, latest, "{endpoint}");
+        }
 
         test_db
             .update_user_configuration(
@@ -31857,6 +31903,22 @@ mod tests {
         let user_items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(user_items["TotalRecordCount"], 1);
         assert_eq!(user_items["Items"][0]["Name"], "Example Movie");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/users/{user_id}/items?IncludeItemTypes=Movie"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_user_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_user_items, user_items);
 
         let response = app
             .clone()
@@ -32577,6 +32639,22 @@ mod tests {
         assert_eq!(persisted_user_item["UserData"]["IsFavorite"], true);
         assert_eq!(persisted_user_item["UserData"]["Likes"], true);
         assert_eq!(persisted_user_item["UserData"]["Rating"], 1.0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/users/{user_id}/items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_persisted_user_item: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_persisted_user_item, persisted_user_item);
 
         let response = app
             .clone()
@@ -43085,21 +43163,23 @@ mod tests {
             assert_eq!(albums["Items"][0]["Type"], "MusicAlbum");
         }
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/AlbumArtists")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let root_album_artists: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(root_album_artists, album_artists);
+        for endpoint in ["/AlbumArtists", "/albumartists"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let root_album_artists: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(root_album_artists, album_artists, "{endpoint}");
+        }
 
         let response = app
             .clone()
