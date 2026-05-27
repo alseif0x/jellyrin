@@ -43666,23 +43666,51 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
+        for endpoint in ["/Years/1984", "/years/1984"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let year: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(year["Name"], "1984", "{endpoint}");
+            assert_eq!(year["Type"], "Year", "{endpoint}");
+            assert_eq!(year["ProductionYear"], 1984, "{endpoint}");
+            assert_eq!(year["IsFolder"], true, "{endpoint}");
+        }
+
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/Years/1984")
+                    .uri("/Years/1977")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let year: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(year["Name"], "1984");
-        assert_eq!(year["Type"], "Year");
-        assert_eq!(year["ProductionYear"], 1984);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
             .oneshot(
