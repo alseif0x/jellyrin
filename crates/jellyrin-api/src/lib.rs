@@ -26798,28 +26798,60 @@ mod tests {
         let programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(programs["TotalRecordCount"], 0);
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/LiveTv/Timers/Defaults")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let timer_defaults: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(timer_defaults["PrePaddingSeconds"], 300);
-        assert_eq!(timer_defaults["PostPaddingSeconds"], 600);
-        assert_eq!(timer_defaults["RecordingsPath"], "/srv/recordings");
-        assert_eq!(
-            timer_defaults["SeriesRecordingPath"],
-            "/srv/recordings/series"
-        );
-        assert_eq!(timer_defaults["KeepUntil"], "UntilDeleted");
+        for endpoint in ["/LiveTv/Timers/Defaults", "/livetv/timers/defaults"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let timer_defaults: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(timer_defaults["Id"], Value::Null, "{endpoint}");
+            assert_eq!(timer_defaults["ProgramId"], Value::Null, "{endpoint}");
+            assert_eq!(timer_defaults["ChannelId"], Value::Null, "{endpoint}");
+            assert_eq!(timer_defaults["Name"], "", "{endpoint}");
+            assert_eq!(timer_defaults["Overview"], "", "{endpoint}");
+            assert_eq!(timer_defaults["StartDate"], Value::Null, "{endpoint}");
+            assert_eq!(timer_defaults["EndDate"], Value::Null, "{endpoint}");
+            assert_eq!(timer_defaults["PrePaddingSeconds"], 300, "{endpoint}");
+            assert_eq!(timer_defaults["PostPaddingSeconds"], 600, "{endpoint}");
+            assert_eq!(timer_defaults["Priority"], 0, "{endpoint}");
+            assert_eq!(timer_defaults["IsPrePaddingRequired"], false, "{endpoint}");
+            assert_eq!(timer_defaults["IsPostPaddingRequired"], false, "{endpoint}");
+            assert_eq!(timer_defaults["KeepUntil"], "UntilDeleted", "{endpoint}");
+            assert_eq!(timer_defaults["RecordAnyTime"], false, "{endpoint}");
+            assert_eq!(timer_defaults["SkipEpisodesInLibrary"], false, "{endpoint}");
+            assert_eq!(timer_defaults["RecordAnyChannel"], false, "{endpoint}");
+            assert_eq!(timer_defaults["NewOnly"], false, "{endpoint}");
+            assert_eq!(timer_defaults["Days"], json!([]), "{endpoint}");
+            assert_eq!(
+                timer_defaults["RecordingsPath"], "/srv/recordings",
+                "{endpoint}"
+            );
+            assert_eq!(
+                timer_defaults["SeriesRecordingPath"], "/srv/recordings/series",
+                "{endpoint}"
+            );
+        }
 
         for endpoint in [
             "/LiveTv/Channels/channel-missing",
