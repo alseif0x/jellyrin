@@ -26638,6 +26638,12 @@ mod tests {
                 "movies",
             ),
             (
+                "/livetv/recordings/folders",
+                "Movies",
+                "RecordingFolder",
+                "movies",
+            ),
+            (
                 "/livetv/recordings/groups",
                 "Morning News",
                 "RecordingGroup",
@@ -26645,6 +26651,12 @@ mod tests {
             ),
             (
                 "/LiveTv/Recordings/Series",
+                "Morning News",
+                "RecordingSeries",
+                "morning-news",
+            ),
+            (
+                "/livetv/recordings/series",
                 "Morning News",
                 "RecordingSeries",
                 "morning-news",
