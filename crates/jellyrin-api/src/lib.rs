@@ -32479,6 +32479,22 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/items/useritems/{item_id}/userdata"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_user_data, user_data);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!("/Items/Users/{user_id}/Items/{item_id}/UserData"))
                     .header("X-Emby-Token", &api_key)
@@ -32495,6 +32511,22 @@ mod tests {
         let updated_user_data: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(updated_user_data["Played"], true);
         assert_eq!(updated_user_data["PlaybackPositionTicks"], 321);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/items/users/{user_id}/items/{item_id}/userdata"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let lowercase_updated_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lowercase_updated_user_data, updated_user_data);
 
         let response = app
             .clone()
