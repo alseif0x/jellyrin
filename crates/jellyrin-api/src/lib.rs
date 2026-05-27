@@ -31025,6 +31025,18 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
                         .header("X-Emby-Token", &api_key)
                         .body(Body::empty())
                         .unwrap(),
@@ -31065,6 +31077,18 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
                         .header("X-Emby-Token", &api_key)
                         .body(Body::empty())
                         .unwrap(),
@@ -31100,6 +31124,19 @@ mod tests {
             "/Library/Library/Refresh",
             "/library/library/refresh",
         ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
             let response = app
                 .clone()
                 .oneshot(
