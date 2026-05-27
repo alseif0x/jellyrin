@@ -3755,11 +3755,20 @@ async fn update_session_capabilities(
 ) -> Result<StatusCode, ApiError> {
     let (_, token) = require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let capabilities = normalize_session_capabilities(body.map(|Json(value)| value), &query)?;
-    state
+    let update_result = state
         .db
-        .update_device_capabilities(&token.access_token, capabilities)
-        .await
-        .map_err(|_| ApiError::not_found("Device session not found"))?;
+        .update_device_capabilities(&token.access_token, capabilities.clone())
+        .await;
+    if update_result.is_err() && token.client == "API Key" {
+        state.db.ensure_device_session(&token).await?;
+        state
+            .db
+            .update_device_capabilities(&token.access_token, capabilities)
+            .await
+            .map_err(|_| ApiError::not_found("Device session not found"))?;
+    } else {
+        update_result.map_err(|_| ApiError::not_found("Device session not found"))?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -29927,6 +29936,68 @@ mod tests {
         assert_eq!(
             sessions[0]["SupportedCommands"],
             json!(["DisplayMessage", "GoHome"])
+        );
+    }
+
+    #[tokio::test]
+    async fn session_capabilities_full_accepts_api_key_without_prior_device_session() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "browser-trace-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Capabilities/Full")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "PlayableMediaTypes": ["Audio", "Video"],
+                            "SupportedCommands": ["DisplayContent", "PlayTrailers"],
+                            "SupportsMediaControl": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Sessions")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sessions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sessions[0]["Client"], "API Key");
+        assert_eq!(sessions[0]["DeviceId"], "api-key:browser-trace-key");
+        assert_eq!(sessions[0]["PlayableMediaTypes"], json!(["Audio", "Video"]));
+        assert_eq!(
+            sessions[0]["SupportedCommands"],
+            json!(["DisplayContent", "PlayTrailers"])
         );
     }
 

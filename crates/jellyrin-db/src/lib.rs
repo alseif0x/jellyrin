@@ -1641,6 +1641,35 @@ impl Database {
         Ok(())
     }
 
+    pub async fn ensure_device_session(&self, token: &DeviceToken) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                access_token, user_id, device_id, device_name, client, version, created_at, last_activity_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            ON CONFLICT(access_token) DO UPDATE SET
+                user_id = excluded.user_id,
+                device_id = excluded.device_id,
+                device_name = excluded.device_name,
+                client = excluded.client,
+                version = excluded.version,
+                last_activity_at = excluded.last_activity_at
+            "#,
+        )
+        .bind(&token.access_token)
+        .bind(token.user_id.to_string())
+        .bind(&token.device_id)
+        .bind(&token.device_name)
+        .bind(&token.client)
+        .bind(&token.version)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn upsert_active_playback_session(
         &self,
         playback: UpsertActivePlaybackSession,

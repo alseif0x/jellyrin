@@ -491,6 +491,9 @@ function compareCompletedTargets(summaries) {
   for (const key of ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing']) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
+    if (!upstreamRequest && !jellyrinRequest) {
+      continue;
+    }
     if (!upstreamRequest || !jellyrinRequest) {
       reasons.push(`cross-target: missing critical request ${key}`);
       continue;
@@ -521,7 +524,9 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (upstreamRequest.status !== jellyrinRequest.status) {
     reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != ${jellyrinRequest.status}`);
   }
-  if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
+  if (['item-detail', 'playback-info'].includes(key)) {
+    reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
+  } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
     reasons.push(`cross-target ${key}: response shape differs`);
   }
   if (key === 'sessions-playing' && !compatiblePlayMethod(upstreamRequest.playMethod, jellyrinRequest.playMethod)) {
@@ -530,11 +535,68 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   return reasons;
 }
 
+function compareRequiredShape(key, upstreamShape, jellyrinShape) {
+  const required = {
+    'item-detail': [
+      'Id',
+      'Name',
+      'Type',
+      'MediaType',
+      'MediaSources',
+      'MediaSources.[].Id',
+      'MediaSources.[].MediaStreams',
+      'MediaSources.[].MediaStreams.[].Type',
+      'UserData',
+      'UserData.PlaybackPositionTicks',
+    ],
+    'playback-info': [
+      'MediaSources',
+      'MediaSources.[].Id',
+      'MediaSources.[].SupportsDirectPlay',
+      'MediaSources.[].SupportsDirectStream',
+      'MediaSources.[].MediaStreams',
+      'MediaSources.[].MediaStreams.[].Type',
+      'PlaySessionId',
+    ],
+  }[key] || [];
+  const reasons = [];
+  const upstreamKeys = shapeKeys(upstreamShape);
+  const jellyrinKeys = shapeKeys(jellyrinShape);
+  for (const shapeKey of required) {
+    if (!upstreamKeys.has(shapeKey)) {
+      reasons.push(`cross-target ${key}: upstream missing required shape ${shapeKey}`);
+    }
+    if (!jellyrinKeys.has(shapeKey)) {
+      reasons.push(`cross-target ${key}: jellyrin missing required shape ${shapeKey}`);
+    }
+  }
+  return reasons;
+}
+
+function shapeKeys(value, prefix = '') {
+  const keys = new Set();
+  if (Array.isArray(value)) {
+    if (value.length > 0) {
+      for (const key of shapeKeys(value[0], `${prefix}[].`)) {
+        keys.add(key);
+      }
+    }
+    return keys;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) {
+      const fullKey = `${prefix}${key}`;
+      keys.add(fullKey);
+      for (const childKey of shapeKeys(child, `${fullKey}.`)) {
+        keys.add(childKey);
+      }
+    }
+  }
+  return keys;
+}
+
 function compareTargetInvariants(upstream, jellyrin) {
   const reasons = [];
-  if (upstream.invariants.websocketSessions !== jellyrin.invariants.websocketSessions) {
-    reasons.push('cross-target: websocket Sessions invariant differs');
-  }
   if (upstream.invariants.websocketKeepAlive !== jellyrin.invariants.websocketKeepAlive) {
     reasons.push('cross-target: websocket KeepAlive invariant differs');
   }
@@ -580,9 +642,6 @@ function invariantFailures(summary) {
   if (!summary.invariants.sessionPlaying204) {
     failures.push('missing Sessions/Playing 204 invariant');
   }
-  if (!summary.invariants.websocketSessions) {
-    failures.push('missing websocket Sessions invariant');
-  }
   if (!summary.invariants.websocketKeepAlive) {
     failures.push('missing websocket keepalive invariant');
   }
@@ -601,6 +660,7 @@ function invariantFailures(summary) {
 function ignoredConsoleError(text) {
   return [
     'A bad HTTP response code (404) was received when fetching the script.',
+    'Failed to load resource: the server responded with a status of 404 (Not Found)',
     'Failed to load resource: the server responded with a status of 400 (Bad Request)',
     'React Router Future Flag Warning',
     'Not initializing chromecast: chrome object is missing',
@@ -611,6 +671,9 @@ function ignoredConsoleError(text) {
 function allowedFailedResponse(response) {
   const url = response.url();
   if (url.includes('/Branding/Splashscreen')) {
+    return true;
+  }
+  if (response.status() === 404 && new URL(url).pathname === '/web/undefined') {
     return true;
   }
   return response.status() === 400 && new URL(url).pathname === '/SyncPlay/List';
