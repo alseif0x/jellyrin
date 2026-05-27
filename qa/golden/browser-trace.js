@@ -88,11 +88,14 @@ async function captureTarget(browser, flowDir, target) {
     pageErrors: [],
     websockets: 0,
     screenshot: `${target.name}.screenshot.png`,
+    criticalRequests: {},
     invariants: {
       playbackInfo200: false,
       streamOk: false,
       sessionPlaying204: false,
       websocketSessions: false,
+      websocketKeepAlive: false,
+      websocketMessageTypes: [],
       unexpectedTranscodePath: false,
       playMethods: [],
     },
@@ -255,10 +258,10 @@ function wirePageCapture(page, summary, requestLog, consoleLog, websocketLog) {
       responseContentType: response.headers()['content-type'] || '',
       queryKeysPreservingCase: Array.from(new URL(response.url()).searchParams.keys()),
     };
-    captureFlowInvariants(summary, record, requestPostData);
     if (record.responseContentType.includes('application/json')) {
       record.responseShape = await responseShape(response);
     }
+    captureFlowInvariants(summary, record, requestPostData);
     summary.requests += 1;
     if (response.status() >= 400 && !response.url().includes('/Branding/Splashscreen')) {
       summary.failedResponses.push(`${response.status()} ${sanitizeUrl(response.url())}`);
@@ -295,12 +298,21 @@ function wirePageCapture(page, summary, requestLog, consoleLog, websocketLog) {
     const url = sanitizeUrl(websocket.url());
     websocketLog.write({ ts: new Date().toISOString(), event: 'open', url });
     websocket.on('framesent', (frame) => {
+      const parsed = parseJsonPayload(frame.payload);
+      addWebsocketMessageType(summary, parsed);
+      if (parsed && parsed.MessageType === 'KeepAlive') {
+        summary.invariants.websocketKeepAlive = true;
+      }
       websocketLog.write(websocketFrameRecord('sent', url, frame.payload));
     });
     websocket.on('framereceived', (frame) => {
       const parsed = parseJsonPayload(frame.payload);
+      addWebsocketMessageType(summary, parsed);
       if (parsed && parsed.MessageType === 'Sessions') {
         summary.invariants.websocketSessions = true;
+      }
+      if (parsed && parsed.MessageType === 'ForceKeepAlive') {
+        summary.invariants.websocketKeepAlive = true;
       }
       websocketLog.write(websocketFrameRecord('received', url, frame.payload));
     });
@@ -333,6 +345,7 @@ function compareSummaries(summaries) {
       reasons.push(`${summary.target}: ${failure}`);
     }
   }
+  reasons.push(...compareCompletedTargets(summaries));
   return {
     failed: reasons.length > 0,
     reasons,
@@ -344,6 +357,10 @@ function captureFlowInvariants(summary, record, requestPostData) {
     return;
   }
   const pathname = new URL(record.url).pathname;
+  const key = criticalRequestKey(record);
+  if (key) {
+    summary.criticalRequests[key] = criticalRequestSummary(record, requestPostData);
+  }
   if (pathname.endsWith('/PlaybackInfo') && record.status === 200) {
     summary.invariants.playbackInfo200 = true;
   }
@@ -359,6 +376,135 @@ function captureFlowInvariants(summary, record, requestPostData) {
   if (/\/transcoding\/|\/hls\/|\/hls1\/|\.m3u8$/i.test(pathname)) {
     summary.invariants.unexpectedTranscodePath = true;
   }
+}
+
+function criticalRequestKey(record) {
+  const pathname = new URL(record.url).pathname;
+  if (record.method === 'POST' && pathname.toLowerCase() === '/users/authenticatebyname') {
+    return 'auth';
+  }
+  if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/[^/]+$/i.test(pathname)) {
+    return 'item-detail';
+  }
+  if (record.method === 'POST' && /\/Items\/[^/]+\/PlaybackInfo$/i.test(pathname)) {
+    return 'playback-info';
+  }
+  if (record.method === 'GET' && /\/Videos\/[^/]+\/stream/i.test(pathname)) {
+    return 'video-stream';
+  }
+  if (record.method === 'POST' && pathname === '/Sessions/Playing') {
+    return 'sessions-playing';
+  }
+  return null;
+}
+
+function criticalRequestSummary(record, requestPostData) {
+  const summary = {
+    method: record.method,
+    status: record.status,
+    contentType: record.responseContentType,
+    queryKeys: record.queryKeysPreservingCase,
+    responseShape: record.responseShape,
+  };
+  if (record.responseHeaders['accept-ranges']) {
+    summary.acceptRanges = record.responseHeaders['accept-ranges'];
+  }
+  if (record.responseHeaders['content-range']) {
+    summary.hasContentRange = true;
+  }
+  if (requestPostData && typeof requestPostData === 'object' && requestPostData.PlayMethod) {
+    summary.playMethod = requestPostData.PlayMethod;
+  }
+  return summary;
+}
+
+function compareCompletedTargets(summaries) {
+  if (flow !== 'p0-direct-play') {
+    return [];
+  }
+  const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
+  const jellyrin = summaries.find((summary) => summary.target === 'jellyrin' && summary.status === 'completed');
+  if (!upstream || !jellyrin) {
+    return [];
+  }
+
+  const reasons = [];
+  for (const key of ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing']) {
+    const upstreamRequest = upstream.criticalRequests[key];
+    const jellyrinRequest = jellyrin.criticalRequests[key];
+    if (!upstreamRequest || !jellyrinRequest) {
+      reasons.push(`cross-target: missing critical request ${key}`);
+      continue;
+    }
+    reasons.push(...compareCriticalRequest(key, upstreamRequest, jellyrinRequest));
+  }
+  reasons.push(...compareTargetInvariants(upstream, jellyrin));
+  return reasons;
+}
+
+function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
+  const reasons = [];
+  if (upstreamRequest.method !== jellyrinRequest.method) {
+    reasons.push(`cross-target ${key}: method ${upstreamRequest.method} != ${jellyrinRequest.method}`);
+  }
+  if (key === 'video-stream') {
+    if (![200, 206].includes(upstreamRequest.status) || ![200, 206].includes(jellyrinRequest.status)) {
+      reasons.push(`cross-target ${key}: stream status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    if (mediaType(upstreamRequest.contentType) !== mediaType(jellyrinRequest.contentType)) {
+      reasons.push(`cross-target ${key}: media type ${upstreamRequest.contentType} != ${jellyrinRequest.contentType}`);
+    }
+    if (Boolean(upstreamRequest.hasContentRange) !== Boolean(jellyrinRequest.hasContentRange)) {
+      reasons.push(`cross-target ${key}: content-range presence differs`);
+    }
+    return reasons;
+  }
+  if (upstreamRequest.status !== jellyrinRequest.status) {
+    reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != ${jellyrinRequest.status}`);
+  }
+  if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
+    reasons.push(`cross-target ${key}: response shape differs`);
+  }
+  if (key === 'sessions-playing' && !compatiblePlayMethod(upstreamRequest.playMethod, jellyrinRequest.playMethod)) {
+    reasons.push(`cross-target ${key}: play method ${upstreamRequest.playMethod} != compatible ${jellyrinRequest.playMethod}`);
+  }
+  return reasons;
+}
+
+function compareTargetInvariants(upstream, jellyrin) {
+  const reasons = [];
+  if (upstream.invariants.websocketSessions !== jellyrin.invariants.websocketSessions) {
+    reasons.push('cross-target: websocket Sessions invariant differs');
+  }
+  if (upstream.invariants.websocketKeepAlive !== jellyrin.invariants.websocketKeepAlive) {
+    reasons.push('cross-target: websocket KeepAlive invariant differs');
+  }
+  if (upstream.invariants.unexpectedTranscodePath !== jellyrin.invariants.unexpectedTranscodePath) {
+    reasons.push('cross-target: unexpected transcode/HLS invariant differs');
+  }
+  return reasons;
+}
+
+function addWebsocketMessageType(summary, parsed) {
+  if (!parsed || !parsed.MessageType) {
+    return;
+  }
+  if (!summary.invariants.websocketMessageTypes.includes(parsed.MessageType)) {
+    summary.invariants.websocketMessageTypes.push(parsed.MessageType);
+    summary.invariants.websocketMessageTypes.sort();
+  }
+}
+
+function compatiblePlayMethod(upstreamMethod, jellyrinMethod) {
+  if (!upstreamMethod || !jellyrinMethod) {
+    return true;
+  }
+  return ['DirectPlay', 'DirectStream'].includes(upstreamMethod)
+    && ['DirectPlay', 'DirectStream'].includes(jellyrinMethod);
+}
+
+function mediaType(contentType) {
+  return String(contentType || '').split(';')[0].trim().toLowerCase();
 }
 
 function invariantFailures(summary) {
@@ -378,6 +524,9 @@ function invariantFailures(summary) {
   if (!summary.invariants.websocketSessions) {
     failures.push('missing websocket Sessions invariant');
   }
+  if (!summary.invariants.websocketKeepAlive) {
+    failures.push('missing websocket keepalive invariant');
+  }
   if (summary.invariants.unexpectedTranscodePath) {
     failures.push('direct-play trace unexpectedly used transcode/HLS path');
   }
@@ -395,6 +544,7 @@ function ignoredConsoleError(text) {
     'A bad HTTP response code (404) was received when fetching the script.',
     'React Router Future Flag Warning',
     'Not initializing chromecast: chrome object is missing',
+    'MEDIA_NOT_SUPPORTED',
   ].some((allowed) => text.includes(allowed));
 }
 
