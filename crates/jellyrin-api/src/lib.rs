@@ -4285,7 +4285,7 @@ async fn install_package(
     Query(query): Query<PackageQuery>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let package = package_infos_from_repositories(
         &state
             .db
@@ -4297,19 +4297,52 @@ async fn install_package(
     .find(|package| package_matches_query(package, &name, &query))
     .ok_or_else(|| ApiError::not_found("Package not found"))?;
     let package_name = json_string_field(&package, "Name").unwrap_or(name);
-    Err(ApiError::conflict(format!(
-        "Package installation is not implemented in Jellyrin yet: {package_name}"
-    )))
+    let package_id = package_install_id(&package, &package_name);
+    let task_key = package_install_task_key(&package_id);
+    match state.db.start_task_run(&task_key).await {
+        Ok(_) => {
+            record_activity(
+                &state.db,
+                "Package installation queued",
+                Some(&format!(
+                    "Package installation was queued for {package_name}."
+                )),
+                "Package",
+                Some(user.id),
+            )
+            .await?;
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(error) if error.to_string().contains("already running") => Err(ApiError::conflict(
+            format!("Package installation is already running: {package_name}"),
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn cancel_package_installation(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_package_id): Path<String>,
+    Path(package_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let task_key = package_install_task_key(&package_id);
+    let _ = state
+        .db
+        .fail_current_task_run(&task_key, "Package installation cancelled.")
+        .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn package_install_id(package: &serde_json::Value, package_name: &str) -> String {
+    json_string_field(package, "Guid")
+        .filter(|guid| !guid.trim().is_empty())
+        .unwrap_or_else(|| stable_entity_id("Package", package_name))
+}
+
+fn package_install_task_key(package_id: &str) -> String {
+    format!("PackageInstall:{}", package_id.trim().to_ascii_lowercase())
 }
 
 async fn package_repositories(
@@ -22971,9 +23004,9 @@ mod tests {
         default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
         encoding_configuration_json, hls_transcode_dedupe_key, json_value_i64,
         last_system_lifecycle_command, load_countries, load_cultures, media_item_by_id,
-        media_item_streams, parse_authorization_token, parse_jellyfin_uuid,
-        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
-        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        media_item_streams, package_install_task_key, parse_authorization_token,
+        parse_jellyfin_uuid, parse_media_browser_pairs, reconcile_transcode_sessions_on_startup,
+        router, spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
         subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
@@ -28061,6 +28094,7 @@ mod tests {
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        let db_for_assertions = db.clone();
         let tmp = tempfile::tempdir().unwrap();
         let plugin_image = tmp.path().join("plugin.png");
         let plugin_image_bytes = vec![
@@ -28332,6 +28366,29 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let package_task_key = package_install_task_key("11111111-1111-1111-1111-111111111111");
+        assert!(
+            db_for_assertions
+                .current_task_run(&package_task_key)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Packages/Installed/Example%20Plugin?Version=1.0.0.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let error: Value = serde_json::from_slice(&body).unwrap();
@@ -28339,7 +28396,7 @@ mod tests {
             error["Message"]
                 .as_str()
                 .unwrap()
-                .contains("Package installation is not implemented")
+                .contains("Package installation is already running")
         );
 
         let response = app
@@ -28347,7 +28404,31 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri("/Package/Packages/Installing/00000000-0000-0000-0000-000000000000")
+                    .uri("/Package/Packages/Installing/11111111-1111-1111-1111-111111111111")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cancelled = db_for_assertions
+            .last_task_result(&package_task_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, "failed");
+        assert_eq!(
+            cancelled.error_message.as_deref(),
+            Some("Package installation cancelled.")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/Packages/Installing/11111111-1111-1111-1111-111111111111")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
