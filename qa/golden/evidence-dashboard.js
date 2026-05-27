@@ -24,7 +24,7 @@ async function main() {
 
   const sources = await loadSources();
   const routeSummary = summarizeRoutes(sources.routes);
-  const dtoSummary = summarizeDtos(sources.dtos);
+  const dtoSummary = summarizeDtos(sources.dtos, sources.dtoFieldParity);
   const apiGolden = summarizeApiGolden(sources.apiGolden);
   const browserTraces = summarizeBrowserTraces(sources.browserTraces);
   const functionalAreas = summarizeFunctionalAreas(sources.functionalParity);
@@ -59,6 +59,7 @@ async function loadSources() {
   return {
     routes: await readJson('api-routes.json', []),
     dtos: await readJson('dto-coverage.json', []),
+    dtoFieldParity: await readJson('dto-field-parity.json', null),
     apiGolden: await readJson(path.join('golden-traces', 'api-parity-latest.json'), null),
     functionalParity: await readText('functional-parity.md', ''),
     browserTraces: await readTraceComparisons(browserTracesDir),
@@ -157,11 +158,12 @@ function summarizeRoutes(routes) {
   };
 }
 
-function summarizeDtos(dtos) {
+function summarizeDtos(dtos, dtoFieldParity) {
   const byStatus = countBy(dtos, 'status');
   const highDangerPending = dtos.filter((dto) => dto.danger_if_wrong === 'high' && dto.status !== 'implemented');
   const pendingGolden = dtos.filter((dto) => String(dto.snapshot || '').includes('pending'));
   const implemented = dtos.filter((dto) => dto.status === 'implemented').length;
+  const golden = dtoFieldParity?.summary || {};
   return {
     total: dtos.length,
     byStatus,
@@ -169,6 +171,11 @@ function summarizeDtos(dtos) {
     implementedPercent: percent(implemented, dtos.length),
     highDangerPending: highDangerPending.length,
     pendingGolden: pendingGolden.length,
+    goldenStatus: dtoFieldParity ? 'available' : 'missing',
+    goldenValidated: golden.upstreamValidated || 0,
+    goldenValidatedPercent: golden.upstreamValidatedPercent || 0,
+    partialGolden: golden.partialGolden || 0,
+    missingGoldenEvidence: golden.missingEvidence ?? pendingGolden.length,
     topHighDangerPending: highDangerPending.slice(0, 10).map((dto) => `${dto.dto_family}.${dto.field}`),
   };
 }
@@ -264,8 +271,8 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
     },
     {
       id: 'dto-field-parity',
-      status: dtoSummary.pendingGolden === 0 && dtoSummary.highDangerPending === 0 ? 'implemented' : 'partial',
-      evidence: `${dtoSummary.implemented}/${dtoSummary.total} DTO fields implemented, pendingGolden=${dtoSummary.pendingGolden}, highDangerPending=${dtoSummary.highDangerPending}`,
+      status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
+      evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
     },
     {
       id: 'functional-areas',
@@ -294,8 +301,8 @@ function nextActions(gates, dtoSummary, browserTraces) {
   if (gates.find((gate) => gate.id === 'browser-login-home')?.status !== 'upstream-validated') {
     actions.push('Run login-home against both upstream and Jellyrin with the API-key preauth path.');
   }
-  if (dtoSummary.pendingGolden > 0) {
-    actions.push('Close G4 DTO field parity by converting pending golden snapshots into required-field assertions.');
+  if (dtoSummary.missingGoldenEvidence > 0 || dtoSummary.partialGolden > 0) {
+    actions.push('Close remaining G4 DTO field parity gaps with targeted traces for transcode, activity log and image info.');
   }
   const missingFlows = ['resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay']
     .filter((flow) => !browserTraces.some((trace) => trace.flow === flow));
@@ -310,6 +317,7 @@ function sourceStatus(sources) {
   return {
     routes: sources.routes.length > 0,
     dtos: sources.dtos.length > 0,
+    dtoFieldParity: Boolean(sources.dtoFieldParity),
     apiGolden: Boolean(sources.apiGolden),
     functionalParity: sources.functionalParity.trim().length > 0,
     browserTraceComparisons: sources.browserTraces.length,
@@ -378,7 +386,9 @@ function renderMarkdown(dashboard) {
   lines.push('## DTO Parity');
   lines.push('');
   lines.push(`- Implemented fields: ${dashboard.dtoSummary.implemented}/${dashboard.dtoSummary.total} (${dashboard.dtoSummary.implementedPercent}%)`);
-  lines.push(`- Pending golden snapshots: ${dashboard.dtoSummary.pendingGolden}`);
+  lines.push(`- Upstream/Jellyrin golden validated: ${dashboard.dtoSummary.goldenValidated}/${dashboard.dtoSummary.total} (${dashboard.dtoSummary.goldenValidatedPercent}%)`);
+  lines.push(`- Partial golden evidence: ${dashboard.dtoSummary.partialGolden}`);
+  lines.push(`- Missing golden evidence: ${dashboard.dtoSummary.missingGoldenEvidence}`);
   lines.push(`- High-danger pending fields: ${dashboard.dtoSummary.highDangerPending}`);
   if (dashboard.dtoSummary.topHighDangerPending.length > 0) {
     lines.push(`- Top high-danger pending: ${dashboard.dtoSummary.topHighDangerPending.join(', ')}`);
