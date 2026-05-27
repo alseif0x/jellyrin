@@ -31220,6 +31220,18 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/Items/{item_id}/ThemeMedia"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/ThemeMedia"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -31249,9 +31261,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/Library/Items/{item_id}/ThemeMedia?StartIndex=1&Limit=1"
-                    ))
+                    .uri(format!("/Items/{item_id}/ThemeMedia?StartIndex=1&Limit=1"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -31287,6 +31297,18 @@ mod tests {
             (format!("/Items/{item_id}/ThemeSongs"), "Audio"),
             (format!("/Items/{item_id}/ThemeVideos"), "Video"),
         ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+
             let response = app
                 .clone()
                 .oneshot(
@@ -33492,18 +33514,23 @@ mod tests {
             assert_eq!(theme_items["Items"].as_array().unwrap().len(), 0);
         }
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/Items/00000000-0000-0000-0000-000000000000/ThemeSongs")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for endpoint in [
+            "/Items/00000000-0000-0000-0000-000000000000/ThemeSongs",
+            "/Items/00000000-0000-0000-0000-000000000000/ThemeVideos",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{endpoint}");
+        }
 
         let response = app
             .clone()
