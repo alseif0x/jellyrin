@@ -28,7 +28,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -100,6 +100,10 @@ async function captureTarget(browser, flowDir, target) {
       websocketMessageTypes: [],
       unexpectedTranscodePath: false,
       playMethods: [],
+      playbackProgress204: false,
+      resumeList200: false,
+      resumeItemMatched: false,
+      resumePositionTicks: null,
     },
   };
 
@@ -136,8 +140,10 @@ async function captureTarget(browser, flowDir, target) {
 
     if (flow === 'login-home') {
       await runLoginHomeFlow(page, summary, publicInfo, target);
-    } else {
+    } else if (flow === 'p0-direct-play') {
       await runDirectPlayFlow(page, summary, publicInfo, target);
+    } else {
+      await runResumeFlow(page, summary, publicInfo, target);
     }
     if (summary.skipped) {
       return summary;
@@ -165,17 +171,73 @@ async function runLoginHomeFlow(page, summary, publicInfo, target) {
   await page.waitForLoadState('networkidle');
 }
 
+async function runResumeFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  const movie = await firstMovieItem(page, summary, auth);
+  if (!movie) {
+    summary.status = 'skipped';
+    summary.skipped = true;
+    summary.reason = 'target has no movie item for resume trace';
+    return;
+  }
+  if (!resumeTraceEligible(movie)) {
+    summary.status = 'skipped';
+    summary.skipped = true;
+    summary.reason = 'target has no resume-eligible movie item for resume trace';
+    return;
+  }
+
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  const positionTicks = resumeTracePositionTicks(movie);
+  const progressResult = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Sessions/Playing/Progress',
+    token: auth.AccessToken,
+    body: {
+      ItemId: movie.Id,
+      MediaSourceId: movie.Id,
+      PositionTicks: positionTicks,
+      IsPaused: false,
+    },
+  });
+  if (progressResult.status !== 204) {
+    throw new Error(`Sessions/Playing/Progress returned HTTP ${progressResult.status}`);
+  }
+
+  const resumeResult = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video&Fields=PrimaryImageAspectRatio`,
+    token: auth.AccessToken,
+  });
+  if (resumeResult.status < 200 || resumeResult.status >= 300) {
+    throw new Error(`UserItems/Resume returned HTTP ${resumeResult.status}`);
+  }
+  const resume = resumeResult.json;
+  const resumeItem = resume.Items?.find((item) => item.Id === movie.Id);
+  if (!resumeItem) {
+    throw new Error('resume list does not contain traced movie item');
+  }
+  if (resumeItem.UserData?.PlaybackPositionTicks !== positionTicks) {
+    throw new Error(`resume position ${resumeItem.UserData?.PlaybackPositionTicks} != ${positionTicks}`);
+  }
+  if (resumeItem.UserData?.Played !== false) {
+    throw new Error(`resume item Played state ${resumeItem.UserData?.Played} != false`);
+  }
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle');
+  summary.item = {
+    id: '<dynamic>',
+    name: movie.Name,
+    type: movie.Type,
+  };
+}
+
 async function runDirectPlayFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
-  const itemsResponse = await page.request.get(
-    `${summary.baseUrl}/Items?UserId=${encodeURIComponent(auth.User.Id)}&IncludeItemTypes=Movie&Recursive=true&StartIndex=0&Limit=10`,
-    { headers: { 'X-Emby-Token': auth.AccessToken } },
-  );
-  if (!itemsResponse.ok()) {
-    throw new Error(`Movie lookup returned HTTP ${itemsResponse.status()}`);
-  }
-  const items = await itemsResponse.json();
-  const movie = items.Items?.find((item) => item.Type === 'Movie' && item.MediaType === 'Video');
+  const movie = await firstMovieItem(page, summary, auth);
   if (!movie) {
     summary.status = 'skipped';
     summary.skipped = true;
@@ -212,6 +274,58 @@ async function runDirectPlayFlow(page, summary, publicInfo, target) {
     name: movie.Name,
     type: movie.Type,
   };
+}
+
+async function firstMovieItem(page, summary, auth) {
+  const itemsResponse = await page.request.get(
+    `${summary.baseUrl}/Items?UserId=${encodeURIComponent(auth.User.Id)}&IncludeItemTypes=Movie&Recursive=true&Fields=RunTimeTicks&StartIndex=0&Limit=10`,
+    { headers: { 'X-Emby-Token': auth.AccessToken } },
+  );
+  if (!itemsResponse.ok()) {
+    throw new Error(`Movie lookup returned HTTP ${itemsResponse.status()}`);
+  }
+  const items = await itemsResponse.json();
+  const movies = items.Items?.filter((item) => item.Type === 'Movie' && item.MediaType === 'Video') || [];
+  return movies.find(resumeTraceEligible) || movies[0];
+}
+
+function resumeTracePositionTicks(movie) {
+  const runtimeTicks = Number(movie.RunTimeTicks || 0);
+  if (Number.isFinite(runtimeTicks) && runtimeTicks > 0) {
+    return Math.max(1, Math.floor(runtimeTicks / 2));
+  }
+  return 50_000_000;
+}
+
+function resumeTraceEligible(movie) {
+  const runtimeTicks = Number(movie.RunTimeTicks || 0);
+  return Number.isFinite(runtimeTicks) && runtimeTicks >= 300 * 10_000_000;
+}
+
+async function browserFetchJson(page, request) {
+  return page.evaluate(async ({ method, url, token, body }) => {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Emby-Token': token,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await response.text();
+    let json = null;
+    if (text) {
+      try {
+        json = JSON.parse(text);
+      } catch (_) {
+        json = null;
+      }
+    }
+    return {
+      status: response.status,
+      json,
+    };
+  }, request);
 }
 
 async function authenticateTarget(page, summary, target) {
@@ -412,7 +526,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (flow !== 'p0-direct-play') {
+  if (!['p0-direct-play', 'resume'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -430,6 +544,17 @@ function captureFlowInvariants(summary, record, requestPostData) {
     summary.invariants.sessionPlaying204 = true;
     if (requestPostData && typeof requestPostData === 'object' && requestPostData.PlayMethod) {
       summary.invariants.playMethods.push(requestPostData.PlayMethod);
+    }
+  }
+  if (pathname === '/Sessions/Playing/Progress' && record.method === 'POST' && record.status === 204) {
+    summary.invariants.playbackProgress204 = true;
+  }
+  if (pathname === '/UserItems/Resume' && record.method === 'GET' && record.status === 200) {
+    summary.invariants.resumeList200 = true;
+    const items = record.responseShape?.Items;
+    if (Array.isArray(items) && items.length > 0) {
+      summary.invariants.resumeItemMatched = true;
+      summary.invariants.resumePositionTicks = 'number';
     }
   }
   if (/\/transcoding\/|\/hls\/|\/hls1\/|\.m3u8$/i.test(pathname)) {
@@ -453,6 +578,12 @@ function criticalRequestKey(record) {
   }
   if (record.method === 'POST' && pathname === '/Sessions/Playing') {
     return 'sessions-playing';
+  }
+  if (record.method === 'POST' && pathname === '/Sessions/Playing/Progress') {
+    return 'sessions-playing-progress';
+  }
+  if (record.method === 'GET' && pathname === '/UserItems/Resume') {
+    return 'resume-list';
   }
   return null;
 }
@@ -478,7 +609,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (flow !== 'p0-direct-play') {
+  if (!['p0-direct-play', 'resume'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -488,7 +619,10 @@ function compareCompletedTargets(summaries) {
   }
 
   const reasons = [];
-  for (const key of ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing']) {
+  const keys = flow === 'resume'
+    ? ['resume-list', 'sessions-playing-progress']
+    : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+  for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
     if (!upstreamRequest && !jellyrinRequest) {
@@ -524,7 +658,7 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (upstreamRequest.status !== jellyrinRequest.status) {
     reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != ${jellyrinRequest.status}`);
   }
-  if (['item-detail', 'playback-info'].includes(key)) {
+  if (['item-detail', 'playback-info', 'resume-list'].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
     reasons.push(`cross-target ${key}: response shape differs`);
@@ -557,6 +691,16 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
       'MediaSources.[].MediaStreams',
       'MediaSources.[].MediaStreams.[].Type',
       'PlaySessionId',
+    ],
+    'resume-list': [
+      'Items',
+      'Items.[].Id',
+      'Items.[].Name',
+      'Items.[].Type',
+      'Items.[].UserData',
+      'Items.[].UserData.PlaybackPositionTicks',
+      'Items.[].UserData.Played',
+      'TotalRecordCount',
     ],
   }[key] || [];
   const reasons = [];
@@ -629,10 +773,22 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (flow !== 'p0-direct-play' || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
+  if (flow === 'resume') {
+    if (!summary.invariants.playbackProgress204) {
+      failures.push('missing Sessions/Playing/Progress 204 invariant');
+    }
+    if (!summary.invariants.resumeList200) {
+      failures.push('missing UserItems/Resume 200 invariant');
+    }
+    if (!summary.invariants.resumeItemMatched) {
+      failures.push('missing resume item invariant');
+    }
+    return failures;
+  }
   if (!summary.invariants.playbackInfo200) {
     failures.push('missing PlaybackInfo 200 invariant');
   }

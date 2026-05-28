@@ -244,6 +244,7 @@ function summarizeFunctionalAreas(markdown) {
 function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas) {
   const p0Direct = browserTraces.find((trace) => trace.flow === 'p0-direct-play');
   const loginHome = browserTraces.find((trace) => trace.flow === 'login-home');
+  const resume = browserTraces.find((trace) => trace.flow === 'resume');
   return [
     {
       id: 'routes',
@@ -267,6 +268,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
       status: loginHome?.status || 'pending',
       evidence: loginHome
         ? `${loginHome.completedTargets.join(',') || 'none'} completed, failed=${loginHome.failed}`
+        : 'missing trace',
+    },
+    {
+      id: 'browser-resume',
+      status: resume?.status || 'pending',
+      evidence: resume
+        ? `${resume.completedTargets.join(',') || 'none'} completed, failed=${resume.failed}`
         : 'missing trace',
     },
     {
