@@ -4566,7 +4566,7 @@ async fn install_package(
     Query(query): Query<PackageQuery>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let package = package_infos_from_repositories(
         &state
             .db
@@ -4578,27 +4578,9 @@ async fn install_package(
     .find(|package| package_matches_query(package, &name, &query))
     .ok_or_else(|| ApiError::not_found("Package not found"))?;
     let package_name = json_string_field(&package, "Name").unwrap_or(name);
-    let package_id = package_install_id(&package, &package_name);
-    let task_key = package_install_task_key(&package_id);
-    match state.db.start_task_run(&task_key).await {
-        Ok(_) => {
-            record_activity(
-                &state.db,
-                "Package installation queued",
-                Some(&format!(
-                    "Package installation was queued for {package_name}."
-                )),
-                "Package",
-                Some(user.id),
-            )
-            .await?;
-            Ok(StatusCode::NO_CONTENT)
-        }
-        Err(error) if error.to_string().contains("already running") => Err(ApiError::conflict(
-            format!("Package installation is already running: {package_name}"),
-        )),
-        Err(error) => Err(error.into()),
-    }
+    Err(ApiError::conflict(format!(
+        "Package installation is not supported in Jellyrin yet: {package_name}"
+    )))
 }
 
 async fn cancel_package_installation(
@@ -4614,12 +4596,6 @@ async fn cancel_package_installation(
         .fail_current_task_run(&task_key, "Package installation cancelled.")
         .await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-fn package_install_id(package: &serde_json::Value, package_name: &str) -> String {
-    json_string_field(package, "Guid")
-        .filter(|guid| !guid.trim().is_empty())
-        .unwrap_or_else(|| stable_entity_id("Package", package_name))
 }
 
 fn package_install_task_key(package_id: &str) -> String {
@@ -28950,7 +28926,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error["Message"]
+                .as_str()
+                .unwrap()
+                .contains("Package installation is not supported")
+        );
 
         let package_task_key = package_install_task_key("11111111-1111-1111-1111-111111111111");
         assert!(
@@ -28958,7 +28942,7 @@ mod tests {
                 .current_task_run(&package_task_key)
                 .await
                 .unwrap()
-                .is_some()
+                .is_none()
         );
 
         let response = app
@@ -28980,7 +28964,7 @@ mod tests {
             error["Message"]
                 .as_str()
                 .unwrap()
-                .contains("Package installation is already running")
+                .contains("Package installation is not supported")
         );
 
         let response = app
@@ -28996,15 +28980,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let cancelled = db_for_assertions
-            .last_task_result(&package_task_key)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(cancelled.status, "failed");
-        assert_eq!(
-            cancelled.error_message.as_deref(),
-            Some("Package installation cancelled.")
+        assert!(
+            db_for_assertions
+                .last_task_result(&package_task_key)
+                .await
+                .unwrap()
+                .is_none()
         );
 
         let response = app

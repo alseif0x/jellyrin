@@ -45,6 +45,9 @@ const authUsersFlowPassword = 'JellyrinAuthFlowPassword!2026';
 const authUsersFlowApiKeyApp = 'Jellyrin Auth Flow API Key';
 const sessionsFlowPrefix = 'Jellyrin Sessions Flow User';
 const sessionsFlowPassword = 'JellyrinSessionsFlowPassword!2026';
+const pluginsFlowRepositoryName = 'Jellyrin Golden Plugin Repository';
+const pluginsFlowPackageName = 'Jellyrin Golden Plugin';
+const pluginsFlowPackageGuid = '22222222-2222-2222-2222-222222222222';
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -69,7 +72,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -269,6 +272,17 @@ async function captureTarget(browser, flowDir, target) {
       authKeyRevoked: false,
       authCreatedUserLogout204: false,
       authUserDeleted: false,
+      pluginsList200: false,
+      pluginsListEmpty: false,
+      pluginRepositories200: false,
+      pluginRepositoryUpdated: false,
+      pluginPackages200: false,
+      pluginPackageMatched: false,
+      pluginManifest200: false,
+      pluginInstallRejected: false,
+      pluginEnableRejected: false,
+      pluginDisableRejected: false,
+      pluginUninstallRejected: false,
       startupPublicInfoIncomplete: false,
       startupConfig200: false,
       startupConfig204: false,
@@ -359,6 +373,8 @@ async function captureTarget(browser, flowDir, target) {
       await runAuthUsersFlow(page, summary, publicInfo, target);
     } else if (flow === 'sessions-websocket') {
       await runSessionsWebsocketFlow(page, summary, publicInfo, target);
+    } else if (flow === 'plugins-packages') {
+      await runPluginsPackagesFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -2189,6 +2205,157 @@ async function runAuthUsersFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runPluginsPackagesFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/dashboard/plugins');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const plugins = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Plugins',
+    token: auth.AccessToken,
+  });
+  if (plugins.status !== 200 || !Array.isArray(plugins.json)) {
+    throw new Error(`Plugins returned HTTP ${plugins.status}`);
+  }
+  summary.invariants.pluginsList200 = true;
+  if (target.name === 'jellyrin' && plugins.json.length !== 0) {
+    throw new Error('Jellyrin reported active plugins despite unsupported .NET plugin execution');
+  }
+  if (plugins.json.length === 0) {
+    summary.invariants.pluginsListEmpty = true;
+  }
+
+  const repositories = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Package/Repositories',
+    token: auth.AccessToken,
+  });
+  if (repositories.status !== 200 || !Array.isArray(repositories.json)) {
+    throw new Error(`Package/Repositories returned HTTP ${repositories.status}`);
+  }
+  summary.invariants.pluginRepositories200 = true;
+
+  const packages = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Packages',
+    token: auth.AccessToken,
+  });
+  if (packages.status !== 200 || !Array.isArray(packages.json)) {
+    throw new Error(`Packages returned HTTP ${packages.status}`);
+  }
+  summary.invariants.pluginPackages200 = true;
+
+  if (target.name !== 'jellyrin') {
+    await page.goto(`${summary.baseUrl}/web/#/dashboard/plugins`, { waitUntil: 'domcontentloaded' });
+    await page.waitForLoadState('networkidle').catch(() => {});
+    return;
+  }
+
+  const repositoryPayload = [{
+    Name: pluginsFlowRepositoryName,
+    Url: 'https://repo.invalid/jellyrin-golden-plugin.json',
+    Enabled: true,
+    Packages: [{
+      Name: pluginsFlowPackageName,
+      Guid: pluginsFlowPackageGuid,
+      Overview: 'Golden unsupported plugin fixture',
+      Description: 'Golden unsupported plugin fixture',
+      Owner: 'Jellyrin',
+      Category: 'General',
+      Versions: [{
+        Version: '1.0.0.0',
+        TargetAbi: '12.0.0.0',
+        SourceUrl: 'https://repo.invalid/jellyrin-golden-plugin.zip',
+        Checksum: 'golden-checksum',
+      }],
+    }],
+  }];
+  const repositoryUpdate = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Package/Repositories',
+    token: auth.AccessToken,
+    body: repositoryPayload,
+  });
+  if (![200, 204].includes(repositoryUpdate.status)) {
+    throw new Error(`Package/Repositories update returned HTTP ${repositoryUpdate.status}`);
+  }
+  summary.invariants.pluginRepositoryUpdated = true;
+
+  const catalog = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Package/Packages',
+    token: auth.AccessToken,
+  });
+  if (catalog.status !== 200 || !catalog.json?.some((item) => item.Name === pluginsFlowPackageName && item.Guid === pluginsFlowPackageGuid)) {
+    throw new Error(`Package catalog did not expose golden plugin, HTTP ${catalog.status}`);
+  }
+  summary.invariants.pluginPackageMatched = true;
+
+  const manifest = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Plugins/${encodeURIComponent(pluginsFlowPackageGuid)}/Manifest`,
+    token: auth.AccessToken,
+  });
+  if (manifest.status !== 200 || manifest.json?.Guid !== pluginsFlowPackageGuid || manifest.json?.Name !== pluginsFlowPackageName) {
+    throw new Error(`Plugin manifest returned HTTP ${manifest.status}`);
+  }
+  summary.invariants.pluginManifest200 = true;
+
+  const install = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Package/Packages/Installed/${encodeURIComponent(pluginsFlowPackageName)}?Version=1.0.0.0`,
+    token: auth.AccessToken,
+  });
+  if (install.status !== 409 || !install.json?.Message?.includes('Package installation is not supported')) {
+    throw new Error(`Package install was not explicitly rejected, HTTP ${install.status}`);
+  }
+  summary.invariants.pluginInstallRejected = true;
+
+  const enable = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Plugins/${encodeURIComponent(pluginsFlowPackageGuid)}/1.0.0.0/Enable`,
+    token: auth.AccessToken,
+  });
+  if (enable.status !== 409 || !enable.json?.Message?.includes('Plugin enable is not implemented')) {
+    throw new Error(`Plugin enable was not explicitly rejected, HTTP ${enable.status}`);
+  }
+  summary.invariants.pluginEnableRejected = true;
+
+  const disable = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Plugins/${encodeURIComponent(pluginsFlowPackageGuid)}/1.0.0.0/Disable`,
+    token: auth.AccessToken,
+  });
+  if (disable.status !== 409 || !disable.json?.Message?.includes('Plugin disable is not implemented')) {
+    throw new Error(`Plugin disable was not explicitly rejected, HTTP ${disable.status}`);
+  }
+  summary.invariants.pluginDisableRejected = true;
+
+  const uninstall = await browserFetchJson(page, {
+    method: 'DELETE',
+    url: `/Plugins/${encodeURIComponent(pluginsFlowPackageGuid)}/1.0.0.0`,
+    token: auth.AccessToken,
+  });
+  if (uninstall.status !== 409 || !uninstall.json?.Message?.includes('Plugin uninstall is not implemented')) {
+    throw new Error(`Plugin uninstall was not explicitly rejected, HTTP ${uninstall.status}`);
+  }
+  summary.invariants.pluginUninstallRejected = true;
+
+  const pluginsAfterLifecycle = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Plugins',
+    token: auth.AccessToken,
+  });
+  if (pluginsAfterLifecycle.status !== 200 || !Array.isArray(pluginsAfterLifecycle.json) || pluginsAfterLifecycle.json.length !== 0) {
+    throw new Error('Jellyrin reported installed plugins after rejected lifecycle operations');
+  }
+  summary.invariants.pluginsListEmpty = true;
+
+  await page.goto(`${summary.baseUrl}/web/#/dashboard/plugins`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -3357,7 +3524,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -3477,6 +3644,35 @@ function captureFlowInvariants(summary, record, requestPostData) {
     }
     if (record.method === 'GET' && pathname === '/web/ConfigurationPages') {
       summary.invariants.adminConfigPages200 = true;
+    }
+  }
+  if (flow === 'plugins-packages') {
+    if (record.method === 'GET' && pathname === '/Plugins' && record.status === 200) {
+      summary.invariants.pluginsList200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Package/Repositories' && record.status === 200) {
+      summary.invariants.pluginRepositories200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Package/Repositories' && [200, 204].includes(record.status)) {
+      summary.invariants.pluginRepositoryUpdated = true;
+    }
+    if (record.method === 'GET' && ['/Packages', '/Package/Packages'].includes(pathname) && record.status === 200) {
+      summary.invariants.pluginPackages200 = true;
+    }
+    if (record.method === 'GET' && /\/Plugins\/[^/]+\/Manifest$/i.test(pathname) && record.status === 200) {
+      summary.invariants.pluginManifest200 = true;
+    }
+    if (record.method === 'POST' && /\/Package\/Packages\/Installed\/[^/]+$/i.test(pathname) && record.status === 409) {
+      summary.invariants.pluginInstallRejected = true;
+    }
+    if (record.method === 'POST' && /\/Plugins\/[^/]+\/[^/]+\/Enable$/i.test(pathname) && record.status === 409) {
+      summary.invariants.pluginEnableRejected = true;
+    }
+    if (record.method === 'POST' && /\/Plugins\/[^/]+\/[^/]+\/Disable$/i.test(pathname) && record.status === 409) {
+      summary.invariants.pluginDisableRejected = true;
+    }
+    if (record.method === 'DELETE' && /\/Plugins\/[^/]+\/[^/]+$/i.test(pathname) && record.status === 409) {
+      summary.invariants.pluginUninstallRejected = true;
     }
   }
   if (flow === 'libraries' && record.status === 200) {
@@ -3762,6 +3958,18 @@ function criticalRequestKey(record, requestPostData) {
   const pathname = new URL(record.url).pathname;
   if (record.method === 'POST' && pathname.toLowerCase() === '/users/authenticatebyname') {
     return flow === 'auth-users' ? 'auth-created-user-login' : 'auth';
+  }
+  if (flow === 'plugins-packages' && record.method === 'GET' && pathname === '/Plugins') {
+    return 'plugins-list';
+  }
+  if (flow === 'plugins-packages' && record.method === 'GET' && pathname === '/Package/Repositories') {
+    return 'plugin-repositories';
+  }
+  if (flow === 'plugins-packages' && record.method === 'GET' && ['/Packages', '/Package/Packages'].includes(pathname)) {
+    return 'plugin-packages';
+  }
+  if (flow === 'plugins-packages' && record.method === 'GET' && /\/Plugins\/[^/]+\/Manifest$/i.test(pathname)) {
+    return 'plugin-manifest';
   }
   if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Users/Public') {
     return 'auth-users-public';
@@ -4148,7 +4356,9 @@ function compareCompletedTargets(summaries) {
                           ? ['auth-users-public', 'auth-users-list', 'auth-providers', 'auth-password-reset-providers', 'auth-user-create', 'auth-created-user-login', 'auth-users-me', 'auth-user-detail', 'auth-user-policy', 'auth-user-configuration', 'auth-keys-list', 'auth-key-create', 'auth-key-system-info', 'auth-key-delete', 'auth-user-logout', 'auth-user-delete']
                           : flow === 'sessions-websocket'
                             ? ['sessions-list', 'sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop']
-                            : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+                            : flow === 'plugins-packages'
+                              ? ['plugins-list', 'plugin-repositories', 'plugin-packages']
+                              : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -4763,6 +4973,34 @@ function invariantFailures(summary) {
     }
     return failures;
   }
+  if (flow === 'plugins-packages') {
+    for (const [field, label] of [
+      ['pluginsList200', 'plugins list'],
+      ['pluginRepositories200', 'plugin repositories'],
+      ['pluginPackages200', 'plugin packages'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
+    }
+    if (summary.target === 'jellyrin') {
+      for (const [field, label] of [
+        ['pluginsListEmpty', 'empty installed plugins'],
+        ['pluginRepositoryUpdated', 'plugin repository update'],
+        ['pluginPackageMatched', 'plugin package catalog'],
+        ['pluginManifest200', 'plugin manifest'],
+        ['pluginInstallRejected', 'package install rejected'],
+        ['pluginEnableRejected', 'plugin enable rejected'],
+        ['pluginDisableRejected', 'plugin disable rejected'],
+        ['pluginUninstallRejected', 'plugin uninstall rejected'],
+      ]) {
+        if (!summary.invariants[field]) {
+          failures.push(`missing ${label} invariant`);
+        }
+      }
+    }
+    return failures;
+  }
   if (flow === 'sessions-websocket') {
     for (const [field, label] of [
       ['websocketKeepAlive', 'ForceKeepAlive/KeepAlive'],
@@ -4836,6 +5074,9 @@ function allowedFailedResponse(response) {
     return true;
   }
   if (response.status() === 400 && url.startsWith('http://127.0.0.1:8096/') && /\/Playlists\/[^/]+$/i.test(new URL(url).pathname)) {
+    return true;
+  }
+  if (flow === 'plugins-packages' && response.status() === 409) {
     return true;
   }
   return response.status() === 400 && new URL(url).pathname === '/SyncPlay/List';
