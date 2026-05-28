@@ -252,6 +252,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const audioHlsLegacy = browserTraces.find((trace) => trace.flow === 'audio-hls-legacy');
   const music = browserTraces.find((trace) => trace.flow === 'music');
   const series = browserTraces.find((trace) => trace.flow === 'series');
+  const playlistsCollections = browserTraces.find((trace) => trace.flow === 'playlists-collections');
   return [
     {
       id: 'routes',
@@ -334,6 +335,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
         : 'missing trace',
     },
     {
+      id: 'browser-playlists-collections',
+      status: playlistsCollections?.status || 'pending',
+      evidence: playlistsCollections
+        ? `${playlistsCollections.completedTargets.join(',') || 'none'} completed, failed=${playlistsCollections.failed}`
+        : 'missing trace',
+    },
+    {
       id: 'dto-field-parity',
       status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
       evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
@@ -368,7 +376,7 @@ function nextActions(gates, dtoSummary, browserTraces) {
   if (dtoSummary.missingGoldenEvidence > 0 || dtoSummary.partialGolden > 0) {
     actions.push('Close remaining G4 DTO field parity gaps with targeted traces for transcode, activity log and image info.');
   }
-  const missingFlows = ['resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series']
+  const missingFlows = ['resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections']
     .filter((flow) => !browserTraces.some((trace) => trace.flow === flow));
   if (missingFlows.length > 0) {
     actions.push(`Add browser traces for: ${missingFlows.join(', ')}.`);

@@ -3172,11 +3172,14 @@ impl Database {
     pub async fn move_media_list_item(
         &self,
         list_id: Uuid,
-        item_id: Uuid,
+        target_id: Uuid,
         new_index: i64,
     ) -> anyhow::Result<()> {
         let mut rows = self.media_list_item_ids(list_id).await?;
-        let Some(current_index) = rows.iter().position(|row| row.0 == item_id) else {
+        let Some(current_index) = rows
+            .iter()
+            .position(|row| row.0 == target_id || row.1 == target_id)
+        else {
             anyhow::bail!("media list item not found");
         };
         let row = rows.remove(current_index);

@@ -27,6 +27,8 @@ const musicFlowAlbum = 'Jellyrin Music Flow Album';
 const musicFlowArtist = 'Jellyrin Music Flow Artist';
 const musicFlowAlbumArtist = 'Jellyrin Music Flow Album Artist';
 const musicFlowGenre = 'Jellyrin Music Flow Rock';
+const listFlowPlaylistName = 'Jellyrin Golden Playlist Flow';
+const listFlowCollectionName = 'Jellyrin Golden Collection Flow';
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -51,7 +53,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -191,6 +193,20 @@ async function captureTarget(browser, flowDir, target) {
       seriesSimilar200: false,
       seriesStream200: false,
       seriesStreamContentTypes: [],
+      playlistCreated: false,
+      playlistDetail200: false,
+      playlistItems200: false,
+      playlistItemIdsMatched: false,
+      playlistMove204: false,
+      playlistMoveUnsupported400: false,
+      playlistMovedOrderMatched: false,
+      playlistDeleteItem204: false,
+      playlistAddItem204: false,
+      playlistRename204: false,
+      playlistRenameUnsupported400: false,
+      collectionCreated: false,
+      collectionAddItems204: false,
+      collectionDeleteItems204: false,
     },
   };
 
@@ -243,6 +259,8 @@ async function captureTarget(browser, flowDir, target) {
       await runMusicFlow(page, summary, publicInfo, target);
     } else if (flow === 'series') {
       await runSeriesFlow(page, summary, publicInfo, target);
+    } else if (flow === 'playlists-collections') {
+      await runPlaylistsCollectionsFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -844,6 +862,156 @@ async function runSeriesFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runPlaylistsCollectionsFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  const movies = await firstTwoMovieItems(page, summary, auth);
+  const [firstMovie, secondMovie] = movies;
+  const playlistName = `${listFlowPlaylistName} ${target.name}`;
+  const collectionName = `${listFlowCollectionName} ${target.name}`;
+
+  const createdPlaylist = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Playlists?Name=${encodeURIComponent(playlistName)}&Ids=${encodeURIComponent(firstMovie.Id)},${encodeURIComponent(secondMovie.Id)}&UserId=${encodeURIComponent(auth.User.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (createdPlaylist.status !== 200) {
+    throw new Error(`playlist create returned HTTP ${createdPlaylist.status}`);
+  }
+  const playlistId = createdPlaylist.json?.Id;
+  if (!playlistId) {
+    throw new Error('playlist create did not return Id');
+  }
+  summary.invariants.playlistCreated = true;
+
+  const playlist = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Users/${encodeURIComponent(auth.User.Id)}/Items/${encodeURIComponent(playlistId)}`,
+    token: auth.AccessToken,
+  });
+  if (playlist.status !== 200) {
+    throw new Error(`playlist detail returned HTTP ${playlist.status}`);
+  }
+  if (playlist.json?.Type !== 'Playlist' || !String(playlist.json?.Name || '').includes(listFlowPlaylistName)) {
+    throw new Error('playlist detail did not match created playlist');
+  }
+  summary.invariants.playlistDetail200 = true;
+
+  const initialItems = await fetchPlaylistItems(page, auth, playlistId);
+  if (initialItems.length < 2 || !initialItems.every((item) => item.PlaylistItemId)) {
+    throw new Error('playlist items did not include expected entries');
+  }
+  summary.invariants.playlistItems200 = true;
+  summary.invariants.playlistItemIdsMatched = true;
+  const secondPlaylistItemId = initialItems.find((item) => item.Id === secondMovie.Id)?.PlaylistItemId;
+  if (!secondPlaylistItemId) {
+    throw new Error('playlist items did not expose movable PlaylistItemId');
+  }
+
+  const move = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Playlists/${encodeURIComponent(playlistId)}/Items/${encodeURIComponent(secondPlaylistItemId)}/Move/0`,
+    token: auth.AccessToken,
+  });
+  if (move.status === 400 && target.name === 'upstream') {
+    summary.invariants.playlistMoveUnsupported400 = true;
+  } else if (![200, 204].includes(move.status)) {
+    throw new Error(`playlist move returned HTTP ${move.status}`);
+  } else {
+    summary.invariants.playlistMove204 = true;
+    const movedItems = await fetchPlaylistItems(page, auth, playlistId);
+    if (movedItems[0]?.Id !== secondMovie.Id) {
+      throw new Error('playlist move did not reorder items');
+    }
+    summary.invariants.playlistMovedOrderMatched = true;
+  }
+
+  const movedItems = await fetchPlaylistItems(page, auth, playlistId);
+  const removablePlaylistItemId = movedItems.find((item) => item.Id === firstMovie.Id)?.PlaylistItemId;
+  if (!removablePlaylistItemId) {
+    throw new Error('playlist moved items did not expose removable PlaylistItemId');
+  }
+  const remove = await browserFetchJson(page, {
+    method: 'DELETE',
+    url: `/Playlists/${encodeURIComponent(playlistId)}/Items?entryIds=${encodeURIComponent(removablePlaylistItemId)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(remove.status)) {
+    throw new Error(`playlist item delete returned HTTP ${remove.status}`);
+  }
+  summary.invariants.playlistDeleteItem204 = true;
+
+  const add = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Playlists/${encodeURIComponent(playlistId)}/Items?Ids=${encodeURIComponent(firstMovie.Id)}&UserId=${encodeURIComponent(auth.User.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(add.status)) {
+    throw new Error(`playlist item add returned HTTP ${add.status}`);
+  }
+  summary.invariants.playlistAddItem204 = true;
+
+  const rename = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Playlists/${encodeURIComponent(playlistId)}`,
+    token: auth.AccessToken,
+    body: { Name: `${playlistName} Renamed` },
+  });
+  if (rename.status === 400 && target.name === 'upstream') {
+    summary.invariants.playlistRenameUnsupported400 = true;
+  } else if (![200, 204].includes(rename.status)) {
+    throw new Error(`playlist rename returned HTTP ${rename.status}`);
+  } else {
+    summary.invariants.playlistRename204 = true;
+  }
+
+  const createdCollection = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Collections?name=${encodeURIComponent(collectionName)}&ids=${encodeURIComponent(firstMovie.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (createdCollection.status !== 200) {
+    throw new Error(`collection create returned HTTP ${createdCollection.status}`);
+  }
+  const collectionId = createdCollection.json?.Id;
+  if (!collectionId) {
+    throw new Error('collection create did not return Id');
+  }
+  summary.invariants.collectionCreated = true;
+
+  const addCollection = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Collections/${encodeURIComponent(collectionId)}/Items?ids=${encodeURIComponent(secondMovie.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(addCollection.status)) {
+    throw new Error(`collection item add returned HTTP ${addCollection.status}`);
+  }
+  summary.invariants.collectionAddItems204 = true;
+
+  const removeCollection = await browserFetchJson(page, {
+    method: 'DELETE',
+    url: `/Collections/${encodeURIComponent(collectionId)}/Items?ids=${encodeURIComponent(firstMovie.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(removeCollection.status)) {
+    throw new Error(`collection item delete returned HTTP ${removeCollection.status}`);
+  }
+  summary.invariants.collectionDeleteItems204 = true;
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: '<dynamic>',
+    playlist: playlistName,
+    collection: collectionName,
+    firstMovie: firstMovie.Name,
+    secondMovie: secondMovie.Name,
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -1042,6 +1210,36 @@ async function firstMovieItem(page, summary, auth) {
   const items = await itemsResponse.json();
   const movies = items.Items?.filter((item) => item.Type === 'Movie' && item.MediaType === 'Video') || [];
   return movies.find(resumeTraceEligible) || movies[0];
+}
+
+async function firstTwoMovieItems(page, summary, auth) {
+  const result = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&IncludeItemTypes=Movie&Recursive=true&Fields=RunTimeTicks,MediaSources,Path&SortBy=SortName&Limit=20`,
+    token: auth.AccessToken,
+  });
+  if (result.status !== 200) {
+    throw new Error(`Movie lookup returned HTTP ${result.status}`);
+  }
+  const movies = (result.json?.Items || [])
+    .filter((item) => item.Type === 'Movie' && item.MediaType === 'Video' && item.Id)
+    .sort((left, right) => left.Name.localeCompare(right.Name));
+  if (movies.length < 2) {
+    throw new Error(`expected at least 2 movies for playlist flow, found ${movies.length}`);
+  }
+  return movies.slice(0, 2);
+}
+
+async function fetchPlaylistItems(page, auth, playlistId) {
+  const result = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Playlists/${encodeURIComponent(playlistId)}/Items?UserId=${encodeURIComponent(auth.User.Id)}&Limit=20`,
+    token: auth.AccessToken,
+  });
+  if (result.status !== 200) {
+    throw new Error(`playlist items returned HTTP ${result.status}`);
+  }
+  return result.json?.Items || [];
 }
 
 async function refreshLibrary(page, auth) {
@@ -1486,12 +1684,15 @@ function hlsTranscodeDeviceProfile() {
 
 async function browserFetchJson(page, request) {
   return page.evaluate(async ({ method, url, token, body }) => {
+    const headers = {
+      'X-Emby-Token': token,
+    };
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+    }
     const response = await fetch(url, {
       method,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Emby-Token': token,
-      },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const text = await response.text();
@@ -1753,7 +1954,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -1946,6 +2147,44 @@ function captureFlowInvariants(summary, record, requestPostData) {
       addUnique(summary.invariants.seriesStreamContentTypes, mediaType(record.responseContentType));
     }
   }
+  if (flow === 'playlists-collections') {
+    if (record.method === 'POST' && pathname === '/Playlists' && record.status === 200) {
+      summary.invariants.playlistCreated = true;
+    }
+    if (record.method === 'GET' && /\/Playlists\/[^/]+$/i.test(pathname) && record.status === 200) {
+      summary.invariants.playlistDetail200 = true;
+    }
+    if (record.method === 'GET' && /\/Playlists\/[^/]+\/Items$/i.test(pathname) && record.status === 200) {
+      summary.invariants.playlistItems200 = true;
+    }
+    if (record.method === 'POST' && /\/Playlists\/[^/]+\/Items\/[^/]+\/Move\/\d+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.playlistMove204 = true;
+    }
+    if (record.method === 'POST' && /\/Playlists\/[^/]+\/Items\/[^/]+\/Move\/\d+$/i.test(pathname) && record.status === 400 && summary.target === 'upstream') {
+      summary.invariants.playlistMoveUnsupported400 = true;
+    }
+    if (record.method === 'DELETE' && /\/Playlists\/[^/]+\/Items$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.playlistDeleteItem204 = true;
+    }
+    if (record.method === 'POST' && /\/Playlists\/[^/]+\/Items$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.playlistAddItem204 = true;
+    }
+    if (record.method === 'POST' && /\/Playlists\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.playlistRename204 = true;
+    }
+    if (record.method === 'POST' && /\/Playlists\/[^/]+$/i.test(pathname) && record.status === 400 && summary.target === 'upstream') {
+      summary.invariants.playlistRenameUnsupported400 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Collections' && record.status === 200) {
+      summary.invariants.collectionCreated = true;
+    }
+    if (record.method === 'POST' && /\/Collections\/[^/]+\/Items$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.collectionAddItems204 = true;
+    }
+    if (record.method === 'DELETE' && /\/Collections\/[^/]+\/Items$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.collectionDeleteItems204 = true;
+    }
+  }
 }
 
 function criticalRequestKey(record) {
@@ -1955,6 +2194,9 @@ function criticalRequestKey(record) {
   }
   if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/Latest$/i.test(pathname)) {
     return 'library-latest';
+  }
+  if (flow === 'playlists-collections' && record.method === 'GET' && /\/Users\/[^/]+\/Items\/[^/]+$/i.test(pathname)) {
+    return 'playlist-detail';
   }
   if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/[^/]+$/i.test(pathname)) {
     return 'item-detail';
@@ -2009,6 +2251,36 @@ function criticalRequestKey(record) {
   }
   if (record.method === 'GET' && /\/(?:Library\/)?Shows\/[^/]+\/Similar$/i.test(pathname)) {
     return 'series-similar';
+  }
+  if (record.method === 'POST' && pathname === '/Playlists') {
+    return 'playlist-create';
+  }
+  if (record.method === 'GET' && /\/Playlists\/[^/]+$/i.test(pathname)) {
+    return 'playlist-detail';
+  }
+  if (record.method === 'GET' && /\/Playlists\/[^/]+\/Items$/i.test(pathname)) {
+    return 'playlist-items';
+  }
+  if (record.method === 'POST' && /\/Playlists\/[^/]+\/Items\/[^/]+\/Move\/\d+$/i.test(pathname)) {
+    return 'playlist-move';
+  }
+  if (record.method === 'DELETE' && /\/Playlists\/[^/]+\/Items$/i.test(pathname)) {
+    return 'playlist-remove-item';
+  }
+  if (record.method === 'POST' && /\/Playlists\/[^/]+\/Items$/i.test(pathname)) {
+    return 'playlist-add-item';
+  }
+  if (record.method === 'POST' && /\/Playlists\/[^/]+$/i.test(pathname)) {
+    return 'playlist-rename';
+  }
+  if (record.method === 'POST' && pathname === '/Collections') {
+    return 'collection-create';
+  }
+  if (record.method === 'POST' && /\/Collections\/[^/]+\/Items$/i.test(pathname)) {
+    return 'collection-add-items';
+  }
+  if (record.method === 'DELETE' && /\/Collections\/[^/]+\/Items$/i.test(pathname)) {
+    return 'collection-remove-items';
   }
   if (record.method === 'GET' && /\/Audio\/[^/]+\/master\.m3u8$/i.test(pathname)) {
     return 'audio-hls-master';
@@ -2106,7 +2378,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -2148,6 +2420,8 @@ function compareCompletedTargets(summaries) {
                 ? ['library-user-views', 'library-items', 'music-albums', 'music-artists', 'music-album-artists', 'music-genres', 'music-instant-mix', 'music-audio-stream']
                 : flow === 'series'
                   ? ['library-user-views', 'library-items', 'library-items-counts', 'series-next-up', 'series-seasons', 'series-episodes', 'series-similar', 'series-video-stream']
+                  : flow === 'playlists-collections'
+                    ? ['playlist-create', 'playlist-detail', 'playlist-items', 'playlist-move', 'playlist-remove-item', 'playlist-add-item', 'playlist-rename', 'collection-create', 'collection-add-items', 'collection-remove-items']
               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -2204,6 +2478,34 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     }
     return reasons;
   }
+  if (key === 'playlist-move') {
+    const compatibleMove = (
+      [200, 204].includes(upstreamRequest.status) && [200, 204].includes(jellyrinRequest.status)
+    ) || (
+      upstreamRequest.status === 400 && [200, 204].includes(jellyrinRequest.status)
+    );
+    if (!compatibleMove) {
+      reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
+  if (key === 'playlist-rename') {
+    const compatibleRename = (
+      [200, 204].includes(upstreamRequest.status) && [200, 204].includes(jellyrinRequest.status)
+    ) || (
+      upstreamRequest.status === 400 && [200, 204].includes(jellyrinRequest.status)
+    );
+    if (!compatibleRename) {
+      reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
+  if (['playlist-remove-item', 'playlist-add-item', 'collection-add-items', 'collection-remove-items'].includes(key)) {
+    if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
+      reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
   if (upstreamRequest.status !== jellyrinRequest.status) {
     reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != ${jellyrinRequest.status}`);
   }
@@ -2235,6 +2537,10 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'series-seasons',
     'series-episodes',
     'series-similar',
+    'playlist-create',
+    'playlist-detail',
+    'playlist-items',
+    'collection-create',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
@@ -2303,6 +2609,10 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'series-seasons': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].SeriesName', 'Items.[].SeriesId'],
     'series-episodes': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].SeriesName', 'Items.[].SeriesId', 'Items.[].IndexNumber', 'Items.[].ParentIndexNumber'],
     'series-similar': ['Items', 'TotalRecordCount'],
+    'playlist-create': ['Id'],
+    'playlist-detail': ['Id', 'Name', 'Type', 'ChildCount'],
+    'playlist-items': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].PlaylistItemId'],
+    'collection-create': ['Id'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -2381,7 +2691,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -2525,6 +2835,33 @@ function invariantFailures(summary) {
     }
     return failures;
   }
+  if (flow === 'playlists-collections') {
+    for (const [field, label] of [
+      ['playlistCreated', 'playlist create'],
+      ['playlistDetail200', 'playlist detail'],
+      ['playlistItems200', 'playlist items'],
+      ['playlistItemIdsMatched', 'playlist item ids'],
+      ['playlistDeleteItem204', 'playlist delete item'],
+      ['playlistAddItem204', 'playlist add item'],
+      ['collectionCreated', 'collection create'],
+      ['collectionAddItems204', 'collection add items'],
+      ['collectionDeleteItems204', 'collection delete items'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
+    }
+    if (!summary.invariants.playlistMove204 && !(summary.target === 'upstream' && summary.invariants.playlistMoveUnsupported400)) {
+      failures.push('missing playlist move invariant');
+    }
+    if (!summary.invariants.playlistMovedOrderMatched && !summary.invariants.playlistMoveUnsupported400) {
+      failures.push('missing playlist moved order invariant');
+    }
+    if (!summary.invariants.playlistRename204 && !(summary.target === 'upstream' && summary.invariants.playlistRenameUnsupported400)) {
+      failures.push('missing playlist rename invariant');
+    }
+    return failures;
+  }
   if (!summary.invariants.playbackInfo200) {
     failures.push('missing PlaybackInfo 200 invariant');
   }
@@ -2567,6 +2904,12 @@ function allowedFailedResponse(response) {
     return true;
   }
   if (response.status() === 404 && new URL(url).pathname === '/web/undefined') {
+    return true;
+  }
+  if (response.status() === 400 && url.startsWith('http://127.0.0.1:8096/') && /\/Playlists\/[^/]+\/Items\/[^/]+\/Move\/\d+$/i.test(new URL(url).pathname)) {
+    return true;
+  }
+  if (response.status() === 400 && url.startsWith('http://127.0.0.1:8096/') && /\/Playlists\/[^/]+$/i.test(new URL(url).pathname)) {
     return true;
   }
   return response.status() === 400 && new URL(url).pathname === '/SyncPlay/List';

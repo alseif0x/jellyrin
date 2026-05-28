@@ -12191,7 +12191,7 @@ async fn item_detail(
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let requested_id = parse_jellyfin_uuid(&item_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(folder) = state
@@ -12202,6 +12202,11 @@ async fn item_detail(
         .find(|folder| folder.id == requested_id)
     {
         return Ok(Json(user_view_to_json(&folder, &server_id)));
+    }
+    if let Ok(list) = state.db.media_list_by_id(requested_id).await {
+        ensure_media_list_read_access(&state.db, &user, &list).await?;
+        let child_count = state.db.media_list_items(list.id).await?.len();
+        return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
     }
 
     let item = state
@@ -12248,6 +12253,11 @@ async fn current_user_item_detail(
     {
         return Ok(Json(user_view_to_json(&folder, &server_id)));
     }
+    if let Ok(list) = state.db.media_list_by_id(requested_id).await {
+        ensure_media_list_read_access(&state.db, &auth_user, &list).await?;
+        let child_count = state.db.media_list_items(list.id).await?.len();
+        return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
+    }
 
     let item = media_item_by_id(&state.db, &item_id).await?;
     let playback = state
@@ -12272,9 +12282,15 @@ async fn user_item_detail(
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, user_id)?;
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Ok(list) = state.db.media_list_by_id(requested_id).await {
+        ensure_media_list_read_access(&state.db, &auth_user, &list).await?;
+        let child_count = state.db.media_list_items(list.id).await?.len();
+        return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     let playback = state.db.playback_state_for_item(user_id, item.id).await?;
-    let server_id = state.db.server_state().await?.server_id.to_string();
     let metadata = metadata_payload_for_item(&state.db, item.id).await?;
     Ok(Json(media_item_to_json_with_playback_and_metadata(
         &item,
