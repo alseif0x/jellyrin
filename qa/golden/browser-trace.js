@@ -29,6 +29,8 @@ const musicFlowAlbumArtist = 'Jellyrin Music Flow Album Artist';
 const musicFlowGenre = 'Jellyrin Music Flow Rock';
 const listFlowPlaylistName = 'Jellyrin Golden Playlist Flow';
 const listFlowCollectionName = 'Jellyrin Golden Collection Flow';
+const imageFlowFixtureName = 'Jellyrin Image Flow Fixture';
+const imageFlowUploadPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFklEQVR42mP8z8Dwn4GBgYGJAQoAFAIBAvhDL0kAAAAASUVORK5CYII=';
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -53,7 +55,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -207,6 +209,20 @@ async function captureTarget(browser, flowDir, target) {
       collectionCreated: false,
       collectionAddItems204: false,
       collectionDeleteItems204: false,
+      imageItemMatched: false,
+      imageInfosInitial200: false,
+      imageUpload204: false,
+      imageInfosAfterUpload200: false,
+      imageInfoTagPresent: false,
+      imageGet200: false,
+      imageGetPng: false,
+      imageHead200: false,
+      imageHeadPng: false,
+      imageExtendedGet200: false,
+      imageExtendedGetPng: false,
+      imageDelete204: false,
+      imageInfosAfterDelete200: false,
+      imageProviders200: false,
     },
   };
 
@@ -261,6 +277,8 @@ async function captureTarget(browser, flowDir, target) {
       await runSeriesFlow(page, summary, publicInfo, target);
     } else if (flow === 'playlists-collections') {
       await runPlaylistsCollectionsFlow(page, summary, publicInfo, target);
+    } else if (flow === 'images') {
+      await runImagesFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -1012,6 +1030,137 @@ async function runPlaylistsCollectionsFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runImagesFlow(page, summary, publicInfo, target) {
+  await ensureImageFlowFixture();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  await ensureVirtualFolder(page, auth, {
+    name: 'Golden Movies',
+    collectionType: 'movies',
+    location: mediaFixtureDir,
+  });
+  await refreshLibrary(page, auth);
+  const movie = await waitForMovieByName(page, summary, auth, imageFlowFixtureName);
+  summary.invariants.imageItemMatched = true;
+
+  const initialInfos = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images`,
+    token: auth.AccessToken,
+  });
+  if (initialInfos.status !== 200 || !Array.isArray(initialInfos.json)) {
+    throw new Error(`initial item images returned HTTP ${initialInfos.status}`);
+  }
+  summary.invariants.imageInfosInitial200 = true;
+
+  const upload = await browserFetchImageUpload(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images/Primary`,
+    token: auth.AccessToken,
+    imageBase64: imageFlowUploadPngBase64,
+  });
+  if (![200, 204].includes(upload.status)) {
+    throw new Error(`image upload returned HTTP ${upload.status}`);
+  }
+  summary.invariants.imageUpload204 = true;
+
+  const infosAfterUpload = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images`,
+    token: auth.AccessToken,
+  });
+  if (infosAfterUpload.status !== 200 || !Array.isArray(infosAfterUpload.json)) {
+    throw new Error(`post-upload item images returned HTTP ${infosAfterUpload.status}`);
+  }
+  summary.invariants.imageInfosAfterUpload200 = true;
+  const primaryInfo = infosAfterUpload.json.find((info) => info.ImageType === 'Primary' && Number(info.ImageIndex || 0) === 0);
+  if (!primaryInfo?.ImageTag) {
+    throw new Error('post-upload item images did not expose Primary ImageTag');
+  }
+  summary.invariants.imageInfoTagPresent = true;
+  const directImage = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images/Primary`,
+    token: auth.AccessToken,
+  });
+  if (directImage.status !== 200) {
+    throw new Error(`direct item image returned HTTP ${directImage.status}`);
+  }
+  summary.invariants.imageGet200 = true;
+  if (mediaType(directImage.contentType) !== 'image/png' || !directImage.startsWithPng) {
+    throw new Error(`direct item image was not PNG: ${directImage.contentType}`);
+  }
+  summary.invariants.imageGetPng = true;
+
+  const headImage = await browserFetchBinary(page, {
+    method: 'HEAD',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images/Primary`,
+    token: auth.AccessToken,
+  });
+  if (headImage.status !== 200) {
+    throw new Error(`HEAD item image returned HTTP ${headImage.status}`);
+  }
+  summary.invariants.imageHead200 = true;
+  if (mediaType(headImage.contentType) !== 'image/png') {
+    throw new Error(`HEAD item image content type was ${headImage.contentType}`);
+  }
+  summary.invariants.imageHeadPng = true;
+
+  const extendedImage = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images/Primary/0/${encodeURIComponent(primaryInfo.ImageTag)}/png/320/180/0/0`,
+    token: auth.AccessToken,
+  });
+  if (extendedImage.status !== 200) {
+    throw new Error(`extended item image returned HTTP ${extendedImage.status}`);
+  }
+  summary.invariants.imageExtendedGet200 = true;
+  if (mediaType(extendedImage.contentType) !== 'image/png' || !extendedImage.startsWithPng) {
+    throw new Error(`extended item image was not PNG: ${extendedImage.contentType}`);
+  }
+  summary.invariants.imageExtendedGetPng = true;
+
+  const providers = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(movie.Id)}/RemoteImages/Providers`,
+    token: auth.AccessToken,
+  });
+  if (providers.status !== 200 || !Array.isArray(providers.json)) {
+    throw new Error(`remote image providers returned HTTP ${providers.status}`);
+  }
+  summary.invariants.imageProviders200 = true;
+
+  const remove = await browserFetchJson(page, {
+    method: 'DELETE',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images/Primary`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(remove.status)) {
+    throw new Error(`image delete returned HTTP ${remove.status}`);
+  }
+  summary.invariants.imageDelete204 = true;
+
+  const infosAfterDelete = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(movie.Id)}/Images`,
+    token: auth.AccessToken,
+  });
+  if (infosAfterDelete.status !== 200 || !Array.isArray(infosAfterDelete.json)) {
+    throw new Error(`post-delete item images returned HTTP ${infosAfterDelete.status}`);
+  }
+  summary.invariants.imageInfosAfterDelete200 = true;
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: '<dynamic>',
+    name: movie.Name,
+    type: movie.Type,
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -1477,6 +1626,42 @@ function preferredTrickplayWidth(movie) {
   return Math.min(320, Math.max(1, Number(videoStream?.Width || 320)));
 }
 
+async function ensureImageFlowFixture() {
+  await fs.mkdir(mediaFixtureDir, { recursive: true });
+  const moviePath = path.join(mediaFixtureDir, `${imageFlowFixtureName}.mp4`);
+  try {
+    await fs.access(moviePath);
+    return;
+  } catch (_) {
+    // Create below.
+  }
+  await execFileAsync('ffmpeg', [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'testsrc=size=160x90:rate=24',
+    '-f',
+    'lavfi',
+    '-i',
+    'sine=frequency=330:sample_rate=44100:duration=6',
+    '-t',
+    '6',
+    '-c:v',
+    'mpeg4',
+    '-pix_fmt',
+    'yuv420p',
+    '-c:a',
+    'aac',
+    '-shortest',
+    '-metadata',
+    `title=${imageFlowFixtureName}`,
+    moviePath,
+  ]);
+}
+
 async function ensureSubtitleTrickplayFixture() {
   await fs.mkdir(mediaFixtureDir, { recursive: true });
   const moviePath = path.join(mediaFixtureDir, `${subtitleTrickplayFixtureName}.mkv`);
@@ -1739,7 +1924,36 @@ async function browserFetchBinary(page, request) {
     return {
       status: response.status,
       contentType: response.headers.get('content-type') || '',
+      cacheControl: response.headers.get('cache-control') || '',
+      etag: response.headers.get('etag') || '',
+      byteLength: bytes.length,
       startsWithJpeg: bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8,
+      startsWithPng: bytes.length >= 8
+        && bytes[0] === 0x89
+        && bytes[1] === 0x50
+        && bytes[2] === 0x4e
+        && bytes[3] === 0x47
+        && bytes[4] === 0x0d
+        && bytes[5] === 0x0a
+        && bytes[6] === 0x1a
+        && bytes[7] === 0x0a,
+    };
+  }, request);
+}
+
+async function browserFetchImageUpload(page, request) {
+  return page.evaluate(async ({ method, url, token, imageBase64 }) => {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'X-Emby-Token': token,
+        'Content-Type': 'image/png',
+      },
+      body: imageBase64,
+    });
+    return {
+      status: response.status,
+      contentType: response.headers.get('content-type') || '',
     };
   }, request);
 }
@@ -1954,7 +2168,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -2185,6 +2399,35 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.collectionDeleteItems204 = true;
     }
   }
+  if (flow === 'images') {
+    if (record.method === 'GET' && /\/Items\/[^/]+\/Images$/i.test(pathname) && record.status === 200) {
+      if (!summary.invariants.imageInfosInitial200) {
+        summary.invariants.imageInfosInitial200 = true;
+      } else if (!summary.invariants.imageInfosAfterUpload200) {
+        summary.invariants.imageInfosAfterUpload200 = true;
+      } else {
+        summary.invariants.imageInfosAfterDelete200 = true;
+      }
+    }
+    if (record.method === 'POST' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.imageUpload204 = true;
+    }
+    if (record.method === 'GET' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname) && record.status === 200) {
+      summary.invariants.imageGet200 = true;
+    }
+    if (record.method === 'HEAD' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname) && record.status === 200) {
+      summary.invariants.imageHead200 = true;
+    }
+    if (record.method === 'GET' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary\/0\/[^/]+\/png\/320\/180\/0\/0$/i.test(pathname) && record.status === 200) {
+      summary.invariants.imageExtendedGet200 = true;
+    }
+    if (record.method === 'GET' && /\/(?:RemoteImage\/)?Items\/[^/]+\/RemoteImages\/Providers$/i.test(pathname) && record.status === 200) {
+      summary.invariants.imageProviders200 = true;
+    }
+    if (record.method === 'DELETE' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.imageDelete204 = true;
+    }
+  }
 }
 
 function criticalRequestKey(record) {
@@ -2282,6 +2525,27 @@ function criticalRequestKey(record) {
   if (record.method === 'DELETE' && /\/Collections\/[^/]+\/Items$/i.test(pathname)) {
     return 'collection-remove-items';
   }
+  if (record.method === 'GET' && /\/Items\/[^/]+\/Images$/i.test(pathname)) {
+    return 'image-infos';
+  }
+  if (record.method === 'POST' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname)) {
+    return 'image-upload';
+  }
+  if (record.method === 'GET' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname)) {
+    return 'image-get';
+  }
+  if (record.method === 'HEAD' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname)) {
+    return 'image-head';
+  }
+  if (record.method === 'GET' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary\/0\/[^/]+\/png\/320\/180\/0\/0$/i.test(pathname)) {
+    return 'image-extended-get';
+  }
+  if (record.method === 'GET' && /\/(?:RemoteImage\/)?Items\/[^/]+\/RemoteImages\/Providers$/i.test(pathname)) {
+    return 'image-providers';
+  }
+  if (record.method === 'DELETE' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname)) {
+    return 'image-delete';
+  }
   if (record.method === 'GET' && /\/Audio\/[^/]+\/master\.m3u8$/i.test(pathname)) {
     return 'audio-hls-master';
   }
@@ -2378,7 +2642,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -2422,6 +2686,8 @@ function compareCompletedTargets(summaries) {
                   ? ['library-user-views', 'library-items', 'library-items-counts', 'series-next-up', 'series-seasons', 'series-episodes', 'series-similar', 'series-video-stream']
                   : flow === 'playlists-collections'
                     ? ['playlist-create', 'playlist-detail', 'playlist-items', 'playlist-move', 'playlist-remove-item', 'playlist-add-item', 'playlist-rename', 'collection-create', 'collection-add-items', 'collection-remove-items']
+                    : flow === 'images'
+                      ? ['image-infos', 'image-upload', 'image-get', 'image-head', 'image-extended-get', 'image-providers', 'image-delete']
               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -2503,6 +2769,21 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (['playlist-remove-item', 'playlist-add-item', 'collection-add-items', 'collection-remove-items'].includes(key)) {
     if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
       reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
+  if (['image-upload', 'image-delete'].includes(key)) {
+    if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
+      reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
+  if (['image-get', 'image-head', 'image-extended-get'].includes(key)) {
+    if (upstreamRequest.status !== 200 || jellyrinRequest.status !== 200) {
+      reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    if (mediaType(upstreamRequest.contentType) !== 'image/png' || mediaType(jellyrinRequest.contentType) !== 'image/png') {
+      reasons.push(`cross-target ${key}: expected image/png, got ${upstreamRequest.contentType} / ${jellyrinRequest.contentType}`);
     }
     return reasons;
   }
@@ -2691,7 +2972,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -2859,6 +3140,29 @@ function invariantFailures(summary) {
     }
     if (!summary.invariants.playlistRename204 && !(summary.target === 'upstream' && summary.invariants.playlistRenameUnsupported400)) {
       failures.push('missing playlist rename invariant');
+    }
+    return failures;
+  }
+  if (flow === 'images') {
+    for (const [field, label] of [
+      ['imageItemMatched', 'image item match'],
+      ['imageInfosInitial200', 'initial image infos'],
+      ['imageUpload204', 'image upload'],
+      ['imageInfosAfterUpload200', 'post-upload image infos'],
+      ['imageInfoTagPresent', 'post-upload image tag'],
+      ['imageGet200', 'direct image get'],
+      ['imageGetPng', 'direct image png'],
+      ['imageHead200', 'direct image head'],
+      ['imageHeadPng', 'direct image head content type'],
+      ['imageExtendedGet200', 'extended image get'],
+      ['imageExtendedGetPng', 'extended image png'],
+      ['imageProviders200', 'remote image providers'],
+      ['imageDelete204', 'image delete'],
+      ['imageInfosAfterDelete200', 'post-delete image infos'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
     }
     return failures;
   }

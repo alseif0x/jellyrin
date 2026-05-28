@@ -1597,7 +1597,15 @@ pub fn router(state: AppState) -> Router {
             get(item_remote_images),
         )
         .route(
+            "/Items/{item_id}/RemoteImages",
+            get(item_remote_images),
+        )
+        .route(
             "/remoteimage/items/{item_id}/remoteimages",
+            get(item_remote_images),
+        )
+        .route(
+            "/items/{item_id}/remoteimages",
             get(item_remote_images),
         )
         .route(
@@ -1605,7 +1613,15 @@ pub fn router(state: AppState) -> Router {
             get(item_remote_image_providers),
         )
         .route(
+            "/Items/{item_id}/RemoteImages/Providers",
+            get(item_remote_image_providers),
+        )
+        .route(
             "/remoteimage/items/{item_id}/remoteimages/providers",
+            get(item_remote_image_providers),
+        )
+        .route(
+            "/items/{item_id}/remoteimages/providers",
             get(item_remote_image_providers),
         )
         .route(
@@ -1613,7 +1629,15 @@ pub fn router(state: AppState) -> Router {
             post(download_remote_image),
         )
         .route(
+            "/Items/{item_id}/RemoteImages/Download",
+            post(download_remote_image),
+        )
+        .route(
             "/remoteimage/items/{item_id}/remoteimages/download",
+            post(download_remote_image),
+        )
+        .route(
+            "/items/{item_id}/remoteimages/download",
             post(download_remote_image),
         )
         .route(
@@ -2246,11 +2270,31 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Items/{item_id}/Images/{image_type}",
-            get(item_placeholder_image),
+            get(item_placeholder_image)
+                .head(item_placeholder_image)
+                .post(update_item_image)
+                .delete(delete_item_image),
         )
         .route(
             "/items/{item_id}/images/{image_type}",
-            get(item_placeholder_image),
+            get(item_placeholder_image)
+                .head(item_placeholder_image)
+                .post(update_item_image)
+                .delete(delete_item_image),
+        )
+        .route(
+            "/Items/{item_id}/Images/{image_type}/{image_index}",
+            get(item_placeholder_image_by_index)
+                .head(item_placeholder_image_by_index)
+                .post(update_item_image_by_index)
+                .delete(delete_item_image_by_index),
+        )
+        .route(
+            "/items/{item_id}/images/{image_type}/{image_index}",
+            get(item_placeholder_image_by_index)
+                .head(item_placeholder_image_by_index)
+                .post(update_item_image_by_index)
+                .delete(delete_item_image_by_index),
         )
         .route(
             "/Image/Items/{item_id}/Images/{image_type}",
@@ -2294,6 +2338,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/image/items/{item_id}/images/{image_type}/{image_index}/{tag}/{format}/{max_width}/{max_height}/{percent_played}/{unplayed_count}",
+            get(item_placeholder_image_extended).head(item_placeholder_image_extended),
+        )
+        .route(
+            "/Items/{item_id}/Images/{image_type}/{image_index}/{tag}/{format}/{max_width}/{max_height}/{percent_played}/{unplayed_count}",
+            get(item_placeholder_image_extended).head(item_placeholder_image_extended),
+        )
+        .route(
+            "/items/{item_id}/images/{image_type}/{image_index}/{tag}/{format}/{max_width}/{max_height}/{percent_played}/{unplayed_count}",
             get(item_placeholder_image_extended).head(item_placeholder_image_extended),
         )
         .route(
