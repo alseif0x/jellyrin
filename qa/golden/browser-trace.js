@@ -18,6 +18,11 @@ const subtitleTrickplayFixtureName = 'Jellyrin Subtitle Trickplay Long Fixture';
 const audioFixtureDir = process.env.JELLYRIN_AUDIO_FIXTURE_DIR
   || path.resolve(__dirname, '../../var/fixtures/m2-music');
 const audioHlsFixtureName = 'Jellyrin Audio HLS Legacy Fixture';
+const musicFlowFixturePrefix = 'Jellyrin Music Flow';
+const musicFlowAlbum = 'Jellyrin Music Flow Album';
+const musicFlowArtist = 'Jellyrin Music Flow Artist';
+const musicFlowAlbumArtist = 'Jellyrin Music Flow Album Artist';
+const musicFlowGenre = 'Jellyrin Music Flow Rock';
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -42,7 +47,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -159,6 +164,17 @@ async function captureTarget(browser, flowDir, target) {
       audioHlsDynamicSegment200: false,
       audioHlsLegacySegment200: false,
       audioHlsSegmentContentTypes: [],
+      musicViewMatched: false,
+      musicSongsMatched: false,
+      musicAlbumMatched: false,
+      musicArtistMatched: false,
+      musicAlbumArtistMatched: false,
+      musicGenreMatched: false,
+      musicInstantMix200: false,
+      musicInstantMixResults: false,
+      musicGenreInstantMix200: false,
+      musicAudioStream200: false,
+      musicAudioStreamContentTypes: [],
     },
   };
 
@@ -207,6 +223,8 @@ async function captureTarget(browser, flowDir, target) {
       await runSubtitlesTrickplayFlow(page, summary, publicInfo, target);
     } else if (flow === 'audio-hls-legacy') {
       await runAudioHlsLegacyFlow(page, summary, publicInfo, target);
+    } else if (flow === 'music') {
+      await runMusicFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -568,6 +586,117 @@ async function runAudioHlsLegacyFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runMusicFlow(page, summary, publicInfo, target) {
+  await ensureMusicFlowFixtures();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  await ensureVirtualFolder(page, auth, {
+    name: 'Golden Music',
+    collectionType: 'music',
+    location: audioFixtureDir,
+  });
+  await refreshLibrary(page, auth);
+  const songs = await waitForMusicFlowSongs(page, auth, { requireMetadata: true });
+  summary.invariants.musicSongsMatched = true;
+  const firstSong = songs[0];
+
+  const userViews = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/UserViews?UserId=${encodeURIComponent(auth.User.Id)}&PresetViews=music`,
+    token: auth.AccessToken,
+  });
+  if (userViews.status !== 200) {
+    throw new Error(`music UserViews returned HTTP ${userViews.status}`);
+  }
+  if (!userViews.json?.Items?.some((view) => view.CollectionType === 'music' || view.Name === 'Golden Music')) {
+    throw new Error('music UserViews did not include the music library');
+  }
+  summary.invariants.musicViewMatched = true;
+
+  if (!songs.some((item) => item.Album === musicFlowAlbum)) {
+    throw new Error('music album metadata not found in song DTOs');
+  }
+  summary.invariants.musicAlbumMatched = true;
+
+  const artists = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Artists?UserId=${encodeURIComponent(auth.User.Id)}&SearchTerm=${encodeURIComponent(musicFlowArtist)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (artists.status !== 200) {
+    throw new Error(`music Artists returned HTTP ${artists.status}`);
+  }
+  if (!artists.json?.Items?.some((item) => item.Name === musicFlowArtist && item.Type === 'MusicArtist')) {
+    throw new Error('music artist not found in Artists result');
+  }
+  summary.invariants.musicArtistMatched = true;
+
+  const albumArtists = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Artists/AlbumArtists?UserId=${encodeURIComponent(auth.User.Id)}&SearchTerm=${encodeURIComponent(musicFlowAlbumArtist)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (albumArtists.status !== 200) {
+    throw new Error(`music AlbumArtists returned HTTP ${albumArtists.status}`);
+  }
+  if (!albumArtists.json?.Items?.some((item) => item.Name === musicFlowAlbumArtist && item.Type === 'MusicArtist')) {
+    throw new Error('music album artist not found in AlbumArtists result');
+  }
+  summary.invariants.musicAlbumArtistMatched = true;
+
+  const genres = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/MusicGenres?UserId=${encodeURIComponent(auth.User.Id)}&SearchTerm=${encodeURIComponent(musicFlowGenre)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (genres.status !== 200) {
+    throw new Error(`music MusicGenres returned HTTP ${genres.status}`);
+  }
+  if (!genres.json?.Items?.some((item) => item.Name === musicFlowGenre && item.Type === 'MusicGenre')) {
+    throw new Error('music genre not found in MusicGenres result');
+  }
+  summary.invariants.musicGenreMatched = true;
+
+  const instantMix = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(firstSong.Id)}/InstantMix?UserId=${encodeURIComponent(auth.User.Id)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (instantMix.status !== 200) {
+    throw new Error(`music InstantMix returned HTTP ${instantMix.status}`);
+  }
+  summary.invariants.musicInstantMix200 = true;
+  if ((instantMix.json?.Items || []).filter((item) => item.Type === 'Audio').length < 2) {
+    throw new Error('music InstantMix did not return the fixture songs');
+  }
+  summary.invariants.musicInstantMixResults = true;
+
+  const stream = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/Audio/${encodeURIComponent(firstSong.Id)}/stream.mp3?Static=true&api_key=${encodeURIComponent(auth.AccessToken)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 206].includes(stream.status)) {
+    throw new Error(`music audio stream returned HTTP ${stream.status}`);
+  }
+  summary.invariants.musicAudioStream200 = true;
+  addUnique(summary.invariants.musicAudioStreamContentTypes, mediaType(stream.contentType));
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: '<dynamic>',
+    name: firstSong.Name,
+    type: firstSong.Type,
+    mediaType: firstSong.MediaType,
+    album: musicFlowAlbum,
+    artist: musicFlowArtist,
+    genre: musicFlowGenre,
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -851,6 +980,47 @@ async function waitForAudioByName(page, auth, name) {
   throw new Error(`audio fixture ${name} not found after refresh; last count=${lastTotal}`);
 }
 
+async function waitForMusicFlowSongs(page, auth, options = {}) {
+  const deadline = Date.now() + 45_000;
+  let lastTotal = 0;
+  while (Date.now() < deadline) {
+    const result = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Audio&SearchTerm=${encodeURIComponent(musicFlowFixturePrefix)}&Fields=MediaSources,RunTimeTicks,Path,Genres,DateCreated,Album,Artists,AlbumArtists&SortBy=SortName&Limit=10`,
+      token: auth.AccessToken,
+    });
+    if (result.status !== 200) {
+      throw new Error(`music fixture lookup returned HTTP ${result.status}`);
+    }
+    const items = result.json?.Items || [];
+    lastTotal = result.json?.TotalRecordCount || 0;
+    const songs = items
+      .filter((candidate) => candidate.Name?.startsWith(musicFlowFixturePrefix))
+      .sort((left, right) => left.Name.localeCompare(right.Name));
+    if (songs.length >= 2 && (!options.requireMetadata || songsHaveMusicFlowMetadata(songs))) {
+      return songs;
+    }
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error(`music fixtures not found after refresh; last count=${lastTotal}`);
+}
+
+function songsHaveMusicFlowMetadata(songs) {
+  return songs.some((song) => song.Album === musicFlowAlbum)
+    && songs.some((song) => arrayIncludesName(song.Artists, musicFlowArtist))
+    && songs.some((song) => song.AlbumArtist === musicFlowAlbumArtist || arrayIncludesName(song.AlbumArtists, musicFlowAlbumArtist))
+    && songs.some((song) => arrayIncludesName(song.Genres, musicFlowGenre));
+}
+
+function arrayIncludesName(values, expected) {
+  return (values || []).some((value) => {
+    if (typeof value === 'string') {
+      return value === expected;
+    }
+    return value?.Name === expected;
+  });
+}
+
 async function ensureUpstreamTrickplayReady(page, auth, movie) {
   const folders = await browserFetchJson(page, {
     method: 'GET',
@@ -1013,6 +1183,43 @@ async function ensureAudioLegacySegmentFixture() {
   for (const directory of [upstreamTranscodeDir, jellyrinTranscodeDir]) {
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(directory, `${audioLegacySegmentId}.mp3`), body);
+  }
+}
+
+async function ensureMusicFlowFixtures() {
+  await fs.mkdir(audioFixtureDir, { recursive: true });
+  const fixtures = [
+    { name: `${musicFlowFixturePrefix} 01`, frequency: '523.25', track: '1' },
+    { name: `${musicFlowFixturePrefix} 02`, frequency: '659.25', track: '2' },
+  ];
+  for (const fixture of fixtures) {
+    const audioPath = path.join(audioFixtureDir, `${fixture.name}.mp3`);
+    await execFileAsync('ffmpeg', [
+      '-hide_banner',
+      '-nostdin',
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      `sine=frequency=${fixture.frequency}:sample_rate=44100:duration=10`,
+      '-c:a',
+      'libmp3lame',
+      '-b:a',
+      '128k',
+      '-metadata',
+      `title=${fixture.name}`,
+      '-metadata',
+      `album=${musicFlowAlbum}`,
+      '-metadata',
+      `artist=${musicFlowArtist}`,
+      '-metadata',
+      `album_artist=${musicFlowAlbumArtist}`,
+      '-metadata',
+      `genre=${musicFlowGenre}`,
+      '-metadata',
+      `track=${fixture.track}`,
+      audioPath,
+    ]);
   }
 }
 
@@ -1330,7 +1537,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -1469,6 +1676,33 @@ function captureFlowInvariants(summary, record, requestPostData) {
       addUnique(summary.invariants.audioHlsSegmentContentTypes, mediaType(record.responseContentType));
     }
   }
+  if (flow === 'music' && record.status === 200) {
+    if (record.method === 'GET' && pathname === '/UserViews') {
+      summary.invariants.musicViewMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Items') {
+      summary.invariants.musicSongsMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Albums') {
+      summary.invariants.musicAlbumMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Artists') {
+      summary.invariants.musicArtistMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Artists/AlbumArtists') {
+      summary.invariants.musicAlbumArtistMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/MusicGenres') {
+      summary.invariants.musicGenreMatched = true;
+    }
+    if (record.method === 'GET' && /\/InstantMix\//i.test(pathname)) {
+      summary.invariants.musicInstantMix200 = true;
+    }
+    if (record.method === 'GET' && /\/Audio\/[^/]+\/stream\.mp3$/i.test(pathname)) {
+      summary.invariants.musicAudioStream200 = true;
+      addUnique(summary.invariants.musicAudioStreamContentTypes, mediaType(record.responseContentType));
+    }
+  }
 }
 
 function criticalRequestKey(record) {
@@ -1496,6 +1730,30 @@ function criticalRequestKey(record) {
   }
   if (record.method === 'GET' && pathname === '/UserItems/Resume') {
     return 'resume-list';
+  }
+  if (record.method === 'GET' && pathname === '/Albums') {
+    return 'music-albums';
+  }
+  if (record.method === 'GET' && pathname === '/Artists') {
+    return 'music-artists';
+  }
+  if (record.method === 'GET' && pathname === '/Artists/AlbumArtists') {
+    return 'music-album-artists';
+  }
+  if (record.method === 'GET' && pathname === '/MusicGenres') {
+    return 'music-genres';
+  }
+  if (record.method === 'GET' && /\/Items\/[^/]+\/InstantMix$/i.test(pathname)) {
+    return 'music-instant-mix';
+  }
+  if (record.method === 'GET' && pathname === '/InstantMix/MusicGenres/InstantMix') {
+    return 'music-genre-instant-mix';
+  }
+  if (record.method === 'GET' && /\/InstantMix\/MusicGenres\/[^/]+\/InstantMix$/i.test(pathname)) {
+    return 'music-genre-instant-mix';
+  }
+  if (record.method === 'GET' && /\/Audio\/[^/]+\/stream\.mp3$/i.test(pathname)) {
+    return 'music-audio-stream';
   }
   if (record.method === 'GET' && /\/Audio\/[^/]+\/master\.m3u8$/i.test(pathname)) {
     return 'audio-hls-master';
@@ -1593,7 +1851,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -1631,6 +1889,8 @@ function compareCompletedTargets(summaries) {
             ? ['playback-info', 'subtitle-playlist', 'subtitle-vtt', 'trickplay-playlist', 'trickplay-tile']
             : flow === 'audio-hls-legacy'
               ? ['audio-hls-master', 'audio-hls-media', 'audio-hls-dynamic-segment', 'audio-hls-legacy-segment']
+              : flow === 'music'
+                ? ['library-user-views', 'library-items', 'music-albums', 'music-artists', 'music-album-artists', 'music-genres', 'music-instant-mix', 'music-audio-stream']
               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -1653,7 +1913,7 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (upstreamRequest.method !== jellyrinRequest.method) {
     reasons.push(`cross-target ${key}: method ${upstreamRequest.method} != ${jellyrinRequest.method}`);
   }
-  if (key === 'video-stream' || key === 'hls-segment' || key === 'audio-hls-legacy-segment') {
+  if (key === 'video-stream' || key === 'hls-segment' || key === 'audio-hls-legacy-segment' || key === 'music-audio-stream') {
     if (![200, 206].includes(upstreamRequest.status) || ![200, 206].includes(jellyrinRequest.status)) {
       reasons.push(`cross-target ${key}: stream status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
     }
@@ -1708,6 +1968,12 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'library-items-counts',
     'library-items',
     'library-latest',
+    'music-albums',
+    'music-artists',
+    'music-album-artists',
+    'music-genres',
+    'music-instant-mix',
+    'music-genre-instant-mix',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
@@ -1766,6 +2032,12 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'library-items-counts': [],
     'library-items': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].UserData'],
     'library-latest': ['[].Id', '[].Name', '[].Type'],
+    'music-albums': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'music-artists': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'music-album-artists': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'music-genres': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'music-instant-mix': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'music-genre-instant-mix': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -1844,7 +2116,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -1943,6 +2215,24 @@ function invariantFailures(summary) {
       ['audioHlsMedia200', 'audio HLS media playlist'],
       ['audioHlsDynamicSegment200', 'audio HLS dynamic segment'],
       ['audioHlsLegacySegment200', 'audio HLS legacy segment'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'music') {
+    for (const [field, label] of [
+      ['musicViewMatched', 'music view'],
+      ['musicSongsMatched', 'music songs'],
+      ['musicAlbumMatched', 'music album'],
+      ['musicArtistMatched', 'music artist'],
+      ['musicAlbumArtistMatched', 'music album artist'],
+      ['musicGenreMatched', 'music genre'],
+      ['musicInstantMix200', 'music instant mix'],
+      ['musicInstantMixResults', 'music instant mix results'],
+      ['musicAudioStream200', 'music audio stream'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);

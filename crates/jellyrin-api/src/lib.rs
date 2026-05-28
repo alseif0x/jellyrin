@@ -1908,8 +1908,8 @@ pub fn router(state: AppState) -> Router {
             "/audio/{item_id}/stream.{container}",
             head(direct_stream_audio_by_container_head),
         )
-        .route("/Items/{item_id}", get(item_detail))
-        .route("/items/{item_id}", get(item_detail))
+        .route("/Items/{item_id}", get(item_detail).post(update_item_metadata))
+        .route("/items/{item_id}", get(item_detail).post(update_item_metadata))
         .route("/Items/{item_id}/Refresh", post(refresh_item))
         .route("/items/{item_id}/refresh", post(refresh_item))
         .route("/ItemUpdate/Items/{item_id}", post(update_item_metadata))

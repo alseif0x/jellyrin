@@ -11,7 +11,7 @@ use argon2::{
 use jellyrin_core::{
     DeviceToken, MediaItem, PlaybackState, ServerState, StartupConfig, User, VirtualFolder,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
@@ -132,6 +132,7 @@ struct MediaInfo {
     width: Option<i32>,
     height: Option<i32>,
     media_streams: Vec<Value>,
+    metadata: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -3744,7 +3745,7 @@ impl Database {
                 media_streams_json = excluded.media_streams_json
             "#,
         )
-        .bind(existing_id)
+        .bind(&existing_id)
         .bind(folder.id.to_string())
         .bind(name)
         .bind(path)
@@ -3761,6 +3762,41 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        if media_info.metadata.as_object().is_some_and(|metadata| !metadata.is_empty()) {
+            self.merge_scanned_media_item_metadata(&existing_id, media_info.metadata)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn merge_scanned_media_item_metadata(
+        &self,
+        item_id: &str,
+        scanned_metadata: Value,
+    ) -> anyhow::Result<()> {
+        let current = sqlx::query_scalar::<_, String>(
+            "SELECT metadata_json FROM media_items WHERE id = ?1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .unwrap_or_else(|| json!({}));
+        let mut merged = current.as_object().cloned().unwrap_or_default();
+        if let Some(scanned) = scanned_metadata.as_object() {
+            for (key, value) in scanned {
+                if !merged.contains_key(key) {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        let metadata_json = serde_json::to_string(&Value::Object(merged))?;
+        sqlx::query("UPDATE media_items SET metadata_json = ?2 WHERE id = ?1")
+            .bind(item_id)
+            .bind(metadata_json)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -5493,7 +5529,79 @@ fn parse_ffprobe_media_info(value: &Value) -> MediaInfo {
             .and_then(json_number_or_string_i64)
             .and_then(|value| i32::try_from(value).ok()),
         media_streams,
+        metadata: ffprobe_tags_to_metadata(value),
     }
+}
+
+fn ffprobe_tags_to_metadata(value: &Value) -> Value {
+    let mut tags = Vec::<&Value>::new();
+    if let Some(format_tags) = value.pointer("/format/tags") {
+        tags.push(format_tags);
+    }
+    if let Some(streams) = value.get("streams").and_then(Value::as_array) {
+        tags.extend(streams.iter().filter_map(|stream| stream.get("tags")));
+    }
+
+    let album = first_tag_value(&tags, &["album"]);
+    let artists = first_tag_value(&tags, &["artist", "artists"])
+        .map(|value| split_tag_values(&value))
+        .unwrap_or_default();
+    let album_artists = first_tag_value(
+        &tags,
+        &[
+            "album_artist",
+            "album artist",
+            "albumartist",
+            "albumartists",
+        ],
+    )
+    .map(|value| split_tag_values(&value))
+    .unwrap_or_default();
+    let genres = first_tag_value(&tags, &["genre"])
+        .map(|value| split_tag_values(&value))
+        .unwrap_or_default();
+
+    let mut metadata = serde_json::Map::new();
+    if let Some(album) = album {
+        metadata.insert("Album".to_string(), Value::String(album));
+    }
+    if !artists.is_empty() {
+        metadata.insert("Artists".to_string(), json!(artists));
+    }
+    if !album_artists.is_empty() {
+        metadata.insert("AlbumArtists".to_string(), json!(album_artists));
+    }
+    if !genres.is_empty() {
+        metadata.insert("Genres".to_string(), json!(genres));
+        metadata.insert("MusicGenres".to_string(), json!(genres));
+    }
+    Value::Object(metadata)
+}
+
+fn first_tag_value(tags: &[&Value], names: &[&str]) -> Option<String> {
+    tags.iter()
+        .filter_map(|tag| tag.as_object())
+        .flat_map(|tag| tag.iter())
+        .find_map(|(key, value)| {
+            names
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+                .then(|| value.as_str().map(str::trim).filter(|value| !value.is_empty()))
+                .flatten()
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn split_tag_values(value: &str) -> Vec<String> {
+    let mut values = Vec::<String>::new();
+    for part in value.split([';', '/']) {
+        let part = part.trim();
+        if part.is_empty() || values.iter().any(|value| value.eq_ignore_ascii_case(part)) {
+            continue;
+        }
+        values.push(part.to_string());
+    }
+    values
 }
 
 fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
@@ -6664,7 +6772,13 @@ mod tests {
             ],
             "format": {
                 "duration": "123.456",
-                "bit_rate": "3000000"
+                "bit_rate": "3000000",
+                "tags": {
+                    "album": "Example Album",
+                    "artist": "Artist One; Artist Two",
+                    "album_artist": "Album Artist",
+                    "genre": "Rock/Jazz"
+                }
             }
         });
         let info = parse_ffprobe_media_info(&value);
@@ -6672,6 +6786,11 @@ mod tests {
         assert_eq!(info.bitrate, Some(3_000_000));
         assert_eq!(info.width, Some(1920));
         assert_eq!(info.height, Some(1080));
+        assert_eq!(info.metadata["Album"], "Example Album");
+        assert_eq!(info.metadata["Artists"], json!(["Artist One", "Artist Two"]));
+        assert_eq!(info.metadata["AlbumArtists"], json!(["Album Artist"]));
+        assert_eq!(info.metadata["MusicGenres"], json!(["Rock", "Jazz"]));
+        assert_eq!(info.metadata["Genres"], json!(["Rock", "Jazz"]));
     }
 
     #[tokio::test]
