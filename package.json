@@ -11,7 +11,7 @@
     "golden:plugins": "node qa/golden/ecosystem-placeholder.js plugin-dual-runtime",
     "golden:livetv": "node qa/golden/ecosystem-placeholder.js livetv-real",
     "golden:dlna": "node qa/golden/ecosystem-placeholder.js dlna-upnp",
-    "golden:syncplay": "node qa/golden/ecosystem-placeholder.js syncplay-advanced",
+    "golden:syncplay": "node qa/golden/syncplay-advanced.js",
     "golden:channels": "node qa/golden/ecosystem-placeholder.js channels-providers",
     "golden:clients": "node qa/golden/ecosystem-placeholder.js non-web-clients",
     "golden:ecosystem-release": "node qa/golden/ecosystem-placeholder.js ecosystem-release",
