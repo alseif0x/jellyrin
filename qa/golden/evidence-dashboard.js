@@ -245,6 +245,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const p0Direct = browserTraces.find((trace) => trace.flow === 'p0-direct-play');
   const loginHome = browserTraces.find((trace) => trace.flow === 'login-home');
   const resume = browserTraces.find((trace) => trace.flow === 'resume');
+  const transcodeHls = browserTraces.find((trace) => trace.flow === 'transcode-hls');
   return [
     {
       id: 'routes',
@@ -275,6 +276,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
       status: resume?.status || 'pending',
       evidence: resume
         ? `${resume.completedTargets.join(',') || 'none'} completed, failed=${resume.failed}`
+        : 'missing trace',
+    },
+    {
+      id: 'browser-transcode-hls',
+      status: transcodeHls?.status || 'pending',
+      evidence: transcodeHls
+        ? `${transcodeHls.completedTargets.join(',') || 'none'} completed, failed=${transcodeHls.failed}`
         : 'missing trace',
     },
     {

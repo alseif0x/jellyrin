@@ -28,7 +28,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -104,6 +104,13 @@ async function captureTarget(browser, flowDir, target) {
       resumeList200: false,
       resumeItemMatched: false,
       resumePositionTicks: null,
+      transcodePlaybackInfo200: false,
+      transcodingUrlPresent: false,
+      hlsMaster200: false,
+      hlsMedia200: false,
+      hlsSegment200: false,
+      hlsPlaylistShapes: [],
+      hlsSegmentContentTypes: [],
     },
   };
 
@@ -142,8 +149,10 @@ async function captureTarget(browser, flowDir, target) {
       await runLoginHomeFlow(page, summary, publicInfo, target);
     } else if (flow === 'p0-direct-play') {
       await runDirectPlayFlow(page, summary, publicInfo, target);
-    } else {
+    } else if (flow === 'resume') {
       await runResumeFlow(page, summary, publicInfo, target);
+    } else {
+      await runTranscodeHlsFlow(page, summary, publicInfo, target);
     }
     if (summary.skipped) {
       return summary;
@@ -235,6 +244,88 @@ async function runResumeFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runTranscodeHlsFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  const movie = await firstMovieItem(page, summary, auth);
+  if (!movie) {
+    summary.status = 'skipped';
+    summary.skipped = true;
+    summary.reason = 'target has no movie item for transcode trace';
+    return;
+  }
+
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  const playbackInfo = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(movie.Id)}/PlaybackInfo`,
+    token: auth.AccessToken,
+    body: withoutUndefined({
+      UserId: auth.User.Id,
+      MediaSourceId: movie.Id,
+      AudioStreamIndex: defaultStreamIndex(movie, 'Audio'),
+      SubtitleStreamIndex: -1,
+      EnableDirectPlay: false,
+      EnableDirectStream: false,
+      EnableTranscoding: true,
+      StartPositionTicks: 0,
+      DeviceProfile: hlsTranscodeDeviceProfile(),
+    }),
+  });
+  if (playbackInfo.status !== 200) {
+    throw new Error(`transcode PlaybackInfo returned HTTP ${playbackInfo.status}`);
+  }
+  const mediaSource = playbackInfo.json?.MediaSources?.[0];
+  const transcodingUrl = mediaSource?.TranscodingUrl;
+  if (!transcodingUrl) {
+    throw new Error('transcode PlaybackInfo did not return TranscodingUrl');
+  }
+
+  const master = await browserFetchText(page, {
+    method: 'GET',
+    url: transcodingUrl,
+    token: auth.AccessToken,
+  });
+  if (master.status !== 200) {
+    throw new Error(`HLS master playlist returned HTTP ${master.status}`);
+  }
+  const mediaPlaylistPath = firstPlaylistUri(master.text);
+  if (!mediaPlaylistPath) {
+    throw new Error('HLS master playlist did not contain a media playlist URI');
+  }
+
+  const media = await browserFetchText(page, {
+    method: 'GET',
+    url: resolveRelativeUrl(transcodingUrl, mediaPlaylistPath),
+    token: auth.AccessToken,
+  });
+  if (media.status !== 200) {
+    throw new Error(`HLS media playlist returned HTTP ${media.status}`);
+  }
+  const segmentPath = firstPlaylistUri(media.text);
+  if (!segmentPath) {
+    throw new Error('HLS media playlist did not contain a segment URI');
+  }
+
+  const segment = await browserFetchText(page, {
+    method: 'GET',
+    url: resolveRelativeUrl(transcodingUrl, segmentPath),
+    token: auth.AccessToken,
+  });
+  if (![200, 206].includes(segment.status)) {
+    throw new Error(`HLS segment returned HTTP ${segment.status}`);
+  }
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle');
+  summary.item = {
+    id: '<dynamic>',
+    name: movie.Name,
+    type: movie.Type,
+  };
+}
+
 async function runDirectPlayFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -302,6 +393,38 @@ function resumeTraceEligible(movie) {
   return Number.isFinite(runtimeTicks) && runtimeTicks >= 300 * 10_000_000;
 }
 
+function defaultStreamIndex(movie, streamType) {
+  const streams = movie.MediaSources?.[0]?.MediaStreams || movie.MediaStreams || [];
+  const stream = streams.find((candidate) => candidate.Type === streamType && candidate.IsDefault)
+    || streams.find((candidate) => candidate.Type === streamType);
+  return stream?.Index;
+}
+
+function withoutUndefined(value) {
+  return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined));
+}
+
+function hlsTranscodeDeviceProfile() {
+  return {
+    DirectPlayProfiles: [],
+    TranscodingProfiles: [
+      {
+        Container: 'ts',
+        Type: 'Video',
+        AudioCodec: 'aac,mp2,opus,flac',
+        VideoCodec: 'h264',
+        Context: 'Streaming',
+        Protocol: 'hls',
+        MaxAudioChannels: '2',
+        MinSegments: '1',
+        BreakOnNonKeyFrames: false,
+      },
+    ],
+    ContainerProfiles: [],
+    CodecProfiles: [],
+  };
+}
+
 async function browserFetchJson(page, request) {
   return page.evaluate(async ({ method, url, token, body }) => {
     const response = await fetch(url, {
@@ -326,6 +449,34 @@ async function browserFetchJson(page, request) {
       json,
     };
   }, request);
+}
+
+async function browserFetchText(page, request) {
+  return page.evaluate(async ({ method, url, token }) => {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'X-Emby-Token': token,
+      },
+    });
+    return {
+      status: response.status,
+      contentType: response.headers.get('content-type') || '',
+      text: await response.text(),
+    };
+  }, request);
+}
+
+function firstPlaylistUri(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith('#'));
+}
+
+function resolveRelativeUrl(base, next) {
+  return new URL(next, new URL(base, 'http://placeholder.invalid')).pathname
+    + new URL(next, new URL(base, 'http://placeholder.invalid')).search;
 }
 
 async function authenticateTarget(page, summary, target) {
@@ -526,7 +677,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -536,6 +687,12 @@ function captureFlowInvariants(summary, record, requestPostData) {
   }
   if (pathname.endsWith('/PlaybackInfo') && record.status === 200) {
     summary.invariants.playbackInfo200 = true;
+    if (flow === 'transcode-hls') {
+      summary.invariants.transcodePlaybackInfo200 = true;
+      if (record.responseShape?.MediaSources?.[0]?.TranscodingUrl) {
+        summary.invariants.transcodingUrlPresent = true;
+      }
+    }
   }
   if (/\/Videos\/[^/]+\/stream/i.test(pathname) && [200, 206].includes(record.status)) {
     summary.invariants.streamOk = true;
@@ -559,6 +716,20 @@ function captureFlowInvariants(summary, record, requestPostData) {
   }
   if (/\/transcoding\/|\/hls\/|\/hls1\/|\.m3u8$/i.test(pathname)) {
     summary.invariants.unexpectedTranscodePath = true;
+  }
+  if (flow === 'transcode-hls') {
+    if (record.method === 'GET' && /master\.m3u8$/i.test(pathname) && record.status === 200) {
+      summary.invariants.hlsMaster200 = true;
+      addUnique(summary.invariants.hlsPlaylistShapes, 'master');
+    }
+    if (record.method === 'GET' && /(?:main|live|stream)\.m3u8$/i.test(pathname) && record.status === 200) {
+      summary.invariants.hlsMedia200 = true;
+      addUnique(summary.invariants.hlsPlaylistShapes, 'media');
+    }
+    if (record.method === 'GET' && /\/(?:hls|hls1)\/.*\.(?:ts|mp4|aac|mp3)$/i.test(pathname) && [200, 206].includes(record.status)) {
+      summary.invariants.hlsSegment200 = true;
+      addUnique(summary.invariants.hlsSegmentContentTypes, mediaType(record.responseContentType));
+    }
   }
 }
 
@@ -585,6 +756,15 @@ function criticalRequestKey(record) {
   if (record.method === 'GET' && pathname === '/UserItems/Resume') {
     return 'resume-list';
   }
+  if (record.method === 'GET' && /master\.m3u8$/i.test(pathname)) {
+    return 'hls-master';
+  }
+  if (record.method === 'GET' && /(?:main|live|stream)\.m3u8$/i.test(pathname)) {
+    return 'hls-media';
+  }
+  if (record.method === 'GET' && /\/(?:hls|hls1)\/.*\.(?:ts|mp4|aac|mp3)$/i.test(pathname)) {
+    return 'hls-segment';
+  }
   return null;
 }
 
@@ -609,7 +789,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -621,7 +801,9 @@ function compareCompletedTargets(summaries) {
   const reasons = [];
   const keys = flow === 'resume'
     ? ['resume-list', 'sessions-playing-progress']
-    : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+    : flow === 'transcode-hls'
+      ? ['playback-info', 'hls-master', 'hls-media', 'hls-segment']
+      : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -643,7 +825,7 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (upstreamRequest.method !== jellyrinRequest.method) {
     reasons.push(`cross-target ${key}: method ${upstreamRequest.method} != ${jellyrinRequest.method}`);
   }
-  if (key === 'video-stream') {
+  if (key === 'video-stream' || key === 'hls-segment') {
     if (![200, 206].includes(upstreamRequest.status) || ![200, 206].includes(jellyrinRequest.status)) {
       reasons.push(`cross-target ${key}: stream status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
     }
@@ -760,6 +942,13 @@ function addWebsocketMessageType(summary, parsed) {
   }
 }
 
+function addUnique(values, value) {
+  if (!values.includes(value)) {
+    values.push(value);
+    values.sort();
+  }
+}
+
 function compatiblePlayMethod(upstreamMethod, jellyrinMethod) {
   if (!upstreamMethod || !jellyrinMethod) {
     return true;
@@ -773,7 +962,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -786,6 +975,24 @@ function invariantFailures(summary) {
     }
     if (!summary.invariants.resumeItemMatched) {
       failures.push('missing resume item invariant');
+    }
+    return failures;
+  }
+  if (flow === 'transcode-hls') {
+    if (!summary.invariants.transcodePlaybackInfo200) {
+      failures.push('missing transcode PlaybackInfo 200 invariant');
+    }
+    if (!summary.invariants.transcodingUrlPresent) {
+      failures.push('missing TranscodingUrl invariant');
+    }
+    if (!summary.invariants.hlsMaster200) {
+      failures.push('missing HLS master playlist 200 invariant');
+    }
+    if (!summary.invariants.hlsMedia200) {
+      failures.push('missing HLS media playlist 200 invariant');
+    }
+    if (!summary.invariants.hlsSegment200) {
+      failures.push('missing HLS segment 200/206 invariant');
     }
     return failures;
   }
