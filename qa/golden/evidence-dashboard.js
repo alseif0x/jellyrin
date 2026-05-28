@@ -36,6 +36,7 @@ async function main() {
     functionalAreas,
     sources.securityHardening,
     sources.performanceRecovery,
+    sources.packagingRelease,
   );
 
   const dashboard = {
@@ -72,6 +73,7 @@ async function loadSources() {
     functionalParity: await readText('functional-parity.md', ''),
     securityHardening: await readJson('security-hardening.json', null),
     performanceRecovery: await readJson('performance-recovery.json', null),
+    packagingRelease: await readJson('packaging-release.json', null),
     browserTraces: await readTraceComparisons(browserTracesDir),
   };
 }
@@ -259,6 +261,7 @@ function buildGates(
   functionalAreas,
   securityHardening,
   performanceRecovery,
+  packagingRelease,
 ) {
   const startupWizard = browserTraces.find((trace) => trace.flow === 'startup-wizard');
   const p0Direct = browserTraces.find((trace) => trace.flow === 'p0-direct-play');
@@ -478,6 +481,13 @@ function buildGates(
         : 'missing performance/recovery matrix',
     },
     {
+      id: 'packaging-release',
+      status: packagingRelease?.status || 'pending',
+      evidence: packagingRelease
+        ? `${packagingRelease.summary.passed}/${packagingRelease.summary.total} checks passed`
+        : 'missing packaging/release matrix',
+    },
+    {
       id: 'dto-field-parity',
       status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
       evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
@@ -530,6 +540,7 @@ function sourceStatus(sources) {
     functionalParity: sources.functionalParity.trim().length > 0,
     securityHardening: Boolean(sources.securityHardening),
     performanceRecovery: Boolean(sources.performanceRecovery),
+    packagingRelease: Boolean(sources.packagingRelease),
     browserTraceComparisons: sources.browserTraces.length,
   };
 }

@@ -7,7 +7,8 @@
     "golden:browser": "node qa/golden/browser-trace.js",
     "golden:startup-wizard": "node qa/golden/startup-wizard-runner.js",
     "golden:dto": "node qa/golden/dto-parity.js",
-    "evidence:dashboard": "node qa/golden/evidence-dashboard.js"
+    "evidence:dashboard": "node qa/golden/evidence-dashboard.js",
+    "qa:packaging-release": "node qa/packaging-release.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2"

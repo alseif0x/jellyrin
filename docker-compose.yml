@@ -1,0 +1,30 @@
+services:
+  jellyrin:
+    build:
+      context: .
+    image: jellyrin:local
+    container_name: jellyrin
+    restart: unless-stopped
+    env_file:
+      - ./ops/jellyrin.env.example
+    ports:
+      - "8096:8096"
+    volumes:
+      - jellyrin-data:/var/lib/jellyrin
+      - jellyrin-cache:/var/cache/jellyrin
+      - jellyrin-logs:/var/log/jellyrin
+      - jellyrin-config:/etc/jellyrin
+      - ./web:/srv/jellyrin/web:ro
+      - ./media:/media:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  jellyrin-data:
+  jellyrin-cache:
+  jellyrin-logs:
+  jellyrin-config:

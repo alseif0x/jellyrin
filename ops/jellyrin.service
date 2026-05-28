@@ -1,0 +1,26 @@
+[Unit]
+Description=Jellyrin media server
+Documentation=https://github.com/alseif0x/jellyrin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jellyrin
+Group=jellyrin
+EnvironmentFile=/etc/jellyrin/jellyrin.env
+ExecStart=/usr/local/bin/jellyrin-server
+Restart=on-failure
+RestartSec=5
+StateDirectory=jellyrin
+CacheDirectory=jellyrin
+LogsDirectory=jellyrin
+ConfigurationDirectory=jellyrin
+ReadWritePaths=/var/lib/jellyrin /var/cache/jellyrin /var/log/jellyrin /etc/jellyrin
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

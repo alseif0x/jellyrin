@@ -23,6 +23,21 @@ The local development service is installed as `jellyrin-rust-dev.service` and
 listens on port `8097` so it can run alongside the upstream .NET Jellyfin
 development server on `8096`.
 
+## Release Packaging
+
+Release artifacts live under `ops/` plus the root Docker files:
+
+- `Dockerfile` builds a release `jellyrin-server` image with `ffmpeg`, persistent
+  volumes and a `/healthz` healthcheck.
+- `docker-compose.yml` runs Jellyrin with persistent data/config/cache/log
+  volumes and read-only Jellyfin Web/media mounts.
+- `ops/jellyrin.service` is the production systemd unit; copy
+  `ops/jellyrin.env.example` to `/etc/jellyrin/jellyrin.env` before enabling it.
+- `ops/release-checklist.md` covers fresh install, upgrade, smoke checks and
+  rollback.
+
+Run `npm run qa:packaging-release` before cutting a release.
+
 ## Compatibility Notes
 
 Jellyfin Web does not always call API routes with the same casing as the
