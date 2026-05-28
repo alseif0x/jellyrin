@@ -21366,6 +21366,11 @@ async fn filtered_media_items(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
+    let metadata_search_by_item = if search_term.is_some() {
+        Some(media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?)
+    } else {
+        None
+    };
     let name_starts_with = normalized_prefix(query.name_starts_with.as_deref());
     let name_starts_with_or_greater =
         normalized_prefix(query.name_starts_with_or_greater.as_deref());
@@ -21401,9 +21406,13 @@ async fn filtered_media_items(
         })
         .filter(|_| is_folder_filter.is_none_or(|is_folder| !is_folder))
         .filter(|item| {
-            search_term
-                .as_ref()
-                .is_none_or(|term| item.name.to_ascii_lowercase().contains(term))
+            search_term.as_ref().is_none_or(|term| {
+                item.name.to_ascii_lowercase().contains(term)
+                    || metadata_search_by_item
+                        .as_ref()
+                        .and_then(|metadata| metadata.get(&item.id))
+                        .is_some_and(|metadata| metadata_value_matches_search(metadata, term))
+            })
         })
         .filter(|item| {
             name_starts_with
@@ -21452,6 +21461,20 @@ async fn filtered_media_items(
     }
 
     Ok(items)
+}
+
+fn metadata_value_matches_search(value: &serde_json::Value, term: &str) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.to_ascii_lowercase().contains(term),
+        serde_json::Value::Number(value) => value.to_string().contains(term),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| metadata_value_matches_search(value, term)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| metadata_value_matches_search(value, term)),
+        serde_json::Value::Bool(_) | serde_json::Value::Null => false,
+    }
 }
 
 fn paged_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaItem> {
@@ -21934,6 +21957,7 @@ fn apply_media_item_metadata(
     };
 
     for (target, keys) in [
+        ("Name", &["Name", "Title", "title"][..]),
         ("Overview", &["Overview", "overview"][..]),
         ("OriginalTitle", &["OriginalTitle", "originalTitle"][..]),
         ("OfficialRating", &["OfficialRating", "OfficialRatings"][..]),

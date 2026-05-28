@@ -2145,6 +2145,11 @@ async function runMetadataSearchFlow(page, summary, publicInfo, target) {
       Name: metadataFlowNfoTitle,
       Overview: 'Manual locked overview',
       Genres: ['Manual Locked Genre'],
+      Studios: [],
+      People: [],
+      Tags: [],
+      ProviderIds: { Imdb: 'tt0950099' },
+      LockData: true,
       LockedFields: ['Overview', 'Genres'],
     },
   });
