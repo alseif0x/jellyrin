@@ -2894,15 +2894,19 @@ async function runNonWebClientFlow(page, summary, publicInfo, target) {
   await page.goto(summary.baseUrl, { waitUntil: 'domcontentloaded' });
   await page.waitForLoadState('networkidle').catch(() => {});
 
-  let auth = null;
   let adminAuth = null;
   let createdClientUserId = null;
   const clientUserName = `${nonWebClientFlowPrefix} ${target.name}`;
-  const clientAuthorization = `MediaBrowser Client="Jellyfin MPV Shim", Device="Jellyrin QA MPV ${target.name}", DeviceId="non-web-client-${target.name}", Version="dev"`;
+  const clientContracts = nonWebClientContracts(target.name);
+  const passedProfiles = [];
+  const activeSessions = [];
 
   try {
+    let username = target.username;
+    let password = target.password;
     if (target.username && target.password) {
-      auth = await loginNonWebClient(page, target.username, target.password, clientAuthorization);
+      username = target.username;
+      password = target.password;
     } else {
       adminAuth = await authenticateTarget(page, summary, target);
       await deleteUsersByName(page, adminAuth.AccessToken, clientUserName);
@@ -2919,106 +2923,116 @@ async function runNonWebClientFlow(page, summary, publicInfo, target) {
         throw new Error(`non-web client Users/New returned HTTP ${createdClient.status}`);
       }
       createdClientUserId = createdClient.json.Id;
-      auth = await loginNonWebClient(page, clientUserName, nonWebClientFlowPassword, clientAuthorization);
+      username = clientUserName;
+      password = nonWebClientFlowPassword;
     }
-    summary.invariants.nonWebClientAuthenticated = true;
 
-    const systemInfo = await browserFetchJson(page, {
-      method: 'GET',
-      url: '/System/Info',
-      token: auth.AccessToken,
-    });
-    if (systemInfo.status !== 200 || !systemInfo.json?.Id) {
-      throw new Error(`non-web System/Info returned HTTP ${systemInfo.status}`);
-    }
-    summary.invariants.nonWebSystemInfo200 = true;
+    let movie = null;
+    for (const contract of clientContracts) {
+      const auth = await loginNonWebClient(page, username, password, contract.authorization);
+      activeSessions.push(auth.AccessToken);
+      summary.invariants.nonWebClientAuthenticated = true;
 
-    const views = await browserFetchJson(page, {
-      method: 'GET',
-      url: `/Users/${encodeURIComponent(auth.User.Id)}/Views`,
-      token: auth.AccessToken,
-    });
-    if (views.status !== 200 || !Array.isArray(views.json?.Items)) {
-      throw new Error(`non-web browse views returned HTTP ${views.status}`);
-    }
-    summary.invariants.nonWebBrowse200 = true;
+      const systemInfo = await browserFetchJson(page, {
+        method: 'GET',
+        url: '/System/Info',
+        token: auth.AccessToken,
+      });
+      if (systemInfo.status !== 200 || !systemInfo.json?.Id) {
+        throw new Error(`non-web ${contract.id} System/Info returned HTTP ${systemInfo.status}`);
+      }
+      summary.invariants.nonWebSystemInfo200 = true;
 
-    const movie = await firstMovieItem(page, summary, auth);
-    if (!movie) {
-      summary.status = 'skipped';
-      summary.skipped = true;
-      summary.reason = 'target has no movie item for non-web client trace';
-      return;
-    }
-    summary.invariants.nonWebMovieMatched = true;
+      const views = await browserFetchJson(page, {
+        method: 'GET',
+        url: `/Users/${encodeURIComponent(auth.User.Id)}/Views`,
+        token: auth.AccessToken,
+      });
+      if (views.status !== 200 || !Array.isArray(views.json?.Items)) {
+        throw new Error(`non-web ${contract.id} browse views returned HTTP ${views.status}`);
+      }
+      summary.invariants.nonWebBrowse200 = true;
 
-    const playbackInfo = await browserFetchJson(page, {
-      method: 'POST',
-      url: `/Items/${encodeURIComponent(movie.Id)}/PlaybackInfo`,
-      token: auth.AccessToken,
-      body: withoutUndefined({
-        UserId: auth.User.Id,
-        MediaSourceId: movie.Id,
-        EnableDirectPlay: true,
-        EnableDirectStream: true,
-        EnableTranscoding: true,
-        StartPositionTicks: 0,
-        DeviceProfile: mpvShimDeviceProfile(),
-      }),
-    });
-    if (playbackInfo.status !== 200 || !Array.isArray(playbackInfo.json?.MediaSources)) {
-      throw new Error(`non-web PlaybackInfo returned HTTP ${playbackInfo.status}`);
-    }
-    summary.invariants.nonWebPlaybackInfo200 = true;
-    const mediaSource = playbackInfo.json.MediaSources[0];
-    if (!mediaSource || mediaSource.SupportsDirectPlay !== true) {
-      throw new Error('non-web PlaybackInfo did not expose a direct-play media source');
-    }
-    summary.invariants.nonWebDirectMediaSource = true;
+      movie = movie || await firstMovieItem(page, summary, auth);
+      if (!movie) {
+        summary.status = 'skipped';
+        summary.skipped = true;
+        summary.reason = 'target has no movie item for non-web client trace';
+        return;
+      }
+      summary.invariants.nonWebMovieMatched = true;
 
-    const stream = await browserFetchBinary(page, {
-      method: 'GET',
-      url: `/Videos/${encodeURIComponent(movie.Id)}/stream.mp4?Static=true&api_key=${encodeURIComponent(auth.AccessToken)}`,
-      token: auth.AccessToken,
-    });
-    if (![200, 206].includes(stream.status) || stream.byteLength <= 0) {
-      throw new Error(`non-web direct stream returned HTTP ${stream.status}`);
-    }
-    summary.invariants.nonWebStream200 = true;
+      const playbackInfo = await browserFetchJson(page, {
+        method: 'POST',
+        url: `/Items/${encodeURIComponent(movie.Id)}/PlaybackInfo`,
+        token: auth.AccessToken,
+        body: withoutUndefined({
+          UserId: auth.User.Id,
+          MediaSourceId: movie.Id,
+          EnableDirectPlay: true,
+          EnableDirectStream: true,
+          EnableTranscoding: true,
+          StartPositionTicks: 0,
+          DeviceProfile: contract.deviceProfile,
+        }),
+      });
+      if (playbackInfo.status !== 200 || !Array.isArray(playbackInfo.json?.MediaSources)) {
+        throw new Error(`non-web ${contract.id} PlaybackInfo returned HTTP ${playbackInfo.status}`);
+      }
+      summary.invariants.nonWebPlaybackInfo200 = true;
+      const mediaSource = playbackInfo.json.MediaSources[0];
+      if (!mediaSource || mediaSource.SupportsDirectPlay !== true) {
+        throw new Error(`non-web ${contract.id} PlaybackInfo did not expose a direct-play media source`);
+      }
+      summary.invariants.nonWebDirectMediaSource = true;
 
-    const positionTicks = resumeTracePositionTicks(movie);
-    const progress = await browserFetchJson(page, {
-      method: 'POST',
-      url: '/Sessions/Playing/Progress',
-      token: auth.AccessToken,
-      body: {
-        ItemId: movie.Id,
-        MediaSourceId: mediaSource.Id || movie.Id,
-        PositionTicks: positionTicks,
-        IsPaused: false,
-        PlayMethod: mediaSource.SupportsDirectPlay ? 'DirectPlay' : 'DirectStream',
-      },
-    });
-    if (progress.status !== 204) {
-      throw new Error(`non-web Sessions/Playing/Progress returned HTTP ${progress.status}`);
-    }
-    summary.invariants.nonWebProgress204 = true;
+      const stream = await browserFetchBinary(page, {
+        method: 'GET',
+        url: `/Videos/${encodeURIComponent(movie.Id)}/stream.mp4?Static=true&api_key=${encodeURIComponent(auth.AccessToken)}`,
+        token: auth.AccessToken,
+      });
+      if (![200, 206].includes(stream.status) || stream.byteLength <= 0) {
+        throw new Error(`non-web ${contract.id} direct stream returned HTTP ${stream.status}`);
+      }
+      summary.invariants.nonWebStream200 = true;
 
-    const resume = await browserFetchJson(page, {
-      method: 'GET',
-      url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video`,
-      token: auth.AccessToken,
-    });
-    if (resume.status !== 200 || !resume.json?.Items?.some((item) => item.Id === movie.Id)) {
-      throw new Error(`non-web resume query did not include movie, HTTP ${resume.status}`);
+      const positionTicks = resumeTracePositionTicks(movie);
+      const progress = await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Sessions/Playing/Progress',
+        token: auth.AccessToken,
+        body: {
+          ItemId: movie.Id,
+          MediaSourceId: mediaSource.Id || movie.Id,
+          PositionTicks: positionTicks,
+          IsPaused: false,
+          PlayMethod: mediaSource.SupportsDirectPlay ? 'DirectPlay' : 'DirectStream',
+        },
+      });
+      if (progress.status !== 204) {
+        throw new Error(`non-web ${contract.id} Sessions/Playing/Progress returned HTTP ${progress.status}`);
+      }
+      summary.invariants.nonWebProgress204 = true;
+
+      const resume = await browserFetchJson(page, {
+        method: 'GET',
+        url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video`,
+        token: auth.AccessToken,
+      });
+      if (resume.status !== 200 || !resume.json?.Items?.some((item) => item.Id === movie.Id)) {
+        throw new Error(`non-web ${contract.id} resume query did not include movie, HTTP ${resume.status}`);
+      }
+      summary.invariants.nonWebResumeMatched = true;
+      passedProfiles.push(contract.id);
     }
-    summary.invariants.nonWebResumeMatched = true;
+    summary.invariants.nonWebClientProfiles = passedProfiles;
+    summary.invariants.nonWebClientProfileCount = passedProfiles.length;
 
     if (target.name === 'jellyrin') {
       const network = await browserFetchJson(page, {
         method: 'GET',
         url: '/System/Configuration/network',
-        token: auth.AccessToken,
+        token: activeSessions[0],
       });
       if (network.status !== 200 || network.json?.EnableUPnP !== false) {
         throw new Error(`Jellyrin DLNA/UPnP unsupported decision not visible in network config, HTTP ${network.status}`);
@@ -3032,14 +3046,14 @@ async function runNonWebClientFlow(page, summary, publicInfo, target) {
       id: '<dynamic>',
       name: movie.Name,
       type: movie.Type,
-      client: 'Jellyfin MPV Shim',
+      clients: passedProfiles,
     };
   } finally {
-    if (auth?.AccessToken) {
+    for (const token of activeSessions) {
       await browserFetchJson(page, {
         method: 'POST',
         url: '/Sessions/Logout',
-        token: auth.AccessToken,
+        token,
       }).catch(() => {});
     }
     if (adminAuth?.AccessToken && createdClientUserId) {
@@ -4392,6 +4406,132 @@ function mpvShimDeviceProfile() {
       { Format: 'srt', Method: 'External' },
       { Format: 'vtt', Method: 'External' },
     ],
+  };
+}
+
+function nonWebClientContracts(targetName) {
+  return [
+    {
+      id: 'mpv-shim',
+      authorization: nonWebClientAuthorization('Jellyfin MPV Shim', `Jellyrin QA MPV ${targetName}`, `non-web-client-mpv-${targetName}`),
+      deviceProfile: mpvShimDeviceProfile(),
+    },
+    {
+      id: 'kodi',
+      authorization: nonWebClientAuthorization('Kodi Sync Queue', `Jellyrin QA Kodi ${targetName}`, `non-web-client-kodi-${targetName}`),
+      deviceProfile: kodiDeviceProfile(),
+    },
+    {
+      id: 'android-tv',
+      authorization: nonWebClientAuthorization('Jellyfin Android TV', `Jellyrin QA Android TV ${targetName}`, `non-web-client-android-tv-${targetName}`),
+      deviceProfile: androidTvDeviceProfile(),
+    },
+    {
+      id: 'android-mobile',
+      authorization: nonWebClientAuthorization('Jellyfin Android', `Jellyrin QA Android ${targetName}`, `non-web-client-android-mobile-${targetName}`),
+      deviceProfile: androidMobileDeviceProfile(),
+    },
+    {
+      id: 'swiftfin',
+      authorization: nonWebClientAuthorization('Swiftfin', `Jellyrin QA Swiftfin ${targetName}`, `non-web-client-swiftfin-${targetName}`),
+      deviceProfile: swiftfinDeviceProfile(),
+    },
+    {
+      id: 'roku',
+      authorization: nonWebClientAuthorization('Jellyfin Roku', `Jellyrin QA Roku ${targetName}`, `non-web-client-roku-${targetName}`),
+      deviceProfile: rokuDeviceProfile(),
+    },
+  ];
+}
+
+function nonWebClientAuthorization(client, device, deviceId) {
+  return `MediaBrowser Client="${client}", Device="${device}", DeviceId="${deviceId}", Version="dev"`;
+}
+
+function kodiDeviceProfile() {
+  return directVideoDeviceProfile({
+    containers: 'mp4,m4v,mkv,webm,mov,avi,ts',
+    videoCodecs: 'h264,hevc,vp8,vp9,mpeg4,mpeg2video',
+    audioCodecs: 'aac,mp3,opus,vorbis,flac,ac3,eac3,dts,mp2',
+    audioContainers: 'mp3,aac,flac,ogg,opus,m4a,wav',
+    directAudioCodecs: 'mp3,aac,flac,vorbis,opus',
+    subtitles: ['srt', 'vtt', 'ass', 'ssa', 'sub'],
+  });
+}
+
+function androidTvDeviceProfile() {
+  return directVideoDeviceProfile({
+    containers: 'mp4,m4v,mkv,webm',
+    videoCodecs: 'h264,hevc,vp9',
+    audioCodecs: 'aac,mp3,opus,vorbis,flac,ac3,eac3',
+    audioContainers: 'mp3,aac,flac,ogg,opus,m4a',
+    directAudioCodecs: 'mp3,aac,flac,vorbis,opus',
+    subtitles: ['srt', 'vtt'],
+  });
+}
+
+function androidMobileDeviceProfile() {
+  return directVideoDeviceProfile({
+    containers: 'mp4,m4v,mkv,webm',
+    videoCodecs: 'h264,hevc,vp9',
+    audioCodecs: 'aac,mp3,opus,vorbis,flac,ac3,eac3',
+    audioContainers: 'mp3,aac,flac,ogg,opus,m4a',
+    directAudioCodecs: 'mp3,aac,flac,vorbis,opus',
+    subtitles: ['srt', 'vtt'],
+  });
+}
+
+function swiftfinDeviceProfile() {
+  return directVideoDeviceProfile({
+    containers: 'mp4,m4v,mov',
+    videoCodecs: 'h264,hevc',
+    audioCodecs: 'aac,mp3,ac3,eac3,alac,flac',
+    audioContainers: 'mp3,aac,flac,m4a',
+    directAudioCodecs: 'mp3,aac,flac,alac',
+    subtitles: ['srt', 'vtt'],
+  });
+}
+
+function rokuDeviceProfile() {
+  return directVideoDeviceProfile({
+    containers: 'mp4,m4v,mov',
+    videoCodecs: 'h264,hevc',
+    audioCodecs: 'aac,mp3,ac3,eac3',
+    audioContainers: 'mp3,aac,m4a',
+    directAudioCodecs: 'mp3,aac',
+    subtitles: ['srt', 'vtt'],
+  });
+}
+
+function directVideoDeviceProfile({ containers, videoCodecs, audioCodecs, audioContainers, directAudioCodecs, subtitles }) {
+  return {
+    DirectPlayProfiles: [
+      {
+        Container: containers,
+        Type: 'Video',
+        VideoCodec: videoCodecs,
+        AudioCodec: audioCodecs,
+      },
+      {
+        Container: audioContainers,
+        Type: 'Audio',
+        AudioCodec: directAudioCodecs,
+      },
+    ],
+    TranscodingProfiles: [
+      {
+        Container: 'ts',
+        Type: 'Video',
+        AudioCodec: 'aac',
+        VideoCodec: 'h264',
+        Context: 'Streaming',
+        Protocol: 'hls',
+        MaxAudioChannels: '2',
+      },
+    ],
+    ContainerProfiles: [],
+    CodecProfiles: [],
+    SubtitleProfiles: subtitles.map((format) => ({ Format: format, Method: 'External' })),
   };
 }
 
@@ -6763,6 +6903,10 @@ function invariantFailures(summary) {
       if (!summary.invariants[field]) {
         failures.push(`missing non-web client ${label} invariant`);
       }
+    }
+    const profileCount = Number(summary.invariants.nonWebClientProfileCount || 0);
+    if (profileCount < 6) {
+      failures.push(`missing non-web client contract profiles, got ${profileCount}/6`);
     }
     return failures;
   }

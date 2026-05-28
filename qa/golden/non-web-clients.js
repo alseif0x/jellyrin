@@ -26,6 +26,8 @@ const baselineEvidence = {
   ],
 };
 
+const requiredProfiles = ['mpv-shim', 'kodi', 'android-tv', 'android-mobile', 'swiftfin', 'roku'];
+
 async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
 
@@ -85,23 +87,25 @@ function buildEvidence(result, comparison) {
     .map((summary) => summary.target)
     .sort();
   const failed = Boolean(comparison.comparison?.failed);
+  const completedProfiles = commonCompletedProfiles(summaries);
 
-  if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream')) {
+  if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream') && completedProfiles.length === requiredProfiles.length) {
     return {
       gate: 'non-web-clients',
       status: 'upstream-validated',
-      percent: 55,
+      percent: 70,
       closed: false,
-      sourcePhase: 'E6.1b',
-      evidence: 'MPV Shim/Jellyfin Media Player contract golden completed against upstream and Jellyrin with no comparison failures.',
+      sourcePhase: 'E6.2',
+      evidence: 'Non-web client contract golden completed against upstream and Jellyrin for MPV/JMP, Kodi, Android TV, Android mobile, Swiftfin/iOS and Roku with no comparison failures.',
       updatedAt,
       completedTargets,
       skippedTargets,
       failedTargets,
+      completedProfiles,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
-        'Dashboard target remains device-validated; run a real MPV Shim/Jellyfin Media Player playback session before closing E6.',
-        'Kodi, Android TV, Android mobile, Swiftfin/iOS and Roku contracts still need dedicated client profiles.',
+        'Dashboard target remains device-validated; run real playback sessions from representative non-web clients before closing E6.',
+        'Contract profiles validate Jellyfin-compatible API shape, but client-version-specific behavior still needs manual/device evidence.',
       ],
     };
   }
@@ -117,10 +121,21 @@ function buildEvidence(result, comparison) {
     completedTargets,
     skippedTargets,
     failedTargets,
+    completedProfiles,
     failedReasons: comparison.comparison?.reasons || [],
     traceExitCode: result.code,
     tracePath: path.relative(plansDir, comparisonPath),
   };
+}
+
+function commonCompletedProfiles(summaries) {
+  const profileSets = summaries
+    .filter((summary) => summary.status === 'completed')
+    .map((summary) => new Set(summary.invariants?.nonWebClientProfiles || []));
+  if (profileSets.length === 0) {
+    return [];
+  }
+  return requiredProfiles.filter((profile) => profileSets.every((profiles) => profiles.has(profile)));
 }
 
 async function readJsonIfExists(filePath) {
@@ -157,6 +172,9 @@ function renderMarkdown(evidence, comparison) {
   }
   if (Array.isArray(evidence.failedTargets)) {
     lines.push(`- Failed targets: ${evidence.failedTargets.join(', ') || 'none'}`);
+  }
+  if (Array.isArray(evidence.completedProfiles)) {
+    lines.push(`- Completed client profiles: ${evidence.completedProfiles.join(', ') || 'none'}`);
   }
   lines.push('');
   if (Array.isArray(evidence.failedReasons) && evidence.failedReasons.length > 0) {

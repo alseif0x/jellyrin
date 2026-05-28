@@ -244,7 +244,9 @@ function buildNextActions(gates) {
   }
   const open = gates.filter((gate) => gate.evolutive !== 'E0' && !gate.closed);
   if (open.length > 0) {
-    actions.push(`Start next roadmap gate: ${open[0].evolutive} ${open[0].id} via ${open[0].command}.`);
+    const gate = open[0];
+    const verb = gate.status === 'not-started' || Number(gate.percent || 0) === 0 ? 'Start' : 'Continue';
+    actions.push(`${verb} next roadmap gate: ${gate.evolutive} ${gate.id} via ${gate.command}.`);
   }
   actions.push('Do not inherit 0023 unsupported-decided evidence as closure for ecosystem gates.');
   actions.push('Keep plans/generated artifacts outside git; commit only harness/generator changes.');
