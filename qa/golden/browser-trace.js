@@ -48,6 +48,10 @@ const sessionsFlowPassword = 'JellyrinSessionsFlowPassword!2026';
 const pluginsFlowRepositoryName = 'Jellyrin Golden Plugin Repository';
 const pluginsFlowPackageName = 'Jellyrin Golden Plugin';
 const pluginsFlowPackageGuid = '22222222-2222-2222-2222-222222222222';
+const liveTvFlowChannelId = 'jellyrin-live-tv-channel';
+const liveTvFlowProgramId = 'jellyrin-live-tv-program';
+const liveTvFlowRecordingId = 'jellyrin-live-tv-recording';
+const liveTvFlowTimerId = 'jellyrin-live-tv-timer';
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -72,7 +76,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages', 'live-tv'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -283,6 +287,20 @@ async function captureTarget(browser, flowDir, target) {
       pluginEnableRejected: false,
       pluginDisableRejected: false,
       pluginUninstallRejected: false,
+      liveTvConfigUpdated: false,
+      liveTvInfo200: false,
+      liveTvTunerTypes200: false,
+      liveTvChannels200: false,
+      liveTvChannelMatched: false,
+      liveTvGuidePrograms200: false,
+      liveTvProgramMatched: false,
+      liveTvStream200: false,
+      liveTvRecordings200: false,
+      liveTvRecordingStream200: false,
+      liveTvTimerCreated: false,
+      liveTvTimerDeleted: false,
+      liveTvSeriesTimerCreated: false,
+      liveTvSeriesTimerDeleted: false,
       startupPublicInfoIncomplete: false,
       startupConfig200: false,
       startupConfig204: false,
@@ -375,6 +393,8 @@ async function captureTarget(browser, flowDir, target) {
       await runSessionsWebsocketFlow(page, summary, publicInfo, target);
     } else if (flow === 'plugins-packages') {
       await runPluginsPackagesFlow(page, summary, publicInfo, target);
+    } else if (flow === 'live-tv') {
+      await runLiveTvFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -2356,6 +2376,196 @@ async function runPluginsPackagesFlow(page, summary, publicInfo, target) {
   await page.waitForLoadState('networkidle').catch(() => {});
 }
 
+async function runLiveTvFlow(page, summary, publicInfo, target) {
+  await ensureLiveTvFixtures();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/livetv');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const liveStreamPath = path.join(mediaFixtureDir, 'jellyrin-live-tv-channel.ts');
+  const recordingPath = path.join(mediaFixtureDir, 'jellyrin-live-tv-recording.ts');
+  const configPayload = {
+    GuideDays: 1,
+    RecordingPath: mediaFixtureDir,
+    TunerHosts: [{
+      Id: 'jellyrin-live-tv-tuner',
+      Type: 'm3u',
+      Url: path.join(mediaFixtureDir, 'jellyrin-live-tv.m3u'),
+      FriendlyName: 'Jellyrin Golden Live TV',
+    }],
+    ListingProviders: [{
+      Id: 'jellyrin-live-tv-guide',
+      Type: 'xmltv',
+      Path: path.join(mediaFixtureDir, 'jellyrin-live-tv.xml'),
+    }],
+    Recordings: [{
+      Id: liveTvFlowRecordingId,
+      Name: 'Jellyrin Live TV Recording',
+      SeriesName: 'Jellyrin Live TV',
+      FolderName: 'Live TV',
+      GroupName: 'Jellyrin Live TV',
+      ChannelId: liveTvFlowChannelId,
+      StartDate: '2026-05-26T08:00:00Z',
+      EndDate: '2026-05-26T09:00:00Z',
+      Path: recordingPath,
+    }],
+    PrePaddingSeconds: 60,
+    PostPaddingSeconds: 120,
+  };
+
+  const configUpdate = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/System/Configuration/livetv',
+    token: auth.AccessToken,
+    body: configPayload,
+  });
+  if (![200, 204].includes(configUpdate.status)) {
+    throw new Error(`Live TV config update returned HTTP ${configUpdate.status}`);
+  }
+  summary.invariants.liveTvConfigUpdated = true;
+
+  const info = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/LiveTv/Info',
+    token: auth.AccessToken,
+  });
+  if (info.status !== 200 || info.json === null) {
+    throw new Error(`LiveTv/Info returned HTTP ${info.status}`);
+  }
+  summary.invariants.liveTvInfo200 = true;
+
+  const tunerTypes = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/LiveTv/TunerHosts/Types',
+    token: auth.AccessToken,
+  });
+  if (tunerTypes.status !== 200 || !tunerTypes.json?.some((item) => item.Id === 'm3u')) {
+    throw new Error(`LiveTv/TunerHosts/Types returned HTTP ${tunerTypes.status}`);
+  }
+  summary.invariants.liveTvTunerTypes200 = true;
+
+  const channels = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (channels.status !== 200 || !Array.isArray(channels.json?.Items)) {
+    throw new Error(`LiveTv/Channels returned HTTP ${channels.status}`);
+  }
+  summary.invariants.liveTvChannels200 = true;
+  const channel = channels.json.Items.find((item) => item.Id === liveTvFlowChannelId);
+  if (!channel || channel.Name !== 'Jellyrin Live TV') {
+    throw new Error('Live TV channel fixture was not imported from M3U');
+  }
+  summary.invariants.liveTvChannelMatched = true;
+
+  const programs = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/LiveTv/Programs?UserId=${encodeURIComponent(auth.User.Id)}&ChannelIds=${encodeURIComponent(liveTvFlowChannelId)}`,
+    token: auth.AccessToken,
+  });
+  if (programs.status !== 200 || !Array.isArray(programs.json?.Items)) {
+    throw new Error(`LiveTv/Programs returned HTTP ${programs.status}`);
+  }
+  summary.invariants.liveTvGuidePrograms200 = true;
+  if (!programs.json.Items.some((item) => item.Name === 'Jellyrin Morning News' && item.ChannelId === liveTvFlowChannelId)) {
+    throw new Error('Live TV XMLTV program fixture was not imported');
+  }
+  summary.invariants.liveTvProgramMatched = true;
+
+  const stream = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/LiveTv/LiveStreamFiles/${encodeURIComponent(liveTvFlowChannelId)}/stream.ts`,
+    token: auth.AccessToken,
+  });
+  if (stream.status !== 200 || !stream.contentType.includes('video/mp2t') || stream.byteLength <= 0) {
+    throw new Error(`LiveTv channel stream returned HTTP ${stream.status}`);
+  }
+  summary.invariants.liveTvStream200 = true;
+
+  const recordings = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/LiveTv/Recordings',
+    token: auth.AccessToken,
+  });
+  if (recordings.status !== 200 || !recordings.json?.Items?.some((item) => item.Id === liveTvFlowRecordingId)) {
+    throw new Error(`LiveTv/Recordings returned HTTP ${recordings.status}`);
+  }
+  summary.invariants.liveTvRecordings200 = true;
+
+  const recordingStream = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/LiveTv/LiveRecordings/${encodeURIComponent(liveTvFlowRecordingId)}/stream`,
+    token: auth.AccessToken,
+  });
+  if (recordingStream.status !== 200 || !recordingStream.contentType.includes('video/mp2t') || recordingStream.byteLength <= 0) {
+    throw new Error(`LiveTv recording stream returned HTTP ${recordingStream.status}`);
+  }
+  summary.invariants.liveTvRecordingStream200 = true;
+
+  const timer = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/LiveTv/Timers',
+    token: auth.AccessToken,
+    body: {
+      Id: liveTvFlowTimerId,
+      ProgramId: liveTvFlowProgramId,
+      ChannelId: liveTvFlowChannelId,
+      Name: 'Jellyrin Live TV Timer',
+    },
+  });
+  if (timer.status !== 200 || timer.json?.Id !== liveTvFlowTimerId) {
+    throw new Error(`LiveTv/Timers create returned HTTP ${timer.status}`);
+  }
+  summary.invariants.liveTvTimerCreated = true;
+
+  const deleteTimer = await browserFetchJson(page, {
+    method: 'DELETE',
+    url: `/LiveTv/Timers/${encodeURIComponent(liveTvFlowTimerId)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(deleteTimer.status)) {
+    throw new Error(`LiveTv/Timers delete returned HTTP ${deleteTimer.status}`);
+  }
+  summary.invariants.liveTvTimerDeleted = true;
+
+  const seriesTimer = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/LiveTv/SeriesTimers',
+    token: auth.AccessToken,
+    body: {
+      Id: `${liveTvFlowTimerId}-series`,
+      ProgramId: liveTvFlowProgramId,
+      ChannelId: liveTvFlowChannelId,
+      Name: 'Jellyrin Live TV Series Timer',
+      RecordAnyTime: true,
+    },
+  });
+  if (seriesTimer.status !== 200 || seriesTimer.json?.IsSeries !== true) {
+    throw new Error(`LiveTv/SeriesTimers create returned HTTP ${seriesTimer.status}`);
+  }
+  summary.invariants.liveTvSeriesTimerCreated = true;
+
+  const deleteSeriesTimer = await browserFetchJson(page, {
+    method: 'DELETE',
+    url: `/LiveTv/SeriesTimers/${encodeURIComponent(`${liveTvFlowTimerId}-series`)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(deleteSeriesTimer.status)) {
+    throw new Error(`LiveTv/SeriesTimers delete returned HTTP ${deleteSeriesTimer.status}`);
+  }
+  summary.invariants.liveTvSeriesTimerDeleted = true;
+
+  await page.goto(`${summary.baseUrl}/web/#/livetv`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: liveTvFlowChannelId,
+    name: 'Jellyrin Live TV',
+    type: 'LiveTv',
+    streamPath: '<fixture>',
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -2922,6 +3132,31 @@ async function ensureMetadataSearchFixtures() {
   <tag>Jellyrin NFO Tag</tag>
   <uniqueid type="imdb">tt0950099</uniqueid>
 </movie>
+`,
+  );
+}
+
+async function ensureLiveTvFixtures() {
+  await fs.mkdir(mediaFixtureDir, { recursive: true });
+  const channelPath = path.join(mediaFixtureDir, 'jellyrin-live-tv-channel.ts');
+  const recordingPath = path.join(mediaFixtureDir, 'jellyrin-live-tv-recording.ts');
+  await fs.writeFile(channelPath, 'jellyrin live tv channel bytes');
+  await fs.writeFile(recordingPath, 'jellyrin live tv recording bytes');
+  await fs.writeFile(
+    path.join(mediaFixtureDir, 'jellyrin-live-tv.m3u'),
+    `#EXTM3U
+#EXTINF:-1 tvg-id="${liveTvFlowChannelId}" tvg-name="Jellyrin Live TV" tvg-chno="101",Jellyrin Live TV
+${channelPath}
+`,
+  );
+  await fs.writeFile(
+    path.join(mediaFixtureDir, 'jellyrin-live-tv.xml'),
+    `<tv>
+  <programme channel="${liveTvFlowChannelId}" start="20260526080000 +0000" stop="20260526090000 +0000">
+    <title>Jellyrin Morning News</title>
+    <desc>Golden XMLTV program fixture</desc>
+  </programme>
+</tv>
 `,
   );
 }
@@ -3524,7 +3759,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages', 'live-tv'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -3673,6 +3908,44 @@ function captureFlowInvariants(summary, record, requestPostData) {
     }
     if (record.method === 'DELETE' && /\/Plugins\/[^/]+\/[^/]+$/i.test(pathname) && record.status === 409) {
       summary.invariants.pluginUninstallRejected = true;
+    }
+  }
+  if (flow === 'live-tv') {
+    if (record.method === 'POST' && pathname === '/System/Configuration/livetv' && [200, 204].includes(record.status)) {
+      summary.invariants.liveTvConfigUpdated = true;
+    }
+    if (record.method === 'GET' && pathname === '/LiveTv/Info' && record.status === 200) {
+      summary.invariants.liveTvInfo200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/LiveTv/TunerHosts/Types' && record.status === 200) {
+      summary.invariants.liveTvTunerTypes200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/LiveTv/Channels' && record.status === 200) {
+      summary.invariants.liveTvChannels200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/LiveTv/Programs' && record.status === 200) {
+      summary.invariants.liveTvGuidePrograms200 = true;
+    }
+    if (record.method === 'GET' && /\/LiveTv\/LiveStreamFiles\/[^/]+\/stream\.ts$/i.test(pathname) && record.status === 200) {
+      summary.invariants.liveTvStream200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/LiveTv/Recordings' && record.status === 200) {
+      summary.invariants.liveTvRecordings200 = true;
+    }
+    if (record.method === 'GET' && /\/LiveTv\/LiveRecordings\/[^/]+\/stream$/i.test(pathname) && record.status === 200) {
+      summary.invariants.liveTvRecordingStream200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/LiveTv/Timers' && record.status === 200) {
+      summary.invariants.liveTvTimerCreated = true;
+    }
+    if (record.method === 'DELETE' && /\/LiveTv\/Timers\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.liveTvTimerDeleted = true;
+    }
+    if (record.method === 'POST' && pathname === '/LiveTv/SeriesTimers' && record.status === 200) {
+      summary.invariants.liveTvSeriesTimerCreated = true;
+    }
+    if (record.method === 'DELETE' && /\/LiveTv\/SeriesTimers\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.liveTvSeriesTimerDeleted = true;
     }
   }
   if (flow === 'libraries' && record.status === 200) {
@@ -3970,6 +4243,24 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'plugins-packages' && record.method === 'GET' && /\/Plugins\/[^/]+\/Manifest$/i.test(pathname)) {
     return 'plugin-manifest';
+  }
+  if (flow === 'live-tv' && record.method === 'GET' && pathname === '/LiveTv/Info') {
+    return 'live-tv-info';
+  }
+  if (flow === 'live-tv' && record.method === 'GET' && pathname === '/LiveTv/Channels') {
+    return 'live-tv-channels';
+  }
+  if (flow === 'live-tv' && record.method === 'GET' && pathname === '/LiveTv/Programs') {
+    return 'live-tv-programs';
+  }
+  if (flow === 'live-tv' && record.method === 'GET' && /\/LiveTv\/LiveStreamFiles\/[^/]+\/stream\.ts$/i.test(pathname)) {
+    return 'live-tv-stream';
+  }
+  if (flow === 'live-tv' && record.method === 'GET' && pathname === '/LiveTv/Recordings') {
+    return 'live-tv-recordings';
+  }
+  if (flow === 'live-tv' && record.method === 'POST' && pathname === '/LiveTv/Timers') {
+    return 'live-tv-timer-create';
   }
   if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Users/Public') {
     return 'auth-users-public';
@@ -4358,6 +4649,8 @@ function compareCompletedTargets(summaries) {
                             ? ['sessions-list', 'sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop']
                             : flow === 'plugins-packages'
                               ? ['plugins-list', 'plugin-repositories', 'plugin-packages']
+                              : flow === 'live-tv'
+                                ? ['live-tv-info', 'live-tv-channels', 'live-tv-programs', 'live-tv-stream', 'live-tv-recordings', 'live-tv-timer-create']
                               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -4997,6 +5290,29 @@ function invariantFailures(summary) {
         if (!summary.invariants[field]) {
           failures.push(`missing ${label} invariant`);
         }
+      }
+    }
+    return failures;
+  }
+  if (flow === 'live-tv') {
+    for (const [field, label] of [
+      ['liveTvConfigUpdated', 'live tv config update'],
+      ['liveTvInfo200', 'live tv info'],
+      ['liveTvTunerTypes200', 'live tv tuner types'],
+      ['liveTvChannels200', 'live tv channels'],
+      ['liveTvChannelMatched', 'live tv channel fixture'],
+      ['liveTvGuidePrograms200', 'live tv guide programs'],
+      ['liveTvProgramMatched', 'live tv program fixture'],
+      ['liveTvStream200', 'live tv channel stream'],
+      ['liveTvRecordings200', 'live tv recordings'],
+      ['liveTvRecordingStream200', 'live tv recording stream'],
+      ['liveTvTimerCreated', 'live tv timer create'],
+      ['liveTvTimerDeleted', 'live tv timer delete'],
+      ['liveTvSeriesTimerCreated', 'live tv series timer create'],
+      ['liveTvSeriesTimerDeleted', 'live tv series timer delete'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
       }
     }
     return failures;

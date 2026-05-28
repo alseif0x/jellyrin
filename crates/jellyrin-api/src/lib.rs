@@ -8167,6 +8167,220 @@ fn live_tv_provider_name(provider: &serde_json::Value) -> String {
     String::new()
 }
 
+async fn live_tv_m3u_channels_from_payload(
+    payload: &serde_json::Value,
+) -> Option<Vec<serde_json::Value>> {
+    let path = live_tv_local_config_path(payload)?;
+    let contents = tokio::fs::read_to_string(path).await.ok()?;
+    let channels = parse_live_tv_m3u_channels(&contents);
+    (!channels.is_empty()).then_some(channels)
+}
+
+fn parse_live_tv_m3u_channels(contents: &str) -> Vec<serde_json::Value> {
+    let mut channels = Vec::new();
+    let mut pending: Option<serde_json::Value> = None;
+    for line in contents.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with("#EXTINF") {
+            let name = line
+                .rsplit_once(',')
+                .map(|(_, name)| name.trim())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Channel");
+            let id = live_tv_m3u_attribute(line, "tvg-id")
+                .or_else(|| live_tv_m3u_attribute(line, "channel-id"))
+                .unwrap_or_else(|| live_tv_stable_id("channel", name));
+            let display_name = live_tv_m3u_attribute(line, "tvg-name")
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| name.to_string());
+            let number = live_tv_m3u_attribute(line, "tvg-chno")
+                .or_else(|| live_tv_m3u_attribute(line, "channel-number"));
+            pending = Some(serde_json::json!({
+                "Id": id,
+                "Name": display_name,
+                "Number": number,
+                "ChannelType": "TV"
+            }));
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(mut channel) = pending.take() {
+            channel["Path"] = serde_json::json!(line);
+            channels.push(channel);
+        }
+    }
+    channels
+}
+
+fn live_tv_m3u_attribute(line: &str, name: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let attr = format!("{}=", name.to_ascii_lowercase());
+    let start = lower.find(&attr)? + attr.len();
+    let quote = line[start..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value_start = start + quote.len_utf8();
+    let value_end = line[value_start..].find(quote)? + value_start;
+    Some(line[value_start..value_end].trim().to_string())
+}
+
+async fn live_tv_xmltv_programs_from_payload(
+    payload: &serde_json::Value,
+) -> Option<Vec<serde_json::Value>> {
+    let path = live_tv_local_config_path(payload)?;
+    let contents = tokio::fs::read_to_string(path).await.ok()?;
+    let programs = parse_live_tv_xmltv_programs(&contents);
+    (!programs.is_empty()).then_some(programs)
+}
+
+fn parse_live_tv_xmltv_programs(contents: &str) -> Vec<serde_json::Value> {
+    live_tv_xml_elements(contents, "programme")
+        .into_iter()
+        .enumerate()
+        .map(|(index, element)| {
+            let channel_id = live_tv_xml_attribute(&element, "channel").unwrap_or_default();
+            let start = live_tv_xml_attribute(&element, "start")
+                .map(|value| live_tv_xmltv_datetime(&value))
+                .unwrap_or(serde_json::Value::Null);
+            let end = live_tv_xml_attribute(&element, "stop")
+                .map(|value| live_tv_xmltv_datetime(&value))
+                .unwrap_or(serde_json::Value::Null);
+            let name = live_tv_xml_first_text(&element, "title")
+                .unwrap_or_else(|| format!("Program {}", index + 1));
+            let overview = live_tv_xml_first_text(&element, "desc").unwrap_or_default();
+            serde_json::json!({
+                "Id": live_tv_stable_id("program", &format!("{channel_id}-{index}-{name}")),
+                "Name": name,
+                "ChannelId": channel_id,
+                "StartDate": start,
+                "EndDate": end,
+                "Overview": overview
+            })
+        })
+        .collect()
+}
+
+fn live_tv_local_config_path(payload: &serde_json::Value) -> Option<PathBuf> {
+    json_string_field(payload, "Path")
+        .or_else(|| json_string_field(payload, "Url"))
+        .map(PathBuf::from)
+        .filter(|path| {
+            !path.as_os_str().is_empty()
+                && path.is_absolute()
+                && path.extension().is_some()
+        })
+}
+
+fn live_tv_xmltv_datetime(value: &str) -> serde_json::Value {
+    let compact = value.split_whitespace().next().unwrap_or(value);
+    if compact.len() >= 14 && compact[..14].chars().all(|ch| ch.is_ascii_digit()) {
+        return serde_json::json!(format!(
+            "{}-{}-{}T{}:{}:{}Z",
+            &compact[0..4],
+            &compact[4..6],
+            &compact[6..8],
+            &compact[8..10],
+            &compact[10..12],
+            &compact[12..14]
+        ));
+    }
+    serde_json::json!(value)
+}
+
+fn live_tv_xml_first_text(contents: &str, tag: &str) -> Option<String> {
+    live_tv_xml_elements(contents, tag)
+        .into_iter()
+        .map(|element| live_tv_xml_decode(&live_tv_strip_xml_tags(&element)))
+        .find(|value| !value.is_empty())
+}
+
+fn live_tv_xml_elements(contents: &str, tag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let lower = contents.to_ascii_lowercase();
+    let mut offset = 0usize;
+    while let Some(start) = lower[offset..].find(&open) {
+        let start = offset + start;
+        let after_tag = start + open.len();
+        if !lower[after_tag..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '>' || ch.is_ascii_whitespace())
+        {
+            offset = after_tag;
+            continue;
+        }
+        let Some(open_end) = lower[start..].find('>').map(|index| start + index + 1) else {
+            break;
+        };
+        let Some(end) = lower[open_end..]
+            .find(&close)
+            .map(|index| open_end + index + close.len())
+        else {
+            break;
+        };
+        values.push(contents[start..end].to_string());
+        offset = end;
+    }
+    values
+}
+
+fn live_tv_xml_attribute(element: &str, name: &str) -> Option<String> {
+    let lower = element.to_ascii_lowercase();
+    let attr = format!("{}=", name.to_ascii_lowercase());
+    let start = lower.find(&attr)? + attr.len();
+    let quote = element[start..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value_start = start + quote.len_utf8();
+    let value_end = element[value_start..].find(quote)? + value_start;
+    Some(live_tv_xml_decode(&element[value_start..value_end]))
+}
+
+fn live_tv_strip_xml_tags(value: &str) -> String {
+    let mut output = String::new();
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn live_tv_xml_decode(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .trim()
+        .to_string()
+}
+
+fn live_tv_stable_id(prefix: &str, value: &str) -> String {
+    let normalized = value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if normalized.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}-{normalized}")
+    }
+}
+
 async fn live_tv_tuner_host_types(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8198,6 +8412,14 @@ async fn add_live_tv_tuner_host(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     payload["Id"] = serde_json::json!(tuner_id);
+    if payload
+        .get("Channels")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|channels| channels.is_empty())
+        && let Some(channels) = live_tv_m3u_channels_from_payload(&payload).await
+    {
+        payload["Channels"] = serde_json::json!(channels);
+    }
 
     let mut config = state
         .db
@@ -8303,6 +8525,14 @@ async fn add_live_tv_listing_provider(
         for (key, value) in fields {
             provider[key] = value;
         }
+    }
+    if provider
+        .get("Programs")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(|programs| programs.is_empty())
+        && let Some(programs) = live_tv_xmltv_programs_from_payload(&provider).await
+    {
+        provider["Programs"] = serde_json::json!(programs);
     }
     let provider_id = provider
         .get("Id")
@@ -23451,8 +23681,9 @@ mod tests {
         encoding_configuration_json, hls_transcode_dedupe_key, json_value_i64,
         last_system_lifecycle_command, load_countries, load_cultures, media_item_by_id,
         media_item_streams, package_install_task_key, parse_authorization_token,
-        parse_jellyfin_uuid, parse_media_browser_pairs, reconcile_transcode_sessions_on_startup,
-        router, spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        parse_jellyfin_uuid, parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs,
+        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
         subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
@@ -29193,6 +29424,179 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let config: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["PluginRepositories"], repositories);
+    }
+
+    #[test]
+    fn live_tv_parses_m3u_and_xmltv_local_sources() {
+        let channels = parse_live_tv_m3u_channels(
+            r#"
+            #EXTM3U
+            #EXTINF:-1 tvg-id="channel-1" tvg-name="News HD" tvg-chno="1",News HD
+            /srv/live/news.ts
+            #EXTINF:-1 tvg-id="channel-2",Movies
+            /srv/live/movies.ts
+            "#,
+        );
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0]["Id"], "channel-1");
+        assert_eq!(channels[0]["Name"], "News HD");
+        assert_eq!(channels[0]["Number"], "1");
+        assert_eq!(channels[0]["Path"], "/srv/live/news.ts");
+        assert_eq!(channels[1]["Id"], "channel-2");
+        assert_eq!(channels[1]["Name"], "Movies");
+
+        let programs = parse_live_tv_xmltv_programs(
+            r#"
+            <tv>
+              <programme channel="channel-1" start="20260526080000 +0000" stop="20260526090000 +0000">
+                <title>Morning &amp; News</title>
+                <desc>Local guide news</desc>
+              </programme>
+            </tv>
+            "#,
+        );
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0]["Name"], "Morning & News");
+        assert_eq!(programs[0]["ChannelId"], "channel-1");
+        assert_eq!(programs[0]["StartDate"], "2026-05-26T08:00:00Z");
+        assert_eq!(programs[0]["EndDate"], "2026-05-26T09:00:00Z");
+        assert_eq!(programs[0]["Overview"], "Local guide news");
+    }
+
+    #[tokio::test]
+    async fn live_tv_ingests_local_m3u_and_xmltv_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stream = tmp.path().join("news.ts");
+        tokio::fs::write(&stream, b"live bytes").await.unwrap();
+        let m3u = tmp.path().join("channels.m3u");
+        tokio::fs::write(
+            &m3u,
+            format!(
+                "#EXTM3U\n#EXTINF:-1 tvg-id=\"channel-1\" tvg-name=\"News HD\" tvg-chno=\"1\",News HD\n{}\n",
+                stream.to_string_lossy()
+            ),
+        )
+        .await
+        .unwrap();
+        let xmltv = tmp.path().join("guide.xml");
+        tokio::fs::write(
+            &xmltv,
+            r#"<tv><programme channel="channel-1" start="20260526080000 +0000" stop="20260526090000 +0000"><title>Morning News</title><desc>Local guide news</desc></programme></tv>"#,
+        )
+        .await
+        .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/TunerHosts")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "m3u-tuner",
+                            "Type": "m3u",
+                            "Url": m3u.to_string_lossy(),
+                            "FriendlyName": "Local M3U"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/ListingProviders")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "xmltv-provider",
+                            "Type": "xmltv",
+                            "Path": xmltv.to_string_lossy()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Channels")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels["TotalRecordCount"], 1);
+        assert_eq!(channels["Items"][0]["Id"], "channel-1");
+        assert_eq!(channels["Items"][0]["Name"], "News HD");
+        assert_eq!(channels["Items"][0]["MediaSources"][0]["SupportsDirectPlay"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Programs?ChannelIds=channel-1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let programs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(programs["TotalRecordCount"], 1);
+        assert_eq!(programs["Items"][0]["Name"], "Morning News");
+        assert_eq!(programs["Items"][0]["ChannelName"], "News HD");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveStreamFiles/channel-1/stream.ts")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"live bytes");
     }
 
     #[tokio::test]

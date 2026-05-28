@@ -259,6 +259,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const authUsers = browserTraces.find((trace) => trace.flow === 'auth-users');
   const sessionsWebsocket = browserTraces.find((trace) => trace.flow === 'sessions-websocket');
   const pluginsPackages = browserTraces.find((trace) => trace.flow === 'plugins-packages');
+  const liveTv = browserTraces.find((trace) => trace.flow === 'live-tv');
   return [
     {
       id: 'routes',
@@ -390,6 +391,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
         : 'missing trace',
     },
     {
+      id: 'browser-live-tv',
+      status: liveTv?.status || 'pending',
+      evidence: liveTv
+        ? `${liveTv.completedTargets.join(',') || 'none'} completed, failed=${liveTv.failed}`
+        : 'missing trace',
+    },
+    {
       id: 'dto-field-parity',
       status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
       evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
@@ -424,7 +432,7 @@ function nextActions(gates, dtoSummary, browserTraces) {
   if (dtoSummary.missingGoldenEvidence > 0 || dtoSummary.partialGolden > 0) {
     actions.push('Close remaining G4 DTO field parity gaps with targeted traces for transcode, activity log and image info.');
   }
-  const missingFlows = ['startup-wizard', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages']
+  const missingFlows = ['startup-wizard', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages', 'live-tv']
     .filter((flow) => !browserTraces.some((trace) => trace.flow === flow));
   if (missingFlows.length > 0) {
     actions.push(`Add browser traces for: ${missingFlows.join(', ')}.`);
