@@ -67,7 +67,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -265,6 +265,18 @@ async function captureTarget(browser, flowDir, target) {
       authKeyRevoked: false,
       authCreatedUserLogout204: false,
       authUserDeleted: false,
+      startupPublicInfoIncomplete: false,
+      startupConfig200: false,
+      startupConfig204: false,
+      startupRemoteAccess204: false,
+      startupUser200: false,
+      startupUser204: false,
+      startupPublicUsersBeforeComplete: false,
+      startupComplete204: false,
+      startupPublicInfoComplete: false,
+      startupLogin200: false,
+      startupSystemInfo200: false,
+      startupPublicUsersAfterComplete: false,
       sessionsTwoClientsOpened: false,
       sessionsStartSent: false,
       sessionsMessageReceived: false,
@@ -286,7 +298,7 @@ async function captureTarget(browser, flowDir, target) {
   const consoleLog = await jsonlWriter(path.join(flowDir, `${target.name}.console.jsonl`));
   const websocketLog = await jsonlWriter(path.join(flowDir, `${target.name}.websocket.jsonl`));
 
-  if ((!target.username || !target.password) && !target.apiKey) {
+  if (flow !== 'startup-wizard' && (!target.username || !target.password) && !target.apiKey) {
     summary.status = 'skipped';
     summary.skipped = true;
     summary.reason = 'missing username/password or API key environment variables';
@@ -309,11 +321,13 @@ async function captureTarget(browser, flowDir, target) {
       throw new Error(`System public info returned HTTP ${publicInfoResponse.status()}`);
     }
     const publicInfo = await publicInfoResponse.json();
-    if (!publicInfo.StartupWizardCompleted) {
+    if (flow !== 'startup-wizard' && !publicInfo.StartupWizardCompleted) {
       throw new Error('Startup wizard is not completed for target');
     }
 
-    if (flow === 'login-home') {
+    if (flow === 'startup-wizard') {
+      await runStartupWizardFlow(page, summary, publicInfo, target);
+    } else if (flow === 'login-home') {
       await runLoginHomeFlow(page, summary, publicInfo, target);
     } else if (flow === 'p0-direct-play') {
       await runDirectPlayFlow(page, summary, publicInfo, target);
@@ -368,6 +382,148 @@ async function runLoginHomeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   await establishWebSession(page, summary, publicInfo, target, auth, '/home');
   await page.waitForLoadState('networkidle');
+}
+
+async function runStartupWizardFlow(page, summary, publicInfo, target) {
+  await page.goto(`${summary.baseUrl}/web/#/wizard/start`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  if (publicInfo.StartupWizardCompleted !== false) {
+    throw new Error('startup wizard target was not in incomplete state');
+  }
+  summary.invariants.startupPublicInfoIncomplete = true;
+
+  const config = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Startup/Configuration',
+  });
+  if (config.status !== 200 || !config.json || !('ServerName' in config.json)) {
+    throw new Error(`Startup/Configuration returned HTTP ${config.status}`);
+  }
+  summary.invariants.startupConfig200 = true;
+
+  const startupConfig = {
+    ...config.json,
+    ServerName: `Jellyrin Startup ${target.name}`,
+    UICulture: 'en-US',
+    MetadataCountryCode: 'US',
+    PreferredMetadataLanguage: 'en',
+  };
+  const configUpdate = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Startup/Configuration',
+    body: startupConfig,
+  });
+  if (![200, 204].includes(configUpdate.status)) {
+    throw new Error(`Startup/Configuration POST returned HTTP ${configUpdate.status}`);
+  }
+  summary.invariants.startupConfig204 = true;
+
+  const userBefore = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Startup/User',
+  });
+  if (userBefore.status !== 200 || !userBefore.json || !('Name' in userBefore.json)) {
+    throw new Error(`Startup/User returned HTTP ${userBefore.status}`);
+  }
+  summary.invariants.startupUser200 = true;
+
+  const adminName = `startup-${target.name}`;
+  const adminPassword = `StartupWizard-${target.name}-Password!2026`;
+  const userUpdate = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Startup/User',
+    body: {
+      Name: adminName,
+      Password: adminPassword,
+    },
+  });
+  if (![200, 204].includes(userUpdate.status)) {
+    throw new Error(`Startup/User POST returned HTTP ${userUpdate.status}`);
+  }
+  summary.invariants.startupUser204 = true;
+
+  const remoteAccess = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Startup/RemoteAccess',
+    body: {
+      EnableRemoteAccess: true,
+    },
+  });
+  if (![200, 204].includes(remoteAccess.status)) {
+    throw new Error(`Startup/RemoteAccess returned HTTP ${remoteAccess.status}`);
+  }
+  summary.invariants.startupRemoteAccess204 = true;
+
+  const publicUsersBefore = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Users/Public?phase=before',
+  });
+  if (publicUsersBefore.status !== 200 || !Array.isArray(publicUsersBefore.json) || publicUsersBefore.json.length !== 0) {
+    throw new Error('Users/Public did not match upstream hidden-first-user semantics before wizard completion');
+  }
+  summary.invariants.startupPublicUsersBeforeComplete = true;
+
+  const complete = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Startup/Complete',
+  });
+  if (![200, 204].includes(complete.status)) {
+    throw new Error(`Startup/Complete returned HTTP ${complete.status}`);
+  }
+  summary.invariants.startupComplete204 = true;
+
+  const publicInfoComplete = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/System/Info/Public',
+  });
+  if (publicInfoComplete.status !== 200 || publicInfoComplete.json?.StartupWizardCompleted !== true) {
+    throw new Error('System/Info/Public did not report completed startup wizard');
+  }
+  summary.invariants.startupPublicInfoComplete = true;
+
+  const login = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Users/AuthenticateByName',
+    authorization: `MediaBrowser Client="Jellyrin Browser Trace", Device="Startup ${target.name}", DeviceId="startup-${target.name}", Version="dev"`,
+    body: {
+      Username: adminName,
+      Pw: adminPassword,
+    },
+  });
+  if (login.status !== 200 || !login.json?.AccessToken || login.json?.User?.Name !== adminName) {
+    throw new Error(`startup login returned HTTP ${login.status}`);
+  }
+  summary.invariants.startupLogin200 = true;
+
+  const systemInfo = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/System/Info',
+    token: login.json.AccessToken,
+  });
+  if (systemInfo.status !== 200 || systemInfo.json?.StartupWizardCompleted !== true) {
+    throw new Error(`System/Info returned HTTP ${systemInfo.status}`);
+  }
+  summary.invariants.startupSystemInfo200 = true;
+
+  const publicUsersAfter = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Users/Public?phase=after',
+  });
+  if (publicUsersAfter.status !== 200 || !Array.isArray(publicUsersAfter.json) || publicUsersAfter.json.length !== 0) {
+    throw new Error('Users/Public did not hide users after wizard completion');
+  }
+  summary.invariants.startupPublicUsersAfterComplete = true;
+
+  await establishWebSession(page, summary, publicInfoComplete.json, {
+    ...target,
+    username: adminName,
+    password: adminPassword,
+  }, {
+    AccessToken: login.json.AccessToken,
+    User: login.json.User,
+    ServerId: login.json.ServerId,
+  }, '/home');
+  await page.waitForLoadState('networkidle').catch(() => {});
 }
 
 async function runSessionsWebsocketFlow(page, summary, publicInfo, target) {
@@ -3135,7 +3291,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -3172,6 +3328,39 @@ function captureFlowInvariants(summary, record, requestPostData) {
   }
   if (pathname === '/Sessions/Playing/Progress' && record.method === 'POST' && record.status === 204) {
     summary.invariants.playbackProgress204 = true;
+  }
+  if (flow === 'startup-wizard') {
+    if (record.method === 'GET' && pathname === '/System/Info/Public' && record.status === 200) {
+      if (record.responseShape?.StartupWizardCompleted) {
+        summary.invariants.startupPublicInfoComplete = true;
+      } else {
+        summary.invariants.startupPublicInfoIncomplete = true;
+      }
+    }
+    if (record.method === 'GET' && pathname === '/Startup/Configuration' && record.status === 200) {
+      summary.invariants.startupConfig200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Startup/Configuration' && [200, 204].includes(record.status)) {
+      summary.invariants.startupConfig204 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Startup/RemoteAccess' && [200, 204].includes(record.status)) {
+      summary.invariants.startupRemoteAccess204 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Startup/User' && record.status === 200) {
+      summary.invariants.startupUser200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Startup/User' && [200, 204].includes(record.status)) {
+      summary.invariants.startupUser204 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Startup/Complete' && [200, 204].includes(record.status)) {
+      summary.invariants.startupComplete204 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Users/AuthenticateByName' && record.status === 200) {
+      summary.invariants.startupLogin200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/Info' && record.status === 200) {
+      summary.invariants.startupSystemInfo200 = true;
+    }
   }
   if (pathname === '/UserItems/Resume' && record.method === 'GET' && record.status === 200) {
     summary.invariants.resumeList200 = true;
@@ -3553,6 +3742,37 @@ function criticalRequestKey(record, requestPostData) {
   if (flow === 'auth-users' && record.method === 'DELETE' && /\/Users\/[^/]+$/i.test(pathname)) {
     return 'auth-user-delete';
   }
+  if (flow === 'startup-wizard' && record.method === 'GET' && pathname === '/System/Info/Public') {
+    return 'startup-public-info';
+  }
+  if (flow === 'startup-wizard' && record.method === 'GET' && pathname === '/Startup/Configuration') {
+    return 'startup-config';
+  }
+  if (flow === 'startup-wizard' && record.method === 'POST' && pathname === '/Startup/Configuration') {
+    return 'startup-config-update';
+  }
+  if (flow === 'startup-wizard' && record.method === 'GET' && pathname === '/Startup/User') {
+    return 'startup-user';
+  }
+  if (flow === 'startup-wizard' && record.method === 'POST' && pathname === '/Startup/User') {
+    return 'startup-user-update';
+  }
+  if (flow === 'startup-wizard' && record.method === 'POST' && pathname === '/Startup/RemoteAccess') {
+    return 'startup-remote-access';
+  }
+  if (flow === 'startup-wizard' && record.method === 'GET' && pathname === '/Users/Public') {
+    const phase = new URL(record.url).searchParams.get('phase');
+    return phase === 'after' ? 'startup-public-users-after' : 'startup-public-users-before';
+  }
+  if (flow === 'startup-wizard' && record.method === 'POST' && pathname === '/Startup/Complete') {
+    return 'startup-complete';
+  }
+  if (flow === 'startup-wizard' && record.method === 'POST' && pathname === '/Users/AuthenticateByName') {
+    return 'startup-login';
+  }
+  if (flow === 'startup-wizard' && record.method === 'GET' && pathname === '/System/Info') {
+    return 'startup-system-info';
+  }
   if (flow === 'sessions-websocket' && record.method === 'GET' && pathname === '/Sessions') {
     return 'sessions-list';
   }
@@ -3808,7 +4028,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -3818,7 +4038,9 @@ function compareCompletedTargets(summaries) {
   }
 
   const reasons = [];
-  const keys = flow === 'resume'
+  const keys = flow === 'startup-wizard'
+    ? ['startup-public-info', 'startup-config', 'startup-config-update', 'startup-user', 'startup-user-update', 'startup-remote-access', 'startup-public-users-before', 'startup-complete', 'startup-login', 'startup-system-info', 'startup-public-users-after']
+    : flow === 'resume'
     ? ['resume-list', 'sessions-playing-progress']
     : flow === 'transcode-hls'
       ? ['playback-info', 'hls-master', 'hls-media', 'hls-segment']
@@ -3962,7 +4184,7 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     }
     return reasons;
   }
-  if (['sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop'].includes(key)) {
+  if (['startup-config-update', 'startup-user-update', 'startup-remote-access', 'startup-complete', 'sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop'].includes(key)) {
     if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
       reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
     }
@@ -4031,6 +4253,11 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'auth-user-detail',
     'auth-keys-list',
     'auth-key-system-info',
+    'startup-public-info',
+    'startup-config',
+    'startup-user',
+    'startup-login',
+    'startup-system-info',
     'sessions-list',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
@@ -4123,6 +4350,11 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'auth-user-detail': ['Id', 'Name', 'Policy', 'Configuration'],
     'auth-keys-list': ['Items', 'TotalRecordCount'],
     'auth-key-system-info': ['Id', 'ServerName', 'Version', 'StartupWizardCompleted'],
+    'startup-public-info': ['Id', 'ServerName', 'Version', 'StartupWizardCompleted'],
+    'startup-config': ['ServerName', 'UICulture', 'MetadataCountryCode', 'PreferredMetadataLanguage'],
+    'startup-user': ['Name'],
+    'startup-login': ['AccessToken', 'User', 'User.Id', 'User.Name'],
+    'startup-system-info': ['Id', 'ServerName', 'Version', 'StartupWizardCompleted'],
     'sessions-list': ['[].Id', '[].UserId', '[].Client', '[].DeviceId', '[].SupportsRemoteControl', '[].SupportedCommands'],
   }[key] || [];
   const reasons = [];
@@ -4202,10 +4434,31 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
+  if (flow === 'startup-wizard') {
+    for (const [field, label] of [
+      ['startupPublicInfoIncomplete', 'incomplete public info'],
+      ['startupConfig200', 'startup configuration read'],
+      ['startupConfig204', 'startup configuration update'],
+      ['startupRemoteAccess204', 'startup remote access update'],
+      ['startupUser200', 'startup user read'],
+      ['startupUser204', 'startup user update'],
+      ['startupPublicUsersBeforeComplete', 'public users before complete'],
+      ['startupComplete204', 'startup complete'],
+      ['startupPublicInfoComplete', 'completed public info'],
+      ['startupLogin200', 'first admin login'],
+      ['startupSystemInfo200', 'authenticated system info'],
+      ['startupPublicUsersAfterComplete', 'public users after complete'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing startup wizard ${label} invariant`);
+      }
+    }
+    return failures;
+  }
   if (flow === 'resume') {
     if (!summary.invariants.playbackProgress204) {
       failures.push('missing Sessions/Playing/Progress 204 invariant');

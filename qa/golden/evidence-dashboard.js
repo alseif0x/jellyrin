@@ -242,6 +242,7 @@ function summarizeFunctionalAreas(markdown) {
 }
 
 function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas) {
+  const startupWizard = browserTraces.find((trace) => trace.flow === 'startup-wizard');
   const p0Direct = browserTraces.find((trace) => trace.flow === 'p0-direct-play');
   const loginHome = browserTraces.find((trace) => trace.flow === 'login-home');
   const resume = browserTraces.find((trace) => trace.flow === 'resume');
@@ -267,6 +268,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
       id: 'api-golden-strict',
       status: apiGolden.status || 'missing',
       evidence: `${apiGolden.passed || 0}/${apiGolden.total || 0} passed, failed=${apiGolden.failed || 0}, strict=${apiGolden.strictEvaluated || 0}`,
+    },
+    {
+      id: 'browser-startup-wizard',
+      status: startupWizard?.status || 'pending',
+      evidence: startupWizard
+        ? `${startupWizard.completedTargets.join(',') || 'none'} completed, failed=${startupWizard.failed}`
+        : 'missing trace',
     },
     {
       id: 'browser-p0-direct-play',
@@ -408,7 +416,7 @@ function nextActions(gates, dtoSummary, browserTraces) {
   if (dtoSummary.missingGoldenEvidence > 0 || dtoSummary.partialGolden > 0) {
     actions.push('Close remaining G4 DTO field parity gaps with targeted traces for transcode, activity log and image info.');
   }
-  const missingFlows = ['resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket']
+  const missingFlows = ['startup-wizard', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket']
     .filter((flow) => !browserTraces.some((trace) => trace.flow === flow));
   if (missingFlows.length > 0) {
     actions.push(`Add browser traces for: ${missingFlows.join(', ')}.`);

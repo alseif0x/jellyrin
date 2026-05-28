@@ -5,6 +5,7 @@
     "test:e2e": "playwright test",
     "golden:api": "node qa/golden/api-parity.js",
     "golden:browser": "node qa/golden/browser-trace.js",
+    "golden:startup-wizard": "node qa/golden/startup-wizard-runner.js",
     "golden:dto": "node qa/golden/dto-parity.js",
     "evidence:dashboard": "node qa/golden/evidence-dashboard.js"
   },

@@ -2879,16 +2879,8 @@ async fn post_startup_complete(State(state): State<AppState>) -> Result<StatusCo
 }
 
 async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let server = state.db.server_state().await?;
-    if server.startup_wizard_completed {
-        return Ok(Json(Vec::new()));
-    }
-    let users = state.db.users().await?;
-    let mut dtos = Vec::with_capacity(users.len());
-    for user in &users {
-        dtos.push(user_to_dto(&state.db, user, server.server_id).await?);
-    }
-    Ok(Json(dtos))
+    let _ = state;
+    Ok(Json(Vec::new()))
 }
 
 async fn get_users(
@@ -42749,6 +42741,27 @@ mod tests {
             .await
             .unwrap();
         let _ = db.server_state().await.unwrap();
+        let app_before_startup_complete = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app_before_startup_complete
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/Public")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let users: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(users.as_array().unwrap().len(), 0);
+
         db.complete_startup_wizard().await.unwrap();
         let app = router(AppState {
             db,
