@@ -33,6 +33,8 @@ const imageFlowFixtureName = 'Jellyrin Image Flow Fixture';
 const imageFlowUploadPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFklEQVR42mP8z8Dwn4GBgYGJAQoAFAIBAvhDL0kAAAAASUVORK5CYII=';
 const metadataFlowPrimaryName = 'Jellyrin Metadata Flow Primary';
 const metadataFlowSimilarName = 'Jellyrin Metadata Flow Similar';
+const metadataFlowNfoFileName = 'Jellyrin Metadata Flow NFO';
+const metadataFlowNfoTitle = 'Jellyrin Metadata Flow NFO Title';
 const metadataFlowGenre = 'Jellyrin Metadata Drama';
 const metadataFlowStudio = 'Jellyrin Metadata Studio';
 const metadataFlowPerson = 'Jellyrin Metadata Person';
@@ -242,6 +244,8 @@ async function captureTarget(browser, flowDir, target) {
       metadataEditorProviderIds: false,
       metadataExternalIds200: false,
       metadataItemsSearch200: false,
+      metadataNfoLocalMatched: false,
+      metadataLockedFieldsPreserved: false,
       metadataSearchHints200: false,
       metadataGenreMatched: false,
       metadataStudioMatched: false,
@@ -1698,6 +1702,7 @@ async function runMetadataSearchFlow(page, summary, publicInfo, target) {
   await refreshLibrary(page, auth);
   const primary = await waitForMovieByName(page, summary, auth, metadataFlowPrimaryName);
   const similar = await waitForMovieByName(page, summary, auth, metadataFlowSimilarName);
+  const nfoItem = await waitForMovieByName(page, summary, auth, metadataFlowNfoTitle);
   summary.invariants.metadataItemsMatched = true;
 
   const primaryMetadata = {
@@ -1776,6 +1781,54 @@ async function runMetadataSearchFlow(page, summary, publicInfo, target) {
   }
   summary.invariants.metadataItemsSearch200 = true;
   summary.invariants.metadataEditorProviderIds = true;
+
+  const nfoDetail = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Users/${encodeURIComponent(auth.User.Id)}/Items/${encodeURIComponent(nfoItem.Id)}?Fields=ProviderIds,Genres,Studios,People,Tags,Overview`,
+    token: auth.AccessToken,
+  });
+  if (nfoDetail.status !== 200) {
+    throw new Error(`metadata NFO detail returned HTTP ${nfoDetail.status}`);
+  }
+  if (
+    nfoDetail.json?.Overview !== 'NFO imported overview one'
+    || !nfoDetail.json?.Genres?.includes('Jellyrin NFO Drama')
+    || nfoDetail.json?.ProviderIds?.Imdb !== 'tt0950099'
+  ) {
+    throw new Error('metadata NFO local fields did not import');
+  }
+  summary.invariants.metadataNfoLocalMatched = true;
+
+  const lockUpdate = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(nfoItem.Id)}`,
+    token: auth.AccessToken,
+    body: {
+      Name: metadataFlowNfoTitle,
+      Overview: 'Manual locked overview',
+      Genres: ['Manual Locked Genre'],
+      LockedFields: ['Overview', 'Genres'],
+    },
+  });
+  if (![200, 204].includes(lockUpdate.status)) {
+    throw new Error(`metadata locked fields update returned HTTP ${lockUpdate.status}`);
+  }
+  await refreshLibrary(page, auth);
+  const lockedDetail = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Users/${encodeURIComponent(auth.User.Id)}/Items/${encodeURIComponent(nfoItem.Id)}?Fields=ProviderIds,Genres,Studios,People,Tags,Overview`,
+    token: auth.AccessToken,
+  });
+  if (lockedDetail.status !== 200) {
+    throw new Error(`metadata locked fields detail returned HTTP ${lockedDetail.status}`);
+  }
+  if (
+    lockedDetail.json?.Overview !== 'Manual locked overview'
+    || !lockedDetail.json?.Genres?.includes('Manual Locked Genre')
+  ) {
+    throw new Error('metadata locked fields were overwritten by refresh');
+  }
+  summary.invariants.metadataLockedFieldsPreserved = true;
 
   const hints = await browserFetchJson(page, {
     method: 'GET',
@@ -2659,6 +2712,7 @@ async function ensureMetadataSearchFixtures() {
   for (const fixture of [
     { name: metadataFlowPrimaryName, color: 'yellow', frequency: '392' },
     { name: metadataFlowSimilarName, color: 'purple', frequency: '494' },
+    { name: metadataFlowNfoFileName, color: 'blue', frequency: '587' },
   ]) {
     const moviePath = path.join(mediaFixtureDir, `${fixture.name}.mp4`);
     try {
@@ -2691,6 +2745,18 @@ async function ensureMetadataSearchFixtures() {
       moviePath,
     ]);
   }
+  await fs.writeFile(
+    path.join(mediaFixtureDir, `${metadataFlowNfoFileName}.nfo`),
+    `<movie>
+  <title>${metadataFlowNfoTitle}</title>
+  <plot>NFO imported overview one</plot>
+  <genre>Jellyrin NFO Drama</genre>
+  <studio>Jellyrin NFO Studio</studio>
+  <tag>Jellyrin NFO Tag</tag>
+  <uniqueid type="imdb">tt0950099</uniqueid>
+</movie>
+`,
+  );
 }
 
 async function ensureSubtitleTrickplayFixture() {

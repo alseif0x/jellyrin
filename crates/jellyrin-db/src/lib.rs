@@ -3672,7 +3672,10 @@ impl Database {
         let modified_at = metadata
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| format_time(OffsetDateTime::from(modified)).ok());
-        let media_info = probe_media_info(Path::new(&path), media_type).await;
+        let mut media_info = probe_media_info(Path::new(&path), media_type).await;
+        if let Some(nfo_metadata) = read_local_nfo_metadata(Path::new(&path)).await {
+            media_info.metadata = merge_metadata_values(media_info.metadata, nfo_metadata);
+        }
         let media_streams_json = serde_json::to_string(&media_info.media_streams)?;
         let exact_id =
             sqlx::query_as::<_, MediaItemIdRow>("SELECT id FROM media_items WHERE path = ?1")
@@ -3765,7 +3768,11 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        if media_info.metadata.as_object().is_some_and(|metadata| !metadata.is_empty()) {
+        if media_info
+            .metadata
+            .as_object()
+            .is_some_and(|metadata| !metadata.is_empty())
+        {
             self.merge_scanned_media_item_metadata(&existing_id, media_info.metadata)
                 .await?;
         }
@@ -3778,18 +3785,21 @@ impl Database {
         item_id: &str,
         scanned_metadata: Value,
     ) -> anyhow::Result<()> {
-        let current = sqlx::query_scalar::<_, String>(
-            "SELECT metadata_json FROM media_items WHERE id = ?1",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
-        .unwrap_or_else(|| json!({}));
+        let current =
+            sqlx::query_scalar::<_, String>("SELECT metadata_json FROM media_items WHERE id = ?1")
+                .bind(item_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+                .unwrap_or_else(|| json!({}));
         let mut merged = current.as_object().cloned().unwrap_or_default();
+        if metadata_lock_data(&merged) {
+            return Ok(());
+        }
+        let locked_fields = metadata_locked_fields(&merged);
         if let Some(scanned) = scanned_metadata.as_object() {
             for (key, value) in scanned {
-                if !merged.contains_key(key) {
+                if !locked_fields.contains(&metadata_lock_key(key)) {
                     merged.insert(key.clone(), value.clone());
                 }
             }
@@ -5581,6 +5591,313 @@ fn ffprobe_tags_to_metadata(value: &Value) -> Value {
     Value::Object(metadata)
 }
 
+async fn read_local_nfo_metadata(path: &Path) -> Option<Value> {
+    let mut candidates = Vec::new();
+    candidates.push(path.with_extension("nfo"));
+    if let Some(parent) = path.parent() {
+        candidates.push(parent.join("movie.nfo"));
+        candidates.push(parent.join("tvshow.nfo"));
+        candidates.push(parent.join("album.nfo"));
+    }
+
+    for candidate in candidates {
+        let Ok(contents) = tokio::fs::read_to_string(&candidate).await else {
+            continue;
+        };
+        let metadata = parse_local_nfo_metadata(&contents);
+        if metadata
+            .as_object()
+            .is_some_and(|metadata| !metadata.is_empty())
+        {
+            return Some(metadata);
+        }
+    }
+    None
+}
+
+fn parse_local_nfo_metadata(contents: &str) -> Value {
+    let mut metadata = serde_json::Map::new();
+    insert_nfo_text(&mut metadata, contents, "title", "Name");
+    insert_nfo_text(&mut metadata, contents, "sorttitle", "SortName");
+    insert_nfo_text(&mut metadata, contents, "originaltitle", "OriginalTitle");
+    insert_nfo_text(&mut metadata, contents, "plot", "Overview");
+    insert_nfo_text(&mut metadata, contents, "outline", "ShortOverview");
+    insert_nfo_text(&mut metadata, contents, "tagline", "Tagline");
+    insert_nfo_text(&mut metadata, contents, "mpaa", "OfficialRating");
+    insert_nfo_text(&mut metadata, contents, "premiered", "PremiereDate");
+    insert_nfo_number(&mut metadata, contents, "year", "ProductionYear");
+    insert_nfo_array(&mut metadata, contents, "genre", "Genres");
+    insert_nfo_array(&mut metadata, contents, "studio", "Studios");
+    insert_nfo_array(&mut metadata, contents, "tag", "Tags");
+    insert_nfo_people(&mut metadata, contents, "director", "Director");
+    insert_nfo_actor_people(&mut metadata, contents);
+
+    let provider_ids = nfo_unique_elements(contents, "uniqueid")
+        .into_iter()
+        .filter_map(|element| {
+            let provider = nfo_attribute(&element, "type")
+                .or_else(|| nfo_attribute(&element, "default"))
+                .unwrap_or_else(|| "Unknown".to_string());
+            let id = xml_decode(&strip_xml_tags(&element)).trim().to_string();
+            (!provider.is_empty() && !id.is_empty()).then_some((provider_key(&provider), id))
+        })
+        .chain(
+            ["imdbid", "tmdbid", "tvdbid"]
+                .into_iter()
+                .filter_map(|tag| nfo_first_text(contents, tag).map(|id| (provider_key(tag), id))),
+        )
+        .fold(serde_json::Map::new(), |mut ids, (key, id)| {
+            ids.insert(key, Value::String(id));
+            ids
+        });
+    if !provider_ids.is_empty() {
+        metadata.insert("ProviderIds".to_string(), Value::Object(provider_ids));
+    }
+
+    Value::Object(metadata)
+}
+
+fn insert_nfo_text(
+    metadata: &mut serde_json::Map<String, Value>,
+    contents: &str,
+    tag: &str,
+    key: &str,
+) {
+    if let Some(value) = nfo_first_text(contents, tag) {
+        metadata.insert(key.to_string(), Value::String(value));
+    }
+}
+
+fn insert_nfo_number(
+    metadata: &mut serde_json::Map<String, Value>,
+    contents: &str,
+    tag: &str,
+    key: &str,
+) {
+    if let Some(value) = nfo_first_text(contents, tag).and_then(|value| value.parse::<i64>().ok()) {
+        metadata.insert(key.to_string(), json!(value));
+    }
+}
+
+fn insert_nfo_array(
+    metadata: &mut serde_json::Map<String, Value>,
+    contents: &str,
+    tag: &str,
+    key: &str,
+) {
+    let values = nfo_text_values(contents, tag);
+    if !values.is_empty() {
+        metadata.insert(key.to_string(), json!(values));
+    }
+}
+
+fn insert_nfo_people(
+    metadata: &mut serde_json::Map<String, Value>,
+    contents: &str,
+    tag: &str,
+    role: &str,
+) {
+    let people = nfo_text_values(contents, tag)
+        .into_iter()
+        .map(|name| json!({ "Name": name, "Type": role }))
+        .collect::<Vec<_>>();
+    if !people.is_empty() {
+        append_metadata_people(metadata, people);
+    }
+}
+
+fn insert_nfo_actor_people(metadata: &mut serde_json::Map<String, Value>, contents: &str) {
+    let people = nfo_unique_elements(contents, "actor")
+        .into_iter()
+        .filter_map(|actor| {
+            nfo_first_text(&actor, "name").map(|name| {
+                let role = nfo_first_text(&actor, "role");
+                json!({
+                    "Name": name,
+                    "Role": role,
+                    "Type": "Actor"
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if !people.is_empty() {
+        append_metadata_people(metadata, people);
+    }
+}
+
+fn append_metadata_people(metadata: &mut serde_json::Map<String, Value>, people: Vec<Value>) {
+    let entry = metadata
+        .entry("People".to_string())
+        .or_insert_with(|| json!([]));
+    if let Some(existing) = entry.as_array_mut() {
+        existing.extend(people);
+    }
+}
+
+fn nfo_first_text(contents: &str, tag: &str) -> Option<String> {
+    nfo_unique_elements(contents, tag)
+        .into_iter()
+        .map(|element| xml_decode(&strip_xml_tags(&element)))
+        .find(|value| !value.is_empty())
+}
+
+fn nfo_text_values(contents: &str, tag: &str) -> Vec<String> {
+    nfo_unique_elements(contents, tag)
+        .into_iter()
+        .map(|element| xml_decode(&strip_xml_tags(&element)))
+        .flat_map(|value| split_tag_values(&value))
+        .collect()
+}
+
+fn nfo_unique_elements(contents: &str, tag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut offset = 0usize;
+    let lower = contents.to_ascii_lowercase();
+    while let Some(start) = lower[offset..].find(&open) {
+        let start = offset + start;
+        let after_tag = start + open.len();
+        if !lower[after_tag..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '>' || ch.is_ascii_whitespace())
+        {
+            offset = after_tag;
+            continue;
+        }
+        let Some(open_end) = lower[start..].find('>').map(|index| start + index + 1) else {
+            break;
+        };
+        let Some(end) = lower[open_end..]
+            .find(&close)
+            .map(|index| open_end + index + close.len())
+        else {
+            break;
+        };
+        values.push(contents[start..end].to_string());
+        offset = end;
+    }
+    values
+}
+
+fn nfo_attribute(element: &str, name: &str) -> Option<String> {
+    let lower = element.to_ascii_lowercase();
+    let attr = format!("{name}=");
+    let start = lower.find(&attr)? + attr.len();
+    let quote = element[start..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let value_start = start + quote.len_utf8();
+    let value_end = element[value_start..].find(quote)? + value_start;
+    Some(xml_decode(&element[value_start..value_end]))
+}
+
+fn strip_xml_tags(value: &str) -> String {
+    let mut output = String::new();
+    let mut in_tag = false;
+    for ch in value.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => output.push(ch),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn xml_decode(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .trim()
+        .to_string()
+}
+
+fn provider_key(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "imdb" | "imdbid" => "Imdb".to_string(),
+        "tmdb" | "tmdbid" => "Tmdb".to_string(),
+        "tvdb" | "tvdbid" => "Tvdb".to_string(),
+        other => other
+            .split(['_', '-', ' '])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect::<String>(),
+    }
+}
+
+fn merge_metadata_values(base: Value, overlay: Value) -> Value {
+    let mut merged = base.as_object().cloned().unwrap_or_default();
+    if let Some(overlay) = overlay.as_object() {
+        for (key, value) in overlay {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(merged)
+}
+
+fn metadata_lock_data(metadata: &serde_json::Map<String, Value>) -> bool {
+    metadata
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("LockData"))
+        .and_then(|(_, value)| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn metadata_locked_fields(metadata: &serde_json::Map<String, Value>) -> HashSet<String> {
+    metadata
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("LockedFields"))
+        .and_then(|(_, value)| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .flat_map(|field| {
+            let key = metadata_lock_key(field);
+            let mut fields = vec![key.clone()];
+            fields.extend(locked_field_aliases(&key));
+            fields
+        })
+        .collect()
+}
+
+fn metadata_lock_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn locked_field_aliases(key: &str) -> Vec<String> {
+    let aliases: &[&str] = match key {
+        "overview" => &["plot", "shortoverview"],
+        "productionyear" => &["year"],
+        "premieredate" => &["premiered"],
+        "genres" => &["genre", "musicgenres"],
+        "studios" => &["studio"],
+        "people" => &["actors", "director", "directors"],
+        "providerids" => &["imdbid", "tmdbid", "tvdbid", "uniqueid"],
+        _ => &[],
+    };
+    aliases
+        .iter()
+        .map(|alias| metadata_lock_key(alias))
+        .collect()
+}
+
 fn first_tag_value(tags: &[&Value], names: &[&str]) -> Option<String> {
     tags.iter()
         .filter_map(|tag| tag.as_object())
@@ -5589,7 +5906,12 @@ fn first_tag_value(tags: &[&Value], names: &[&str]) -> Option<String> {
             names
                 .iter()
                 .any(|name| key.eq_ignore_ascii_case(name))
-                .then(|| value.as_str().map(str::trim).filter(|value| !value.is_empty()))
+                .then(|| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
                 .flatten()
                 .map(ToOwned::to_owned)
         })
@@ -5820,6 +6142,7 @@ mod tests {
         ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
         SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertActiveViewingSession,
         UpsertPlaybackState, UpsertTranscodeSession, parse_ffprobe_media_info,
+        parse_local_nfo_metadata,
     };
     use serde_json::json;
     use time::Duration;
@@ -6790,10 +7113,151 @@ mod tests {
         assert_eq!(info.width, Some(1920));
         assert_eq!(info.height, Some(1080));
         assert_eq!(info.metadata["Album"], "Example Album");
-        assert_eq!(info.metadata["Artists"], json!(["Artist One", "Artist Two"]));
+        assert_eq!(
+            info.metadata["Artists"],
+            json!(["Artist One", "Artist Two"])
+        );
         assert_eq!(info.metadata["AlbumArtists"], json!(["Album Artist"]));
         assert_eq!(info.metadata["MusicGenres"], json!(["Rock", "Jazz"]));
         assert_eq!(info.metadata["Genres"], json!(["Rock", "Jazz"]));
+    }
+
+    #[test]
+    fn parses_local_nfo_metadata_json() {
+        let metadata = parse_local_nfo_metadata(
+            r#"
+            <movie>
+              <title>Local &amp; Exact Title</title>
+              <sorttitle>Exact Title, Local</sorttitle>
+              <originaltitle>Original Local Title</originaltitle>
+              <plot>NFO overview</plot>
+              <outline>Short NFO overview</outline>
+              <tagline>Local tagline</tagline>
+              <year>1984</year>
+              <premiered>1984-06-01</premiered>
+              <mpaa>PG</mpaa>
+              <genre>Drama / Mystery</genre>
+              <genre>Science Fiction</genre>
+              <studio>Studio One</studio>
+              <tag>Imported</tag>
+              <uniqueid type="imdb">tt1234567</uniqueid>
+              <tmdbid>9876</tmdbid>
+              <director>Jane Director</director>
+              <actor>
+                <name>John Actor</name>
+                <role>Detective</role>
+              </actor>
+            </movie>
+            "#,
+        );
+
+        assert_eq!(metadata["Name"], "Local & Exact Title");
+        assert_eq!(metadata["SortName"], "Exact Title, Local");
+        assert_eq!(metadata["OriginalTitle"], "Original Local Title");
+        assert_eq!(metadata["Overview"], "NFO overview");
+        assert_eq!(metadata["ShortOverview"], "Short NFO overview");
+        assert_eq!(metadata["Tagline"], "Local tagline");
+        assert_eq!(metadata["ProductionYear"], 1984);
+        assert_eq!(metadata["PremiereDate"], "1984-06-01");
+        assert_eq!(metadata["OfficialRating"], "PG");
+        assert_eq!(
+            metadata["Genres"],
+            json!(["Drama", "Mystery", "Science Fiction"])
+        );
+        assert_eq!(metadata["Studios"], json!(["Studio One"]));
+        assert_eq!(metadata["Tags"], json!(["Imported"]));
+        assert_eq!(metadata["ProviderIds"]["Imdb"], "tt1234567");
+        assert_eq!(metadata["ProviderIds"]["Tmdb"], "9876");
+        assert_eq!(metadata["People"][0]["Name"], "Jane Director");
+        assert_eq!(metadata["People"][0]["Type"], "Director");
+        assert_eq!(metadata["People"][1]["Name"], "John Actor");
+        assert_eq!(metadata["People"][1]["Role"], "Detective");
+    }
+
+    #[tokio::test]
+    async fn scan_imports_local_nfo_and_respects_locked_metadata_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Nfo Movie.mp4");
+        let nfo = tmp.path().join("Nfo Movie.nfo");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+        tokio::fs::write(
+            &nfo,
+            r#"
+            <movie>
+              <title>NFO Movie Title</title>
+              <plot>NFO overview one</plot>
+              <genre>Drama</genre>
+              <studio>Studio One</studio>
+              <uniqueid type="imdb">tt0000001</uniqueid>
+            </movie>
+            "#,
+        )
+        .await
+        .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        let item = db.media_items().await.unwrap().remove(0);
+        let metadata = db
+            .media_item_metadata()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|metadata| metadata.item_id == item.id)
+            .unwrap()
+            .payload;
+        assert_eq!(metadata["Name"], "NFO Movie Title");
+        assert_eq!(metadata["Overview"], "NFO overview one");
+        assert_eq!(metadata["Genres"], json!(["Drama"]));
+        assert_eq!(metadata["ProviderIds"]["Imdb"], "tt0000001");
+
+        db.update_media_item_metadata(
+            item.id,
+            json!({
+                "Overview": "Manual locked overview",
+                "Genres": ["Manual Genre"],
+                "LockedFields": ["Overview", "Genres"]
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &nfo,
+            r#"
+            <movie>
+              <title>NFO Movie Retitled</title>
+              <plot>NFO overview two</plot>
+              <genre>Comedy</genre>
+              <studio>Studio Two</studio>
+              <uniqueid type="imdb">tt0000002</uniqueid>
+            </movie>
+            "#,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        let metadata = db
+            .media_item_metadata()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|metadata| metadata.item_id == item.id)
+            .unwrap()
+            .payload;
+        assert_eq!(metadata["Name"], "NFO Movie Retitled");
+        assert_eq!(metadata["Overview"], "Manual locked overview");
+        assert_eq!(metadata["Genres"], json!(["Manual Genre"]));
+        assert_eq!(metadata["Studios"], json!(["Studio Two"]));
+        assert_eq!(metadata["ProviderIds"]["Imdb"], "tt0000002");
     }
 
     #[tokio::test]
