@@ -41,6 +41,8 @@ const metadataFlowYear = 1995;
 const authUsersFlowPrefix = 'Jellyrin Auth Flow User';
 const authUsersFlowPassword = 'JellyrinAuthFlowPassword!2026';
 const authUsersFlowApiKeyApp = 'Jellyrin Auth Flow API Key';
+const sessionsFlowPrefix = 'Jellyrin Sessions Flow User';
+const sessionsFlowPassword = 'JellyrinSessionsFlowPassword!2026';
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -65,7 +67,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -263,6 +265,20 @@ async function captureTarget(browser, flowDir, target) {
       authKeyRevoked: false,
       authCreatedUserLogout204: false,
       authUserDeleted: false,
+      sessionsTwoClientsOpened: false,
+      sessionsStartSent: false,
+      sessionsMessageReceived: false,
+      sessionsList200: false,
+      sessionsCapabilities204: false,
+      sessionsUserAdd204: false,
+      sessionsObserverUpdate: false,
+      sessionsRemotePlay204: false,
+      sessionsRemotePlayMessage: false,
+      sessionsRemotePlaystate204: false,
+      sessionsRemotePlaystateMessage: false,
+      sessionsRemoteStop204: false,
+      sessionsRemoteStoppedMessage: false,
+      sessionsCleanupConfirmed: false,
     },
   };
 
@@ -323,6 +339,8 @@ async function captureTarget(browser, flowDir, target) {
       await runMetadataSearchFlow(page, summary, publicInfo, target);
     } else if (flow === 'auth-users') {
       await runAuthUsersFlow(page, summary, publicInfo, target);
+    } else if (flow === 'sessions-websocket') {
+      await runSessionsWebsocketFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -350,6 +368,311 @@ async function runLoginHomeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   await establishWebSession(page, summary, publicInfo, target, auth, '/home');
   await page.waitForLoadState('networkidle');
+}
+
+async function runSessionsWebsocketFlow(page, summary, publicInfo, target) {
+  const admin = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, admin, '/home');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const ownerName = `${sessionsFlowPrefix} Owner ${target.name}`;
+  const guestName = `${sessionsFlowPrefix} Guest ${target.name}`;
+  let createdOwnerId = null;
+  let createdGuestId = null;
+  let receiverToken = null;
+  let observerToken = null;
+  let receiverSessionId = null;
+  let observerSessionId = null;
+
+  async function cleanupExistingUsers() {
+    const users = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Users',
+      token: admin.AccessToken,
+    });
+    if (users.status !== 200) {
+      throw new Error(`sessions cleanup user list returned HTTP ${users.status}`);
+    }
+    for (const user of users.json || []) {
+      if ((user?.Name === ownerName || user?.Name === guestName) && user.Id) {
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/Users/${encodeURIComponent(user.Id)}`,
+          token: admin.AccessToken,
+        });
+      }
+    }
+  }
+
+  await cleanupExistingUsers();
+
+  try {
+    const createdOwner = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/New',
+      token: admin.AccessToken,
+      body: {
+        Name: ownerName,
+        Password: sessionsFlowPassword,
+      },
+    });
+    if (createdOwner.status !== 200 || !createdOwner.json?.Id || createdOwner.json.Name !== ownerName) {
+      throw new Error(`sessions owner Users/New returned HTTP ${createdOwner.status}`);
+    }
+    createdOwnerId = createdOwner.json.Id;
+
+    const ownerPolicy = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Users/${encodeURIComponent(createdOwnerId)}/Policy`,
+      token: admin.AccessToken,
+      body: {
+        ...(createdOwner.json.Policy || {}),
+        IsAdministrator: true,
+        IsDisabled: false,
+      },
+    });
+    if (![200, 204].includes(ownerPolicy.status)) {
+      throw new Error(`sessions owner policy update returned HTTP ${ownerPolicy.status}`);
+    }
+
+    const createdGuest = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/New',
+      token: admin.AccessToken,
+      body: {
+        Name: guestName,
+        Password: sessionsFlowPassword,
+      },
+    });
+    if (createdGuest.status !== 200 || !createdGuest.json?.Id || createdGuest.json.Name !== guestName) {
+      throw new Error(`sessions guest Users/New returned HTTP ${createdGuest.status}`);
+    }
+    createdGuestId = createdGuest.json.Id;
+
+    const receiverLogin = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/AuthenticateByName',
+      authorization: `MediaBrowser Client="Jellyrin Browser Trace", Device="Sessions Receiver ${target.name}", DeviceId="sessions-receiver-${target.name}", Version="dev"`,
+      body: {
+        Username: ownerName,
+        Pw: sessionsFlowPassword,
+      },
+    });
+    if (receiverLogin.status !== 200 || !receiverLogin.json?.AccessToken) {
+      throw new Error(`sessions receiver login returned HTTP ${receiverLogin.status}`);
+    }
+    receiverToken = receiverLogin.json.AccessToken;
+    receiverSessionId = receiverLogin.json?.SessionInfo?.Id || receiverToken;
+
+    const observerLogin = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/AuthenticateByName',
+      authorization: `MediaBrowser Client="Jellyrin Browser Trace", Device="Sessions Observer ${target.name}", DeviceId="sessions-observer-${target.name}", Version="dev"`,
+      body: {
+        Username: guestName,
+        Pw: sessionsFlowPassword,
+      },
+    });
+    if (observerLogin.status !== 200 || !observerLogin.json?.AccessToken) {
+      throw new Error(`sessions observer login returned HTTP ${observerLogin.status}`);
+    }
+    observerToken = observerLogin.json.AccessToken;
+    observerSessionId = observerLogin.json?.SessionInfo?.Id || observerToken;
+
+    const movie = await firstMovieItem(page, summary, {
+      AccessToken: receiverToken,
+      User: { Id: createdOwnerId },
+    });
+    if (!movie) {
+      throw new Error('target has no movie item for sessions websocket trace');
+    }
+
+    const capabilitiesUrl = '/Sessions/Capabilities/Full?'
+      + [
+        ['PlayableMediaTypes', 'Audio,Video'],
+        ['SupportedCommands', 'DisplayContent,DisplayMessage,GoHome,Play,Seek'],
+        ['SupportsRemoteControl', 'true'],
+        ['SupportsMediaControl', 'true'],
+      ].map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&');
+    const initialSessions = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Sessions',
+      token: receiverToken,
+    });
+    if (initialSessions.status !== 200 || !Array.isArray(initialSessions.json)) {
+      throw new Error(`Sessions returned HTTP ${initialSessions.status}`);
+    }
+    const receiverSession = initialSessions.json.find((session) => session.Id === receiverSessionId);
+    const observerInitialSessions = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Sessions',
+      token: observerToken,
+    });
+    if (observerInitialSessions.status !== 200 || !Array.isArray(observerInitialSessions.json)) {
+      throw new Error(`observer Sessions returned HTTP ${observerInitialSessions.status}`);
+    }
+    const observerSession = observerInitialSessions.json.find((session) => session.Id === observerSessionId);
+    if (!receiverSession || !observerSession) {
+      throw new Error('sessions list did not include each temporary client in its own session view');
+    }
+    summary.invariants.sessionsList200 = true;
+
+    await startWebsocketProbe(page, summary.baseUrl, [
+      { name: 'receiver', token: receiverToken, deviceId: `sessions-receiver-${target.name}` },
+      { name: 'observer', token: observerToken, deviceId: `sessions-observer-${target.name}` },
+    ]);
+    await waitForWebsocketMessages(page, [
+      ['receiver', 'ForceKeepAlive'],
+      ['observer', 'ForceKeepAlive'],
+    ]);
+    summary.invariants.sessionsTwoClientsOpened = true;
+    summary.invariants.sessionsStartSent = true;
+
+    for (const token of [receiverToken, observerToken]) {
+      const result = await browserFetchJson(page, {
+        method: 'POST',
+        url: capabilitiesUrl,
+        token,
+        body: {},
+      });
+      if (![200, 204].includes(result.status)) {
+        throw new Error(`Sessions/Capabilities/Full returned HTTP ${result.status}`);
+      }
+    }
+    summary.invariants.sessionsCapabilities204 = true;
+    await waitForWebsocketMessages(page, [
+      ['receiver', 'Sessions'],
+      ['observer', 'Sessions'],
+    ]);
+    summary.invariants.sessionsMessageReceived = true;
+
+    const addUser = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Sessions/${encodeURIComponent(receiverSessionId)}/User/${encodeURIComponent(createdGuestId)}`,
+      token: admin.AccessToken,
+    });
+    if (![200, 204].includes(addUser.status)) {
+      throw new Error(`Sessions/{id}/User/{userId} returned HTTP ${addUser.status}`);
+    }
+    summary.invariants.sessionsUserAdd204 = true;
+    const addUserBroadcast = await browserFetchJson(page, {
+      method: 'POST',
+      url: capabilitiesUrl,
+      token: receiverToken,
+      body: {},
+    });
+    if (![200, 204].includes(addUserBroadcast.status)) {
+      throw new Error(`Sessions/Capabilities/Full add-user broadcast returned HTTP ${addUserBroadcast.status}`);
+    }
+    await waitForWebsocketMessages(page, [
+      ['observer', 'Sessions'],
+    ], { minimumCount: 2 });
+    const observerAddedSessions = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Sessions',
+      token: observerToken,
+    });
+    const observerCanSeeReceiver = (observerAddedSessions.json || [])
+      .some((session) => session.Id === receiverSessionId);
+    if (observerAddedSessions.status !== 200 || !observerCanSeeReceiver) {
+      throw new Error('observer session list did not include receiver after add-user');
+    }
+    summary.invariants.sessionsObserverUpdate = true;
+
+    const remotePlay = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Sessions/${encodeURIComponent(receiverSessionId)}/Playing?PlayCommand=PlayNow&ItemIds=${encodeURIComponent(movie.Id)}&StartPositionTicks=123000000`,
+      token: admin.AccessToken,
+    });
+    if (![200, 204].includes(remotePlay.status)) {
+      throw new Error(`Sessions/{id}/Playing remote play returned HTTP ${remotePlay.status}`);
+    }
+    summary.invariants.sessionsRemotePlay204 = true;
+    await waitForWebsocketMessages(page, [
+      ['receiver', 'Play'],
+      ['receiver', 'Sessions'],
+    ]);
+    summary.invariants.sessionsRemotePlayMessage = true;
+
+    const remotePause = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Sessions/${encodeURIComponent(receiverSessionId)}/Playing/Pause`,
+      token: admin.AccessToken,
+    });
+    if (![200, 204].includes(remotePause.status)) {
+      throw new Error(`Sessions/{id}/Playing/Pause returned HTTP ${remotePause.status}`);
+    }
+    summary.invariants.sessionsRemotePlaystate204 = true;
+    await waitForWebsocketMessages(page, [
+      ['receiver', 'Playstate'],
+      ['receiver', 'Sessions'],
+    ]);
+    summary.invariants.sessionsRemotePlaystateMessage = true;
+
+    const remoteStop = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Sessions/${encodeURIComponent(receiverSessionId)}/Playing/Stop`,
+      token: admin.AccessToken,
+    });
+    if (![200, 204].includes(remoteStop.status)) {
+      throw new Error(`Sessions/{id}/Playing/Stop returned HTTP ${remoteStop.status}`);
+    }
+    summary.invariants.sessionsRemoteStop204 = true;
+    await waitForWebsocketMessages(page, [
+      ['receiver', 'Playstate'],
+      ['receiver', 'Sessions'],
+    ], { minimumCount: 2 });
+    summary.invariants.sessionsRemoteStoppedMessage = true;
+
+    const stoppedSessions = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Sessions',
+      token: admin.AccessToken,
+    });
+    const stoppedReceiver = (stoppedSessions.json || []).find((session) => session.Id === receiverSessionId);
+    if (stoppedSessions.status !== 200 || !stoppedReceiver) {
+      throw new Error('remote stop session verification did not include receiver session');
+    }
+    summary.invariants.sessionsCleanupConfirmed = true;
+
+    await closeWebsocketProbe(page);
+    summary.item = {
+      id: '<dynamic>',
+      name: movie.Name,
+      type: movie.Type,
+      user: '<temporary-sessions-flow-users>',
+    };
+  } finally {
+    await closeWebsocketProbe(page).catch(() => {});
+    if (receiverToken) {
+      await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Sessions/Logout',
+        token: receiverToken,
+      }).catch(() => {});
+    }
+    if (observerToken) {
+      await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Sessions/Logout',
+        token: observerToken,
+      }).catch(() => {});
+    }
+    if (createdGuestId) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Users/${encodeURIComponent(createdGuestId)}`,
+        token: admin.AccessToken,
+      }).catch(() => {});
+    }
+    if (createdOwnerId) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Users/${encodeURIComponent(createdOwnerId)}`,
+        token: admin.AccessToken,
+      }).catch(() => {});
+    }
+  }
 }
 
 async function runAdminDashboardFlow(page, summary, publicInfo, target) {
@@ -2452,6 +2775,94 @@ async function browserFetchJson(page, request) {
   }, request);
 }
 
+async function startWebsocketProbe(page, baseUrl, sockets) {
+  await page.evaluate(async ({ baseUrl, sockets }) => {
+    if (window.__jellyrinWsProbe?.sockets) {
+      for (const socket of Object.values(window.__jellyrinWsProbe.sockets)) {
+        try {
+          socket.close();
+        } catch (_) {
+          // Ignore stale probe sockets.
+        }
+      }
+    }
+    const wsBaseUrl = baseUrl.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:');
+    const probe = {
+      messages: [],
+      sockets: {},
+    };
+    window.__jellyrinWsProbe = probe;
+
+    await Promise.all(sockets.map(({ name, token, deviceId }) => new Promise((resolve, reject) => {
+      const socket = new WebSocket(`${wsBaseUrl}/socket?api_key=${encodeURIComponent(token)}&deviceId=${encodeURIComponent(deviceId || `sessions-${name}`)}`);
+      probe.sockets[name] = socket;
+      const timeout = setTimeout(() => reject(new Error(`websocket ${name} did not open`)), 10_000);
+      socket.addEventListener('open', () => {
+        clearTimeout(timeout);
+        const sessionsStart = JSON.stringify({ MessageType: 'SessionsStart', Data: '0,1500' });
+        socket.send(sessionsStart);
+        probe.messages.push({ socket: name, direction: 'sent', messageType: 'SessionsStart' });
+        resolve();
+      });
+      socket.addEventListener('message', (event) => {
+        try {
+          const parsed = JSON.parse(event.data);
+          probe.messages.push({
+            socket: name,
+            direction: 'received',
+            messageType: parsed.MessageType,
+            data: parsed.Data,
+          });
+          if (parsed.MessageType === 'ForceKeepAlive') {
+            const keepAlive = JSON.stringify({ MessageType: 'KeepAlive' });
+            socket.send(keepAlive);
+            probe.messages.push({ socket: name, direction: 'sent', messageType: 'KeepAlive' });
+          }
+        } catch (_) {
+          probe.messages.push({ socket: name, direction: 'received', messageType: '<non-json>' });
+        }
+      });
+      socket.addEventListener('error', () => {
+        clearTimeout(timeout);
+        reject(new Error(`websocket ${name} error`));
+      }, { once: true });
+    })));
+  }, { baseUrl, sockets });
+}
+
+async function waitForWebsocketMessages(page, expectations, options = {}) {
+  const minimumCount = options.minimumCount || 1;
+  await page.waitForFunction(
+    ({ expectations, minimumCount }) => {
+      const messages = window.__jellyrinWsProbe?.messages || [];
+      return expectations.every(([socket, messageType]) =>
+        messages.filter((message) =>
+          message.socket === socket
+          && message.direction === 'received'
+          && message.messageType === messageType
+        ).length >= minimumCount,
+      );
+    },
+    { expectations, minimumCount },
+    { timeout: options.timeout || 15_000 },
+  );
+}
+
+async function closeWebsocketProbe(page) {
+  await page.evaluate(() => {
+    if (!window.__jellyrinWsProbe?.sockets) {
+      return;
+    }
+    for (const socket of Object.values(window.__jellyrinWsProbe.sockets)) {
+      try {
+        socket.close();
+      } catch (_) {
+        // Ignore close races.
+      }
+    }
+  });
+}
+
 async function browserFetchText(page, request) {
   return page.evaluate(async ({ method, url, token }) => {
     const response = await fetch(url, {
@@ -2724,7 +3135,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -3070,6 +3481,26 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.authUserDeleted = true;
     }
   }
+  if (flow === 'sessions-websocket') {
+    if (record.method === 'GET' && pathname === '/Sessions' && record.status === 200) {
+      summary.invariants.sessionsList200 = true;
+    }
+    if (record.method === 'POST' && /\/Sessions\/Capabilities\/Full$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.sessionsCapabilities204 = true;
+    }
+    if (record.method === 'POST' && /\/Sessions\/[^/]+\/User\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.sessionsUserAdd204 = true;
+    }
+    if (record.method === 'POST' && /\/Sessions\/[^/]+\/Playing$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.sessionsRemotePlay204 = true;
+    }
+    if (record.method === 'POST' && /\/Sessions\/[^/]+\/Playing\/Pause$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.sessionsRemotePlaystate204 = true;
+    }
+    if (record.method === 'POST' && /\/Sessions\/[^/]+\/Playing\/Stop$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.sessionsRemoteStop204 = true;
+    }
+  }
 }
 
 function criticalRequestKey(record, requestPostData) {
@@ -3121,6 +3552,24 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'auth-users' && record.method === 'DELETE' && /\/Users\/[^/]+$/i.test(pathname)) {
     return 'auth-user-delete';
+  }
+  if (flow === 'sessions-websocket' && record.method === 'GET' && pathname === '/Sessions') {
+    return 'sessions-list';
+  }
+  if (flow === 'sessions-websocket' && record.method === 'POST' && /\/Sessions\/Capabilities\/Full$/i.test(pathname)) {
+    return 'sessions-capabilities';
+  }
+  if (flow === 'sessions-websocket' && record.method === 'POST' && /\/Sessions\/[^/]+\/User\/[^/]+$/i.test(pathname)) {
+    return 'sessions-add-user';
+  }
+  if (flow === 'sessions-websocket' && record.method === 'POST' && /\/Sessions\/[^/]+\/Playing$/i.test(pathname)) {
+    return 'sessions-remote-play';
+  }
+  if (flow === 'sessions-websocket' && record.method === 'POST' && /\/Sessions\/[^/]+\/Playing\/Pause$/i.test(pathname)) {
+    return 'sessions-remote-playstate';
+  }
+  if (flow === 'sessions-websocket' && record.method === 'POST' && /\/Sessions\/[^/]+\/Playing\/Stop$/i.test(pathname)) {
+    return 'sessions-remote-stop';
   }
   if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/Latest$/i.test(pathname)) {
     return 'library-latest';
@@ -3359,7 +3808,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -3409,7 +3858,9 @@ function compareCompletedTargets(summaries) {
                         ? ['metadata-update-primary', 'metadata-update-similar', 'metadata-editor', 'metadata-external-ids', 'metadata-items-search', 'metadata-search-hints', 'metadata-genres', 'metadata-studios', 'metadata-persons', 'metadata-years', 'metadata-similar']
                         : flow === 'auth-users'
                           ? ['auth-users-public', 'auth-users-list', 'auth-providers', 'auth-password-reset-providers', 'auth-user-create', 'auth-created-user-login', 'auth-users-me', 'auth-user-detail', 'auth-user-policy', 'auth-user-configuration', 'auth-keys-list', 'auth-key-create', 'auth-key-system-info', 'auth-key-delete', 'auth-user-logout', 'auth-user-delete']
-                          : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+                          : flow === 'sessions-websocket'
+                            ? ['sessions-list', 'sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop']
+                            : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -3511,6 +3962,12 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     }
     return reasons;
   }
+  if (['sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop'].includes(key)) {
+    if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
+      reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
   if (['image-get', 'image-head', 'image-extended-get'].includes(key)) {
     if (upstreamRequest.status !== 200 || jellyrinRequest.status !== 200) {
       reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
@@ -3574,6 +4031,7 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'auth-user-detail',
     'auth-keys-list',
     'auth-key-system-info',
+    'sessions-list',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
@@ -3665,6 +4123,7 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'auth-user-detail': ['Id', 'Name', 'Policy', 'Configuration'],
     'auth-keys-list': ['Items', 'TotalRecordCount'],
     'auth-key-system-info': ['Id', 'ServerName', 'Version', 'StartupWizardCompleted'],
+    'sessions-list': ['[].Id', '[].UserId', '[].Client', '[].DeviceId', '[].SupportsRemoteControl', '[].SupportedCommands'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -3743,7 +4202,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -3981,6 +4440,31 @@ function invariantFailures(summary) {
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing auth/users ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'sessions-websocket') {
+    for (const [field, label] of [
+      ['websocketKeepAlive', 'ForceKeepAlive/KeepAlive'],
+      ['websocketSessions', 'Sessions message'],
+      ['sessionsTwoClientsOpened', 'two websocket clients'],
+      ['sessionsStartSent', 'SessionsStart'],
+      ['sessionsMessageReceived', 'initial Sessions response'],
+      ['sessionsList200', 'Sessions list'],
+      ['sessionsCapabilities204', 'session capabilities'],
+      ['sessionsUserAdd204', 'additional user update'],
+      ['sessionsObserverUpdate', 'observer Sessions update'],
+      ['sessionsRemotePlay204', 'remote play command'],
+      ['sessionsRemotePlayMessage', 'remote Play websocket message'],
+      ['sessionsRemotePlaystate204', 'remote playstate command'],
+      ['sessionsRemotePlaystateMessage', 'remote Playstate websocket message'],
+      ['sessionsRemoteStop204', 'remote stop command'],
+      ['sessionsRemoteStoppedMessage', 'remote stopped websocket message'],
+      ['sessionsCleanupConfirmed', 'remote stop cleanup'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing sessions/websocket ${label} invariant`);
       }
     }
     return failures;
