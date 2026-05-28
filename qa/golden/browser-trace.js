@@ -38,6 +38,9 @@ const metadataFlowStudio = 'Jellyrin Metadata Studio';
 const metadataFlowPerson = 'Jellyrin Metadata Person';
 const metadataFlowTag = 'Jellyrin Metadata Tag';
 const metadataFlowYear = 1995;
+const authUsersFlowPrefix = 'Jellyrin Auth Flow User';
+const authUsersFlowPassword = 'JellyrinAuthFlowPassword!2026';
+const authUsersFlowApiKeyApp = 'Jellyrin Auth Flow API Key';
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -62,7 +65,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -244,6 +247,22 @@ async function captureTarget(browser, flowDir, target) {
       metadataYearMatched: false,
       metadataSimilar200: false,
       metadataSimilarMatched: false,
+      authUsersPublic200: false,
+      authUsersList200: false,
+      authProviders200: false,
+      authPasswordResetProviders200: false,
+      authUserCreated: false,
+      authCreatedUserLogin200: false,
+      authCreatedUserMe200: false,
+      authUserDetail200: false,
+      authUserPolicy204: false,
+      authUserConfiguration204: false,
+      authKeysList200: false,
+      authKeyCreated: false,
+      authKeyUsable: false,
+      authKeyRevoked: false,
+      authCreatedUserLogout204: false,
+      authUserDeleted: false,
     },
   };
 
@@ -302,6 +321,8 @@ async function captureTarget(browser, flowDir, target) {
       await runImagesFlow(page, summary, publicInfo, target);
     } else if (flow === 'metadata-search') {
       await runMetadataSearchFlow(page, summary, publicInfo, target);
+    } else if (flow === 'auth-users') {
+      await runAuthUsersFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -1353,6 +1374,289 @@ async function runMetadataSearchFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runAuthUsersFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const userName = `${authUsersFlowPrefix} ${target.name}`;
+  const apiKeyApp = `${authUsersFlowApiKeyApp} ${target.name}`;
+  let createdUserId = null;
+  let createdUserToken = null;
+  let createdApiKey = null;
+
+  async function cleanupExistingUsers() {
+    const users = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Users',
+      token: auth.AccessToken,
+    });
+    if (users.status !== 200) {
+      throw new Error(`Users cleanup list returned HTTP ${users.status}`);
+    }
+    for (const user of users.json || []) {
+      if (user?.Name === userName && user.Id) {
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/Users/${encodeURIComponent(user.Id)}`,
+          token: auth.AccessToken,
+        });
+      }
+    }
+  }
+
+  async function cleanupApiKey() {
+    const keys = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Auth/Keys',
+      token: auth.AccessToken,
+    });
+    if (keys.status !== 200) {
+      return;
+    }
+    for (const item of keys.json?.Items || []) {
+      if ((item.AppName === apiKeyApp || item.Name === apiKeyApp) && item.AccessToken) {
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/Auth/Keys/${encodeURIComponent(item.AccessToken)}`,
+          token: auth.AccessToken,
+        });
+      }
+    }
+  }
+
+  await cleanupExistingUsers();
+  await cleanupApiKey();
+
+  try {
+    const publicUsers = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Users/Public',
+      token: auth.AccessToken,
+    });
+    if (publicUsers.status !== 200 || !Array.isArray(publicUsers.json)) {
+      throw new Error(`Users/Public returned HTTP ${publicUsers.status}`);
+    }
+    summary.invariants.authUsersPublic200 = true;
+
+    const users = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Users',
+      token: auth.AccessToken,
+    });
+    if (users.status !== 200 || !Array.isArray(users.json) || !users.json.some((user) => user.Id === auth.User.Id)) {
+      throw new Error(`Users returned HTTP ${users.status}`);
+    }
+    summary.invariants.authUsersList200 = true;
+
+    const authProviders = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Auth/Providers',
+      token: auth.AccessToken,
+    });
+    if (authProviders.status !== 200 || !Array.isArray(authProviders.json)) {
+      throw new Error(`Auth/Providers returned HTTP ${authProviders.status}`);
+    }
+    summary.invariants.authProviders200 = true;
+
+    const resetProviders = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Auth/PasswordResetProviders',
+      token: auth.AccessToken,
+    });
+    if (resetProviders.status !== 200 || !Array.isArray(resetProviders.json)) {
+      throw new Error(`Auth/PasswordResetProviders returned HTTP ${resetProviders.status}`);
+    }
+    summary.invariants.authPasswordResetProviders200 = true;
+
+    const created = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/New',
+      token: auth.AccessToken,
+      body: {
+        Name: userName,
+        Password: authUsersFlowPassword,
+      },
+    });
+    if (created.status !== 200 || !created.json?.Id || created.json.Name !== userName) {
+      throw new Error(`Users/New returned HTTP ${created.status}`);
+    }
+    createdUserId = created.json.Id;
+    summary.invariants.authUserCreated = true;
+
+    const createdLogin = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/AuthenticateByName',
+      authorization: `MediaBrowser Client="Jellyrin Browser Trace", Device="Auth Users ${target.name}", DeviceId="auth-users-${target.name}", Version="dev"`,
+      body: {
+        Username: userName,
+        Pw: authUsersFlowPassword,
+      },
+    });
+    if (createdLogin.status !== 200 || !createdLogin.json?.AccessToken || createdLogin.json?.User?.Id !== createdUserId) {
+      throw new Error(`created user authentication returned HTTP ${createdLogin.status}`);
+    }
+    createdUserToken = createdLogin.json.AccessToken;
+    summary.invariants.authCreatedUserLogin200 = true;
+
+    const currentUser = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Users/Me',
+      token: createdUserToken,
+    });
+    if (currentUser.status !== 200 || currentUser.json?.Id !== createdUserId) {
+      throw new Error(`Users/Me returned HTTP ${currentUser.status}`);
+    }
+    summary.invariants.authCreatedUserMe200 = true;
+
+    const userDetail = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/Users/${encodeURIComponent(createdUserId)}`,
+      token: auth.AccessToken,
+    });
+    if (userDetail.status !== 200 || userDetail.json?.Id !== createdUserId) {
+      throw new Error(`Users/{id} returned HTTP ${userDetail.status}`);
+    }
+    summary.invariants.authUserDetail200 = true;
+
+    const policyUpdate = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Users/${encodeURIComponent(createdUserId)}/Policy`,
+      token: auth.AccessToken,
+      body: {
+        ...(userDetail.json.Policy || {}),
+        IsAdministrator: false,
+        IsDisabled: false,
+      },
+    });
+    if (![200, 204].includes(policyUpdate.status)) {
+      throw new Error(`Users/{id}/Policy returned HTTP ${policyUpdate.status}`);
+    }
+    summary.invariants.authUserPolicy204 = true;
+
+    const configurationUpdate = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Users/${encodeURIComponent(createdUserId)}/Configuration`,
+      token: auth.AccessToken,
+      body: {
+        ...(userDetail.json.Configuration || {}),
+        EnableNextEpisodeAutoPlay: false,
+      },
+    });
+    if (![200, 204].includes(configurationUpdate.status)) {
+      throw new Error(`Users/{id}/Configuration returned HTTP ${configurationUpdate.status}`);
+    }
+    summary.invariants.authUserConfiguration204 = true;
+
+    const keysBefore = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Auth/Keys',
+      token: auth.AccessToken,
+    });
+    if (keysBefore.status !== 200 || !Array.isArray(keysBefore.json?.Items)) {
+      throw new Error(`Auth/Keys returned HTTP ${keysBefore.status}`);
+    }
+    summary.invariants.authKeysList200 = true;
+
+    const createKey = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Auth/Keys?app=${encodeURIComponent(apiKeyApp)}`,
+      token: auth.AccessToken,
+    });
+    if (![200, 204].includes(createKey.status)) {
+      throw new Error(`Auth/Keys create returned HTTP ${createKey.status}`);
+    }
+    summary.invariants.authKeyCreated = true;
+
+    const keysAfter = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Auth/Keys',
+      token: auth.AccessToken,
+    });
+    if (keysAfter.status !== 200) {
+      throw new Error(`Auth/Keys after create returned HTTP ${keysAfter.status}`);
+    }
+    createdApiKey = (keysAfter.json?.Items || [])
+      .find((item) => (item.AppName === apiKeyApp || item.Name === apiKeyApp) && item.AccessToken)
+      ?.AccessToken;
+    if (!createdApiKey) {
+      throw new Error('created Auth/Keys entry was not returned');
+    }
+
+    const keyInfo = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/System/Info',
+      token: createdApiKey,
+    });
+    if (keyInfo.status !== 200 || !keyInfo.json?.Id) {
+      throw new Error(`created api key System/Info returned HTTP ${keyInfo.status}`);
+    }
+    summary.invariants.authKeyUsable = true;
+
+    const deleteKey = await browserFetchJson(page, {
+      method: 'DELETE',
+      url: `/Auth/Keys/${encodeURIComponent(createdApiKey)}`,
+      token: auth.AccessToken,
+    });
+    if (![200, 204].includes(deleteKey.status)) {
+      throw new Error(`Auth/Keys delete returned HTTP ${deleteKey.status}`);
+    }
+    createdApiKey = null;
+    summary.invariants.authKeyRevoked = true;
+
+    const logout = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Sessions/Logout',
+      token: createdUserToken,
+    });
+    if (![200, 204].includes(logout.status)) {
+      throw new Error(`Sessions/Logout returned HTTP ${logout.status}`);
+    }
+    createdUserToken = null;
+    summary.invariants.authCreatedUserLogout204 = true;
+
+    const deleteUser = await browserFetchJson(page, {
+      method: 'DELETE',
+      url: `/Users/${encodeURIComponent(createdUserId)}`,
+      token: auth.AccessToken,
+    });
+    if (![200, 204].includes(deleteUser.status)) {
+      throw new Error(`Users delete returned HTTP ${deleteUser.status}`);
+    }
+    createdUserId = null;
+    summary.invariants.authUserDeleted = true;
+  } finally {
+    if (createdApiKey) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Auth/Keys/${encodeURIComponent(createdApiKey)}`,
+        token: auth.AccessToken,
+      }).catch(() => {});
+    }
+    if (createdUserToken) {
+      await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Sessions/Logout',
+        token: createdUserToken,
+      }).catch(() => {});
+    }
+    if (createdUserId) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Users/${encodeURIComponent(createdUserId)}`,
+        token: auth.AccessToken,
+      }).catch(() => {});
+    }
+  }
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    user: '<temporary-auth-flow-user>',
+    apiKeyApp,
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -2116,10 +2420,14 @@ function hlsTranscodeDeviceProfile() {
 }
 
 async function browserFetchJson(page, request) {
-  return page.evaluate(async ({ method, url, token, body }) => {
-    const headers = {
-      'X-Emby-Token': token,
-    };
+  return page.evaluate(async ({ method, url, token, authorization, body }) => {
+    const headers = {};
+    if (token) {
+      headers['X-Emby-Token'] = token;
+    }
+    if (authorization) {
+      headers.Authorization = authorization;
+    }
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
     }
@@ -2416,7 +2724,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -2712,12 +3020,107 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.metadataSimilar200 = true;
     }
   }
+  if (flow === 'auth-users') {
+    if (record.method === 'GET' && pathname === '/Users/Public' && record.status === 200) {
+      summary.invariants.authUsersPublic200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Users' && record.status === 200) {
+      summary.invariants.authUsersList200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Auth/Providers' && record.status === 200) {
+      summary.invariants.authProviders200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Auth/PasswordResetProviders' && record.status === 200) {
+      summary.invariants.authPasswordResetProviders200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Users/New' && record.status === 200) {
+      summary.invariants.authUserCreated = true;
+    }
+    if (record.method === 'POST' && pathname === '/Users/AuthenticateByName' && record.status === 200) {
+      summary.invariants.authCreatedUserLogin200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Users/Me' && record.status === 200) {
+      summary.invariants.authCreatedUserMe200 = true;
+    }
+    if (record.method === 'GET' && /\/Users\/[^/]+$/i.test(pathname) && record.status === 200) {
+      summary.invariants.authUserDetail200 = true;
+    }
+    if (record.method === 'POST' && /\/Users\/[^/]+\/Policy$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.authUserPolicy204 = true;
+    }
+    if (record.method === 'POST' && /\/Users\/[^/]+\/Configuration$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.authUserConfiguration204 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Auth/Keys' && record.status === 200) {
+      summary.invariants.authKeysList200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Auth/Keys' && [200, 204].includes(record.status)) {
+      summary.invariants.authKeyCreated = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/Info' && record.status === 200) {
+      summary.invariants.authKeyUsable = true;
+    }
+    if (record.method === 'DELETE' && /\/Auth\/Keys\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.authKeyRevoked = true;
+    }
+    if (record.method === 'POST' && pathname === '/Sessions/Logout' && [200, 204].includes(record.status)) {
+      summary.invariants.authCreatedUserLogout204 = true;
+    }
+    if (record.method === 'DELETE' && /\/Users\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.authUserDeleted = true;
+    }
+  }
 }
 
 function criticalRequestKey(record, requestPostData) {
   const pathname = new URL(record.url).pathname;
   if (record.method === 'POST' && pathname.toLowerCase() === '/users/authenticatebyname') {
-    return 'auth';
+    return flow === 'auth-users' ? 'auth-created-user-login' : 'auth';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Users/Public') {
+    return 'auth-users-public';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Users') {
+    return 'auth-users-list';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Auth/Providers') {
+    return 'auth-providers';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Auth/PasswordResetProviders') {
+    return 'auth-password-reset-providers';
+  }
+  if (flow === 'auth-users' && record.method === 'POST' && pathname === '/Users/New') {
+    return 'auth-user-create';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Users/Me') {
+    return 'auth-users-me';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && /\/Users\/[^/]+$/i.test(pathname)) {
+    return 'auth-user-detail';
+  }
+  if (flow === 'auth-users' && record.method === 'POST' && /\/Users\/[^/]+\/Policy$/i.test(pathname)) {
+    return 'auth-user-policy';
+  }
+  if (flow === 'auth-users' && record.method === 'POST' && /\/Users\/[^/]+\/Configuration$/i.test(pathname)) {
+    return 'auth-user-configuration';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Auth/Keys') {
+    return 'auth-keys-list';
+  }
+  if (flow === 'auth-users' && record.method === 'POST' && pathname === '/Auth/Keys') {
+    return 'auth-key-create';
+  }
+  if (flow === 'auth-users' && record.method === 'GET' && pathname === '/System/Info') {
+    return 'auth-key-system-info';
+  }
+  if (flow === 'auth-users' && record.method === 'DELETE' && /\/Auth\/Keys\/[^/]+$/i.test(pathname)) {
+    return 'auth-key-delete';
+  }
+  if (flow === 'auth-users' && record.method === 'POST' && pathname === '/Sessions/Logout') {
+    return 'auth-user-logout';
+  }
+  if (flow === 'auth-users' && record.method === 'DELETE' && /\/Users\/[^/]+$/i.test(pathname)) {
+    return 'auth-user-delete';
   }
   if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/Latest$/i.test(pathname)) {
     return 'library-latest';
@@ -2956,7 +3359,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -3004,7 +3407,9 @@ function compareCompletedTargets(summaries) {
                       ? ['image-infos', 'image-upload', 'image-get', 'image-head', 'image-extended-get', 'image-providers', 'image-delete']
                       : flow === 'metadata-search'
                         ? ['metadata-update-primary', 'metadata-update-similar', 'metadata-editor', 'metadata-external-ids', 'metadata-items-search', 'metadata-search-hints', 'metadata-genres', 'metadata-studios', 'metadata-persons', 'metadata-years', 'metadata-similar']
-              : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+                        : flow === 'auth-users'
+                          ? ['auth-users-public', 'auth-users-list', 'auth-providers', 'auth-password-reset-providers', 'auth-user-create', 'auth-created-user-login', 'auth-users-me', 'auth-user-detail', 'auth-user-policy', 'auth-user-configuration', 'auth-keys-list', 'auth-key-create', 'auth-key-system-info', 'auth-key-delete', 'auth-user-logout', 'auth-user-delete']
+                          : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -3100,6 +3505,12 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     }
     return reasons;
   }
+  if (['auth-user-policy', 'auth-user-configuration', 'auth-key-create', 'auth-key-delete', 'auth-user-logout', 'auth-user-delete'].includes(key)) {
+    if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
+      reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
   if (['image-get', 'image-head', 'image-extended-get'].includes(key)) {
     if (upstreamRequest.status !== 200 || jellyrinRequest.status !== 200) {
       reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
@@ -3153,6 +3564,16 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'metadata-persons',
     'metadata-years',
     'metadata-similar',
+    'auth-users-public',
+    'auth-users-list',
+    'auth-providers',
+    'auth-password-reset-providers',
+    'auth-user-create',
+    'auth-created-user-login',
+    'auth-users-me',
+    'auth-user-detail',
+    'auth-keys-list',
+    'auth-key-system-info',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
@@ -3234,6 +3655,16 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'metadata-persons': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
     'metadata-years': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
     'metadata-similar': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'auth-users-public': [],
+    'auth-users-list': ['[].Id', '[].Name', '[].Policy', '[].Configuration'],
+    'auth-providers': [],
+    'auth-password-reset-providers': [],
+    'auth-user-create': ['Id', 'Name', 'Policy', 'Configuration'],
+    'auth-created-user-login': ['AccessToken', 'User', 'User.Id', 'User.Name'],
+    'auth-users-me': ['Id', 'Name'],
+    'auth-user-detail': ['Id', 'Name', 'Policy', 'Configuration'],
+    'auth-keys-list': ['Items', 'TotalRecordCount'],
+    'auth-key-system-info': ['Id', 'ServerName', 'Version', 'StartupWizardCompleted'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -3312,7 +3743,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -3525,6 +3956,31 @@ function invariantFailures(summary) {
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'auth-users') {
+    for (const [field, label] of [
+      ['authUsersPublic200', 'public users'],
+      ['authUsersList200', 'admin users list'],
+      ['authProviders200', 'authentication providers'],
+      ['authPasswordResetProviders200', 'password reset providers'],
+      ['authUserCreated', 'user create'],
+      ['authCreatedUserLogin200', 'created user login'],
+      ['authCreatedUserMe200', 'created user me'],
+      ['authUserDetail200', 'user detail'],
+      ['authUserPolicy204', 'user policy update'],
+      ['authUserConfiguration204', 'user configuration update'],
+      ['authKeysList200', 'API keys list'],
+      ['authKeyCreated', 'API key create'],
+      ['authKeyUsable', 'API key system info'],
+      ['authKeyRevoked', 'API key revoke'],
+      ['authCreatedUserLogout204', 'created user logout'],
+      ['authUserDeleted', 'user delete'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing auth/users ${label} invariant`);
       }
     }
     return failures;
