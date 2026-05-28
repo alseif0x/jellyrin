@@ -111,6 +111,9 @@ struct SyncPlayParticipant {
     user_id: Uuid,
     user_name: String,
     session_id: String,
+    is_ready: bool,
+    is_buffering: bool,
+    last_seen_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone)]
@@ -8766,6 +8769,9 @@ fn syncplay_participant(user: &User, token: &DeviceToken) -> SyncPlayParticipant
         user_id: user.id,
         user_name: user.name.clone(),
         session_id: token.access_token.clone(),
+        is_ready: false,
+        is_buffering: false,
+        last_seen_at: OffsetDateTime::now_utc(),
     }
 }
 
@@ -8778,7 +8784,10 @@ fn syncplay_group_json(group: &SyncPlayGroup) -> serde_json::Value {
                 "UserId": participant.user_id,
                 "UserName": participant.user_name,
                 "SessionId": participant.session_id,
-                "IsGroupOwner": participant.user_id == group.owner_user_id
+                "IsGroupOwner": participant.user_id == group.owner_user_id,
+                "IsReady": participant.is_ready,
+                "IsBuffering": participant.is_buffering,
+                "LastSeenDate": format_time_for_json(participant.last_seen_at)
             })
         })
         .collect::<Vec<_>>();
@@ -8916,7 +8925,25 @@ async fn syncplay_ping(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let now = OffsetDateTime::now_utc();
+    let mut updates = Vec::new();
+    {
+        let mut groups = syncplay_groups().lock().await;
+        for group in groups.values_mut() {
+            if let Some(participant) = group.participants.get_mut(&token.access_token) {
+                participant.last_seen_at = now;
+                group.updated_at = now;
+                updates.push((
+                    syncplay_group_json(group),
+                    group.participants.keys().cloned().collect::<Vec<_>>(),
+                ));
+            }
+        }
+    }
+    for (group_json, participant_session_ids) in updates {
+        broadcast_syncplay_group_update(&participant_session_ids, &group_json, "Ping");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -8937,6 +8964,7 @@ async fn syncplay_group_command(
             .values_mut()
             .find(|group| group.participants.contains_key(&token.access_token))
             .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
+        syncplay_apply_participant_command(group, &token.access_token, &command, &payload, now);
         syncplay_apply_command_to_state(&mut group.state, &command, &payload, now);
         group.updated_at = now;
         (
@@ -8960,6 +8988,43 @@ async fn syncplay_group_command(
         );
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn syncplay_apply_participant_command(
+    group: &mut SyncPlayGroup,
+    session_id: &str,
+    command: &str,
+    payload: &serde_json::Value,
+    now: OffsetDateTime,
+) {
+    let Some(participant) = group.participants.get_mut(session_id) else {
+        return;
+    };
+    participant.last_seen_at = now;
+    match command.to_ascii_lowercase().as_str() {
+        "ready" => {
+            participant.is_ready = payload
+                .get("IsReady")
+                .or_else(|| payload.get("Ready"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            participant.is_buffering = false;
+        }
+        "buffering" => {
+            participant.is_buffering = payload
+                .get("IsBuffering")
+                .or_else(|| payload.get("Buffering"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if participant.is_buffering {
+                participant.is_ready = false;
+            }
+        }
+        "pause" | "unpause" | "seek" | "stop" => {
+            participant.is_buffering = false;
+        }
+        _ => {}
+    }
 }
 
 fn syncplay_apply_command_to_state(
@@ -9019,8 +9084,64 @@ fn syncplay_apply_command_to_state(
                 .filter(|value| value.is_array())
             {
                 object.insert("Queue".to_string(), queue.clone());
+                object.insert(
+                    "QueueVersion".to_string(),
+                    serde_json::json!(now.unix_timestamp_nanos().to_string()),
+                );
             }
             object.insert("PlayState".to_string(), serde_json::json!("Queued"));
+        }
+        "removefromplaylist" => {
+            if let Some(queue) = object
+                .get_mut("Queue")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                if let Some(index) = json_i64_any_field(payload, &["PlaylistItemIndex", "Index"]) {
+                    if index >= 0 && (index as usize) < queue.len() {
+                        queue.remove(index as usize);
+                    }
+                } else if let Some(item_id) =
+                    json_string_any_field(payload, &["PlaylistItemId", "ItemId"])
+                {
+                    queue.retain(|item| !syncplay_queue_item_matches(item, &item_id));
+                }
+            }
+        }
+        "moveplaylistitem" => {
+            let from = json_i64_any_field(payload, &["PlaylistItemIndex", "OldIndex", "FromIndex"]);
+            let to = json_i64_any_field(payload, &["NewIndex", "ToIndex"]);
+            if let (Some(from), Some(to), Some(queue)) = (
+                from,
+                to,
+                object
+                    .get_mut("Queue")
+                    .and_then(serde_json::Value::as_array_mut),
+            ) {
+                if from >= 0
+                    && to >= 0
+                    && (from as usize) < queue.len()
+                    && (to as usize) < queue.len()
+                {
+                    let item = queue.remove(from as usize);
+                    queue.insert(to as usize, item);
+                }
+            }
+        }
+        "nextitem" => {
+            let index = object
+                .get("PlaylistItemIndex")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                + 1;
+            object.insert("PlaylistItemIndex".to_string(), serde_json::json!(index));
+        }
+        "previousitem" => {
+            let index = object
+                .get("PlaylistItemIndex")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                .saturating_sub(1);
+            object.insert("PlaylistItemIndex".to_string(), serde_json::json!(index));
         }
         "setplaylistitem" => {
             if let Some(item_id) = json_string_any_field(payload, &["PlaylistItemId", "ItemId"]) {
@@ -9060,6 +9181,15 @@ fn syncplay_apply_command_to_state(
     }
 }
 
+fn syncplay_queue_item_matches(item: &serde_json::Value, item_id: &str) -> bool {
+    item.as_str().is_some_and(|value| value == item_id)
+        || item
+            .get("Id")
+            .or_else(|| item.get("ItemId"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == item_id)
+}
+
 fn broadcast_syncplay_group_update(
     participant_session_ids: &[String],
     group: &serde_json::Value,
@@ -9072,6 +9202,8 @@ fn broadcast_syncplay_group_update(
                 "MessageType": "SyncPlayGroupUpdate",
                 "Data": {
                     "Reason": reason,
+                    "Command": reason,
+                    "Payload": {},
                     "GroupId": group["GroupId"].clone(),
                     "Group": group.clone()
                 }
@@ -33423,6 +33555,145 @@ mod tests {
         let updated_group: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(updated_group["State"]["LastCommandName"], "Unpause");
         assert_eq!(updated_group["State"]["LastCommand"]["PositionTicks"], 100);
+
+        let mut queue_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/SetNewQueue")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(
+                        json!({
+                            "Items": [
+                                { "Id": "queue-a", "Name": "Queue A" },
+                                { "Id": "queue-b", "Name": "Queue B" }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let queue_event =
+            next_playback_event_type(&mut queue_events, &api_key, "SyncPlayCommand").await;
+        assert_eq!(queue_event["Data"]["Command"], "SetNewQueue");
+        assert_eq!(
+            queue_event["Data"]["Group"]["State"]["Queue"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            queue_event["Data"]["Group"]["State"]["QueueVersion"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+
+        let mut ready_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Ready")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(json!({ "IsReady": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let ready_event =
+            next_playback_event_type(&mut ready_events, &api_key, "SyncPlayCommand").await;
+        let ready_participants = ready_event["Data"]["Group"]["Participants"]
+            .as_array()
+            .unwrap();
+        let ready_owner = ready_participants
+            .iter()
+            .find(|participant| participant["UserName"] == "admin")
+            .unwrap();
+        assert_eq!(ready_owner["IsReady"], true);
+        assert_eq!(ready_owner["IsBuffering"], false);
+
+        let mut buffering_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Buffering")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(json!({ "IsBuffering": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let buffering_event =
+            next_playback_event_type(&mut buffering_events, &api_key, "SyncPlayCommand").await;
+        let buffering_participants = buffering_event["Data"]["Group"]["Participants"]
+            .as_array()
+            .unwrap();
+        let buffering_owner = buffering_participants
+            .iter()
+            .find(|participant| participant["UserName"] == "admin")
+            .unwrap();
+        assert_eq!(buffering_owner["IsReady"], false);
+        assert_eq!(buffering_owner["IsBuffering"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/MovePlaylistItem")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(
+                        json!({ "PlaylistItemIndex": 0, "NewIndex": 1 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/RemoveFromPlaylist")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(json!({ "ItemId": "queue-b" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let queue_group: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            queue_group["State"]["Queue"],
+            json!([{ "Id": "queue-a", "Name": "Queue A" }])
+        );
 
         let response = app
             .clone()

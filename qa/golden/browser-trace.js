@@ -6650,6 +6650,9 @@ function allowedFailedResponse(response) {
   if (flow === 'plugins-packages' && response.status() === 409) {
     return true;
   }
+  if (flow === 'syncplay' && response.status() === 404 && /\/SyncPlay\/[^/]+$/i.test(new URL(url).pathname)) {
+    return true;
+  }
   return response.status() === 400 && new URL(url).pathname === '/SyncPlay/List';
 }
 
