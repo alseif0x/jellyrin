@@ -28,7 +28,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -111,6 +111,14 @@ async function captureTarget(browser, flowDir, target) {
       hlsSegment200: false,
       hlsPlaylistShapes: [],
       hlsSegmentContentTypes: [],
+      adminSystemInfo200: false,
+      adminStorage200: false,
+      adminScheduledTasks200: false,
+      adminActivityLog200: false,
+      adminDevices200: false,
+      adminPlugins200: false,
+      adminRepositories200: false,
+      adminConfigPages200: false,
     },
   };
 
@@ -151,8 +159,10 @@ async function captureTarget(browser, flowDir, target) {
       await runDirectPlayFlow(page, summary, publicInfo, target);
     } else if (flow === 'resume') {
       await runResumeFlow(page, summary, publicInfo, target);
-    } else {
+    } else if (flow === 'transcode-hls') {
       await runTranscodeHlsFlow(page, summary, publicInfo, target);
+    } else {
+      await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
     if (summary.skipped) {
       return summary;
@@ -177,6 +187,39 @@ async function captureTarget(browser, flowDir, target) {
 async function runLoginHomeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+}
+
+async function runAdminDashboardFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/dashboard');
+  await page.waitForLoadState('networkidle');
+
+  const endpoints = [
+    ['System/Info', '/System/Info'],
+    ['System/Info/Storage', '/System/Info/Storage'],
+    ['ScheduledTasks', '/ScheduledTasks?IsEnabled=true'],
+    ['System/ActivityLog/Entries', '/System/ActivityLog/Entries?StartIndex=0&Limit=20'],
+    ['Devices', '/Devices'],
+    ['Plugins', '/Plugins'],
+    ['Repositories', '/Repositories'],
+    ['ConfigurationPages', '/web/ConfigurationPages?EnableInMainMenu=true'],
+  ];
+  for (const [name, url] of endpoints) {
+    const result = await browserFetchJson(page, {
+      method: 'GET',
+      url,
+      token: auth.AccessToken,
+    });
+    if (result.status !== 200) {
+      throw new Error(`${name} returned HTTP ${result.status}`);
+    }
+    if (result.json === null) {
+      throw new Error(`${name} did not return JSON`);
+    }
+  }
+
+  await page.goto(`${summary.baseUrl}/web/#/dashboard`, { waitUntil: 'domcontentloaded' });
   await page.waitForLoadState('networkidle');
 }
 
@@ -677,7 +720,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -731,6 +774,32 @@ function captureFlowInvariants(summary, record, requestPostData) {
       addUnique(summary.invariants.hlsSegmentContentTypes, mediaType(record.responseContentType));
     }
   }
+  if (flow === 'admin-dashboard' && record.status === 200) {
+    if (record.method === 'GET' && pathname === '/System/Info') {
+      summary.invariants.adminSystemInfo200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/Info/Storage') {
+      summary.invariants.adminStorage200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/ScheduledTasks') {
+      summary.invariants.adminScheduledTasks200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/ActivityLog/Entries') {
+      summary.invariants.adminActivityLog200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Devices') {
+      summary.invariants.adminDevices200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Plugins') {
+      summary.invariants.adminPlugins200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Repositories') {
+      summary.invariants.adminRepositories200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/web/ConfigurationPages') {
+      summary.invariants.adminConfigPages200 = true;
+    }
+  }
 }
 
 function criticalRequestKey(record) {
@@ -765,6 +834,30 @@ function criticalRequestKey(record) {
   if (record.method === 'GET' && /\/(?:hls|hls1)\/.*\.(?:ts|mp4|aac|mp3)$/i.test(pathname)) {
     return 'hls-segment';
   }
+  if (record.method === 'GET' && pathname === '/System/Info') {
+    return 'admin-system-info';
+  }
+  if (record.method === 'GET' && pathname === '/System/Info/Storage') {
+    return 'admin-storage';
+  }
+  if (record.method === 'GET' && pathname === '/ScheduledTasks') {
+    return 'admin-scheduled-tasks';
+  }
+  if (record.method === 'GET' && pathname === '/System/ActivityLog/Entries') {
+    return 'admin-activity-log';
+  }
+  if (record.method === 'GET' && pathname === '/Devices') {
+    return 'admin-devices';
+  }
+  if (record.method === 'GET' && pathname === '/Plugins') {
+    return 'admin-plugins';
+  }
+  if (record.method === 'GET' && pathname === '/Repositories') {
+    return 'admin-repositories';
+  }
+  if (record.method === 'GET' && pathname === '/web/ConfigurationPages') {
+    return 'admin-config-pages';
+  }
   return null;
 }
 
@@ -789,7 +882,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -803,7 +896,18 @@ function compareCompletedTargets(summaries) {
     ? ['resume-list', 'sessions-playing-progress']
     : flow === 'transcode-hls'
       ? ['playback-info', 'hls-master', 'hls-media', 'hls-segment']
-      : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+      : flow === 'admin-dashboard'
+        ? [
+            'admin-system-info',
+            'admin-storage',
+            'admin-scheduled-tasks',
+            'admin-activity-log',
+            'admin-devices',
+            'admin-plugins',
+            'admin-repositories',
+            'admin-config-pages',
+          ]
+        : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -840,7 +944,19 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (upstreamRequest.status !== jellyrinRequest.status) {
     reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != ${jellyrinRequest.status}`);
   }
-  if (['item-detail', 'playback-info', 'resume-list'].includes(key)) {
+  if ([
+    'item-detail',
+    'playback-info',
+    'resume-list',
+    'admin-system-info',
+    'admin-storage',
+    'admin-scheduled-tasks',
+    'admin-activity-log',
+    'admin-devices',
+    'admin-plugins',
+    'admin-repositories',
+    'admin-config-pages',
+  ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
     reasons.push(`cross-target ${key}: response shape differs`);
@@ -884,6 +1000,14 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
       'Items.[].UserData.Played',
       'TotalRecordCount',
     ],
+    'admin-system-info': ['ProductName', 'Version', 'ServerName', 'StartupWizardCompleted'],
+    'admin-storage': ['ProgramDataFolder', 'WebFolder', 'CacheFolder', 'LogFolder', 'TranscodingTempFolder'],
+    'admin-scheduled-tasks': ['[].Id', '[].Name', '[].Key', '[].State'],
+    'admin-activity-log': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Date'],
+    'admin-devices': ['Items'],
+    'admin-plugins': [],
+    'admin-repositories': [],
+    'admin-config-pages': [],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -962,7 +1086,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -993,6 +1117,23 @@ function invariantFailures(summary) {
     }
     if (!summary.invariants.hlsSegment200) {
       failures.push('missing HLS segment 200/206 invariant');
+    }
+    return failures;
+  }
+  if (flow === 'admin-dashboard') {
+    for (const [field, label] of [
+      ['adminSystemInfo200', 'System/Info'],
+      ['adminStorage200', 'System/Info/Storage'],
+      ['adminScheduledTasks200', 'ScheduledTasks'],
+      ['adminActivityLog200', 'System/ActivityLog/Entries'],
+      ['adminDevices200', 'Devices'],
+      ['adminPlugins200', 'Plugins'],
+      ['adminRepositories200', 'Repositories'],
+      ['adminConfigPages200', 'web/ConfigurationPages'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing admin ${label} 200 invariant`);
+      }
     }
     return failures;
   }
@@ -1027,6 +1168,7 @@ function ignoredConsoleError(text) {
     'Failed to load resource: the server responded with a status of 400 (Bad Request)',
     'React Router Future Flag Warning',
     'Not initializing chromecast: chrome object is missing',
+    'You rendered descendant <Routes> (or called `useRoutes()`) at "/"',
     'MEDIA_NOT_SUPPORTED',
   ].some((allowed) => text.includes(allowed));
 }
