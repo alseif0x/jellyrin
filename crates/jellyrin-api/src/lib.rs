@@ -7763,6 +7763,11 @@ fn json_string_any_field(payload: &serde_json::Value, keys: &[&str]) -> Option<S
     })
 }
 
+fn json_i64_any_field(payload: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(serde_json::Value::as_i64))
+}
+
 fn syncplay_participant(user: &User, token: &DeviceToken) -> SyncPlayParticipant {
     SyncPlayParticipant {
         user_id: user.id,
@@ -7939,11 +7944,7 @@ async fn syncplay_group_command(
             .values_mut()
             .find(|group| group.participants.contains_key(&token.access_token))
             .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
-        group.state = serde_json::json!({
-            "LastCommand": payload,
-            "LastCommandName": command,
-            "LastCommandDate": format_time_for_json(now)
-        });
+        syncplay_apply_command_to_state(&mut group.state, &command, &payload, now);
         group.updated_at = now;
         (
             group.id.clone(),
@@ -7966,6 +7967,100 @@ async fn syncplay_group_command(
         );
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn syncplay_apply_command_to_state(
+    state: &mut serde_json::Value,
+    command: &str,
+    payload: &serde_json::Value,
+    now: OffsetDateTime,
+) {
+    if !state.is_object() {
+        *state = serde_json::json!({});
+    }
+    let object = state.as_object_mut().expect("syncplay state object");
+    object.insert("LastCommand".to_string(), payload.clone());
+    object.insert(
+        "LastCommandName".to_string(),
+        serde_json::Value::String(command.to_string()),
+    );
+    object.insert(
+        "LastCommandDate".to_string(),
+        serde_json::Value::String(format_time_for_json(now)),
+    );
+
+    if let Some(position_ticks) =
+        json_i64_any_field(payload, &["PositionTicks", "SeekPositionTicks", "NewPositionTicks"])
+    {
+        object.insert("PositionTicks".to_string(), serde_json::json!(position_ticks));
+    }
+
+    match command.to_ascii_lowercase().as_str() {
+        "pause" => {
+            object.insert("IsPaused".to_string(), serde_json::json!(true));
+            object.insert("PlayState".to_string(), serde_json::json!("Paused"));
+        }
+        "unpause" => {
+            object.insert("IsPaused".to_string(), serde_json::json!(false));
+            object.insert("PlayState".to_string(), serde_json::json!("Playing"));
+        }
+        "seek" => {
+            object.insert("PlayState".to_string(), serde_json::json!("Seeking"));
+        }
+        "buffering" => {
+            object.insert("PlayState".to_string(), serde_json::json!("Buffering"));
+        }
+        "stop" => {
+            object.insert("IsPaused".to_string(), serde_json::json!(false));
+            object.insert("PlayState".to_string(), serde_json::json!("Stopped"));
+        }
+        "queue" | "setnewqueue" => {
+            if let Some(queue) = payload
+                .get("Queue")
+                .or_else(|| payload.get("Items"))
+                .or_else(|| payload.get("ItemIds"))
+                .filter(|value| value.is_array())
+            {
+                object.insert("Queue".to_string(), queue.clone());
+            }
+            object.insert("PlayState".to_string(), serde_json::json!("Queued"));
+        }
+        "setplaylistitem" => {
+            if let Some(item_id) = json_string_any_field(payload, &["PlaylistItemId", "ItemId"]) {
+                object.insert("PlaylistItemId".to_string(), serde_json::json!(item_id));
+            }
+            if let Some(index) = json_i64_any_field(payload, &["PlaylistItemIndex", "Index"]) {
+                object.insert("PlaylistItemIndex".to_string(), serde_json::json!(index));
+            }
+        }
+        "setrepeatmode" => {
+            if let Some(mode) = json_string_any_field(payload, &["RepeatMode", "Mode"]) {
+                object.insert("RepeatMode".to_string(), serde_json::json!(mode));
+            }
+        }
+        "setshufflemode" => {
+            if let Some(enabled) = payload
+                .get("ShuffleMode")
+                .or_else(|| payload.get("Shuffle"))
+                .and_then(serde_json::Value::as_bool)
+            {
+                object.insert("ShuffleMode".to_string(), serde_json::json!(enabled));
+            }
+        }
+        "setignorewait" => {
+            if let Some(enabled) = payload
+                .get("IgnoreWait")
+                .or_else(|| payload.get("IgnoreWaitEnabled"))
+                .and_then(serde_json::Value::as_bool)
+            {
+                object.insert("IgnoreWait".to_string(), serde_json::json!(enabled));
+            }
+        }
+        "ready" => {
+            object.insert("IsReady".to_string(), serde_json::json!(true));
+        }
+        _ => {}
+    }
 }
 
 fn broadcast_syncplay_group_update(
@@ -31509,6 +31604,87 @@ mod tests {
             next_playback_event_type(&mut join_guest_events, &guest_key, "SyncPlayGroupUpdate")
                 .await;
         assert_eq!(join_guest_event["Data"]["Reason"], "Join");
+
+        let mut pause_owner_events = subscribe_playback_events();
+        let mut pause_guest_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/syncplay/pause")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(json!({ "PositionTicks": 1_000 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let pause_owner_event =
+            next_playback_event_type(&mut pause_owner_events, &api_key, "SyncPlayCommand").await;
+        let pause_guest_event =
+            next_playback_event_type(&mut pause_guest_events, &guest_key, "SyncPlayCommand").await;
+        for event in [pause_owner_event, pause_guest_event] {
+            assert_eq!(event["Data"]["GroupId"], group_id);
+            assert_eq!(event["Data"]["Command"], "pause");
+            assert_eq!(event["Data"]["Group"]["State"]["IsPaused"], true);
+            assert_eq!(event["Data"]["Group"]["State"]["PlayState"], "Paused");
+            assert_eq!(event["Data"]["Group"]["State"]["PositionTicks"], 1_000);
+        }
+
+        let mut seek_owner_events = subscribe_playback_events();
+        let mut seek_guest_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Seek")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::from(json!({ "SeekPositionTicks": 42_000 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let seek_owner_event =
+            next_playback_event_type(&mut seek_owner_events, &api_key, "SyncPlayCommand").await;
+        let seek_guest_event =
+            next_playback_event_type(&mut seek_guest_events, &guest_key, "SyncPlayCommand").await;
+        for event in [seek_owner_event, seek_guest_event] {
+            assert_eq!(event["Data"]["GroupId"], group_id);
+            assert_eq!(event["Data"]["Command"], "Seek");
+            assert_eq!(event["Data"]["Group"]["State"]["PlayState"], "Seeking");
+            assert_eq!(event["Data"]["Group"]["State"]["PositionTicks"], 42_000);
+        }
+
+        let mut unpause_owner_events = subscribe_playback_events();
+        let mut unpause_guest_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Unpause")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(json!({ "PositionTicks": 42_000 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let unpause_owner_event =
+            next_playback_event_type(&mut unpause_owner_events, &api_key, "SyncPlayCommand").await;
+        let unpause_guest_event =
+            next_playback_event_type(&mut unpause_guest_events, &guest_key, "SyncPlayCommand")
+                .await;
+        for event in [unpause_owner_event, unpause_guest_event] {
+            assert_eq!(event["Data"]["GroupId"], group_id);
+            assert_eq!(event["Data"]["Command"], "Unpause");
+            assert_eq!(event["Data"]["Group"]["State"]["IsPaused"], false);
+            assert_eq!(event["Data"]["Group"]["State"]["PlayState"], "Playing");
+            assert_eq!(event["Data"]["Group"]["State"]["PositionTicks"], 42_000);
+        }
 
         let mut leave_owner_events = subscribe_playback_events();
         let response = app

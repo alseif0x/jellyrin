@@ -258,6 +258,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const metadataSearch = browserTraces.find((trace) => trace.flow === 'metadata-search');
   const authUsers = browserTraces.find((trace) => trace.flow === 'auth-users');
   const sessionsWebsocket = browserTraces.find((trace) => trace.flow === 'sessions-websocket');
+  const syncplay = browserTraces.find((trace) => trace.flow === 'syncplay');
   const pluginsPackages = browserTraces.find((trace) => trace.flow === 'plugins-packages');
   const liveTv = browserTraces.find((trace) => trace.flow === 'live-tv');
   return [
@@ -384,6 +385,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
         : 'missing trace',
     },
     {
+      id: 'browser-syncplay',
+      status: syncplay?.status || 'pending',
+      evidence: syncplay
+        ? `${syncplay.completedTargets.join(',') || 'none'} completed, failed=${syncplay.failed}`
+        : 'missing trace',
+    },
+    {
       id: 'browser-plugins-packages',
       status: pluginsPackages?.status || 'pending',
       evidence: pluginsPackages
@@ -432,7 +440,7 @@ function nextActions(gates, dtoSummary, browserTraces) {
   if (dtoSummary.missingGoldenEvidence > 0 || dtoSummary.partialGolden > 0) {
     actions.push('Close remaining G4 DTO field parity gaps with targeted traces for transcode, activity log and image info.');
   }
-  const missingFlows = ['startup-wizard', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages', 'live-tv']
+  const missingFlows = ['startup-wizard', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv']
     .filter((flow) => !browserTraces.some((trace) => trace.flow === flow));
   if (missingFlows.length > 0) {
     actions.push(`Add browser traces for: ${missingFlows.join(', ')}.`);

@@ -45,6 +45,8 @@ const authUsersFlowPassword = 'JellyrinAuthFlowPassword!2026';
 const authUsersFlowApiKeyApp = 'Jellyrin Auth Flow API Key';
 const sessionsFlowPrefix = 'Jellyrin Sessions Flow User';
 const sessionsFlowPassword = 'JellyrinSessionsFlowPassword!2026';
+const syncplayFlowPrefix = 'Jellyrin SyncPlay Flow User';
+const syncplayFlowPassword = 'JellyrinSyncPlayFlowPassword!2026';
 const pluginsFlowRepositoryName = 'Jellyrin Golden Plugin Repository';
 const pluginsFlowPackageName = 'Jellyrin Golden Plugin';
 const pluginsFlowPackageGuid = '22222222-2222-2222-2222-222222222222';
@@ -76,7 +78,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages', 'live-tv'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -327,6 +329,20 @@ async function captureTarget(browser, flowDir, target) {
       sessionsRemoteStop204: false,
       sessionsRemoteStoppedMessage: false,
       sessionsCleanupConfirmed: false,
+      syncplayTwoClientsOpened: false,
+      syncplayGroupCreated: false,
+      syncplayGuestJoined: false,
+      syncplayList200: false,
+      syncplayGet200: false,
+      syncplayPause204: false,
+      syncplayPauseFanout: false,
+      syncplaySeek204: false,
+      syncplaySeekFanout: false,
+      syncplayUnpause204: false,
+      syncplayUnpauseFanout: false,
+      syncplayGuestLeft: false,
+      syncplayOwnerLeft: false,
+      syncplayCleanupConfirmed: false,
     },
   };
 
@@ -391,6 +407,8 @@ async function captureTarget(browser, flowDir, target) {
       await runAuthUsersFlow(page, summary, publicInfo, target);
     } else if (flow === 'sessions-websocket') {
       await runSessionsWebsocketFlow(page, summary, publicInfo, target);
+    } else if (flow === 'syncplay') {
+      await runSyncPlayFlow(page, summary, publicInfo, target);
     } else if (flow === 'plugins-packages') {
       await runPluginsPackagesFlow(page, summary, publicInfo, target);
     } else if (flow === 'live-tv') {
@@ -865,6 +883,240 @@ async function runSessionsWebsocketFlow(page, summary, publicInfo, target) {
       await browserFetchJson(page, {
         method: 'DELETE',
         url: `/Users/${encodeURIComponent(createdOwnerId)}`,
+        token: admin.AccessToken,
+      }).catch(() => {});
+    }
+  }
+}
+
+async function runSyncPlayFlow(page, summary, publicInfo, target) {
+  const admin = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, admin, '/home');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const guestName = `${syncplayFlowPrefix} Guest ${target.name}`;
+  const groupId = `jellyrin-syncplay-${target.name}-${Date.now()}`;
+  let createdGuestId = null;
+  let guestToken = null;
+
+  async function cleanupExistingUsers() {
+    const users = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/Users',
+      token: admin.AccessToken,
+    });
+    if (users.status !== 200) {
+      throw new Error(`syncplay cleanup user list returned HTTP ${users.status}`);
+    }
+    for (const user of users.json || []) {
+      if (user?.Name === guestName && user.Id) {
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/Users/${encodeURIComponent(user.Id)}`,
+          token: admin.AccessToken,
+        });
+      }
+    }
+  }
+
+  await cleanupExistingUsers();
+
+  try {
+    const createdGuest = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/New',
+      token: admin.AccessToken,
+      body: {
+        Name: guestName,
+        Password: syncplayFlowPassword,
+      },
+    });
+    if (createdGuest.status !== 200 || !createdGuest.json?.Id || createdGuest.json.Name !== guestName) {
+      throw new Error(`syncplay guest Users/New returned HTTP ${createdGuest.status}`);
+    }
+    createdGuestId = createdGuest.json.Id;
+
+    const guestLogin = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/AuthenticateByName',
+      authorization: `MediaBrowser Client="Jellyrin Browser Trace", Device="SyncPlay Guest ${target.name}", DeviceId="syncplay-guest-${target.name}", Version="dev"`,
+      body: {
+        Username: guestName,
+        Pw: syncplayFlowPassword,
+      },
+    });
+    if (guestLogin.status !== 200 || !guestLogin.json?.AccessToken) {
+      throw new Error(`syncplay guest login returned HTTP ${guestLogin.status}`);
+    }
+    guestToken = guestLogin.json.AccessToken;
+
+    await startWebsocketProbe(page, summary.baseUrl, [
+      { name: 'owner', token: admin.AccessToken, deviceId: `syncplay-owner-${target.name}` },
+      { name: 'guest', token: guestToken, deviceId: `syncplay-guest-${target.name}` },
+    ]);
+    await waitForWebsocketMessages(page, [
+      ['owner', 'ForceKeepAlive'],
+      ['guest', 'ForceKeepAlive'],
+    ]);
+    summary.invariants.syncplayTwoClientsOpened = true;
+
+    const createdGroup = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/New',
+      token: admin.AccessToken,
+      body: {
+        GroupId: groupId,
+        Name: `Jellyrin SyncPlay ${target.name}`,
+      },
+    });
+    if (createdGroup.status !== 200 || createdGroup.json?.GroupId !== groupId) {
+      throw new Error(`SyncPlay/New returned HTTP ${createdGroup.status}`);
+    }
+    summary.invariants.syncplayGroupCreated = true;
+
+    const join = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Join',
+      token: guestToken,
+      body: { GroupId: groupId },
+    });
+    if (join.status !== 200 || join.json?.Participants?.length !== 2) {
+      throw new Error(`SyncPlay/Join returned HTTP ${join.status}`);
+    }
+    summary.invariants.syncplayGuestJoined = true;
+
+    const list = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/SyncPlay/List',
+      token: admin.AccessToken,
+    });
+    if (list.status !== 200 || !(list.json || []).some((group) => group.GroupId === groupId)) {
+      throw new Error(`SyncPlay/List did not include created group, HTTP ${list.status}`);
+    }
+    summary.invariants.syncplayList200 = true;
+
+    const getGroup = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/SyncPlay/${encodeURIComponent(groupId)}`,
+      token: admin.AccessToken,
+    });
+    if (getGroup.status !== 200 || getGroup.json?.Participants?.length !== 2) {
+      throw new Error(`SyncPlay/{id} returned HTTP ${getGroup.status}`);
+    }
+    summary.invariants.syncplayGet200 = true;
+
+    const pause = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Pause',
+      token: admin.AccessToken,
+      body: { PositionTicks: 1_000 },
+    });
+    if (![200, 204].includes(pause.status)) {
+      throw new Error(`SyncPlay/Pause returned HTTP ${pause.status}`);
+    }
+    summary.invariants.syncplayPause204 = true;
+    await waitForWebsocketMessages(page, [
+      ['owner', 'SyncPlayCommand'],
+      ['guest', 'SyncPlayCommand'],
+    ]);
+    summary.invariants.syncplayPauseFanout = true;
+
+    const seek = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Seek',
+      token: guestToken,
+      body: { SeekPositionTicks: 42_000 },
+    });
+    if (![200, 204].includes(seek.status)) {
+      throw new Error(`SyncPlay/Seek returned HTTP ${seek.status}`);
+    }
+    summary.invariants.syncplaySeek204 = true;
+    await waitForWebsocketMessages(page, [
+      ['owner', 'SyncPlayCommand'],
+      ['guest', 'SyncPlayCommand'],
+    ], { minimumCount: 2 });
+    summary.invariants.syncplaySeekFanout = true;
+
+    const unpause = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Unpause',
+      token: admin.AccessToken,
+      body: { PositionTicks: 42_000 },
+    });
+    if (![200, 204].includes(unpause.status)) {
+      throw new Error(`SyncPlay/Unpause returned HTTP ${unpause.status}`);
+    }
+    summary.invariants.syncplayUnpause204 = true;
+    await waitForWebsocketMessages(page, [
+      ['owner', 'SyncPlayCommand'],
+      ['guest', 'SyncPlayCommand'],
+    ], { minimumCount: 3 });
+    summary.invariants.syncplayUnpauseFanout = true;
+
+    const stateAfterCommands = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/SyncPlay/${encodeURIComponent(groupId)}`,
+      token: admin.AccessToken,
+    });
+    if (stateAfterCommands.status !== 200 || stateAfterCommands.json?.State?.LastCommandName !== 'Unpause') {
+      throw new Error(`SyncPlay final state returned HTTP ${stateAfterCommands.status}`);
+    }
+
+    const guestLeave = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Leave',
+      token: guestToken,
+    });
+    if (![200, 204].includes(guestLeave.status)) {
+      throw new Error(`SyncPlay/Leave guest returned HTTP ${guestLeave.status}`);
+    }
+    summary.invariants.syncplayGuestLeft = true;
+
+    const ownerLeave = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Leave',
+      token: admin.AccessToken,
+    });
+    if (![200, 204].includes(ownerLeave.status)) {
+      throw new Error(`SyncPlay/Leave owner returned HTTP ${ownerLeave.status}`);
+    }
+    summary.invariants.syncplayOwnerLeft = true;
+
+    const deletedGroup = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/SyncPlay/${encodeURIComponent(groupId)}`,
+      token: admin.AccessToken,
+    });
+    if (deletedGroup.status !== 404) {
+      throw new Error(`SyncPlay group cleanup expected 404, got HTTP ${deletedGroup.status}`);
+    }
+    summary.invariants.syncplayCleanupConfirmed = true;
+
+    await closeWebsocketProbe(page);
+    summary.item = {
+      id: groupId,
+      name: `Jellyrin SyncPlay ${target.name}`,
+      type: 'SyncPlay',
+      user: '<temporary-syncplay-flow-user>',
+    };
+  } finally {
+    await closeWebsocketProbe(page).catch(() => {});
+    if (guestToken) {
+      await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Sessions/Logout',
+        token: guestToken,
+      }).catch(() => {});
+    }
+    await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Leave',
+      token: admin.AccessToken,
+    }).catch(() => {});
+    if (createdGuestId) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Users/${encodeURIComponent(createdGuestId)}`,
         token: admin.AccessToken,
       }).catch(() => {});
     }
@@ -3759,7 +4011,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'plugins-packages', 'live-tv'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -4225,6 +4477,36 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.sessionsRemoteStop204 = true;
     }
   }
+  if (flow === 'syncplay') {
+    if (record.method === 'POST' && pathname === '/SyncPlay/New' && record.status === 200) {
+      summary.invariants.syncplayGroupCreated = true;
+    }
+    if (record.method === 'POST' && pathname === '/SyncPlay/Join' && record.status === 200) {
+      summary.invariants.syncplayGuestJoined = true;
+    }
+    if (record.method === 'GET' && pathname === '/SyncPlay/List' && record.status === 200) {
+      summary.invariants.syncplayList200 = true;
+    }
+    if (record.method === 'GET' && /\/SyncPlay\/[^/]+$/i.test(pathname) && record.status === 200) {
+      summary.invariants.syncplayGet200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/SyncPlay/Pause' && [200, 204].includes(record.status)) {
+      summary.invariants.syncplayPause204 = true;
+    }
+    if (record.method === 'POST' && pathname === '/SyncPlay/Seek' && [200, 204].includes(record.status)) {
+      summary.invariants.syncplaySeek204 = true;
+    }
+    if (record.method === 'POST' && pathname === '/SyncPlay/Unpause' && [200, 204].includes(record.status)) {
+      summary.invariants.syncplayUnpause204 = true;
+    }
+    if (record.method === 'POST' && pathname === '/SyncPlay/Leave' && [200, 204].includes(record.status)) {
+      if (!summary.invariants.syncplayGuestLeft) {
+        summary.invariants.syncplayGuestLeft = true;
+      } else {
+        summary.invariants.syncplayOwnerLeft = true;
+      }
+    }
+  }
 }
 
 function criticalRequestKey(record, requestPostData) {
@@ -4261,6 +4543,27 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'live-tv' && record.method === 'POST' && pathname === '/LiveTv/Timers') {
     return 'live-tv-timer-create';
+  }
+  if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/New') {
+    return 'syncplay-new';
+  }
+  if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Join') {
+    return 'syncplay-join';
+  }
+  if (flow === 'syncplay' && record.method === 'GET' && pathname === '/SyncPlay/List') {
+    return 'syncplay-list';
+  }
+  if (flow === 'syncplay' && record.method === 'GET' && /\/SyncPlay\/[^/]+$/i.test(pathname)) {
+    return 'syncplay-get';
+  }
+  if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Pause') {
+    return 'syncplay-pause';
+  }
+  if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Seek') {
+    return 'syncplay-seek';
+  }
+  if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Unpause') {
+    return 'syncplay-unpause';
   }
   if (flow === 'auth-users' && record.method === 'GET' && pathname === '/Users/Public') {
     return 'auth-users-public';
@@ -4593,7 +4896,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -4647,6 +4950,8 @@ function compareCompletedTargets(summaries) {
                           ? ['auth-users-public', 'auth-users-list', 'auth-providers', 'auth-password-reset-providers', 'auth-user-create', 'auth-created-user-login', 'auth-users-me', 'auth-user-detail', 'auth-user-policy', 'auth-user-configuration', 'auth-keys-list', 'auth-key-create', 'auth-key-system-info', 'auth-key-delete', 'auth-user-logout', 'auth-user-delete']
                           : flow === 'sessions-websocket'
                             ? ['sessions-list', 'sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop']
+                            : flow === 'syncplay'
+                              ? ['syncplay-new', 'syncplay-join', 'syncplay-list', 'syncplay-get', 'syncplay-pause', 'syncplay-seek', 'syncplay-unpause']
                             : flow === 'plugins-packages'
                               ? ['plugins-list', 'plugin-repositories', 'plugin-packages']
                               : flow === 'live-tv'
@@ -5003,7 +5308,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -5338,6 +5643,30 @@ function invariantFailures(summary) {
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing sessions/websocket ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'syncplay') {
+    for (const [field, label] of [
+      ['websocketKeepAlive', 'ForceKeepAlive/KeepAlive'],
+      ['syncplayTwoClientsOpened', 'two websocket clients'],
+      ['syncplayGroupCreated', 'group create'],
+      ['syncplayGuestJoined', 'guest join'],
+      ['syncplayList200', 'group list'],
+      ['syncplayGet200', 'group detail'],
+      ['syncplayPause204', 'pause command'],
+      ['syncplayPauseFanout', 'pause fanout'],
+      ['syncplaySeek204', 'seek command'],
+      ['syncplaySeekFanout', 'seek fanout'],
+      ['syncplayUnpause204', 'unpause command'],
+      ['syncplayUnpauseFanout', 'unpause fanout'],
+      ['syncplayGuestLeft', 'guest leave'],
+      ['syncplayOwnerLeft', 'owner leave'],
+      ['syncplayCleanupConfirmed', 'group cleanup'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing SyncPlay ${label} invariant`);
       }
     }
     return failures;
