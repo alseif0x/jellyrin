@@ -78,7 +78,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -371,6 +371,12 @@ async function captureTarget(browser, flowDir, target) {
       scheduledTasksTriggers204: false,
       scheduledTasksLibraryRefresh204: false,
       scheduledTasksActivityLogged: false,
+      backupList200: false,
+      backupCreated: false,
+      backupSnapshotSummary: false,
+      backupManifest200: false,
+      backupRestored: false,
+      backupActivityLogged: false,
     },
   };
 
@@ -447,6 +453,8 @@ async function captureTarget(browser, flowDir, target) {
       await runNonWebClientFlow(page, summary, publicInfo, target);
     } else if (flow === 'scheduled-tasks') {
       await runScheduledTasksFlow(page, summary, publicInfo, target);
+    } else if (flow === 'backup-restore') {
+      await runBackupRestoreFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -3053,6 +3061,87 @@ async function runScheduledTasksFlow(page, summary, publicInfo, target) {
   }
 }
 
+async function runBackupRestoreFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/dashboard/general');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const backups = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Backup',
+    token: auth.AccessToken,
+  });
+  if (backups.status !== 200 || !Array.isArray(backups.json)) {
+    throw new Error(`Backup list returned HTTP ${backups.status}`);
+  }
+  summary.invariants.backupList200 = true;
+
+  const created = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Backup/Create',
+    token: auth.AccessToken,
+    body: {
+      Metadata: true,
+      Database: true,
+      Subtitles: false,
+      Trickplay: false,
+    },
+  });
+  if (created.status !== 200 || !created.json?.Path) {
+    throw new Error(`Backup/Create returned HTTP ${created.status}`);
+  }
+  summary.invariants.backupCreated = true;
+  if (
+    created.json.SnapshotSummary?.HasRestoreData !== true
+    || typeof created.json.SnapshotSummary?.Users !== 'number'
+    || typeof created.json.SnapshotSummary?.VirtualFolders !== 'number'
+    || created.json.SnapshotSummary?.FilesMode !== 'metadata-only'
+    || created.json.SnapshotSummary?.PluginsMode !== 'configuration-only'
+  ) {
+    throw new Error('Backup/Create did not include the expected snapshot summary');
+  }
+  summary.invariants.backupSnapshotSummary = true;
+
+  const manifest = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Backup/Manifest?path=${encodeURIComponent(created.json.Path)}`,
+    token: auth.AccessToken,
+  });
+  if (manifest.status !== 200 || manifest.json?.Path !== created.json.Path) {
+    throw new Error(`Backup/Manifest returned HTTP ${manifest.status}`);
+  }
+  summary.invariants.backupManifest200 = true;
+
+  const restore = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Backup/Restore',
+    token: auth.AccessToken,
+    body: {
+      ArchiveFileName: created.json.Path,
+    },
+  });
+  if (![200, 204].includes(restore.status)) {
+    throw new Error(`Backup/Restore returned HTTP ${restore.status}`);
+  }
+  summary.invariants.backupRestored = true;
+
+  const activity = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/System/ActivityLog/Entries?Limit=20',
+    token: auth.AccessToken,
+  });
+  if (activity.status !== 200 || !activity.json?.Items?.some((entry) => entry.Name === 'Backup restored')) {
+    throw new Error(`ActivityLog did not include Backup restored, HTTP ${activity.status}`);
+  }
+  summary.invariants.backupActivityLogged = true;
+
+  summary.item = {
+    id: created.json.Path,
+    name: created.json.Path,
+    type: 'BackupManifest',
+  };
+}
+
 async function runLiveTvFlow(page, summary, publicInfo, target) {
   await ensureLiveTvFixtures();
   const auth = await authenticateTarget(page, summary, target);
@@ -4471,7 +4560,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -4983,6 +5072,24 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.scheduledTasksActivityLogged = true;
     }
   }
+  if (flow === 'backup-restore') {
+    if (record.method === 'GET' && pathname === '/Backup' && record.status === 200) {
+      summary.invariants.backupList200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Backup/Create' && record.status === 200) {
+      summary.invariants.backupCreated = true;
+      summary.invariants.backupSnapshotSummary = true;
+    }
+    if (record.method === 'GET' && pathname === '/Backup/Manifest' && record.status === 200) {
+      summary.invariants.backupManifest200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Backup/Restore' && [200, 204].includes(record.status)) {
+      summary.invariants.backupRestored = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/ActivityLog/Entries' && record.status === 200) {
+      summary.invariants.backupActivityLogged = true;
+    }
+  }
   if (flow === 'sessions-websocket') {
     if (record.method === 'GET' && pathname === '/Sessions' && record.status === 200) {
       summary.invariants.sessionsList200 = true;
@@ -5133,6 +5240,21 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'scheduled-tasks' && record.method === 'GET' && pathname === '/System/ActivityLog/Entries') {
     return 'scheduled-tasks-activity-log';
+  }
+  if (flow === 'backup-restore' && record.method === 'GET' && pathname === '/Backup') {
+    return 'backup-list';
+  }
+  if (flow === 'backup-restore' && record.method === 'POST' && pathname === '/Backup/Create') {
+    return 'backup-create';
+  }
+  if (flow === 'backup-restore' && record.method === 'GET' && pathname === '/Backup/Manifest') {
+    return 'backup-manifest';
+  }
+  if (flow === 'backup-restore' && record.method === 'POST' && pathname === '/Backup/Restore') {
+    return 'backup-restore';
+  }
+  if (flow === 'backup-restore' && record.method === 'GET' && pathname === '/System/ActivityLog/Entries') {
+    return 'backup-activity-log';
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/New') {
     return 'syncplay-new';
@@ -5486,7 +5608,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -5552,6 +5674,8 @@ function compareCompletedTargets(summaries) {
                                     ? ['non-web-system-info', 'non-web-views', 'non-web-playback-info', 'non-web-video-stream', 'non-web-progress', 'non-web-resume']
                                     : flow === 'scheduled-tasks'
                                       ? ['scheduled-tasks-list', 'scheduled-tasks-detail', 'scheduled-tasks-start', 'scheduled-tasks-cancel', 'scheduled-tasks-triggers', 'scheduled-tasks-library-refresh', 'scheduled-tasks-activity-log']
+                                      : flow === 'backup-restore'
+                                        ? ['backup-list', 'backup-create', 'backup-manifest', 'backup-restore', 'backup-activity-log']
                               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -5904,7 +6028,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -6327,6 +6451,21 @@ function invariantFailures(summary) {
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing scheduled-tasks ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'backup-restore') {
+    for (const [field, label] of [
+      ['backupList200', 'backup list'],
+      ['backupCreated', 'backup create'],
+      ['backupSnapshotSummary', 'snapshot summary'],
+      ['backupManifest200', 'backup manifest'],
+      ['backupRestored', 'backup restore'],
+      ['backupActivityLogged', 'activity log'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing backup-restore ${label} invariant`);
       }
     }
     return failures;

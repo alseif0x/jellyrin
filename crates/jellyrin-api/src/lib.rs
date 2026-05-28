@@ -3055,7 +3055,12 @@ async fn backup_restore_snapshot_json(db: &Database) -> Result<serde_json::Value
         "SystemConfigurationPayloads": system_configuration_payloads_backup_json(
             db.system_configuration_payloads().await?
         ),
-        "BrandingConfiguration": branding_backup_json(db.branding_config().await?)
+        "BrandingConfiguration": branding_backup_json(db.branding_config().await?),
+        "Users": backup_users_json(db.users().await?),
+        "VirtualFolders": backup_virtual_folders_json(db.virtual_folders().await?),
+        "MediaMetadata": backup_media_metadata_json(db).await?,
+        "Files": backup_files_decision_json(),
+        "Plugins": backup_plugins_decision_json()
     }))
 }
 
@@ -3087,6 +3092,9 @@ async fn restore_backup_data(db: &Database, snapshot: &serde_json::Value) -> Res
     .await?;
     db.update_branding_config(branding_from_backup(branding)?)
         .await?;
+    restore_users_from_backup(db, snapshot.get("Users")).await?;
+    restore_virtual_folders_from_backup(db, snapshot.get("VirtualFolders")).await?;
+    restore_media_metadata_from_backup(db, snapshot.get("MediaMetadata")).await?;
     Ok(())
 }
 
@@ -3148,6 +3156,268 @@ fn branding_from_backup(value: &serde_json::Value) -> Result<BrandingConfig, Api
     })
 }
 
+fn backup_users_json(users: Vec<User>) -> serde_json::Value {
+    serde_json::json!(
+        users
+            .into_iter()
+            .map(|user| {
+                serde_json::json!({
+                    "Name": user.name,
+                    "IsAdministrator": user.is_administrator,
+                    "IsDisabled": user.is_disabled
+                })
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
+fn backup_virtual_folders_json(folders: Vec<VirtualFolder>) -> serde_json::Value {
+    serde_json::json!(
+        folders
+            .into_iter()
+            .map(|folder| {
+                serde_json::json!({
+                    "Name": folder.name,
+                    "CollectionType": folder.collection_type,
+                    "Locations": folder.locations
+                })
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
+async fn backup_media_metadata_json(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let items_by_id = db
+        .media_items()
+        .await?
+        .into_iter()
+        .map(|item| (item.id, item))
+        .collect::<HashMap<_, _>>();
+    let mut metadata = Vec::new();
+    for item_metadata in db.media_item_metadata().await? {
+        let Some(item) = items_by_id.get(&item_metadata.item_id) else {
+            continue;
+        };
+        metadata.push(serde_json::json!({
+            "Path": item.path,
+            "Name": item.name,
+            "Metadata": item_metadata.payload
+        }));
+    }
+    Ok(serde_json::json!(metadata))
+}
+
+fn backup_files_decision_json() -> serde_json::Value {
+    serde_json::json!({
+        "Mode": "metadata-only",
+        "Supported": false,
+        "Reason": "Backup stores media paths and metadata references; media/image bytes are not copied by this engine version."
+    })
+}
+
+fn backup_plugins_decision_json() -> serde_json::Value {
+    serde_json::json!({
+        "Mode": "configuration-only",
+        "Supported": false,
+        "Reason": "Plugin package binaries are not restored; repository configuration is covered by SystemConfigurationPayloads.PluginRepositories."
+    })
+}
+
+async fn restore_users_from_backup(
+    db: &Database,
+    value: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let users = value
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request("Backup users must be an array"))?;
+    if users.is_empty() {
+        return Err(ApiError::bad_request(
+            "Backup users must contain at least one administrator",
+        ));
+    }
+    let mut restored_profiles = Vec::new();
+    for user in users {
+        let object = user
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Backup user entry must be an object"))?;
+        let name = object
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ApiError::bad_request("Backup user entry is missing Name"))?;
+        let is_administrator = object
+            .get("IsAdministrator")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let is_disabled = object
+            .get("IsDisabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        restored_profiles.push((name.to_string(), is_administrator, is_disabled));
+    }
+    if !restored_profiles
+        .iter()
+        .any(|(_, is_administrator, is_disabled)| *is_administrator && !*is_disabled)
+    {
+        return Err(ApiError::bad_request(
+            "Backup users must contain at least one enabled administrator",
+        ));
+    }
+
+    let mut existing_by_name = db
+        .users()
+        .await?
+        .into_iter()
+        .map(|user| (user.name.to_lowercase(), user))
+        .collect::<HashMap<_, _>>();
+    for (name, is_administrator, is_disabled) in restored_profiles {
+        let key = name.to_lowercase();
+        let user = if let Some(existing) = existing_by_name.get(&key) {
+            existing.clone()
+        } else {
+            let created = db.create_user(&name, None).await?;
+            existing_by_name.insert(key, created.clone());
+            created
+        };
+        db.update_user_profile(user.id, &name, is_administrator, is_disabled)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn restore_virtual_folders_from_backup(
+    db: &Database,
+    value: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let folders = value
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request("Backup virtual folders must be an array"))?;
+    for folder in folders {
+        let object = folder
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Backup virtual folder entry must be an object"))?;
+        let name = object
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| ApiError::bad_request("Backup virtual folder is missing Name"))?;
+        let collection_type = object
+            .get("CollectionType")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let locations = object
+            .get("Locations")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| ApiError::bad_request("Backup virtual folder is missing Locations"))?;
+        let mut restored_locations = Vec::new();
+        for location in locations {
+            let location = location
+                .as_str()
+                .map(str::trim)
+                .filter(|location| !location.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_request("Backup virtual folder location must be a string")
+                })?;
+            if !backup_restore_path_is_safe(location) {
+                return Err(ApiError::bad_request(format!(
+                    "Backup virtual folder location is not safe to restore: {location}"
+                )));
+            }
+            restored_locations.push(location.to_string());
+        }
+        db.upsert_virtual_folder(name, collection_type, restored_locations)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn restore_media_metadata_from_backup(
+    db: &Database,
+    value: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request("Backup media metadata must be an array"))?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    scan_all_library_items(db).await?;
+    let items_by_path = db
+        .media_items()
+        .await?
+        .into_iter()
+        .map(|item| (item.path.clone(), item))
+        .collect::<HashMap<_, _>>();
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Backup media metadata entry must be an object"))?;
+        let path = object
+            .get("Path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| ApiError::bad_request("Backup media metadata entry is missing Path"))?;
+        if !backup_restore_path_is_safe(path) {
+            return Err(ApiError::bad_request(format!(
+                "Backup media metadata path is not safe to restore: {path}"
+            )));
+        }
+        let metadata = object
+            .get("Metadata")
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("Backup media metadata entry is missing Metadata"))?;
+        if let Some(item) = items_by_path.get(path) {
+            db.update_media_item_metadata(item.id, metadata).await?;
+        }
+    }
+    Ok(())
+}
+
+fn backup_restore_path_is_safe(path: &str) -> bool {
+    let path = FsPath::new(path);
+    if !path.is_absolute() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    if path.parent().is_none() {
+        return false;
+    }
+    let dangerous_roots = [
+        FsPath::new("/bin"),
+        FsPath::new("/boot"),
+        FsPath::new("/dev"),
+        FsPath::new("/etc"),
+        FsPath::new("/proc"),
+        FsPath::new("/root"),
+        FsPath::new("/run"),
+        FsPath::new("/sbin"),
+        FsPath::new("/sys"),
+        FsPath::new("/usr"),
+        FsPath::new("/var"),
+    ];
+    !dangerous_roots
+        .iter()
+        .any(|dangerous_root| path.starts_with(dangerous_root))
+}
+
 fn required_backup_value(
     value: &serde_json::Value,
     field: &str,
@@ -3164,7 +3434,41 @@ fn backup_manifest_json(manifest: &BackupManifest) -> serde_json::Value {
         "BackupEngineVersion": manifest.backup_engine_version,
         "DateCreated": format_time_for_json(manifest.created_at),
         "Path": manifest.path,
-        "Options": manifest.options
+        "Options": manifest.options,
+        "SnapshotSummary": backup_snapshot_summary_json(manifest.restore_snapshot.as_ref())
+    })
+}
+
+fn backup_snapshot_summary_json(snapshot: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(snapshot) = snapshot else {
+        return serde_json::json!({
+            "HasRestoreData": false
+        });
+    };
+    serde_json::json!({
+        "HasRestoreData": true,
+        "Users": snapshot
+            .get("Users")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "VirtualFolders": snapshot
+            .get("VirtualFolders")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "MediaMetadata": snapshot
+            .get("MediaMetadata")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "FilesMode": snapshot
+            .get("Files")
+            .and_then(|files| files.get("Mode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        "PluginsMode": snapshot
+            .get("Plugins")
+            .and_then(|plugins| plugins.get("Mode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
     })
 }
 
@@ -23819,14 +24123,15 @@ mod tests {
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, SystemLifecycleCommand,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
-        encoding_configuration_json, hls_transcode_dedupe_key, json_value_i64,
-        last_system_lifecycle_command, load_countries, load_cultures, media_item_by_id,
-        media_item_streams, package_install_task_key, parse_authorization_token,
-        parse_jellyfin_uuid, parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs,
-        parse_media_browser_pairs, reconcile_transcode_sessions_on_startup, router,
-        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
-        subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        encoding_configuration_json, backup_restore_snapshot_json, hls_transcode_dedupe_key,
+        json_value_i64, last_system_lifecycle_command, load_countries, load_cultures,
+        media_item_by_id, media_item_streams, package_install_task_key,
+        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_m3u_channels,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
+        stable_entity_id, subscribe_playback_events, subscribe_system_lifecycle_commands,
+        syncplay_groups, transcode_dedupe_lock, transcode_temp_root, trickplay_settings,
+        trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -24529,6 +24834,39 @@ mod tests {
         })
         .await
         .unwrap();
+        let guest = db.create_user("Guest", None).await.unwrap();
+        db.update_user_profile(guest.id, "Guest", false, true)
+            .await
+            .unwrap();
+        let media_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(media_root.path().join("Snapshot Movie.mp4"), b"snapshot")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Snapshot Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let snapshot_movie = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "Snapshot Movie")
+            .unwrap();
+        db.update_media_item_metadata(
+            snapshot_movie.id,
+            json!({
+                "ProviderIds": { "Imdb": "tt0000001" },
+                "Overview": "Snapshot overview"
+            }),
+        )
+        .await
+        .unwrap();
         let db_for_assertions = db.clone();
         let app = router(AppState {
             db,
@@ -24598,6 +24936,12 @@ mod tests {
         assert_eq!(created["Options"]["Subtitles"], false);
         assert_eq!(created["Options"]["Database"], true);
         assert!(created["Options"].get("RestoreData").is_none());
+        assert_eq!(created["SnapshotSummary"]["HasRestoreData"], true);
+        assert_eq!(created["SnapshotSummary"]["Users"], 2);
+        assert_eq!(created["SnapshotSummary"]["VirtualFolders"], 1);
+        assert_eq!(created["SnapshotSummary"]["MediaMetadata"], 1);
+        assert_eq!(created["SnapshotSummary"]["FilesMode"], "metadata-only");
+        assert_eq!(created["SnapshotSummary"]["PluginsMode"], "configuration-only");
 
         let response = app
             .clone()
@@ -24751,6 +25095,51 @@ mod tests {
             })
             .await
             .unwrap();
+        db_for_assertions
+            .update_user_profile(guest.id, "Guest", true, false)
+            .await
+            .unwrap();
+        db_for_assertions
+            .upsert_virtual_folder(
+                "Snapshot Movies",
+                Some("tvshows"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db_for_assertions
+            .update_media_item_metadata(
+                snapshot_movie.id,
+                json!({
+                    "ProviderIds": { "Tmdb": "changed" },
+                    "Overview": "Changed overview"
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut unsafe_snapshot = backup_restore_snapshot_json(&db_for_assertions).await.unwrap();
+        unsafe_snapshot["VirtualFolders"][0]["Locations"] = json!(["/etc"]);
+        let unsafe_manifest = db_for_assertions
+            .create_backup_manifest("12.0.0", "1", json!({}), Some(unsafe_snapshot))
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/backup/restore")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ArchiveFileName": unsafe_manifest.path }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .oneshot(
@@ -24790,6 +25179,35 @@ mod tests {
             Some(".snapshot { color: green; }")
         );
         assert!(restored_branding.splashscreen_enabled);
+        let restored_guest = db_for_assertions
+            .users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.name == "Guest")
+            .unwrap();
+        assert!(!restored_guest.is_administrator);
+        assert!(restored_guest.is_disabled);
+        let restored_folder = db_for_assertions
+            .virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.name == "Snapshot Movies")
+            .unwrap();
+        assert_eq!(restored_folder.collection_type.as_deref(), Some("movies"));
+        assert_eq!(
+            restored_folder.locations,
+            vec![media_root.path().to_string_lossy().to_string()]
+        );
+        let restored_metadata = db_for_assertions.media_item_metadata().await.unwrap();
+        assert!(
+            restored_metadata
+                .iter()
+                .any(|metadata| metadata.item_id == snapshot_movie.id
+                    && metadata.payload["ProviderIds"]["Imdb"] == "tt0000001"
+                    && metadata.payload["Overview"] == "Snapshot overview")
+        );
     }
 
     #[tokio::test]
