@@ -78,7 +78,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore', 'migration-import'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -377,6 +377,12 @@ async function captureTarget(browser, flowDir, target) {
       backupManifest200: false,
       backupRestored: false,
       backupActivityLogged: false,
+      migrationDryRun200: false,
+      migrationReadOnlyPolicy: false,
+      migrationImport200: false,
+      migrationBackupCreated: false,
+      migrationRollbackDocumented: false,
+      migrationActivityLogged: false,
     },
   };
 
@@ -455,6 +461,8 @@ async function captureTarget(browser, flowDir, target) {
       await runScheduledTasksFlow(page, summary, publicInfo, target);
     } else if (flow === 'backup-restore') {
       await runBackupRestoreFlow(page, summary, publicInfo, target);
+    } else if (flow === 'migration-import') {
+      await runMigrationImportFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -3142,6 +3150,80 @@ async function runBackupRestoreFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runMigrationImportFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/dashboard/general');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  const payload = {
+    SourceName: `jellyfin-golden-${target.name}`,
+    Data: {
+      Users: [],
+      Libraries: [],
+      Media: [],
+      UserData: [],
+      Playlists: [],
+      Collections: [],
+      TaskHistory: [{ Name: 'RefreshLibrary' }],
+      Transcodes: [{ PlaySessionId: 'runtime-only' }],
+      PackageState: [{ Name: 'ExamplePlugin' }],
+    },
+  };
+
+  const dryRun = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Migration/Jellyfin/DryRun',
+    token: auth.AccessToken,
+    body: payload,
+  });
+  if (dryRun.status !== 200 || dryRun.json?.DryRun !== true) {
+    throw new Error(`Migration/Jellyfin/DryRun returned HTTP ${dryRun.status}`);
+  }
+  summary.invariants.migrationDryRun200 = true;
+  if (
+    dryRun.json.SourcePolicy?.OriginalDatabaseMutation !== 'never'
+    || dryRun.json.SourcePolicy?.BackupRequired !== true
+  ) {
+    throw new Error('Migration dry-run did not expose read-only source and backup policy');
+  }
+  summary.invariants.migrationReadOnlyPolicy = true;
+
+  const imported = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Migration/Jellyfin/Import',
+    token: auth.AccessToken,
+    body: payload,
+  });
+  if (imported.status !== 200 || imported.json?.Applied !== true) {
+    throw new Error(`Migration/Jellyfin/Import returned HTTP ${imported.status}`);
+  }
+  summary.invariants.migrationImport200 = true;
+  if (!imported.json.SourcePolicy?.BackupPath) {
+    throw new Error('Migration import did not create a pre-import backup');
+  }
+  summary.invariants.migrationBackupCreated = true;
+  if (imported.json.Rollback?.Automatic !== false || !imported.json.Rollback?.Procedure) {
+    throw new Error('Migration import did not document rollback');
+  }
+  summary.invariants.migrationRollbackDocumented = true;
+
+  const activity = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/System/ActivityLog/Entries?Limit=20',
+    token: auth.AccessToken,
+  });
+  if (activity.status !== 200 || !activity.json?.Items?.some((entry) => entry.Name === 'Jellyfin migration imported')) {
+    throw new Error(`ActivityLog did not include Jellyfin migration imported, HTTP ${activity.status}`);
+  }
+  summary.invariants.migrationActivityLogged = true;
+
+  summary.item = {
+    id: imported.json.SourcePolicy.BackupPath,
+    name: payload.SourceName,
+    type: 'JellyfinMigration',
+  };
+}
+
 async function runLiveTvFlow(page, summary, publicInfo, target) {
   await ensureLiveTvFixtures();
   const auth = await authenticateTarget(page, summary, target);
@@ -4560,7 +4642,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore', 'migration-import'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -5090,6 +5172,20 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.backupActivityLogged = true;
     }
   }
+  if (flow === 'migration-import') {
+    if (record.method === 'POST' && pathname === '/Migration/Jellyfin/DryRun' && record.status === 200) {
+      summary.invariants.migrationDryRun200 = true;
+      summary.invariants.migrationReadOnlyPolicy = true;
+    }
+    if (record.method === 'POST' && pathname === '/Migration/Jellyfin/Import' && record.status === 200) {
+      summary.invariants.migrationImport200 = true;
+      summary.invariants.migrationBackupCreated = true;
+      summary.invariants.migrationRollbackDocumented = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/ActivityLog/Entries' && record.status === 200) {
+      summary.invariants.migrationActivityLogged = true;
+    }
+  }
   if (flow === 'sessions-websocket') {
     if (record.method === 'GET' && pathname === '/Sessions' && record.status === 200) {
       summary.invariants.sessionsList200 = true;
@@ -5255,6 +5351,15 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'backup-restore' && record.method === 'GET' && pathname === '/System/ActivityLog/Entries') {
     return 'backup-activity-log';
+  }
+  if (flow === 'migration-import' && record.method === 'POST' && pathname === '/Migration/Jellyfin/DryRun') {
+    return 'migration-dry-run';
+  }
+  if (flow === 'migration-import' && record.method === 'POST' && pathname === '/Migration/Jellyfin/Import') {
+    return 'migration-import';
+  }
+  if (flow === 'migration-import' && record.method === 'GET' && pathname === '/System/ActivityLog/Entries') {
+    return 'migration-activity-log';
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/New') {
     return 'syncplay-new';
@@ -5608,7 +5713,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore', 'migration-import'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -5676,6 +5781,8 @@ function compareCompletedTargets(summaries) {
                                       ? ['scheduled-tasks-list', 'scheduled-tasks-detail', 'scheduled-tasks-start', 'scheduled-tasks-cancel', 'scheduled-tasks-triggers', 'scheduled-tasks-library-refresh', 'scheduled-tasks-activity-log']
                                       : flow === 'backup-restore'
                                         ? ['backup-list', 'backup-create', 'backup-manifest', 'backup-restore', 'backup-activity-log']
+                                        : flow === 'migration-import'
+                                          ? ['migration-dry-run', 'migration-import', 'migration-activity-log']
                               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -6028,7 +6135,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore', 'migration-import'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -6466,6 +6573,21 @@ function invariantFailures(summary) {
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing backup-restore ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'migration-import') {
+    for (const [field, label] of [
+      ['migrationDryRun200', 'dry-run'],
+      ['migrationReadOnlyPolicy', 'read-only source policy'],
+      ['migrationImport200', 'import'],
+      ['migrationBackupCreated', 'backup'],
+      ['migrationRollbackDocumented', 'rollback'],
+      ['migrationActivityLogged', 'activity log'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing migration-import ${label} invariant`);
       }
     }
     return failures;

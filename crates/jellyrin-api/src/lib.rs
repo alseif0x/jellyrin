@@ -138,6 +138,10 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/manifest", get(backup_manifest))
         .route("/Backup/Restore", post(restore_backup))
         .route("/backup/restore", post(restore_backup))
+        .route("/Migration/Jellyfin/DryRun", post(jellyfin_migration_dry_run))
+        .route("/migration/jellyfin/dryrun", post(jellyfin_migration_dry_run))
+        .route("/Migration/Jellyfin/Import", post(jellyfin_migration_import))
+        .route("/migration/jellyfin/import", post(jellyfin_migration_import))
         .route("/System/Info/Storage", get(system_storage))
         .route("/system/info/storage", get(system_storage))
         .route("/System/Logs", get(system_logs))
@@ -2948,6 +2952,14 @@ struct BackupRestoreBody {
     archive_file_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct JellyfinMigrationBody {
+    #[serde(alias = "SourceName")]
+    source_name: Option<String>,
+    #[serde(alias = "Data")]
+    data: serde_json::Value,
+}
+
 async fn backups(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3031,6 +3043,54 @@ async fn restore_backup(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn jellyfin_migration_dry_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<JellyfinMigrationBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let report = analyze_jellyfin_migration(&state.db, &payload).await?;
+    Ok(Json(report.json(None)))
+}
+
+async fn jellyfin_migration_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<JellyfinMigrationBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let backup_snapshot = backup_restore_snapshot_json(&state.db).await?;
+    let backup = state
+        .db
+        .create_backup_manifest(
+            COMPATIBLE_SERVER_VERSION,
+            "1",
+            serde_json::json!({
+                "Database": true,
+                "Metadata": true,
+                "Reason": "Pre-migration safety backup"
+            }),
+            Some(backup_snapshot),
+        )
+        .await?;
+    let mut report = apply_jellyfin_migration(&state.db, &payload).await?;
+    record_activity(
+        &state.db,
+        "Jellyfin migration imported",
+        Some(&format!(
+            "Jellyfin migration import completed after safety backup {}.",
+            backup.path
+        )),
+        "System",
+        Some(user.id),
+    )
+    .await?;
+    report.applied = true;
+    Ok(Json(report.json(Some(&backup.path))))
 }
 
 fn backup_options_json(payload: Option<BackupOptionsBody>) -> serde_json::Value {
@@ -3470,6 +3530,489 @@ fn backup_snapshot_summary_json(snapshot: Option<&serde_json::Value>) -> serde_j
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
     })
+}
+
+#[derive(Debug, Default)]
+struct JellyfinMigrationReport {
+    source_name: String,
+    applied: bool,
+    users: usize,
+    libraries: usize,
+    media_metadata: usize,
+    user_data: usize,
+    playlists: usize,
+    collections: usize,
+    scanned_items: usize,
+    imported_users: usize,
+    imported_libraries: usize,
+    imported_media_metadata: usize,
+    imported_user_data: usize,
+    imported_lists: usize,
+    unsupported: BTreeMap<&'static str, String>,
+    warnings: Vec<String>,
+}
+
+impl JellyfinMigrationReport {
+    fn json(&self, backup_path: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "SourcePolicy": {
+                "Mode": "json-export",
+                "OriginalDatabaseMutation": "never",
+                "ReadOnly": true,
+                "BackupRequired": true,
+                "BackupPath": backup_path
+            },
+            "SourceName": self.source_name,
+            "DryRun": !self.applied,
+            "Applied": self.applied,
+            "Rollback": {
+                "Automatic": false,
+                "Procedure": "Restore the BackupPath manifest created before import, or restore the exported Jellyfin source externally if the source was changed outside Jellyrin."
+            },
+            "Counts": {
+                "Users": self.users,
+                "Libraries": self.libraries,
+                "MediaMetadata": self.media_metadata,
+                "UserData": self.user_data,
+                "Playlists": self.playlists,
+                "Collections": self.collections,
+                "ScannedItems": self.scanned_items
+            },
+            "Imported": {
+                "Users": self.imported_users,
+                "Libraries": self.imported_libraries,
+                "MediaMetadata": self.imported_media_metadata,
+                "UserData": self.imported_user_data,
+                "Lists": self.imported_lists
+            },
+            "Families": {
+                "MediaHierarchy": "libraries-and-scanned-paths",
+                "Ancestors": "derived-from-library-scan",
+                "Streams": "derived-from-media-scan",
+                "Chapters": "unsupported-decided",
+                "Subtitles": "derived-from-media-scan",
+                "Lyrics": "unsupported-decided",
+                "KeyframesTrickplay": "unsupported-decided",
+                "Playlists": "imported-by-name-and-item-path",
+                "Collections": "imported-by-name-and-item-path",
+                "UserData": "imported-by-user-and-item-path",
+                "TaskHistory": "unsupported-decided",
+                "Transcodes": "unsupported-runtime-state",
+                "PackageState": "unsupported-decided"
+            },
+            "Unsupported": self.unsupported,
+            "Warnings": self.warnings
+        })
+    }
+}
+
+async fn analyze_jellyfin_migration(
+    db: &Database,
+    payload: &JellyfinMigrationBody,
+) -> Result<JellyfinMigrationReport, ApiError> {
+    let data = migration_data_object(payload)?;
+    let mut report = JellyfinMigrationReport {
+        source_name: payload
+            .source_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("jellyfin-json-export")
+            .to_string(),
+        applied: false,
+        users: migration_array(data, "Users").len(),
+        libraries: migration_libraries(data).len(),
+        media_metadata: migration_media_entries(data).len(),
+        user_data: migration_array(data, "UserData").len(),
+        playlists: migration_array(data, "Playlists").len(),
+        collections: migration_array(data, "Collections").len(),
+        ..Default::default()
+    };
+    report.unsupported = jellyfin_migration_unsupported_map(data);
+    validate_migration_payload(data, &mut report)?;
+    report.scanned_items = db.media_items().await?.len();
+    Ok(report)
+}
+
+async fn apply_jellyfin_migration(
+    db: &Database,
+    payload: &JellyfinMigrationBody,
+) -> Result<JellyfinMigrationReport, ApiError> {
+    let mut report = analyze_jellyfin_migration(db, payload).await?;
+    let data = migration_data_object(payload)?;
+
+    report.imported_users = import_jellyfin_users(db, data).await?;
+    report.imported_libraries = import_jellyfin_libraries(db, data).await?;
+    report.scanned_items = scan_all_library_items(db).await?;
+    report.imported_media_metadata = import_jellyfin_media_metadata(db, data).await?;
+    report.imported_user_data = import_jellyfin_user_data(db, data).await?;
+    report.imported_lists = import_jellyfin_lists(db, data).await?;
+    Ok(report)
+}
+
+fn migration_data_object(
+    payload: &JellyfinMigrationBody,
+) -> Result<&serde_json::Map<String, serde_json::Value>, ApiError> {
+    payload
+        .data
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("Jellyfin migration Data must be an object"))
+}
+
+fn migration_array<'a>(
+    data: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> &'a [serde_json::Value] {
+    data.get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn migration_libraries(data: &serde_json::Map<String, serde_json::Value>) -> &[serde_json::Value] {
+    data.get("Libraries")
+        .or_else(|| data.get("VirtualFolders"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn migration_media_entries(
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> &[serde_json::Value] {
+    data.get("Media")
+        .or_else(|| data.get("MediaMetadata"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn validate_migration_payload(
+    data: &serde_json::Map<String, serde_json::Value>,
+    report: &mut JellyfinMigrationReport,
+) -> Result<(), ApiError> {
+    for library in migration_libraries(data) {
+        let object = library
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration library must be an object"))?;
+        let locations = object
+            .get("Locations")
+            .or_else(|| object.get("Paths"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration library is missing Locations"))?;
+        for location in locations {
+            let location = location
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ApiError::bad_request("Jellyfin migration library location must be a string"))?;
+            if !backup_restore_path_is_safe(location) {
+                return Err(ApiError::bad_request(format!(
+                    "Jellyfin migration library location is not safe to import: {location}"
+                )));
+            }
+        }
+    }
+
+    for media in migration_media_entries(data) {
+        let object = media
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration media entry must be an object"))?;
+        if let Some(path) = migration_string_field(object, &["Path", "FilePath"]) {
+            if !backup_restore_path_is_safe(&path) {
+                return Err(ApiError::bad_request(format!(
+                    "Jellyfin migration media path is not safe to import: {path}"
+                )));
+            }
+        } else {
+            report
+                .warnings
+                .push("Media entry without Path/FilePath will be skipped.".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn jellyfin_migration_unsupported_map(
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> BTreeMap<&'static str, String> {
+    let mut unsupported = BTreeMap::new();
+    for (field, reason) in [
+        ("Chapters", "No chapter persistence importer is available yet."),
+        ("Lyrics", "Lyrics files are not imported from Jellyfin exports yet."),
+        ("Keyframes", "Trickplay/keyframe tiles are regenerated, not migrated."),
+        ("Trickplay", "Trickplay/keyframe tiles are regenerated, not migrated."),
+        ("TaskHistory", "Task history is runtime/audit data and is not replayed."),
+        ("Transcodes", "Transcode sessions are runtime state and are not migrated."),
+        ("PackageState", "Plugin package binaries are not imported."),
+    ] {
+        if data.get(field).is_some() {
+            unsupported.insert(field, reason.to_string());
+        }
+    }
+    unsupported
+}
+
+async fn import_jellyfin_users(
+    db: &Database,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<usize, ApiError> {
+    let mut imported = 0usize;
+    let mut existing_by_name = db
+        .users()
+        .await?
+        .into_iter()
+        .map(|user| (user.name.to_lowercase(), user))
+        .collect::<HashMap<_, _>>();
+    for user in migration_array(data, "Users") {
+        let object = user
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration user must be an object"))?;
+        let Some(name) = migration_string_field(object, &["Name", "Username"]) else {
+            continue;
+        };
+        let policy = object.get("Policy").and_then(serde_json::Value::as_object);
+        let is_administrator = migration_bool_field(object, &["IsAdministrator"])
+            .or_else(|| policy.and_then(|policy| migration_bool_field(policy, &["IsAdministrator"])))
+            .unwrap_or(false);
+        let is_disabled = migration_bool_field(object, &["IsDisabled"])
+            .or_else(|| policy.and_then(|policy| migration_bool_field(policy, &["IsDisabled"])))
+            .unwrap_or(false);
+        let key = name.to_lowercase();
+        let user = if let Some(existing) = existing_by_name.get(&key) {
+            existing.clone()
+        } else {
+            let created = db.create_user(&name, None).await?;
+            existing_by_name.insert(key, created.clone());
+            created
+        };
+        db.update_user_profile(user.id, &name, is_administrator, is_disabled)
+            .await?;
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+async fn import_jellyfin_libraries(
+    db: &Database,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<usize, ApiError> {
+    let mut imported = 0usize;
+    for library in migration_libraries(data) {
+        let object = library
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration library must be an object"))?;
+        let Some(name) = migration_string_field(object, &["Name", "DisplayName"]) else {
+            continue;
+        };
+        let collection_type = migration_string_field(object, &["CollectionType", "ContentType"]);
+        let locations = object
+            .get("Locations")
+            .or_else(|| object.get("Paths"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration library is missing Locations"))?
+            .iter()
+            .filter_map(|location| location.as_str().map(str::trim))
+            .filter(|location| !location.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        for location in &locations {
+            if !backup_restore_path_is_safe(location) {
+                return Err(ApiError::bad_request(format!(
+                    "Jellyfin migration library location is not safe to import: {location}"
+                )));
+            }
+        }
+        db.upsert_virtual_folder(&name, collection_type.as_deref(), locations)
+            .await?;
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+async fn import_jellyfin_media_metadata(
+    db: &Database,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<usize, ApiError> {
+    let items_by_path = db
+        .media_items()
+        .await?
+        .into_iter()
+        .map(|item| (item.path.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut imported = 0usize;
+    for media in migration_media_entries(data) {
+        let object = media
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration media entry must be an object"))?;
+        let Some(path) = migration_string_field(object, &["Path", "FilePath"]) else {
+            continue;
+        };
+        if !backup_restore_path_is_safe(&path) {
+            return Err(ApiError::bad_request(format!(
+                "Jellyfin migration media path is not safe to import: {path}"
+            )));
+        }
+        let Some(item) = items_by_path.get(&path) else {
+            continue;
+        };
+        let metadata = object
+            .get("Metadata")
+            .cloned()
+            .unwrap_or_else(|| media.clone());
+        db.update_media_item_metadata(item.id, metadata).await?;
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+async fn import_jellyfin_user_data(
+    db: &Database,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<usize, ApiError> {
+    let users_by_name = db
+        .users()
+        .await?
+        .into_iter()
+        .map(|user| (user.name.to_lowercase(), user))
+        .collect::<HashMap<_, _>>();
+    let items_by_path = db
+        .media_items()
+        .await?
+        .into_iter()
+        .map(|item| (item.path.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let mut imported = 0usize;
+    for user_data in migration_array(data, "UserData") {
+        let object = user_data
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("Jellyfin migration user data must be an object"))?;
+        let Some(user_name) = migration_string_field(object, &["UserName", "Username", "User"]) else {
+            continue;
+        };
+        let Some(path) = migration_string_field(object, &["Path", "FilePath"]) else {
+            continue;
+        };
+        if !backup_restore_path_is_safe(&path) {
+            return Err(ApiError::bad_request(format!(
+                "Jellyfin migration user data path is not safe to import: {path}"
+            )));
+        }
+        let Some(user) = users_by_name.get(&user_name.to_lowercase()) else {
+            continue;
+        };
+        let Some(item) = items_by_path.get(&path) else {
+            continue;
+        };
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: None,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: migration_i64_field(object, &["PositionTicks", "PlaybackPositionTicks"])
+                .unwrap_or(0),
+            is_paused: false,
+            played: migration_bool_field(object, &["Played", "IsPlayed"]).unwrap_or(false),
+        })
+        .await?;
+        if migration_bool_field(object, &["IsFavorite", "Favorite"]).unwrap_or(false) {
+            db.set_item_favorite(user.id, item.id, true).await?;
+        }
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+async fn import_jellyfin_lists(
+    db: &Database,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<usize, ApiError> {
+    let mut imported = 0usize;
+    imported += import_jellyfin_list_family(db, data, "Playlists", "playlist", None).await?;
+    imported += import_jellyfin_list_family(db, data, "Collections", "collection", Some("boxsets")).await?;
+    Ok(imported)
+}
+
+async fn import_jellyfin_list_family(
+    db: &Database,
+    data: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    kind: &str,
+    collection_type: Option<&str>,
+) -> Result<usize, ApiError> {
+    let existing_lists = db.media_lists(kind).await?;
+    let existing_by_name = existing_lists
+        .into_iter()
+        .map(|list| (list.name.to_lowercase(), list))
+        .collect::<HashMap<_, _>>();
+    let items_by_path = db
+        .media_items()
+        .await?
+        .into_iter()
+        .map(|item| (item.path.clone(), item.id))
+        .collect::<HashMap<_, _>>();
+    let mut imported = 0usize;
+    for list in migration_array(data, field) {
+        let object = list
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request(format!("Jellyfin migration {field} entry must be an object")))?;
+        let Some(name) = migration_string_field(object, &["Name"]) else {
+            continue;
+        };
+        let item_ids = object
+            .get("ItemPaths")
+            .or_else(|| object.get("Paths"))
+            .and_then(serde_json::Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(|path| items_by_path.get(path).copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(existing) = existing_by_name.get(&name.to_lowercase()) {
+            db.add_media_list_items(existing.id, item_ids).await?;
+        } else {
+            db.create_media_list(kind, &name, collection_type, None, item_ids)
+                .await?;
+        }
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+fn migration_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+) -> Option<String> {
+    fields.iter().find_map(|field| {
+        object
+            .get(*field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn migration_bool_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+) -> Option<bool> {
+    fields
+        .iter()
+        .find_map(|field| object.get(*field).and_then(serde_json::Value::as_bool))
+}
+
+fn migration_i64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+) -> Option<i64> {
+    fields
+        .iter()
+        .find_map(|field| object.get(*field).and_then(serde_json::Value::as_i64))
 }
 
 #[derive(Debug, Deserialize)]
@@ -25208,6 +25751,270 @@ mod tests {
                     && metadata.payload["ProviderIds"]["Imdb"] == "tt0000001"
                     && metadata.payload["Overview"] == "Snapshot overview")
         );
+    }
+
+    #[tokio::test]
+    async fn jellyfin_migration_dry_run_and_import_are_safe_and_idempotent() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie_path = media_root.path().join("Imported Movie.mp4");
+        tokio::fs::write(&movie_path, b"imported").await.unwrap();
+        let movie_path = movie_path.to_string_lossy().to_string();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "migration-test-key")
+            .await
+            .unwrap();
+        let db_for_assertions = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let payload = json!({
+            "SourceName": "jellyfin-test-export",
+            "Data": {
+                "Users": [{
+                    "Name": "Imported User",
+                    "Policy": {
+                        "IsAdministrator": false,
+                        "IsDisabled": false
+                    }
+                }],
+                "Libraries": [{
+                    "Name": "Imported Movies",
+                    "CollectionType": "movies",
+                    "Locations": [media_root.path().to_string_lossy()]
+                }],
+                "Media": [{
+                    "Path": movie_path,
+                    "Metadata": {
+                        "ProviderIds": { "Imdb": "tt1234567" },
+                        "Overview": "Imported overview"
+                    }
+                }],
+                "UserData": [{
+                    "UserName": "Imported User",
+                    "Path": movie_path,
+                    "Played": true,
+                    "IsFavorite": true,
+                    "PositionTicks": 123456
+                }],
+                "Playlists": [{
+                    "Name": "Imported Playlist",
+                    "ItemPaths": [movie_path]
+                }],
+                "Collections": [{
+                    "Name": "Imported Collection",
+                    "ItemPaths": [movie_path]
+                }],
+                "TaskHistory": [{ "Name": "RefreshLibrary" }],
+                "Transcodes": [{ "PlaySessionId": "runtime-only" }],
+                "PackageState": [{ "Name": "Plugin" }]
+            }
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Migration/Jellyfin/DryRun")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let dry_run: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(dry_run["DryRun"], true);
+        assert_eq!(
+            dry_run["SourcePolicy"]["OriginalDatabaseMutation"],
+            "never"
+        );
+        assert_eq!(dry_run["SourcePolicy"]["BackupRequired"], true);
+        assert_eq!(dry_run["Counts"]["Users"], 1);
+        assert_eq!(dry_run["Counts"]["Libraries"], 1);
+        assert_eq!(dry_run["Counts"]["MediaMetadata"], 1);
+        assert_eq!(dry_run["Counts"]["UserData"], 1);
+        assert_eq!(dry_run["Counts"]["Playlists"], 1);
+        assert_eq!(dry_run["Counts"]["Collections"], 1);
+        assert!(dry_run["Unsupported"]["TaskHistory"].as_str().is_some());
+        assert_eq!(db_for_assertions.virtual_folders().await.unwrap().len(), 0);
+        assert_eq!(db_for_assertions.backup_manifests().await.unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/migration/jellyfin/import")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let imported: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(imported["Applied"], true);
+        assert_eq!(imported["DryRun"], false);
+        assert!(imported["SourcePolicy"]["BackupPath"].as_str().is_some());
+        assert_eq!(imported["Imported"]["Users"], 1);
+        assert_eq!(imported["Imported"]["Libraries"], 1);
+        assert_eq!(imported["Imported"]["MediaMetadata"], 1);
+        assert_eq!(imported["Imported"]["UserData"], 1);
+        assert_eq!(imported["Imported"]["Lists"], 2);
+
+        let backups = db_for_assertions.backup_manifests().await.unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            imported["SourcePolicy"]["BackupPath"],
+            backups[0].path.as_str()
+        );
+        let imported_user = db_for_assertions
+            .users()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|user| user.name == "Imported User")
+            .unwrap();
+        assert!(!imported_user.is_administrator);
+        assert!(!imported_user.is_disabled);
+        let imported_folder = db_for_assertions
+            .virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.name == "Imported Movies")
+            .unwrap();
+        assert_eq!(imported_folder.collection_type.as_deref(), Some("movies"));
+        assert_eq!(imported_folder.locations, vec![media_root.path().to_string_lossy().to_string()]);
+        let imported_item = db_for_assertions
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "Imported Movie")
+            .unwrap();
+        let metadata = db_for_assertions.media_item_metadata().await.unwrap();
+        assert!(metadata.iter().any(|metadata| {
+            metadata.item_id == imported_item.id
+                && metadata.payload["ProviderIds"]["Imdb"] == "tt1234567"
+                && metadata.payload["Overview"] == "Imported overview"
+        }));
+        let playback = db_for_assertions
+            .playback_state_for_item(imported_user.id, imported_item.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(playback.played);
+        assert!(playback.is_favorite);
+        assert_eq!(playback.position_ticks, 123456);
+        let playlist = db_for_assertions
+            .media_lists("playlist")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|list| list.name == "Imported Playlist")
+            .unwrap();
+        assert_eq!(
+            db_for_assertions
+                .media_list_items(playlist.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/migration/jellyfin/import")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(db_for_assertions.backup_manifests().await.unwrap().len(), 2);
+        assert_eq!(
+            db_for_assertions
+                .users()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|user| user.name == "Imported User")
+                .count(),
+            1
+        );
+        assert_eq!(
+            db_for_assertions
+                .virtual_folders()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|folder| folder.name == "Imported Movies")
+                .count(),
+            1
+        );
+        assert_eq!(
+            db_for_assertions
+                .media_lists("playlist")
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|list| list.name == "Imported Playlist")
+                .count(),
+            1
+        );
+        assert_eq!(
+            db_for_assertions
+                .media_list_items(playlist.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Migration/Jellyfin/DryRun")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Data": {
+                                "Libraries": [{
+                                    "Name": "Unsafe",
+                                    "Locations": ["/etc"]
+                                }]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
