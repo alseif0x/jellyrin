@@ -5,6 +5,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const {
   requiredProfiles,
+  buildCompatibilityMatrix,
   loadManualDeviceEvidence,
 } = require('./non-web-device-evidence');
 
@@ -16,6 +17,8 @@ const traceDir = path.join(generatedDir, 'e2e-traces', 'non-web-client');
 const comparisonPath = path.join(traceDir, 'comparison.json');
 const evidencePath = path.join(generatedDir, 'non-web-clients.json');
 const evidenceMarkdownPath = path.join(generatedDir, 'non-web-clients.md');
+const matrixPath = path.join(generatedDir, 'non-web-client-matrix.json');
+const matrixMarkdownPath = path.join(generatedDir, 'non-web-client-matrix.md');
 
 const baselineEvidence = {
   gate: 'non-web-clients',
@@ -36,12 +39,18 @@ async function main() {
   const result = await runBrowserTrace();
   const comparison = await readJsonIfExists(comparisonPath);
   const manualEvidence = await loadManualDeviceEvidence();
-  const evidence = buildEvidence(result, comparison, manualEvidence);
+  const completedProfiles = completedProfilesFromComparison(comparison);
+  const compatibilityMatrix = buildCompatibilityMatrix(completedProfiles, manualEvidence);
+  const evidence = buildEvidence(result, comparison, manualEvidence, compatibilityMatrix);
 
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison, manualEvidence));
+  await fs.writeFile(matrixPath, `${JSON.stringify(compatibilityMatrix, null, 2)}\n`);
+  await fs.writeFile(matrixMarkdownPath, renderMatrixMarkdown(compatibilityMatrix));
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
+  console.log(`wrote ${matrixPath}`);
+  console.log(`wrote ${matrixMarkdownPath}`);
 
   if (evidence.status !== 'upstream-validated' && evidence.status !== 'device-validated') {
     process.exitCode = result.code || 1;
@@ -66,14 +75,16 @@ function runBrowserTrace() {
   });
 }
 
-function buildEvidence(result, comparison, manualEvidence) {
+function buildEvidence(result, comparison, manualEvidence, compatibilityMatrix) {
   const updatedAt = new Date().toISOString();
   const deviceEvidence = summarizeManualEvidence(manualEvidence);
+  const matrixEvidence = summarizeCompatibilityMatrix(compatibilityMatrix);
   if (!comparison) {
     return {
       ...baselineEvidence,
       updatedAt,
       deviceEvidence,
+      matrixEvidence,
       evidence: `${baselineEvidence.evidence} Browser trace did not produce comparison.json.`,
     };
   }
@@ -112,6 +123,7 @@ function buildEvidence(result, comparison, manualEvidence) {
       failedTargets,
       completedProfiles,
       deviceEvidence,
+      matrixEvidence,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [],
     };
@@ -121,16 +133,19 @@ function buildEvidence(result, comparison, manualEvidence) {
     return {
       gate: 'non-web-clients',
       status: 'upstream-validated',
-      percent: 80,
+      percent: matrixEvidence.hasBestEffort ? 80 : 90,
       closed: false,
       sourcePhase: 'E6.3',
-      evidence: 'Non-web client contract golden completed against upstream and Jellyrin for MPV/JMP, Kodi, Android TV, Android mobile, Swiftfin/iOS and Roku with no comparison failures; manual device evidence intake is ready.',
+      evidence: matrixEvidence.hasBestEffort
+        ? 'Non-web client contract golden completed against upstream and Jellyrin; manual device evidence intake is ready.'
+        : 'Non-web client contract golden completed against upstream and Jellyrin, manual device evidence intake is ready, and the generated client matrix has no best-effort entries.',
       updatedAt,
       completedTargets,
       skippedTargets,
       failedTargets,
       completedProfiles,
       deviceEvidence,
+      matrixEvidence,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
         'Dashboard target remains device-validated; run real playback sessions from representative non-web clients before closing E6.',
@@ -153,10 +168,16 @@ function buildEvidence(result, comparison, manualEvidence) {
     failedTargets,
     completedProfiles,
     deviceEvidence,
+    matrixEvidence,
     failedReasons: comparison.comparison?.reasons || [],
     traceExitCode: result.code,
     tracePath: path.relative(plansDir, comparisonPath),
   };
+}
+
+function completedProfilesFromComparison(comparison) {
+  const summaries = comparison?.summaries || [];
+  return commonCompletedProfiles(summaries);
 }
 
 function summarizeManualEvidence(manualEvidence) {
@@ -178,6 +199,20 @@ function summarizeManualEvidence(manualEvidence) {
       file: entry.relativePath,
       errors: entry.errors,
     })),
+  };
+}
+
+function summarizeCompatibilityMatrix(matrix) {
+  const statusCounts = {};
+  for (const client of matrix.clients) {
+    statusCounts[client.currentStatus] = (statusCounts[client.currentStatus] || 0) + 1;
+  }
+  return {
+    path: path.relative(plansDir, matrixPath),
+    markdownPath: path.relative(plansDir, matrixMarkdownPath),
+    clientCount: matrix.clients.length,
+    hasBestEffort: matrix.hasBestEffort,
+    statusCounts,
   };
 }
 
@@ -235,6 +270,12 @@ function renderMarkdown(evidence, comparison, manualEvidence) {
     lines.push(`- Valid manual evidence files: ${evidence.deviceEvidence.validCount}`);
     lines.push(`- Invalid manual evidence files: ${evidence.deviceEvidence.invalidCount}`);
   }
+  if (evidence.matrixEvidence) {
+    lines.push(`- Compatibility matrix: \`${evidence.matrixEvidence.path}\``);
+    lines.push(`- Compatibility matrix markdown: \`${evidence.matrixEvidence.markdownPath}\``);
+    lines.push(`- Matrix clients: ${evidence.matrixEvidence.clientCount}`);
+    lines.push(`- Matrix has best-effort: ${evidence.matrixEvidence.hasBestEffort}`);
+  }
   lines.push('');
   if (manualEvidence?.valid?.length) {
     lines.push('## Manual Device Evidence');
@@ -274,6 +315,37 @@ function renderMarkdown(evidence, comparison, manualEvidence) {
     for (const reason of comparison.comparison.reasons) {
       lines.push(`- ${reason}`);
     }
+    lines.push('');
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function renderMatrixMarkdown(matrix) {
+  const lines = [];
+  lines.push('# Non-Web Client Compatibility Matrix');
+  lines.push('');
+  lines.push(`Generated: ${matrix.generatedAt}`);
+  lines.push(`Has best-effort: ${matrix.hasBestEffort}`);
+  lines.push('');
+  lines.push('| Client | Priority | Status | Version | Evidence |');
+  lines.push('| --- | --- | --- | --- | --- |');
+  for (const client of matrix.clients) {
+    lines.push(`| ${client.clientName} | ${client.priority} | ${client.currentStatus} | ${client.version} | ${client.manualEvidence || client.validationCommand} |`);
+  }
+  lines.push('');
+  lines.push('## Details');
+  lines.push('');
+  for (const client of matrix.clients) {
+    lines.push(`### ${client.clientName}`);
+    lines.push('');
+    lines.push(`- Client ID: \`${client.clientId}\``);
+    lines.push(`- Auth: ${client.authMethod}`);
+    lines.push(`- Discovery: ${client.discoveryMethod}`);
+    lines.push(`- Playback modes: ${client.requiredPlaybackModes.join(', ')}`);
+    lines.push(`- Direct-play formats: ${client.directPlayFormats.join(', ')}`);
+    lines.push(`- Transcode: ${client.transcodeRequirements.join(', ')}`);
+    lines.push(`- Subtitles: ${client.subtitleRequirements.join(', ')}`);
+    lines.push(`- Known quirks: ${client.knownQuirks.join('; ')}`);
     lines.push('');
   }
   return `${lines.join('\n')}\n`;

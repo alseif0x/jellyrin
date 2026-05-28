@@ -10,7 +10,88 @@ const manualEvidenceDir = process.env.JELLYRIN_NON_WEB_DEVICE_EVIDENCE_DIR
   || path.join(plansDir, 'manual', 'non-web-clients');
 const templatePath = path.join(manualEvidenceDir, 'template.json');
 
-const requiredProfiles = ['mpv-shim', 'kodi', 'android-tv', 'android-mobile', 'swiftfin', 'roku'];
+const clientProfiles = [
+  {
+    id: 'mpv-shim',
+    name: 'MPV Shim / Jellyfin Media Player',
+    priority: 'P1',
+    validationTarget: 'manual-repeatable',
+    authMethod: 'AuthenticateByName with MediaBrowser authorization',
+    discoveryMethod: '/System/Info',
+    playbackModes: ['direct-play', 'direct-stream', 'hls-transcode'],
+    directPlayFormats: ['mp4', 'm4v', 'mkv', 'webm', 'mov', 'avi', 'ts'],
+    transcodeRequirements: ['hls', 'h264', 'aac'],
+    subtitleRequirements: ['srt', 'vtt'],
+    knownQuirks: ['desktop clients vary DeviceProfile fields by mpv/libmpv build'],
+  },
+  {
+    id: 'kodi',
+    name: 'Kodi plugin',
+    priority: 'P2',
+    validationTarget: 'contract-simulated',
+    authMethod: 'AuthenticateByName with MediaBrowser authorization',
+    discoveryMethod: '/System/Info',
+    playbackModes: ['direct-play', 'direct-stream', 'hls-transcode'],
+    directPlayFormats: ['mp4', 'm4v', 'mkv', 'webm', 'mov', 'avi', 'ts'],
+    transcodeRequirements: ['hls', 'h264', 'aac'],
+    subtitleRequirements: ['srt', 'vtt', 'ass', 'ssa', 'sub'],
+    knownQuirks: ['Kodi-specific sync queue behavior needs later real plugin validation'],
+  },
+  {
+    id: 'android-tv',
+    name: 'Jellyfin Android TV',
+    priority: 'P1',
+    validationTarget: 'contract-simulated',
+    authMethod: 'AuthenticateByName with MediaBrowser authorization',
+    discoveryMethod: '/System/Info',
+    playbackModes: ['direct-play', 'direct-stream', 'hls-transcode'],
+    directPlayFormats: ['mp4', 'm4v', 'mkv', 'webm'],
+    transcodeRequirements: ['hls', 'h264', 'aac'],
+    subtitleRequirements: ['srt', 'vtt'],
+    knownQuirks: ['TV device codec support varies by hardware generation'],
+  },
+  {
+    id: 'android-mobile',
+    name: 'Jellyfin Android mobile',
+    priority: 'P1',
+    validationTarget: 'contract-simulated',
+    authMethod: 'AuthenticateByName with MediaBrowser authorization',
+    discoveryMethod: '/System/Info',
+    playbackModes: ['direct-play', 'direct-stream', 'hls-transcode'],
+    directPlayFormats: ['mp4', 'm4v', 'mkv', 'webm'],
+    transcodeRequirements: ['hls', 'h264', 'aac'],
+    subtitleRequirements: ['srt', 'vtt'],
+    knownQuirks: ['external player handoff may change playback progress cadence'],
+  },
+  {
+    id: 'swiftfin',
+    name: 'Swiftfin / iOS',
+    priority: 'P1',
+    validationTarget: 'contract-simulated',
+    authMethod: 'AuthenticateByName with MediaBrowser authorization',
+    discoveryMethod: '/System/Info',
+    playbackModes: ['direct-play', 'direct-stream', 'hls-transcode'],
+    directPlayFormats: ['mp4', 'm4v', 'mov'],
+    transcodeRequirements: ['hls', 'h264', 'aac'],
+    subtitleRequirements: ['srt', 'vtt'],
+    knownQuirks: ['Apple platform playback is sensitive to HLS/container combinations'],
+  },
+  {
+    id: 'roku',
+    name: 'Jellyfin Roku',
+    priority: 'P2',
+    validationTarget: 'contract-simulated',
+    authMethod: 'AuthenticateByName with MediaBrowser authorization',
+    discoveryMethod: '/System/Info',
+    playbackModes: ['direct-play', 'direct-stream', 'hls-transcode'],
+    directPlayFormats: ['mp4', 'm4v', 'mov'],
+    transcodeRequirements: ['hls', 'h264', 'aac'],
+    subtitleRequirements: ['srt', 'vtt'],
+    knownQuirks: ['Roku firmware media capability differences require real-device evidence before closure'],
+  },
+];
+
+const requiredProfiles = clientProfiles.map((profile) => profile.id);
 const requiredFlowChecks = [
   'discovery',
   'login',
@@ -190,6 +271,53 @@ function manualEvidenceTemplate() {
   };
 }
 
+function buildCompatibilityMatrix(completedProfiles, manualEvidence) {
+  const completed = new Set(completedProfiles || []);
+  const validEvidenceByClient = new Map();
+  for (const entry of manualEvidence?.valid || []) {
+    validEvidenceByClient.set(entry.evidence.clientId, entry);
+  }
+  const clients = clientProfiles.map((profile) => {
+    const deviceEvidence = validEvidenceByClient.get(profile.id);
+    const contractValidated = completed.has(profile.id);
+    const validationLevel = deviceEvidence ? 'manual-repeatable' : contractValidated ? 'contract-simulated' : 'not-started';
+    return {
+      clientId: profile.id,
+      clientName: profile.name,
+      priority: profile.priority,
+      version: deviceEvidence?.evidence.clientVersion || 'contract-profile',
+      authMethod: profile.authMethod,
+      discoveryMethod: profile.discoveryMethod,
+      requiredEndpoints: [
+        '/System/Info',
+        '/Users/AuthenticateByName',
+        '/Users/{UserId}/Views',
+        '/Items/{ItemId}/PlaybackInfo',
+        '/Videos/{ItemId}/stream.mp4',
+        '/Sessions/Playing/Progress',
+        '/UserItems/Resume',
+        '/Sessions/Logout',
+      ],
+      requiredWebsocketMessages: [],
+      requiredPlaybackModes: profile.playbackModes,
+      directPlayFormats: profile.directPlayFormats,
+      transcodeRequirements: profile.transcodeRequirements,
+      subtitleRequirements: profile.subtitleRequirements,
+      imageRequirements: ['primary image endpoints inherited from web/client base matrix'],
+      knownQuirks: profile.knownQuirks,
+      currentStatus: validationLevel,
+      validationCommand: 'npm run golden:clients',
+      manualEvidence: deviceEvidence?.relativePath || null,
+    };
+  });
+  return {
+    generatedAt: new Date().toISOString(),
+    statusModel: ['not-started', 'contract-simulated', 'manual-repeatable'],
+    hasBestEffort: clients.some((client) => client.currentStatus === 'best-effort'),
+    clients,
+  };
+}
+
 async function main() {
   const report = await loadManualDeviceEvidence();
   console.log(JSON.stringify({
@@ -221,8 +349,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  clientProfiles,
   requiredProfiles,
   requiredFlowChecks,
+  buildCompatibilityMatrix,
   loadManualDeviceEvidence,
   validateManualEvidence,
 };
