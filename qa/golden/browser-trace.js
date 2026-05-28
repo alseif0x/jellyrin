@@ -78,7 +78,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -352,6 +352,16 @@ async function captureTarget(browser, flowDir, target) {
       channelsLatest200: false,
       channelsFeatures200: false,
       channelsFeatureMatched: false,
+      nonWebClientAuthenticated: false,
+      nonWebSystemInfo200: false,
+      nonWebBrowse200: false,
+      nonWebMovieMatched: false,
+      nonWebPlaybackInfo200: false,
+      nonWebDirectMediaSource: false,
+      nonWebStream200: false,
+      nonWebProgress204: false,
+      nonWebResumeMatched: false,
+      nonWebDlnaUnsupportedDecided: false,
     },
   };
 
@@ -424,6 +434,8 @@ async function captureTarget(browser, flowDir, target) {
       await runLiveTvFlow(page, summary, publicInfo, target);
     } else if (flow === 'channels') {
       await runChannelsFlow(page, summary, publicInfo, target);
+    } else if (flow === 'non-web-client') {
+      await runNonWebClientFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -2768,6 +2780,141 @@ async function runChannelsFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runNonWebClientFlow(page, summary, publicInfo, target) {
+  let auth = null;
+  if (target.username && target.password) {
+    const login = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/AuthenticateByName',
+      authorization: `MediaBrowser Client="Jellyfin MPV Shim", Device="Jellyrin QA MPV ${target.name}", DeviceId="non-web-client-${target.name}", Version="dev"`,
+      body: {
+        Username: target.username,
+        Pw: target.password,
+      },
+    });
+    if (login.status !== 200 || !login.json?.AccessToken || !login.json?.User?.Id) {
+      throw new Error(`non-web client login returned HTTP ${login.status}`);
+    }
+    auth = login.json;
+    summary.invariants.nonWebClientAuthenticated = true;
+  } else {
+    auth = await authenticateTarget(page, summary, target);
+    summary.invariants.nonWebClientAuthenticated = true;
+  }
+
+  const systemInfo = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/System/Info',
+    token: auth.AccessToken,
+  });
+  if (systemInfo.status !== 200 || !systemInfo.json?.Id) {
+    throw new Error(`non-web System/Info returned HTTP ${systemInfo.status}`);
+  }
+  summary.invariants.nonWebSystemInfo200 = true;
+
+  const views = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Users/${encodeURIComponent(auth.User.Id)}/Views`,
+    token: auth.AccessToken,
+  });
+  if (views.status !== 200 || !Array.isArray(views.json?.Items)) {
+    throw new Error(`non-web browse views returned HTTP ${views.status}`);
+  }
+  summary.invariants.nonWebBrowse200 = true;
+
+  const movie = await firstMovieItem(page, summary, auth);
+  if (!movie) {
+    summary.status = 'skipped';
+    summary.skipped = true;
+    summary.reason = 'target has no movie item for non-web client trace';
+    return;
+  }
+  summary.invariants.nonWebMovieMatched = true;
+
+  const playbackInfo = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(movie.Id)}/PlaybackInfo`,
+    token: auth.AccessToken,
+    body: withoutUndefined({
+      UserId: auth.User.Id,
+      MediaSourceId: movie.Id,
+      EnableDirectPlay: true,
+      EnableDirectStream: true,
+      EnableTranscoding: true,
+      StartPositionTicks: 0,
+      DeviceProfile: mpvShimDeviceProfile(),
+    }),
+  });
+  if (playbackInfo.status !== 200 || !Array.isArray(playbackInfo.json?.MediaSources)) {
+    throw new Error(`non-web PlaybackInfo returned HTTP ${playbackInfo.status}`);
+  }
+  summary.invariants.nonWebPlaybackInfo200 = true;
+  const mediaSource = playbackInfo.json.MediaSources[0];
+  if (!mediaSource || mediaSource.SupportsDirectPlay !== true) {
+    throw new Error('non-web PlaybackInfo did not expose a direct-play media source');
+  }
+  summary.invariants.nonWebDirectMediaSource = true;
+
+  const stream = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/Videos/${encodeURIComponent(movie.Id)}/stream.mp4?Static=true&api_key=${encodeURIComponent(auth.AccessToken)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 206].includes(stream.status) || stream.byteLength <= 0) {
+    throw new Error(`non-web direct stream returned HTTP ${stream.status}`);
+  }
+  summary.invariants.nonWebStream200 = true;
+
+  const positionTicks = resumeTracePositionTicks(movie);
+  const progress = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Sessions/Playing/Progress',
+    token: auth.AccessToken,
+    body: {
+      ItemId: movie.Id,
+      MediaSourceId: mediaSource.Id || movie.Id,
+      PositionTicks: positionTicks,
+      IsPaused: false,
+      PlayMethod: mediaSource.SupportsDirectPlay ? 'DirectPlay' : 'DirectStream',
+    },
+  });
+  if (progress.status !== 204) {
+    throw new Error(`non-web Sessions/Playing/Progress returned HTTP ${progress.status}`);
+  }
+  summary.invariants.nonWebProgress204 = true;
+
+  const resume = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video`,
+    token: auth.AccessToken,
+  });
+  if (resume.status !== 200 || !resume.json?.Items?.some((item) => item.Id === movie.Id)) {
+    throw new Error(`non-web resume query did not include movie, HTTP ${resume.status}`);
+  }
+  summary.invariants.nonWebResumeMatched = true;
+
+  if (target.name === 'jellyrin') {
+    const network = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/System/Configuration/network',
+      token: auth.AccessToken,
+    });
+    if (network.status !== 200 || network.json?.EnableUPnP !== false) {
+      throw new Error(`Jellyrin DLNA/UPnP unsupported decision not visible in network config, HTTP ${network.status}`);
+    }
+    summary.invariants.nonWebDlnaUnsupportedDecided = true;
+  } else {
+    summary.invariants.nonWebDlnaUnsupportedDecided = true;
+  }
+
+  summary.item = {
+    id: '<dynamic>',
+    name: movie.Name,
+    type: movie.Type,
+    client: 'Jellyfin MPV Shim',
+  };
+}
+
 async function runLiveTvFlow(page, summary, publicInfo, target) {
   await ensureLiveTvFixtures();
   const auth = await authenticateTarget(page, summary, target);
@@ -3758,6 +3905,41 @@ function hlsTranscodeDeviceProfile() {
   };
 }
 
+function mpvShimDeviceProfile() {
+  return {
+    DirectPlayProfiles: [
+      {
+        Container: 'mp4,m4v,mkv,webm,mov,avi,ts',
+        Type: 'Video',
+        VideoCodec: 'h264,hevc,vp8,vp9,mpeg4,mpeg2video',
+        AudioCodec: 'aac,mp3,opus,vorbis,flac,ac3,eac3,mp2',
+      },
+      {
+        Container: 'mp3,aac,flac,ogg,opus,m4a',
+        Type: 'Audio',
+        AudioCodec: 'mp3,aac,flac,vorbis,opus',
+      },
+    ],
+    TranscodingProfiles: [
+      {
+        Container: 'ts',
+        Type: 'Video',
+        AudioCodec: 'aac,mp3',
+        VideoCodec: 'h264',
+        Context: 'Streaming',
+        Protocol: 'hls',
+        MaxAudioChannels: '2',
+      },
+    ],
+    ContainerProfiles: [],
+    CodecProfiles: [],
+    SubtitleProfiles: [
+      { Format: 'srt', Method: 'External' },
+      { Format: 'vtt', Method: 'External' },
+    ],
+  };
+}
+
 async function browserFetchJson(page, request) {
   return page.evaluate(async ({ method, url, token, authorization, body }) => {
     const headers = {};
@@ -4151,7 +4333,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -4614,6 +4796,32 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.channelsFeatureMatched = true;
     }
   }
+  if (flow === 'non-web-client') {
+    if (record.method === 'POST' && pathname === '/Users/AuthenticateByName' && record.status === 200) {
+      summary.invariants.nonWebClientAuthenticated = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/Info' && record.status === 200) {
+      summary.invariants.nonWebSystemInfo200 = true;
+    }
+    if (record.method === 'GET' && /\/Users\/[^/]+\/Views$/i.test(pathname) && record.status === 200) {
+      summary.invariants.nonWebBrowse200 = true;
+    }
+    if (record.method === 'POST' && /\/Items\/[^/]+\/PlaybackInfo$/i.test(pathname) && record.status === 200) {
+      summary.invariants.nonWebPlaybackInfo200 = true;
+    }
+    if (record.method === 'GET' && /\/Videos\/[^/]+\/stream\.mp4$/i.test(pathname) && [200, 206].includes(record.status)) {
+      summary.invariants.nonWebStream200 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Sessions/Playing/Progress' && record.status === 204) {
+      summary.invariants.nonWebProgress204 = true;
+    }
+    if (record.method === 'GET' && pathname === '/UserItems/Resume' && record.status === 200) {
+      summary.invariants.nonWebResumeMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/Configuration/network' && record.status === 200) {
+      summary.invariants.nonWebDlnaUnsupportedDecided = true;
+    }
+  }
   if (flow === 'sessions-websocket') {
     if (record.method === 'GET' && pathname === '/Sessions' && record.status === 200) {
       summary.invariants.sessionsList200 = true;
@@ -4722,6 +4930,27 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'channels' && record.method === 'GET' && /\/Channels\/[^/]+\/Features$/i.test(pathname)) {
     return 'channels-feature-by-id';
+  }
+  if (flow === 'non-web-client' && record.method === 'GET' && pathname === '/System/Info') {
+    return 'non-web-system-info';
+  }
+  if (flow === 'non-web-client' && record.method === 'GET' && /\/Users\/[^/]+\/Views$/i.test(pathname)) {
+    return 'non-web-views';
+  }
+  if (flow === 'non-web-client' && record.method === 'POST' && /\/Items\/[^/]+\/PlaybackInfo$/i.test(pathname)) {
+    return 'non-web-playback-info';
+  }
+  if (flow === 'non-web-client' && record.method === 'GET' && /\/Videos\/[^/]+\/stream\.mp4$/i.test(pathname)) {
+    return 'non-web-video-stream';
+  }
+  if (flow === 'non-web-client' && record.method === 'POST' && pathname === '/Sessions/Playing/Progress') {
+    return 'non-web-progress';
+  }
+  if (flow === 'non-web-client' && record.method === 'GET' && pathname === '/UserItems/Resume') {
+    return 'non-web-resume';
+  }
+  if (flow === 'non-web-client' && record.method === 'GET' && pathname === '/System/Configuration/network') {
+    return 'non-web-network-config';
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/New') {
     return 'syncplay-new';
@@ -5075,7 +5304,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -5137,6 +5366,8 @@ function compareCompletedTargets(summaries) {
                                 ? ['live-tv-info', 'live-tv-channels', 'live-tv-programs', 'live-tv-stream', 'live-tv-recordings', 'live-tv-timer-create']
                                 : flow === 'channels'
                                   ? ['channels-list', 'channels-features', 'channels-filters', 'channels-media-deletion-filter', 'channels-items', 'channels-latest', 'channels-feature-by-id']
+                                  : flow === 'non-web-client'
+                                    ? ['non-web-system-info', 'non-web-views', 'non-web-playback-info', 'non-web-video-stream', 'non-web-progress', 'non-web-resume']
                               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -5489,7 +5720,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -5874,6 +6105,25 @@ function invariantFailures(summary) {
         if (!summary.invariants[field]) {
           failures.push(`missing Channels ${label} invariant`);
         }
+      }
+    }
+    return failures;
+  }
+  if (flow === 'non-web-client') {
+    for (const [field, label] of [
+      ['nonWebClientAuthenticated', 'client authentication'],
+      ['nonWebSystemInfo200', 'system info discovery'],
+      ['nonWebBrowse200', 'library browse'],
+      ['nonWebMovieMatched', 'movie item match'],
+      ['nonWebPlaybackInfo200', 'PlaybackInfo'],
+      ['nonWebDirectMediaSource', 'direct media source'],
+      ['nonWebStream200', 'direct stream'],
+      ['nonWebProgress204', 'playback progress'],
+      ['nonWebResumeMatched', 'resume state'],
+      ['nonWebDlnaUnsupportedDecided', 'DLNA/UPnP decision'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing non-web client ${label} invariant`);
       }
     }
     return failures;
