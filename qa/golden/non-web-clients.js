@@ -3,6 +3,10 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const {
+  requiredProfiles,
+  loadManualDeviceEvidence,
+} = require('./non-web-device-evidence');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
@@ -26,17 +30,16 @@ const baselineEvidence = {
   ],
 };
 
-const requiredProfiles = ['mpv-shim', 'kodi', 'android-tv', 'android-mobile', 'swiftfin', 'roku'];
-
 async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
 
   const result = await runBrowserTrace();
   const comparison = await readJsonIfExists(comparisonPath);
-  const evidence = buildEvidence(result, comparison);
+  const manualEvidence = await loadManualDeviceEvidence();
+  const evidence = buildEvidence(result, comparison, manualEvidence);
 
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
-  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison));
+  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison, manualEvidence));
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
 
@@ -63,12 +66,14 @@ function runBrowserTrace() {
   });
 }
 
-function buildEvidence(result, comparison) {
+function buildEvidence(result, comparison, manualEvidence) {
   const updatedAt = new Date().toISOString();
+  const deviceEvidence = summarizeManualEvidence(manualEvidence);
   if (!comparison) {
     return {
       ...baselineEvidence,
       updatedAt,
+      deviceEvidence,
       evidence: `${baselineEvidence.evidence} Browser trace did not produce comparison.json.`,
     };
   }
@@ -89,22 +94,47 @@ function buildEvidence(result, comparison) {
   const failed = Boolean(comparison.comparison?.failed);
   const completedProfiles = commonCompletedProfiles(summaries);
 
-  if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream') && completedProfiles.length === requiredProfiles.length) {
+  const contractsComplete = !failed
+    && completedTargets.includes('jellyrin')
+    && completedTargets.includes('upstream')
+    && completedProfiles.length === requiredProfiles.length;
+  if (contractsComplete && deviceEvidence.validCount > 0) {
     return {
       gate: 'non-web-clients',
-      status: 'upstream-validated',
-      percent: 70,
-      closed: false,
-      sourcePhase: 'E6.2',
-      evidence: 'Non-web client contract golden completed against upstream and Jellyrin for MPV/JMP, Kodi, Android TV, Android mobile, Swiftfin/iOS and Roku with no comparison failures.',
+      status: 'device-validated',
+      percent: 100,
+      closed: true,
+      sourcePhase: 'E6.3',
+      evidence: `Non-web client contracts completed against upstream and Jellyrin, and ${deviceEvidence.validCount} real client playback evidence file(s) passed validation.`,
       updatedAt,
       completedTargets,
       skippedTargets,
       failedTargets,
       completedProfiles,
+      deviceEvidence,
+      tracePath: path.relative(plansDir, comparisonPath),
+      openRisks: [],
+    };
+  }
+
+  if (contractsComplete) {
+    return {
+      gate: 'non-web-clients',
+      status: 'upstream-validated',
+      percent: 80,
+      closed: false,
+      sourcePhase: 'E6.3',
+      evidence: 'Non-web client contract golden completed against upstream and Jellyrin for MPV/JMP, Kodi, Android TV, Android mobile, Swiftfin/iOS and Roku with no comparison failures; manual device evidence intake is ready.',
+      updatedAt,
+      completedTargets,
+      skippedTargets,
+      failedTargets,
+      completedProfiles,
+      deviceEvidence,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
         'Dashboard target remains device-validated; run real playback sessions from representative non-web clients before closing E6.',
+        `Add at least one passing device evidence JSON under ${deviceEvidence.directory}.`,
         'Contract profiles validate Jellyfin-compatible API shape, but client-version-specific behavior still needs manual/device evidence.',
       ],
     };
@@ -122,9 +152,32 @@ function buildEvidence(result, comparison) {
     skippedTargets,
     failedTargets,
     completedProfiles,
+    deviceEvidence,
     failedReasons: comparison.comparison?.reasons || [],
     traceExitCode: result.code,
     tracePath: path.relative(plansDir, comparisonPath),
+  };
+}
+
+function summarizeManualEvidence(manualEvidence) {
+  return {
+    directory: manualEvidence.directory,
+    templatePath: manualEvidence.templatePath,
+    validCount: manualEvidence.valid.length,
+    invalidCount: manualEvidence.invalid.length,
+    validClients: manualEvidence.valid.map((entry) => ({
+      clientId: entry.evidence.clientId,
+      clientName: entry.evidence.clientName,
+      clientVersion: entry.evidence.clientVersion,
+      deviceName: entry.evidence.deviceName,
+      platform: entry.evidence.platform,
+      testedAt: entry.evidence.testedAt,
+      file: entry.relativePath,
+    })),
+    invalidFiles: manualEvidence.invalid.map((entry) => ({
+      file: entry.relativePath,
+      errors: entry.errors,
+    })),
   };
 }
 
@@ -149,7 +202,7 @@ async function readJsonIfExists(filePath) {
   }
 }
 
-function renderMarkdown(evidence, comparison) {
+function renderMarkdown(evidence, comparison, manualEvidence) {
   const lines = [];
   lines.push('# Non-Web Clients Evidence');
   lines.push('');
@@ -176,7 +229,29 @@ function renderMarkdown(evidence, comparison) {
   if (Array.isArray(evidence.completedProfiles)) {
     lines.push(`- Completed client profiles: ${evidence.completedProfiles.join(', ') || 'none'}`);
   }
+  if (evidence.deviceEvidence) {
+    lines.push(`- Manual evidence directory: \`${evidence.deviceEvidence.directory}\``);
+    lines.push(`- Manual evidence template: \`${evidence.deviceEvidence.templatePath}\``);
+    lines.push(`- Valid manual evidence files: ${evidence.deviceEvidence.validCount}`);
+    lines.push(`- Invalid manual evidence files: ${evidence.deviceEvidence.invalidCount}`);
+  }
   lines.push('');
+  if (manualEvidence?.valid?.length) {
+    lines.push('## Manual Device Evidence');
+    lines.push('');
+    for (const entry of manualEvidence.valid) {
+      lines.push(`- ${entry.evidence.clientName} ${entry.evidence.clientVersion} on ${entry.evidence.platform}: \`${entry.relativePath}\``);
+    }
+    lines.push('');
+  }
+  if (manualEvidence?.invalid?.length) {
+    lines.push('## Invalid Manual Evidence');
+    lines.push('');
+    for (const entry of manualEvidence.invalid) {
+      lines.push(`- \`${entry.relativePath}\`: ${entry.errors.join('; ')}`);
+    }
+    lines.push('');
+  }
   if (Array.isArray(evidence.failedReasons) && evidence.failedReasons.length > 0) {
     lines.push('## Failed Reasons');
     lines.push('');
