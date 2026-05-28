@@ -6245,7 +6245,10 @@ async fn start_scheduled_task(
     Query(query): Query<AuthQuery>,
     Path(task_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !user.is_administrator {
+        return Err(ApiError::forbidden("Administrator access required"));
+    }
     if is_library_scan_task(&task_id) {
         recover_stale_library_scan_runs(&state.db).await?;
         let run = match state.db.start_task_run(LIBRARY_SCAN_TASK_KEY).await {
@@ -6266,6 +6269,8 @@ async fn start_scheduled_task(
             Err(error) => return Err(error.into()),
         };
         let db = state.db.clone();
+        let session_id = token.access_token.clone();
+        broadcast_scheduled_tasks_update(&db, &session_id).await?;
         tokio::spawn(async move {
             match scan_all_library_items(&db).await {
                 Ok(scanned_count) => {
@@ -6283,6 +6288,7 @@ async fn start_scheduled_task(
                     let _ = db.fail_task_run(run.id, &message).await;
                 }
             }
+            let _ = broadcast_scheduled_tasks_update(&db, &session_id).await;
         });
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -6296,12 +6302,16 @@ async fn stop_scheduled_task(
     Query(query): Query<AuthQuery>,
     Path(task_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !user.is_administrator {
+        return Err(ApiError::forbidden("Administrator access required"));
+    }
     if is_library_scan_task(&task_id) {
         state
             .db
             .fail_current_task_run(LIBRARY_SCAN_TASK_KEY, "Task run cancelled.")
             .await?;
+        broadcast_scheduled_tasks_update(&state.db, &token.access_token).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -6330,6 +6340,17 @@ async fn recover_stale_library_scan_runs(db: &Database) -> Result<(), ApiError> 
         "Task run expired before completion.",
     )
     .await?;
+    Ok(())
+}
+
+async fn broadcast_scheduled_tasks_update(db: &Database, session_id: &str) -> Result<(), ApiError> {
+    broadcast_session_message(
+        session_id,
+        serde_json::json!({
+            "MessageType": "ScheduledTasksInfo",
+            "Data": [library_scan_task_json(db).await?]
+        }),
+    );
     Ok(())
 }
 
@@ -6526,6 +6547,8 @@ fn task_run_result_json(run: &TaskRun) -> serde_json::Value {
         "StartTimeUtc": format_time_for_json(run.started_at),
         "EndTimeUtc": run.completed_at.map(format_time_for_json)
             .unwrap_or_else(|| format_time_for_json(run.updated_at)),
+        "ErrorMessage": run.error_message.clone(),
+        "Result": run.result_json.clone().unwrap_or_else(|| serde_json::json!({})),
     })
 }
 
@@ -24836,6 +24859,7 @@ mod tests {
         let task: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(task["Id"], "scan-media-library");
 
+        let mut task_events = subscribe_playback_events();
         for endpoint in [
             "/ScheduledTasks/Running/scan-media-library",
             "/scheduledtasks/running/scan-media-library",
@@ -24854,6 +24878,10 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
         }
+        let started_event =
+            next_playback_event_type(&mut task_events, &api_key, "ScheduledTasksInfo").await;
+        assert_eq!(started_event["Data"][0]["Key"], "RefreshLibrary");
+        assert_eq!(started_event["Data"][0]["State"], "Running");
 
         let mut task = json!({});
         for _ in 0..20 {
@@ -24879,7 +24907,16 @@ mod tests {
         assert_eq!(task["State"], "Idle");
         assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
         assert_eq!(task["LastExecutionResult"]["Key"], "RefreshLibrary");
+        assert_eq!(task["LastExecutionResult"]["ErrorMessage"], Value::Null);
+        assert_eq!(task["LastExecutionResult"]["Result"]["ItemsScanned"], 0);
+        let completed_event =
+            next_playback_event_type(&mut task_events, &api_key, "ScheduledTasksInfo").await;
+        assert_eq!(
+            completed_event["Data"][0]["LastExecutionResult"]["Status"],
+            "Completed"
+        );
 
+        let mut cancel_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -24893,6 +24930,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cancel_event =
+            next_playback_event_type(&mut cancel_events, &api_key, "ScheduledTasksInfo").await;
+        assert_eq!(cancel_event["Data"][0]["Key"], "RefreshLibrary");
 
         let response = app
             .clone()

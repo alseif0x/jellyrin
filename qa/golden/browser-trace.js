@@ -78,7 +78,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -362,6 +362,15 @@ async function captureTarget(browser, flowDir, target) {
       nonWebProgress204: false,
       nonWebResumeMatched: false,
       nonWebDlnaUnsupportedDecided: false,
+      scheduledTasksList200: false,
+      scheduledTasksDetail200: false,
+      scheduledTasksStarted: false,
+      scheduledTasksWebsocketUpdate: false,
+      scheduledTasksCompleted: false,
+      scheduledTasksCancelled: false,
+      scheduledTasksTriggers204: false,
+      scheduledTasksLibraryRefresh204: false,
+      scheduledTasksActivityLogged: false,
     },
   };
 
@@ -436,6 +445,8 @@ async function captureTarget(browser, flowDir, target) {
       await runChannelsFlow(page, summary, publicInfo, target);
     } else if (flow === 'non-web-client') {
       await runNonWebClientFlow(page, summary, publicInfo, target);
+    } else if (flow === 'scheduled-tasks') {
+      await runScheduledTasksFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -2915,6 +2926,133 @@ async function runNonWebClientFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runScheduledTasksFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/dashboard/tasks');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  await startWebsocketProbe(page, summary.baseUrl, [
+    { name: 'admin', token: auth.AccessToken, deviceId: `scheduled-tasks-${target.name}` },
+  ]);
+  await waitForWebsocketMessages(page, [
+    ['admin', 'ForceKeepAlive'],
+  ]);
+
+  try {
+    const tasks = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/ScheduledTasks?IsEnabled=true',
+      token: auth.AccessToken,
+    });
+    if (tasks.status !== 200 || !Array.isArray(tasks.json)) {
+      throw new Error(`ScheduledTasks returned HTTP ${tasks.status}`);
+    }
+    summary.invariants.scheduledTasksList200 = true;
+    const scanTask = tasks.json.find((task) => task.Key === 'RefreshLibrary' || task.Id === 'scan-media-library');
+    if (!scanTask?.Id) {
+      throw new Error('ScheduledTasks did not include RefreshLibrary');
+    }
+
+    const detail = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/ScheduledTasks/${encodeURIComponent(scanTask.Id)}`,
+      token: auth.AccessToken,
+    });
+    if (detail.status !== 200 || detail.json?.Key !== 'RefreshLibrary') {
+      throw new Error(`ScheduledTasks/{id} returned HTTP ${detail.status}`);
+    }
+    summary.invariants.scheduledTasksDetail200 = true;
+
+    const start = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/ScheduledTasks/Running/${encodeURIComponent(scanTask.Id)}`,
+      token: auth.AccessToken,
+    });
+    if (![200, 204].includes(start.status)) {
+      throw new Error(`ScheduledTasks/Running start returned HTTP ${start.status}`);
+    }
+    summary.invariants.scheduledTasksStarted = true;
+    await waitForWebsocketMessages(page, [
+      ['admin', 'ScheduledTasksInfo'],
+    ]);
+    summary.invariants.scheduledTasksWebsocketUpdate = true;
+
+    let completedTask = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const poll = await browserFetchJson(page, {
+        method: 'GET',
+        url: `/ScheduledTasks/${encodeURIComponent(scanTask.Id)}`,
+        token: auth.AccessToken,
+      });
+      if (poll.status !== 200) {
+        throw new Error(`ScheduledTasks/{id} poll returned HTTP ${poll.status}`);
+      }
+      completedTask = poll.json;
+      if (completedTask.State === 'Idle' && completedTask.LastExecutionResult?.Status === 'Completed') {
+        break;
+      }
+      await page.waitForTimeout(100);
+    }
+    if (completedTask?.LastExecutionResult?.Status !== 'Completed') {
+      throw new Error('ScheduledTasks did not complete RefreshLibrary');
+    }
+    summary.invariants.scheduledTasksCompleted = true;
+
+    const cancel = await browserFetchJson(page, {
+      method: 'DELETE',
+      url: `/ScheduledTasks/Running/${encodeURIComponent(scanTask.Id)}`,
+      token: auth.AccessToken,
+    });
+    if (![200, 204].includes(cancel.status)) {
+      throw new Error(`ScheduledTasks/Running cancel returned HTTP ${cancel.status}`);
+    }
+    summary.invariants.scheduledTasksCancelled = true;
+
+    const triggers = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/ScheduledTasks/${encodeURIComponent(scanTask.Id)}/Triggers`,
+      token: auth.AccessToken,
+      body: [{
+        Type: 'IntervalTrigger',
+        IntervalTicks: 43_200_000_000,
+      }],
+    });
+    if (![200, 204].includes(triggers.status)) {
+      throw new Error(`ScheduledTasks/{id}/Triggers returned HTTP ${triggers.status}`);
+    }
+    summary.invariants.scheduledTasksTriggers204 = true;
+
+    const refresh = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Library/Refresh',
+      token: auth.AccessToken,
+    });
+    if (![200, 204].includes(refresh.status)) {
+      throw new Error(`Library/Refresh returned HTTP ${refresh.status}`);
+    }
+    summary.invariants.scheduledTasksLibraryRefresh204 = true;
+
+    const activity = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/System/ActivityLog/Entries?Limit=20',
+      token: auth.AccessToken,
+    });
+    if (activity.status !== 200 || !activity.json?.Items?.some((entry) => entry.Name === 'Library scan completed')) {
+      throw new Error(`ActivityLog did not include Library scan completed, HTTP ${activity.status}`);
+    }
+    summary.invariants.scheduledTasksActivityLogged = true;
+
+    await closeWebsocketProbe(page);
+    summary.item = {
+      id: scanTask.Id,
+      name: scanTask.Name,
+      type: 'ScheduledTask',
+    };
+  } finally {
+    await closeWebsocketProbe(page).catch(() => {});
+  }
+}
+
 async function runLiveTvFlow(page, summary, publicInfo, target) {
   await ensureLiveTvFixtures();
   const auth = await authenticateTarget(page, summary, target);
@@ -4333,7 +4471,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -4822,6 +4960,29 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.nonWebDlnaUnsupportedDecided = true;
     }
   }
+  if (flow === 'scheduled-tasks') {
+    if (record.method === 'GET' && pathname === '/ScheduledTasks' && record.status === 200) {
+      summary.invariants.scheduledTasksList200 = true;
+    }
+    if (record.method === 'GET' && /\/ScheduledTasks\/[^/]+$/i.test(pathname) && record.status === 200) {
+      summary.invariants.scheduledTasksDetail200 = true;
+    }
+    if (record.method === 'POST' && /\/ScheduledTasks\/Running\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.scheduledTasksStarted = true;
+    }
+    if (record.method === 'DELETE' && /\/ScheduledTasks\/Running\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.scheduledTasksCancelled = true;
+    }
+    if (record.method === 'POST' && /\/ScheduledTasks\/[^/]+\/Triggers$/i.test(pathname) && [200, 204].includes(record.status)) {
+      summary.invariants.scheduledTasksTriggers204 = true;
+    }
+    if (record.method === 'POST' && pathname === '/Library/Refresh' && [200, 204].includes(record.status)) {
+      summary.invariants.scheduledTasksLibraryRefresh204 = true;
+    }
+    if (record.method === 'GET' && pathname === '/System/ActivityLog/Entries' && record.status === 200) {
+      summary.invariants.scheduledTasksActivityLogged = true;
+    }
+  }
   if (flow === 'sessions-websocket') {
     if (record.method === 'GET' && pathname === '/Sessions' && record.status === 200) {
       summary.invariants.sessionsList200 = true;
@@ -4951,6 +5112,27 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'non-web-client' && record.method === 'GET' && pathname === '/System/Configuration/network') {
     return 'non-web-network-config';
+  }
+  if (flow === 'scheduled-tasks' && record.method === 'GET' && pathname === '/ScheduledTasks') {
+    return 'scheduled-tasks-list';
+  }
+  if (flow === 'scheduled-tasks' && record.method === 'GET' && /\/ScheduledTasks\/[^/]+$/i.test(pathname)) {
+    return 'scheduled-tasks-detail';
+  }
+  if (flow === 'scheduled-tasks' && record.method === 'POST' && /\/ScheduledTasks\/Running\/[^/]+$/i.test(pathname)) {
+    return 'scheduled-tasks-start';
+  }
+  if (flow === 'scheduled-tasks' && record.method === 'DELETE' && /\/ScheduledTasks\/Running\/[^/]+$/i.test(pathname)) {
+    return 'scheduled-tasks-cancel';
+  }
+  if (flow === 'scheduled-tasks' && record.method === 'POST' && /\/ScheduledTasks\/[^/]+\/Triggers$/i.test(pathname)) {
+    return 'scheduled-tasks-triggers';
+  }
+  if (flow === 'scheduled-tasks' && record.method === 'POST' && pathname === '/Library/Refresh') {
+    return 'scheduled-tasks-library-refresh';
+  }
+  if (flow === 'scheduled-tasks' && record.method === 'GET' && pathname === '/System/ActivityLog/Entries') {
+    return 'scheduled-tasks-activity-log';
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/New') {
     return 'syncplay-new';
@@ -5304,7 +5486,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -5368,6 +5550,8 @@ function compareCompletedTargets(summaries) {
                                   ? ['channels-list', 'channels-features', 'channels-filters', 'channels-media-deletion-filter', 'channels-items', 'channels-latest', 'channels-feature-by-id']
                                   : flow === 'non-web-client'
                                     ? ['non-web-system-info', 'non-web-views', 'non-web-playback-info', 'non-web-video-stream', 'non-web-progress', 'non-web-resume']
+                                    : flow === 'scheduled-tasks'
+                                      ? ['scheduled-tasks-list', 'scheduled-tasks-detail', 'scheduled-tasks-start', 'scheduled-tasks-cancel', 'scheduled-tasks-triggers', 'scheduled-tasks-library-refresh', 'scheduled-tasks-activity-log']
                               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -5720,7 +5904,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -6124,6 +6308,25 @@ function invariantFailures(summary) {
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing non-web client ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'scheduled-tasks') {
+    for (const [field, label] of [
+      ['websocketKeepAlive', 'ForceKeepAlive/KeepAlive'],
+      ['scheduledTasksList200', 'task list'],
+      ['scheduledTasksDetail200', 'task detail'],
+      ['scheduledTasksStarted', 'task start'],
+      ['scheduledTasksWebsocketUpdate', 'websocket update'],
+      ['scheduledTasksCompleted', 'task completion'],
+      ['scheduledTasksCancelled', 'task cancel'],
+      ['scheduledTasksTriggers204', 'trigger update'],
+      ['scheduledTasksLibraryRefresh204', 'library refresh'],
+      ['scheduledTasksActivityLogged', 'activity log'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing scheduled-tasks ${label} invariant`);
       }
     }
     return failures;

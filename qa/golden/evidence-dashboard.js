@@ -263,6 +263,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const liveTv = browserTraces.find((trace) => trace.flow === 'live-tv');
   const channels = browserTraces.find((trace) => trace.flow === 'channels');
   const nonWebClient = browserTraces.find((trace) => trace.flow === 'non-web-client');
+  const scheduledTasks = browserTraces.find((trace) => trace.flow === 'scheduled-tasks');
   return [
     {
       id: 'routes',
@@ -422,6 +423,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
         : 'missing trace',
     },
     {
+      id: 'browser-scheduled-tasks',
+      status: scheduledTasks?.status || 'pending',
+      evidence: scheduledTasks
+        ? `${scheduledTasks.completedTargets.join(',') || 'none'} completed, failed=${scheduledTasks.failed}`
+        : 'missing trace',
+    },
+    {
       id: 'dto-field-parity',
       status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
       evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
@@ -456,7 +464,7 @@ function nextActions(gates, dtoSummary, browserTraces) {
   if (dtoSummary.missingGoldenEvidence > 0 || dtoSummary.partialGolden > 0) {
     actions.push('Close remaining G4 DTO field parity gaps with targeted traces for transcode, activity log and image info.');
   }
-  const missingFlows = ['startup-wizard', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client']
+  const missingFlows = ['startup-wizard', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels', 'non-web-client', 'scheduled-tasks']
     .filter((flow) => !browserTraces.some((trace) => trace.flow === flow));
   if (missingFlows.length > 0) {
     actions.push(`Add browser traces for: ${missingFlows.join(', ')}.`);
