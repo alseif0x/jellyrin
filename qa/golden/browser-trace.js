@@ -15,6 +15,10 @@ const chromiumExecutable = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
 const mediaFixtureDir = process.env.JELLYRIN_MEDIA_FIXTURE_DIR
   || path.resolve(__dirname, '../../var/fixtures/m2-movies');
 const subtitleTrickplayFixtureName = 'Jellyrin Subtitle Trickplay Long Fixture';
+const seriesFixtureDir = process.env.JELLYRIN_SERIES_FIXTURE_DIR
+  || path.resolve(__dirname, '../../var/fixtures/m2-series');
+const seriesFlowName = 'Jellyrin Series Flow';
+const seriesFlowSeasonName = 'Season 01';
 const audioFixtureDir = process.env.JELLYRIN_AUDIO_FIXTURE_DIR
   || path.resolve(__dirname, '../../var/fixtures/m2-music');
 const audioHlsFixtureName = 'Jellyrin Audio HLS Legacy Fixture';
@@ -47,7 +51,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -175,6 +179,18 @@ async function captureTarget(browser, flowDir, target) {
       musicGenreInstantMix200: false,
       musicAudioStream200: false,
       musicAudioStreamContentTypes: [],
+      seriesViewMatched: false,
+      seriesEpisodesMatched: false,
+      seriesEpisodeMetadataMatched: false,
+      seriesCounts200: false,
+      seriesNextUp200: false,
+      seriesSeasons200: false,
+      seriesSeasonMatched: false,
+      seriesEpisodesRoute200: false,
+      seriesEpisodesRouteMatched: false,
+      seriesSimilar200: false,
+      seriesStream200: false,
+      seriesStreamContentTypes: [],
     },
   };
 
@@ -225,6 +241,8 @@ async function captureTarget(browser, flowDir, target) {
       await runAudioHlsLegacyFlow(page, summary, publicInfo, target);
     } else if (flow === 'music') {
       await runMusicFlow(page, summary, publicInfo, target);
+    } else if (flow === 'series') {
+      await runSeriesFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -697,6 +715,135 @@ async function runMusicFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runSeriesFlow(page, summary, publicInfo, target) {
+  await ensureSeriesFlowFixtures();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  await ensureVirtualFolder(page, auth, {
+    name: 'Golden Series',
+    collectionType: 'tvshows',
+    location: seriesFixtureDir,
+  });
+  await refreshLibrary(page, auth);
+  const episodes = await waitForSeriesFlowEpisodes(page, auth, { requireMetadata: true });
+  summary.invariants.seriesEpisodesMatched = true;
+  const firstEpisode = episodes[0];
+  if (
+    !episodes.every((episode) => episode.Type === 'Episode')
+    || !episodes.every((episode) => episode.SeriesName === seriesFlowName)
+    || !episodes.every((episode) => episode.SeriesId)
+    || !episodes.every((episode) => episode.ParentIndexNumber === 1)
+    || !episodes.every((episode, index) => episode.IndexNumber === index + 1)
+  ) {
+    throw new Error('series episode DTO metadata did not match expected season/episode fields');
+  }
+  summary.invariants.seriesEpisodeMetadataMatched = true;
+  const seriesId = firstEpisode.SeriesId;
+
+  const userViews = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/UserViews?UserId=${encodeURIComponent(auth.User.Id)}&PresetViews=tvshows`,
+    token: auth.AccessToken,
+  });
+  if (userViews.status !== 200) {
+    throw new Error(`series UserViews returned HTTP ${userViews.status}`);
+  }
+  if (!userViews.json?.Items?.some((view) => view.CollectionType === 'tvshows' || view.Name === 'Golden Series')) {
+    throw new Error('series UserViews did not include the tvshows library');
+  }
+  summary.invariants.seriesViewMatched = true;
+
+  const counts = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/Counts?UserId=${encodeURIComponent(auth.User.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (counts.status !== 200) {
+    throw new Error(`series Items/Counts returned HTTP ${counts.status}`);
+  }
+  if (Number(counts.json?.EpisodeCount || 0) < 3 || Number(counts.json?.SeriesCount || 0) < 1) {
+    throw new Error('series Items/Counts did not include scanned series episodes');
+  }
+  summary.invariants.seriesCounts200 = true;
+
+  const nextUp = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Shows/NextUp?UserId=${encodeURIComponent(auth.User.Id)}&SeriesId=${encodeURIComponent(seriesId)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (nextUp.status !== 200) {
+    throw new Error(`series Shows/NextUp returned HTTP ${nextUp.status}`);
+  }
+  if (!nextUp.json?.Items?.some((item) => item.Type === 'Episode' && item.SeriesName === seriesFlowName)) {
+    throw new Error('series Shows/NextUp did not return the fixture series');
+  }
+  summary.invariants.seriesNextUp200 = true;
+
+  const seasons = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Shows/${encodeURIComponent(seriesId)}/Seasons?UserId=${encodeURIComponent(auth.User.Id)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (seasons.status !== 200) {
+    throw new Error(`series Seasons returned HTTP ${seasons.status}`);
+  }
+  const season = seasons.json?.Items?.find((item) => item.Type === 'Season' && item.SeriesName === seriesFlowName);
+  if (!season?.Id || season.IndexNumber !== 1) {
+    throw new Error('series Seasons did not include Season 1');
+  }
+  summary.invariants.seriesSeasons200 = true;
+  summary.invariants.seriesSeasonMatched = true;
+
+  const seasonEpisodes = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Shows/${encodeURIComponent(seriesId)}/Episodes?UserId=${encodeURIComponent(auth.User.Id)}&SeasonId=${encodeURIComponent(season.Id)}&Fields=MediaSources,RunTimeTicks,Path&SortBy=SortName&Limit=10`,
+    token: auth.AccessToken,
+  });
+  if (seasonEpisodes.status !== 200) {
+    throw new Error(`series Episodes route returned HTTP ${seasonEpisodes.status}`);
+  }
+  if ((seasonEpisodes.json?.Items || []).filter((item) => item.Type === 'Episode' && item.SeriesName === seriesFlowName).length < 3) {
+    throw new Error('series Episodes route did not return all fixture episodes');
+  }
+  summary.invariants.seriesEpisodesRoute200 = true;
+  summary.invariants.seriesEpisodesRouteMatched = true;
+
+  const similar = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Shows/${encodeURIComponent(seriesId)}/Similar?UserId=${encodeURIComponent(auth.User.Id)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (similar.status !== 200) {
+    throw new Error(`series Similar returned HTTP ${similar.status}`);
+  }
+  summary.invariants.seriesSimilar200 = true;
+
+  const stream = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/Videos/${encodeURIComponent(firstEpisode.Id)}/stream.mp4?Static=true&api_key=${encodeURIComponent(auth.AccessToken)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 206].includes(stream.status)) {
+    throw new Error(`series episode stream returned HTTP ${stream.status}`);
+  }
+  summary.invariants.seriesStream200 = true;
+  addUnique(summary.invariants.seriesStreamContentTypes, mediaType(stream.contentType));
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: '<dynamic>',
+    name: firstEpisode.Name,
+    type: firstEpisode.Type,
+    mediaType: firstEpisode.MediaType,
+    series: seriesFlowName,
+    season: 1,
+    episode: 1,
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -1005,6 +1152,39 @@ async function waitForMusicFlowSongs(page, auth, options = {}) {
   throw new Error(`music fixtures not found after refresh; last count=${lastTotal}`);
 }
 
+async function waitForSeriesFlowEpisodes(page, auth, options = {}) {
+  const deadline = Date.now() + 60_000;
+  let lastTotal = 0;
+  while (Date.now() < deadline) {
+    const result = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Episode&SearchTerm=${encodeURIComponent(seriesFlowName)}&Fields=MediaSources,RunTimeTicks,Path&SortBy=SortName&Limit=10`,
+      token: auth.AccessToken,
+    });
+    if (result.status !== 200) {
+      throw new Error(`series fixture lookup returned HTTP ${result.status}`);
+    }
+    const items = result.json?.Items || [];
+    lastTotal = result.json?.TotalRecordCount || 0;
+    const episodes = items
+      .filter((candidate) => candidate.Name?.startsWith(seriesFlowName) && candidate.Type === 'Episode')
+      .sort((left, right) => Number(left.IndexNumber || 0) - Number(right.IndexNumber || 0));
+    if (episodes.length >= 3 && (!options.requireMetadata || episodesHaveSeriesFlowMetadata(episodes))) {
+      return episodes;
+    }
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error(`series fixtures not found after refresh; last count=${lastTotal}`);
+}
+
+function episodesHaveSeriesFlowMetadata(episodes) {
+  return episodes.every((episode) => episode.Type === 'Episode')
+    && episodes.every((episode) => episode.SeriesName === seriesFlowName)
+    && episodes.every((episode) => episode.SeriesId)
+    && episodes.every((episode) => episode.ParentIndexNumber === 1)
+    && episodes.every((episode, index) => episode.IndexNumber === index + 1);
+}
+
 function songsHaveMusicFlowMetadata(songs) {
   return songs.some((song) => song.Album === musicFlowAlbum)
     && songs.some((song) => arrayIncludesName(song.Artists, musicFlowArtist))
@@ -1219,6 +1399,42 @@ async function ensureMusicFlowFixtures() {
       '-metadata',
       `track=${fixture.track}`,
       audioPath,
+    ]);
+  }
+}
+
+async function ensureSeriesFlowFixtures() {
+  const seasonDir = path.join(seriesFixtureDir, seriesFlowName, seriesFlowSeasonName);
+  await fs.mkdir(seasonDir, { recursive: true });
+  for (const episode of [
+    { number: 1, color: 'red', frequency: '440' },
+    { number: 2, color: 'green', frequency: '554.37' },
+    { number: 3, color: 'blue', frequency: '659.25' },
+  ]) {
+    const episodeName = `${seriesFlowName} S01E${String(episode.number).padStart(2, '0')}`;
+    const episodePath = path.join(seasonDir, `${episodeName}.mp4`);
+    await execFileAsync('ffmpeg', [
+      '-hide_banner',
+      '-nostdin',
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      `color=c=${episode.color}:s=320x180:r=24:d=5`,
+      '-f',
+      'lavfi',
+      '-i',
+      `sine=frequency=${episode.frequency}:sample_rate=44100:duration=5`,
+      '-c:v',
+      'mpeg4',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-shortest',
+      '-metadata',
+      `title=${episodeName}`,
+      episodePath,
     ]);
   }
 }
@@ -1537,7 +1753,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -1703,6 +1919,33 @@ function captureFlowInvariants(summary, record, requestPostData) {
       addUnique(summary.invariants.musicAudioStreamContentTypes, mediaType(record.responseContentType));
     }
   }
+  if (flow === 'series' && record.status === 200) {
+    if (record.method === 'GET' && pathname === '/UserViews') {
+      summary.invariants.seriesViewMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Items') {
+      summary.invariants.seriesEpisodesMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Items/Counts') {
+      summary.invariants.seriesCounts200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Shows/NextUp') {
+      summary.invariants.seriesNextUp200 = true;
+    }
+    if (record.method === 'GET' && /\/Shows\/[^/]+\/Seasons$/i.test(pathname)) {
+      summary.invariants.seriesSeasons200 = true;
+    }
+    if (record.method === 'GET' && /\/Shows\/[^/]+\/Episodes$/i.test(pathname)) {
+      summary.invariants.seriesEpisodesRoute200 = true;
+    }
+    if (record.method === 'GET' && /\/(?:Library\/)?Shows\/[^/]+\/Similar$/i.test(pathname)) {
+      summary.invariants.seriesSimilar200 = true;
+    }
+    if (record.method === 'GET' && /\/Videos\/[^/]+\/stream\.mp4$/i.test(pathname)) {
+      summary.invariants.seriesStream200 = true;
+      addUnique(summary.invariants.seriesStreamContentTypes, mediaType(record.responseContentType));
+    }
+  }
 }
 
 function criticalRequestKey(record) {
@@ -1720,7 +1963,7 @@ function criticalRequestKey(record) {
     return 'playback-info';
   }
   if (record.method === 'GET' && /\/Videos\/[^/]+\/stream/i.test(pathname)) {
-    return 'video-stream';
+    return flow === 'series' ? 'series-video-stream' : 'video-stream';
   }
   if (record.method === 'POST' && pathname === '/Sessions/Playing') {
     return 'sessions-playing';
@@ -1754,6 +1997,18 @@ function criticalRequestKey(record) {
   }
   if (record.method === 'GET' && /\/Audio\/[^/]+\/stream\.mp3$/i.test(pathname)) {
     return 'music-audio-stream';
+  }
+  if (record.method === 'GET' && pathname === '/Shows/NextUp') {
+    return 'series-next-up';
+  }
+  if (record.method === 'GET' && /\/Shows\/[^/]+\/Seasons$/i.test(pathname)) {
+    return 'series-seasons';
+  }
+  if (record.method === 'GET' && /\/Shows\/[^/]+\/Episodes$/i.test(pathname)) {
+    return 'series-episodes';
+  }
+  if (record.method === 'GET' && /\/(?:Library\/)?Shows\/[^/]+\/Similar$/i.test(pathname)) {
+    return 'series-similar';
   }
   if (record.method === 'GET' && /\/Audio\/[^/]+\/master\.m3u8$/i.test(pathname)) {
     return 'audio-hls-master';
@@ -1851,7 +2106,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -1891,6 +2146,8 @@ function compareCompletedTargets(summaries) {
               ? ['audio-hls-master', 'audio-hls-media', 'audio-hls-dynamic-segment', 'audio-hls-legacy-segment']
               : flow === 'music'
                 ? ['library-user-views', 'library-items', 'music-albums', 'music-artists', 'music-album-artists', 'music-genres', 'music-instant-mix', 'music-audio-stream']
+                : flow === 'series'
+                  ? ['library-user-views', 'library-items', 'library-items-counts', 'series-next-up', 'series-seasons', 'series-episodes', 'series-similar', 'series-video-stream']
               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -1913,7 +2170,7 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (upstreamRequest.method !== jellyrinRequest.method) {
     reasons.push(`cross-target ${key}: method ${upstreamRequest.method} != ${jellyrinRequest.method}`);
   }
-  if (key === 'video-stream' || key === 'hls-segment' || key === 'audio-hls-legacy-segment' || key === 'music-audio-stream') {
+  if (key === 'video-stream' || key === 'hls-segment' || key === 'audio-hls-legacy-segment' || key === 'music-audio-stream' || key === 'series-video-stream') {
     if (![200, 206].includes(upstreamRequest.status) || ![200, 206].includes(jellyrinRequest.status)) {
       reasons.push(`cross-target ${key}: stream status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
     }
@@ -1974,6 +2231,10 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'music-genres',
     'music-instant-mix',
     'music-genre-instant-mix',
+    'series-next-up',
+    'series-seasons',
+    'series-episodes',
+    'series-similar',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
@@ -2038,6 +2299,10 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'music-genres': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
     'music-instant-mix': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
     'music-genre-instant-mix': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'series-next-up': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].SeriesName', 'Items.[].SeriesId'],
+    'series-seasons': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].SeriesName', 'Items.[].SeriesId'],
+    'series-episodes': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].SeriesName', 'Items.[].SeriesId', 'Items.[].IndexNumber', 'Items.[].ParentIndexNumber'],
+    'series-similar': ['Items', 'TotalRecordCount'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -2116,7 +2381,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -2233,6 +2498,26 @@ function invariantFailures(summary) {
       ['musicInstantMix200', 'music instant mix'],
       ['musicInstantMixResults', 'music instant mix results'],
       ['musicAudioStream200', 'music audio stream'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'series') {
+    for (const [field, label] of [
+      ['seriesViewMatched', 'series view'],
+      ['seriesEpisodesMatched', 'series episodes'],
+      ['seriesEpisodeMetadataMatched', 'series episode metadata'],
+      ['seriesCounts200', 'series counts'],
+      ['seriesNextUp200', 'series next up'],
+      ['seriesSeasons200', 'series seasons'],
+      ['seriesSeasonMatched', 'series season match'],
+      ['seriesEpisodesRoute200', 'series episodes route'],
+      ['seriesEpisodesRouteMatched', 'series episodes route match'],
+      ['seriesSimilar200', 'series similar'],
+      ['seriesStream200', 'series episode stream'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);

@@ -1549,7 +1549,15 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_similar_show_items),
         )
         .route(
+            "/Shows/{item_id}/Similar",
+            get(authenticated_similar_show_items),
+        )
+        .route(
             "/library/shows/{item_id}/similar",
+            get(authenticated_similar_show_items),
+        )
+        .route(
+            "/shows/{item_id}/similar",
             get(authenticated_similar_show_items),
         )
         .route(
