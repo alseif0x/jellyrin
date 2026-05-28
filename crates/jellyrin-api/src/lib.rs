@@ -15974,13 +15974,11 @@ fn direct_play_profile_matches(item: &MediaItem, profile: &DirectPlayProfileMatc
     }
 
     if !profile.audio_codecs.is_empty() {
-        let Some(audio_codec) = media_item_stream_codec(item, "Audio") else {
-            return false;
-        };
-        if !profile
-            .audio_codecs
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(&audio_codec))
+        if let Some(audio_codec) = media_item_stream_codec(item, "Audio")
+            && !profile
+                .audio_codecs
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&audio_codec))
         {
             return false;
         }
@@ -24998,10 +24996,11 @@ mod tests {
 
     use super::{
         AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
-        DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID, ItemsQuery,
-        SystemLifecycleCommand, backup_restore_snapshot_json, cleanup_orphan_hls_transcode_dirs,
-        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
-        default_user_configuration, encoding_configuration_json, hls_transcode_dedupe_key,
+        DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
+        DirectPlayProfileMatcher, ItemsQuery, SystemLifecycleCommand, backup_restore_snapshot_json,
+        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
+        direct_play_profile_matches, encoding_configuration_json, hls_transcode_dedupe_key,
         json_value_i64, last_system_lifecycle_command, load_countries, load_cultures,
         media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_m3u_channels,
@@ -25026,6 +25025,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use time::OffsetDateTime;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -44715,6 +44715,39 @@ mod tests {
         .unwrap();
         assert_eq!(recent_cleaned, 0);
         assert!(recent_dir.exists());
+    }
+
+    #[test]
+    fn direct_play_profile_allows_video_without_audio_stream() {
+        let now = OffsetDateTime::now_utc();
+        let item = MediaItem {
+            id: Uuid::new_v4(),
+            virtual_folder_id: Uuid::new_v4(),
+            name: "Silent MPV Fixture".to_string(),
+            path: "/tmp/Silent MPV Fixture.mp4".to_string(),
+            media_type: "Video".to_string(),
+            collection_type: None,
+            file_size: Some(1024),
+            runtime_ticks: Some(60_000_000),
+            bitrate: Some(1000),
+            width: Some(320),
+            height: Some(180),
+            media_streams: vec![json!({
+                "Type": "Video",
+                "Index": 0,
+                "Codec": "h264"
+            })],
+            created_at: now,
+            updated_at: now,
+        };
+        let profile = DirectPlayProfileMatcher {
+            profile_type: Some("Video".to_string()),
+            containers: vec!["mp4".to_string()],
+            video_codecs: vec!["h264".to_string()],
+            audio_codecs: vec!["aac".to_string(), "mp3".to_string()],
+        };
+
+        assert!(direct_play_profile_matches(&item, &profile));
     }
 
     #[tokio::test]

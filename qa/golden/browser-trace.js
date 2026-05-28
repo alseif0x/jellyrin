@@ -47,6 +47,8 @@ const sessionsFlowPrefix = 'Jellyrin Sessions Flow User';
 const sessionsFlowPassword = 'JellyrinSessionsFlowPassword!2026';
 const syncplayFlowPrefix = 'Jellyrin SyncPlay Flow User';
 const syncplayFlowPassword = 'JellyrinSyncPlayFlowPassword!2026';
+const nonWebClientFlowPrefix = 'Jellyrin Non-Web Client Flow User';
+const nonWebClientFlowPassword = 'JellyrinNonWebClientFlowPassword!2026';
 const pluginsFlowRepositoryName = 'Jellyrin Golden Plugin Repository';
 const pluginsFlowPackageName = 'Jellyrin Golden Plugin';
 const pluginsFlowPackageGuid = '22222222-2222-2222-2222-222222222222';
@@ -2889,138 +2891,201 @@ async function runChannelsFlow(page, summary, publicInfo, target) {
 }
 
 async function runNonWebClientFlow(page, summary, publicInfo, target) {
+  await page.goto(summary.baseUrl, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+
   let auth = null;
-  if (target.username && target.password) {
-    const login = await browserFetchJson(page, {
-      method: 'POST',
-      url: '/Users/AuthenticateByName',
-      authorization: `MediaBrowser Client="Jellyfin MPV Shim", Device="Jellyrin QA MPV ${target.name}", DeviceId="non-web-client-${target.name}", Version="dev"`,
-      body: {
-        Username: target.username,
-        Pw: target.password,
-      },
-    });
-    if (login.status !== 200 || !login.json?.AccessToken || !login.json?.User?.Id) {
-      throw new Error(`non-web client login returned HTTP ${login.status}`);
+  let adminAuth = null;
+  let createdClientUserId = null;
+  const clientUserName = `${nonWebClientFlowPrefix} ${target.name}`;
+  const clientAuthorization = `MediaBrowser Client="Jellyfin MPV Shim", Device="Jellyrin QA MPV ${target.name}", DeviceId="non-web-client-${target.name}", Version="dev"`;
+
+  try {
+    if (target.username && target.password) {
+      auth = await loginNonWebClient(page, target.username, target.password, clientAuthorization);
+    } else {
+      adminAuth = await authenticateTarget(page, summary, target);
+      await deleteUsersByName(page, adminAuth.AccessToken, clientUserName);
+      const createdClient = await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Users/New',
+        token: adminAuth.AccessToken,
+        body: {
+          Name: clientUserName,
+          Password: nonWebClientFlowPassword,
+        },
+      });
+      if (createdClient.status !== 200 || !createdClient.json?.Id) {
+        throw new Error(`non-web client Users/New returned HTTP ${createdClient.status}`);
+      }
+      createdClientUserId = createdClient.json.Id;
+      auth = await loginNonWebClient(page, clientUserName, nonWebClientFlowPassword, clientAuthorization);
     }
-    auth = login.json;
     summary.invariants.nonWebClientAuthenticated = true;
-  } else {
-    auth = await authenticateTarget(page, summary, target);
-    summary.invariants.nonWebClientAuthenticated = true;
-  }
 
-  const systemInfo = await browserFetchJson(page, {
-    method: 'GET',
-    url: '/System/Info',
-    token: auth.AccessToken,
-  });
-  if (systemInfo.status !== 200 || !systemInfo.json?.Id) {
-    throw new Error(`non-web System/Info returned HTTP ${systemInfo.status}`);
-  }
-  summary.invariants.nonWebSystemInfo200 = true;
-
-  const views = await browserFetchJson(page, {
-    method: 'GET',
-    url: `/Users/${encodeURIComponent(auth.User.Id)}/Views`,
-    token: auth.AccessToken,
-  });
-  if (views.status !== 200 || !Array.isArray(views.json?.Items)) {
-    throw new Error(`non-web browse views returned HTTP ${views.status}`);
-  }
-  summary.invariants.nonWebBrowse200 = true;
-
-  const movie = await firstMovieItem(page, summary, auth);
-  if (!movie) {
-    summary.status = 'skipped';
-    summary.skipped = true;
-    summary.reason = 'target has no movie item for non-web client trace';
-    return;
-  }
-  summary.invariants.nonWebMovieMatched = true;
-
-  const playbackInfo = await browserFetchJson(page, {
-    method: 'POST',
-    url: `/Items/${encodeURIComponent(movie.Id)}/PlaybackInfo`,
-    token: auth.AccessToken,
-    body: withoutUndefined({
-      UserId: auth.User.Id,
-      MediaSourceId: movie.Id,
-      EnableDirectPlay: true,
-      EnableDirectStream: true,
-      EnableTranscoding: true,
-      StartPositionTicks: 0,
-      DeviceProfile: mpvShimDeviceProfile(),
-    }),
-  });
-  if (playbackInfo.status !== 200 || !Array.isArray(playbackInfo.json?.MediaSources)) {
-    throw new Error(`non-web PlaybackInfo returned HTTP ${playbackInfo.status}`);
-  }
-  summary.invariants.nonWebPlaybackInfo200 = true;
-  const mediaSource = playbackInfo.json.MediaSources[0];
-  if (!mediaSource || mediaSource.SupportsDirectPlay !== true) {
-    throw new Error('non-web PlaybackInfo did not expose a direct-play media source');
-  }
-  summary.invariants.nonWebDirectMediaSource = true;
-
-  const stream = await browserFetchBinary(page, {
-    method: 'GET',
-    url: `/Videos/${encodeURIComponent(movie.Id)}/stream.mp4?Static=true&api_key=${encodeURIComponent(auth.AccessToken)}`,
-    token: auth.AccessToken,
-  });
-  if (![200, 206].includes(stream.status) || stream.byteLength <= 0) {
-    throw new Error(`non-web direct stream returned HTTP ${stream.status}`);
-  }
-  summary.invariants.nonWebStream200 = true;
-
-  const positionTicks = resumeTracePositionTicks(movie);
-  const progress = await browserFetchJson(page, {
-    method: 'POST',
-    url: '/Sessions/Playing/Progress',
-    token: auth.AccessToken,
-    body: {
-      ItemId: movie.Id,
-      MediaSourceId: mediaSource.Id || movie.Id,
-      PositionTicks: positionTicks,
-      IsPaused: false,
-      PlayMethod: mediaSource.SupportsDirectPlay ? 'DirectPlay' : 'DirectStream',
-    },
-  });
-  if (progress.status !== 204) {
-    throw new Error(`non-web Sessions/Playing/Progress returned HTTP ${progress.status}`);
-  }
-  summary.invariants.nonWebProgress204 = true;
-
-  const resume = await browserFetchJson(page, {
-    method: 'GET',
-    url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video`,
-    token: auth.AccessToken,
-  });
-  if (resume.status !== 200 || !resume.json?.Items?.some((item) => item.Id === movie.Id)) {
-    throw new Error(`non-web resume query did not include movie, HTTP ${resume.status}`);
-  }
-  summary.invariants.nonWebResumeMatched = true;
-
-  if (target.name === 'jellyrin') {
-    const network = await browserFetchJson(page, {
+    const systemInfo = await browserFetchJson(page, {
       method: 'GET',
-      url: '/System/Configuration/network',
+      url: '/System/Info',
       token: auth.AccessToken,
     });
-    if (network.status !== 200 || network.json?.EnableUPnP !== false) {
-      throw new Error(`Jellyrin DLNA/UPnP unsupported decision not visible in network config, HTTP ${network.status}`);
+    if (systemInfo.status !== 200 || !systemInfo.json?.Id) {
+      throw new Error(`non-web System/Info returned HTTP ${systemInfo.status}`);
     }
-    summary.invariants.nonWebDlnaUnsupportedDecided = true;
-  } else {
-    summary.invariants.nonWebDlnaUnsupportedDecided = true;
-  }
+    summary.invariants.nonWebSystemInfo200 = true;
 
-  summary.item = {
-    id: '<dynamic>',
-    name: movie.Name,
-    type: movie.Type,
-    client: 'Jellyfin MPV Shim',
-  };
+    const views = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/Users/${encodeURIComponent(auth.User.Id)}/Views`,
+      token: auth.AccessToken,
+    });
+    if (views.status !== 200 || !Array.isArray(views.json?.Items)) {
+      throw new Error(`non-web browse views returned HTTP ${views.status}`);
+    }
+    summary.invariants.nonWebBrowse200 = true;
+
+    const movie = await firstMovieItem(page, summary, auth);
+    if (!movie) {
+      summary.status = 'skipped';
+      summary.skipped = true;
+      summary.reason = 'target has no movie item for non-web client trace';
+      return;
+    }
+    summary.invariants.nonWebMovieMatched = true;
+
+    const playbackInfo = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Items/${encodeURIComponent(movie.Id)}/PlaybackInfo`,
+      token: auth.AccessToken,
+      body: withoutUndefined({
+        UserId: auth.User.Id,
+        MediaSourceId: movie.Id,
+        EnableDirectPlay: true,
+        EnableDirectStream: true,
+        EnableTranscoding: true,
+        StartPositionTicks: 0,
+        DeviceProfile: mpvShimDeviceProfile(),
+      }),
+    });
+    if (playbackInfo.status !== 200 || !Array.isArray(playbackInfo.json?.MediaSources)) {
+      throw new Error(`non-web PlaybackInfo returned HTTP ${playbackInfo.status}`);
+    }
+    summary.invariants.nonWebPlaybackInfo200 = true;
+    const mediaSource = playbackInfo.json.MediaSources[0];
+    if (!mediaSource || mediaSource.SupportsDirectPlay !== true) {
+      throw new Error('non-web PlaybackInfo did not expose a direct-play media source');
+    }
+    summary.invariants.nonWebDirectMediaSource = true;
+
+    const stream = await browserFetchBinary(page, {
+      method: 'GET',
+      url: `/Videos/${encodeURIComponent(movie.Id)}/stream.mp4?Static=true&api_key=${encodeURIComponent(auth.AccessToken)}`,
+      token: auth.AccessToken,
+    });
+    if (![200, 206].includes(stream.status) || stream.byteLength <= 0) {
+      throw new Error(`non-web direct stream returned HTTP ${stream.status}`);
+    }
+    summary.invariants.nonWebStream200 = true;
+
+    const positionTicks = resumeTracePositionTicks(movie);
+    const progress = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Sessions/Playing/Progress',
+      token: auth.AccessToken,
+      body: {
+        ItemId: movie.Id,
+        MediaSourceId: mediaSource.Id || movie.Id,
+        PositionTicks: positionTicks,
+        IsPaused: false,
+        PlayMethod: mediaSource.SupportsDirectPlay ? 'DirectPlay' : 'DirectStream',
+      },
+    });
+    if (progress.status !== 204) {
+      throw new Error(`non-web Sessions/Playing/Progress returned HTTP ${progress.status}`);
+    }
+    summary.invariants.nonWebProgress204 = true;
+
+    const resume = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video`,
+      token: auth.AccessToken,
+    });
+    if (resume.status !== 200 || !resume.json?.Items?.some((item) => item.Id === movie.Id)) {
+      throw new Error(`non-web resume query did not include movie, HTTP ${resume.status}`);
+    }
+    summary.invariants.nonWebResumeMatched = true;
+
+    if (target.name === 'jellyrin') {
+      const network = await browserFetchJson(page, {
+        method: 'GET',
+        url: '/System/Configuration/network',
+        token: auth.AccessToken,
+      });
+      if (network.status !== 200 || network.json?.EnableUPnP !== false) {
+        throw new Error(`Jellyrin DLNA/UPnP unsupported decision not visible in network config, HTTP ${network.status}`);
+      }
+      summary.invariants.nonWebDlnaUnsupportedDecided = true;
+    } else {
+      summary.invariants.nonWebDlnaUnsupportedDecided = true;
+    }
+
+    summary.item = {
+      id: '<dynamic>',
+      name: movie.Name,
+      type: movie.Type,
+      client: 'Jellyfin MPV Shim',
+    };
+  } finally {
+    if (auth?.AccessToken) {
+      await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Sessions/Logout',
+        token: auth.AccessToken,
+      }).catch(() => {});
+    }
+    if (adminAuth?.AccessToken && createdClientUserId) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Users/${encodeURIComponent(createdClientUserId)}`,
+        token: adminAuth.AccessToken,
+      }).catch(() => {});
+    }
+  }
+}
+
+async function loginNonWebClient(page, username, password, authorization) {
+  const login = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Users/AuthenticateByName',
+    authorization,
+    body: {
+      Username: username,
+      Pw: password,
+    },
+  });
+  if (login.status !== 200 || !login.json?.AccessToken || !login.json?.User?.Id) {
+    throw new Error(`non-web client login returned HTTP ${login.status}`);
+  }
+  return login.json;
+}
+
+async function deleteUsersByName(page, adminToken, userName) {
+  const users = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Users',
+    token: adminToken,
+  });
+  if (users.status !== 200) {
+    throw new Error(`user cleanup list returned HTTP ${users.status}`);
+  }
+  for (const user of users.json || []) {
+    if (user?.Name === userName && user.Id) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Users/${encodeURIComponent(user.Id)}`,
+        token: adminToken,
+      });
+    }
+  }
 }
 
 async function runScheduledTasksFlow(page, summary, publicInfo, target) {
@@ -6019,6 +6084,29 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
     return reasons;
   }
+  if (key.startsWith('non-web-')) {
+    if (key === 'non-web-video-stream') {
+      if (![200, 206].includes(upstreamRequest.status) || ![200, 206].includes(jellyrinRequest.status)) {
+        reasons.push(`cross-target ${key}: stream status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+      }
+      if (mediaType(upstreamRequest.contentType) !== mediaType(jellyrinRequest.contentType)) {
+        reasons.push(`cross-target ${key}: media type ${upstreamRequest.contentType} != ${jellyrinRequest.contentType}`);
+      }
+      return reasons;
+    }
+    if (key === 'non-web-progress') {
+      if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
+        reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+      }
+      return reasons;
+    }
+    if (upstreamRequest.status !== 200 || jellyrinRequest.status !== 200) {
+      reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+      return reasons;
+    }
+    reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
+    return reasons;
+  }
   if (['image-get', 'image-head', 'image-extended-get'].includes(key)) {
     if (upstreamRequest.status !== 200 || jellyrinRequest.status !== 200) {
       reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
@@ -6188,6 +6276,10 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'syncplay-new': ['GroupId', 'GroupName', 'Participants', 'State'],
     'syncplay-list': ['[].GroupId', '[].GroupName', '[].Participants', '[].State'],
     'syncplay-get': ['GroupId', 'GroupName', 'Participants', 'State'],
+    'non-web-system-info': ['Id', 'ServerName', 'Version'],
+    'non-web-views': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'non-web-playback-info': ['MediaSources', 'MediaSources.[].Id', 'MediaSources.[].SupportsDirectPlay', 'MediaSources.[].SupportsDirectStream', 'MediaSources.[].MediaStreams', 'MediaSources.[].MediaStreams.[].Type', 'PlaySessionId'],
+    'non-web-resume': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].UserData'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);

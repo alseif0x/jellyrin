@@ -13,7 +13,7 @@
     "golden:dlna": "node qa/golden/ecosystem-placeholder.js dlna-upnp",
     "golden:syncplay": "node qa/golden/syncplay-advanced.js",
     "golden:channels": "node qa/golden/ecosystem-placeholder.js channels-providers",
-    "golden:clients": "node qa/golden/ecosystem-placeholder.js non-web-clients",
+    "golden:clients": "node qa/golden/non-web-clients.js",
     "golden:ecosystem-release": "node qa/golden/ecosystem-placeholder.js ecosystem-release",
     "evidence:ecosystem": "node qa/golden/ecosystem-parity.js",
     "evidence:dashboard": "node qa/golden/evidence-dashboard.js",
