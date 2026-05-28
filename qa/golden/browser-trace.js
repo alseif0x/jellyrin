@@ -31,6 +31,13 @@ const listFlowPlaylistName = 'Jellyrin Golden Playlist Flow';
 const listFlowCollectionName = 'Jellyrin Golden Collection Flow';
 const imageFlowFixtureName = 'Jellyrin Image Flow Fixture';
 const imageFlowUploadPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFklEQVR42mP8z8Dwn4GBgYGJAQoAFAIBAvhDL0kAAAAASUVORK5CYII=';
+const metadataFlowPrimaryName = 'Jellyrin Metadata Flow Primary';
+const metadataFlowSimilarName = 'Jellyrin Metadata Flow Similar';
+const metadataFlowGenre = 'Jellyrin Metadata Drama';
+const metadataFlowStudio = 'Jellyrin Metadata Studio';
+const metadataFlowPerson = 'Jellyrin Metadata Person';
+const metadataFlowTag = 'Jellyrin Metadata Tag';
+const metadataFlowYear = 1995;
 const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
   || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
 const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
@@ -55,7 +62,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -223,6 +230,20 @@ async function captureTarget(browser, flowDir, target) {
       imageDelete204: false,
       imageInfosAfterDelete200: false,
       imageProviders200: false,
+      metadataItemsMatched: false,
+      metadataUpdatePrimary204: false,
+      metadataUpdateSimilar204: false,
+      metadataEditor200: false,
+      metadataEditorProviderIds: false,
+      metadataExternalIds200: false,
+      metadataItemsSearch200: false,
+      metadataSearchHints200: false,
+      metadataGenreMatched: false,
+      metadataStudioMatched: false,
+      metadataPersonMatched: false,
+      metadataYearMatched: false,
+      metadataSimilar200: false,
+      metadataSimilarMatched: false,
     },
   };
 
@@ -279,6 +300,8 @@ async function captureTarget(browser, flowDir, target) {
       await runPlaylistsCollectionsFlow(page, summary, publicInfo, target);
     } else if (flow === 'images') {
       await runImagesFlow(page, summary, publicInfo, target);
+    } else if (flow === 'metadata-search') {
+      await runMetadataSearchFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -1161,6 +1184,175 @@ async function runImagesFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runMetadataSearchFlow(page, summary, publicInfo, target) {
+  await ensureMetadataSearchFixtures();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  await ensureVirtualFolder(page, auth, {
+    name: 'Golden Metadata',
+    collectionType: 'movies',
+    location: mediaFixtureDir,
+  });
+  await refreshLibrary(page, auth);
+  const primary = await waitForMovieByName(page, summary, auth, metadataFlowPrimaryName);
+  const similar = await waitForMovieByName(page, summary, auth, metadataFlowSimilarName);
+  summary.invariants.metadataItemsMatched = true;
+
+  const primaryMetadata = {
+    Name: metadataFlowPrimaryName,
+    Overview: 'Jellyrin metadata flow overview',
+    Genres: [metadataFlowGenre, 'Jellyrin Metadata Mystery'],
+    Studios: [{ Name: metadataFlowStudio }],
+    People: [{ Name: metadataFlowPerson, Type: 'Actor' }],
+    Tags: [metadataFlowTag],
+    ProviderIds: { Imdb: 'tt0950000', Tmdb: '95000' },
+    ProductionYear: metadataFlowYear,
+  };
+  const similarMetadata = {
+    Name: metadataFlowSimilarName,
+    Overview: 'Jellyrin metadata flow similar overview',
+    Genres: [metadataFlowGenre],
+    Studios: [{ Name: metadataFlowStudio }],
+    Tags: [metadataFlowTag],
+    ProviderIds: { Imdb: 'tt0950001' },
+    ProductionYear: metadataFlowYear,
+  };
+
+  const primaryUpdate = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(primary.Id)}`,
+    token: auth.AccessToken,
+    body: primaryMetadata,
+  });
+  if (![200, 204].includes(primaryUpdate.status)) {
+    throw new Error(`primary metadata update returned HTTP ${primaryUpdate.status}`);
+  }
+  summary.invariants.metadataUpdatePrimary204 = true;
+
+  const similarUpdate = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(similar.Id)}`,
+    token: auth.AccessToken,
+    body: similarMetadata,
+  });
+  if (![200, 204].includes(similarUpdate.status)) {
+    throw new Error(`similar metadata update returned HTTP ${similarUpdate.status}`);
+  }
+  summary.invariants.metadataUpdateSimilar204 = true;
+
+  const editor = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(primary.Id)}/MetadataEditor`,
+    token: auth.AccessToken,
+  });
+  if (editor.status !== 200 || !Array.isArray(editor.json?.ExternalIdInfos)) {
+    throw new Error(`metadata editor returned HTTP ${editor.status}`);
+  }
+  summary.invariants.metadataEditor200 = true;
+
+  const externalIds = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(primary.Id)}/ExternalIdInfos`,
+    token: auth.AccessToken,
+  });
+  if (externalIds.status !== 200 || !Array.isArray(externalIds.json)) {
+    throw new Error(`external id infos returned HTTP ${externalIds.status}`);
+  }
+  summary.invariants.metadataExternalIds200 = true;
+
+  const itemSearch = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Movie&SearchTerm=${encodeURIComponent('Metadata Flow Primary')}&Fields=ProviderIds,Genres,Studios,People,Tags,Overview&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (itemSearch.status !== 200 || !itemSearch.json?.Items?.some((item) => item.Id === primary.Id)) {
+    throw new Error(`metadata item search returned HTTP ${itemSearch.status}`);
+  }
+  const matchedSearchItem = itemSearch.json.Items.find((item) => item.Id === primary.Id);
+  if (matchedSearchItem?.ProviderIds?.Imdb !== 'tt0950000') {
+    throw new Error('metadata item search did not expose updated Imdb provider id');
+  }
+  summary.invariants.metadataItemsSearch200 = true;
+  summary.invariants.metadataEditorProviderIds = true;
+
+  const hints = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Search/Hints?UserId=${encodeURIComponent(auth.User.Id)}&SearchTerm=${encodeURIComponent('Metadata Flow Primary')}&IncludeItemTypes=Movie&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (hints.status !== 200 || !hints.json?.SearchHints?.some((hint) => hint.ItemId === primary.Id || hint.Id === primary.Id)) {
+    throw new Error(`metadata Search/Hints returned HTTP ${hints.status}`);
+  }
+  summary.invariants.metadataSearchHints200 = true;
+
+  const genre = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Genres?UserId=${encodeURIComponent(auth.User.Id)}&SearchTerm=${encodeURIComponent(metadataFlowGenre)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (genre.status !== 200 || !genre.json?.Items?.some((item) => item.Name === metadataFlowGenre && item.Type === 'Genre')) {
+    throw new Error(`metadata Genres returned HTTP ${genre.status}`);
+  }
+  summary.invariants.metadataGenreMatched = true;
+
+  const studio = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Studios?UserId=${encodeURIComponent(auth.User.Id)}&SearchTerm=${encodeURIComponent(metadataFlowStudio)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (studio.status !== 200 || !studio.json?.Items?.some((item) => item.Name === metadataFlowStudio && item.Type === 'Studio')) {
+    throw new Error(`metadata Studios returned HTTP ${studio.status}`);
+  }
+  summary.invariants.metadataStudioMatched = true;
+
+  const person = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Persons?UserId=${encodeURIComponent(auth.User.Id)}&SearchTerm=${encodeURIComponent(metadataFlowPerson)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (person.status !== 200 || !person.json?.Items?.some((item) => item.Name === metadataFlowPerson && item.Type === 'Person')) {
+    throw new Error(`metadata Persons returned HTTP ${person.status}`);
+  }
+  summary.invariants.metadataPersonMatched = true;
+
+  const years = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Years?UserId=${encodeURIComponent(auth.User.Id)}&StartIndex=0&Limit=10`,
+    token: auth.AccessToken,
+  });
+  if (years.status !== 200 || !years.json?.Items?.some((item) => item.Name === String(metadataFlowYear) && item.Type === 'Year')) {
+    throw new Error(`metadata Years returned HTTP ${years.status}`);
+  }
+  summary.invariants.metadataYearMatched = true;
+
+  const similarResult = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items/${encodeURIComponent(primary.Id)}/Similar?UserId=${encodeURIComponent(auth.User.Id)}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (similarResult.status !== 200) {
+    throw new Error(`metadata similar returned HTTP ${similarResult.status}`);
+  }
+  summary.invariants.metadataSimilar200 = true;
+  if (!similarResult.json?.Items?.some((item) => item.Id === similar.Id)) {
+    throw new Error('metadata similar did not return shared-genre fixture');
+  }
+  summary.invariants.metadataSimilarMatched = true;
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: '<dynamic>',
+    name: primary.Name,
+    type: primary.Type,
+    genre: metadataFlowGenre,
+    studio: metadataFlowStudio,
+    year: metadataFlowYear,
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -1433,6 +1625,7 @@ async function ensureVirtualFolder(page, auth, { name, collectionType, location 
 async function waitForMovieByName(page, summary, auth, name) {
   const deadline = Date.now() + 30_000;
   let lastTotal = 0;
+  const expectedPathSuffix = `/${name}.mp4`;
   while (Date.now() < deadline) {
     const result = await browserFetchJson(page, {
       method: 'GET',
@@ -1446,6 +1639,22 @@ async function waitForMovieByName(page, summary, auth, name) {
     const movie = result.json?.Items?.find((item) => item.Name === name);
     if (movie) {
       return movie;
+    }
+    const pathMatch = result.json?.Items?.find((item) => item.Path?.endsWith(expectedPathSuffix));
+    if (pathMatch) {
+      return pathMatch;
+    }
+    const pathResult = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Movie&Fields=MediaSources,RunTimeTicks,Path&Limit=100`,
+      token: auth.AccessToken,
+    });
+    if (pathResult.status !== 200) {
+      throw new Error(`fixture movie path lookup returned HTTP ${pathResult.status}`);
+    }
+    const pathMovie = pathResult.json?.Items?.find((item) => item.Path?.endsWith(expectedPathSuffix));
+    if (pathMovie) {
+      return pathMovie;
     }
     await page.waitForTimeout(1_000);
   }
@@ -1660,6 +1869,45 @@ async function ensureImageFlowFixture() {
     `title=${imageFlowFixtureName}`,
     moviePath,
   ]);
+}
+
+async function ensureMetadataSearchFixtures() {
+  await fs.mkdir(mediaFixtureDir, { recursive: true });
+  for (const fixture of [
+    { name: metadataFlowPrimaryName, color: 'yellow', frequency: '392' },
+    { name: metadataFlowSimilarName, color: 'purple', frequency: '494' },
+  ]) {
+    const moviePath = path.join(mediaFixtureDir, `${fixture.name}.mp4`);
+    try {
+      await fs.access(moviePath);
+      continue;
+    } catch (_) {
+      // Create below.
+    }
+    await execFileAsync('ffmpeg', [
+      '-hide_banner',
+      '-nostdin',
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      `color=c=${fixture.color}:s=160x90:r=24:d=6`,
+      '-f',
+      'lavfi',
+      '-i',
+      `sine=frequency=${fixture.frequency}:sample_rate=44100:duration=6`,
+      '-c:v',
+      'mpeg4',
+      '-pix_fmt',
+      'yuv420p',
+      '-c:a',
+      'aac',
+      '-shortest',
+      '-metadata',
+      `title=${fixture.name}`,
+      moviePath,
+    ]);
+  }
 }
 
 async function ensureSubtitleTrickplayFixture() {
@@ -2168,11 +2416,11 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
-  const key = criticalRequestKey(record);
+  const key = criticalRequestKey(record, requestPostData);
   if (key) {
     summary.criticalRequests[key] = criticalRequestSummary(record, requestPostData);
   }
@@ -2428,9 +2676,45 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.imageDelete204 = true;
     }
   }
+  if (flow === 'metadata-search') {
+    if (record.method === 'POST' && /\/ItemUpdate\/Items\/[^/]+$/i.test(pathname) && [200, 204].includes(record.status)) {
+      if (!summary.invariants.metadataUpdatePrimary204) {
+        summary.invariants.metadataUpdatePrimary204 = true;
+      } else {
+        summary.invariants.metadataUpdateSimilar204 = true;
+      }
+    }
+    if (record.method === 'GET' && /\/ItemUpdate\/Items\/[^/]+\/MetadataEditor$/i.test(pathname) && record.status === 200) {
+      summary.invariants.metadataEditor200 = true;
+    }
+    if (record.method === 'GET' && /\/ItemLookup\/Items\/[^/]+\/ExternalIdInfos$/i.test(pathname) && record.status === 200) {
+      summary.invariants.metadataExternalIds200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Items' && record.status === 200) {
+      summary.invariants.metadataItemsSearch200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Search/Hints' && record.status === 200) {
+      summary.invariants.metadataSearchHints200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Genres' && record.status === 200) {
+      summary.invariants.metadataGenreMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Studios' && record.status === 200) {
+      summary.invariants.metadataStudioMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Persons' && record.status === 200) {
+      summary.invariants.metadataPersonMatched = true;
+    }
+    if (record.method === 'GET' && pathname === '/Years' && record.status === 200) {
+      summary.invariants.metadataYearMatched = true;
+    }
+    if (record.method === 'GET' && /\/Items\/[^/]+\/Similar$/i.test(pathname) && record.status === 200) {
+      summary.invariants.metadataSimilar200 = true;
+    }
+  }
 }
 
-function criticalRequestKey(record) {
+function criticalRequestKey(record, requestPostData) {
   const pathname = new URL(record.url).pathname;
   if (record.method === 'POST' && pathname.toLowerCase() === '/users/authenticatebyname') {
     return 'auth';
@@ -2546,6 +2830,36 @@ function criticalRequestKey(record) {
   if (record.method === 'DELETE' && /\/(?:Image\/)?Items\/[^/]+\/Images\/Primary$/i.test(pathname)) {
     return 'image-delete';
   }
+  if (record.method === 'POST' && /\/(?:ItemUpdate\/)?Items\/[^/]+$/i.test(pathname)) {
+    return requestPostData?.Overview?.includes('similar') ? 'metadata-update-similar' : 'metadata-update-primary';
+  }
+  if (record.method === 'GET' && /\/(?:ItemUpdate\/)?Items\/[^/]+\/MetadataEditor$/i.test(pathname)) {
+    return 'metadata-editor';
+  }
+  if (record.method === 'GET' && /\/(?:ItemLookup\/)?Items\/[^/]+\/ExternalIdInfos$/i.test(pathname)) {
+    return 'metadata-external-ids';
+  }
+  if (flow === 'metadata-search' && record.method === 'GET' && pathname === '/Items') {
+    return 'metadata-items-search';
+  }
+  if (record.method === 'GET' && pathname === '/Search/Hints') {
+    return 'metadata-search-hints';
+  }
+  if (flow === 'metadata-search' && record.method === 'GET' && pathname === '/Genres') {
+    return 'metadata-genres';
+  }
+  if (flow === 'metadata-search' && record.method === 'GET' && pathname === '/Studios') {
+    return 'metadata-studios';
+  }
+  if (flow === 'metadata-search' && record.method === 'GET' && pathname === '/Persons') {
+    return 'metadata-persons';
+  }
+  if (flow === 'metadata-search' && record.method === 'GET' && pathname === '/Years') {
+    return 'metadata-years';
+  }
+  if (flow === 'metadata-search' && record.method === 'GET' && /\/Items\/[^/]+\/Similar$/i.test(pathname)) {
+    return 'metadata-similar';
+  }
   if (record.method === 'GET' && /\/Audio\/[^/]+\/master\.m3u8$/i.test(pathname)) {
     return 'audio-hls-master';
   }
@@ -2642,7 +2956,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -2688,6 +3002,8 @@ function compareCompletedTargets(summaries) {
                     ? ['playlist-create', 'playlist-detail', 'playlist-items', 'playlist-move', 'playlist-remove-item', 'playlist-add-item', 'playlist-rename', 'collection-create', 'collection-add-items', 'collection-remove-items']
                     : flow === 'images'
                       ? ['image-infos', 'image-upload', 'image-get', 'image-head', 'image-extended-get', 'image-providers', 'image-delete']
+                      : flow === 'metadata-search'
+                        ? ['metadata-update-primary', 'metadata-update-similar', 'metadata-editor', 'metadata-external-ids', 'metadata-items-search', 'metadata-search-hints', 'metadata-genres', 'metadata-studios', 'metadata-persons', 'metadata-years', 'metadata-similar']
               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -2778,6 +3094,12 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     }
     return reasons;
   }
+  if (['metadata-update-primary', 'metadata-update-similar'].includes(key)) {
+    if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
+      reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    return reasons;
+  }
   if (['image-get', 'image-head', 'image-extended-get'].includes(key)) {
     if (upstreamRequest.status !== 200 || jellyrinRequest.status !== 200) {
       reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
@@ -2822,6 +3144,15 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'playlist-detail',
     'playlist-items',
     'collection-create',
+    'metadata-editor',
+    'metadata-external-ids',
+    'metadata-items-search',
+    'metadata-search-hints',
+    'metadata-genres',
+    'metadata-studios',
+    'metadata-persons',
+    'metadata-years',
+    'metadata-similar',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
@@ -2894,6 +3225,15 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'playlist-detail': ['Id', 'Name', 'Type', 'ChildCount'],
     'playlist-items': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].PlaylistItemId'],
     'collection-create': ['Id'],
+    'metadata-editor': ['ExternalIdInfos', 'ExternalIdInfos.[].Key', 'Cultures', 'Countries'],
+    'metadata-external-ids': ['[].Key'],
+    'metadata-items-search': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'metadata-search-hints': ['SearchHints', 'TotalRecordCount', 'SearchHints.[].ItemId', 'SearchHints.[].Name', 'SearchHints.[].Type'],
+    'metadata-genres': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'metadata-studios': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'metadata-persons': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'metadata-years': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'metadata-similar': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -2972,7 +3312,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -3159,6 +3499,29 @@ function invariantFailures(summary) {
       ['imageProviders200', 'remote image providers'],
       ['imageDelete204', 'image delete'],
       ['imageInfosAfterDelete200', 'post-delete image infos'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'metadata-search') {
+    for (const [field, label] of [
+      ['metadataItemsMatched', 'metadata fixture items'],
+      ['metadataUpdatePrimary204', 'primary metadata update'],
+      ['metadataUpdateSimilar204', 'similar metadata update'],
+      ['metadataEditor200', 'metadata editor'],
+      ['metadataEditorProviderIds', 'metadata editor provider ids'],
+      ['metadataExternalIds200', 'external id infos'],
+      ['metadataItemsSearch200', 'items search'],
+      ['metadataSearchHints200', 'search hints'],
+      ['metadataGenreMatched', 'genre search'],
+      ['metadataStudioMatched', 'studio search'],
+      ['metadataPersonMatched', 'person search'],
+      ['metadataYearMatched', 'year search'],
+      ['metadataSimilar200', 'similar route'],
+      ['metadataSimilarMatched', 'similar shared metadata result'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);

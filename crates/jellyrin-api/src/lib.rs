@@ -1959,7 +1959,15 @@ pub fn router(state: AppState) -> Router {
             get(item_metadata_editor),
         )
         .route(
+            "/Items/{item_id}/MetadataEditor",
+            get(item_metadata_editor),
+        )
+        .route(
             "/itemupdate/items/{item_id}/metadataeditor",
+            get(item_metadata_editor),
+        )
+        .route(
+            "/items/{item_id}/metadataeditor",
             get(item_metadata_editor),
         )
         .route(
@@ -1967,7 +1975,15 @@ pub fn router(state: AppState) -> Router {
             get(item_external_id_infos),
         )
         .route(
+            "/Items/{item_id}/ExternalIdInfos",
+            get(item_external_id_infos),
+        )
+        .route(
             "/itemlookup/items/{item_id}/externalidinfos",
+            get(item_external_id_infos),
+        )
+        .route(
+            "/items/{item_id}/externalidinfos",
             get(item_external_id_infos),
         )
         .route(
@@ -44364,6 +44380,19 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/Items/{item_id}/ExternalIdInfos"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri("/ItemLookup/Items/RemoteSearch/Movie")
                     .header("X-Emby-Token", &editor_key)
@@ -44533,6 +44562,29 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
+                    .uri(format!("/Items/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Name": "Metadata Movie",
+                            "Overview": "Manual overview canonical",
+                            "ProviderIds": { "Tmdb": "9876" },
+                            "Tags": ["Edited"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
                     .uri(format!(
                         "/ItemUpdate/Items/{item_id}/ContentType?ContentType=Movie"
                     ))
@@ -44559,14 +44611,27 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let editor_payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(editor_payload["Item"]["Id"], item_id);
-        assert_eq!(editor_payload["Item"]["Overview"], "Manual overview");
+        assert_eq!(editor_payload["Item"]["Overview"], "Manual overview canonical");
         assert_eq!(editor_payload["Item"]["ProviderIds"]["Tmdb"], "9876");
         assert_eq!(editor_payload["Item"]["Tags"], json!(["Edited"]));
-        assert_eq!(editor_payload["Metadata"]["Overview"], "Manual overview");
+        assert_eq!(editor_payload["Metadata"]["Overview"], "Manual overview canonical");
         assert_eq!(editor_payload["Metadata"]["ProviderIds"]["Tmdb"], "9876");
         assert_eq!(editor_payload["Metadata"]["ContentType"], "Movie");
         assert_eq!(editor_payload["ExternalIdInfos"][0]["Key"], "Imdb");
         assert!(editor_payload["Cultures"].as_array().unwrap().len() > 100);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/MetadataEditor"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .clone()
