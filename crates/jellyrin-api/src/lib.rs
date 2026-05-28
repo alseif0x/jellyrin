@@ -8794,6 +8794,7 @@ fn syncplay_group_json(group: &SyncPlayGroup) -> serde_json::Value {
     serde_json::json!({
         "GroupId": group.id,
         "Id": group.id,
+        "GroupName": group.name,
         "Name": group.name,
         "Participants": participants,
         "State": group.state,
@@ -33302,6 +33303,28 @@ mod tests {
         assert_eq!(created["GroupId"], group_id);
         assert_eq!(created["Name"], "Rust sync shell");
         assert_eq!(created["Participants"].as_array().unwrap().len(), 1);
+
+        let generated_group_name = format!("Rust generated sync shell {group_id}");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(
+                        json!({ "GroupName": generated_group_name }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let generated_group: Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(generated_group["GroupId"], group_id);
+        assert_eq!(generated_group["GroupName"], generated_group_name);
+        assert_eq!(generated_group["Name"], generated_group_name);
 
         let response = app
             .clone()
