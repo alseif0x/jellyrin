@@ -28,7 +28,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -119,6 +119,14 @@ async function captureTarget(browser, flowDir, target) {
       adminPlugins200: false,
       adminRepositories200: false,
       adminConfigPages200: false,
+      libraryViews200: false,
+      libraryGroupingOptions200: false,
+      libraryVirtualFolders200: false,
+      libraryItemsCounts200: false,
+      libraryItems200: false,
+      libraryLatest200: false,
+      libraryViewMatched: false,
+      libraryItemMatched: false,
     },
   };
 
@@ -161,6 +169,8 @@ async function captureTarget(browser, flowDir, target) {
       await runResumeFlow(page, summary, publicInfo, target);
     } else if (flow === 'transcode-hls') {
       await runTranscodeHlsFlow(page, summary, publicInfo, target);
+    } else if (flow === 'libraries') {
+      await runLibrariesFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -221,6 +231,82 @@ async function runAdminDashboardFlow(page, summary, publicInfo, target) {
 
   await page.goto(`${summary.baseUrl}/web/#/dashboard`, { waitUntil: 'domcontentloaded' });
   await page.waitForLoadState('networkidle');
+}
+
+async function runLibrariesFlow(page, summary, publicInfo, target) {
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  const viewsResult = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/UserViews?UserId=${encodeURIComponent(auth.User.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (viewsResult.status !== 200) {
+    throw new Error(`UserViews returned HTTP ${viewsResult.status}`);
+  }
+  const libraryView = (viewsResult.json?.Items || [])
+    .find((item) => ['movies', 'boxsets'].includes(String(item.CollectionType || '').toLowerCase()))
+    || viewsResult.json?.Items?.[0];
+  if (!libraryView?.Id) {
+    throw new Error('UserViews returned no library views');
+  }
+  summary.invariants.libraryViewMatched = true;
+
+  const endpoints = [
+    ['UserViews/GroupingOptions', `/UserViews/GroupingOptions?UserId=${encodeURIComponent(auth.User.Id)}`],
+    ['Library/VirtualFolders', '/Library/VirtualFolders'],
+    ['Items/Counts', `/Items/Counts?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(libraryView.Id)}`],
+  ];
+  for (const [name, url] of endpoints) {
+    const result = await browserFetchJson(page, {
+      method: 'GET',
+      url,
+      token: auth.AccessToken,
+    });
+    if (result.status !== 200) {
+      throw new Error(`${name} returned HTTP ${result.status}`);
+    }
+    if (result.json === null) {
+      throw new Error(`${name} did not return JSON`);
+    }
+  }
+
+  const itemsResult = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(libraryView.Id)}&Recursive=true&IncludeItemTypes=Movie&Fields=PrimaryImageAspectRatio,MediaSources,DateCreated&StartIndex=0&Limit=12`,
+    token: auth.AccessToken,
+  });
+  if (itemsResult.status !== 200) {
+    throw new Error(`Items returned HTTP ${itemsResult.status}`);
+  }
+  const libraryItem = itemsResult.json?.Items?.find((item) => item.Type === 'Movie') || itemsResult.json?.Items?.[0];
+  if (!libraryItem?.Id) {
+    throw new Error('library Items returned no media items');
+  }
+  summary.invariants.libraryItemMatched = true;
+
+  const latestResult = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Users/${encodeURIComponent(auth.User.Id)}/Items/Latest?ParentId=${encodeURIComponent(libraryView.Id)}&IncludeItemTypes=Movie&Limit=12&Fields=PrimaryImageAspectRatio,MediaSources,DateCreated`,
+    token: auth.AccessToken,
+  });
+  if (latestResult.status !== 200) {
+    throw new Error(`Users/Items/Latest returned HTTP ${latestResult.status}`);
+  }
+  if (!Array.isArray(latestResult.json)) {
+    throw new Error('Users/Items/Latest did not return a JSON array');
+  }
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.library = {
+    id: '<dynamic>',
+    name: libraryView.Name,
+    collectionType: libraryView.CollectionType,
+    itemName: libraryItem.Name,
+  };
 }
 
 async function runResumeFlow(page, summary, publicInfo, target) {
@@ -720,7 +806,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -800,12 +886,35 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.adminConfigPages200 = true;
     }
   }
+  if (flow === 'libraries' && record.status === 200) {
+    if (record.method === 'GET' && pathname === '/UserViews') {
+      summary.invariants.libraryViews200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/UserViews/GroupingOptions') {
+      summary.invariants.libraryGroupingOptions200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Library/VirtualFolders') {
+      summary.invariants.libraryVirtualFolders200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Items/Counts') {
+      summary.invariants.libraryItemsCounts200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Items') {
+      summary.invariants.libraryItems200 = true;
+    }
+    if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/Latest$/i.test(pathname)) {
+      summary.invariants.libraryLatest200 = true;
+    }
+  }
 }
 
 function criticalRequestKey(record) {
   const pathname = new URL(record.url).pathname;
   if (record.method === 'POST' && pathname.toLowerCase() === '/users/authenticatebyname') {
     return 'auth';
+  }
+  if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/Latest$/i.test(pathname)) {
+    return 'library-latest';
   }
   if (record.method === 'GET' && /\/Users\/[^/]+\/Items\/[^/]+$/i.test(pathname)) {
     return 'item-detail';
@@ -858,6 +967,21 @@ function criticalRequestKey(record) {
   if (record.method === 'GET' && pathname === '/web/ConfigurationPages') {
     return 'admin-config-pages';
   }
+  if (record.method === 'GET' && pathname === '/UserViews') {
+    return 'library-user-views';
+  }
+  if (record.method === 'GET' && pathname === '/UserViews/GroupingOptions') {
+    return 'library-grouping-options';
+  }
+  if (record.method === 'GET' && pathname === '/Library/VirtualFolders') {
+    return 'library-virtual-folders';
+  }
+  if (record.method === 'GET' && pathname === '/Items/Counts') {
+    return 'library-items-counts';
+  }
+  if (record.method === 'GET' && pathname === '/Items') {
+    return 'library-items';
+  }
   return null;
 }
 
@@ -882,7 +1006,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -907,7 +1031,16 @@ function compareCompletedTargets(summaries) {
             'admin-repositories',
             'admin-config-pages',
           ]
-        : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+        : flow === 'libraries'
+          ? [
+              'library-user-views',
+              'library-grouping-options',
+              'library-virtual-folders',
+              'library-items-counts',
+              'library-items',
+              'library-latest',
+            ]
+          : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -956,6 +1089,12 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     'admin-plugins',
     'admin-repositories',
     'admin-config-pages',
+    'library-user-views',
+    'library-grouping-options',
+    'library-virtual-folders',
+    'library-items-counts',
+    'library-items',
+    'library-latest',
   ].includes(key)) {
     reasons.push(...compareRequiredShape(key, upstreamRequest.responseShape, jellyrinRequest.responseShape));
   } else if (JSON.stringify(upstreamRequest.responseShape) !== JSON.stringify(jellyrinRequest.responseShape)) {
@@ -1008,6 +1147,12 @@ function compareRequiredShape(key, upstreamShape, jellyrinShape) {
     'admin-plugins': [],
     'admin-repositories': [],
     'admin-config-pages': [],
+    'library-user-views': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type'],
+    'library-grouping-options': [],
+    'library-virtual-folders': ['[].Name', '[].CollectionType', '[].Locations'],
+    'library-items-counts': [],
+    'library-items': ['Items', 'TotalRecordCount', 'Items.[].Id', 'Items.[].Name', 'Items.[].Type', 'Items.[].UserData'],
+    'library-latest': ['[].Id', '[].Name', '[].Type'],
   }[key] || [];
   const reasons = [];
   const upstreamKeys = shapeKeys(upstreamShape);
@@ -1086,7 +1231,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -1134,6 +1279,27 @@ function invariantFailures(summary) {
       if (!summary.invariants[field]) {
         failures.push(`missing admin ${label} 200 invariant`);
       }
+    }
+    return failures;
+  }
+  if (flow === 'libraries') {
+    for (const [field, label] of [
+      ['libraryViews200', 'UserViews'],
+      ['libraryGroupingOptions200', 'UserViews/GroupingOptions'],
+      ['libraryVirtualFolders200', 'Library/VirtualFolders'],
+      ['libraryItemsCounts200', 'Items/Counts'],
+      ['libraryItems200', 'Items'],
+      ['libraryLatest200', 'Users/Items/Latest'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing library ${label} 200 invariant`);
+      }
+    }
+    if (!summary.invariants.libraryViewMatched) {
+      failures.push('missing library view match invariant');
+    }
+    if (!summary.invariants.libraryItemMatched) {
+      failures.push('missing library item match invariant');
     }
     return failures;
   }

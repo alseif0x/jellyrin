@@ -1645,6 +1645,17 @@ impl Database {
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
+            DELETE FROM devices
+            WHERE user_id = ?1 AND device_id = ?2 AND access_token != ?3
+            "#,
+        )
+        .bind(token.user_id.to_string())
+        .bind(&token.device_id)
+        .bind(&token.access_token)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
             INSERT INTO devices (
                 access_token, user_id, device_id, device_name, client, version, created_at, last_activity_at
             )
@@ -6094,6 +6105,27 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn api_key_device_sessions_replace_same_named_device() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("root".to_string(), "secret")
+            .await
+            .unwrap();
+        let first_key = db.issue_api_key_for_user(user.id, "golden").await.unwrap();
+        let second_key = db.issue_api_key_for_user(user.id, "golden").await.unwrap();
+        let (_, first_token) = db.user_by_api_key(&first_key).await.unwrap();
+        let (_, second_token) = db.user_by_api_key(&second_key).await.unwrap();
+
+        db.ensure_device_session(&first_token).await.unwrap();
+        db.ensure_device_session(&second_token).await.unwrap();
+
+        let sessions = db.device_sessions_for_user(user.id).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].access_token, second_key);
+        assert_eq!(sessions[0].device_id, "api-key:golden");
     }
 
     #[tokio::test]

@@ -247,6 +247,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const resume = browserTraces.find((trace) => trace.flow === 'resume');
   const transcodeHls = browserTraces.find((trace) => trace.flow === 'transcode-hls');
   const adminDashboard = browserTraces.find((trace) => trace.flow === 'admin-dashboard');
+  const libraries = browserTraces.find((trace) => trace.flow === 'libraries');
   return [
     {
       id: 'routes',
@@ -291,6 +292,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
       status: adminDashboard?.status || 'pending',
       evidence: adminDashboard
         ? `${adminDashboard.completedTargets.join(',') || 'none'} completed, failed=${adminDashboard.failed}`
+        : 'missing trace',
+    },
+    {
+      id: 'browser-libraries',
+      status: libraries?.status || 'pending',
+      evidence: libraries
+        ? `${libraries.completedTargets.join(',') || 'none'} completed, failed=${libraries.failed}`
         : 'missing trace',
     },
     {
