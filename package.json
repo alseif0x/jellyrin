@@ -9,7 +9,7 @@
     "golden:dto": "node qa/golden/dto-parity.js",
     "golden:ecosystem": "npm run evidence:ecosystem",
     "golden:plugins": "node qa/golden/ecosystem-placeholder.js plugin-dual-runtime",
-    "golden:livetv": "node qa/golden/ecosystem-placeholder.js livetv-real",
+    "golden:livetv": "node qa/golden/livetv-real.js",
     "golden:dlna": "node qa/golden/ecosystem-placeholder.js dlna-upnp",
     "golden:syncplay": "node qa/golden/syncplay-advanced.js",
     "golden:channels": "node qa/golden/ecosystem-placeholder.js channels-providers",

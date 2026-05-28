@@ -6767,7 +6767,51 @@ fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     merge_known_network_value(&mut config, &payload, "RecordingPostProcessorArguments");
     merge_known_network_value(&mut config, &payload, "SaveRecordingNFO");
     merge_known_network_value(&mut config, &payload, "SaveRecordingImages");
+    enrich_live_tv_configuration_local_sources(&mut config);
     config
+}
+
+fn enrich_live_tv_configuration_local_sources(config: &mut serde_json::Value) {
+    if let Some(tuners) = config
+        .get_mut("TunerHosts")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for tuner in tuners {
+            let has_channels = tuner
+                .get("Channels")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|channels| !channels.is_empty());
+            if !has_channels
+                && let Some(path) = live_tv_local_config_path(tuner)
+                && let Ok(contents) = fs::read_to_string(path)
+            {
+                let channels = parse_live_tv_m3u_channels(&contents);
+                if !channels.is_empty() {
+                    tuner["Channels"] = serde_json::json!(channels);
+                }
+            }
+        }
+    }
+    if let Some(providers) = config
+        .get_mut("ListingProviders")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for provider in providers {
+            let has_programs = provider
+                .get("Programs")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|programs| !programs.is_empty());
+            if !has_programs
+                && let Some(path) = live_tv_local_config_path(provider)
+                && let Ok(contents) = fs::read_to_string(path)
+            {
+                let programs = parse_live_tv_xmltv_programs(&contents);
+                if !programs.is_empty() {
+                    provider["Programs"] = serde_json::json!(programs);
+                }
+            }
+        }
+    }
 }
 
 fn default_metadata_configuration() -> serde_json::Value {
@@ -9272,7 +9316,8 @@ async fn live_tv_channel_mapping_options(
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let tuner_channels = live_tv_channel_items(&config)
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let tuner_channels = live_tv_channel_items(&config, &server_id)
         .into_iter()
         .map(live_tv_channel_mapping_option)
         .collect::<Vec<_>>();
@@ -9888,7 +9933,10 @@ async fn live_tv_channels(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    Ok(Json(query_result(live_tv_channel_items(&config))))
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(Json(query_result(live_tv_channel_items(
+        &config, &server_id,
+    ))))
 }
 
 async fn live_tv_channel(
@@ -9903,7 +9951,8 @@ async fn live_tv_channel(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    let channel = live_tv_channel_items(&config)
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let channel = live_tv_channel_items(&config, &server_id)
         .into_iter()
         .find(|channel| {
             json_string_field(channel, "Id")
@@ -9921,7 +9970,8 @@ async fn live_tv_channel_by_id(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    live_tv_channel_items(&config)
+    let server_id = db.server_state().await?.server_id.to_string();
+    live_tv_channel_items(&config, &server_id)
         .into_iter()
         .find(|channel| {
             json_string_field(channel, "Id")
@@ -9976,7 +10026,8 @@ async fn live_tv_program(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    let program = live_tv_program_items(&config)
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let program = live_tv_program_items(&config, &server_id)
         .into_iter()
         .find(|program| {
             json_string_field(program, "Id")
@@ -9994,7 +10045,8 @@ async fn live_tv_program_result(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    let mut programs = live_tv_program_items(&config);
+    let server_id = db.server_state().await?.server_id.to_string();
+    let mut programs = live_tv_program_items(&config, &server_id);
     if !channel_ids.is_empty() {
         programs.retain(|program| {
             json_string_field(program, "ChannelId").is_some_and(|channel_id| {
@@ -10059,7 +10111,10 @@ async fn live_tv_recordings(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    Ok(Json(query_result(live_tv_recording_items(&config))))
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(Json(query_result(live_tv_recording_items(
+        &config, &server_id,
+    ))))
 }
 
 async fn live_tv_recording(
@@ -10074,7 +10129,8 @@ async fn live_tv_recording(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    let recording = live_tv_recording_items(&config)
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let recording = live_tv_recording_items(&config, &server_id)
         .into_iter()
         .find(|recording| {
             json_string_field(recording, "Id")
@@ -10092,7 +10148,8 @@ async fn live_tv_recording_by_id(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    live_tv_recording_items(&config)
+    let server_id = db.server_state().await?.server_id.to_string();
+    live_tv_recording_items(&config, &server_id)
         .into_iter()
         .find(|recording| {
             json_string_field(recording, "Id")
@@ -10130,8 +10187,9 @@ async fn live_tv_recording_folders(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
+    let server_id = state.db.server_state().await?.server_id.to_string();
     Ok(Json(query_result(live_tv_recording_group_items(
-        &config, "Folder",
+        &config, &server_id, "Folder",
     ))))
 }
 
@@ -10146,8 +10204,9 @@ async fn live_tv_recording_groups(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
+    let server_id = state.db.server_state().await?.server_id.to_string();
     Ok(Json(query_result(live_tv_recording_group_items(
-        &config, "Group",
+        &config, &server_id, "Group",
     ))))
 }
 
@@ -10162,8 +10221,9 @@ async fn live_tv_recording_series(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
+    let server_id = state.db.server_state().await?.server_id.to_string();
     Ok(Json(query_result(live_tv_recording_group_items(
-        &config, "Series",
+        &config, &server_id, "Series",
     ))))
 }
 
@@ -10203,7 +10263,7 @@ fn json_string_list_field(value: &serde_json::Value, field: &str) -> Option<Vec<
     }
 }
 
-fn live_tv_channel_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
+fn live_tv_channel_items(config: &serde_json::Value, server_id: &str) -> Vec<serde_json::Value> {
     let mut channels = Vec::new();
     let Some(tuner_hosts) = config
         .get("TunerHosts")
@@ -10225,7 +10285,7 @@ fn live_tv_channel_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
         };
         for (channel_index, channel) in tuner_channels.iter().enumerate() {
             if let Some(channel) =
-                live_tv_channel_item(&tuner_id, &tuner_name, channel, channel_index)
+                live_tv_channel_item(&tuner_id, &tuner_name, channel, channel_index, server_id)
             {
                 channels.push(channel);
             }
@@ -10250,6 +10310,7 @@ fn live_tv_channel_item(
     tuner_name: &str,
     channel: &serde_json::Value,
     index: usize,
+    server_id: &str,
 ) -> Option<serde_json::Value> {
     let (mut base, raw_name) = match channel {
         serde_json::Value::Object(fields) => (serde_json::Value::Object(fields.clone()), None),
@@ -10271,6 +10332,7 @@ fn live_tv_channel_item(
 
     base["Id"] = serde_json::json!(id);
     base["ChannelId"] = base["Id"].clone();
+    base["ServerId"] = serde_json::json!(server_id);
     base["Name"] = serde_json::json!(name);
     base["SortName"] = serde_json::json!(
         number
@@ -10353,11 +10415,17 @@ fn live_tv_channel_media_source(
     }))
 }
 
-fn live_tv_program_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
-    let channels = live_tv_channel_items(config);
+fn live_tv_program_items(config: &serde_json::Value, server_id: &str) -> Vec<serde_json::Value> {
+    let channels = live_tv_channel_items(config, server_id);
     let mut programs = Vec::new();
-    collect_live_tv_programs(config, "ListingProviders", &channels, &mut programs);
-    collect_live_tv_programs(config, "TunerHosts", &channels, &mut programs);
+    collect_live_tv_programs(
+        config,
+        "ListingProviders",
+        &channels,
+        &mut programs,
+        server_id,
+    );
+    collect_live_tv_programs(config, "TunerHosts", &channels, &mut programs, server_id);
     programs.sort_by(|left, right| {
         let left_start = json_string_field(left, "StartDate").unwrap_or_default();
         let right_start = json_string_field(right, "StartDate").unwrap_or_default();
@@ -10380,6 +10448,7 @@ fn collect_live_tv_programs(
     collection_key: &str,
     channels: &[serde_json::Value],
     programs: &mut Vec<serde_json::Value>,
+    server_id: &str,
 ) {
     let Some(sources) = config
         .get(collection_key)
@@ -10396,7 +10465,7 @@ fn collect_live_tv_programs(
         };
         for (program_index, program) in source_programs.iter().enumerate() {
             if let Some(program) =
-                live_tv_program_item(&source_id, channels, program, program_index)
+                live_tv_program_item(&source_id, channels, program, program_index, server_id)
             {
                 programs.push(program);
             }
@@ -10409,6 +10478,7 @@ fn live_tv_program_item(
     channels: &[serde_json::Value],
     program: &serde_json::Value,
     index: usize,
+    server_id: &str,
 ) -> Option<serde_json::Value> {
     let (mut base, raw_name) = match program {
         serde_json::Value::Object(fields) => (serde_json::Value::Object(fields.clone()), None),
@@ -10442,6 +10512,7 @@ fn live_tv_program_item(
     base["Name"] = serde_json::json!(name.clone());
     base["SortName"] = serde_json::json!(name);
     base["Type"] = serde_json::json!("Program");
+    base["ServerId"] = serde_json::json!(server_id);
     base["MediaType"] = serde_json::json!("Video");
     base["ChannelId"] = serde_json::json!(channel_id);
     base["ChannelName"] = channel_name
@@ -10470,8 +10541,8 @@ fn live_tv_program_item(
     Some(base)
 }
 
-fn live_tv_recording_items(config: &serde_json::Value) -> Vec<serde_json::Value> {
-    let channels = live_tv_channel_items(config);
+fn live_tv_recording_items(config: &serde_json::Value, server_id: &str) -> Vec<serde_json::Value> {
+    let channels = live_tv_channel_items(config, server_id);
     let mut recordings = config
         .get("Recordings")
         .and_then(serde_json::Value::as_array)
@@ -10480,7 +10551,7 @@ fn live_tv_recording_items(config: &serde_json::Value) -> Vec<serde_json::Value>
                 .iter()
                 .enumerate()
                 .filter_map(|(index, recording)| {
-                    live_tv_recording_item(recording, index, &channels)
+                    live_tv_recording_item(recording, index, &channels, server_id)
                 })
                 .collect::<Vec<_>>()
         })
@@ -10507,6 +10578,7 @@ fn live_tv_recording_item(
     recording: &serde_json::Value,
     index: usize,
     channels: &[serde_json::Value],
+    server_id: &str,
 ) -> Option<serde_json::Value> {
     let serde_json::Value::Object(fields) = recording else {
         return None;
@@ -10530,6 +10602,7 @@ fn live_tv_recording_item(
     item["Name"] = serde_json::json!(name.clone());
     item["SortName"] = serde_json::json!(name);
     item["Type"] = serde_json::json!("Recording");
+    item["ServerId"] = serde_json::json!(server_id);
     item["MediaType"] = serde_json::json!("Video");
     item["ChannelId"] = serde_json::json!(channel_id);
     item["ChannelName"] = channel_name
@@ -10583,10 +10656,11 @@ fn live_tv_recording_content_type(path: &FsPath) -> &'static str {
 
 fn live_tv_recording_group_items(
     config: &serde_json::Value,
+    server_id: &str,
     group_type: &'static str,
 ) -> Vec<serde_json::Value> {
     let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-    for recording in live_tv_recording_items(config) {
+    for recording in live_tv_recording_items(config, server_id) {
         let key = match group_type {
             "Folder" => json_string_field(&recording, "FolderName")
                 .or_else(|| json_string_field(&recording, "Category"))
@@ -20440,7 +20514,8 @@ async fn configured_live_tv_channel_items(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    Ok(live_tv_channel_items(&config))
+    let server_id = db.server_state().await?.server_id.to_string();
+    Ok(live_tv_channel_items(&config, &server_id))
 }
 
 fn channel_provider_json(

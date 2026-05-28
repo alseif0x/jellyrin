@@ -3400,11 +3400,25 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
       Type: 'm3u',
       Url: path.join(mediaFixtureDir, 'jellyrin-live-tv.m3u'),
       FriendlyName: 'Jellyrin Golden Live TV',
+      Channels: [{
+        Id: liveTvFlowChannelId,
+        Name: 'Jellyrin Live TV',
+        Number: '101',
+        Path: liveStreamPath,
+      }],
     }],
     ListingProviders: [{
       Id: 'jellyrin-live-tv-guide',
       Type: 'xmltv',
       Path: path.join(mediaFixtureDir, 'jellyrin-live-tv.xml'),
+      Programs: [{
+        Id: liveTvFlowProgramId,
+        Name: 'Jellyrin Morning News',
+        ChannelId: liveTvFlowChannelId,
+        StartDate: '2026-05-26T08:00:00Z',
+        EndDate: '2026-05-26T09:00:00Z',
+        Overview: 'Live TV guide fixture',
+      }],
     }],
     Recordings: [{
       Id: liveTvFlowRecordingId,
