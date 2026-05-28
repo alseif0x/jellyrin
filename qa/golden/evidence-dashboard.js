@@ -249,6 +249,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const adminDashboard = browserTraces.find((trace) => trace.flow === 'admin-dashboard');
   const libraries = browserTraces.find((trace) => trace.flow === 'libraries');
   const subtitlesTrickplay = browserTraces.find((trace) => trace.flow === 'subtitles-trickplay');
+  const audioHlsLegacy = browserTraces.find((trace) => trace.flow === 'audio-hls-legacy');
   return [
     {
       id: 'routes',
@@ -310,6 +311,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
         : 'missing trace',
     },
     {
+      id: 'browser-audio-hls-legacy',
+      status: audioHlsLegacy?.status || 'pending',
+      evidence: audioHlsLegacy
+        ? `${audioHlsLegacy.completedTargets.join(',') || 'none'} completed, failed=${audioHlsLegacy.failed}`
+        : 'missing trace',
+    },
+    {
       id: 'dto-field-parity',
       status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
       evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
@@ -344,7 +352,7 @@ function nextActions(gates, dtoSummary, browserTraces) {
   if (dtoSummary.missingGoldenEvidence > 0 || dtoSummary.partialGolden > 0) {
     actions.push('Close remaining G4 DTO field parity gaps with targeted traces for transcode, activity log and image info.');
   }
-  const missingFlows = ['resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay']
+  const missingFlows = ['resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy']
     .filter((flow) => !browserTraces.some((trace) => trace.flow === flow));
   if (missingFlows.length > 0) {
     actions.push(`Add browser traces for: ${missingFlows.join(', ')}.`);

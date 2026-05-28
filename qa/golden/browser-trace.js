@@ -15,6 +15,14 @@ const chromiumExecutable = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
 const mediaFixtureDir = process.env.JELLYRIN_MEDIA_FIXTURE_DIR
   || path.resolve(__dirname, '../../var/fixtures/m2-movies');
 const subtitleTrickplayFixtureName = 'Jellyrin Subtitle Trickplay Long Fixture';
+const audioFixtureDir = process.env.JELLYRIN_AUDIO_FIXTURE_DIR
+  || path.resolve(__dirname, '../../var/fixtures/m2-music');
+const audioHlsFixtureName = 'Jellyrin Audio HLS Legacy Fixture';
+const upstreamTranscodeDir = process.env.JELLYFIN_TRANSCODE_DIR
+  || '/home/cdmonio/dev/jellyfin-data/cache/transcodes';
+const jellyrinTranscodeDir = process.env.JELLYRIN_TRANSCODE_DIR
+  || path.join('/tmp', 'jellyrin', 'transcodes');
+const audioLegacySegmentId = Number.parseInt(process.env.JELLYRIN_AUDIO_LEGACY_SEGMENT_ID || '987654321', 10);
 
 const targetDefinitions = [
   {
@@ -34,7 +42,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -143,6 +151,14 @@ async function captureTarget(browser, flowDir, target) {
       trickplayImagesOnly: false,
       trickplayTile200: false,
       trickplayTileJpeg: false,
+      audioItemMatched: false,
+      audioPlaybackInfo200: false,
+      audioTranscodingUrlPresent: false,
+      audioHlsMaster200: false,
+      audioHlsMedia200: false,
+      audioHlsDynamicSegment200: false,
+      audioHlsLegacySegment200: false,
+      audioHlsSegmentContentTypes: [],
     },
   };
 
@@ -189,6 +205,8 @@ async function captureTarget(browser, flowDir, target) {
       await runLibrariesFlow(page, summary, publicInfo, target);
     } else if (flow === 'subtitles-trickplay') {
       await runSubtitlesTrickplayFlow(page, summary, publicInfo, target);
+    } else if (flow === 'audio-hls-legacy') {
+      await runAudioHlsLegacyFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -446,6 +464,110 @@ async function runSubtitlesTrickplayFlow(page, summary, publicInfo, target) {
   };
 }
 
+async function runAudioHlsLegacyFlow(page, summary, publicInfo, target) {
+  await ensureAudioHlsFixture();
+  await ensureAudioLegacySegmentFixture();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  await ensureVirtualFolder(page, auth, {
+    name: 'Golden Music',
+    collectionType: 'music',
+    location: audioFixtureDir,
+  });
+  await refreshLibrary(page, auth);
+  const audio = await waitForAudioByName(page, auth, audioHlsFixtureName);
+  summary.invariants.audioItemMatched = true;
+  const mediaSourceId = audio.MediaSources?.[0]?.Id || audio.Id;
+  const audioStreamIndex = defaultStreamIndex(audio, 'Audio') ?? 0;
+
+  const playbackInfo = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(audio.Id)}/PlaybackInfo`,
+    token: auth.AccessToken,
+    body: withoutUndefined({
+      UserId: auth.User.Id,
+      MediaSourceId: mediaSourceId,
+      AudioStreamIndex: audioStreamIndex,
+      EnableDirectPlay: false,
+      EnableDirectStream: false,
+      EnableTranscoding: true,
+      StartPositionTicks: 0,
+    }),
+  });
+  if (playbackInfo.status !== 200) {
+    throw new Error(`audio PlaybackInfo returned HTTP ${playbackInfo.status}`);
+  }
+  summary.invariants.audioPlaybackInfo200 = true;
+  if (playbackInfo.json?.MediaSources?.[0]?.TranscodingUrl) {
+    summary.invariants.audioTranscodingUrlPresent = true;
+  }
+
+  const query = `api_key=${encodeURIComponent(auth.AccessToken)}&Static=true&MediaSourceId=${encodeURIComponent(mediaSourceId)}`;
+  const master = await browserFetchText(page, {
+    method: 'GET',
+    url: `/Audio/${encodeURIComponent(audio.Id)}/master.m3u8?${query}`,
+    token: auth.AccessToken,
+  });
+  if (master.status !== 200) {
+    throw new Error(`audio HLS master returned HTTP ${master.status}`);
+  }
+  summary.invariants.audioHlsMaster200 = true;
+  if (!master.text.includes('#EXTM3U') || !master.text.includes('main.m3u8')) {
+    throw new Error('audio HLS master missing expected shape');
+  }
+
+  const media = await browserFetchText(page, {
+    method: 'GET',
+    url: `/Audio/${encodeURIComponent(audio.Id)}/main.m3u8?${query}`,
+    token: auth.AccessToken,
+  });
+  if (media.status !== 200) {
+    throw new Error(`audio HLS media playlist returned HTTP ${media.status}`);
+  }
+  summary.invariants.audioHlsMedia200 = true;
+  if (!media.text.includes('#EXTM3U') || !media.text.includes('/hls1/') && !media.text.includes('hls1/')) {
+    throw new Error('audio HLS media playlist missing expected hls1 segment');
+  }
+
+  const dynamicSegmentPath = firstPlaylistUri(media.text);
+  if (!dynamicSegmentPath || !/\.(?:mp3|aac|ts)(?:\?|$)/i.test(dynamicSegmentPath)) {
+    throw new Error('audio HLS media playlist did not contain mp3/aac/ts segment URI');
+  }
+  const dynamicSegment = await browserFetchBinary(page, {
+    method: 'GET',
+    url: resolveRelativeUrl(`/Audio/${audio.Id}/main.m3u8`, dynamicSegmentPath),
+    token: auth.AccessToken,
+  });
+  if (![200, 206].includes(dynamicSegment.status)) {
+    throw new Error(`audio HLS dynamic segment returned HTTP ${dynamicSegment.status}`);
+  }
+  summary.invariants.audioHlsDynamicSegment200 = true;
+  addUnique(summary.invariants.audioHlsSegmentContentTypes, mediaType(dynamicSegment.contentType));
+
+  const legacySegment = await browserFetchBinary(page, {
+    method: 'GET',
+    url: `/Audio/${encodeURIComponent(audio.Id)}/hls/${audioLegacySegmentId}/stream.mp3?api_key=${encodeURIComponent(auth.AccessToken)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 206].includes(legacySegment.status)) {
+    throw new Error(`audio HLS legacy segment returned HTTP ${legacySegment.status}`);
+  }
+  summary.invariants.audioHlsLegacySegment200 = true;
+  addUnique(summary.invariants.audioHlsSegmentContentTypes, mediaType(legacySegment.contentType));
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: '<dynamic>',
+    name: audio.Name,
+    type: audio.Type,
+    mediaType: audio.MediaType,
+    container: audio.MediaSources?.[0]?.Container,
+  };
+}
+
 async function runResumeFlow(page, summary, publicInfo, target) {
   const auth = await authenticateTarget(page, summary, target);
   const movie = await firstMovieItem(page, summary, auth);
@@ -657,6 +779,34 @@ async function refreshLibrary(page, auth) {
   }
 }
 
+async function ensureVirtualFolder(page, auth, { name, collectionType, location }) {
+  const folders = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Library/VirtualFolders',
+    token: auth.AccessToken,
+  });
+  if (folders.status !== 200) {
+    throw new Error(`Library/VirtualFolders returned HTTP ${folders.status}`);
+  }
+  const exists = folders.json?.some((folder) => (
+    folder.Name === name
+    || (folder.Locations || []).includes(location)
+    || (folder.LibraryOptions?.PathInfos || []).some((pathInfo) => pathInfo.Path === location)
+  ));
+  if (exists) {
+    return;
+  }
+  const create = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Library/VirtualFolders?name=${encodeURIComponent(name)}&collectionType=${encodeURIComponent(collectionType)}&paths=${encodeURIComponent(location)}`,
+    token: auth.AccessToken,
+    body: {},
+  });
+  if (![200, 204].includes(create.status)) {
+    throw new Error(`Library/VirtualFolders create returned HTTP ${create.status}`);
+  }
+}
+
 async function waitForMovieByName(page, summary, auth, name) {
   const deadline = Date.now() + 30_000;
   let lastTotal = 0;
@@ -677,6 +827,28 @@ async function waitForMovieByName(page, summary, auth, name) {
     await page.waitForTimeout(1_000);
   }
   throw new Error(`fixture movie ${name} not found after refresh; last count=${lastTotal}`);
+}
+
+async function waitForAudioByName(page, auth, name) {
+  const deadline = Date.now() + 30_000;
+  let lastTotal = 0;
+  while (Date.now() < deadline) {
+    const result = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Audio&SearchTerm=${encodeURIComponent(name)}&Fields=MediaSources,RunTimeTicks,Path&Limit=5`,
+      token: auth.AccessToken,
+    });
+    if (result.status !== 200) {
+      throw new Error(`audio fixture lookup returned HTTP ${result.status}`);
+    }
+    lastTotal = result.json?.TotalRecordCount || 0;
+    const item = result.json?.Items?.find((candidate) => candidate.Name === name);
+    if (item) {
+      return item;
+    }
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error(`audio fixture ${name} not found after refresh; last count=${lastTotal}`);
 }
 
 async function ensureUpstreamTrickplayReady(page, auth, movie) {
@@ -804,6 +976,44 @@ async function ensureSubtitleTrickplayFixture() {
     'language=eng',
     moviePath,
   ]);
+}
+
+async function ensureAudioHlsFixture() {
+  await fs.mkdir(audioFixtureDir, { recursive: true });
+  const audioPath = path.join(audioFixtureDir, `${audioHlsFixtureName}.mp3`);
+  try {
+    await fs.access(audioPath);
+    return;
+  } catch (_) {
+    // Create below.
+  }
+  await execFileAsync('ffmpeg', [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'sine=frequency=440:sample_rate=44100:duration=12',
+    '-c:a',
+    'libmp3lame',
+    '-b:a',
+    '128k',
+    '-metadata',
+    `title=${audioHlsFixtureName}`,
+    audioPath,
+  ]);
+}
+
+async function ensureAudioLegacySegmentFixture() {
+  if (!Number.isInteger(audioLegacySegmentId) || audioLegacySegmentId < 0) {
+    throw new Error(`Invalid JELLYRIN_AUDIO_LEGACY_SEGMENT_ID: ${audioLegacySegmentId}`);
+  }
+  const body = Buffer.from('jellyrin golden legacy mp3 segment\n', 'utf8');
+  for (const directory of [upstreamTranscodeDir, jellyrinTranscodeDir]) {
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, `${audioLegacySegmentId}.mp3`), body);
+  }
 }
 
 function resumeTracePositionTicks(movie) {
@@ -1120,7 +1330,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -1137,6 +1347,12 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.transcodePlaybackInfo200 = true;
       if (record.responseShape?.MediaSources?.[0]?.TranscodingUrl) {
         summary.invariants.transcodingUrlPresent = true;
+      }
+    }
+    if (flow === 'audio-hls-legacy') {
+      summary.invariants.audioPlaybackInfo200 = true;
+      if (record.responseShape?.MediaSources?.[0]?.TranscodingUrl) {
+        summary.invariants.audioTranscodingUrlPresent = true;
       }
     }
   }
@@ -1237,6 +1453,22 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.trickplayTile200 = true;
     }
   }
+  if (flow === 'audio-hls-legacy' && record.status === 200) {
+    if (record.method === 'GET' && /\/Audio\/[^/]+\/master\.m3u8$/i.test(pathname)) {
+      summary.invariants.audioHlsMaster200 = true;
+    }
+    if (record.method === 'GET' && /\/Audio\/[^/]+\/main\.m3u8$/i.test(pathname)) {
+      summary.invariants.audioHlsMedia200 = true;
+    }
+    if (record.method === 'GET' && /\/Audio\/[^/]+\/hls1\/.*\.(?:mp3|aac|ts)$/i.test(pathname)) {
+      summary.invariants.audioHlsDynamicSegment200 = true;
+      addUnique(summary.invariants.audioHlsSegmentContentTypes, mediaType(record.responseContentType));
+    }
+    if (record.method === 'GET' && /\/(?:HlsSegment\/)?Audio\/[^/]+\/hls\/[^/]+\/stream\.(?:mp3|aac)$/i.test(pathname)) {
+      summary.invariants.audioHlsLegacySegment200 = true;
+      addUnique(summary.invariants.audioHlsSegmentContentTypes, mediaType(record.responseContentType));
+    }
+  }
 }
 
 function criticalRequestKey(record) {
@@ -1264,6 +1496,18 @@ function criticalRequestKey(record) {
   }
   if (record.method === 'GET' && pathname === '/UserItems/Resume') {
     return 'resume-list';
+  }
+  if (record.method === 'GET' && /\/Audio\/[^/]+\/master\.m3u8$/i.test(pathname)) {
+    return 'audio-hls-master';
+  }
+  if (record.method === 'GET' && /\/Audio\/[^/]+\/main\.m3u8$/i.test(pathname)) {
+    return 'audio-hls-media';
+  }
+  if (record.method === 'GET' && /\/Audio\/[^/]+\/hls1\/.*\.(?:mp3|aac|ts)$/i.test(pathname)) {
+    return 'audio-hls-dynamic-segment';
+  }
+  if (record.method === 'GET' && /\/(?:HlsSegment\/)?Audio\/[^/]+\/hls\/[^/]+\/stream\.(?:mp3|aac)$/i.test(pathname)) {
+    return 'audio-hls-legacy-segment';
   }
   if (record.method === 'GET' && /master\.m3u8$/i.test(pathname)) {
     return 'hls-master';
@@ -1349,7 +1593,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -1385,7 +1629,9 @@ function compareCompletedTargets(summaries) {
             ]
           : flow === 'subtitles-trickplay'
             ? ['playback-info', 'subtitle-playlist', 'subtitle-vtt', 'trickplay-playlist', 'trickplay-tile']
-            : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+            : flow === 'audio-hls-legacy'
+              ? ['audio-hls-master', 'audio-hls-media', 'audio-hls-dynamic-segment', 'audio-hls-legacy-segment']
+              : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -1407,12 +1653,25 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
   if (upstreamRequest.method !== jellyrinRequest.method) {
     reasons.push(`cross-target ${key}: method ${upstreamRequest.method} != ${jellyrinRequest.method}`);
   }
-  if (key === 'video-stream' || key === 'hls-segment') {
+  if (key === 'video-stream' || key === 'hls-segment' || key === 'audio-hls-legacy-segment') {
     if (![200, 206].includes(upstreamRequest.status) || ![200, 206].includes(jellyrinRequest.status)) {
       reasons.push(`cross-target ${key}: stream status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
     }
     if (mediaType(upstreamRequest.contentType) !== mediaType(jellyrinRequest.contentType)) {
       reasons.push(`cross-target ${key}: media type ${upstreamRequest.contentType} != ${jellyrinRequest.contentType}`);
+    }
+    if (Boolean(upstreamRequest.hasContentRange) !== Boolean(jellyrinRequest.hasContentRange)) {
+      reasons.push(`cross-target ${key}: content-range presence differs`);
+    }
+    return reasons;
+  }
+  if (key === 'audio-hls-dynamic-segment') {
+    const allowedAudioHlsTypes = new Set(['audio/mpeg', 'audio/aac', 'video/mp2t']);
+    if (![200, 206].includes(upstreamRequest.status) || ![200, 206].includes(jellyrinRequest.status)) {
+      reasons.push(`cross-target ${key}: stream status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
+    }
+    if (!allowedAudioHlsTypes.has(mediaType(upstreamRequest.contentType)) || !allowedAudioHlsTypes.has(mediaType(jellyrinRequest.contentType))) {
+      reasons.push(`cross-target ${key}: unexpected media type ${upstreamRequest.contentType} / ${jellyrinRequest.contentType}`);
     }
     if (Boolean(upstreamRequest.hasContentRange) !== Boolean(jellyrinRequest.hasContentRange)) {
       reasons.push(`cross-target ${key}: content-range presence differs`);
@@ -1585,7 +1844,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -1669,6 +1928,21 @@ function invariantFailures(summary) {
       ['trickplayImagesOnly', 'trickplay images-only playlist'],
       ['trickplayTile200', 'trickplay tile'],
       ['trickplayTileJpeg', 'trickplay JPEG tile'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'audio-hls-legacy') {
+    for (const [field, label] of [
+      ['audioItemMatched', 'audio item match'],
+      ['audioPlaybackInfo200', 'audio PlaybackInfo'],
+      ['audioHlsMaster200', 'audio HLS master playlist'],
+      ['audioHlsMedia200', 'audio HLS media playlist'],
+      ['audioHlsDynamicSegment200', 'audio HLS dynamic segment'],
+      ['audioHlsLegacySegment200', 'audio HLS legacy segment'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);
