@@ -2,13 +2,19 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const { chromium } = require('playwright');
+const execFileAsync = promisify(execFile);
 
 const outputRoot = process.env.JELLYRIN_BROWSER_TRACE_OUT
   || path.resolve(__dirname, '../../../../plans/generated/e2e-traces');
 const flow = process.env.JELLYRIN_BROWSER_FLOW || 'p0-direct-play';
 const chromiumExecutable = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
   || '/home/cdmonio/.cache/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-linux64/chrome-headless-shell';
+const mediaFixtureDir = process.env.JELLYRIN_MEDIA_FIXTURE_DIR
+  || path.resolve(__dirname, '../../var/fixtures/m2-movies');
+const subtitleTrickplayFixtureName = 'Jellyrin Subtitle Trickplay Long Fixture';
 
 const targetDefinitions = [
   {
@@ -28,7 +34,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow)) {
+  if (!['login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -127,6 +133,16 @@ async function captureTarget(browser, flowDir, target) {
       libraryLatest200: false,
       libraryViewMatched: false,
       libraryItemMatched: false,
+      subtitlePlaybackInfo200: false,
+      subtitleStreamMatched: false,
+      subtitlePlaylist200: false,
+      subtitlePlaylistShape: false,
+      subtitleVtt200: false,
+      subtitleVttCue: false,
+      trickplayPlaylist200: false,
+      trickplayImagesOnly: false,
+      trickplayTile200: false,
+      trickplayTileJpeg: false,
     },
   };
 
@@ -171,6 +187,8 @@ async function captureTarget(browser, flowDir, target) {
       await runTranscodeHlsFlow(page, summary, publicInfo, target);
     } else if (flow === 'libraries') {
       await runLibrariesFlow(page, summary, publicInfo, target);
+    } else if (flow === 'subtitles-trickplay') {
+      await runSubtitlesTrickplayFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -306,6 +324,125 @@ async function runLibrariesFlow(page, summary, publicInfo, target) {
     name: libraryView.Name,
     collectionType: libraryView.CollectionType,
     itemName: libraryItem.Name,
+  };
+}
+
+async function runSubtitlesTrickplayFlow(page, summary, publicInfo, target) {
+  await ensureSubtitleTrickplayFixture();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/home');
+  await page.waitForLoadState('networkidle');
+
+  await refreshLibrary(page, auth);
+  const movie = await waitForMovieByName(page, summary, auth, subtitleTrickplayFixtureName);
+  const mediaSource = movie.MediaSources?.[0] || {};
+  const subtitleStreams = (mediaSource.MediaStreams || movie.MediaStreams || [])
+    .filter((stream) => stream.Type === 'Subtitle' && Number.isInteger(Number(stream.Index)));
+  const subtitleStream = subtitleStreams.find((stream) => stream.IsExternal === false) || subtitleStreams[0];
+  if (!subtitleStream) {
+    throw new Error('subtitle-trickplay fixture has no subtitle stream');
+  }
+  summary.invariants.subtitleStreamMatched = true;
+  const subtitleIndex = Number(subtitleStream.Index);
+  const mediaSourceId = mediaSource.Id || movie.Id;
+  const trickplayWidth = preferredTrickplayWidth(movie);
+
+  const playbackInfo = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/Items/${encodeURIComponent(movie.Id)}/PlaybackInfo`,
+    token: auth.AccessToken,
+    body: withoutUndefined({
+      UserId: auth.User.Id,
+      MediaSourceId: mediaSourceId,
+      AudioStreamIndex: defaultStreamIndex(movie, 'Audio'),
+      SubtitleStreamIndex: subtitleIndex,
+      EnableDirectPlay: true,
+      EnableDirectStream: true,
+      EnableTranscoding: true,
+      StartPositionTicks: 0,
+    }),
+  });
+  if (playbackInfo.status !== 200) {
+    throw new Error(`subtitle PlaybackInfo returned HTTP ${playbackInfo.status}`);
+  }
+  summary.invariants.subtitlePlaybackInfo200 = true;
+
+  const subtitlePlaylist = await browserFetchText(page, {
+    method: 'GET',
+    url: `/Videos/${encodeURIComponent(movie.Id)}/${encodeURIComponent(mediaSourceId)}/Subtitles/${subtitleIndex}/subtitles.m3u8?SegmentLength=2`,
+    token: auth.AccessToken,
+  });
+  if (subtitlePlaylist.status !== 200) {
+    throw new Error(`subtitle playlist returned HTTP ${subtitlePlaylist.status}`);
+  }
+  summary.invariants.subtitlePlaylist200 = true;
+  if (subtitlePlaylist.text.includes('#EXTM3U') && subtitlePlaylist.text.includes('stream.vtt')) {
+    summary.invariants.subtitlePlaylistShape = true;
+  } else {
+    throw new Error('subtitle playlist missing expected HLS/VTT shape');
+  }
+
+  const subtitleVtt = await browserFetchText(page, {
+    method: 'GET',
+    url: `/Videos/${encodeURIComponent(movie.Id)}/${encodeURIComponent(mediaSourceId)}/Subtitles/${subtitleIndex}/Stream.vtt?AddVttTimeMap=true`,
+    token: auth.AccessToken,
+  });
+  if (subtitleVtt.status !== 200) {
+    throw new Error(`subtitle VTT stream returned HTTP ${subtitleVtt.status}`);
+  }
+  summary.invariants.subtitleVtt200 = true;
+  if (subtitleVtt.text.startsWith('WEBVTT') && subtitleVtt.text.includes('Hello from Jellyrin')) {
+    summary.invariants.subtitleVttCue = true;
+  } else {
+    throw new Error('subtitle VTT stream missing expected cue');
+  }
+
+  if (target.name === 'upstream') {
+    await ensureUpstreamTrickplayReady(page, auth, movie);
+  }
+
+  const trickplayPlaylist = await browserFetchText(page, {
+    method: 'GET',
+    url: `/Videos/${encodeURIComponent(movie.Id)}/Trickplay/${trickplayWidth}/tiles.m3u8`,
+    token: auth.AccessToken,
+  });
+  if (trickplayPlaylist.status !== 200) {
+    throw new Error(`trickplay playlist returned HTTP ${trickplayPlaylist.status}`);
+  }
+  summary.invariants.trickplayPlaylist200 = true;
+  if (trickplayPlaylist.text.includes('#EXT-X-IMAGES-ONLY')) {
+    summary.invariants.trickplayImagesOnly = true;
+  } else {
+    throw new Error('trickplay playlist missing EXT-X-IMAGES-ONLY');
+  }
+  const tilePath = firstPlaylistUri(trickplayPlaylist.text);
+  if (!tilePath || !/\.jpg(?:\?|$)/i.test(tilePath)) {
+    throw new Error('trickplay playlist did not contain a JPEG tile URI');
+  }
+
+  const trickplayTile = await browserFetchBinary(page, {
+    method: 'GET',
+    url: resolveRelativeUrl(`/Videos/${movie.Id}/Trickplay/${trickplayWidth}/tiles.m3u8`, tilePath),
+    token: auth.AccessToken,
+  });
+  if (trickplayTile.status !== 200) {
+    throw new Error(`trickplay tile returned HTTP ${trickplayTile.status}`);
+  }
+  summary.invariants.trickplayTile200 = true;
+  if (trickplayTile.contentType.split(';')[0].trim().toLowerCase() === 'image/jpeg' && trickplayTile.startsWithJpeg) {
+    summary.invariants.trickplayTileJpeg = true;
+  } else {
+    throw new Error(`trickplay tile was not JPEG: ${trickplayTile.contentType}`);
+  }
+
+  await page.goto(`${summary.baseUrl}/web/#/home`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: '<dynamic>',
+    name: movie.Name,
+    type: movie.Type,
+    subtitleIndex,
+    trickplayWidth,
   };
 }
 
@@ -509,6 +646,166 @@ async function firstMovieItem(page, summary, auth) {
   return movies.find(resumeTraceEligible) || movies[0];
 }
 
+async function refreshLibrary(page, auth) {
+  const result = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/Library/Refresh',
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(result.status)) {
+    throw new Error(`Library/Refresh returned HTTP ${result.status}`);
+  }
+}
+
+async function waitForMovieByName(page, summary, auth, name) {
+  const deadline = Date.now() + 30_000;
+  let lastTotal = 0;
+  while (Date.now() < deadline) {
+    const result = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Movie&SearchTerm=${encodeURIComponent(name)}&Fields=MediaSources,RunTimeTicks,Path&Limit=5`,
+      token: auth.AccessToken,
+    });
+    if (result.status !== 200) {
+      throw new Error(`fixture movie lookup returned HTTP ${result.status}`);
+    }
+    lastTotal = result.json?.TotalRecordCount || 0;
+    const movie = result.json?.Items?.find((item) => item.Name === name);
+    if (movie) {
+      return movie;
+    }
+    await page.waitForTimeout(1_000);
+  }
+  throw new Error(`fixture movie ${name} not found after refresh; last count=${lastTotal}`);
+}
+
+async function ensureUpstreamTrickplayReady(page, auth, movie) {
+  const folders = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Library/VirtualFolders',
+    token: auth.AccessToken,
+  });
+  if (folders.status !== 200) {
+    throw new Error(`upstream virtual folders lookup returned HTTP ${folders.status}`);
+  }
+  const folder = folders.json?.find((candidate) => (
+    candidate.LibraryOptions?.PathInfos || []
+  ).some((pathInfo) => pathInfo.Path && movie.Path?.startsWith(pathInfo.Path)));
+  if (!folder?.ItemId || !folder.LibraryOptions) {
+    throw new Error('upstream trickplay fixture library folder not found');
+  }
+
+  if (!folder.LibraryOptions.EnableTrickplayImageExtraction) {
+    const update = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Library/VirtualFolders/LibraryOptions',
+      token: auth.AccessToken,
+      body: {
+        Id: folder.ItemId,
+        LibraryOptions: {
+          ...folder.LibraryOptions,
+          EnableTrickplayImageExtraction: true,
+          ExtractTrickplayImagesDuringLibraryScan: false,
+        },
+      },
+    });
+    if (![200, 204].includes(update.status)) {
+      throw new Error(`upstream trickplay library option update returned HTTP ${update.status}`);
+    }
+  }
+
+  const tasks = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/ScheduledTasks',
+    token: auth.AccessToken,
+  });
+  if (tasks.status !== 200) {
+    throw new Error(`upstream scheduled tasks lookup returned HTTP ${tasks.status}`);
+  }
+  const trickplayTask = tasks.json?.find((task) => task.Key === 'RefreshTrickplayImages');
+  if (!trickplayTask?.Id) {
+    throw new Error('upstream trickplay scheduled task not found');
+  }
+  const start = await browserFetchJson(page, {
+    method: 'POST',
+    url: `/ScheduledTasks/Running/${encodeURIComponent(trickplayTask.Id)}`,
+    token: auth.AccessToken,
+  });
+  if (![200, 204].includes(start.status)) {
+    throw new Error(`upstream trickplay task start returned HTTP ${start.status}`);
+  }
+
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    const playlist = await browserFetchText(page, {
+      method: 'GET',
+      url: `/Videos/${encodeURIComponent(movie.Id)}/Trickplay/${preferredTrickplayWidth(movie)}/tiles.m3u8`,
+      token: auth.AccessToken,
+    });
+    if (playlist.status === 200) {
+      return;
+    }
+    await page.waitForTimeout(2_000);
+  }
+  throw new Error('upstream trickplay playlist was not generated before timeout');
+}
+
+function preferredTrickplayWidth(movie) {
+  const mediaSource = movie.MediaSources?.[0] || {};
+  const videoStream = (mediaSource.MediaStreams || movie.MediaStreams || [])
+    .find((stream) => stream.Type === 'Video' && Number(stream.Width) > 0);
+  return Math.min(320, Math.max(1, Number(videoStream?.Width || 320)));
+}
+
+async function ensureSubtitleTrickplayFixture() {
+  await fs.mkdir(mediaFixtureDir, { recursive: true });
+  const moviePath = path.join(mediaFixtureDir, `${subtitleTrickplayFixtureName}.mkv`);
+  const subtitlePath = path.join(mediaFixtureDir, `${subtitleTrickplayFixtureName}.eng.srt`);
+  try {
+    await fs.access(moviePath);
+    return;
+  } catch (_) {
+    // Create below.
+  }
+  await fs.writeFile(
+    subtitlePath,
+    '1\n00:00:00,000 --> 00:00:01,500\nHello from Jellyrin subtitles\n\n'
+      + '2\n00:00:08,000 --> 00:00:10,000\nSecond cue for trickplay coverage\n\n',
+  );
+  await execFileAsync('ffmpeg', [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    'testsrc=size=160x90:rate=1',
+    '-f',
+    'lavfi',
+    '-i',
+    'anullsrc=channel_layout=stereo:sample_rate=44100',
+    '-i',
+    subtitlePath,
+    '-t',
+    '12',
+    '-map',
+    '0:v:0',
+    '-map',
+    '1:a:0',
+    '-map',
+    '2:s:0',
+    '-c:v',
+    'mpeg4',
+    '-c:a',
+    'aac',
+    '-c:s',
+    'srt',
+    '-metadata:s:s:0',
+    'language=eng',
+    moviePath,
+  ]);
+}
+
 function resumeTracePositionTicks(movie) {
   const runtimeTicks = Number(movie.RunTimeTicks || 0);
   if (Number.isFinite(runtimeTicks) && runtimeTicks > 0) {
@@ -592,6 +889,23 @@ async function browserFetchText(page, request) {
       status: response.status,
       contentType: response.headers.get('content-type') || '',
       text: await response.text(),
+    };
+  }, request);
+}
+
+async function browserFetchBinary(page, request) {
+  return page.evaluate(async ({ method, url, token }) => {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        'X-Emby-Token': token,
+      },
+    });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return {
+      status: response.status,
+      contentType: response.headers.get('content-type') || '',
+      startsWithJpeg: bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8,
     };
   }, request);
 }
@@ -806,7 +1120,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -816,6 +1130,9 @@ function captureFlowInvariants(summary, record, requestPostData) {
   }
   if (pathname.endsWith('/PlaybackInfo') && record.status === 200) {
     summary.invariants.playbackInfo200 = true;
+    if (flow === 'subtitles-trickplay') {
+      summary.invariants.subtitlePlaybackInfo200 = true;
+    }
     if (flow === 'transcode-hls') {
       summary.invariants.transcodePlaybackInfo200 = true;
       if (record.responseShape?.MediaSources?.[0]?.TranscodingUrl) {
@@ -906,6 +1223,20 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.libraryLatest200 = true;
     }
   }
+  if (flow === 'subtitles-trickplay' && record.status === 200) {
+    if (record.method === 'GET' && /\/(?:Subtitle\/)?Videos\/[^/]+\/[^/]+\/Subtitles\/[^/]+\/subtitles\.m3u8$/i.test(pathname)) {
+      summary.invariants.subtitlePlaylist200 = true;
+    }
+    if (record.method === 'GET' && /\/(?:Subtitle\/)?Videos\/[^/]+\/[^/]+\/Subtitles\/[^/]+\/Stream\.vtt$/i.test(pathname)) {
+      summary.invariants.subtitleVtt200 = true;
+    }
+    if (record.method === 'GET' && /\/(?:Trickplay\/)?Videos\/[^/]+\/Trickplay\/[^/]+\/tiles\.m3u8$/i.test(pathname)) {
+      summary.invariants.trickplayPlaylist200 = true;
+    }
+    if (record.method === 'GET' && /\/(?:Trickplay\/)?Videos\/[^/]+\/Trickplay\/[^/]+\/[^/]+\.jpg$/i.test(pathname)) {
+      summary.invariants.trickplayTile200 = true;
+    }
+  }
 }
 
 function criticalRequestKey(record) {
@@ -982,6 +1313,18 @@ function criticalRequestKey(record) {
   if (record.method === 'GET' && pathname === '/Items') {
     return 'library-items';
   }
+  if (record.method === 'GET' && /\/(?:Subtitle\/)?Videos\/[^/]+\/[^/]+\/Subtitles\/[^/]+\/subtitles\.m3u8$/i.test(pathname)) {
+    return 'subtitle-playlist';
+  }
+  if (record.method === 'GET' && /\/(?:Subtitle\/)?Videos\/[^/]+\/[^/]+\/Subtitles\/[^/]+\/Stream\.vtt$/i.test(pathname)) {
+    return 'subtitle-vtt';
+  }
+  if (record.method === 'GET' && /\/(?:Trickplay\/)?Videos\/[^/]+\/Trickplay\/[^/]+\/tiles\.m3u8$/i.test(pathname)) {
+    return 'trickplay-playlist';
+  }
+  if (record.method === 'GET' && /\/(?:Trickplay\/)?Videos\/[^/]+\/Trickplay\/[^/]+\/[^/]+\.jpg$/i.test(pathname)) {
+    return 'trickplay-tile';
+  }
   return null;
 }
 
@@ -1006,7 +1349,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow)) {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -1040,7 +1383,9 @@ function compareCompletedTargets(summaries) {
               'library-items',
               'library-latest',
             ]
-          : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
+          : flow === 'subtitles-trickplay'
+            ? ['playback-info', 'subtitle-playlist', 'subtitle-vtt', 'trickplay-playlist', 'trickplay-tile']
+            : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
     const jellyrinRequest = jellyrin.criticalRequests[key];
@@ -1071,6 +1416,15 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     }
     if (Boolean(upstreamRequest.hasContentRange) !== Boolean(jellyrinRequest.hasContentRange)) {
       reasons.push(`cross-target ${key}: content-range presence differs`);
+    }
+    return reasons;
+  }
+  if (key === 'trickplay-tile') {
+    if (upstreamRequest.status !== jellyrinRequest.status) {
+      reasons.push(`cross-target ${key}: status ${upstreamRequest.status} != ${jellyrinRequest.status}`);
+    }
+    if (mediaType(upstreamRequest.contentType) !== mediaType(jellyrinRequest.contentType)) {
+      reasons.push(`cross-target ${key}: media type ${upstreamRequest.contentType} != ${jellyrinRequest.contentType}`);
     }
     return reasons;
   }
@@ -1231,7 +1585,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries'].includes(flow) || summary.status !== 'completed') {
+  if (!['p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -1300,6 +1654,25 @@ function invariantFailures(summary) {
     }
     if (!summary.invariants.libraryItemMatched) {
       failures.push('missing library item match invariant');
+    }
+    return failures;
+  }
+  if (flow === 'subtitles-trickplay') {
+    for (const [field, label] of [
+      ['subtitlePlaybackInfo200', 'subtitle PlaybackInfo'],
+      ['subtitleStreamMatched', 'subtitle stream match'],
+      ['subtitlePlaylist200', 'subtitle playlist'],
+      ['subtitlePlaylistShape', 'subtitle playlist shape'],
+      ['subtitleVtt200', 'subtitle VTT stream'],
+      ['subtitleVttCue', 'subtitle VTT cue'],
+      ['trickplayPlaylist200', 'trickplay playlist'],
+      ['trickplayImagesOnly', 'trickplay images-only playlist'],
+      ['trickplayTile200', 'trickplay tile'],
+      ['trickplayTileJpeg', 'trickplay JPEG tile'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing ${label} invariant`);
+      }
     }
     return failures;
   }

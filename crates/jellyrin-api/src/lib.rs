@@ -1366,6 +1366,7 @@ pub fn router(state: AppState) -> Router {
             "/Subtitle/Videos/{item_id}/Subtitles",
             post(upload_subtitle),
         )
+        .route("/Videos/{item_id}/Subtitles", post(upload_subtitle))
         .route(
             "/subtitle/videos/{item_id}/subtitles",
             post(upload_subtitle),
@@ -1379,7 +1380,15 @@ pub fn router(state: AppState) -> Router {
             delete(delete_subtitle),
         )
         .route(
+            "/Videos/{item_id}/Subtitles/{index}",
+            delete(delete_subtitle),
+        )
+        .route(
             "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/subtitles.m3u8",
+            get(subtitle_playlist),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/subtitles.m3u8",
             get(subtitle_playlist),
         )
         .route(
@@ -1391,7 +1400,15 @@ pub fn router(state: AppState) -> Router {
             get(subtitle_stream),
         )
         .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/Stream.{format}",
+            get(subtitle_stream),
+        )
+        .route(
             "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/stream.{format}",
+            get(subtitle_stream),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/stream.{format}",
             get(subtitle_stream),
         )
         .route(
@@ -1403,7 +1420,15 @@ pub fn router(state: AppState) -> Router {
             get(subtitle_stream_with_ticks),
         )
         .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/{start_position_ticks}/Stream.{format}",
+            get(subtitle_stream_with_ticks),
+        )
+        .route(
             "/Subtitle/Videos/{item_id}/{media_source_id}/Subtitles/{index}/{start_position_ticks}/stream.{format}",
+            get(subtitle_stream_with_ticks),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/{start_position_ticks}/stream.{format}",
             get(subtitle_stream_with_ticks),
         )
         .route(
@@ -1415,11 +1440,19 @@ pub fn router(state: AppState) -> Router {
             get(trickplay_playlist),
         )
         .route(
+            "/Videos/{item_id}/Trickplay/{width}/tiles.m3u8",
+            get(trickplay_playlist),
+        )
+        .route(
             "/trickplay/videos/{item_id}/trickplay/{width}/tiles.m3u8",
             get(trickplay_playlist),
         )
         .route(
             "/Trickplay/Videos/{item_id}/Trickplay/{width}/{tile_file}",
+            get(trickplay_tile),
+        )
+        .route(
+            "/Videos/{item_id}/Trickplay/{width}/{tile_file}",
             get(trickplay_tile),
         )
         .route(
@@ -16823,7 +16856,7 @@ async fn trickplay_playlist(
     let item = trickplay_video_item(&state, &headers, &query, &item_id).await?;
     let width = parse_positive_u32(&width, "Invalid trickplay width")?;
     let settings = trickplay_settings(&state.db).await?;
-    validate_trickplay_width(width, &settings)?;
+    validate_trickplay_width(width, &settings, &item)?;
     let info = ensure_trickplay_info(&state.db, &item, &settings, width, 0).await?;
     let thumbnail_duration = (info.interval_ms as f64 / 1000.0).max(1.0);
     let thumbnails_per_sprite = trickplay_thumbnails_per_sprite(&settings);
@@ -16860,7 +16893,7 @@ async fn trickplay_tile(
     let item = trickplay_video_item(&state, &headers, &query, &item_id).await?;
     let width = parse_positive_u32(&width, "Invalid trickplay width")?;
     let settings = trickplay_settings(&state.db).await?;
-    validate_trickplay_width(width, &settings)?;
+    validate_trickplay_width(width, &settings, &item)?;
     let index = tile_file
         .strip_suffix(".jpg")
         .ok_or_else(|| ApiError::not_found("Trickplay tile not found"))?;
@@ -16913,10 +16946,14 @@ async fn ensure_trickplay_tile(
         "tile={}x{}:nb_frames={frame_count}:padding=0:margin=0",
         settings.tile_width, settings.tile_height
     );
-    let filter = format!(
-        "fps=1/{:.3},{scale_filter},{tile_filter}",
-        settings.interval_seconds
-    );
+    let filter = if frame_count <= 1 {
+        scale_filter
+    } else {
+        format!(
+            "fps=1/{:.3},{scale_filter},{tile_filter}",
+            settings.interval_seconds
+        )
+    };
     let output = Command::new("ffmpeg")
         .arg("-hide_banner")
         .arg("-nostdin")
@@ -17208,8 +17245,22 @@ fn trickplay_process_threads_from_options(options: &serde_json::Value) -> u32 {
         .unwrap_or(1)
 }
 
-fn validate_trickplay_width(width: u32, settings: &TrickplaySettings) -> Result<(), ApiError> {
-    if settings.allowed_widths.contains(&width) {
+fn validate_trickplay_width(
+    width: u32,
+    settings: &TrickplaySettings,
+    item: &MediaItem,
+) -> Result<(), ApiError> {
+    let natural_width = item
+        .width
+        .and_then(|source_width| positive_u32(i64::from(source_width)));
+    let allowed_for_small_source = natural_width.is_some_and(|source_width| {
+        width == source_width
+            && settings
+                .allowed_widths
+                .iter()
+                .any(|allowed_width| source_width < *allowed_width)
+    });
+    if settings.allowed_widths.contains(&width) || allowed_for_small_source {
         Ok(())
     } else {
         Err(ApiError::not_found("Trickplay width not found"))
@@ -36952,6 +37003,20 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/Trickplay/160/tiles.m3u8?api_key={api_key}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/Trickplay/Videos/{item_id}/Trickplay/320/0.jpg"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -37117,7 +37182,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2"
+                        "/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -37131,7 +37196,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2&apiKey={api_key}"
+                        "/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2&apiKey={api_key}"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -37154,7 +37219,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/Stream.vtt?AddVttTimeMap=true"
+                        "/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/Stream.vtt?AddVttTimeMap=true"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -37171,6 +37236,20 @@ mod tests {
         assert!(vtt.starts_with("WEBVTT"));
         assert!(vtt.contains("X-TIMESTAMP-MAP=MPEGTS:900000"));
         assert!(vtt.contains("Hello from Jellyrin"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Subtitle/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/Stream.vtt?AddVttTimeMap=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .oneshot(

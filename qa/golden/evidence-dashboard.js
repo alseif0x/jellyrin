@@ -248,6 +248,7 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
   const transcodeHls = browserTraces.find((trace) => trace.flow === 'transcode-hls');
   const adminDashboard = browserTraces.find((trace) => trace.flow === 'admin-dashboard');
   const libraries = browserTraces.find((trace) => trace.flow === 'libraries');
+  const subtitlesTrickplay = browserTraces.find((trace) => trace.flow === 'subtitles-trickplay');
   return [
     {
       id: 'routes',
@@ -299,6 +300,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
       status: libraries?.status || 'pending',
       evidence: libraries
         ? `${libraries.completedTargets.join(',') || 'none'} completed, failed=${libraries.failed}`
+        : 'missing trace',
+    },
+    {
+      id: 'browser-subtitles-trickplay',
+      status: subtitlesTrickplay?.status || 'pending',
+      evidence: subtitlesTrickplay
+        ? `${subtitlesTrickplay.completedTargets.join(',') || 'none'} completed, failed=${subtitlesTrickplay.failed}`
         : 'missing trace',
     },
     {
