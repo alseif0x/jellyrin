@@ -13881,13 +13881,13 @@ async fn playback_info_response(
             serde_json::json!(direct_stream_supported),
         );
         media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(false));
+        media_source.remove("DirectStreamUrl");
         apply_playback_stream_selection(media_source, &options);
     }
 
     Ok(Json(serde_json::json!({
         "MediaSources": media_sources,
         "PlaySessionId": play_session_id,
-        "ErrorCode": null,
     })))
 }
 
@@ -14012,14 +14012,13 @@ fn playback_transcode_session_info_response(
                 access_token
             )),
         );
-        media_source.insert("DirectStreamUrl".to_string(), serde_json::Value::Null);
+        media_source.remove("DirectStreamUrl");
         apply_playback_stream_selection(media_source, options);
     }
 
     Ok(Json(serde_json::json!({
         "MediaSources": media_sources,
         "PlaySessionId": play_session_id,
-        "ErrorCode": null,
     })))
 }
 
@@ -35900,9 +35899,11 @@ mod tests {
             alternate_playback_info["MediaSources"][0]["Id"],
             second_item_id
         );
-        assert_eq!(
-            alternate_playback_info["MediaSources"][0]["DirectStreamUrl"],
-            format!("/Videos/{second_item_id}/stream")
+        assert!(
+            !alternate_playback_info["MediaSources"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("DirectStreamUrl")
         );
 
         let response = app

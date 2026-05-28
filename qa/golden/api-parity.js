@@ -8,6 +8,7 @@ const jellyrinBaseUrl = trimTrailingSlash(process.env.JELLYRIN_URL || 'http://12
 const goldenMode = process.env.JELLYRIN_GOLDEN_MODE || 'smoke';
 const outputPath = process.env.JELLYRIN_GOLDEN_OUT
   || path.resolve(__dirname, '../../../../plans/generated/golden-traces/api-parity-latest.json');
+const fixtureOverview = 'Golden overview';
 const fixturePngBytes = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMCAQAABQABDQottAAAAABJRU5ErkJggg==',
   'base64',
@@ -29,7 +30,7 @@ const authenticatedCases = [
   { name: 'users', method: 'GET', path: '/Users' },
   { name: 'views', method: 'GET', dataDependentList: true, shapeMode: 'strict-only', path: ({ userId }) => `/UserViews?UserId=${encodeURIComponent(userId)}` },
   { name: 'items-movies-first-page', method: 'GET', path: ({ userId }) => `/Items?UserId=${encodeURIComponent(userId)}&IncludeItemTypes=Movie&StartIndex=0&Limit=5` },
-  { name: 'item-detail-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}` },
+  { name: 'item-detail-movie', method: 'GET', requiresMovie: true, shapeMode: 'strict-only', path: ({ movieItemId, userId }) => `/Items/${encodeURIComponent(movieItemId)}?UserId=${encodeURIComponent(userId)}&Fields=Overview` },
   { name: 'item-playback-info-movie', method: 'GET', requiresMovie: true, requiresUserToken: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo` },
   {
     name: 'item-playback-info-post-movie',
@@ -45,6 +46,35 @@ const authenticatedCases = [
       EnableDirectStream: true,
       EnableTranscoding: true,
       StartPositionTicks: 50_000_000,
+    }),
+  },
+  {
+    name: 'item-playback-info-transcode-movie',
+    method: 'POST',
+    requiresMovie: true,
+    shapeMode: 'strict-only',
+    path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo`,
+    body: ({ movieItemId, userId }) => ({
+      UserId: userId,
+      MediaSourceId: movieItemId,
+      AudioStreamIndex: 1,
+      SubtitleStreamIndex: -1,
+      EnableDirectPlay: false,
+      EnableDirectStream: false,
+      EnableTranscoding: true,
+      StartPositionTicks: 50_000_000,
+      DeviceProfile: transcodeDeviceProfile(),
+    }),
+  },
+  {
+    name: 'item-playback-info-invalid-media-source',
+    method: 'POST',
+    requiresMovie: true,
+    shapeMode: 'strict-only',
+    path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/PlaybackInfo`,
+    body: () => ({
+      MediaSourceId: '00000000000000000000000000000000',
+      AudioStreamIndex: 1,
     }),
   },
   { name: 'activity-log-entries', method: 'GET', path: '/System/ActivityLog/Entries?StartIndex=0&Limit=5', shapeMode: 'strict-only' },
@@ -224,8 +254,58 @@ async function buildAuthenticatedContext(baseUrl, auth) {
   }
   if (context.movieItemId) {
     await ensureFixtureImages(baseUrl, auth, context.movieItemId);
+    await ensureFixtureOverview(baseUrl, auth, context.userId, context.movieItemId);
   }
   return context;
+}
+
+function transcodeDeviceProfile() {
+  return {
+    DirectPlayProfiles: [],
+    TranscodingProfiles: [
+      {
+        Container: 'mp4',
+        Type: 'Video',
+        AudioCodec: 'aac,mp2,opus,flac',
+        VideoCodec: 'av1,h264,vp9',
+        Context: 'Streaming',
+        Protocol: 'hls',
+        MaxAudioChannels: '2',
+        MinSegments: '1',
+        BreakOnNonKeyFrames: false,
+      },
+    ],
+    ContainerProfiles: [],
+    CodecProfiles: [],
+  };
+}
+
+async function ensureFixtureOverview(baseUrl, auth, userId, movieItemId) {
+  const headers = { 'X-Emby-Token': auth.accessToken };
+  const detailPath = `/Items/${encodeURIComponent(movieItemId)}?UserId=${encodeURIComponent(userId)}&Fields=Overview`;
+  const detailResponse = await fetch(`${baseUrl}${detailPath}`, { headers });
+  if (!detailResponse.ok || !detailResponse.headers.get('content-type')?.includes('application/json')) {
+    return;
+  }
+  const detail = await detailResponse.json();
+  if (detail.Overview === fixtureOverview) {
+    return;
+  }
+  detail.Overview = fixtureOverview;
+  const updatePath = baseUrl === upstreamBaseUrl
+    ? `/Items/${encodeURIComponent(movieItemId)}`
+    : `/ItemUpdate/Items/${encodeURIComponent(movieItemId)}`;
+  const update = await fetch(`${baseUrl}${updatePath}`, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(detail),
+  });
+  if (!update.ok) {
+    throw new Error(`fixture overview setup failed for ${baseUrl} with HTTP ${update.status}`);
+  }
 }
 
 async function ensureFixtureImages(baseUrl, auth, movieItemId) {
@@ -396,7 +476,7 @@ function strictAssertions(caseName) {
           'EnableTranscoding',
           'StartPositionTicks',
         ]),
-        queryResultHasFields(['MediaSources', 'PlaySessionId', 'ErrorCode']),
+        queryResultHasFields(['MediaSources', 'PlaySessionId']),
         firstMediaSourceHasFields([
           'SupportsDirectPlay',
           'SupportsDirectStream',
@@ -405,6 +485,32 @@ function strictAssertions(caseName) {
           'MediaStreams.[].Channels',
           'MediaStreams.[].SampleRate',
         ]),
+      ];
+    case 'item-playback-info-transcode-movie':
+      return [
+        requestBodyHasFields([
+          'MediaSourceId',
+          'AudioStreamIndex',
+          'SubtitleStreamIndex',
+          'EnableDirectPlay',
+          'EnableDirectStream',
+          'EnableTranscoding',
+          'StartPositionTicks',
+          'DeviceProfile.TranscodingProfiles',
+        ]),
+        queryResultHasFields(['MediaSources', 'PlaySessionId']),
+        firstMediaSourceHasFields([
+          'SupportsDirectPlay',
+          'SupportsDirectStream',
+          'SupportsTranscoding',
+          'TranscodingUrl',
+          'MediaStreams',
+        ]),
+      ];
+    case 'item-playback-info-invalid-media-source':
+      return [
+        requestBodyHasFields(['MediaSourceId', 'AudioStreamIndex']),
+        queryResultHasFields(['MediaSources', 'PlaySessionId', 'ErrorCode']),
       ];
     case 'activity-log-entries':
       return [
