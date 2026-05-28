@@ -3369,9 +3369,9 @@ async fn restore_virtual_folders_from_backup(
         .as_array()
         .ok_or_else(|| ApiError::bad_request("Backup virtual folders must be an array"))?;
     for folder in folders {
-        let object = folder
-            .as_object()
-            .ok_or_else(|| ApiError::bad_request("Backup virtual folder entry must be an object"))?;
+        let object = folder.as_object().ok_or_else(|| {
+            ApiError::bad_request("Backup virtual folder entry must be an object")
+        })?;
         let name = object
             .get("Name")
             .and_then(serde_json::Value::as_str)
@@ -3430,9 +3430,9 @@ async fn restore_media_metadata_from_backup(
         .map(|item| (item.path.clone(), item))
         .collect::<HashMap<_, _>>();
     for entry in entries {
-        let object = entry
-            .as_object()
-            .ok_or_else(|| ApiError::bad_request("Backup media metadata entry must be an object"))?;
+        let object = entry.as_object().ok_or_else(|| {
+            ApiError::bad_request("Backup media metadata entry must be an object")
+        })?;
         let path = object
             .get("Path")
             .and_then(serde_json::Value::as_str)
@@ -3444,10 +3444,9 @@ async fn restore_media_metadata_from_backup(
                 "Backup media metadata path is not safe to restore: {path}"
             )));
         }
-        let metadata = object
-            .get("Metadata")
-            .cloned()
-            .ok_or_else(|| ApiError::bad_request("Backup media metadata entry is missing Metadata"))?;
+        let metadata = object.get("Metadata").cloned().ok_or_else(|| {
+            ApiError::bad_request("Backup media metadata entry is missing Metadata")
+        })?;
         if let Some(item) = items_by_path.get(path) {
             db.update_media_item_metadata(item.id, metadata).await?;
         }
@@ -3708,13 +3707,17 @@ fn validate_migration_payload(
             .get("Locations")
             .or_else(|| object.get("Paths"))
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| ApiError::bad_request("Jellyfin migration library is missing Locations"))?;
+            .ok_or_else(|| {
+                ApiError::bad_request("Jellyfin migration library is missing Locations")
+            })?;
         for location in locations {
             let location = location
                 .as_str()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| ApiError::bad_request("Jellyfin migration library location must be a string"))?;
+                .ok_or_else(|| {
+                    ApiError::bad_request("Jellyfin migration library location must be a string")
+                })?;
             if !backup_restore_path_is_safe(location) {
                 return Err(ApiError::bad_request(format!(
                     "Jellyfin migration library location is not safe to import: {location}"
@@ -3724,9 +3727,9 @@ fn validate_migration_payload(
     }
 
     for media in migration_media_entries(data) {
-        let object = media
-            .as_object()
-            .ok_or_else(|| ApiError::bad_request("Jellyfin migration media entry must be an object"))?;
+        let object = media.as_object().ok_or_else(|| {
+            ApiError::bad_request("Jellyfin migration media entry must be an object")
+        })?;
         if let Some(path) = migration_string_field(object, &["Path", "FilePath"]) {
             if !backup_restore_path_is_safe(&path) {
                 return Err(ApiError::bad_request(format!(
@@ -3747,12 +3750,30 @@ fn jellyfin_migration_unsupported_map(
 ) -> BTreeMap<&'static str, String> {
     let mut unsupported = BTreeMap::new();
     for (field, reason) in [
-        ("Chapters", "No chapter persistence importer is available yet."),
-        ("Lyrics", "Lyrics files are not imported from Jellyfin exports yet."),
-        ("Keyframes", "Trickplay/keyframe tiles are regenerated, not migrated."),
-        ("Trickplay", "Trickplay/keyframe tiles are regenerated, not migrated."),
-        ("TaskHistory", "Task history is runtime/audit data and is not replayed."),
-        ("Transcodes", "Transcode sessions are runtime state and are not migrated."),
+        (
+            "Chapters",
+            "No chapter persistence importer is available yet.",
+        ),
+        (
+            "Lyrics",
+            "Lyrics files are not imported from Jellyfin exports yet.",
+        ),
+        (
+            "Keyframes",
+            "Trickplay/keyframe tiles are regenerated, not migrated.",
+        ),
+        (
+            "Trickplay",
+            "Trickplay/keyframe tiles are regenerated, not migrated.",
+        ),
+        (
+            "TaskHistory",
+            "Task history is runtime/audit data and is not replayed.",
+        ),
+        (
+            "Transcodes",
+            "Transcode sessions are runtime state and are not migrated.",
+        ),
         ("PackageState", "Plugin package binaries are not imported."),
     ] {
         if data.get(field).is_some() {
@@ -3782,7 +3803,9 @@ async fn import_jellyfin_users(
         };
         let policy = object.get("Policy").and_then(serde_json::Value::as_object);
         let is_administrator = migration_bool_field(object, &["IsAdministrator"])
-            .or_else(|| policy.and_then(|policy| migration_bool_field(policy, &["IsAdministrator"])))
+            .or_else(|| {
+                policy.and_then(|policy| migration_bool_field(policy, &["IsAdministrator"]))
+            })
             .unwrap_or(false);
         let is_disabled = migration_bool_field(object, &["IsDisabled"])
             .or_else(|| policy.and_then(|policy| migration_bool_field(policy, &["IsDisabled"])))
@@ -3819,7 +3842,9 @@ async fn import_jellyfin_libraries(
             .get("Locations")
             .or_else(|| object.get("Paths"))
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| ApiError::bad_request("Jellyfin migration library is missing Locations"))?
+            .ok_or_else(|| {
+                ApiError::bad_request("Jellyfin migration library is missing Locations")
+            })?
             .iter()
             .filter_map(|location| location.as_str().map(str::trim))
             .filter(|location| !location.is_empty())
@@ -3851,9 +3876,9 @@ async fn import_jellyfin_media_metadata(
         .collect::<HashMap<_, _>>();
     let mut imported = 0usize;
     for media in migration_media_entries(data) {
-        let object = media
-            .as_object()
-            .ok_or_else(|| ApiError::bad_request("Jellyfin migration media entry must be an object"))?;
+        let object = media.as_object().ok_or_else(|| {
+            ApiError::bad_request("Jellyfin migration media entry must be an object")
+        })?;
         let Some(path) = migration_string_field(object, &["Path", "FilePath"]) else {
             continue;
         };
@@ -3893,10 +3918,11 @@ async fn import_jellyfin_user_data(
         .collect::<HashMap<_, _>>();
     let mut imported = 0usize;
     for user_data in migration_array(data, "UserData") {
-        let object = user_data
-            .as_object()
-            .ok_or_else(|| ApiError::bad_request("Jellyfin migration user data must be an object"))?;
-        let Some(user_name) = migration_string_field(object, &["UserName", "Username", "User"]) else {
+        let object = user_data.as_object().ok_or_else(|| {
+            ApiError::bad_request("Jellyfin migration user data must be an object")
+        })?;
+        let Some(user_name) = migration_string_field(object, &["UserName", "Username", "User"])
+        else {
             continue;
         };
         let Some(path) = migration_string_field(object, &["Path", "FilePath"]) else {
@@ -3919,8 +3945,11 @@ async fn import_jellyfin_user_data(
             media_source_id: None,
             audio_stream_index: None,
             subtitle_stream_index: None,
-            position_ticks: migration_i64_field(object, &["PositionTicks", "PlaybackPositionTicks"])
-                .unwrap_or(0),
+            position_ticks: migration_i64_field(
+                object,
+                &["PositionTicks", "PlaybackPositionTicks"],
+            )
+            .unwrap_or(0),
             is_paused: false,
             played: migration_bool_field(object, &["Played", "IsPlayed"]).unwrap_or(false),
         })
@@ -3939,7 +3968,8 @@ async fn import_jellyfin_lists(
 ) -> Result<usize, ApiError> {
     let mut imported = 0usize;
     imported += import_jellyfin_list_family(db, data, "Playlists", "playlist", None).await?;
-    imported += import_jellyfin_list_family(db, data, "Collections", "collection", Some("boxsets")).await?;
+    imported +=
+        import_jellyfin_list_family(db, data, "Collections", "collection", Some("boxsets")).await?;
     Ok(imported)
 }
 
@@ -3963,9 +3993,11 @@ async fn import_jellyfin_list_family(
         .collect::<HashMap<_, _>>();
     let mut imported = 0usize;
     for list in migration_array(data, field) {
-        let object = list
-            .as_object()
-            .ok_or_else(|| ApiError::bad_request(format!("Jellyfin migration {field} entry must be an object")))?;
+        let object = list.as_object().ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Jellyfin migration {field} entry must be an object"
+            ))
+        })?;
         let Some(name) = migration_string_field(object, &["Name"]) else {
             continue;
         };
@@ -8950,10 +8982,14 @@ fn syncplay_apply_command_to_state(
         serde_json::Value::String(format_time_for_json(now)),
     );
 
-    if let Some(position_ticks) =
-        json_i64_any_field(payload, &["PositionTicks", "SeekPositionTicks", "NewPositionTicks"])
-    {
-        object.insert("PositionTicks".to_string(), serde_json::json!(position_ticks));
+    if let Some(position_ticks) = json_i64_any_field(
+        payload,
+        &["PositionTicks", "SeekPositionTicks", "NewPositionTicks"],
+    ) {
+        object.insert(
+            "PositionTicks".to_string(),
+            serde_json::json!(position_ticks),
+        );
     }
 
     match command.to_ascii_lowercase().as_str() {
@@ -9235,7 +9271,11 @@ async fn live_tv_m3u_channels_from_payload(
 fn parse_live_tv_m3u_channels(contents: &str) -> Vec<serde_json::Value> {
     let mut channels = Vec::new();
     let mut pending: Option<serde_json::Value> = None;
-    for line in contents.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         if line.starts_with("#EXTINF") {
             let name = line
                 .rsplit_once(',')
@@ -9323,9 +9363,7 @@ fn live_tv_local_config_path(payload: &serde_json::Value) -> Option<PathBuf> {
         .or_else(|| json_string_field(payload, "Url"))
         .map(PathBuf::from)
         .filter(|path| {
-            !path.as_os_str().is_empty()
-                && path.is_absolute()
-                && path.extension().is_some()
+            !path.as_os_str().is_empty() && path.is_absolute() && path.extension().is_some()
         })
 }
 
@@ -24802,19 +24840,19 @@ mod tests {
     use std::fs;
 
     use super::{
-        AppState, AUTH_LOCKOUT_FAILURE_LIMIT, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
-        DEFAULT_PASSWORD_RESET_PROVIDER_ID, SystemLifecycleCommand,
-        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
-        encoding_configuration_json, backup_restore_snapshot_json, hls_transcode_dedupe_key,
+        AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
+        DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID, ItemsQuery,
+        SystemLifecycleCommand, backup_restore_snapshot_json, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_subtitle_stream_index,
+        default_user_configuration, encoding_configuration_json, hls_transcode_dedupe_key,
         json_value_i64, last_system_lifecycle_command, load_countries, load_cultures,
-        media_item_by_id, media_item_streams, package_install_task_key,
+        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs, redact_sensitive_log_text,
-        reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
-        stable_entity_id, subscribe_playback_events, subscribe_system_lifecycle_commands,
-        syncplay_groups, transcode_dedupe_lock, transcode_temp_root, trickplay_settings,
-        trickplay_tile_cache_path,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        reconcile_transcode_sessions_on_startup, redact_sensitive_log_text, router,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -24951,6 +24989,41 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn large_browse_paging_handles_100k_items_without_expanding_response() {
+        let virtual_folder_id =
+            uuid::Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        let items = (0..100_000)
+            .map(|index| MediaItem {
+                id: uuid::Uuid::from_u128(index + 1),
+                virtual_folder_id,
+                name: format!("Movie {index:06}"),
+                path: format!("/media/Movie {index:06}.mkv"),
+                media_type: "Video".to_string(),
+                collection_type: Some("movies".to_string()),
+                file_size: Some(1024),
+                runtime_ticks: Some(60_000_000),
+                bitrate: Some(1_000_000),
+                width: Some(1920),
+                height: Some(1080),
+                media_streams: Vec::new(),
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            })
+            .collect::<Vec<_>>();
+        let query = ItemsQuery {
+            start_index: Some(99_990),
+            limit: Some(25),
+            ..ItemsQuery::default()
+        };
+
+        let page = paged_media_items(items, &query);
+
+        assert_eq!(page.len(), 10);
+        assert_eq!(page[0].name, "Movie 099990");
+        assert_eq!(page[9].name, "Movie 099999");
     }
 
     #[test]
@@ -25684,7 +25757,10 @@ mod tests {
         assert_eq!(created["SnapshotSummary"]["VirtualFolders"], 1);
         assert_eq!(created["SnapshotSummary"]["MediaMetadata"], 1);
         assert_eq!(created["SnapshotSummary"]["FilesMode"], "metadata-only");
-        assert_eq!(created["SnapshotSummary"]["PluginsMode"], "configuration-only");
+        assert_eq!(
+            created["SnapshotSummary"]["PluginsMode"],
+            "configuration-only"
+        );
 
         let response = app
             .clone()
@@ -25861,7 +25937,9 @@ mod tests {
             .await
             .unwrap();
 
-        let mut unsafe_snapshot = backup_restore_snapshot_json(&db_for_assertions).await.unwrap();
+        let mut unsafe_snapshot = backup_restore_snapshot_json(&db_for_assertions)
+            .await
+            .unwrap();
         unsafe_snapshot["VirtualFolders"][0]["Locations"] = json!(["/etc"]);
         let unsafe_manifest = db_for_assertions
             .create_backup_manifest("12.0.0", "1", json!({}), Some(unsafe_snapshot))
@@ -26037,10 +26115,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let dry_run: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(dry_run["DryRun"], true);
-        assert_eq!(
-            dry_run["SourcePolicy"]["OriginalDatabaseMutation"],
-            "never"
-        );
+        assert_eq!(dry_run["SourcePolicy"]["OriginalDatabaseMutation"], "never");
         assert_eq!(dry_run["SourcePolicy"]["BackupRequired"], true);
         assert_eq!(dry_run["Counts"]["Users"], 1);
         assert_eq!(dry_run["Counts"]["Libraries"], 1);
@@ -26100,7 +26175,10 @@ mod tests {
             .find(|folder| folder.name == "Imported Movies")
             .unwrap();
         assert_eq!(imported_folder.collection_type.as_deref(), Some("movies"));
-        assert_eq!(imported_folder.locations, vec![media_root.path().to_string_lossy().to_string()]);
+        assert_eq!(
+            imported_folder.locations,
+            vec![media_root.path().to_string_lossy().to_string()]
+        );
         let imported_item = db_for_assertions
             .media_items()
             .await
@@ -26561,7 +26639,12 @@ mod tests {
             uploaded_log["Document"],
             "browser logentry api_key=[REDACTED]&Token=\"[REDACTED]\""
         );
-        assert!(!uploaded_log["Document"].as_str().unwrap().contains(&api_key));
+        assert!(
+            !uploaded_log["Document"]
+                .as_str()
+                .unwrap()
+                .contains(&api_key)
+        );
         assert_eq!(uploaded_log["ContentType"], "text/plain");
         assert_eq!(uploaded_log["FileName"], "web.log");
         assert_eq!(
@@ -28703,10 +28786,7 @@ mod tests {
         assert_eq!(channels_root["Items"][0]["Id"], "livetv");
         assert_eq!(channels_root["Items"][0]["Type"], "Channel");
         assert_eq!(channels_root["Items"][0]["ChildCount"], 2);
-        assert_eq!(
-            channels_root["Items"][0]["UserData"]["IsFavorite"],
-            false
-        );
+        assert_eq!(channels_root["Items"][0]["UserData"]["IsFavorite"], false);
 
         let response = app
             .clone()
@@ -31191,7 +31271,10 @@ mod tests {
         assert_eq!(channels["TotalRecordCount"], 1);
         assert_eq!(channels["Items"][0]["Id"], "channel-1");
         assert_eq!(channels["Items"][0]["Name"], "News HD");
-        assert_eq!(channels["Items"][0]["MediaSources"][0]["SupportsDirectPlay"], true);
+        assert_eq!(
+            channels["Items"][0]["MediaSources"][0]["SupportsDirectPlay"],
+            true
+        );
 
         let response = app
             .clone()
@@ -33173,7 +33256,9 @@ mod tests {
                     .method(Method::POST)
                     .uri("/SyncPlay/Seek")
                     .header("X-Emby-Token", &guest_key)
-                    .body(Body::from(json!({ "SeekPositionTicks": 42_000 }).to_string()))
+                    .body(Body::from(
+                        json!({ "SeekPositionTicks": 42_000 }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -46717,10 +46802,16 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let editor_payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(editor_payload["Item"]["Id"], item_id);
-        assert_eq!(editor_payload["Item"]["Overview"], "Manual overview canonical");
+        assert_eq!(
+            editor_payload["Item"]["Overview"],
+            "Manual overview canonical"
+        );
         assert_eq!(editor_payload["Item"]["ProviderIds"]["Tmdb"], "9876");
         assert_eq!(editor_payload["Item"]["Tags"], json!(["Edited"]));
-        assert_eq!(editor_payload["Metadata"]["Overview"], "Manual overview canonical");
+        assert_eq!(
+            editor_payload["Metadata"]["Overview"],
+            "Manual overview canonical"
+        );
         assert_eq!(editor_payload["Metadata"]["ProviderIds"]["Tmdb"], "9876");
         assert_eq!(editor_payload["Metadata"]["ContentType"], "Movie");
         assert_eq!(editor_payload["ExternalIdInfos"][0]["Key"], "Imdb");

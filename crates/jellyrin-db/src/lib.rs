@@ -12,12 +12,17 @@ use jellyrin_core::{
     DeviceToken, MediaItem, PlaybackState, ServerState, StartupConfig, User, VirtualFolder,
 };
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    QueryBuilder, Sqlite, SqliteConnection, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+const SQLITE_MAX_CONNECTIONS: u32 = 5;
 
 #[derive(Clone)]
 pub struct Database {
@@ -351,9 +356,21 @@ pub struct SystemConfigurationPayloads {
 
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        let mut options = database_url
+            .parse::<SqliteConnectOptions>()
+            .with_context(|| format!("failed to parse SQLite database URL at {database_url}"))?
+            .busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+            .foreign_keys(true);
+        if should_enable_wal(database_url) {
+            options = options.journal_mode(SqliteJournalMode::Wal);
+        }
+
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(database_url)
+            .max_connections(SQLITE_MAX_CONNECTIONS)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move { configure_sqlite_connection(connection).await })
+            })
+            .connect_with(options)
             .await
             .with_context(|| format!("failed to connect SQLite database at {database_url}"))?;
 
@@ -4241,6 +4258,20 @@ impl Database {
     }
 }
 
+fn should_enable_wal(database_url: &str) -> bool {
+    !database_url.contains(":memory:")
+}
+
+async fn configure_sqlite_connection(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("PRAGMA busy_timeout = 5000")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
 fn push_activity_log_join_and_filters(
     query: &mut QueryBuilder<'_, Sqlite>,
     filter: &ActivityLogFilter,
@@ -6147,6 +6178,23 @@ mod tests {
     use serde_json::json;
     use time::Duration;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn sqlite_runtime_settings_enable_busy_timeout_and_foreign_keys() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(busy_timeout, 5_000);
+        assert_eq!(foreign_keys, 1);
+    }
 
     #[tokio::test]
     async fn creates_initial_server_state_once() {

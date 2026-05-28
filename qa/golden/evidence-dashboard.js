@@ -28,7 +28,15 @@ async function main() {
   const apiGolden = summarizeApiGolden(sources.apiGolden);
   const browserTraces = summarizeBrowserTraces(sources.browserTraces);
   const functionalAreas = summarizeFunctionalAreas(sources.functionalParity);
-  const gates = buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas, sources.securityHardening);
+  const gates = buildGates(
+    routeSummary,
+    dtoSummary,
+    apiGolden,
+    browserTraces,
+    functionalAreas,
+    sources.securityHardening,
+    sources.performanceRecovery,
+  );
 
   const dashboard = {
     generatedAt: new Date().toISOString(),
@@ -63,6 +71,7 @@ async function loadSources() {
     apiGolden: await readJson(path.join('golden-traces', 'api-parity-latest.json'), null),
     functionalParity: await readText('functional-parity.md', ''),
     securityHardening: await readJson('security-hardening.json', null),
+    performanceRecovery: await readJson('performance-recovery.json', null),
     browserTraces: await readTraceComparisons(browserTracesDir),
   };
 }
@@ -242,7 +251,15 @@ function summarizeFunctionalAreas(markdown) {
   return rows;
 }
 
-function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas, securityHardening) {
+function buildGates(
+  routeSummary,
+  dtoSummary,
+  apiGolden,
+  browserTraces,
+  functionalAreas,
+  securityHardening,
+  performanceRecovery,
+) {
   const startupWizard = browserTraces.find((trace) => trace.flow === 'startup-wizard');
   const p0Direct = browserTraces.find((trace) => trace.flow === 'p0-direct-play');
   const loginHome = browserTraces.find((trace) => trace.flow === 'login-home');
@@ -454,6 +471,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
         : 'missing security matrix',
     },
     {
+      id: 'performance-recovery',
+      status: performanceRecovery?.status || 'pending',
+      evidence: performanceRecovery
+        ? `${performanceRecovery.summary.passed}/${performanceRecovery.summary.total} checks passed`
+        : 'missing performance/recovery matrix',
+    },
+    {
       id: 'dto-field-parity',
       status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
       evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
@@ -505,6 +529,7 @@ function sourceStatus(sources) {
     apiGolden: Boolean(sources.apiGolden),
     functionalParity: sources.functionalParity.trim().length > 0,
     securityHardening: Boolean(sources.securityHardening),
+    performanceRecovery: Boolean(sources.performanceRecovery),
     browserTraceComparisons: sources.browserTraces.length,
   };
 }
