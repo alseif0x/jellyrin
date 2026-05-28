@@ -78,7 +78,7 @@ const targetDefinitions = [
 ];
 
 async function main() {
-  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv'].includes(flow)) {
+  if (!['startup-wizard', 'login-home', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels'].includes(flow)) {
     throw new Error(`Unsupported browser flow: ${flow}`);
   }
 
@@ -343,6 +343,15 @@ async function captureTarget(browser, flowDir, target) {
       syncplayGuestLeft: false,
       syncplayOwnerLeft: false,
       syncplayCleanupConfirmed: false,
+      channelsList200: false,
+      channelsProviderMatched: false,
+      channelsFilterMatched: false,
+      channelsDeletionFilterMatched: false,
+      channelsItems200: false,
+      channelsItemMatched: false,
+      channelsLatest200: false,
+      channelsFeatures200: false,
+      channelsFeatureMatched: false,
     },
   };
 
@@ -413,6 +422,8 @@ async function captureTarget(browser, flowDir, target) {
       await runPluginsPackagesFlow(page, summary, publicInfo, target);
     } else if (flow === 'live-tv') {
       await runLiveTvFlow(page, summary, publicInfo, target);
+    } else if (flow === 'channels') {
+      await runChannelsFlow(page, summary, publicInfo, target);
     } else {
       await runAdminDashboardFlow(page, summary, publicInfo, target);
     }
@@ -2628,6 +2639,135 @@ async function runPluginsPackagesFlow(page, summary, publicInfo, target) {
   await page.waitForLoadState('networkidle').catch(() => {});
 }
 
+async function runChannelsFlow(page, summary, publicInfo, target) {
+  await ensureLiveTvFixtures();
+  const auth = await authenticateTarget(page, summary, target);
+  await establishWebSession(page, summary, publicInfo, target, auth, '/channels');
+  await page.waitForLoadState('networkidle').catch(() => {});
+
+  if (target.name === 'jellyrin') {
+    const configUpdate = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/System/Configuration/livetv',
+      token: auth.AccessToken,
+      body: {
+        GuideDays: 1,
+        RecordingPath: mediaFixtureDir,
+        TunerHosts: [{
+          Id: 'jellyrin-channels-tuner',
+          Type: 'm3u',
+          Url: path.join(mediaFixtureDir, 'jellyrin-live-tv.m3u'),
+          FriendlyName: 'Jellyrin Channels Golden Live TV',
+        }],
+        ListingProviders: [],
+      },
+    });
+    if (![200, 204].includes(configUpdate.status)) {
+      throw new Error(`channels Live TV config update returned HTTP ${configUpdate.status}`);
+    }
+  }
+
+  const channels = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels?SupportsLatestItems=true',
+    token: auth.AccessToken,
+  });
+  if (channels.status !== 200 || !Array.isArray(channels.json?.Items)) {
+    throw new Error(`Channels returned HTTP ${channels.status}`);
+  }
+  summary.invariants.channelsList200 = true;
+
+  const features = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels/Features',
+    token: auth.AccessToken,
+  });
+  if (features.status !== 200 || !Array.isArray(features.json)) {
+    throw new Error(`Channels/Features returned HTTP ${features.status}`);
+  }
+  summary.invariants.channelsFeatures200 = true;
+
+  if (target.name !== 'jellyrin') {
+    await page.goto(`${summary.baseUrl}/web/#/channels`, { waitUntil: 'domcontentloaded' });
+    await page.waitForLoadState('networkidle').catch(() => {});
+    return;
+  }
+
+  const provider = channels.json.Items.find((item) => item.Id === 'livetv');
+  if (!provider || provider.Type !== 'Channel' || provider.ChildCount < 1) {
+    throw new Error('Channels did not expose the local Live TV provider');
+  }
+  summary.invariants.channelsProviderMatched = true;
+
+  const filtered = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels?SupportsMediaDeletion=false&IsFavorite=false',
+    token: auth.AccessToken,
+  });
+  if (filtered.status !== 200 || !filtered.json?.Items?.some((item) => item.Id === 'livetv')) {
+    throw new Error(`Channels filter did not retain local provider, HTTP ${filtered.status}`);
+  }
+  summary.invariants.channelsFilterMatched = true;
+
+  const deletionFiltered = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels?SupportsMediaDeletion=true',
+    token: auth.AccessToken,
+  });
+  if (deletionFiltered.status !== 200 || deletionFiltered.json?.Items?.some((item) => item.Id === 'livetv')) {
+    throw new Error(`Channels media-deletion filter did not remove local provider, HTTP ${deletionFiltered.status}`);
+  }
+  summary.invariants.channelsDeletionFilterMatched = true;
+
+  const channelItems = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels/livetv/Items?StartIndex=0&Limit=10',
+    token: auth.AccessToken,
+  });
+  if (channelItems.status !== 200 || !Array.isArray(channelItems.json?.Items)) {
+    throw new Error(`Channels/livetv/Items returned HTTP ${channelItems.status}`);
+  }
+  summary.invariants.channelsItems200 = true;
+  if (!channelItems.json.Items.some((item) => item.Id === liveTvFlowChannelId && item.ChannelId === 'livetv')) {
+    throw new Error('Channels/livetv/Items did not expose the M3U channel fixture');
+  }
+  summary.invariants.channelsItemMatched = true;
+
+  const latest = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels/Items/Latest?Limit=5',
+    token: auth.AccessToken,
+  });
+  if (latest.status !== 200 || !latest.json?.Items?.some((item) => item.Id === liveTvFlowChannelId)) {
+    throw new Error(`Channels/Items/Latest did not expose channel fixture, HTTP ${latest.status}`);
+  }
+  summary.invariants.channelsLatest200 = true;
+
+  const feature = features.json.find((item) => item.ChannelId === 'livetv');
+  if (!feature || feature.SupportsLatestItems !== true || feature.ContentType !== 'TvChannel') {
+    throw new Error('Channels/Features did not expose local Live TV feature capabilities');
+  }
+  summary.invariants.channelsFeatureMatched = true;
+
+  const featureById = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels/livetv/Features',
+    token: auth.AccessToken,
+  });
+  if (featureById.status !== 200 || !featureById.json?.some((item) => item.ChannelId === 'livetv')) {
+    throw new Error(`Channels/livetv/Features returned HTTP ${featureById.status}`);
+  }
+
+  await page.goto(`${summary.baseUrl}/web/#/channels`, { waitUntil: 'domcontentloaded' });
+  await page.waitForLoadState('networkidle').catch(() => {});
+  summary.item = {
+    id: 'livetv',
+    name: 'Live TV',
+    type: 'Channel',
+    fixtureChannelId: liveTvFlowChannelId,
+  };
+}
+
 async function runLiveTvFlow(page, summary, publicInfo, target) {
   await ensureLiveTvFixtures();
   const auth = await authenticateTarget(page, summary, target);
@@ -4011,7 +4151,7 @@ function compareSummaries(summaries) {
 }
 
 function captureFlowInvariants(summary, record, requestPostData) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'plugins-packages', 'live-tv', 'channels'].includes(flow)) {
     return;
   }
   const pathname = new URL(record.url).pathname;
@@ -4457,6 +4597,23 @@ function captureFlowInvariants(summary, record, requestPostData) {
       summary.invariants.authUserDeleted = true;
     }
   }
+  if (flow === 'channels') {
+    if (record.method === 'GET' && pathname === '/Channels' && record.status === 200) {
+      summary.invariants.channelsList200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Channels/Features' && record.status === 200) {
+      summary.invariants.channelsFeatures200 = true;
+    }
+    if (record.method === 'GET' && /\/Channels\/[^/]+\/Items$/i.test(pathname) && record.status === 200) {
+      summary.invariants.channelsItems200 = true;
+    }
+    if (record.method === 'GET' && pathname === '/Channels/Items/Latest' && record.status === 200) {
+      summary.invariants.channelsLatest200 = true;
+    }
+    if (record.method === 'GET' && /\/Channels\/[^/]+\/Features$/i.test(pathname) && record.status === 200) {
+      summary.invariants.channelsFeatureMatched = true;
+    }
+  }
   if (flow === 'sessions-websocket') {
     if (record.method === 'GET' && pathname === '/Sessions' && record.status === 200) {
       summary.invariants.sessionsList200 = true;
@@ -4543,6 +4700,28 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'live-tv' && record.method === 'POST' && pathname === '/LiveTv/Timers') {
     return 'live-tv-timer-create';
+  }
+  if (flow === 'channels' && record.method === 'GET' && pathname === '/Channels') {
+    const searchParams = new URL(record.url).searchParams;
+    if (searchParams.get('SupportsMediaDeletion') === 'true') {
+      return 'channels-media-deletion-filter';
+    }
+    if (searchParams.get('SupportsMediaDeletion') === 'false') {
+      return 'channels-filters';
+    }
+    return 'channels-list';
+  }
+  if (flow === 'channels' && record.method === 'GET' && pathname === '/Channels/Features') {
+    return 'channels-features';
+  }
+  if (flow === 'channels' && record.method === 'GET' && /\/Channels\/[^/]+\/Items$/i.test(pathname)) {
+    return 'channels-items';
+  }
+  if (flow === 'channels' && record.method === 'GET' && pathname === '/Channels/Items/Latest') {
+    return 'channels-latest';
+  }
+  if (flow === 'channels' && record.method === 'GET' && /\/Channels\/[^/]+\/Features$/i.test(pathname)) {
+    return 'channels-feature-by-id';
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/New') {
     return 'syncplay-new';
@@ -4896,7 +5075,7 @@ function criticalRequestSummary(record, requestPostData) {
 }
 
 function compareCompletedTargets(summaries) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay'].includes(flow)) {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels'].includes(flow)) {
     return [];
   }
   const upstream = summaries.find((summary) => summary.target === 'upstream' && summary.status === 'completed');
@@ -4956,6 +5135,8 @@ function compareCompletedTargets(summaries) {
                               ? ['plugins-list', 'plugin-repositories', 'plugin-packages']
                               : flow === 'live-tv'
                                 ? ['live-tv-info', 'live-tv-channels', 'live-tv-programs', 'live-tv-stream', 'live-tv-recordings', 'live-tv-timer-create']
+                                : flow === 'channels'
+                                  ? ['channels-list', 'channels-features', 'channels-filters', 'channels-media-deletion-filter', 'channels-items', 'channels-latest', 'channels-feature-by-id']
                               : ['auth', 'item-detail', 'playback-info', 'video-stream', 'sessions-playing'];
   for (const key of keys) {
     const upstreamRequest = upstream.criticalRequests[key];
@@ -5308,7 +5489,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -5667,6 +5848,32 @@ function invariantFailures(summary) {
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing SyncPlay ${label} invariant`);
+      }
+    }
+    return failures;
+  }
+  if (flow === 'channels') {
+    for (const [field, label] of [
+      ['channelsList200', 'channels list'],
+      ['channelsFeatures200', 'channels features'],
+    ]) {
+      if (!summary.invariants[field]) {
+        failures.push(`missing Channels ${label} invariant`);
+      }
+    }
+    if (summary.target === 'jellyrin') {
+      for (const [field, label] of [
+        ['channelsProviderMatched', 'local provider'],
+        ['channelsFilterMatched', 'supports/favorite filters'],
+        ['channelsDeletionFilterMatched', 'media deletion filter'],
+        ['channelsItems200', 'provider items'],
+        ['channelsItemMatched', 'fixture channel item'],
+        ['channelsLatest200', 'latest channel items'],
+        ['channelsFeatureMatched', 'feature capabilities'],
+      ]) {
+        if (!summary.invariants[field]) {
+          failures.push(`missing Channels ${label} invariant`);
+        }
       }
     }
     return failures;

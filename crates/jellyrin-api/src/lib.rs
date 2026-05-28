@@ -19090,9 +19090,9 @@ struct ChannelsQuery {
     #[serde(alias = "supportsLatestItems", alias = "SupportsLatestItems")]
     supports_latest_items: Option<bool>,
     #[serde(alias = "supportsMediaDeletion", alias = "SupportsMediaDeletion")]
-    _supports_media_deletion: Option<bool>,
+    supports_media_deletion: Option<bool>,
     #[serde(alias = "isFavorite", alias = "IsFavorite")]
-    _is_favorite: Option<bool>,
+    is_favorite: Option<bool>,
 }
 
 async fn channels(
@@ -19104,6 +19104,21 @@ async fn channels(
     let mut items = channel_provider_items(&state.db).await?;
     if query.supports_latest_items.unwrap_or(false) {
         items.retain(|channel| json_bool_field(channel, "SupportsLatestItems").unwrap_or(false));
+    }
+    if let Some(supports_media_deletion) = query.supports_media_deletion {
+        items.retain(|channel| {
+            json_bool_field(channel, "SupportsMediaDeletion").unwrap_or(false)
+                == supports_media_deletion
+        });
+    }
+    if let Some(is_favorite) = query.is_favorite {
+        items.retain(|channel| {
+            channel
+                .get("UserData")
+                .and_then(|value| json_bool_field(value, "IsFavorite"))
+                .unwrap_or(false)
+                == is_favorite
+        });
     }
     let total = items.len();
     let start_index = query.start_index.unwrap_or(0);
@@ -19274,6 +19289,14 @@ fn channel_provider_json(
         "PlayAccess": "Full",
         "RemoteTrailers": [],
         "ProviderIds": { "JellyrinLocal": id },
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": 0,
+            "IsFavorite": false,
+            "Played": false,
+            "Key": id,
+            "ItemId": id
+        },
         "IsFolder": true,
         "ParentId": null,
         "Type": "Channel",
@@ -27209,6 +27232,44 @@ mod tests {
         assert_eq!(channels_root["Items"][0]["Id"], "livetv");
         assert_eq!(channels_root["Items"][0]["Type"], "Channel");
         assert_eq!(channels_root["Items"][0]["ChildCount"], 2);
+        assert_eq!(
+            channels_root["Items"][0]["UserData"]["IsFavorite"],
+            false
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels?SupportsMediaDeletion=false&IsFavorite=false")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_channels["TotalRecordCount"], 1);
+        assert_eq!(filtered_channels["Items"][0]["Id"], "livetv");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels?SupportsMediaDeletion=true")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let filtered_channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(filtered_channels["TotalRecordCount"], 0);
+        assert_eq!(filtered_channels["Items"], json!([]));
 
         let response = app
             .clone()
