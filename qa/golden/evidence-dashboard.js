@@ -28,7 +28,7 @@ async function main() {
   const apiGolden = summarizeApiGolden(sources.apiGolden);
   const browserTraces = summarizeBrowserTraces(sources.browserTraces);
   const functionalAreas = summarizeFunctionalAreas(sources.functionalParity);
-  const gates = buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas);
+  const gates = buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas, sources.securityHardening);
 
   const dashboard = {
     generatedAt: new Date().toISOString(),
@@ -62,6 +62,7 @@ async function loadSources() {
     dtoFieldParity: await readJson('dto-field-parity.json', null),
     apiGolden: await readJson(path.join('golden-traces', 'api-parity-latest.json'), null),
     functionalParity: await readText('functional-parity.md', ''),
+    securityHardening: await readJson('security-hardening.json', null),
     browserTraces: await readTraceComparisons(browserTracesDir),
   };
 }
@@ -241,7 +242,7 @@ function summarizeFunctionalAreas(markdown) {
   return rows;
 }
 
-function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas) {
+function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, functionalAreas, securityHardening) {
   const startupWizard = browserTraces.find((trace) => trace.flow === 'startup-wizard');
   const p0Direct = browserTraces.find((trace) => trace.flow === 'p0-direct-play');
   const loginHome = browserTraces.find((trace) => trace.flow === 'login-home');
@@ -446,6 +447,13 @@ function buildGates(routeSummary, dtoSummary, apiGolden, browserTraces, function
         : 'missing trace',
     },
     {
+      id: 'security-hardening',
+      status: securityHardening?.status || 'pending',
+      evidence: securityHardening
+        ? `${securityHardening.summary.passed}/${securityHardening.summary.total} checks passed`
+        : 'missing security matrix',
+    },
+    {
       id: 'dto-field-parity',
       status: dtoSummary.missingGoldenEvidence === 0 && dtoSummary.partialGolden === 0 ? 'upstream-validated' : 'partial',
       evidence: `${dtoSummary.goldenValidated}/${dtoSummary.total} DTO fields upstream-validated, partial=${dtoSummary.partialGolden}, missing=${dtoSummary.missingGoldenEvidence}`,
@@ -496,6 +504,7 @@ function sourceStatus(sources) {
     dtoFieldParity: Boolean(sources.dtoFieldParity),
     apiGolden: Boolean(sources.apiGolden),
     functionalParity: sources.functionalParity.trim().length > 0,
+    securityHardening: Boolean(sources.securityHardening),
     browserTraceComparisons: sources.browserTraces.length,
   };
 }

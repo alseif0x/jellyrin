@@ -72,6 +72,9 @@ static SYSTEM_LIFECYCLE_LAST: AtomicU8 = AtomicU8::new(0);
 static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
 static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLock::new();
+static AUTH_FAILURES: OnceLock<Mutex<HashMap<String, AuthFailureState>>> = OnceLock::new();
+const AUTH_LOCKOUT_FAILURE_LIMIT: u32 = 5;
+const AUTH_LOCKOUT_SECONDS: u64 = 60;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -108,6 +111,12 @@ struct SyncPlayParticipant {
     user_id: Uuid,
     user_name: String,
     session_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct AuthFailureState {
+    failures: u32,
+    locked_until_epoch: Option<u64>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -4311,8 +4320,10 @@ async fn authenticate_by_name(
         .as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("Username must not be empty"))?;
+    let lockout_key = auth_lockout_key("name", username);
+    ensure_auth_not_locked(&lockout_key).await?;
     let password = payload.pw.as_deref().unwrap_or("");
-    let (user, token) = state
+    let auth_result = state
         .db
         .authenticate_user_by_name(
             username,
@@ -4322,8 +4333,17 @@ async fn authenticate_by_name(
             &auth.client,
             &auth.version,
         )
-        .await
-        .map_err(|_| ApiError::unauthorized("Invalid username or password"))?;
+        .await;
+    let (user, token) = match auth_result {
+        Ok(result) => {
+            clear_auth_failure(&lockout_key).await;
+            result
+        }
+        Err(_) => {
+            record_auth_failure(&lockout_key).await;
+            return Err(ApiError::unauthorized("Invalid username or password"));
+        }
+    };
     let server = state.db.server_state().await?;
     record_activity(
         &state.db,
@@ -4346,8 +4366,10 @@ async fn authenticate_user_by_id(
     Json(payload): Json<AuthenticateUserByNameDto>,
 ) -> Result<Json<AuthenticationResultDto>, ApiError> {
     let auth = client_auth_from_headers(&headers);
+    let lockout_key = auth_lockout_key("id", &user_id.to_string());
+    ensure_auth_not_locked(&lockout_key).await?;
     let password = payload.pw.as_deref().unwrap_or("");
-    let (user, token) = state
+    let auth_result = state
         .db
         .authenticate_user_by_id(
             user_id,
@@ -4357,8 +4379,17 @@ async fn authenticate_user_by_id(
             &auth.client,
             &auth.version,
         )
-        .await
-        .map_err(|_| ApiError::unauthorized("Invalid username or password"))?;
+        .await;
+    let (user, token) = match auth_result {
+        Ok(result) => {
+            clear_auth_failure(&lockout_key).await;
+            result
+        }
+        Err(_) => {
+            record_auth_failure(&lockout_key).await;
+            return Err(ApiError::unauthorized("Invalid username or password"));
+        }
+    };
     let server = state.db.server_state().await?;
     record_activity(
         &state.db,
@@ -4372,6 +4403,66 @@ async fn authenticate_user_by_id(
     Ok(Json(
         authentication_result_to_dto(&state.db, &user, &token, server.server_id).await?,
     ))
+}
+
+fn auth_lockout_key(kind: &str, value: &str) -> String {
+    format!("{}:{}", kind, value.trim().to_ascii_lowercase())
+}
+
+async fn ensure_auth_not_locked(key: &str) -> Result<(), ApiError> {
+    let now = epoch_seconds();
+    let mut failures = AUTH_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+    if let Some(state) = failures.get(key) {
+        if state
+            .locked_until_epoch
+            .is_some_and(|locked_until| locked_until > now)
+        {
+            return Err(ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                error: anyhow::anyhow!("Too many failed login attempts"),
+            });
+        }
+    }
+    if failures
+        .get(key)
+        .and_then(|state| state.locked_until_epoch)
+        .is_some()
+    {
+        failures.remove(key);
+    }
+    Ok(())
+}
+
+async fn record_auth_failure(key: &str) {
+    let now = epoch_seconds();
+    let mut failures = AUTH_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+    let entry = failures.entry(key.to_string()).or_insert(AuthFailureState {
+        failures: 0,
+        locked_until_epoch: None,
+    });
+    entry.failures = entry.failures.saturating_add(1);
+    if entry.failures >= AUTH_LOCKOUT_FAILURE_LIMIT {
+        entry.locked_until_epoch = Some(now.saturating_add(AUTH_LOCKOUT_SECONDS));
+    }
+}
+
+async fn clear_auth_failure(key: &str) {
+    if let Some(failures) = AUTH_FAILURES.get() {
+        failures.lock().await.remove(key);
+    }
+}
+
+fn epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -10881,7 +10972,7 @@ async fn client_log_document(
     tokio::fs::create_dir_all(&state.log_dir).await?;
     let path = state.log_dir.join("clientlog.log");
     let timestamp = OffsetDateTime::now_utc().format(&Rfc3339)?;
-    let message = String::from_utf8_lossy(&body).replace('\0', "");
+    let message = redact_sensitive_log_text(&String::from_utf8_lossy(&body).replace('\0', ""));
     let line = serde_json::json!({
         "Timestamp": timestamp,
         "UserId": user.id.simple().to_string(),
@@ -10915,6 +11006,55 @@ fn content_disposition_filename(value: &str) -> Option<String> {
             .trim();
         (!file_name.is_empty()).then(|| file_name.to_string())
     })
+}
+
+fn redact_sensitive_log_text(input: &str) -> String {
+    let mut output = input.to_string();
+    for marker in [
+        "api_key=",
+        "apiKey=",
+        "ApiKey=",
+        "AccessToken=",
+        "access_token=",
+        "Token=\"",
+        "token=",
+        "X-Emby-Token:",
+        "Authorization:",
+        "\"AccessToken\":\"",
+        "\"Token\":\"",
+    ] {
+        output = redact_marker_value(&output, marker);
+    }
+    output
+}
+
+fn redact_marker_value(input: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+    while let Some(index) = remaining.find(marker) {
+        let (prefix, after_prefix) = remaining.split_at(index + marker.len());
+        output.push_str(prefix);
+        output.push_str("[REDACTED]");
+        let mut end = after_prefix.len();
+        let redact_until_line_end = matches!(marker, "Authorization:" | "X-Emby-Token:");
+        for (char_index, character) in after_prefix.char_indices() {
+            let is_stop = if redact_until_line_end {
+                matches!(character, '\n' | '\r')
+            } else {
+                matches!(
+                    character,
+                    '&' | ' ' | '\n' | '\r' | '\t' | '"' | '\'' | ',' | ';' | '}'
+                )
+            };
+            if is_stop {
+                end = char_index;
+                break;
+            }
+        }
+        remaining = &after_prefix[end..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 async fn get_virtual_folders(
@@ -24662,7 +24802,7 @@ mod tests {
     use std::fs;
 
     use super::{
-        AppState, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
+        AppState, AUTH_LOCKOUT_FAILURE_LIMIT, COMPATIBLE_SERVER_VERSION, DEFAULT_AUTHENTICATION_PROVIDER_ID,
         DEFAULT_PASSWORD_RESET_PROVIDER_ID, SystemLifecycleCommand,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
@@ -24670,7 +24810,7 @@ mod tests {
         json_value_i64, last_system_lifecycle_command, load_countries, load_cultures,
         media_item_by_id, media_item_streams, package_install_task_key,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs, redact_sensitive_log_text,
         reconcile_transcode_sessions_on_startup, router, spawn_hls_transcode_task,
         stable_entity_id, subscribe_playback_events, subscribe_system_lifecycle_commands,
         syncplay_groups, transcode_dedupe_lock, transcode_temp_root, trickplay_settings,
@@ -25164,6 +25304,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn authentication_rate_limit_locks_repeated_failures_and_redacts_logs() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_first_user("rate-limit-admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for attempt in 0..AUTH_LOCKOUT_FAILURE_LIMIT {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/Users/AuthenticateByName")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({ "Username": "rate-limit-admin", "Pw": "wrong" }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {attempt}"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Username": "rate-limit-admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        assert_eq!(
+            redact_sensitive_log_text(
+                "GET /x?api_key=abc123&Token=\"def456\" Authorization: Bearer ghi789\n"
+            ),
+            "GET /x?api_key=[REDACTED]&Token=\"[REDACTED]\" Authorization:[REDACTED]\n"
+        );
     }
 
     #[tokio::test]
@@ -26347,7 +26547,9 @@ mod tests {
                         header::CONTENT_DISPOSITION,
                         "form-data; name=\"file\"; filename=\"web.log\"",
                     )
-                    .body(Body::from("browser log\0entry"))
+                    .body(Body::from(format!(
+                        "browser log\0entry api_key={api_key}&Token=\"{api_key}\""
+                    )))
                     .unwrap(),
             )
             .await
@@ -26355,7 +26557,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
         let uploaded_log: Value = serde_json::from_str(client_log.lines().last().unwrap()).unwrap();
-        assert_eq!(uploaded_log["Document"], "browser logentry");
+        assert_eq!(
+            uploaded_log["Document"],
+            "browser logentry api_key=[REDACTED]&Token=\"[REDACTED]\""
+        );
+        assert!(!uploaded_log["Document"].as_str().unwrap().contains(&api_key));
         assert_eq!(uploaded_log["ContentType"], "text/plain");
         assert_eq!(uploaded_log["FileName"], "web.log");
         assert_eq!(
