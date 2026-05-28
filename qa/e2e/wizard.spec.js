@@ -143,9 +143,9 @@ test('fresh install completes the Jellyfin web startup wizard and loads a scanne
   });
   expect(playbackInfoResponse.ok()).toBeTruthy();
   const playbackInfo = await playbackInfoResponse.json();
-  expect(playbackInfo.ErrorCode).toBeNull();
+  expect(playbackInfo.ErrorCode).toBeUndefined();
   expect(playbackInfo.PlaySessionId).toBeTruthy();
-  expect(playbackInfo.MediaSources[0].DirectStreamUrl).toBe(`/Videos/${movie.Id}/stream`);
+  expect(playbackInfo.MediaSources[0].DirectStreamUrl).toBeUndefined();
   expect(playbackInfo.MediaSources[0].SupportsDirectPlay).toBe(true);
   expect(playbackInfo.MediaSources[0].SupportsDirectStream).toBe(true);
   expect(playbackInfo.MediaSources[0].SupportsTranscoding).toBe(false);

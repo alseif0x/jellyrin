@@ -168,6 +168,14 @@ function evaluateField(field, contexts) {
   }
   const upstream = hasAnyPath(context.upstream, rule.paths);
   const jellyrin = hasAnyPath(context.jellyrin, rule.paths);
+  if (rule.expectedAbsent && !upstream && !jellyrin) {
+    return resultFor(
+      field,
+      'upstream-validated',
+      `${context.source}; optional field absent on both sides`,
+      rule.paths,
+    );
+  }
   if (upstream && jellyrin) {
     return resultFor(field, 'upstream-validated', context.source, rule.paths);
   }
@@ -201,7 +209,7 @@ function ruleFor(field) {
     'MediaSourceInfo.SupportsDirectStream': ['mediaSourceInfo', ['MediaSources.[].SupportsDirectStream']],
     'MediaSourceInfo.SupportsTranscoding': ['mediaSourceInfo', ['MediaSources.[].SupportsTranscoding']],
     'MediaSourceInfo.TranscodingUrl': ['playbackInfoTranscodeResponse', ['MediaSources.[].TranscodingUrl']],
-    'MediaSourceInfo.DirectStreamUrl': ['playbackInfoPostResponse', ['MediaSources.[].DirectStreamUrl']],
+    'MediaSourceInfo.DirectStreamUrl': ['playbackInfoPostResponse', ['MediaSources.[].DirectStreamUrl'], { expectedAbsent: true }],
     'MediaSourceInfo.RunTimeTicks': ['mediaSourceInfo', ['MediaSources.[].RunTimeTicks']],
     'MediaSourceInfo.Bitrate': ['mediaSourceInfo', ['MediaSources.[].Bitrate']],
     'MediaSourceInfo.DefaultAudioStreamIndex': ['mediaSourceInfo', ['MediaSources.[].DefaultAudioStreamIndex']],
@@ -273,7 +281,7 @@ function ruleFor(field) {
     'ImageInfo.Path': ['imageInfo', ['Path']],
   };
   const value = exact[name];
-  return value ? { context: value[0], paths: value[1] } : null;
+  return value ? { context: value[0], paths: value[1], ...(value[2] || {}) } : null;
 }
 
 function resultFor(field, goldenStatus, evidence, paths = []) {

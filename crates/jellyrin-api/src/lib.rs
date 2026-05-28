@@ -10614,8 +10614,8 @@ fn media_list_to_json(list: &MediaList, server_id: &str, child_count: usize) -> 
         "ServerId": server_id,
         "Id": list.id.simple().to_string(),
         "Etag": null,
-        "DateCreated": list.created_at.to_string(),
-        "DateLastMediaAdded": list.updated_at.to_string(),
+        "DateCreated": format_time_for_json(list.created_at),
+        "DateLastMediaAdded": format_time_for_json(list.updated_at),
         "CanDelete": true,
         "CanDownload": false,
         "SortName": list.name,
@@ -12626,7 +12626,9 @@ fn remote_search_result_from_media_item(
         "IndexNumber": null,
         "IndexNumberEnd": null,
         "ParentIndexNumber": null,
-        "PremiereDate": metadata.and_then(|metadata| first_metadata_value_from_json(metadata, &["PremiereDate", "AirDate", "DateCreated"])),
+        "PremiereDate": metadata
+            .and_then(|metadata| first_metadata_value_from_json(metadata, &["PremiereDate", "AirDate", "DateCreated"]))
+            .map(|value| normalize_metadata_date_for_json(&value)),
         "ImageUrl": null,
         "SearchProviderName": "Jellyrin Local Library",
         "Overview": overview,
@@ -18442,7 +18444,7 @@ fn remote_trailer_json(
         "ServerId": server_id,
         "Id": stable_entity_id("Trailer", &format!("{source_id}:{url}")),
         "Etag": null,
-        "DateCreated": item.created_at.to_string(),
+        "DateCreated": format_time_for_json(item.created_at),
         "CanDelete": false,
         "CanDownload": false,
         "SortName": display_name,
@@ -20196,7 +20198,7 @@ fn user_view_to_json(folder: &VirtualFolder, server_id: &str) -> serde_json::Val
         "ServerId": server_id,
         "Id": folder.id.simple().to_string(),
         "Etag": null,
-        "DateCreated": folder.created_at.to_string(),
+        "DateCreated": format_time_for_json(folder.created_at),
         "CanDelete": false,
         "CanDownload": false,
         "SortName": folder.name,
@@ -20254,7 +20256,7 @@ fn transcode_session_json(session: &TranscodeSession) -> serde_json::Value {
         "TranscodeReasons": [],
         "IsAudioDirect": false,
         "IsVideoDirect": false,
-        "UpdatedAt": session.updated_at.to_string(),
+        "UpdatedAt": format_time_for_json(session.updated_at),
     })
 }
 
@@ -20291,7 +20293,6 @@ fn media_item_to_json_with_playback_and_metadata(
         .or(default_audio_stream_index);
     let selected_subtitle_stream_index =
         selected_subtitle_stream_index(playback, default_subtitle_stream_index);
-    let direct_stream_url = media_item_direct_stream_url(item, &item_id);
     let video_type = if item.media_type == "Video" {
         serde_json::json!("VideoFile")
     } else {
@@ -20331,7 +20332,6 @@ fn media_item_to_json_with_playback_and_metadata(
         "Size": file_size,
         "Name": item.name,
         "IsRemote": false,
-        "DirectStreamUrl": direct_stream_url,
         "ETag": null,
         "RunTimeTicks": item.runtime_ticks,
         "ReadAtNativeFramerate": false,
@@ -20365,8 +20365,8 @@ fn media_item_to_json_with_playback_and_metadata(
         "ParentIndexNumber": parent_index_number,
         "IndexNumber": index_number,
         "Etag": null,
-        "DateCreated": item.created_at.to_string(),
-        "DateLastMediaAdded": item.updated_at.to_string(),
+        "DateCreated": format_time_for_json(item.created_at),
+        "DateLastMediaAdded": format_time_for_json(item.updated_at),
         "PremiereDate": null,
         "ProductionYear": null,
         "CommunityRating": null,
@@ -20455,7 +20455,7 @@ fn apply_media_item_metadata(
     {
         object.insert(
             "PremiereDate".to_string(),
-            serde_json::Value::String(premiere_date),
+            serde_json::Value::String(normalize_metadata_date_for_json(&premiere_date)),
         );
     }
 
@@ -20524,6 +20524,18 @@ fn metadata_values_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Vec
 
 fn first_metadata_value_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Option<String> {
     metadata_values_from_json(metadata, keys).into_iter().next()
+}
+
+fn normalize_metadata_date_for_json(value: &str) -> String {
+    if OffsetDateTime::parse(value, &Rfc3339).is_ok() {
+        return value.to_string();
+    }
+    if let Some(value) = value.strip_suffix(" +00:00:00")
+        && let Some((date, time)) = value.split_once(' ')
+    {
+        return format!("{date}T{time}Z");
+    }
+    value.to_string()
 }
 
 fn first_metadata_number_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Option<f64> {
@@ -20857,13 +20869,6 @@ fn media_item_content_type(item: &MediaItem) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
-}
-
-fn media_item_direct_stream_url(item: &MediaItem, item_id: &str) -> String {
-    match item.media_type.as_str() {
-        "Audio" => format!("/Audio/{item_id}/stream"),
-        _ => format!("/Videos/{item_id}/stream"),
-    }
 }
 
 fn hls_codecs(item: &MediaItem) -> Option<String> {
@@ -23372,7 +23377,12 @@ mod tests {
         assert_eq!(media_source["TranscodingSubProtocol"], "hls");
         assert_eq!(media_source["TranscodingContainer"], "ts");
         assert_eq!(media_source["Container"], "ts");
-        assert_eq!(media_source["DirectStreamUrl"], Value::Null);
+        assert!(
+            !media_source
+                .as_object()
+                .unwrap()
+                .contains_key("DirectStreamUrl")
+        );
         let play_session_id = info["PlaySessionId"].as_str().unwrap();
         assert_eq!(
             media_source["TranscodingUrl"],
@@ -32875,9 +32885,11 @@ mod tests {
         assert_eq!(detail["MediaSources"][0]["Bitrate"], 2_500_000);
         assert_eq!(detail["MediaSources"][0]["DefaultAudioStreamIndex"], 1);
         assert_eq!(detail["MediaSources"][0]["DefaultSubtitleStreamIndex"], 2);
-        assert_eq!(
-            detail["MediaSources"][0]["DirectStreamUrl"],
-            format!("/Videos/{item_id}/stream")
+        assert!(
+            !detail["MediaSources"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("DirectStreamUrl")
         );
         assert_eq!(
             detail["MediaSources"][0]["MediaStreams"][0]["Type"],
@@ -38952,9 +38964,11 @@ mod tests {
         assert_eq!(result["Items"][0]["Name"], "Example Song");
         assert_eq!(result["Items"][0]["Type"], "Audio");
         let item_id = result["Items"][0]["Id"].as_str().unwrap();
-        assert_eq!(
-            result["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
-            format!("/Audio/{item_id}/stream")
+        assert!(
+            !result["Items"][0]["MediaSources"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("DirectStreamUrl")
         );
         assert_eq!(
             result["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Type"],
@@ -39153,9 +39167,11 @@ mod tests {
         assert_eq!(instant_mix["Items"].as_array().unwrap().len(), 1);
         assert_eq!(instant_mix["Items"][0]["Id"], item_id);
         assert_eq!(instant_mix["Items"][0]["Type"], "Audio");
-        assert_eq!(
-            instant_mix["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
-            format!("/Audio/{item_id}/stream")
+        assert!(
+            !instant_mix["Items"][0]["MediaSources"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("DirectStreamUrl")
         );
         assert_eq!(instant_mix["Items"][0]["UserData"]["Played"], false);
 
@@ -39488,9 +39504,11 @@ mod tests {
             assert_eq!(genre_id_mix["StartIndex"], expected_start_index);
             assert_eq!(genre_id_mix["Items"][0]["Id"], expected_id);
             assert_eq!(genre_id_mix["Items"][0]["Type"], "Audio");
-            assert_eq!(
-                genre_id_mix["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
-                format!("/Audio/{expected_id}/stream")
+            assert!(
+                !genre_id_mix["Items"][0]["MediaSources"][0]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("DirectStreamUrl")
             );
         }
 
@@ -39539,10 +39557,13 @@ mod tests {
             let genre_mix: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(genre_mix["TotalRecordCount"], 2);
             assert_eq!(genre_mix["StartIndex"], expected_start_index);
+            assert_eq!(genre_mix["Items"][0]["Id"], expected_id);
             assert_eq!(genre_mix["Items"][0]["Type"], "Audio");
-            assert_eq!(
-                genre_mix["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
-                format!("/Audio/{expected_id}/stream")
+            assert!(
+                !genre_mix["Items"][0]["MediaSources"][0]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("DirectStreamUrl")
             );
         }
 
@@ -40936,9 +40957,11 @@ mod tests {
         assert_eq!(result["TotalRecordCount"], 1);
         let item_id = result["Items"][0]["Id"].as_str().unwrap();
         assert_eq!(result["Items"][0]["MediaSources"][0]["Container"], "aac");
-        assert_eq!(
-            result["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
-            format!("/Audio/{item_id}/stream")
+        assert!(
+            !result["Items"][0]["MediaSources"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("DirectStreamUrl")
         );
 
         let legacy_segment_id = 987_654_321_i64;
