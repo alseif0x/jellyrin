@@ -45,6 +45,7 @@ use jellyrin_transcode::{
     spawn_transcode_process, wait_for_hls_readiness,
 };
 use rand_core::{OsRng, RngCore};
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -9446,6 +9447,108 @@ async fn live_tv_m3u_channels_from_payload(
     (!channels.is_empty()).then_some(channels)
 }
 
+async fn live_tv_hdhomerun_channels_from_payload(
+    payload: &mut serde_json::Value,
+) -> Option<Vec<serde_json::Value>> {
+    let base_url = payload
+        .get("Url")
+        .and_then(serde_json::Value::as_str)
+        .map(|url| {
+            let url = if url.starts_with("http://") || url.starts_with("https://") {
+                url.to_string()
+            } else {
+                format!("http://{url}")
+            };
+            url.trim_end_matches('/').to_string()
+        })?;
+
+    let client = HttpClient::new();
+
+    let discover_url = format!("{base_url}/discover.json");
+    let discover: serde_json::Value = client
+        .get(&discover_url)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    if let Some(device_id) = discover.get("DeviceID").and_then(serde_json::Value::as_str) {
+        payload["DeviceId"] = serde_json::json!(device_id);
+    }
+    if let Some(friendly_name) = discover
+        .get("FriendlyName")
+        .and_then(serde_json::Value::as_str)
+    {
+        payload["FriendlyName"] = serde_json::json!(friendly_name);
+    }
+    if let Some(tuner_count) = discover
+        .get("TunerCount")
+        .and_then(serde_json::Value::as_u64)
+    {
+        payload["TunerCount"] = serde_json::json!(tuner_count);
+    }
+
+    let lineup_url = discover
+        .get("LineupURL")
+        .and_then(serde_json::Value::as_str)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{base_url}/lineup.json"));
+
+    let lineup: Vec<serde_json::Value> = client
+        .get(&lineup_url)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let channels = parse_live_tv_hdhomerun_channels(&lineup);
+    (!channels.is_empty()).then_some(channels)
+}
+
+fn hdhomerun_bool_field(entry: &serde_json::Value, key: &str) -> bool {
+    match entry.get(key) {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_u64().is_some_and(|v| v != 0),
+        _ => false,
+    }
+}
+
+fn parse_live_tv_hdhomerun_channels(lineup: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    lineup
+        .iter()
+        .filter(|entry| !hdhomerun_bool_field(entry, "DRM"))
+        .filter_map(|entry| {
+            let guide_number = entry.get("GuideNumber")?.as_str()?.to_string();
+            let guide_name = entry
+                .get("GuideName")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&guide_number)
+                .to_string();
+            let url = entry
+                .get("URL")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let is_hd = hdhomerun_bool_field(entry, "HD");
+            let is_favorite = hdhomerun_bool_field(entry, "Favorite");
+            Some(serde_json::json!({
+                "Id": format!("hdhr_{guide_number}"),
+                "Name": guide_name,
+                "Number": guide_number,
+                "Path": url,
+                "ChannelType": "TV",
+                "IsHD": is_hd,
+                "IsFavorite": is_favorite,
+            }))
+        })
+        .collect()
+}
+
 fn parse_live_tv_m3u_channels(contents: &str) -> Vec<serde_json::Value> {
     let mut channels = Vec::new();
     let mut pending: Option<serde_json::Value> = None;
@@ -9684,7 +9787,17 @@ async fn add_live_tv_tuner_host(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     payload["Id"] = serde_json::json!(tuner_id);
-    if payload
+
+    let tuner_type = payload
+        .get("Type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if tuner_type == "hdhomerun" {
+        if let Some(channels) = live_tv_hdhomerun_channels_from_payload(&mut payload).await {
+            payload["Channels"] = serde_json::json!(channels);
+        }
+    } else if payload
         .get("Channels")
         .and_then(serde_json::Value::as_array)
         .is_none_or(|channels| channels.is_empty())
@@ -10090,12 +10203,14 @@ async fn live_tv_stream_file(
     }
     let channel = live_tv_channel_by_id(&state.db, &stream_id).await?;
     let path = live_tv_channel_path(&channel)?;
-    let path_container = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default();
-    if !path_container.eq_ignore_ascii_case(container.trim()) {
-        return Err(ApiError::not_found("Live TV stream not found"));
+    if !live_tv_channel_is_remote(&path) {
+        let path_container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        if !path_container.eq_ignore_ascii_case(container.trim()) {
+            return Err(ApiError::not_found("Live TV stream not found"));
+        }
     }
     stream_live_tv_channel(channel, &headers).await
 }
@@ -10172,8 +10287,33 @@ async fn stream_live_tv_channel(
     headers: &HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
     let path = live_tv_channel_path(&channel)?;
+    if live_tv_channel_is_remote(&path) {
+        return proxy_live_tv_channel_url(path.to_string_lossy().into_owned()).await;
+    }
     let content_type = live_tv_recording_content_type(&path).to_string();
     stream_path(path, content_type, headers, true).await
+}
+
+async fn proxy_live_tv_channel_url(url: String) -> Result<axum::response::Response, ApiError> {
+    let client = HttpClient::new();
+    let upstream = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("HDHomeRun proxy error: {error}")))?;
+    if !upstream.status().is_success() {
+        return Err(ApiError::internal(format!(
+            "HDHomeRun upstream returned HTTP {}",
+            upstream.status()
+        )));
+    }
+    let stream = upstream.bytes_stream();
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "video/mp2t")],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 async fn live_tv_recording_folders(
@@ -10371,6 +10511,11 @@ fn live_tv_channel_path(channel: &serde_json::Value) -> Result<PathBuf, ApiError
         .ok_or_else(|| ApiError::not_found("Live TV stream not found"))
 }
 
+fn live_tv_channel_is_remote(path: &FsPath) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
 fn live_tv_channel_media_source(
     channel: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
@@ -10378,19 +10523,24 @@ fn live_tv_channel_media_source(
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
     let name = json_string_field(channel, "Name").unwrap_or_else(|| channel_id.clone());
     let path = live_tv_channel_path(channel)?;
-    let container = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| "ts".to_string());
+    let is_remote = live_tv_channel_is_remote(&path);
+    let container = if is_remote {
+        "ts".to_string()
+    } else {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "ts".to_string())
+    };
+    let protocol = if is_remote { "Http" } else { "File" };
     Ok(serde_json::json!({
-        "Protocol": "File",
+        "Protocol": protocol,
         "Id": channel_id,
         "Path": path.to_string_lossy().to_string(),
         "Type": "Default",
         "Container": container,
         "Name": name,
-        "IsRemote": false,
+        "IsRemote": is_remote,
         "DirectStreamUrl": format!("/LiveTv/LiveStreamFiles/{channel_id}/stream.{container}"),
         "ETag": null,
         "RunTimeTicks": null,
@@ -25049,6 +25199,13 @@ impl ApiError {
             error: anyhow::anyhow!(message.into()),
         }
     }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: anyhow::anyhow!(message.into()),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -25075,10 +25232,11 @@ mod tests {
         DirectPlayProfileMatcher, ItemsQuery, SystemLifecycleCommand, backup_restore_snapshot_json,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
-        direct_play_profile_matches, encoding_configuration_json, hls_transcode_dedupe_key,
-        json_value_i64, last_system_lifecycle_command, load_countries, load_cultures,
-        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
-        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_m3u_channels,
+        direct_play_profile_matches, encoding_configuration_json, hdhomerun_bool_field,
+        hls_transcode_dedupe_key, json_value_i64, last_system_lifecycle_command,
+        live_tv_channel_is_remote, load_countries, load_cultures, media_item_by_id,
+        media_item_streams, package_install_task_key, paged_media_items, parse_authorization_token,
+        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
         parse_live_tv_xmltv_programs, parse_media_browser_pairs,
         reconcile_transcode_sessions_on_startup, redact_sensitive_log_text, router,
         spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
@@ -31539,6 +31697,78 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"live bytes");
+    }
+
+    #[test]
+    fn live_tv_hdhomerun_lineup_maps_to_channels_and_excludes_drm() {
+        use serde_json::json;
+        let lineup = vec![
+            json!({
+                "GuideNumber": "4.1",
+                "GuideName": "NBC HD",
+                "URL": "http://192.168.1.100:5004/auto/v4.1",
+                "HD": 1,
+                "Favorite": 0,
+                "DRM": 0,
+            }),
+            json!({
+                "GuideNumber": "5.1",
+                "GuideName": "CBS HD",
+                "URL": "http://192.168.1.100:5004/auto/v5.1",
+                "HD": 1,
+                "Favorite": 1,
+                "DRM": 0,
+            }),
+            json!({
+                "GuideNumber": "6.1",
+                "GuideName": "Pay-Per-View",
+                "URL": "http://192.168.1.100:5004/auto/v6.1",
+                "HD": 0,
+                "Favorite": 0,
+                "DRM": 1,
+            }),
+        ];
+        let channels = parse_live_tv_hdhomerun_channels(&lineup);
+        assert_eq!(channels.len(), 2, "DRM channel must be excluded");
+        assert_eq!(channels[0]["Id"], "hdhr_4.1");
+        assert_eq!(channels[0]["Name"], "NBC HD");
+        assert_eq!(channels[0]["Number"], "4.1");
+        assert_eq!(channels[0]["Path"], "http://192.168.1.100:5004/auto/v4.1");
+        assert_eq!(channels[0]["IsHD"], true);
+        assert_eq!(channels[0]["IsFavorite"], false);
+        assert_eq!(channels[1]["Id"], "hdhr_5.1");
+        assert_eq!(channels[1]["IsFavorite"], true);
+
+        let drm_entry = json!({ "GuideNumber": "7.1", "GuideName": "DRM Bool", "URL": "http://x/auto/v7.1", "HD": true, "Favorite": false, "DRM": true });
+        assert!(
+            hdhomerun_bool_field(&drm_entry, "DRM"),
+            "bool true treated as DRM"
+        );
+        let non_drm_entry = json!({ "DRM": false });
+        assert!(
+            !hdhomerun_bool_field(&non_drm_entry, "DRM"),
+            "bool false not DRM"
+        );
+        let numeric_hd = json!({ "HD": 1 });
+        assert!(hdhomerun_bool_field(&numeric_hd, "HD"), "numeric 1 is HD");
+        let numeric_not_hd = json!({ "HD": 0 });
+        assert!(
+            !hdhomerun_bool_field(&numeric_not_hd, "HD"),
+            "numeric 0 is not HD"
+        );
+    }
+
+    #[test]
+    fn live_tv_hdhomerun_remote_path_detected() {
+        use std::path::PathBuf;
+        let http_path = PathBuf::from("http://192.168.1.100:5004/auto/v4.1");
+        assert!(live_tv_channel_is_remote(&http_path));
+        let https_path = PathBuf::from("https://example.com/stream");
+        assert!(live_tv_channel_is_remote(&https_path));
+        let local_path = PathBuf::from("/srv/live/news.ts");
+        assert!(!live_tv_channel_is_remote(&local_path));
+        let rel_path = PathBuf::from("news.ts");
+        assert!(!live_tv_channel_is_remote(&rel_path));
     }
 
     #[tokio::test]
