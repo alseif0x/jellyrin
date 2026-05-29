@@ -270,6 +270,23 @@ function start(port) {
         const baseUrl = `http://127.0.0.1:${assignedPort}`;
         const discover = buildDiscoverResponse(baseUrl);
 
+        // Concurrent connection counters keyed by channel path (e.g. '/auto/v4.1').
+        // currentConcurrentByChannel: number of live connections right now.
+        // maxConcurrentByChannel: peak concurrent seen since last reset.
+        const currentConcurrentByChannel = Object.create(null);
+        const maxConcurrentByChannel = Object.create(null);
+
+        function channelConnOpen(channelPath) {
+          currentConcurrentByChannel[channelPath] = (currentConcurrentByChannel[channelPath] || 0) + 1;
+          if ((maxConcurrentByChannel[channelPath] || 0) < currentConcurrentByChannel[channelPath]) {
+            maxConcurrentByChannel[channelPath] = currentConcurrentByChannel[channelPath];
+          }
+        }
+
+        function channelConnClose(channelPath) {
+          currentConcurrentByChannel[channelPath] = Math.max(0, (currentConcurrentByChannel[channelPath] || 1) - 1);
+        }
+
         const server = http.createServer((req, res) => {
           const url = req.url.split('?')[0];
 
@@ -293,7 +310,36 @@ function start(port) {
             return;
           }
 
+          if (url === '/stats') {
+            // Return current and max concurrent connections by channel path.
+            const body = JSON.stringify({
+              maxConcurrentByChannel: Object.assign(Object.create(null), maxConcurrentByChannel),
+              currentConcurrentByChannel: Object.assign(Object.create(null), currentConcurrentByChannel),
+            });
+            res.writeHead(200, {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(body),
+            });
+            res.end(body);
+            return;
+          }
+
+          if (url === '/stats/reset' && req.method === 'POST') {
+            // Clear max counters (current remains real).
+            Object.keys(maxConcurrentByChannel).forEach((k) => { delete maxConcurrentByChannel[k]; });
+            const body = JSON.stringify({ ok: true });
+            res.writeHead(200, {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(body),
+            });
+            res.end(body);
+            return;
+          }
+
           if (url.startsWith('/auto/v')) {
+            // Track this incoming connection for sharing metrics.
+            channelConnOpen(url);
+
             // Stream the TS body in a loop (chunked, no Content-Length) until the client
             // disconnects. Looping proper MPEG-2 TS data lets ffprobe identify the codec within
             // its 3-second analyzeduration window without hanging on an empty or null-PID stream.
@@ -314,8 +360,8 @@ function start(port) {
                 res.once('drain', sendChunk);
               }
             }
-            req.on('close', () => { streaming = false; });
-            req.on('error', () => { streaming = false; });
+            req.on('close', () => { streaming = false; channelConnClose(url); });
+            req.on('error', () => { streaming = false; channelConnClose(url); });
             sendChunk();
             return;
           }

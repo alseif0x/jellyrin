@@ -932,6 +932,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64",
+ "bytes",
  "futures-util",
  "http-body-util",
  "jellyrin-compat",

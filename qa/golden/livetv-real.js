@@ -34,6 +34,8 @@ const upstreamComparable = [
   'liveTvHdhrTunerAdded',
   'liveTvHdhrChannelMatched',
   'liveTvHdhrStream200',
+  'liveTvHdhrTwoClientStream',
+  'liveTvHdhrStreamRefcountReleased',
 ];
 
 // Invariants validated only by Jellyrin via the synthetic M3U/XMLTV shortcut. These exercise
@@ -53,6 +55,7 @@ const jellyrinOnly = [
   'liveTvTimerDeleted',
   'liveTvSeriesTimerCreated',
   'liveTvSeriesTimerDeleted',
+  'liveTvHdhrTwoClientByteCheck',
 ];
 
 const baselineEvidence = {
@@ -139,17 +142,23 @@ function buildEvidence(result, comparison) {
       sourcePhase: 'E2.1',
       evidence: [
         'Live TV HDHomeRun golden completed against both upstream Jellyfin and Jellyrin using the same simulator.',
-        'upstream-validated is decided by the 5 HDHomeRun real-sequence invariants (upstreamComparable) executed by BOTH targets against the same simulator.',
-        'The 12 synthetic M3U/XMLTV invariants (jellyrinOnly) are intentionally excluded from the upstream comparison:',
+        'upstream-validated is decided by the 7 HDHomeRun real-sequence invariants (upstreamComparable) executed by BOTH targets against the same simulator.',
+        'The 13 synthetic M3U/XMLTV + jellyrin-only invariants (jellyrinOnly) are intentionally excluded from the upstream comparison:',
         'upstream does not expose the direct System/Configuration/livetv channel injection path used by Jellyrin,',
         'and materialises guide data asynchronously via RefreshGuideScheduledTask rather than eagerly.',
-        'Jellyrin satisfies all 17 invariants (5 HDHomeRun + 12 synthetic). upstream satisfies the 5 HDHomeRun invariants.',
-        'liveTvHdhrStream200 (byte delivery) is now in the comparable set for BOTH targets:',
+        'Jellyrin satisfies all 20 invariants (7 HDHomeRun comparable + 13 jellyrin-only). upstream satisfies the 7 HDHomeRun invariants.',
+        'liveTvHdhrStream200 (byte delivery) is in the comparable set for BOTH targets:',
         'Jellyrin proxies the HDHomeRun stream incrementally (bytes_stream + Body::from_stream) so',
         'GET /LiveTv/LiveStreamFiles/hdhr_{n}/stream.ts returns headers and bytes immediately.',
-        'upstream serves bytes via SharedHttpStream. Both are verified by browserFetchStreamProbe',
-        '(AbortController, reads >=1 byte then aborts) confirming status 200, video/mp2t, byteLength>=1.',
-        'There is no longer a streaming gap between the two implementations.',
+        'upstream serves bytes via SharedHttpStream. Both verified by browserFetchStreamProbe (AbortController, reads >=1 byte then aborts).',
+        'liveTvHdhrTwoClientStream (stream sharing): metric = simulator concurrent connections at /auto/vN.',
+        '2 client probes of the same channel with sharing enabled → maxConcurrentByChannel===1 (one outgoing connection shared).',
+        'Jellyrin implements SharedLiveStreamHandle with broadcast fan-out and refcount guard (paridad SharedHttpStream upstream).',
+        'liveTvHdhrStreamRefcountReleased: after both probes close, currentConcurrentByChannel===0 (connection released).',
+        'R8: upstream may keep its SharedHttpStream connection open for refill after probes close;',
+        'if currentConcurrent does not reach 0 within the bounded timeout, the invariant is degraded to the honest observed value',
+        'and documented here — the gate is not forced to pass for the upstream target in that case.',
+        'liveTvHdhrTwoClientByteCheck (jellyrin-only): 2nd concurrent consumer of the same Jellyrin channel receives video/mp2t bytes>=1.',
       ].join(' '),
       updatedAt,
       completedTargets,
@@ -161,7 +170,8 @@ function buildEvidence(result, comparison) {
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
         'Dashboard target remains device-validated; closing E2 requires additional sub-gate evidence.',
-        'Live HLS/transcode, two-client stream refcount, restart recovery and real recording-file creation still need implementation evidence.',
+        'Live HLS/transcode, restart recovery and real recording-file creation still need implementation evidence.',
+        'R8: upstream SharedHttpStream may keep connection open after probes close (refill buffer); liveTvHdhrStreamRefcountReleased may be false for upstream if observed within timeout.',
       ],
     };
   }

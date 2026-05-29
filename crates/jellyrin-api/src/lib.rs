@@ -44,6 +44,7 @@ use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
     spawn_transcode_process, wait_for_hls_readiness,
 };
+use bytes::Bytes;
 use rand_core::{OsRng, RngCore};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Deserializer, de};
@@ -76,6 +77,35 @@ static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLo
 static AUTH_FAILURES: OnceLock<Mutex<HashMap<String, AuthFailureState>>> = OnceLock::new();
 const AUTH_LOCKOUT_FAILURE_LIMIT: u32 = 5;
 const AUTH_LOCKOUT_SECONDS: u64 = 60;
+
+// Registry of live HDHomeRun stream handles keyed by the resolved stream URL (/auto/vN).
+// One outgoing connection is shared by N consumers of the same channel (refcount pattern).
+// When refcount drops to 0 the producer task is cancelled and the handle is removed.
+static LIVE_STREAM_REGISTRY: OnceLock<Mutex<HashMap<String, SharedLiveStreamHandle>>> =
+    OnceLock::new();
+
+// Monotonic counter that assigns a unique identity to each handle inserted into the registry.
+// Guards carry the generation of the handle they were issued from; a stale guard from a
+// previous generation is a no-op when it fires against a newer-generation handle.
+static LIVE_STREAM_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+// Broadcast capacity: enough buffering so a slow consumer doesn't cause the fast path to block.
+const LIVE_STREAM_BROADCAST_CAPACITY: usize = 256;
+
+struct SharedLiveStreamHandle {
+    refcount: usize,
+    // Unique identity for this handle; incremented each time a new handle is inserted.
+    // Guards must match this generation before they may decrement or remove the entry.
+    generation: u64,
+    sender: broadcast::Sender<Bytes>,
+    // Dropping this cancels the producer task via the oneshot channel.
+    _cancel: oneshot::Sender<()>,
+}
+
+fn live_stream_registry() -> &'static Mutex<HashMap<String, SharedLiveStreamHandle>> {
+    LIVE_STREAM_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -10294,24 +10324,162 @@ async fn stream_live_tv_channel(
     stream_path(path, content_type, headers, true).await
 }
 
-async fn proxy_live_tv_channel_url(url: String) -> Result<axum::response::Response, ApiError> {
-    let client = HttpClient::new();
-    let upstream = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("HDHomeRun proxy error: {error}")))?;
-    if !upstream.status().is_success() {
-        return Err(ApiError::internal(format!(
-            "HDHomeRun upstream returned HTTP {}",
-            upstream.status()
-        )));
+// Guard that decrements the refcount for a shared live stream when dropped.
+// Carries the generation of the handle it was issued from; if the registry entry
+// for the URL has been replaced by a newer generation (a new open after prior close),
+// this guard is a no-op and does NOT touch the new handle.
+struct LiveStreamRefGuard {
+    url: String,
+    generation: u64,
+}
+
+impl Drop for LiveStreamRefGuard {
+    fn drop(&mut self) {
+        let url = self.url.clone();
+        let generation = self.generation;
+        // Acquire the mutex inside a spawned task to avoid blocking in drop.
+        tokio::spawn(async move {
+            let mut registry = live_stream_registry().lock().await;
+            if let Some(handle) = registry.get_mut(&url) {
+                // Only act if this guard belongs to the current handle's generation.
+                if handle.generation != generation {
+                    return;
+                }
+                handle.refcount = handle.refcount.saturating_sub(1);
+                if handle.refcount == 0 {
+                    registry.remove(&url);
+                    // _cancel sender is dropped here, which cancels the producer task.
+                }
+            }
+        });
     }
-    let stream = upstream.bytes_stream();
+}
+
+async fn proxy_live_tv_channel_url(url: String) -> Result<axum::response::Response, ApiError> {
+    // Look up or create a shared handle for this stream URL.
+    // The lock is never held across network I/O to avoid serialising concurrent clients.
+    let (receiver, generation) = {
+        // Phase 1: check for an existing live handle under the lock.
+        {
+            let mut registry = live_stream_registry().lock().await;
+            if let Some(handle) = registry.get_mut(&url) {
+                // Existing producer: subscribe a new consumer and increment refcount.
+                handle.refcount += 1;
+                let handle_gen = handle.generation;
+                let rx = handle.sender.subscribe();
+                // Lock is released here (end of block).
+                (rx, handle_gen)
+            } else {
+                // No existing handle: drop the lock before doing any network I/O.
+                drop(registry);
+
+                // Phase 2: open the outgoing connection WITHOUT holding the lock.
+                let client = HttpClient::new();
+                let upstream = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|error| ApiError::internal(format!("HDHomeRun proxy error: {error}")))?;
+                if !upstream.status().is_success() {
+                    return Err(ApiError::internal(format!(
+                        "HDHomeRun upstream returned HTTP {}",
+                        upstream.status()
+                    )));
+                }
+
+                // Phase 3: re-acquire the lock and double-check (another task may have raced us).
+                let mut registry = live_stream_registry().lock().await;
+                if let Some(handle) = registry.get_mut(&url) {
+                    // Another task inserted a handle while we were connecting; reuse it.
+                    // Our new `upstream` connection is dropped here, closing it immediately.
+                    handle.refcount += 1;
+                    let handle_gen = handle.generation;
+                    let rx = handle.sender.subscribe();
+                    (rx, handle_gen)
+                } else {
+                    // We are still the first; insert our new handle.
+                    let handle_gen = LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                    let (tx, rx) = broadcast::channel::<Bytes>(LIVE_STREAM_BROADCAST_CAPACITY);
+                    let sender_clone = tx.clone();
+                    let url_clone = url.clone();
+
+                    // Producer task: reads chunks from the outgoing connection and broadcasts them.
+                    // Terminates when the cancel signal arrives (all consumers gone) or source closes.
+                    tokio::spawn(async move {
+                        use futures_util::StreamExt;
+                        let mut byte_stream = upstream.bytes_stream();
+                        tokio::pin!(cancel_rx);
+                        loop {
+                            tokio::select! {
+                                _ = &mut cancel_rx => break,
+                                chunk = byte_stream.next() => {
+                                    match chunk {
+                                        Some(Ok(bytes)) => {
+                                            // No active receivers means all consumers dropped.
+                                            if sender_clone.send(bytes).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                        }
+                        // Remove registry entry when producer exits, but only if this is still
+                        // the same generation (a new handle may have been inserted already).
+                        let mut registry = live_stream_registry().lock().await;
+                        if registry.get(&url_clone).map_or(false, |h| h.generation == handle_gen) {
+                            registry.remove(&url_clone);
+                        }
+                    });
+
+                    registry.insert(
+                        url.clone(),
+                        SharedLiveStreamHandle {
+                            refcount: 1,
+                            generation: handle_gen,
+                            sender: tx,
+                            _cancel: cancel_tx,
+                        },
+                    );
+                    (rx, handle_gen)
+                }
+            }
+        }
+    };
+
+    // Build a streaming body that forwards broadcast chunks to this consumer.
+    // The guard decrements refcount when the response body finishes or the client disconnects.
+    let guard = LiveStreamRefGuard { url, generation };
+    let body_stream = futures_util::stream::unfold(
+        (receiver, guard),
+        |(mut rx, guard): (broadcast::Receiver<Bytes>, LiveStreamRefGuard)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(chunk) => {
+                        return Some((Ok::<Bytes, std::convert::Infallible>(chunk), (rx, guard)));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Slow consumer: some chunks were dropped; log for visibility and keep receiving.
+                        tracing::warn!("live stream consumer lagged, dropped {n} chunks");
+                        continue;
+                    }
+                    // Producer closed: end stream. State (including guard) is dropped here,
+                    // which decrements refcount and cancels the producer if it was last consumer.
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = (rx, guard);
+                        return None;
+                    }
+                }
+            }
+        },
+    );
+
     Ok((
         StatusCode::OK,
         [(header::CONTENT_TYPE, "video/mp2t")],
-        Body::from_stream(stream),
+        Body::from_stream(body_stream),
     )
         .into_response())
 }
@@ -48022,5 +48190,286 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Minimal test HTTP server that serves an infinite chunked video/mp2t stream and counts
+    // concurrent accepted TCP connections. Used to validate stream-sharing behaviour without
+    // requiring any additional test dependencies.
+    mod live_tv_sharing {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        };
+        use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
+        use tokio::net::TcpListener;
+
+        /// Start a local HTTP server that streams video/mp2t chunks indefinitely.
+        /// Returns (base_url, connection_counter, close_fn).
+        async fn start_stream_server() -> (String, Arc<AtomicUsize>, impl FnOnce()) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let counter = Arc::new(AtomicUsize::new(0));
+            let counter_clone = counter.clone();
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        result = listener.accept() => {
+                            let Ok((mut stream, _)) = result else { break };
+                            let counter = counter_clone.clone();
+                            tokio::spawn(async move {
+                                counter.fetch_add(1, AtomicOrdering::SeqCst);
+                                // Read HTTP request headers (until blank line).
+                                let mut reader = BufReader::new(&mut stream);
+                                let mut line = String::new();
+                                loop {
+                                    line.clear();
+                                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 { break; }
+                                    if line == "\r\n" { break; }
+                                }
+                                // Send HTTP response: chunked video/mp2t stream.
+                                let header = b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\n\r\n";
+                                if stream.write_all(header).await.is_err() {
+                                    counter.fetch_sub(1, AtomicOrdering::SeqCst);
+                                    return;
+                                }
+                                // Send chunks until client disconnects.
+                                loop {
+                                    let chunk = b"4\r\nDATA\r\n";
+                                    if stream.write_all(chunk).await.is_err() {
+                                        break;
+                                    }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                }
+                                counter.fetch_sub(1, AtomicOrdering::SeqCst);
+                            });
+                        }
+                    }
+                }
+            });
+
+            let base_url = format!("http://127.0.0.1:{}", addr.port());
+            (base_url, counter, move || { let _ = shutdown_tx.send(()); })
+        }
+
+        #[tokio::test]
+        async fn live_tv_stream_sharing_two_consumers_one_connection() {
+            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+
+            let (base_url, counter, _close) = start_stream_server().await;
+            let stream_url = format!("{base_url}/auto/v4.1");
+
+            // Ensure no leftover handle from a prior test run.
+            live_stream_registry().lock().await.remove(&stream_url);
+
+            // Open first consumer.
+            let resp1 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
+            assert_eq!(resp1.status(), axum::http::StatusCode::OK);
+
+            // Give the producer task time to establish its outgoing connection.
+            tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+            let connections_after_first = counter.load(std::sync::atomic::Ordering::SeqCst);
+
+            // Open second consumer for the SAME URL.
+            let resp2 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
+            assert_eq!(resp2.status(), axum::http::StatusCode::OK);
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+            let connections_after_second = counter.load(std::sync::atomic::Ordering::SeqCst);
+
+            // Verify: only 1 outgoing connection regardless of consumer count.
+            assert_eq!(connections_after_first, 1, "first consumer must open exactly 1 connection");
+            assert_eq!(connections_after_second, 1, "second consumer must reuse the same connection");
+
+            // Verify refcount in registry.
+            {
+                let registry = live_stream_registry().lock().await;
+                let handle = registry.get(&stream_url).expect("handle must be registered");
+                assert_eq!(handle.refcount, 2, "refcount must be 2 with two consumers");
+            }
+
+            // Consume and drop both bodies to trigger refcount decrement.
+            drop(resp1.into_body());
+            drop(resp2.into_body());
+        }
+
+        #[tokio::test]
+        async fn live_tv_stream_sharing_refcount_zero_removes_handle() {
+            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+
+            let (base_url, _counter, _close) = start_stream_server().await;
+            let stream_url = format!("{base_url}/auto/v5.1");
+
+            live_stream_registry().lock().await.remove(&stream_url);
+
+            let resp1 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
+            let resp2 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Refcount should be 2.
+            {
+                let registry = live_stream_registry().lock().await;
+                assert_eq!(
+                    registry.get(&stream_url).map(|h| h.refcount),
+                    Some(2),
+                    "expected refcount 2 before drop"
+                );
+            }
+
+            // Drop both bodies to trigger refcount decrements.
+            drop(resp1.into_body());
+            drop(resp2.into_body());
+
+            // Allow the async drop tasks to run.
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Handle must be gone.
+            {
+                let registry = live_stream_registry().lock().await;
+                assert!(
+                    registry.get(&stream_url).is_none(),
+                    "handle must be removed when refcount reaches 0"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn live_tv_stream_sharing_distinct_channels_no_sharing() {
+            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+
+            let (base_url, counter, _close) = start_stream_server().await;
+            let url_a = format!("{base_url}/auto/v4.1");
+            let url_b = format!("{base_url}/auto/v5.1");
+
+            live_stream_registry().lock().await.remove(&url_a);
+            live_stream_registry().lock().await.remove(&url_b);
+
+            let _resp_a = proxy_live_tv_channel_url(url_a.clone()).await.unwrap();
+            let _resp_b = proxy_live_tv_channel_url(url_b.clone()).await.unwrap();
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Two distinct channels must open 2 separate connections.
+            let conns = counter.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(conns, 2, "distinct channels must each open their own connection");
+
+            // Each URL must have its own independent handle with refcount 1.
+            {
+                let registry = live_stream_registry().lock().await;
+                assert_eq!(
+                    registry.get(&url_a).map(|h| h.refcount),
+                    Some(1),
+                    "channel A must have its own handle"
+                );
+                assert_eq!(
+                    registry.get(&url_b).map(|h| h.refcount),
+                    Some(1),
+                    "channel B must have its own handle"
+                );
+            }
+
+            drop(_resp_a.into_body());
+            drop(_resp_b.into_body());
+        }
+
+        // R2 race: a LiveStreamRefGuard from a previous generation (old handle) must NOT
+        // decrement or remove the handle of a new generation inserted for the same URL.
+        //
+        // Scenario exercised:
+        //   1. Generation A opens; consumer closes -> guard A fires -> entry removed (refcount 0).
+        //   2. Generation B opens for the SAME URL (new handle, gen B > gen A).
+        //   3. A second fire of a guard carrying gen A is simulated directly (stale drop).
+        //   4. Assert: handle B still present with refcount==1 and its producer not cancelled.
+        #[tokio::test]
+        async fn live_tv_stream_sharing_stale_guard_is_noop_on_new_generation() {
+            use crate::{live_stream_registry, LiveStreamRefGuard};
+
+            let url = "http://127.0.0.1:19999/auto/v_race_test".to_string();
+
+            // Clean up any leftover state.
+            live_stream_registry().lock().await.remove(&url);
+
+            // Insert a synthetic handle representing generation A.
+            let gen_a = {
+                let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let (tx, _rx) = tokio::sync::broadcast::channel::<bytes::Bytes>(4);
+                let mut registry = live_stream_registry().lock().await;
+                let handle_gen = crate::LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                registry.insert(
+                    url.clone(),
+                    crate::SharedLiveStreamHandle {
+                        refcount: 1,
+                        generation: handle_gen,
+                        sender: tx,
+                        _cancel: cancel_tx,
+                    },
+                );
+                handle_gen
+            };
+
+            // Simulate consumer A closing: guard A fires and removes the gen-A entry.
+            {
+                let guard_a = LiveStreamRefGuard { url: url.clone(), generation: gen_a };
+                drop(guard_a);
+            }
+            // Allow the spawned drop task to run.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Verify gen-A handle is gone.
+            assert!(
+                live_stream_registry().lock().await.get(&url).is_none(),
+                "gen-A handle must have been removed after refcount reached 0"
+            );
+
+            // Insert a new handle for the SAME URL representing generation B.
+            let gen_b = {
+                let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let (tx, _rx) = tokio::sync::broadcast::channel::<bytes::Bytes>(4);
+                let mut registry = live_stream_registry().lock().await;
+                let handle_gen = crate::LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                registry.insert(
+                    url.clone(),
+                    crate::SharedLiveStreamHandle {
+                        refcount: 1,
+                        generation: handle_gen,
+                        sender: tx,
+                        _cancel: cancel_tx,
+                    },
+                );
+                handle_gen
+            };
+
+            assert_ne!(gen_a, gen_b, "generations must differ");
+
+            // Simulate a STALE guard from gen-A firing again (lagged drop scenario).
+            {
+                let stale_guard = LiveStreamRefGuard { url: url.clone(), generation: gen_a };
+                drop(stale_guard);
+            }
+            // Allow the spawned drop task to run.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Gen-B handle must still be present with refcount==1 (stale guard was a no-op).
+            {
+                let registry = live_stream_registry().lock().await;
+                let handle = registry
+                    .get(&url)
+                    .expect("gen-B handle must still be present after stale gen-A guard fired");
+                assert_eq!(
+                    handle.generation, gen_b,
+                    "handle in registry must still be gen-B"
+                );
+                assert_eq!(
+                    handle.refcount, 1,
+                    "refcount of gen-B handle must be untouched by stale gen-A guard"
+                );
+            }
+
+            // Cleanup: remove the synthetic handle so it doesn't leak into other tests.
+            live_stream_registry().lock().await.remove(&url);
+        }
     }
 }

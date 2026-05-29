@@ -2,6 +2,7 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const http = require('node:http');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { chromium } = require('playwright');
@@ -322,6 +323,9 @@ async function captureTarget(browser, flowDir, target) {
       liveTvHdhrChannelMatched: false,
       liveTvHdhrStreamSetup: false,
       liveTvHdhrStream200: false,
+      liveTvHdhrTwoClientStream: false,
+      liveTvHdhrStreamRefcountReleased: false,
+      liveTvHdhrTwoClientByteCheck: false,
       startupPublicInfoIncomplete: false,
       startupConfig200: false,
       startupConfig204: false,
@@ -3684,7 +3688,17 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
   // the infinite stream). Jellyrin's proxy now streams incrementally (bytes_stream + Body::from_stream)
   // so headers and bytes are returned immediately without buffering the full body.
 
+  // Reset simulator stats before the byte-check and sharing tests so we measure the peak
+  // from a clean baseline for this target. For upstream, PlaybackInfo opens 1 sim connection;
+  // for Jellyrin, the stream proxy opens 1 sim connection and shares it via broadcast fan-out.
+  // In both cases, maxConcurrentByChannel[simPath]===1 confirms sharing.
+  if (hdhrSimUrl) {
+    await nodeHttpJson('POST', `${hdhrSimUrl}/stats/reset`).catch(() => {});
+  }
+
   let hdhrLiveStreamId = null;
+  // Stream path on the target server (used for both per-target byte-check and sharing test).
+  let hdhrTargetStreamPath = null;
 
   if (target.name === 'jellyrin' && /^hdhr_/.test(hdhrChannel.Id)) {
     // Jellyrin path: GET /LiveTv/Channels/{channelId}?fields=MediaSources
@@ -3715,6 +3729,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
         return directStreamUrl;
       }
     })();
+    hdhrTargetStreamPath = jellyrinStreamPath;
     const jellyrinStreamProbe = await browserFetchStreamProbe(page, {
       url: jellyrinStreamPath,
       token: auth.AccessToken,
@@ -3758,6 +3773,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
         return hdhrMediaSource.Path;
       }
     })();
+    hdhrTargetStreamPath = hdhrStreamPath;
 
     const hdhrStreamProbe = await browserFetchStreamProbe(page, {
       url: hdhrStreamPath,
@@ -3775,8 +3791,69 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
       throw new Error(`HDHomeRun stream probe returned HTTP ${hdhrStreamProbe.status} contentType="${hdhrStreamProbe.contentType}" bytes=${hdhrStreamProbe.byteLength}`);
     }
     summary.invariants.liveTvHdhrStream200 = true;
+    // Note: hdhrLiveStreamId is kept open here so the sharing test below can reuse the same
+    // LiveStreamFiles URL. It will be closed after the sharing test completes.
+  }
 
-    // Close the live stream to release the tuner.
+  // Stream-sharing / refcount test (upstreamComparable + jellyrinOnly byte check).
+  //
+  // Metric: simulator connection counters at /auto/vN. With sharing: 2 clients → maxConcurrent===1.
+  // Without sharing: maxConcurrent===2. Both targets hit the same simulator.
+  //
+  // Note on R8 (upstream refcount release): upstream may keep the connection to the simulator
+  // open for stream refill even after both Jellyrin/upstream proxy probes are gone. If
+  // currentConcurrent does not drop to 0 within the bounded timeout, we degrade
+  // liveTvHdhrStreamRefcountReleased to the honest observable result and document it.
+  if (hdhrSimUrl && hdhrTargetStreamPath) {
+    // Determine the simulator channel path for this channel (e.g. '/auto/v4.1').
+    const guideNumber = (
+      hdhrChannel.ChannelNumber
+      || (typeof hdhrChannel.Id === 'string' ? hdhrChannel.Id.replace(/^hdhr_/, '') : '')
+    );
+    const simChannelPath = `/auto/v${guideNumber}`;
+
+    // Open 2 concurrent stream probes and hold them open briefly to ensure overlap.
+    // browserFetchStreamProbeOverlap: fetch URL, read minBytes, then hold for holdMs before aborting.
+    const probe1Promise = browserFetchStreamProbeOverlap(page, {
+      url: hdhrTargetStreamPath,
+      token: auth.AccessToken,
+      minBytes: 1,
+      holdMs: 600,
+    });
+    // Small stagger so both are clearly in-flight at the same time.
+    await new Promise((resolve) => { setTimeout(resolve, 30); });
+    const probe2Promise = browserFetchStreamProbeOverlap(page, {
+      url: hdhrTargetStreamPath,
+      token: auth.AccessToken,
+      minBytes: 1,
+      holdMs: 600,
+    });
+
+    const [probe1, probe2] = await Promise.all([probe1Promise, probe2Promise]);
+
+    // /stats is read AFTER Promise.all resolves (both probes have finished or timed out).
+    // maxConcurrentByChannel is a peak counter on the simulator: it records the highest
+    // simultaneous connection count observed, so it retains the value even after connections close.
+    const statsAfterOpen = await nodeHttpJson('GET', `${hdhrSimUrl}/stats`).catch(() => null);
+
+    const maxConcurrent = statsAfterOpen?.json?.maxConcurrentByChannel?.[simChannelPath] ?? -1;
+    // maxConcurrent===1: sharing confirmed (Jellyrin proxy reused one connection).
+    // maxConcurrent===2: no sharing (each probe triggered a separate upstream connection).
+    summary.invariants.liveTvHdhrTwoClientStream = maxConcurrent === 1;
+
+    // Jellyrin-only: 2nd consumer must receive actual bytes (video/mp2t, byteLength>=1).
+    if (target.name === 'jellyrin') {
+      summary.invariants.liveTvHdhrTwoClientByteCheck = (
+        probe2.status === 200
+        && probe2.contentType.includes('video/mp2t')
+        && probe2.byteLength >= 1
+      );
+    }
+
+    // Close the upstream live stream before polling for refcount release.
+    // For upstream, closing the live stream triggers CloseLiveStream (ConsumerCount--; a <=0
+    // TryRemove + Close() cancels the SharedHttpStream token and closes the sim connection).
+    // For Jellyrin the stream is stateless and hdhrLiveStreamId is null.
     if (hdhrLiveStreamId) {
       await browserFetchJson(page, {
         method: 'POST',
@@ -3784,6 +3861,24 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
         token: auth.AccessToken,
       }).catch(() => {});
     }
+
+    // Wait for the simulator connections to drain (bounded timeout).
+    // R8: upstream's SharedHttpStream may keep the sim connection open briefly for refill after
+    // CloseLiveStream; poll until currentConcurrent reaches 0 or the timeout expires.
+    // If the timeout expires, we record the honest observed value — the gate is not forced to pass.
+    const refcountReleaseTimeoutMs = 5000;
+    const refcountPollIntervalMs = 200;
+    const refcountDeadline = Date.now() + refcountReleaseTimeoutMs;
+    let currentConcurrent = -1;
+    while (Date.now() < refcountDeadline) {
+      const statsAfterClose = await nodeHttpJson('GET', `${hdhrSimUrl}/stats`).catch(() => null);
+      currentConcurrent = statsAfterClose?.json?.currentConcurrentByChannel?.[simChannelPath] ?? -1;
+      if (currentConcurrent === 0) break;
+      await new Promise((resolve) => { setTimeout(resolve, refcountPollIntervalMs); });
+    }
+    summary.invariants.liveTvHdhrStreamRefcountReleased = currentConcurrent === 0;
+    // If currentConcurrent did not reach 0 (R8), the invariant is false and the evidence
+    // text in livetv-real.js documents this as an honest upstream observation.
   }
 
   // Clean up the simulator tuner host so no residual HDHomeRun config is left
@@ -5001,6 +5096,46 @@ async function browserFetchStreamProbe(page, request) {
   }, request);
 }
 
+// Like browserFetchStreamProbe but holds the connection open for holdMs ms after reading minBytes.
+// This ensures two concurrent callers have overlapping in-flight requests so the simulator's
+// maxConcurrentByChannel counter captures the peak. Returns status, contentType, byteLength.
+async function browserFetchStreamProbeOverlap(page, request) {
+  return page.evaluate(async ({ url, token, minBytes, holdMs }) => {
+    const controller = new AbortController();
+    let response;
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: token ? { 'X-Emby-Token': token } : {},
+        signal: controller.signal,
+      });
+    } catch (err) {
+      return { status: 0, contentType: '', byteLength: 0, error: String(err) };
+    }
+    if (!response.ok && response.status !== 200) {
+      return { status: response.status, contentType: response.headers.get('content-type') || '', byteLength: 0 };
+    }
+    const contentType = response.headers.get('content-type') || '';
+    let totalBytes = 0;
+    try {
+      const reader = response.body.getReader();
+      while (totalBytes < minBytes) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        totalBytes += value ? value.length : 0;
+      }
+      // Hold the connection open for holdMs to ensure overlap with concurrent probes.
+      await new Promise((resolve) => { setTimeout(resolve, holdMs || 500); });
+      reader.cancel().catch(() => {});
+    } catch (_) {
+      // Abort or partial read is expected; bytes already counted.
+    } finally {
+      controller.abort();
+    }
+    return { status: response.status, contentType, byteLength: totalBytes };
+  }, request);
+}
+
 async function browserFetchImageUpload(page, request) {
   return page.evaluate(async ({ method, url, token, imageBase64 }) => {
     const response = await fetch(url, {
@@ -5028,6 +5163,34 @@ function firstPlaylistUri(text) {
 function resolveRelativeUrl(base, next) {
   return new URL(next, new URL(base, 'http://placeholder.invalid')).pathname
     + new URL(next, new URL(base, 'http://placeholder.invalid')).search;
+}
+
+// Make a direct HTTP request from Node.js context (not browser page) and return parsed JSON.
+// Used for simulator /stats and /stats/reset calls to avoid cross-origin browser fetch issues.
+function nodeHttpJson(method, absoluteUrl, body) {
+  return new Promise((resolve) => {
+    const parsed = new URL(absoluteUrl);
+    const bodyStr = body !== undefined ? JSON.stringify(body) : null;
+    const options = {
+      hostname: parsed.hostname,
+      port: parseInt(parsed.port, 10) || 80,
+      path: parsed.pathname + parsed.search,
+      method,
+      headers: bodyStr ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) } : {},
+    };
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        let json = null;
+        try { json = JSON.parse(data); } catch (_) { json = null; }
+        resolve({ status: res.statusCode, json });
+      });
+    });
+    req.on('error', () => resolve({ status: 0, json: null }));
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
 }
 
 async function authenticateTarget(page, summary, target) {
@@ -7081,12 +7244,14 @@ function invariantFailures(summary) {
       ['liveTvHdhrTunerAdded', 'live tv HDHomeRun tuner added'],
       ['liveTvHdhrChannelMatched', 'live tv HDHomeRun channel matched'],
       ['liveTvHdhrStream200', 'live tv HDHomeRun stream bytes'],
+      ['liveTvHdhrTwoClientStream', 'live tv HDHomeRun two-client sharing (maxConcurrent===1)'],
+      ['liveTvHdhrStreamRefcountReleased', 'live tv HDHomeRun refcount released (currentConcurrent===0)'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);
       }
     }
-    // Synthetic M3U/XMLTV invariants are Jellyrin-only; upstream skips this block by design.
+    // Synthetic M3U/XMLTV and jellyrin-only invariants; upstream skips this block by design.
     if (summary.target === 'jellyrin') {
       for (const [field, label] of [
         ['liveTvConfigUpdated', 'live tv config update'],
@@ -7101,6 +7266,7 @@ function invariantFailures(summary) {
         ['liveTvTimerDeleted', 'live tv timer delete'],
         ['liveTvSeriesTimerCreated', 'live tv series timer create'],
         ['liveTvSeriesTimerDeleted', 'live tv series timer delete'],
+        ['liveTvHdhrTwoClientByteCheck', 'live tv HDHomeRun two-client byte check (2nd consumer bytes>=1)'],
       ]) {
         if (!summary.invariants[field]) {
           failures.push(`missing ${label} invariant`);
