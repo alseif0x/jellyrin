@@ -201,7 +201,7 @@ function buildEvidence(result, comparison) {
         'R-TOCTOU: Jellyrin check+insert atomic under the same registry lock. No TOCTOU window.',
         'liveTvHdhrTunerLimitRecovery (upstreamComparable): after closing channel 4.1 and draining /stats current===0, opening channel 5.1 returns 200 + bytes on BOTH targets.',
         'liveTvHdhrTunerLimitSharingExempt (jellyrin-only): 2 consumers of channel 4.1 with TunerCount=1 do NOT trigger a conflict; maxConcurrentByChannel[/auto/v4.1]===1 (sharing exempt). Upstream sharing is not directly comparable via the sim metric (upstream uses file-based SharedHttpStream, not broadcast fan-out).',
-        'D5 R-LIMIT-SCOPE: TunerCount limit counts only direct TS proxy streams (LIVE_STREAM_REGISTRY). HLS sessions (LIVE_HLS_SESSIONS) and recordings (LIVE_TV_RECORDING_REGISTRY) use separate registries; unifying them is a future sub-gate.',
+        'D5 R-LIMIT-SCOPE closed in Jellyrin: TunerCount now uses a shared LIVE_TUNER_LEASES registry across direct TS, live HLS and recordings; the formal upstream-comparable golden block still exercises direct TS conflict/recovery, while Rust tests cover cross-mode lease conflicts.',
         'Upstream isolation: the main sim tuner is deleted before the limit test on upstream to prevent fallback to the main tuner (TunerCount=0). Only the limit tuner (TunerCount=1) serves channels 4.1/5.1 during the conflict sequence.',
       ].join(' '),
       updatedAt,

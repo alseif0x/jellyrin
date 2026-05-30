@@ -55,7 +55,7 @@ D: diff qa/golden <=2 (+1 fixture XMLTV si A); sin ficheros fuera de scope.
 R-EPG-INJECT (alto): si upstream no materializa el programa mapeado al canal hdhr, degradar GeneratesTimers a jellyrinOnly CON evidencia. R-UPSTREAM-FRESH: recrear upstream 8098 fresco antes de cada golden (SQLite degrada). R-CREATE-REQUIRES-PROGRAM: upstream CreateSeriesTimer lanza si ProgramId no resuelve -> obtener ProgramId real de GET /LiveTv/Programs upstream antes del POST. R-MATCH-SUBSET: documentar reglas no implementadas. R-DOUBLE-SPAWN (E2.7 S1): guard de LIVE_TV_RECORDING_REGISTRY por timer_id + Id estable evita doble. R-DETERMINISM: ventana 4s suficiente para ffprobe. R-TIMER-FILTER: timers generados (IsSeries=false, SeriesTimerId) deben aparecer en GET /LiveTv/Timers.
 
 ## Fuera de alcance
-RecordNewOnly/SkipEpisodesInLibrary/duplicados/Days/RecordAnyTime 10min; timers futuros/scheduler; restart recovery; UDP discovery; tuner legacy; unificar HLS/recording en TunerCount; post-scan librería (R-LIBSCAN); EncodedRecorder.
+RecordNewOnly/SkipEpisodesInLibrary/duplicados/Days/RecordAnyTime 10min; timers futuros/scheduler; restart recovery; UDP discovery; tuner legacy; golden cross-mode HLS/recording para TunerCount; post-scan librería (R-LIBSCAN); EncodedRecorder.
 
 ## Resultado final - 2026-05-30
 

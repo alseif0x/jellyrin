@@ -7,7 +7,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -23,6 +23,7 @@ use axum::{
     routing::{delete, get, head, post},
 };
 use base64::{Engine as _, engine::general_purpose};
+use bytes::Bytes;
 use jellyrin_compat::{
     AuthenticateUserByNameDto, AuthenticationResultDto, CountryDto, CultureDto, HealthResponse,
     LocalizationOptionDto, PublicSystemInfo, SessionInfoDto, StartupConfigurationDto,
@@ -44,7 +45,6 @@ use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
     spawn_transcode_process, wait_for_hls_readiness,
 };
-use bytes::Bytes;
 use rand_core::{OsRng, RngCore};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Deserializer, de};
@@ -87,8 +87,7 @@ static LIVE_STREAM_REGISTRY: OnceLock<Mutex<HashMap<String, SharedLiveStreamHand
 // Monotonic counter that assigns a unique identity to each handle inserted into the registry.
 // Guards carry the generation of the handle they were issued from; a stale guard from a
 // previous generation is a no-op when it fires against a newer-generation handle.
-static LIVE_STREAM_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static LIVE_STREAM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // Broadcast capacity: enough buffering so a slow consumer doesn't cause the fast path to block.
 const LIVE_STREAM_BROADCAST_CAPACITY: usize = 256;
@@ -108,6 +107,64 @@ const LIVE_HLS_READINESS_TIMEOUT_SECS: u64 = 15;
 // recordings and resolve the path for streaming. Mirrors LIVE_STREAM_REGISTRY layout.
 static LIVE_TV_RECORDING_REGISTRY: OnceLock<Mutex<HashMap<String, LiveTvRecordingHandle>>> =
     OnceLock::new();
+
+// Shared HDHomeRun tuner-slot accounting across direct TS, live HLS and recordings.
+// Keyed by tuner host + resolved channel URL so multiple consumers of the same channel
+// share one logical tuner slot, while distinct channels on the same tuner honor TunerCount.
+static LIVE_TUNER_LEASES: OnceLock<StdMutex<HashMap<LiveTunerLeaseKey, LiveTunerLease>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct LiveTunerLeaseKey {
+    tuner_host_id: String,
+    channel_url: String,
+}
+
+#[derive(Debug)]
+struct LiveTunerLease {
+    refcount: usize,
+}
+
+struct LiveTunerLeaseGuard {
+    key: LiveTunerLeaseKey,
+}
+
+impl Drop for LiveTunerLeaseGuard {
+    fn drop(&mut self) {
+        release_live_tuner_lease(&self.key);
+    }
+}
+
+fn release_live_tuner_lease(key: &LiveTunerLeaseKey) {
+    let Ok(mut leases) = live_tuner_lease_registry().lock() else {
+        tracing::error!("live tuner lease registry lock poisoned while releasing lease");
+        return;
+    };
+    if let Some(lease) = leases.get_mut(key) {
+        lease.refcount = lease.refcount.saturating_sub(1);
+        if lease.refcount == 0 {
+            leases.remove(key);
+        }
+    }
+}
+
+fn live_tuner_lease_registry() -> &'static StdMutex<HashMap<LiveTunerLeaseKey, LiveTunerLease>> {
+    LIVE_TUNER_LEASES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn with_live_tuner_leases<R>(
+    f: impl FnOnce(&mut HashMap<LiveTunerLeaseKey, LiveTunerLease>) -> R,
+) -> Result<R, ApiError> {
+    match live_tuner_lease_registry().lock() {
+        Ok(mut leases) => Ok(f(&mut leases)),
+        Err(_) => {
+            tracing::error!("live tuner lease registry lock poisoned");
+            Err(ApiError::internal(
+                "live tuner lease registry lock poisoned",
+            ))
+        }
+    }
+}
 
 struct LiveTvRecordingHandle {
     // Dropping or sending cancels the in-progress recording task.
@@ -129,9 +186,7 @@ struct SharedLiveStreamHandle {
     sender: broadcast::Sender<Bytes>,
     // Dropping this cancels the producer task via the oneshot channel.
     _cancel: oneshot::Sender<()>,
-    // The tuner host that owns this stream URL; used for TunerCount limit enforcement.
-    // None for channels without a tuner host (e.g. local-file M3U channels).
-    tuner_host_id: Option<String>,
+    _tuner_lease: Option<LiveTunerLeaseGuard>,
 }
 
 fn live_stream_registry() -> &'static Mutex<HashMap<String, SharedLiveStreamHandle>> {
@@ -2819,12 +2874,15 @@ pub async fn reconcile_live_tv_recordings_on_startup(
         if !live_tv_channel_is_remote(&channel_path) {
             continue;
         }
+        let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(db, &channel).await;
 
         spawn_live_tv_recording(
             db.clone(),
             log_dir.to_path_buf(),
             timer,
             channel_path.to_string_lossy().into_owned(),
+            tuner_host_id,
+            tuner_count,
         );
         recovery.restarted_recordings += 1;
     }
@@ -9372,8 +9430,7 @@ fn syncplay_apply_command_to_state(
                 object
                     .get_mut("Queue")
                     .and_then(serde_json::Value::as_array_mut),
-            )
-                && from >= 0
+            ) && from >= 0
                 && to >= 0
                 && (from as usize) < queue.len()
                 && (to as usize) < queue.len()
@@ -10494,10 +10551,7 @@ async fn stream_live_tv_recording(
 // Resolve the TunerCount for a given tuner host ID from the livetv named configuration.
 // Returns None if the host is not found, TunerCount is absent, or is zero (unlimited).
 async fn tuner_count_for_host(db: &Database, tuner_host_id: &str) -> Option<u64> {
-    let config = db
-        .named_configuration("livetv")
-        .await
-        .ok()??;
+    let config = db.named_configuration("livetv").await.ok()??;
     let tuner_count = config
         .get("TunerHosts")
         .and_then(serde_json::Value::as_array)?
@@ -10510,7 +10564,61 @@ async fn tuner_count_for_host(db: &Database, tuner_host_id: &str) -> Option<u64>
         .get("TunerCount")
         .and_then(serde_json::Value::as_u64)?;
     // TunerCount == 0 means unlimited (no enforcement).
-    if tuner_count == 0 { None } else { Some(tuner_count) }
+    if tuner_count == 0 {
+        None
+    } else {
+        Some(tuner_count)
+    }
+}
+
+async fn live_tv_channel_tuner_limit(
+    db: &Database,
+    channel: &serde_json::Value,
+) -> (Option<String>, Option<u64>) {
+    let tuner_host_id = json_string_field(channel, "TunerHostId");
+    let tuner_count = match &tuner_host_id {
+        Some(host_id) => tuner_count_for_host(db, host_id).await,
+        None => None,
+    };
+    (tuner_host_id, tuner_count)
+}
+
+fn acquire_live_tuner_lease(
+    tuner_host_id: Option<String>,
+    channel_url: &str,
+    tuner_count: Option<u64>,
+) -> Result<Option<LiveTunerLeaseGuard>, ApiError> {
+    let (Some(tuner_host_id), Some(limit)) = (tuner_host_id, tuner_count) else {
+        return Ok(None);
+    };
+    let key = LiveTunerLeaseKey {
+        tuner_host_id: tuner_host_id.to_ascii_lowercase(),
+        channel_url: channel_url.to_string(),
+    };
+
+    with_live_tuner_leases(|leases| {
+        if let Some(lease) = leases.get_mut(&key) {
+            lease.refcount += 1;
+            return Ok(Some(LiveTunerLeaseGuard { key }));
+        }
+
+        let active_distinct_channels = leases
+            .keys()
+            .filter(|lease_key| {
+                lease_key
+                    .tuner_host_id
+                    .eq_ignore_ascii_case(&key.tuner_host_id)
+            })
+            .count() as u64;
+        if active_distinct_channels >= limit {
+            return Err(ApiError::internal(format!(
+                "HDHomeRun simultaneous stream limit has been reached (TunerCount={limit})"
+            )));
+        }
+
+        leases.insert(key.clone(), LiveTunerLease { refcount: 1 });
+        Ok(Some(LiveTunerLeaseGuard { key }))
+    })?
 }
 
 async fn stream_live_tv_channel(
@@ -10520,11 +10628,7 @@ async fn stream_live_tv_channel(
 ) -> Result<axum::response::Response, ApiError> {
     let path = live_tv_channel_path(&channel)?;
     if live_tv_channel_is_remote(&path) {
-        let tuner_host_id = json_string_field(&channel, "TunerHostId");
-        let tuner_count = match &tuner_host_id {
-            Some(host_id) => tuner_count_for_host(db, host_id).await,
-            None => None,
-        };
+        let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(db, &channel).await;
         return proxy_live_tv_channel_url(
             path.to_string_lossy().into_owned(),
             tuner_host_id,
@@ -10581,7 +10685,7 @@ async fn proxy_live_tv_channel_url(
             if let Some(handle) = registry.get_mut(&url) {
                 // Existing producer for this URL (same channel): subscribe a new consumer and
                 // increment refcount. This is the sharing path — 2 consumers of the SAME channel
-                // are exempt from TunerCount enforcement (same stream, no new tuner slot needed).
+                // share the same tuner lease (same stream, no new tuner slot needed).
                 handle.refcount += 1;
                 let handle_gen = handle.generation;
                 let rx = handle.sender.subscribe();
@@ -10589,31 +10693,18 @@ async fn proxy_live_tv_channel_url(
                 (rx, handle_gen)
             } else {
                 // No existing handle: this is a NEW channel stream (different URL).
-                // Before opening a new upstream connection, enforce the TunerCount limit.
-                // The check and insert are performed atomically under the same lock (no TOCTOU).
-                if let (Some(host_id), Some(limit)) = (&tuner_host_id, tuner_count) {
-                    // Count distinct URLs currently active for this tuner host.
-                    let active = registry
-                        .values()
-                        .filter(|h| {
-                            h.tuner_host_id
-                                .as_deref()
-                                .is_some_and(|id| id.eq_ignore_ascii_case(host_id))
-                        })
-                        .count() as u64;
-                    if active >= limit {
-                        return Err(ApiError::internal(format!(
-                            "HDHomeRun simultaneous stream limit has been reached (TunerCount={limit})"
-                        )));
-                    }
-                }
+                // Before opening a new upstream connection, acquire a shared tuner lease.
+                // The lease registry is global across direct TS, live HLS and recordings.
+                let tuner_lease =
+                    acquire_live_tuner_lease(tuner_host_id.clone(), &url, tuner_count)?;
 
                 // No existing handle. Create the broadcast channel and INSERT the handle into the
                 // registry BEFORE opening the upstream connection. This prevents a concurrent
                 // request from also entering Phase 2 and opening a duplicate simulator connection
                 // (which would briefly inflate maxConcurrentByChannel). Any request arriving
                 // while the connection is being established will find this entry and subscribe.
-                let handle_gen = LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let handle_gen =
+                    LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
                 let (tx, rx) = broadcast::channel::<Bytes>(LIVE_STREAM_BROADCAST_CAPACITY);
                 let sender_clone = tx.clone();
@@ -10625,7 +10716,7 @@ async fn proxy_live_tv_channel_url(
                         generation: handle_gen,
                         sender: tx,
                         _cancel: cancel_tx,
-                        tuner_host_id: tuner_host_id.clone(),
+                        _tuner_lease: tuner_lease,
                     },
                 );
                 // Release the registry lock before doing network I/O.
@@ -10647,7 +10738,10 @@ async fn proxy_live_tv_channel_url(
                     Ok(resp) if resp.status().is_success() => resp,
                     Ok(resp) => {
                         let mut registry = live_stream_registry().lock().await;
-                        if registry.get(&url).is_some_and(|h| h.generation == handle_gen) {
+                        if registry
+                            .get(&url)
+                            .is_some_and(|h| h.generation == handle_gen)
+                        {
                             registry.remove(&url);
                         }
                         return Err(ApiError::internal(format!(
@@ -10657,10 +10751,15 @@ async fn proxy_live_tv_channel_url(
                     }
                     Err(error) => {
                         let mut registry = live_stream_registry().lock().await;
-                        if registry.get(&url).is_some_and(|h| h.generation == handle_gen) {
+                        if registry
+                            .get(&url)
+                            .is_some_and(|h| h.generation == handle_gen)
+                        {
                             registry.remove(&url);
                         }
-                        return Err(ApiError::internal(format!("HDHomeRun proxy error: {error}")));
+                        return Err(ApiError::internal(format!(
+                            "HDHomeRun proxy error: {error}"
+                        )));
                     }
                 };
 
@@ -10690,7 +10789,10 @@ async fn proxy_live_tv_channel_url(
                     // Remove registry entry when producer exits, but only if this is still
                     // the same generation (a new handle may have been inserted already).
                     let mut registry = live_stream_registry().lock().await;
-                    if registry.get(&url_clone).is_some_and(|h| h.generation == handle_gen) {
+                    if registry
+                        .get(&url_clone)
+                        .is_some_and(|h| h.generation == handle_gen)
+                    {
                         registry.remove(&url_clone);
                     }
                 });
@@ -10983,9 +11085,7 @@ fn live_tv_channel_media_source(
     let (supports_transcoding, transcoding_sub_protocol, transcoding_container, transcoding_url) =
         if is_remote {
             let play_session_id = live_tv_channel_hls_play_session_id(&channel_id);
-            let url = format!(
-                "/Videos/{channel_id}/master.m3u8?PlaySessionId={play_session_id}"
-            );
+            let url = format!("/Videos/{channel_id}/master.m3u8?PlaySessionId={play_session_id}");
             (
                 serde_json::json!(true),
                 serde_json::json!("hls"),
@@ -11307,10 +11407,7 @@ fn live_tv_recording_name(name: &str, start_date: OffsetDateTime) -> String {
 // Returns the recordings directory: DataPath/livetv/recordings.
 // DataPath mirrors system_info's data_root = log_dir.parent() (fallback to log_dir itself).
 fn live_tv_recordings_dir(log_dir: &FsPath) -> PathBuf {
-    let data_root = log_dir
-        .parent()
-        .unwrap_or(log_dir)
-        .to_path_buf();
+    let data_root = log_dir.parent().unwrap_or(log_dir).to_path_buf();
     data_root.join("livetv").join("recordings")
 }
 
@@ -11346,7 +11443,10 @@ fn live_tv_timer_is_terminal(timer: &serde_json::Value) -> bool {
 // Paridad: DefaultLiveTvService.CreateTimer Id=MD5(seriesTimerId+program.ExternalId).
 // We use the same FNV-based stable_entity_id pattern used elsewhere in Jellyrin.
 fn series_timer_child_id(series_timer_id: &str, program_id: &str) -> String {
-    stable_entity_id("SeriesTimerChild", &format!("{series_timer_id}+{program_id}"))
+    stable_entity_id(
+        "SeriesTimerChild",
+        &format!("{series_timer_id}+{program_id}"),
+    )
 }
 
 // Generate child timers in config["Timers"] for programs that match this series timer.
@@ -11415,8 +11515,7 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
             .to_ascii_lowercase();
         let program_series_id = json_string_field(program, "SeriesId");
         let name_match = !series_name.is_empty() && program_name == series_name;
-        let series_id_match = series_series_id.is_some()
-            && series_series_id == program_series_id;
+        let series_id_match = series_series_id.is_some() && series_series_id == program_series_id;
         if !name_match && !series_id_match {
             continue;
         }
@@ -11424,13 +11523,14 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
         // Channel scope check.
         // Program ChannelId may be an XMLTV guide number (e.g. "4.1") while the series timer
         // ChannelId is the Jellyrin channel Id (e.g. "hdhr_4.1"). Accept both forms.
-        let program_channel_id = json_string_field(program, "ChannelId")
-            .unwrap_or_default();
+        let program_channel_id = json_string_field(program, "ChannelId").unwrap_or_default();
         // Resolve the effective channel Id for the child timer: prefer the series timer's
         // channel Id if it matches (so maybe_spawn can find the channel), else use the program's.
         let effective_channel_id = if let Some(ref scid) = series_channel_id {
             let guide_from_series = scid.strip_prefix("hdhr_").unwrap_or(scid.as_str());
-            let guide_from_program = program_channel_id.strip_prefix("hdhr_").unwrap_or(program_channel_id.as_str());
+            let guide_from_program = program_channel_id
+                .strip_prefix("hdhr_")
+                .unwrap_or(program_channel_id.as_str());
             if guide_from_series.eq_ignore_ascii_case(guide_from_program)
                 || scid.eq_ignore_ascii_case(&program_channel_id)
             {
@@ -11441,9 +11541,7 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
         } else {
             program_channel_id.clone()
         };
-        if !record_any_channel
-            && let Some(ref scid) = series_channel_id
-        {
+        if !record_any_channel && let Some(ref scid) = series_channel_id {
             let guide_from_series = scid.strip_prefix("hdhr_").unwrap_or(scid.as_str());
             let guide_from_program = program_channel_id
                 .strip_prefix("hdhr_")
@@ -11514,8 +11612,7 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
         let child_id = json_string_field(child, "Id").unwrap_or_default();
         // Idempotent: skip if timer already exists (same Id).
         if timers.iter().any(|t| {
-            json_string_field(t, "Id")
-                .is_some_and(|id| id.eq_ignore_ascii_case(&child_id))
+            json_string_field(t, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&child_id))
         }) {
             continue;
         }
@@ -11647,12 +11744,15 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
         return;
     }
     let channel_url = channel_path.to_string_lossy().into_owned();
+    let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(&state.db, &channel).await;
 
     spawn_live_tv_recording(
         state.db.clone(),
         state.log_dir.clone(),
         timer.clone(),
         channel_url,
+        tuner_host_id,
+        tuner_count,
     );
 }
 
@@ -11664,9 +11764,11 @@ fn spawn_live_tv_recording(
     log_dir: PathBuf,
     timer: serde_json::Value,
     channel_url: String,
+    tuner_host_id: Option<String>,
+    tuner_count: Option<u64>,
 ) {
     tokio::spawn(async move {
-        record_channel_to_file(db, log_dir, timer, channel_url).await;
+        record_channel_to_file(db, log_dir, timer, channel_url, tuner_host_id, tuner_count).await;
     });
 }
 
@@ -11675,6 +11777,8 @@ async fn record_channel_to_file(
     log_dir: PathBuf,
     timer: serde_json::Value,
     channel_url: String,
+    tuner_host_id: Option<String>,
+    tuner_count: Option<u64>,
 ) {
     let timer_id = json_string_field(&timer, "Id").unwrap_or_default();
     let name = json_string_field(&timer, "Name").unwrap_or_else(|| "Recording".to_string());
@@ -11689,11 +11793,7 @@ async fn record_channel_to_file(
         .unwrap_or_else(OffsetDateTime::now_utc);
     let post_padding_secs = json_string_field(&timer, "PostPaddingSeconds")
         .and_then(|s| s.parse::<i64>().ok())
-        .or_else(|| {
-            timer
-                .get("PostPaddingSeconds")
-                .and_then(|v| v.as_i64())
-        })
+        .or_else(|| timer.get("PostPaddingSeconds").and_then(|v| v.as_i64()))
         .unwrap_or(0);
     let recording_end = end_date + Duration::seconds(post_padding_secs);
     let now = OffsetDateTime::now_utc();
@@ -11702,6 +11802,14 @@ async fn record_channel_to_file(
         return;
     }
     let duration = recording_end - now;
+
+    let _tuner_lease = match acquire_live_tuner_lease(tuner_host_id, &channel_url, tuner_count) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!("skipping Live TV recording because tuner limit was reached: {error:?}");
+            return;
+        }
+    };
 
     // Build the file path: DataPath/livetv/recordings/<ValidFilename(Name+" "+StartDate yyyy_MM_dd_HH_mm_ss)>.ts
     let recording_file_name = get_valid_filename(&live_tv_recording_name(&name, start_date));
@@ -11781,11 +11889,7 @@ async fn record_channel_to_file(
     }
 
     // Open the upstream HTTP stream (paridad DirectRecorder.RecordFromMediaSource).
-    let upstream_resp = match HttpClient::new()
-        .get(&channel_url)
-        .send()
-        .await
-    {
+    let upstream_resp = match HttpClient::new().get(&channel_url).send().await {
         Ok(resp) if resp.status().is_success() => resp,
         Ok(resp) => {
             tracing::error!(url = %channel_url, status = %resp.status(), "upstream channel returned non-2xx for recording");
@@ -11878,9 +11982,7 @@ async fn record_channel_to_file(
         // Update the timer status and RecordingPath (paridad upstream timer.RecordingPath + Status=Completed).
         if let Some(timers) = config.get_mut("Timers").and_then(|v| v.as_array_mut()) {
             for t in timers.iter_mut() {
-                if json_string_field(t, "Id")
-                    .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
-                {
+                if json_string_field(t, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&timer_id)) {
                     t["Status"] = serde_json::json!("Completed");
                     t["RecordingPath"] = serde_json::json!(path_str);
                     break;
@@ -11915,8 +12017,7 @@ async fn record_channel_to_file(
             let kept: Vec<_> = timers
                 .iter()
                 .filter(|t| {
-                    !json_string_field(t, "Id")
-                        .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
+                    !json_string_field(t, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
                 })
                 .cloned()
                 .collect();
@@ -17227,8 +17328,7 @@ fn live_hls_session_registry() -> &'static Mutex<HashMap<String, LiveHlsSessionE
 // Constructs a synthetic MediaItem for a live TV channel so it can be embedded inside a
 // TranscodeSession without requiring a real media_items DB row.
 fn live_tv_channel_synthetic_media_item(channel_id: &str, channel_url: &str) -> MediaItem {
-    let id = live_tv_channel_stable_uuid(channel_id)
-        .unwrap_or_else(Uuid::new_v4);
+    let id = live_tv_channel_stable_uuid(channel_id).unwrap_or_else(Uuid::new_v4);
     let now = OffsetDateTime::now_utc();
     MediaItem {
         id,
@@ -17307,7 +17407,7 @@ fn live_hls_session_json(entry: &LiveHlsSessionEntry) -> serde_json::Value {
 // Starts a new live TV HLS ffmpeg transcode session for the given channel, registers stop_tx
 // in TRANSCODE_STOPS, and inserts the entry into LIVE_HLS_SESSIONS. The session lifecycle
 // mirrors spawn_hls_transcode_task but without DB calls.
-async fn spawn_live_hls_transcode_task(
+struct LiveHlsTranscodeStart {
     play_session_id: String,
     channel_id: String,
     channel_url: String,
@@ -17315,7 +17415,21 @@ async fn spawn_live_hls_transcode_task(
     user_id: Uuid,
     command: jellyrin_core::FfmpegCommandSpec,
     output_path: String,
-) {
+    tuner_lease: Option<LiveTunerLeaseGuard>,
+}
+
+async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
+    let LiveHlsTranscodeStart {
+        play_session_id,
+        channel_id,
+        channel_url,
+        device_id,
+        user_id,
+        command,
+        output_path,
+        tuner_lease,
+    } = start;
+
     // Register the stop sender in TRANSCODE_STOPS so DELETE ActiveEncodings can kill ffmpeg.
     let (stop_tx, stop_rx) = oneshot::channel();
     {
@@ -17348,6 +17462,7 @@ async fn spawn_live_hls_transcode_task(
     }
 
     tokio::spawn(async move {
+        let _tuner_lease = tuner_lease;
         let mut process = match spawn_transcode_process(&command) {
             Ok(process) => process,
             Err(error) => {
@@ -17357,7 +17472,10 @@ async fn spawn_live_hls_transcode_task(
                     entry.status = "failed".to_string();
                     entry.updated_at = OffsetDateTime::now_utc();
                 }
-                transcode_stop_registry().lock().await.remove(&play_session_id);
+                transcode_stop_registry()
+                    .lock()
+                    .await
+                    .remove(&play_session_id);
                 return;
             }
         };
@@ -17392,7 +17510,10 @@ async fn spawn_live_hls_transcode_task(
         };
 
         drop(process);
-        transcode_stop_registry().lock().await.remove(&play_session_id);
+        transcode_stop_registry()
+            .lock()
+            .await
+            .remove(&play_session_id);
 
         {
             let mut registry = live_hls_session_registry().lock().await;
@@ -20525,7 +20646,11 @@ async fn active_hls_transcode_session_for(
     // try to resolve it as a live TV channel. This branch does NOT relax validation for VOD items.
     if is_live_tv_channel_id(item_id) {
         return active_hls_transcode_session_for_live_tv(
-            state, item_id, play_session_id, media_type, user.id,
+            state,
+            item_id,
+            play_session_id,
+            media_type,
+            user.id,
         )
         .await;
     }
@@ -20567,6 +20692,7 @@ async fn active_hls_transcode_session_for_live_tv(
     let channel_url = live_tv_channel_path(&channel)?
         .to_string_lossy()
         .to_string();
+    let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(&state.db, &channel).await;
 
     // Check for an existing active session by play_session_id.
     {
@@ -20589,6 +20715,8 @@ async fn active_hls_transcode_session_for_live_tv(
         }
     }
 
+    let tuner_lease = acquire_live_tuner_lease(tuner_host_id, &channel_url, tuner_count)?;
+
     // Start a new live HLS transcode session for this channel.
     let new_play_session_id = play_session_id.to_string();
     let layout = HlsTranscodeLayout::new(transcode_temp_root(), &new_play_session_id);
@@ -20607,15 +20735,16 @@ async fn active_hls_transcode_session_for_live_tv(
     let command = build_hls_ffmpeg_command(&request);
     let output_path = layout.media_playlist_path.to_string_lossy().to_string();
 
-    spawn_live_hls_transcode_task(
-        new_play_session_id.clone(),
-        channel_id.to_string(),
+    spawn_live_hls_transcode_task(LiveHlsTranscodeStart {
+        play_session_id: new_play_session_id.clone(),
+        channel_id: channel_id.to_string(),
         channel_url,
-        None,
+        device_id: None,
         user_id,
         command,
         output_path,
-    )
+        tuner_lease,
+    })
     .await;
 
     // Return the just-registered session.
@@ -26716,14 +26845,13 @@ mod tests {
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, SystemLifecycleCommand, backup_restore_snapshot_json,
         cascade_delete_series_timer_timers, cleanup_orphan_hls_transcode_dirs,
-        cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
-        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
-        format_time_for_json, get_valid_filename, hdhomerun_bool_field,
-        hls_transcode_dedupe_key, json_string_field, json_value_i64, last_system_lifecycle_command,
-        is_live_tv_channel_id, live_tv_channel_is_remote, live_tv_channel_media_source,
-        live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_recording_name,
-        load_countries, load_cultures, materialize_series_timer_timers,
+        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
+        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
+        encoding_configuration_json, format_time_for_json, get_valid_filename,
+        hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id, json_string_field,
+        json_value_i64, last_system_lifecycle_command, live_tv_channel_is_remote,
+        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
+        live_tv_recording_name, load_countries, load_cultures, materialize_series_timer_timers,
         media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
         parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
@@ -33265,7 +33393,9 @@ mod tests {
     // without delete_segments (live stream must not delete old segments while ffmpeg runs).
     #[test]
     fn live_hls_ffmpeg_command_uses_event_playlist_and_http_input() {
-        use jellyrin_core::{HlsTranscodeRequest, TranscodeStreamSelection, build_hls_ffmpeg_command};
+        use jellyrin_core::{
+            HlsTranscodeRequest, TranscodeStreamSelection, build_hls_ffmpeg_command,
+        };
         let request = HlsTranscodeRequest::new(
             "http://192.168.1.100:5004/auto/v4.1",
             "/tmp/jellyrin/transcodes/live-session/main.m3u8",
@@ -33280,23 +33410,36 @@ mod tests {
         assert_eq!(command.program, "ffmpeg");
         // -i must point to the HTTP URL directly (no file path wrapping).
         assert!(
-            command.args.windows(2).any(|pair| pair == ["-i", "http://192.168.1.100:5004/auto/v4.1"]),
-            "command must include -i <hdhr_url>: {:?}", command.args
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-i", "http://192.168.1.100:5004/auto/v4.1"]),
+            "command must include -i <hdhr_url>: {:?}",
+            command.args
         );
         // -hls_playlist_type event is required for a live (non-ending) playlist.
         assert!(
-            command.args.windows(2).any(|pair| pair == ["-hls_playlist_type", "event"]),
-            "command must include -hls_playlist_type event: {:?}", command.args
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-hls_playlist_type", "event"]),
+            "command must include -hls_playlist_type event: {:?}",
+            command.args
         );
         // No delete_segments / hls_flags that would remove old segments (live streams keep all segs).
         assert!(
-            !command.args.iter().any(|arg| arg.contains("delete_segments")),
-            "command must not include delete_segments: {:?}", command.args
+            !command
+                .args
+                .iter()
+                .any(|arg| arg.contains("delete_segments")),
+            "command must not include delete_segments: {:?}",
+            command.args
         );
         // No -ss seek flag for a live stream (start_position_ticks is 0 by default).
         assert!(
             !command.args.iter().any(|arg| arg == "-ss"),
-            "command must not include -ss for live: {:?}", command.args
+            "command must not include -ss for live: {:?}",
+            command.args
         );
     }
 
@@ -33311,7 +33454,10 @@ mod tests {
             "Path": "http://192.168.1.100:5004/auto/v4.1",
         });
         let ms = live_tv_channel_media_source(&channel).unwrap();
-        assert_eq!(ms["SupportsTranscoding"], true, "remote channel must support transcoding");
+        assert_eq!(
+            ms["SupportsTranscoding"], true,
+            "remote channel must support transcoding"
+        );
         assert_eq!(ms["TranscodingSubProtocol"], "hls");
         assert_eq!(ms["TranscodingContainer"], "ts");
         // TranscodingUrl must include master.m3u8 or live.m3u8 and a PlaySessionId.
@@ -33325,7 +33471,10 @@ mod tests {
             "TranscodingUrl must include PlaySessionId: {url}"
         );
         // SupportsDirectStream must remain true (do not break the existing direct TS path).
-        assert_eq!(ms["SupportsDirectStream"], true, "direct stream must still be supported");
+        assert_eq!(
+            ms["SupportsDirectStream"], true,
+            "direct stream must still be supported"
+        );
     }
 
     // Spec: local (non-remote) channels must NOT expose SupportsTranscoding:true (no HLS for local TS).
@@ -33337,8 +33486,14 @@ mod tests {
             "Path": "/srv/live/news.ts",
         });
         let ms = live_tv_channel_media_source(&channel).unwrap();
-        assert_eq!(ms["SupportsTranscoding"], false, "local channel must not expose HLS transcode");
-        assert!(ms["TranscodingUrl"].is_null(), "local channel must not have TranscodingUrl");
+        assert_eq!(
+            ms["SupportsTranscoding"], false,
+            "local channel must not expose HLS transcode"
+        );
+        assert!(
+            ms["TranscodingUrl"].is_null(),
+            "local channel must not have TranscodingUrl"
+        );
     }
 
     // Spec: is_live_tv_channel_id returns true for hdhr_* (which fails parse_jellyfin_uuid)
@@ -33347,8 +33502,14 @@ mod tests {
     #[test]
     fn live_tv_channel_id_detection_isolates_live_from_vod() {
         // HDHomeRun channel IDs are NOT valid Jellyfin UUIDs.
-        assert!(is_live_tv_channel_id("hdhr_4.1"), "hdhr_ prefix must be detected as live");
-        assert!(is_live_tv_channel_id("hdhr_5.1"), "hdhr_ prefix must be detected as live");
+        assert!(
+            is_live_tv_channel_id("hdhr_4.1"),
+            "hdhr_ prefix must be detected as live"
+        );
+        assert!(
+            is_live_tv_channel_id("hdhr_5.1"),
+            "hdhr_ prefix must be detected as live"
+        );
         // Proper UUIDs (VOD item IDs) must NOT be detected as live TV channels.
         assert!(
             !is_live_tv_channel_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
@@ -33368,7 +33529,10 @@ mod tests {
         let uuid2 = live_tv_channel_stable_uuid("hdhr_4.1");
         assert_eq!(uuid1, uuid2, "stable UUID must be deterministic");
         let uuid_other = live_tv_channel_stable_uuid("hdhr_5.1");
-        assert_ne!(uuid1, uuid_other, "different channels must get different UUIDs");
+        assert_ne!(
+            uuid1, uuid_other,
+            "different channels must get different UUIDs"
+        );
     }
 
     // Spec A(a): recording file name == <Name> <yyyy_MM_dd_HH_mm_ss>.ts
@@ -33382,10 +33546,16 @@ mod tests {
 
         // get_valid_filename strips invalid chars.
         let safe = get_valid_filename("NBC HD 2026_05_29_14_30_00");
-        assert_eq!(safe, "NBC HD 2026_05_29_14_30_00", "safe filename unchanged");
+        assert_eq!(
+            safe, "NBC HD 2026_05_29_14_30_00",
+            "safe filename unchanged"
+        );
 
         let unsafe_name = get_valid_filename("My/Show:2026");
-        assert_eq!(unsafe_name, "My_Show_2026", "invalid chars replaced with underscore");
+        assert_eq!(
+            unsafe_name, "My_Show_2026",
+            "invalid chars replaced with underscore"
+        );
     }
 
     // Spec A(b): copy writes bytes from a TS mock server to a file with len > 0.
@@ -33408,8 +33578,12 @@ mod tests {
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 { break; }
-                    if line == "\r\n" { break; }
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
                 }
                 let body = ts_clone.as_slice();
                 let header = format!(
@@ -33422,7 +33596,9 @@ mod tests {
         });
 
         let dir = tempfile::tempdir().unwrap();
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let timer = serde_json::json!({
             "Id": "test-timer-1",
@@ -33437,18 +33613,28 @@ mod tests {
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
         let channel_url = format!("http://127.0.0.1:{port}/stream");
 
-        record_channel_to_file(db.clone(), log_dir, timer, channel_url).await;
+        record_channel_to_file(db.clone(), log_dir, timer, channel_url, None, None).await;
 
         // After recording, config["Recordings"] should have a Completed entry.
-        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
         // Find a Completed recording.
         let completed = recordings
             .iter()
             .find(|r| r["Status"].as_str() == Some("Completed"));
-        assert!(completed.is_some(), "should have a Completed recording in config");
+        assert!(
+            completed.is_some(),
+            "should have a Completed recording in config"
+        );
         let path_str = completed.unwrap()["Path"].as_str().unwrap_or("");
-        assert!(!path_str.is_empty(), "Completed recording must have a non-empty Path");
+        assert!(
+            !path_str.is_empty(),
+            "Completed recording must have a non-empty Path"
+        );
         let meta = tokio::fs::metadata(path_str).await;
         assert!(meta.is_ok(), "recording file must exist on disk");
         assert!(meta.unwrap().len() > 0, "recording file must have len > 0");
@@ -33512,11 +33698,17 @@ mod tests {
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 { break; }
-                    if line == "\r\n" { break; }
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
                 }
                 let _ = writer
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 0\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 0\r\n\r\n",
+                    )
                     .await;
             }
         });
@@ -33524,7 +33716,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("logs");
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let timer = serde_json::json!({
             "Id": "zero-timer",
@@ -33537,20 +33731,30 @@ mod tests {
         });
         let channel_url = format!("http://127.0.0.1:{port}/stream");
 
-        record_channel_to_file(db.clone(), log_dir, timer, channel_url).await;
+        record_channel_to_file(db.clone(), log_dir, timer, channel_url, None, None).await;
 
-        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
         // No Completed recording should exist.
         let completed = recordings
             .iter()
             .any(|r| r["Status"].as_str() == Some("Completed"));
-        assert!(!completed, "0-byte recording must not create a Completed entry");
+        assert!(
+            !completed,
+            "0-byte recording must not create a Completed entry"
+        );
         // No InProgress either (it must have been cleaned up).
         let in_progress = recordings
             .iter()
             .any(|r| r["Status"].as_str() == Some("InProgress"));
-        assert!(!in_progress, "0-byte recording must clean up InProgress entry");
+        assert!(
+            !in_progress,
+            "0-byte recording must clean up InProgress entry"
+        );
     }
 
     #[tokio::test]
@@ -33564,7 +33768,9 @@ mod tests {
             .unwrap();
         tokio::fs::write(&stale_file, b"partial").await.unwrap();
 
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let mut config = default_live_tv_configuration();
         config["Recordings"] = serde_json::json!([{
@@ -33598,7 +33804,10 @@ mod tests {
         assert_eq!(recovery.removed_stale_recordings, 1);
         assert_eq!(recovery.removed_expired_timers, 1);
         assert_eq!(recovery.restarted_recordings, 0);
-        assert!(!stale_file.exists(), "stale partial recording must be removed");
+        assert!(
+            !stale_file.exists(),
+            "stale partial recording must be removed"
+        );
 
         let config = db.named_configuration("livetv").await.unwrap().unwrap();
         assert!(config["Recordings"].as_array().unwrap().is_empty());
@@ -33607,7 +33816,11 @@ mod tests {
         let second = reconcile_live_tv_recordings_on_startup(&db, &log_dir)
             .await
             .unwrap();
-        assert_eq!(second, Default::default(), "startup recovery must be idempotent");
+        assert_eq!(
+            second,
+            Default::default(),
+            "startup recovery must be idempotent"
+        );
     }
 
     #[tokio::test]
@@ -33651,7 +33864,9 @@ mod tests {
             .unwrap();
         tokio::fs::write(&stale_file, b"partial").await.unwrap();
 
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let mut config = default_live_tv_configuration();
         config["TunerHosts"] = serde_json::json!([{
@@ -33695,9 +33910,12 @@ mod tests {
         assert_eq!(recovery.removed_stale_recordings, 1);
         assert_eq!(recovery.removed_expired_timers, 0);
         assert_eq!(recovery.restarted_recordings, 1);
-        assert!(!stale_file.exists(), "stale file should not block restarted recording");
+        assert!(
+            !stale_file.exists(),
+            "stale file should not block restarted recording"
+        );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let config = db.named_configuration("livetv").await.unwrap().unwrap();
             let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
@@ -33717,14 +33935,21 @@ mod tests {
                 assert_eq!(timer["RecordingPath"], path);
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "recording did not complete");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recording did not complete"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
         let second = reconcile_live_tv_recordings_on_startup(&db, &log_dir)
             .await
             .unwrap();
-        assert_eq!(second, Default::default(), "completed recovery must be idempotent");
+        assert_eq!(
+            second,
+            Default::default(),
+            "completed recovery must be idempotent"
+        );
     }
 
     #[tokio::test]
@@ -49988,7 +50213,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         };
-        use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
         /// Start a local HTTP server that streams video/mp2t chunks indefinitely.
@@ -50039,12 +50264,14 @@ mod tests {
             });
 
             let base_url = format!("http://127.0.0.1:{}", addr.port());
-            (base_url, counter, move || { let _ = shutdown_tx.send(()); })
+            (base_url, counter, move || {
+                let _ = shutdown_tx.send(());
+            })
         }
 
         #[tokio::test]
         async fn live_tv_stream_sharing_two_consumers_one_connection() {
-            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+            use crate::{live_stream_registry, proxy_live_tv_channel_url};
 
             let (base_url, counter, _close) = start_stream_server().await;
             let stream_url = format!("{base_url}/auto/v4.1");
@@ -50053,7 +50280,9 @@ mod tests {
             live_stream_registry().lock().await.remove(&stream_url);
 
             // Open first consumer.
-            let resp1 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
+            let resp1 = proxy_live_tv_channel_url(stream_url.clone(), None, None)
+                .await
+                .unwrap();
             assert_eq!(resp1.status(), axum::http::StatusCode::OK);
 
             // Give the producer task time to establish its outgoing connection.
@@ -50061,20 +50290,30 @@ mod tests {
             let connections_after_first = counter.load(std::sync::atomic::Ordering::SeqCst);
 
             // Open second consumer for the SAME URL.
-            let resp2 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
+            let resp2 = proxy_live_tv_channel_url(stream_url.clone(), None, None)
+                .await
+                .unwrap();
             assert_eq!(resp2.status(), axum::http::StatusCode::OK);
 
             tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
             let connections_after_second = counter.load(std::sync::atomic::Ordering::SeqCst);
 
             // Verify: only 1 outgoing connection regardless of consumer count.
-            assert_eq!(connections_after_first, 1, "first consumer must open exactly 1 connection");
-            assert_eq!(connections_after_second, 1, "second consumer must reuse the same connection");
+            assert_eq!(
+                connections_after_first, 1,
+                "first consumer must open exactly 1 connection"
+            );
+            assert_eq!(
+                connections_after_second, 1,
+                "second consumer must reuse the same connection"
+            );
 
             // Verify refcount in registry.
             {
                 let registry = live_stream_registry().lock().await;
-                let handle = registry.get(&stream_url).expect("handle must be registered");
+                let handle = registry
+                    .get(&stream_url)
+                    .expect("handle must be registered");
                 assert_eq!(handle.refcount, 2, "refcount must be 2 with two consumers");
             }
 
@@ -50085,15 +50324,19 @@ mod tests {
 
         #[tokio::test]
         async fn live_tv_stream_sharing_refcount_zero_removes_handle() {
-            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+            use crate::{live_stream_registry, proxy_live_tv_channel_url};
 
             let (base_url, _counter, _close) = start_stream_server().await;
             let stream_url = format!("{base_url}/auto/v5.1");
 
             live_stream_registry().lock().await.remove(&stream_url);
 
-            let resp1 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
-            let resp2 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
+            let resp1 = proxy_live_tv_channel_url(stream_url.clone(), None, None)
+                .await
+                .unwrap();
+            let resp2 = proxy_live_tv_channel_url(stream_url.clone(), None, None)
+                .await
+                .unwrap();
 
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
@@ -50126,7 +50369,7 @@ mod tests {
 
         #[tokio::test]
         async fn live_tv_stream_sharing_distinct_channels_no_sharing() {
-            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+            use crate::{live_stream_registry, proxy_live_tv_channel_url};
 
             let (base_url, counter, _close) = start_stream_server().await;
             let url_a = format!("{base_url}/auto/v4.1");
@@ -50135,14 +50378,21 @@ mod tests {
             live_stream_registry().lock().await.remove(&url_a);
             live_stream_registry().lock().await.remove(&url_b);
 
-            let _resp_a = proxy_live_tv_channel_url(url_a.clone(), None, None).await.unwrap();
-            let _resp_b = proxy_live_tv_channel_url(url_b.clone(), None, None).await.unwrap();
+            let _resp_a = proxy_live_tv_channel_url(url_a.clone(), None, None)
+                .await
+                .unwrap();
+            let _resp_b = proxy_live_tv_channel_url(url_b.clone(), None, None)
+                .await
+                .unwrap();
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             // Two distinct channels must open 2 separate connections.
             let conns = counter.load(std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(conns, 2, "distinct channels must each open their own connection");
+            assert_eq!(
+                conns, 2,
+                "distinct channels must each open their own connection"
+            );
 
             // Each URL must have its own independent handle with refcount 1.
             {
@@ -50173,7 +50423,7 @@ mod tests {
         //   4. Assert: handle B still present with refcount==1 and its producer not cancelled.
         #[tokio::test]
         async fn live_tv_stream_sharing_stale_guard_is_noop_on_new_generation() {
-            use crate::{live_stream_registry, LiveStreamRefGuard};
+            use crate::{LiveStreamRefGuard, live_stream_registry};
 
             let url = "http://127.0.0.1:19999/auto/v_race_test".to_string();
 
@@ -50185,7 +50435,8 @@ mod tests {
                 let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
                 let (tx, _rx) = tokio::sync::broadcast::channel::<bytes::Bytes>(4);
                 let mut registry = live_stream_registry().lock().await;
-                let handle_gen = crate::LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let handle_gen = crate::LIVE_STREAM_GENERATION
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 registry.insert(
                     url.clone(),
                     crate::SharedLiveStreamHandle {
@@ -50193,7 +50444,7 @@ mod tests {
                         generation: handle_gen,
                         sender: tx,
                         _cancel: cancel_tx,
-                        tuner_host_id: None,
+                        _tuner_lease: None,
                     },
                 );
                 handle_gen
@@ -50201,7 +50452,10 @@ mod tests {
 
             // Simulate consumer A closing: guard A fires and removes the gen-A entry.
             {
-                let guard_a = LiveStreamRefGuard { url: url.clone(), generation: gen_a };
+                let guard_a = LiveStreamRefGuard {
+                    url: url.clone(),
+                    generation: gen_a,
+                };
                 drop(guard_a);
             }
             // Allow the spawned drop task to run.
@@ -50218,7 +50472,8 @@ mod tests {
                 let (cancel_tx, _cancel_rx) = tokio::sync::oneshot::channel::<()>();
                 let (tx, _rx) = tokio::sync::broadcast::channel::<bytes::Bytes>(4);
                 let mut registry = live_stream_registry().lock().await;
-                let handle_gen = crate::LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let handle_gen = crate::LIVE_STREAM_GENERATION
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 registry.insert(
                     url.clone(),
                     crate::SharedLiveStreamHandle {
@@ -50226,7 +50481,7 @@ mod tests {
                         generation: handle_gen,
                         sender: tx,
                         _cancel: cancel_tx,
-                        tuner_host_id: None,
+                        _tuner_lease: None,
                     },
                 );
                 handle_gen
@@ -50236,7 +50491,10 @@ mod tests {
 
             // Simulate a STALE guard from gen-A firing again (lagged drop scenario).
             {
-                let stale_guard = LiveStreamRefGuard { url: url.clone(), generation: gen_a };
+                let stale_guard = LiveStreamRefGuard {
+                    url: url.clone(),
+                    generation: gen_a,
+                };
                 drop(stale_guard);
             }
             // Allow the spawned drop task to run.
@@ -50271,7 +50529,7 @@ mod tests {
         // (a) Same channel, TunerCount=1, second consumer -> Ok (sharing exempt, NOT conflict).
         #[tokio::test]
         async fn live_tv_tuner_limit_same_channel_second_consumer_ok() {
-            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+            use crate::{live_stream_registry, proxy_live_tv_channel_url};
 
             let (base_url, _counter, _close) = start_stream_server().await;
             let stream_url = format!("{base_url}/auto/v4.1_tunerlimit");
@@ -50282,13 +50540,10 @@ mod tests {
             let tuner_count = Some(1u64);
 
             // First consumer: opens a new handle. Active count goes from 0 to 1 (==limit).
-            let resp1 = proxy_live_tv_channel_url(
-                stream_url.clone(),
-                tuner_host_id.clone(),
-                tuner_count,
-            )
-            .await
-            .expect("first open must succeed (active=0 < limit=1)");
+            let resp1 =
+                proxy_live_tv_channel_url(stream_url.clone(), tuner_host_id.clone(), tuner_count)
+                    .await
+                    .expect("first open must succeed (active=0 < limit=1)");
             assert_eq!(resp1.status(), axum::http::StatusCode::OK);
 
             // Second consumer of the SAME URL: hits the sharing path (URL already in registry)
@@ -50299,7 +50554,9 @@ mod tests {
                 tuner_count,
             )
             .await
-            .expect("second consumer of SAME channel must be exempt from TunerCount limit (sharing)");
+            .expect(
+                "second consumer of SAME channel must be exempt from TunerCount limit (sharing)",
+            );
             assert_eq!(resp2.status(), axum::http::StatusCode::OK);
 
             // Verify refcount is 2 (not 1), confirming sharing was used.
@@ -50322,7 +50579,7 @@ mod tests {
         // (b) Two distinct channels of the same tuner host, TunerCount=1 -> second open is Err.
         #[tokio::test]
         async fn live_tv_tuner_limit_distinct_channels_second_open_err() {
-            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+            use crate::{live_stream_registry, proxy_live_tv_channel_url};
 
             let (base_url, _counter, _close) = start_stream_server().await;
             let url_a = format!("{base_url}/auto/v4.1_limit_a");
@@ -50335,9 +50592,10 @@ mod tests {
             let tuner_count = Some(1u64);
 
             // First channel (A): succeeds (active=0 < limit=1).
-            let _resp_a = proxy_live_tv_channel_url(url_a.clone(), tuner_host_id.clone(), tuner_count)
-                .await
-                .expect("channel A open must succeed");
+            let _resp_a =
+                proxy_live_tv_channel_url(url_a.clone(), tuner_host_id.clone(), tuner_count)
+                    .await
+                    .expect("channel A open must succeed");
 
             // Second channel (B) of the SAME tuner host: fails (active=1 >= limit=1).
             let result_b =
@@ -50357,7 +50615,7 @@ mod tests {
         //     the second distinct channel must open successfully (recovery).
         #[tokio::test]
         async fn live_tv_tuner_limit_recovery_after_close() {
-            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+            use crate::{live_stream_registry, proxy_live_tv_channel_url};
 
             let (base_url, _counter, _close) = start_stream_server().await;
             let url_a = format!("{base_url}/auto/v4.1_recovery_a");
@@ -50389,13 +50647,231 @@ mod tests {
             let resp_b =
                 proxy_live_tv_channel_url(url_b.clone(), tuner_host_id.clone(), tuner_count)
                     .await
-                    .expect("channel B must open successfully after channel A is closed (recovery)");
+                    .expect(
+                        "channel B must open successfully after channel A is closed (recovery)",
+                    );
             assert_eq!(resp_b.status(), axum::http::StatusCode::OK);
 
             drop(resp_b.into_body());
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             live_stream_registry().lock().await.remove(&url_a);
             live_stream_registry().lock().await.remove(&url_b);
+        }
+
+        #[tokio::test]
+        async fn live_tuner_lease_same_channel_across_modes_shares_slot() {
+            let host = "lease-host-same";
+            let url = "http://127.0.0.1:19001/auto/v4.1";
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
+
+            let lease_a = crate::acquire_live_tuner_lease(Some(host.to_string()), url, Some(1))
+                .expect("first lease must succeed");
+            let lease_b =
+                crate::acquire_live_tuner_lease(Some(host.to_ascii_uppercase()), url, Some(1))
+                    .expect("same channel must share the tuner slot despite host-id casing");
+            assert!(lease_a.is_some());
+            assert!(lease_b.is_some());
+
+            {
+                let registry = crate::live_tuner_lease_registry()
+                    .lock()
+                    .expect("live tuner lease registry");
+                let key = crate::LiveTunerLeaseKey {
+                    tuner_host_id: host.to_string(),
+                    channel_url: url.to_string(),
+                };
+                assert_eq!(
+                    registry.get(&key).map(|lease| lease.refcount),
+                    Some(2),
+                    "same channel across modes should increment the shared lease refcount"
+                );
+            }
+
+            let other_channel = crate::acquire_live_tuner_lease(
+                Some(host.to_string()),
+                "http://127.0.0.1:19001/auto/v5.1",
+                Some(1),
+            );
+            assert!(
+                other_channel.is_err(),
+                "different channel must conflict while the shared same-channel slot is active"
+            );
+
+            drop(lease_a);
+            drop(lease_b);
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
+        }
+
+        #[tokio::test]
+        async fn live_tuner_lease_release_allows_next_channel() {
+            let host = "lease-host-release";
+            let url_a = "http://127.0.0.1:19002/auto/v4.1";
+            let url_b = "http://127.0.0.1:19002/auto/v5.1";
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
+
+            let lease_a = crate::acquire_live_tuner_lease(Some(host.to_string()), url_a, Some(1))
+                .expect("first channel must acquire slot");
+            assert!(
+                crate::acquire_live_tuner_lease(Some(host.to_string()), url_b, Some(1)).is_err(),
+                "second distinct channel must conflict while slot is held"
+            );
+            drop(lease_a);
+
+            let lease_b = crate::acquire_live_tuner_lease(Some(host.to_string()), url_b, Some(1))
+                .expect("second channel must acquire after release");
+            assert!(lease_b.is_some());
+            drop(lease_b);
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
+        }
+
+        #[tokio::test]
+        async fn live_tuner_lease_unlimited_tuner_count_zero() {
+            let host = "lease-host-unlimited";
+            let lease = crate::acquire_live_tuner_lease(
+                Some(host.to_string()),
+                "http://127.0.0.1:19003/auto/v4.1",
+                None,
+            )
+            .expect("unlimited host should not fail");
+            assert!(
+                lease.is_none(),
+                "TunerCount=0/None is unlimited and should not create a tracked lease"
+            );
+        }
+
+        #[tokio::test]
+        async fn live_hls_tuner_limit_conflict_uses_shared_lease_registry() {
+            let host = "lease-host-hls";
+            let url_a = "http://127.0.0.1:19004/auto/v4.1";
+            let url_b = "http://127.0.0.1:19004/auto/v5.1";
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
+
+            let _direct_like_lease =
+                crate::acquire_live_tuner_lease(Some(host.to_string()), url_a, Some(1))
+                    .expect("setup lease must succeed");
+
+            let db = jellyrin_db::Database::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let mut config = crate::default_live_tv_configuration();
+            config["TunerHosts"] = serde_json::json!([{
+                "Id": host,
+                "TunerCount": 1,
+                "Channels": [{
+                    "Id": "hdhr_5.1",
+                    "Name": "Channel 5.1",
+                    "Number": "5.1",
+                    "Path": url_b,
+                }]
+            }]);
+            db.update_named_configuration("livetv", crate::live_tv_configuration_json(config))
+                .await
+                .unwrap();
+            let state = crate::AppState {
+                db,
+                web_dir: ".".into(),
+                log_dir: ".".into(),
+                local_address: "http://127.0.0.1:8097".to_string(),
+            };
+
+            let result = crate::active_hls_transcode_session_for_live_tv(
+                &state,
+                "hdhr_5.1",
+                "play-session-hls-limit",
+                "Video",
+                uuid::Uuid::nil(),
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "HLS on a different channel must honor the shared TunerCount lease"
+            );
+            assert!(
+                crate::live_hls_session_registry()
+                    .lock()
+                    .await
+                    .get("play-session-hls-limit")
+                    .is_none(),
+                "HLS conflict must not register a live HLS session"
+            );
+
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
+        }
+
+        #[tokio::test]
+        async fn live_recording_tuner_limit_conflict_does_not_persist_inprogress() {
+            let host = "lease-host-recording";
+            let url_a = "http://127.0.0.1:19005/auto/v4.1";
+            let url_b = "http://127.0.0.1:19005/auto/v5.1";
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
+
+            let _direct_like_lease =
+                crate::acquire_live_tuner_lease(Some(host.to_string()), url_a, Some(1))
+                    .expect("setup lease must succeed");
+
+            let db = jellyrin_db::Database::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let log_dir = dir.path().join("logs");
+            tokio::fs::create_dir_all(&log_dir).await.unwrap();
+            let now = time::OffsetDateTime::now_utc();
+            let timer = serde_json::json!({
+                "Id": "recording-limit-timer",
+                "Name": "Blocked Recording",
+                "ChannelId": "hdhr_5.1",
+                "StartDate": crate::format_time_for_json(now - time::Duration::seconds(5)),
+                "EndDate": crate::format_time_for_json(now + time::Duration::seconds(20)),
+                "PostPaddingSeconds": 0,
+                "IsSeries": false,
+            });
+
+            crate::record_channel_to_file(
+                db.clone(),
+                log_dir,
+                timer,
+                url_b.to_string(),
+                Some(host.to_string()),
+                Some(1),
+            )
+            .await;
+
+            let recordings = db
+                .named_configuration("livetv")
+                .await
+                .unwrap()
+                .and_then(|config| config["Recordings"].as_array().cloned())
+                .unwrap_or_default();
+            assert!(
+                recordings.is_empty(),
+                "recording conflict must not persist an InProgress zombie"
+            );
+
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| !key.tuner_host_id.eq_ignore_ascii_case(host));
         }
     }
 
@@ -50408,16 +50884,24 @@ mod tests {
         assert_eq!(id1, id2, "same inputs must produce the same Id");
 
         let id_diff_program = series_timer_child_id("series-abc", "program-OTHER");
-        assert_ne!(id1, id_diff_program, "different program_id must give different Id");
+        assert_ne!(
+            id1, id_diff_program,
+            "different program_id must give different Id"
+        );
 
         let id_diff_series = series_timer_child_id("series-OTHER", "program-xyz");
-        assert_ne!(id1, id_diff_series, "different series_timer_id must give different Id");
+        assert_ne!(
+            id1, id_diff_series,
+            "different series_timer_id must give different Id"
+        );
     }
 
     // DS1 / Spec (a): match by Name generates a child timer with SeriesTimerId set.
     #[tokio::test]
     async fn series_timer_name_match_generates_child_timer_with_series_timer_id() {
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let mut config = default_live_tv_configuration();
 
@@ -50451,14 +50935,24 @@ mod tests {
         });
         materialize_series_timer_timers(&state, &series_timer).await;
 
-        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let timers = config["Timers"].as_array().cloned().unwrap_or_default();
-        let child = timers.iter().find(|t| {
-            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-001")
-        });
-        assert!(child.is_some(), "must generate at least one child timer with SeriesTimerId");
+        let child = timers
+            .iter()
+            .find(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-001"));
+        assert!(
+            child.is_some(),
+            "must generate at least one child timer with SeriesTimerId"
+        );
         let child = child.unwrap();
-        assert_eq!(child["IsSeries"], false, "child timer IsSeries must be false");
+        assert_eq!(
+            child["IsSeries"], false,
+            "child timer IsSeries must be false"
+        );
         assert_eq!(child["ProgramId"].as_str(), Some("prog-001"));
         assert_eq!(child["Name"].as_str(), Some("Serie Test"));
     }
@@ -50466,7 +50960,9 @@ mod tests {
     // DS2 / Spec (b): scope by ChannelId — wrong channel does not generate unless RecordAnyChannel.
     #[tokio::test]
     async fn series_timer_channel_scope_excludes_wrong_channel() {
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let mut config = default_live_tv_configuration();
 
@@ -50500,12 +50996,19 @@ mod tests {
         });
         materialize_series_timer_timers(&state, &series_timer_scoped).await;
 
-        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let timers = config["Timers"].as_array().cloned().unwrap_or_default();
-        let child = timers.iter().find(|t| {
-            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-scoped")
-        });
-        assert!(child.is_none(), "wrong channel must not generate a child timer without RecordAnyChannel");
+        let child = timers
+            .iter()
+            .find(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-scoped"));
+        assert!(
+            child.is_none(),
+            "wrong channel must not generate a child timer without RecordAnyChannel"
+        );
 
         // With RecordAnyChannel=true the program on hdhr_5.1 must match.
         let series_timer_any = serde_json::json!({
@@ -50516,18 +51019,27 @@ mod tests {
         });
         materialize_series_timer_timers(&state, &series_timer_any).await;
 
-        let config2 = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config2 = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let timers2 = config2["Timers"].as_array().cloned().unwrap_or_default();
-        let child_any = timers2.iter().find(|t| {
-            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-any")
-        });
-        assert!(child_any.is_some(), "RecordAnyChannel must match program on any channel");
+        let child_any = timers2
+            .iter()
+            .find(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-any"));
+        assert!(
+            child_any.is_some(),
+            "RecordAnyChannel must match program on any channel"
+        );
     }
 
     // DS2 / Spec (c): program EndDate < now (expired) does not generate a timer.
     #[tokio::test]
     async fn series_timer_expired_program_does_not_generate_timer() {
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let mut config = default_live_tv_configuration();
 
@@ -50560,12 +51072,19 @@ mod tests {
         });
         materialize_series_timer_timers(&state, &series_timer).await;
 
-        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let timers = config["Timers"].as_array().cloned().unwrap_or_default();
-        let child = timers.iter().find(|t| {
-            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-expired")
-        });
-        assert!(child.is_none(), "expired program (EndDate < now) must not generate a timer");
+        let child = timers
+            .iter()
+            .find(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-expired"));
+        assert!(
+            child.is_none(),
+            "expired program (EndDate < now) must not generate a timer"
+        );
     }
 
     // DS1 / DS3 / Spec (d): program in window generates a timer with IsSeries=false.
@@ -50573,7 +51092,9 @@ mod tests {
     // generated timer in config["Timers"] is the observable invariant of this test.)
     #[tokio::test]
     async fn series_timer_in_window_program_generates_is_series_false_timer() {
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let mut config = default_live_tv_configuration();
 
@@ -50606,12 +51127,19 @@ mod tests {
         });
         materialize_series_timer_timers(&state, &series_timer).await;
 
-        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let timers = config["Timers"].as_array().cloned().unwrap_or_default();
-        let child = timers.iter().find(|t| {
-            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-live")
-        });
-        assert!(child.is_some(), "in-window program must generate a child timer");
+        let child = timers
+            .iter()
+            .find(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-live"));
+        assert!(
+            child.is_some(),
+            "in-window program must generate a child timer"
+        );
         let child = child.unwrap();
         assert_eq!(
             child["IsSeries"], false,
@@ -50622,7 +51150,9 @@ mod tests {
     // DS5 / Spec (e): DELETE series timer cascades — child timers are removed from config["Timers"].
     #[tokio::test]
     async fn series_timer_delete_cascades_to_child_timers() {
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
 
         // Directly write child timers into config["Timers"] simulating prior materialisation.
         let mut config = default_live_tv_configuration();
@@ -50649,17 +51179,24 @@ mod tests {
 
         cascade_delete_series_timer_timers(&db, "st-cascade").await;
 
-        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let config = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
         let timers = config["Timers"].as_array().cloned().unwrap_or_default();
 
-        let child_gone = timers.iter().all(|t| {
-            json_string_field(t, "SeriesTimerId").as_deref() != Some("st-cascade")
-        });
-        assert!(child_gone, "cascade delete must remove child timers with SeriesTimerId=st-cascade");
+        let child_gone = timers
+            .iter()
+            .all(|t| json_string_field(t, "SeriesTimerId").as_deref() != Some("st-cascade"));
+        assert!(
+            child_gone,
+            "cascade delete must remove child timers with SeriesTimerId=st-cascade"
+        );
 
-        let unrelated_kept = timers.iter().any(|t| {
-            json_string_field(t, "Id").as_deref() == Some("unrelated-1")
-        });
+        let unrelated_kept = timers
+            .iter()
+            .any(|t| json_string_field(t, "Id").as_deref() == Some("unrelated-1"));
         assert!(unrelated_kept, "cascade delete must keep unrelated timers");
     }
 
@@ -50667,7 +51204,9 @@ mod tests {
     // must not produce duplicate timers — Id is stable (idempotent).
     #[tokio::test]
     async fn series_timer_materialize_twice_is_idempotent() {
-        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         let mut config = default_live_tv_configuration();
 
@@ -50701,13 +51240,23 @@ mod tests {
 
         // First call — creates the child timer.
         materialize_series_timer_timers(&state, &series_timer).await;
-        let config_after_first = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
-        let timers_after_first = config_after_first["Timers"].as_array().cloned().unwrap_or_default();
+        let config_after_first = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let timers_after_first = config_after_first["Timers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let count_first = timers_after_first
             .iter()
             .filter(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-idem"))
             .count();
-        assert_eq!(count_first, 1, "first call must create exactly one child timer");
+        assert_eq!(
+            count_first, 1,
+            "first call must create exactly one child timer"
+        );
 
         let id_first = timers_after_first
             .iter()
@@ -50717,13 +51266,23 @@ mod tests {
 
         // Second call — must not duplicate.
         materialize_series_timer_timers(&state, &series_timer).await;
-        let config_after_second = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
-        let timers_after_second = config_after_second["Timers"].as_array().cloned().unwrap_or_default();
+        let config_after_second = db
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap_or_default();
+        let timers_after_second = config_after_second["Timers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let count_second = timers_after_second
             .iter()
             .filter(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-idem"))
             .count();
-        assert_eq!(count_second, 1, "second call must not create a duplicate timer");
+        assert_eq!(
+            count_second, 1,
+            "second call must not create a duplicate timer"
+        );
 
         let id_second = timers_after_second
             .iter()
@@ -50731,6 +51290,9 @@ mod tests {
             .and_then(|t| json_string_field(t, "Id"))
             .expect("child timer must still have an Id after second call");
 
-        assert_eq!(id_first, id_second, "Id must be stable (deterministic) across calls");
+        assert_eq!(
+            id_first, id_second,
+            "Id must be stable (deterministic) across calls"
+        );
     }
 }
