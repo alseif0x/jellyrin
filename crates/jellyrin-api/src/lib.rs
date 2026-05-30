@@ -93,6 +93,16 @@ static LIVE_STREAM_GENERATION: std::sync::atomic::AtomicU64 =
 // Broadcast capacity: enough buffering so a slow consumer doesn't cause the fast path to block.
 const LIVE_STREAM_BROADCAST_CAPACITY: usize = 256;
 
+// In-memory registry for live TV HLS transcode sessions.
+// Keyed by play_session_id; mirrors the VOD transcode session lifecycle but without
+// requiring a media_items DB row (live TV channels are not in the media_items table).
+static LIVE_HLS_SESSIONS: OnceLock<Mutex<HashMap<String, LiveHlsSessionEntry>>> = OnceLock::new();
+
+// Longer readiness timeout for live TV HLS (compared to VOD 5s) because an HTTP live
+// stream source may need a few extra seconds for ffmpeg to buffer the first segment.
+// Only applied to live TV sessions; VOD keeps the original 5s limit.
+const LIVE_HLS_READINESS_TIMEOUT_SECS: u64 = 15;
+
 struct SharedLiveStreamHandle {
     refcount: usize,
     // Unique identity for this handle; incremented each time a new handle is inserted.
@@ -151,6 +161,23 @@ struct SyncPlayParticipant {
 struct AuthFailureState {
     failures: u32,
     locked_until_epoch: Option<u64>,
+}
+
+// Entry for an active live TV HLS transcode session. Stored in LIVE_HLS_SESSIONS keyed
+// by play_session_id. Lifecycle mirrors VOD TranscodeSession without the DB media_item JOIN.
+#[derive(Debug, Clone)]
+struct LiveHlsSessionEntry {
+    play_session_id: String,
+    dedupe_key: String,
+    channel_id: String,
+    channel_url: String,
+    output_path: String,
+    user_id: Uuid,
+    device_id: Option<String>,
+    status: String,
+    process_id: Option<i64>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -10370,81 +10397,93 @@ async fn proxy_live_tv_channel_url(url: String) -> Result<axum::response::Respon
                 // Lock is released here (end of block).
                 (rx, handle_gen)
             } else {
-                // No existing handle: drop the lock before doing any network I/O.
+                // No existing handle. Create the broadcast channel and INSERT the handle into the
+                // registry BEFORE opening the upstream connection. This prevents a concurrent
+                // request from also entering Phase 2 and opening a duplicate simulator connection
+                // (which would briefly inflate maxConcurrentByChannel). Any request arriving
+                // while the connection is being established will find this entry and subscribe.
+                let handle_gen = LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                let (tx, rx) = broadcast::channel::<Bytes>(LIVE_STREAM_BROADCAST_CAPACITY);
+                let sender_clone = tx.clone();
+                let url_clone = url.clone();
+                registry.insert(
+                    url.clone(),
+                    SharedLiveStreamHandle {
+                        refcount: 1,
+                        generation: handle_gen,
+                        sender: tx,
+                        _cancel: cancel_tx,
+                    },
+                );
+                // Release the registry lock before doing network I/O.
                 drop(registry);
 
-                // Phase 2: open the outgoing connection WITHOUT holding the lock.
-                let client = HttpClient::new();
-                let upstream = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|error| ApiError::internal(format!("HDHomeRun proxy error: {error}")))?;
-                if !upstream.status().is_success() {
-                    return Err(ApiError::internal(format!(
-                        "HDHomeRun upstream returned HTTP {}",
-                        upstream.status()
-                    )));
-                }
+                // Phase 2: open the outgoing connection WITHOUT holding the registry lock.
+                // If it fails, clean up the pre-inserted entry and return an error.
+                //
+                // Known edge case: if consumer 2 subscribes (Phase 1, finds the pre-inserted
+                // entry, increments refcount, receives a broadcast::Receiver) between Phase 1
+                // and the connection failure below, it will receive RecvError::Closed when the
+                // producer never sends — yielding a 200 response with an empty body. This is
+                // an uncommon timing window (connection attempt is typically fast). Fixing it
+                // would require either (a) not pre-inserting until after the connection is
+                // established (reverting the duplicate-prevention property), or (b) marking the
+                // handle as "connecting" and having late consumers await a separate ready signal.
+                // Documented as a known limitation; the test suite does not exercise this window.
+                let upstream = match HttpClient::new().get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => resp,
+                    Ok(resp) => {
+                        let mut registry = live_stream_registry().lock().await;
+                        if registry.get(&url).map_or(false, |h| h.generation == handle_gen) {
+                            registry.remove(&url);
+                        }
+                        return Err(ApiError::internal(format!(
+                            "HDHomeRun upstream returned HTTP {}",
+                            resp.status()
+                        )));
+                    }
+                    Err(error) => {
+                        let mut registry = live_stream_registry().lock().await;
+                        if registry.get(&url).map_or(false, |h| h.generation == handle_gen) {
+                            registry.remove(&url);
+                        }
+                        return Err(ApiError::internal(format!("HDHomeRun proxy error: {error}")));
+                    }
+                };
 
-                // Phase 3: re-acquire the lock and double-check (another task may have raced us).
-                let mut registry = live_stream_registry().lock().await;
-                if let Some(handle) = registry.get_mut(&url) {
-                    // Another task inserted a handle while we were connecting; reuse it.
-                    // Our new `upstream` connection is dropped here, closing it immediately.
-                    handle.refcount += 1;
-                    let handle_gen = handle.generation;
-                    let rx = handle.sender.subscribe();
-                    (rx, handle_gen)
-                } else {
-                    // We are still the first; insert our new handle.
-                    let handle_gen = LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-                    let (tx, rx) = broadcast::channel::<Bytes>(LIVE_STREAM_BROADCAST_CAPACITY);
-                    let sender_clone = tx.clone();
-                    let url_clone = url.clone();
-
-                    // Producer task: reads chunks from the outgoing connection and broadcasts them.
-                    // Terminates when the cancel signal arrives (all consumers gone) or source closes.
-                    tokio::spawn(async move {
-                        use futures_util::StreamExt;
-                        let mut byte_stream = upstream.bytes_stream();
-                        tokio::pin!(cancel_rx);
-                        loop {
-                            tokio::select! {
-                                _ = &mut cancel_rx => break,
-                                chunk = byte_stream.next() => {
-                                    match chunk {
-                                        Some(Ok(bytes)) => {
-                                            // No active receivers means all consumers dropped.
-                                            if sender_clone.send(bytes).is_err() {
-                                                break;
-                                            }
+                // Phase 3: start the producer task. The registry entry already exists.
+                // Producer task: reads chunks from the outgoing connection and broadcasts them.
+                // Terminates when the cancel signal arrives (all consumers gone) or source closes.
+                tokio::spawn(async move {
+                    use futures_util::StreamExt;
+                    let mut byte_stream = upstream.bytes_stream();
+                    tokio::pin!(cancel_rx);
+                    loop {
+                        tokio::select! {
+                            _ = &mut cancel_rx => break,
+                            chunk = byte_stream.next() => {
+                                match chunk {
+                                    Some(Ok(bytes)) => {
+                                        // No active receivers means all consumers dropped.
+                                        if sender_clone.send(bytes).is_err() {
+                                            break;
                                         }
-                                        _ => break,
                                     }
+                                    _ => break,
                                 }
                             }
                         }
-                        // Remove registry entry when producer exits, but only if this is still
-                        // the same generation (a new handle may have been inserted already).
-                        let mut registry = live_stream_registry().lock().await;
-                        if registry.get(&url_clone).map_or(false, |h| h.generation == handle_gen) {
-                            registry.remove(&url_clone);
-                        }
-                    });
+                    }
+                    // Remove registry entry when producer exits, but only if this is still
+                    // the same generation (a new handle may have been inserted already).
+                    let mut registry = live_stream_registry().lock().await;
+                    if registry.get(&url_clone).map_or(false, |h| h.generation == handle_gen) {
+                        registry.remove(&url_clone);
+                    }
+                });
 
-                    registry.insert(
-                        url.clone(),
-                        SharedLiveStreamHandle {
-                            refcount: 1,
-                            generation: handle_gen,
-                            sender: tx,
-                            _cancel: cancel_tx,
-                        },
-                    );
-                    (rx, handle_gen)
-                }
+                (rx, handle_gen)
             }
         }
     };
@@ -10684,6 +10723,30 @@ fn live_tv_channel_is_remote(path: &FsPath) -> bool {
     s.starts_with("http://") || s.starts_with("https://")
 }
 
+// Returns a stable play_session_id for a live TV channel used in the HLS TranscodingUrl.
+// Deterministic so clients can predict it from the channel_id; changes only when channel_id changes.
+fn live_tv_channel_hls_play_session_id(channel_id: &str) -> String {
+    stable_entity_id("LiveTvHls", channel_id)
+}
+
+// Returns a dedupe key used to claim/find a live transcode session for a channel.
+fn live_tv_channel_hls_dedupe_key(channel_id: &str) -> String {
+    format!("livetv:hls:{channel_id}")
+}
+
+// Returns a stable UUID for a live TV channel, used as the item_id when registering a
+// transcode session in the database (which requires a Uuid, not a raw channel string).
+fn live_tv_channel_stable_uuid(channel_id: &str) -> Option<Uuid> {
+    let hex = stable_entity_id("LiveTvChannel", channel_id);
+    Uuid::parse_str(&hex).ok()
+}
+
+// Returns true when a channel_id looks like an HDHomeRun channel (starts with "hdhr_") or
+// when it fails parse_jellyfin_uuid, indicating it may be a live TV channel identifier.
+fn is_live_tv_channel_id(channel_id: &str) -> bool {
+    channel_id.starts_with("hdhr_") || parse_jellyfin_uuid(channel_id).is_err()
+}
+
 fn live_tv_channel_media_source(
     channel: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
@@ -10701,6 +10764,31 @@ fn live_tv_channel_media_source(
             .unwrap_or_else(|| "ts".to_string())
     };
     let protocol = if is_remote { "Http" } else { "File" };
+
+    // Remote (HDHomeRun) channels support HLS transcode in addition to direct TS stream.
+    // The stable play_session_id is embedded in the TranscodingUrl so clients can reuse it
+    // across channel-detail fetches without starting a new session each time.
+    let (supports_transcoding, transcoding_sub_protocol, transcoding_container, transcoding_url) =
+        if is_remote {
+            let play_session_id = live_tv_channel_hls_play_session_id(&channel_id);
+            let url = format!(
+                "/Videos/{channel_id}/master.m3u8?PlaySessionId={play_session_id}"
+            );
+            (
+                serde_json::json!(true),
+                serde_json::json!("hls"),
+                serde_json::json!("ts"),
+                serde_json::Value::String(url),
+            )
+        } else {
+            (
+                serde_json::json!(false),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
+        };
+
     Ok(serde_json::json!({
         "Protocol": protocol,
         "Id": channel_id,
@@ -10713,7 +10801,10 @@ fn live_tv_channel_media_source(
         "ETag": null,
         "RunTimeTicks": null,
         "ReadAtNativeFramerate": true,
-        "SupportsTranscoding": false,
+        "SupportsTranscoding": supports_transcoding,
+        "TranscodingSubProtocol": transcoding_sub_protocol,
+        "TranscodingContainer": transcoding_container,
+        "TranscodingUrl": transcoding_url,
         "SupportsDirectStream": true,
         "SupportsDirectPlay": true,
         "IsInfiniteStream": true,
@@ -16226,6 +16317,198 @@ fn transcode_stop_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<(
     TRANSCODE_STOPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn live_hls_session_registry() -> &'static Mutex<HashMap<String, LiveHlsSessionEntry>> {
+    LIVE_HLS_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Constructs a synthetic MediaItem for a live TV channel so it can be embedded inside a
+// TranscodeSession without requiring a real media_items DB row.
+fn live_tv_channel_synthetic_media_item(channel_id: &str, channel_url: &str) -> MediaItem {
+    let id = live_tv_channel_stable_uuid(channel_id)
+        .unwrap_or_else(Uuid::new_v4);
+    let now = OffsetDateTime::now_utc();
+    MediaItem {
+        id,
+        virtual_folder_id: Uuid::nil(),
+        name: channel_id.to_string(),
+        path: channel_url.to_string(),
+        media_type: "Video".to_string(),
+        collection_type: None,
+        file_size: None,
+        runtime_ticks: None,
+        bitrate: None,
+        width: None,
+        height: None,
+        media_streams: vec![],
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+// Builds a synthetic TranscodeSession from a LiveHlsSessionEntry for handlers that need one.
+fn live_hls_entry_to_transcode_session(entry: &LiveHlsSessionEntry) -> TranscodeSession {
+    let item = live_tv_channel_synthetic_media_item(&entry.channel_id, &entry.channel_url);
+    TranscodeSession {
+        play_session_id: entry.play_session_id.clone(),
+        dedupe_key: Some(entry.dedupe_key.clone()),
+        device_id: entry.device_id.clone(),
+        user_id: entry.user_id,
+        item,
+        media_source_id: Some(entry.channel_id.clone()),
+        audio_stream_index: None,
+        subtitle_stream_index: None,
+        video_stream_index: Some(0),
+        output_path: entry.output_path.clone(),
+        process_id: entry.process_id,
+        status: entry.status.clone(),
+        progress_percent: None,
+        position_ticks: 0,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+    }
+}
+
+// Builds the ActiveEncodings JSON for a live TV HLS session. Mirrors transcode_session_json
+// but uses channel_id as the item identifier instead of a UUID.
+fn live_hls_session_json(entry: &LiveHlsSessionEntry) -> serde_json::Value {
+    serde_json::json!({
+        "PlaySessionId": entry.play_session_id,
+        "UserId": entry.user_id.simple().to_string(),
+        "ItemId": entry.channel_id,
+        "MediaSourceId": entry.channel_id,
+        "DeviceId": null,
+        "Path": entry.output_path,
+        "OutputPath": entry.output_path,
+        "Status": entry.status,
+        "ProcessId": entry.process_id,
+        "ProgressPercentage": null,
+        "CompletionPercentage": null,
+        "TranscodingPositionTicks": 0,
+        "TranscodingStartPositionTicks": 0,
+        "Container": "ts",
+        "VideoCodec": "ts",
+        "AudioCodec": null,
+        "Width": null,
+        "Height": null,
+        "Bitrate": null,
+        "VideoStreamIndex": 0,
+        "AudioStreamIndex": null,
+        "SubtitleStreamIndex": null,
+        "TranscodeReasons": [],
+        "IsAudioDirect": false,
+        "IsVideoDirect": false,
+        "UpdatedAt": format_time_for_json(entry.updated_at),
+    })
+}
+
+// Starts a new live TV HLS ffmpeg transcode session for the given channel, registers stop_tx
+// in TRANSCODE_STOPS, and inserts the entry into LIVE_HLS_SESSIONS. The session lifecycle
+// mirrors spawn_hls_transcode_task but without DB calls.
+async fn spawn_live_hls_transcode_task(
+    play_session_id: String,
+    channel_id: String,
+    channel_url: String,
+    device_id: Option<String>,
+    user_id: Uuid,
+    command: jellyrin_core::FfmpegCommandSpec,
+    output_path: String,
+) {
+    // Register the stop sender in TRANSCODE_STOPS so DELETE ActiveEncodings can kill ffmpeg.
+    let (stop_tx, stop_rx) = oneshot::channel();
+    {
+        let mut registry = transcode_stop_registry().lock().await;
+        if let Some(prev) = registry.insert(play_session_id.clone(), stop_tx) {
+            let _ = prev.send(());
+        }
+    }
+
+    // Register the live HLS session entry.
+    {
+        let now = OffsetDateTime::now_utc();
+        let entry = LiveHlsSessionEntry {
+            play_session_id: play_session_id.clone(),
+            dedupe_key: live_tv_channel_hls_dedupe_key(&channel_id),
+            channel_id: channel_id.clone(),
+            channel_url: channel_url.clone(),
+            output_path: output_path.clone(),
+            user_id,
+            device_id,
+            status: "starting".to_string(),
+            process_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        live_hls_session_registry()
+            .lock()
+            .await
+            .insert(play_session_id.clone(), entry);
+    }
+
+    tokio::spawn(async move {
+        let mut process = match spawn_transcode_process(&command) {
+            Ok(process) => process,
+            Err(error) => {
+                tracing::error!(%play_session_id, %error, "failed to spawn live HLS transcode process");
+                let mut registry = live_hls_session_registry().lock().await;
+                if let Some(entry) = registry.get_mut(&play_session_id) {
+                    entry.status = "failed".to_string();
+                    entry.updated_at = OffsetDateTime::now_utc();
+                }
+                transcode_stop_registry().lock().await.remove(&play_session_id);
+                return;
+            }
+        };
+
+        let process_id = process.process_id().map(i64::from);
+        {
+            let mut registry = live_hls_session_registry().lock().await;
+            if let Some(entry) = registry.get_mut(&play_session_id) {
+                entry.status = "running".to_string();
+                entry.process_id = process_id;
+                entry.updated_at = OffsetDateTime::now_utc();
+            }
+        }
+
+        let mut stopped = false;
+        let exit = tokio::select! {
+            exit = process.wait() => exit,
+            _ = stop_rx => {
+                stopped = true;
+                process.stop().await
+            }
+        };
+
+        let final_status = match exit {
+            Ok(_) if stopped => "stopped",
+            Ok(exit) if exit.success => "completed",
+            Ok(_) => "failed",
+            Err(error) => {
+                tracing::error!(%play_session_id, %error, "live HLS transcode process wait failed");
+                "failed"
+            }
+        };
+
+        drop(process);
+        transcode_stop_registry().lock().await.remove(&play_session_id);
+
+        {
+            let mut registry = live_hls_session_registry().lock().await;
+            if let Some(entry) = registry.get_mut(&play_session_id) {
+                entry.status = final_status.to_string();
+                entry.updated_at = OffsetDateTime::now_utc();
+            }
+        }
+
+        if stopped {
+            cleanup_hls_transcode_files(&output_path).await;
+            live_hls_session_registry()
+                .lock()
+                .await
+                .remove(&play_session_id);
+        }
+    });
+}
+
 async fn resolve_media_source_item(
     db: &Database,
     requested_item: MediaItem,
@@ -17183,10 +17466,17 @@ async fn hls_media_playlist_response_for(
     let session =
         active_hls_transcode_session_for(state, headers, item_id, &query, route.media_type).await?;
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
+    // Live TV HLS sessions use a longer readiness timeout because the HTTP live source
+    // (HDHomeRun stream) may require extra buffering before ffmpeg writes the first segment.
+    let readiness_timeout = if is_live_tv_channel_id(item_id) {
+        std::time::Duration::from_secs(LIVE_HLS_READINESS_TIMEOUT_SECS)
+    } else {
+        std::time::Duration::from_secs(5)
+    };
     let ready = wait_for_hls_readiness(
         &layout.media_playlist_path,
         layout.segment_path(0),
-        std::time::Duration::from_secs(5),
+        readiness_timeout,
     )
     .await?;
     if !ready {
@@ -19321,14 +19611,24 @@ async fn active_hls_transcode_session_for(
     query: &HlsQuery,
     media_type: &str,
 ) -> Result<TranscodeSession, ApiError> {
-    require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
-    let requested_item_id = parse_jellyfin_uuid(item_id)?;
+    let user = require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
     let play_session_id = query
         .play_session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
+
+    // D1a: Live TV channel branch. When item_id is not a standard Jellyfin UUID (e.g. "hdhr_4.1"),
+    // try to resolve it as a live TV channel. This branch does NOT relax validation for VOD items.
+    if is_live_tv_channel_id(item_id) {
+        return active_hls_transcode_session_for_live_tv(
+            state, item_id, play_session_id, media_type, user.id,
+        )
+        .await;
+    }
+
+    let requested_item_id = parse_jellyfin_uuid(item_id)?;
     let session = state
         .db
         .transcode_session_by_play_session_id(play_session_id)
@@ -19344,6 +19644,84 @@ async fn active_hls_transcode_session_for(
         return Err(ApiError::not_found("HLS transcode session not found"));
     }
     Ok(session)
+}
+
+// Resolves or starts a live TV HLS transcode session for the given channel.
+// Uses an in-memory registry (LIVE_HLS_SESSIONS) because live TV channels are not in the
+// media_items DB table and therefore cannot be stored via the standard transcode DB path.
+// Registers stop_tx in TRANSCODE_STOPS so DELETE ActiveEncodings kills ffmpeg cleanly.
+async fn active_hls_transcode_session_for_live_tv(
+    state: &AppState,
+    channel_id: &str,
+    play_session_id: &str,
+    media_type: &str,
+    user_id: Uuid,
+) -> Result<TranscodeSession, ApiError> {
+    if media_type != "Video" {
+        return Err(ApiError::not_found("HLS transcode session not found"));
+    }
+
+    let channel = live_tv_channel_by_id(&state.db, channel_id).await?;
+    let channel_url = live_tv_channel_path(&channel)?
+        .to_string_lossy()
+        .to_string();
+
+    // Check for an existing active session by play_session_id.
+    {
+        let registry = live_hls_session_registry().lock().await;
+        if let Some(entry) = registry.get(play_session_id) {
+            if matches!(entry.status.as_str(), "starting" | "running") {
+                return Ok(live_hls_entry_to_transcode_session(entry));
+            }
+        }
+    }
+
+    // No active session found. Check by dedupe_key to avoid starting a duplicate.
+    let dedupe_key = live_tv_channel_hls_dedupe_key(channel_id);
+    {
+        let registry = live_hls_session_registry().lock().await;
+        if let Some(entry) = registry.values().find(|e| {
+            e.dedupe_key == dedupe_key && matches!(e.status.as_str(), "starting" | "running")
+        }) {
+            return Ok(live_hls_entry_to_transcode_session(entry));
+        }
+    }
+
+    // Start a new live HLS transcode session for this channel.
+    let new_play_session_id = play_session_id.to_string();
+    let layout = HlsTranscodeLayout::new(transcode_temp_root(), &new_play_session_id);
+    tokio::fs::create_dir_all(&layout.session_dir).await?;
+
+    let request = HlsTranscodeRequest::new(
+        channel_url.clone(),
+        layout.media_playlist_path.to_string_lossy().to_string(),
+        layout.segment_pattern_string(),
+        TranscodeStreamSelection {
+            video_stream_index: Some(0),
+            audio_stream_index: Some(0),
+            subtitle_stream_index: None,
+        },
+    );
+    let command = build_hls_ffmpeg_command(&request);
+    let output_path = layout.media_playlist_path.to_string_lossy().to_string();
+
+    spawn_live_hls_transcode_task(
+        new_play_session_id.clone(),
+        channel_id.to_string(),
+        channel_url,
+        None,
+        user_id,
+        command,
+        output_path,
+    )
+    .await;
+
+    // Return the just-registered session.
+    let registry = live_hls_session_registry().lock().await;
+    registry
+        .get(&new_play_session_id)
+        .map(live_hls_entry_to_transcode_session)
+        .ok_or_else(|| ApiError::internal("Failed to register live HLS session"))
 }
 
 fn playlist_response(
@@ -21155,7 +21533,15 @@ async fn active_encodings(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let sessions = state.db.active_transcode_sessions().await?;
-    Ok(Json(sessions.iter().map(transcode_session_json).collect()))
+    let mut result: Vec<serde_json::Value> = sessions.iter().map(transcode_session_json).collect();
+    // Include active live TV HLS sessions from the in-memory registry.
+    let live_registry = live_hls_session_registry().lock().await;
+    for entry in live_registry.values() {
+        if matches!(entry.status.as_str(), "starting" | "running") {
+            result.push(live_hls_session_json(entry));
+        }
+    }
+    Ok(Json(result))
 }
 
 async fn stop_active_encoding(
@@ -21170,6 +21556,35 @@ async fn stop_active_encoding(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
+
+    // Check the live HLS in-memory registry first (live TV channels are not in the DB).
+    let live_entry = live_hls_session_registry()
+        .lock()
+        .await
+        .get(play_session_id)
+        .cloned();
+    if let Some(entry) = live_entry {
+        if entry.user_id != user.id && !user.is_administrator {
+            return Err(ApiError::forbidden("Transcode session access denied"));
+        }
+        let stop_sender = transcode_stop_registry()
+            .lock()
+            .await
+            .remove(play_session_id);
+        if let Some(stop_sender) = stop_sender {
+            // spawn_live_hls_transcode_task will set status and remove the entry.
+            let _ = stop_sender.send(());
+        } else {
+            // Already stopped; clean up the entry and files.
+            live_hls_session_registry()
+                .lock()
+                .await
+                .remove(play_session_id);
+            cleanup_hls_transcode_files(&entry.output_path).await;
+        }
+        return Ok(StatusCode::OK);
+    }
+
     let session = state
         .db
         .transcode_session_by_play_session_id(play_session_id)
@@ -25402,7 +25817,8 @@ mod tests {
         default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
         direct_play_profile_matches, encoding_configuration_json, hdhomerun_bool_field,
         hls_transcode_dedupe_key, json_value_i64, last_system_lifecycle_command,
-        live_tv_channel_is_remote, load_countries, load_cultures, media_item_by_id,
+        is_live_tv_channel_id, live_tv_channel_is_remote, live_tv_channel_media_source,
+        live_tv_channel_stable_uuid, load_countries, load_cultures, media_item_by_id,
         media_item_streams, package_install_task_key, paged_media_items, parse_authorization_token,
         parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
         parse_live_tv_xmltv_programs, parse_media_browser_pairs,
@@ -31937,6 +32353,116 @@ mod tests {
         assert!(!live_tv_channel_is_remote(&local_path));
         let rel_path = PathBuf::from("news.ts");
         assert!(!live_tv_channel_is_remote(&rel_path));
+    }
+
+    // Spec: HlsTranscodeRequest live -> command contains -hls_playlist_type event and -i <url>,
+    // without delete_segments (live stream must not delete old segments while ffmpeg runs).
+    #[test]
+    fn live_hls_ffmpeg_command_uses_event_playlist_and_http_input() {
+        use jellyrin_core::{HlsTranscodeRequest, TranscodeStreamSelection, build_hls_ffmpeg_command};
+        let request = HlsTranscodeRequest::new(
+            "http://192.168.1.100:5004/auto/v4.1",
+            "/tmp/jellyrin/transcodes/live-session/main.m3u8",
+            "/tmp/jellyrin/transcodes/live-session/segment_%05d.ts",
+            TranscodeStreamSelection {
+                video_stream_index: Some(0),
+                audio_stream_index: Some(0),
+                subtitle_stream_index: None,
+            },
+        );
+        let command = build_hls_ffmpeg_command(&request);
+        assert_eq!(command.program, "ffmpeg");
+        // -i must point to the HTTP URL directly (no file path wrapping).
+        assert!(
+            command.args.windows(2).any(|pair| pair == ["-i", "http://192.168.1.100:5004/auto/v4.1"]),
+            "command must include -i <hdhr_url>: {:?}", command.args
+        );
+        // -hls_playlist_type event is required for a live (non-ending) playlist.
+        assert!(
+            command.args.windows(2).any(|pair| pair == ["-hls_playlist_type", "event"]),
+            "command must include -hls_playlist_type event: {:?}", command.args
+        );
+        // No delete_segments / hls_flags that would remove old segments (live streams keep all segs).
+        assert!(
+            !command.args.iter().any(|arg| arg.contains("delete_segments")),
+            "command must not include delete_segments: {:?}", command.args
+        );
+        // No -ss seek flag for a live stream (start_position_ticks is 0 by default).
+        assert!(
+            !command.args.iter().any(|arg| arg == "-ss"),
+            "command must not include -ss for live: {:?}", command.args
+        );
+    }
+
+    // Spec: live_tv_channel_media_source of a remote (HDHomeRun) channel includes
+    // SupportsTranscoding:true, TranscodingSubProtocol:"hls", and TranscodingUrl pointing to
+    // master.m3u8 (or live.m3u8) with a stable PlaySessionId embedded.
+    #[test]
+    fn live_tv_remote_channel_media_source_exposes_hls_transcode_fields() {
+        let channel = json!({
+            "Id": "hdhr_4.1",
+            "Name": "NBC HD",
+            "Path": "http://192.168.1.100:5004/auto/v4.1",
+        });
+        let ms = live_tv_channel_media_source(&channel).unwrap();
+        assert_eq!(ms["SupportsTranscoding"], true, "remote channel must support transcoding");
+        assert_eq!(ms["TranscodingSubProtocol"], "hls");
+        assert_eq!(ms["TranscodingContainer"], "ts");
+        // TranscodingUrl must include master.m3u8 or live.m3u8 and a PlaySessionId.
+        let url = ms["TranscodingUrl"].as_str().unwrap_or("");
+        assert!(
+            url.contains("master.m3u8") || url.contains("live.m3u8"),
+            "TranscodingUrl must reference master.m3u8 or live.m3u8: {url}"
+        );
+        assert!(
+            url.contains("PlaySessionId="),
+            "TranscodingUrl must include PlaySessionId: {url}"
+        );
+        // SupportsDirectStream must remain true (do not break the existing direct TS path).
+        assert_eq!(ms["SupportsDirectStream"], true, "direct stream must still be supported");
+    }
+
+    // Spec: local (non-remote) channels must NOT expose SupportsTranscoding:true (no HLS for local TS).
+    #[test]
+    fn live_tv_local_channel_media_source_has_no_hls_transcode() {
+        let channel = json!({
+            "Id": "channel-local",
+            "Name": "Local News",
+            "Path": "/srv/live/news.ts",
+        });
+        let ms = live_tv_channel_media_source(&channel).unwrap();
+        assert_eq!(ms["SupportsTranscoding"], false, "local channel must not expose HLS transcode");
+        assert!(ms["TranscodingUrl"].is_null(), "local channel must not have TranscodingUrl");
+    }
+
+    // Spec: is_live_tv_channel_id returns true for hdhr_* (which fails parse_jellyfin_uuid)
+    // and false for proper UUID strings — ensuring the D1 live TV branch is isolated to live
+    // channels only and does not open a bypass for VOD items.
+    #[test]
+    fn live_tv_channel_id_detection_isolates_live_from_vod() {
+        // HDHomeRun channel IDs are NOT valid Jellyfin UUIDs.
+        assert!(is_live_tv_channel_id("hdhr_4.1"), "hdhr_ prefix must be detected as live");
+        assert!(is_live_tv_channel_id("hdhr_5.1"), "hdhr_ prefix must be detected as live");
+        // Proper UUIDs (VOD item IDs) must NOT be detected as live TV channels.
+        assert!(
+            !is_live_tv_channel_id("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            "UUID item_id must not be treated as live TV channel"
+        );
+        assert!(
+            !is_live_tv_channel_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "UUID simple form must not be treated as live TV channel"
+        );
+    }
+
+    // Spec: stable UUID for a live TV channel is derived deterministically from the channel_id
+    // so the same channel always gets the same item_id in synthetic sessions.
+    #[test]
+    fn live_tv_channel_stable_uuid_is_deterministic() {
+        let uuid1 = live_tv_channel_stable_uuid("hdhr_4.1");
+        let uuid2 = live_tv_channel_stable_uuid("hdhr_4.1");
+        assert_eq!(uuid1, uuid2, "stable UUID must be deterministic");
+        let uuid_other = live_tv_channel_stable_uuid("hdhr_5.1");
+        assert_ne!(uuid1, uuid_other, "different channels must get different UUIDs");
     }
 
     #[tokio::test]

@@ -3,211 +3,91 @@
 'use strict';
 
 const http = require('node:http');
+const { spawnSync } = require('node:child_process');
+const os = require('node:os');
+const path = require('node:path');
+const fs = require('node:fs');
 
-// Pre-encoded 1-second MPEG-2 video TS segment (176×144 @ 29.97 fps, 100 kbps).
-// Generated with: ffmpeg -f lavfi -i color=black:size=176x144:rate=29.97:duration=1
-//   -c:v mpeg2video -b:v 100k -r 29.97 -f mpegts <output>
-// This is served as a looping chunked stream so that:
-//   1. ffprobe (run by Jellyfin PlaybackInfo) can identify "mpeg2video" within its 3-second
-//      analyzeduration window — proper PAT/PMT and I-frame data are present from byte 0.
-//   2. The upstream Jellyfin SharedHttpStream temp file stays open (no EOF is sent) so the
-//      /LiveTv/LiveStreamFiles/<id>/stream.ts endpoint is fetcheable for the byte-check probe.
-// Content-Type: video/mp2t, no Content-Length (chunked transfer encoding).
-const TS_LOOP_BODY = Buffer.from(
-  'R0AREABC8CUAAcEAAP8B/wAB/IAUSBIBBkZGbXBlZwlTZXJ2aWNlMDF3fEPK////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////////////////////9HQAAQAACwDQABwQAAAAHwACqxBLL/////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/////////////////////////////////////////////0dQABAAArASAAHBAADhAPAAAuEA8ACe'
-  + 'iyPR////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////R0EAMAdQ'
-  + 'AAB7DH4AAAAB4AAAgMAKMQAH79cRAAfYYQAAAbMLAJAU///gEAAAAbUUigABAAAAAAG4AAgAQAAA'
-  + 'AQAAD//4AAABtY//80GAAAABARP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5Sl'
-  + 'Ii5SlIiAAAABAhP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIiAAAAB'
-  + 'AxP4fSlIi5SlIi5HAQARUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIgAAAAQQT+H0p'
-  + 'SIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIgAAAAQUT+H0pSIuUpSIuUpSI'
-  + 'uUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIgAAAAQYT+H0pSIuUpSIuUpSIuUpSIuUpSIuU'
-  + 'pSIuUpSIuUpSIuUpSIuUpSIuUpSIgAAAAQcT+EcBADItAP//////////////////////////////'
-  + '////////////////////////////fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5Sl'
-  + 'Ii5SlIiAAAABCBP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIiAAAAB'
-  + 'CRP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIiAR0EAM0oA////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/////////////wAAAeAAAIDACjEACQdNEQAH79cAAAEAAFf/+4AAAAG1gR/zQYAAAAEBEnCzgAAA'
-  + 'AQIScLOAAAABAxJws4AAAAEEEnCzgAAAAQUScLOAAAABBhJws4AAAAEHEnCzgAAAAQgScLOAAAAB'
-  + 'CRJws4BHQQA0ShAAAIbHfgD/////////////////////////////////////////////////////'
-  + '////////////////////////////////////AAAB4AAAgMAKMQAJHsMRAAkHTQAAAQAAl//7gAAA'
-  + 'AbWBH/NBgAAAAQEScLOAAAABAhJws4AAAAEDEnCzgAAAAQQScLOAAAABBRJws4AAAAEGEnCzgAAA'
-  + 'AQcScLOAAAABCBJws4AAAAEJEnCzgEdAABEAALANAAHBAAAAAfAAKrEEsv//////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////R1AAEQACsBIAAcEAAOEA8AAC'
-  + '4QDwAJ6LI9H/////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////////////////////////////////////////////////////////////////////////9H'
-  + 'QQA1SgD/////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////AAAB4AAAgMAKMQAJNjkRAAkewwAAAQAA1//7gAAAAbWBH/NB'
-  + 'gAAAAQEScLOAAAABAhJws4AAAAEDEnCzgAAAAQQScLOAAAABBRJws4AAAAEGEnCzgAAAAQcScLOA'
-  + 'AAABCBJws4AAAAEJEnCzgEdBADZKEAAAkoJ+AP//////////////////////////////////////'
-  + '//////////////////////////////////////////////////8AAAHgAACAwAoxAAlNrxEACTY5'
-  + 'AAABAAEX//uAAAABtYEf80GAAAABARJws4AAAAECEnCzgAAAAQMScLOAAAABBBJws4AAAAEFEnCz'
-  + 'gAAAAQYScLOAAAABBxJws4AAAAEIEnCzgAAAAQkScLOAR0EAN0oA////////////////////////'
-  + '/////////////////////////////////////////////////////////////////////////wAA'
-  + 'AeAAAIDACjEACWUlEQAJTa8AAAEAAVf/+4AAAAG1gR/zQYAAAAEBEnCzgAAAAQIScLOAAAABAxJw'
-  + 's4AAAAEEEnCzgAAAAQUScLOAAAABBhJws4AAAAEHEnCzgAAAAQgScLOAAAABCRJws4BHQAASAACw'
-  + 'DQABwQAAAAHwACqxBLL/////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/////////////0dQABIAArASAAHBAADhAPAAAuEA8ACeiyPR////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////R0EAOEoQAACePX4A////////////////////////'
-  + '/////////////////////////////////////////////////////////////////wAAAeAAAIDA'
-  + 'CjEACXybEQAJZSUAAAEAAZf/+4AAAAG1gR/zQYAAAAEBEnCzgAAAAQIScLOAAAABAxJws4AAAAEE'
-  + 'EnCzgAAAAQUScLOAAAABBhJws4AAAAEHEnCzgAAAAQgScLOAAAABCRJws4BHQQA5SgD/////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////AAAB4AAAgMAKMQAJlBERAAl8mwAAAQAB1//7gAAAAbWBH/NBgAAAAQEScLOAAAAB'
-  + 'AhJws4AAAAEDEnCzgAAAAQQScLOAAAABBRJws4AAAAEGEnCzgAAAAQcScLOAAAABCBJws4AAAAEJ'
-  + 'EnCzgEdBADpKEAAAqfh+AP//////////////////////////////////////////////////////'
-  + '//////////////////////////////////8AAAHgAACAwAoxAAmrhxEACZQRAAABAAIX//uAAAAB'
-  + 'tYEf80GAAAABARJws4AAAAECEnCzgAAAAQMScLOAAAABBBJws4AAAAEFEnCzgAAAAQYScLOAAAAB'
-  + 'BxJws4AAAAEIEnCzgAAAAQkScLOAR0AAEwAAsA0AAcEAAAAB8AAqsQSy////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////////////////////////////////////////////////9HUAATAAKwEgABwQAA4QDwAALh'
-  + 'APAAnosj0f//////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/////////////////////////////////////////////////////////////////////////0dB'
-  + 'ADtKAP//////////////////////////////////////////////////////////////////////'
-  + '//////////////////////////8AAAHgAACAwAoxAAnC/REACauHAAABAAJX//uAAAABtYEf80GA'
-  + 'AAABARJws4AAAAECEnCzgAAAAQMScLOAAAABBBJws4AAAAEFEnCzgAAAAQYScLOAAAABBxJws4AA'
-  + 'AAEIEnCzgAAAAQkScLOAR0EAPEoQAAC1s34A////////////////////////////////////////'
-  + '/////////////////////////////////////////////////wAAAeAAAIDACjEACdpzEQAJwv0A'
-  + 'AAEAApf/+4AAAAG1gR/zQYAAAAEBEnCzgAAAAQIScLOAAAABAxJws4AAAAEEEnCzgAAAAQUScLOA'
-  + 'AAABBhJws4AAAAEHEnCzgAAAAQgScLOAAAABCRJws4BHQQA9SgD/////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////AAAB'
-  + '4AAAgMAKMQAJ8ekRAAnacwAAAQAC1//7gAAAAbWBH/NBgAAAAQEScLOAAAABAhJws4AAAAEDEnCz'
-  + 'gAAAAQQScLOAAAABBRJws4AAAAEGEnCzgAAAAQcScLOAAAABCBJws4AAAAEJEnCzgEdAABQAALAN'
-  + 'AAHBAAAAAfAAKrEEsv//////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////R1AAFAACsBIAAcEAAOEA8AAC4QDwAJ6LI9H/////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////////////////////////////////9HQQA+B1AAAMFufgAAAAHgAACAwAoxAAsJXxEACfHp'
-  + 'AAABswsAkBT//+AQAAABtRSKAAEAAAAAAbgACAYAAAABAAAP//gAAAG1j//zQYAAAAEBE/h9KUiL'
-  + 'lKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiIAAAAECE/h9KUiLlKUiLlKUiLlK'
-  + 'UiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiIAAAAEDE/h9KUiLlKUiLkcBAB9SlIi5SlIi5SlI'
-  + 'i5SlIi5SlIi5SlIi5SlIi5SlIi5SlIiAAAABBBP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5'
-  + 'SlIi5SlIi5SlIi5SlIiAAAABBRP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5Sl'
-  + 'Ii5SlIiAAAABBhP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIiAAAAB'
-  + 'BxP4RwEAMC0A//////////////////////////////////////////////////////////99KUiL'
-  + 'lKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiIAAAAEIE/h9KUiLlKUiLlKUiLlK'
-  + 'UiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiLlKUiIAAAAEJE/h9KUiLlKUiLlKUiLlKUiLlKUiLlKUi'
-  + 'LlKUiLlKUiLlKUiLlKUiLlKUiIBHQQAxSgD/////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////AAAB4AAAgMAKMQALINUR'
-  + 'AAsJXwAAAQAAV//7gAAAAbWBH/NBgAAAAQEScLOAAAABAhJws4AAAAEDEnCzgAAAAQQScLOAAAAB'
-  + 'BRJws4AAAAEGEnCzgAAAAQcScLOAAAABCBJws4AAAAEJEnCzgEdBADJKEAAAzSl+AP//////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//8AAAHgAACAwAoxAAs4SxEACyDVAAABAACX//uAAAABtYEf80GAAAABARJws4AAAAECEnCzgAAA'
-  + 'AQMScLOAAAABBBJws4AAAAEFEnCzgAAAAQYScLOAAAABBxJws4AAAAEIEnCzgAAAAQkScLOAR0AR'
-  + 'EQBC8CUAAcEAAP8B/wAB/IAUSBIBBkZGbXBlZwlTZXJ2aWNlMDF3fEPK////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////////////////9HQAAVAACwDQABwQAAAAHwACqxBLL/////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/////////////////////////////////////////0dQABUAArASAAHBAADhAPAAAuEA8ACeiyPR'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////R0EAM0oA////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/////////////////wAAAeAAAIDACjEAC0/BEQALOEsAAAEAANf/+4AAAAG1gR/zQYAAAAEBEnCz'
-  + 'gAAAAQIScLOAAAABAxJws4AAAAEEEnCzgAAAAQUScLOAAAABBhJws4AAAAEHEnCzgAAAAQgScLOA'
-  + 'AAABCRJws4BHQQA0ShAAANjkfgD/////////////////////////////////////////////////'
-  + '////////////////////////////////////////AAAB4AAAgMAKMQALZzcRAAtPwQAAAQABF//7'
-  + 'gAAAAbWBH/NBgAAAAQEScLOAAAABAhJws4AAAAEDEnCzgAAAAQQScLOAAAABBRJws4AAAAEGEnCz'
-  + 'gAAAAQcScLOAAAABCBJws4AAAAEJEnCzgEdBADVKAP//////////////////////////////////'
-  + '//////////////////////////////////////////////////////////////8AAAHgAACAwAox'
-  + 'AAt+rREAC2c3AAABAAFX//uAAAABtYEf80GAAAABARJws4AAAAECEnCzgAAAAQMScLOAAAABBBJw'
-  + 's4AAAAEFEnCzgAAAAQYScLOAAAABBxJws4AAAAEIEnCzgAAAAQkScLOAR0AAFgAAsA0AAcEAAAAB'
-  + '8AAqsQSy////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//9HUAAWAAKwEgABwQAA4QDwAALhAPAAnosj0f//////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/////////////////////////0dBADZKEAAA5J9+AP//////////////////////////////////'
-  + '//////////////////////////////////////////////////////8AAAHgAACAwAoxAAuWIxEA'
-  + 'C36tAAABAAGX//uAAAABtYEf80GAAAABARJws4AAAAECEnCzgAAAAQMScLOAAAABBBJws4AAAAEF'
-  + 'EnCzgAAAAQYScLOAAAABBxJws4AAAAEIEnCzgAAAAQkScLOAR0EAN0oA////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/wAAAeAAAIDACjEAC62ZEQALliMAAAEAAdf/+4AAAAG1gR/zQYAAAAEBEnCzgAAAAQIScLOAAAAB'
-  + 'AxJws4AAAAEEEnCzgAAAAQUScLOAAAABBhJws4AAAAEHEnCzgAAAAQgScLOAAAABCRJws4BHQQA4'
-  + 'ShAAAPBafgD/////////////////////////////////////////////////////////////////'
-  + '////////////////////////AAAB4AAAgMAKMQALxQ8RAAutmQAAAQACF//7gAAAAbWBH/NBgAAA'
-  + 'AQEScLOAAAABAhJws4AAAAEDEnCzgAAAAQQScLOAAAABBRJws4AAAAEGEnCzgAAAAQcScLOAAAAB'
-  + 'CBJws4AAAAEJEnCzgEdAABcAALANAAHBAAAAAfAAKrEEsv//////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////R1AAFwACsBIAAcEAAOEA8AAC4QDwAJ6LI9H/'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////////////////////////////////////////////////////////////9HQQA5SgD/////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////AAAB4AAAgMAKMQAL3IURAAvFDwAAAQACV//7gAAAAbWBH/NBgAAAAQEScLOA'
-  + 'AAABAhJws4AAAAEDEnCzgAAAAQQScLOAAAABBRJws4AAAAEGEnCzgAAAAQcScLOAAAABCBJws4AA'
-  + 'AAEJEnCzgEdBADpKEAAA/BV+AP//////////////////////////////////////////////////'
-  + '//////////////////////////////////////8AAAHgAACAwAoxAAvz+xEAC9yFAAABAAKX//uA'
-  + 'AAABtYEf80GAAAABARJws4AAAAECEnCzgAAAAQMScLOAAAABBBJws4AAAAEFEnCzgAAAAQYScLOA'
-  + 'AAABBxJws4AAAAEIEnCzgAAAAQkScLOAR0EAO0oA////////////////////////////////////'
-  + '/////////////////////////////////////////////////////////////wAAAeAAAIDACjEA'
-  + 'DQtxEQAL8/sAAAEAAtf/+4AAAAG1gR/zQYAAAAEBEnCzgAAAAQIScLOAAAABAxJws4AAAAEEEnCz'
-  + 'gAAAAQUScLOAAAABBhJws4AAAAEHEnCzgAAAAQgScLOAAAABCRJws4BHQAAYAACwDQABwQAAAAHw'
-  + 'ACqxBLL/////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '/0dQABgAArASAAHBAADhAPAAAuEA8ACeiyPR////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////R0EAPAdQAAEH0H4AAAAB4AAAgMAKMQANIucRAA0LcQAAAbMLAJAU'
-  + '///gEAAAAbUUigABAAAAAAG4AAgMAAAAAQAAD//4AAABtY//80GAAAABARP4fSlIi5SlIi5SlIi5'
-  + 'SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIiAAAABAhP4fSlIi5SlIi5SlIi5SlIi5SlIi5Sl'
-  + 'Ii5SlIi5SlIi5SlIi5SlIi5SlIiAAAABAxP4fSlIi5SlIi5HAQAdUpSIuUpSIuUpSIuUpSIuUpSI'
-  + 'uUpSIuUpSIuUpSIuUpSIgAAAAQQT+H0pSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuU'
-  + 'pSIuUpSIgAAAAQUT+H0pSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIgAAA'
-  + 'AQYT+H0pSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIuUpSIgAAAAQcT+EcBAD4t'
-  + 'AP//////////////////////////////////////////////////////////fSlIi5SlIi5SlIi5'
-  + 'SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIiAAAABCBP4fSlIi5SlIi5SlIi5SlIi5SlIi5Sl'
-  + 'Ii5SlIi5SlIi5SlIi5SlIi5SlIiAAAABCRP4fSlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi5SlIi'
-  + '5SlIi5SlIi5SlIiAR0EAP0oA////////////////////////////////////////////////////'
-  + '/////////////////////////////////////////////wAAAeAAAIDACjEADTpdEQANIucAAAEA'
-  + 'AFf/+4AAAAG1gR/zQYAAAAEBEnCzgAAAAQIScLOAAAABAxJws4AAAAEEEnCzgAAAAQUScLOAAAAB'
-  + 'BhJws4AAAAEHEnCzgAAAAQgScLOAAAABCRJws4BHQQAwShAAAROLfgD/////////////////////'
-  + '////////////////////////////////////////////////////////////////////AAAB4AAA'
-  + 'gMAKMQANUdMRAA06XQAAAQAAl//7gAAAAbWBH/NBgAAAAQEScLOAAAABAhJws4AAAAEDEnCzgAAA'
-  + 'AQQScLOAAAABBRJws4AAAAEGEnCzgAAAAQcScLOAAAABCBJws4AAAAEJEnCzgEdAABkAALANAAHB'
-  + 'AAAAAfAAKrEEsv//////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////R1AAGQACsBIAAcEAAOEA8AAC4QDwAJ6LI9H/////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////////////////////////////9HQQAxSgD/////////////////////////////////////'
-  + '////////////////////////////////////////////////////////////AAAB4AAAgMAKMQAN'
-  + 'aUkRAA1R0wAAAQAA1//7gAAAAbWBH/NBgAAAAQEScLOAAAABAhJws4AAAAEDEnCzgAAAAQQScLOA'
-  + 'AAABBRJws4AAAAEGEnCzgAAAAQcScLOAAAABCBJws4AAAAEJEnCzgEdBADJKEAABH0Z+AP//////'
-  + '////////////////////////////////////////////////////////////////////////////'
-  + '//////8AAAHgAACAwAoxAA2AvxEADWlJAAABAAEX//uAAAABtYEf80GAAAABARJws4AAAAECEnCz'
-  + 'gAAAAQMScLOAAAABBBJws4AAAAEFEnCzgAAAAQYScLOAAAABBxJws4AAAAEIEnCzgAAAAQkScLOA'
-  + 'R0EAM0oA////////////////////////////////////////////////////////////////////'
-  + '/////////////////////////////wAAAeAAAIDACjEADZg1EQANgL8AAAEAAVf/+4AAAAG1gR/z'
-  + 'QYAAAAEBEnCzgAAAAQIScLOAAAABAxJws4AAAAEEEnCzgAAAAQUScLOAAAABBhJws4AAAAEHEnCz'
-  + 'gAAAAQgScLOAAAABCRJws4A=',
-  'base64',
-);
+// MPEG-2 TS clip with monotonically-increasing PCR/PTS/DTS (no backward jumps).
+// Generated at simulator startup using ffmpeg (option b: pre-generate a clip long enough
+// that the test never reaches EOF; 600 s is well beyond the ~60 s window of the golden
+// test run, even accounting for all sequential operations on both targets).
+//
+// Why option (b) over option (a) (in-place TS resampling):
+//   Option (a) requires parsing 188-byte TS packets, locating PCR fields in adaptation
+//   headers and PTS/DTS in PES headers, and adjusting every field by the per-loop offset.
+//   This is correct but fragile if the embedded clip has unusual flags or PCR gaps.
+//   Option (b) delegates correct muxing to ffmpeg and is trivially verifiable with ffprobe.
+//
+// Root cause of the previous DTS regression (fixed here):
+//   The old TS_LOOP_BODY (a ~10 kB base64-encoded ~1 s clip) was streamed in a byte loop
+//   without adjusting timestamps. Each full loop reset DTS from the clip's last value back
+//   to its first value (e.g. 213087 -> 126000), causing ~245 backward DTS jumps per 5 MB.
+//   ffmpeg with -copyts reads from a temp file (SharedHttpStream) that accumulated these
+//   non-monotonic timestamps and therefore decoded 0 frames (packet corrupt, drop=62209).
+//   Jellyrin was unaffected only because it reads directly over HTTP and lets ffmpeg
+//   regenerate timestamps from scratch (-copyts absent).
+//
+// Rate throttling (native playback speed):
+//   The stream is served at approximately native bitrate (~100 kbps = 12.5 kB/s) so that
+//   upstream Jellyfin's SharedHttpStream temp file grows slowly — matching real live TV.
+//   Without throttling, the sim sends the entire clip in ~7 s; the SharedHttpStream
+//   pre-buffers everything, and by the time a new ffmpeg consumer attaches it reads from
+//   a write-position near the end of the clip, producing only a ~1.6 s segment before EOF.
+//   With throttling, ffmpeg always finds fresh data arriving at the head of the stream.
+//
+// Clip properties: 176x144 black frame, mpeg2video, 29.97 fps, 100 kbps, ~6.3 MB / 600 s.
+// PAT+PMT start at byte 0 so ffprobe identifies the codec immediately on the first few TS
+// packets — no long analyzeduration window required for codec detection.
+
+const FFMPEG_BIN = process.env.FFMPEG_BIN || '/usr/bin/ffmpeg';
+const CLIP_DURATION_S = 600;
+
+// Approximate target throughput in bytes/second.
+// Derived from: 100 kbps video = 12500 B/s, plus ~5% TS overhead = ~13125 B/s.
+// We use 13000 B/s (slightly under) to avoid readers ever stalling on an empty buffer.
+const TARGET_BYTES_PER_SEC = 13000;
+
+// Chunk size for each write call. Larger chunks reduce syscall overhead but increase
+// latency jitter. 1880 bytes (10 TS packets) is a reasonable balance.
+const CHUNK_SIZE = 1880;
+
+// Delay in ms between chunks to approximate TARGET_BYTES_PER_SEC.
+const CHUNK_DELAY_MS = Math.round((CHUNK_SIZE / TARGET_BYTES_PER_SEC) * 1000);
+
+// Generate the clip once at module load time and keep it in memory.
+// spawnSync is used to block until ffmpeg finishes — acceptable at startup (~1.2 s).
+// If ffmpeg is unavailable the simulator throws immediately (fail-fast).
+function generateMonotonicClip() {
+  // Write to a temp file then read into memory.
+  const tmpFile = path.join(os.tmpdir(), `hdhomerun-sim-${process.pid}.ts`);
+  try {
+    const result = spawnSync(
+      FFMPEG_BIN,
+      [
+        '-y',
+        '-f', 'lavfi',
+        '-i', `color=black:size=176x144:rate=29.97:duration=${CLIP_DURATION_S}`,
+        '-c:v', 'mpeg2video',
+        '-b:v', '100k',
+        '-r', '29.97',
+        '-f', 'mpegts',
+        tmpFile,
+      ],
+      { timeout: 60000, stdio: 'pipe' },
+    );
+    if (result.status !== 0) {
+      const stderr = result.stderr ? result.stderr.toString().slice(-500) : '(no stderr)';
+      throw new Error(`ffmpeg exited ${result.status}: ${stderr}`);
+    }
+    const buf = fs.readFileSync(tmpFile);
+    return buf;
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch (_) { /* ignore */ }
+  }
+}
+
+const TS_CLIP = generateMonotonicClip();
 
 const LINEUP_CHANNELS = [
   {
@@ -325,8 +205,13 @@ function start(port) {
           }
 
           if (url === '/stats/reset' && req.method === 'POST') {
-            // Clear max counters (current remains real).
+            // Clear both peak and current counters to establish a clean baseline for the next
+            // measurement interval. currentConcurrentByChannel is also reset because upstream
+            // Jellyfin's SharedHttpStream may keep the simulator connection open for stream
+            // refill (R8) even after clients close — resetting current prevents this from
+            // contaminating the next target's sharing metric.
             Object.keys(maxConcurrentByChannel).forEach((k) => { delete maxConcurrentByChannel[k]; });
+            Object.keys(currentConcurrentByChannel).forEach((k) => { delete currentConcurrentByChannel[k]; });
             const body = JSON.stringify({ ok: true });
             res.writeHead(200, {
               'Content-Type': 'application/json',
@@ -340,22 +225,34 @@ function start(port) {
             // Track this incoming connection for sharing metrics.
             channelConnOpen(url);
 
-            // Stream the TS body in a loop (chunked, no Content-Length) until the client
-            // disconnects. Looping proper MPEG-2 TS data lets ffprobe identify the codec within
-            // its 3-second analyzeduration window without hanging on an empty or null-PID stream.
-            // The infinite stream keeps the Jellyfin SharedHttpStream open so the LiveStreamFiles
-            // URL is accessible for the byte-check probe after PlaybackInfo completes.
+            // Stream the pre-generated monotonic TS clip at approximately native playback
+            // rate (TARGET_BYTES_PER_SEC ≈ 13 kB/s ≈ 100 kbps + TS overhead).
+            //
+            // Rate throttling is critical for upstream Jellyfin's SharedHttpStream: without
+            // it the sim sends the entire 600 s clip in ~48 s, the SharedHttpStream temp
+            // file fills up quickly, and new ffmpeg consumers attach at the end of the
+            // pre-buffered window rather than the head — producing only a ~1.6 s segment.
+            // With throttling the file grows at live-TV speed, ensuring each consumer always
+            // finds fresh data arriving at the write head.
+            //
+            // After the clip ends the connection is held open without sending more data.
+            // This should not happen during normal test execution because the clip is 600 s
+            // and the full golden test run (both targets) takes well under 60 s per target.
             res.writeHead(200, { 'Content-Type': 'video/mp2t' });
             let streaming = true;
             let offset = 0;
-            const chunkSize = 1880;
             function sendChunk() {
               if (!streaming) return;
-              const chunk = TS_LOOP_BODY.subarray(offset, offset + chunkSize);
-              offset = (offset + chunk.length) % TS_LOOP_BODY.length;
-              const flushed = res.write(chunk.length > 0 ? chunk : TS_LOOP_BODY.subarray(0, chunkSize));
+              if (offset >= TS_CLIP.length) {
+                // Clip exhausted — hold connection open. Should not occur during testing.
+                setTimeout(sendChunk, 1000);
+                return;
+              }
+              const chunk = TS_CLIP.subarray(offset, offset + CHUNK_SIZE);
+              offset += chunk.length;
+              const flushed = res.write(chunk);
               if (flushed) {
-                setTimeout(sendChunk, 10);
+                setTimeout(sendChunk, CHUNK_DELAY_MS);
               } else {
                 res.once('drain', sendChunk);
               }
@@ -374,7 +271,15 @@ function start(port) {
           resolve({
             url: baseUrl,
             close() {
-              return new Promise((res) => server.close(res));
+              return new Promise((res) => {
+                // closeAllConnections() drops all active keep-alive and streaming connections
+                // immediately so server.close() resolves instead of waiting indefinitely for
+                // ongoing TS stream clients (e.g. ffmpeg ingest) to disconnect on their own.
+                if (typeof server.closeAllConnections === 'function') {
+                  server.closeAllConnections();
+                }
+                server.close(res);
+              });
             },
           });
         });

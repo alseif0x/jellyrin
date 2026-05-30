@@ -116,7 +116,10 @@ async function main() {
       summaries.push(summary);
     }
   } finally {
-    await browser.close();
+    await Promise.race([
+      browser.close(),
+      new Promise((resolve) => { setTimeout(resolve, 15000); }),
+    ]).catch(() => {});
     if (hdhrSimClose) {
       await hdhrSimClose();
       hdhrSimUrl = null;
@@ -141,6 +144,10 @@ async function main() {
     }
     process.exitCode = 1;
   }
+  // Force-exit to prevent Playwright's pending browser cleanup or the HDHR simulator's
+  // lingering stream connections from keeping the event loop alive indefinitely. All output
+  // files have already been written above; the exit code reflects the comparison result.
+  process.exit(process.exitCode || 0);
 }
 
 async function captureTarget(browser, flowDir, target) {
@@ -326,6 +333,12 @@ async function captureTarget(browser, flowDir, target) {
       liveTvHdhrTwoClientStream: false,
       liveTvHdhrStreamRefcountReleased: false,
       liveTvHdhrTwoClientByteCheck: false,
+      liveTvHdhrHlsMaster200: false,
+      liveTvHdhrHlsMediaLive: false,
+      liveTvHdhrHlsSegment200: false,
+      liveTvHdhrHlsActiveEncoding: false,
+      liveTvHdhrHlsTranscodeUrl: false,
+      liveTvHdhrHlsFfmpegReaped: false,
       startupPublicInfoIncomplete: false,
       startupConfig200: false,
       startupConfig204: false,
@@ -428,6 +441,9 @@ async function captureTarget(browser, flowDir, target) {
     ignoreHTTPSErrors: true,
   });
   const page = await context.newPage();
+  // Bound all page.evaluate() calls so no single request hangs indefinitely.
+  // Navigation timeouts (goto, waitForLoadState) are kept at the Playwright default.
+  page.setDefaultTimeout(25000);
   wirePageCapture(page, summary, requestLog, consoleLog, websocketLog);
 
   try {
@@ -492,15 +508,25 @@ async function captureTarget(browser, flowDir, target) {
     if (summary.skipped) {
       return summary;
     }
-    await page.screenshot({ path: path.join(flowDir, summary.screenshot), fullPage: true });
+    await page.screenshot({ path: path.join(flowDir, summary.screenshot), fullPage: true, timeout: 5000 }).catch(() => {});
     summary.finalUrl = sanitizeUrl(page.url());
     summary.status = 'completed';
   } catch (error) {
     summary.status = 'failed';
     summary.error = error.message;
-    await page.screenshot({ path: path.join(flowDir, summary.screenshot), fullPage: true }).catch(() => {});
+    await page.screenshot({ path: path.join(flowDir, summary.screenshot), fullPage: true, timeout: 5000 }).catch(() => {});
   } finally {
-    await context.close();
+    // Close page and context with a bounded timeout so live-streaming WebSocket connections
+    // do not prevent cleanup from completing. The Promise.race ensures forward progress even
+    // if the browser is slow to acknowledge the close for an open live stream.
+    await Promise.race([
+      page.close({ runBeforeUnload: false }),
+      new Promise((resolve) => { setTimeout(resolve, 5000); }),
+    ]).catch(() => {});
+    await Promise.race([
+      context.close(),
+      new Promise((resolve) => { setTimeout(resolve, 5000); }),
+    ]).catch(() => {});
     await requestLog.close();
     await consoleLog.close();
     await websocketLog.close();
@@ -3409,7 +3435,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
   await ensureLiveTvFixtures();
   const auth = await authenticateTarget(page, summary, target);
   await establishWebSession(page, summary, publicInfo, target, auth, '/livetv');
-  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
   // Synthetic M3U/XMLTV block: Jellyrin-only shortcut that injects channels/programs/recordings
   // directly via System/Configuration/livetv. Upstream does not expose this path and materializes
@@ -3688,8 +3714,10 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
   // the infinite stream). Jellyrin's proxy now streams incrementally (bytes_stream + Body::from_stream)
   // so headers and bytes are returned immediately without buffering the full body.
 
-  // Reset simulator stats before the byte-check and sharing tests so we measure the peak
-  // from a clean baseline for this target. For upstream, PlaybackInfo opens 1 sim connection;
+  // Reset simulator stats (both peak and current counters) before the byte-check and sharing
+  // tests so we measure from a clean baseline for this target. Resetting current counters too
+  // prevents upstream Jellyfin's SharedHttpStream R8 refill connection from contaminating
+  // the next target's sharing metric. For upstream, PlaybackInfo opens 1 sim connection;
   // for Jellyrin, the stream proxy opens 1 sim connection and shares it via broadcast fan-out.
   // In both cases, maxConcurrentByChannel[simPath]===1 confirms sharing.
   if (hdhrSimUrl) {
@@ -3812,6 +3840,12 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
     );
     const simChannelPath = `/auto/v${guideNumber}`;
 
+    // Brief pause to allow the byte-check connection's server-side close to propagate
+    // before the sharing probes start. Jellyrin inserts the registry entry atomically
+    // before opening the upstream connection (preventing duplicate connections), so probe2
+    // will subscribe to probe1's handle rather than opening a separate upstream connection.
+    await new Promise((resolve) => { setTimeout(resolve, 100); });
+
     // Open 2 concurrent stream probes and hold them open briefly to ensure overlap.
     // browserFetchStreamProbeOverlap: fetch URL, read minBytes, then hold for holdMs before aborting.
     const probe1Promise = browserFetchStreamProbeOverlap(page, {
@@ -3881,6 +3915,195 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
     // text in livetv-real.js documents this as an honest upstream observation.
   }
 
+  // HLS / Transcode Live TV block (upstreamComparable + jellyrinOnly).
+  //
+  // Validates that the channel can be played via HLS transcode:
+  //   master.m3u8 (200, #EXT-X-STREAM-INF) -> media playlist EVENT (>=1 #EXTINF, no ENDLIST) ->
+  //   segment .ts (200, video/mp2t, bytes>0) -> ActiveEncodings lists session ->
+  //   DELETE ActiveEncodings -> session disappears (poll <=5s).
+  //
+  // Jellyrin: TranscodingUrl is embedded in the channel MediaSource.
+  // upstream: uses PlaybackInfo with an HLS device profile to get a TranscodingUrl.
+  // Both targets: GET master.m3u8 -> media playlist -> segment -> ActiveEncodings -> DELETE.
+  //
+  // Reset stats before the HLS block so we don't contaminate the sharing test counters.
+  if (hdhrSimUrl) {
+    await nodeHttpJson('POST', `${hdhrSimUrl}/stats/reset`).catch(() => {});
+  }
+
+  let hlsTranscodingUrl = null;
+  let hlsPlaySessionId = null;
+
+  if (target.name === 'jellyrin' && /^hdhr_/.test(hdhrChannel.Id)) {
+    // Jellyrin: extract TranscodingUrl from the channel MediaSource (SupportsTranscoding:true).
+    const hdhrChannelForHls = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/LiveTv/Channels/${encodeURIComponent(hdhrChannel.Id)}?fields=MediaSources`,
+      token: auth.AccessToken,
+    });
+    if (hdhrChannelForHls.status === 200) {
+      const ms = hdhrChannelForHls.json?.MediaSources?.[0];
+      const transcodingUrl = ms?.TranscodingUrl;
+      if (transcodingUrl && ms?.SupportsTranscoding === true && ms?.TranscodingSubProtocol === 'hls') {
+        hlsTranscodingUrl = transcodingUrl;
+        // Extract PlaySessionId from the URL for DELETE.
+        try {
+          const urlParams = new URLSearchParams(transcodingUrl.split('?')[1] || '');
+          hlsPlaySessionId = urlParams.get('PlaySessionId') || null;
+        } catch (_) { /* ignore */ }
+        summary.invariants.liveTvHdhrHlsTranscodeUrl = true;
+      }
+    }
+  } else if (target.name !== 'jellyrin') {
+    // Upstream: use PlaybackInfo with an HLS device profile to force transcoding.
+    // The response includes a TranscodingUrl for the live HLS stream.
+    const hdhrHlsPlaybackInfo = await browserFetchJson(page, {
+      method: 'POST',
+      url: `/Items/${encodeURIComponent(hdhrChannel.Id)}/PlaybackInfo`,
+      token: auth.AccessToken,
+      body: {
+        UserId: auth.User.Id,
+        EnableTranscoding: true,
+        EnableDirectPlay: false,
+        EnableDirectStream: false,
+        AutoOpenLiveStream: true,
+        DeviceProfile: hlsTranscodeDeviceProfile(),
+      },
+    });
+    if (hdhrHlsPlaybackInfo.status === 200) {
+      const ms = hdhrHlsPlaybackInfo.json?.MediaSources?.[0];
+      const transcodingUrl = ms?.TranscodingUrl;
+      if (transcodingUrl) {
+        hlsTranscodingUrl = transcodingUrl;
+        hlsPlaySessionId = hdhrHlsPlaybackInfo.json?.PlaySessionId || null;
+      }
+    }
+  }
+
+  if (hlsTranscodingUrl) {
+    // GET master.m3u8 — bounded: the server should respond quickly but we guard against hangs.
+    const master = await browserFetchTextBounded(page, {
+      method: 'GET',
+      url: hlsTranscodingUrl,
+      token: auth.AccessToken,
+      timeoutMs: 20000,
+    });
+    if (master.status === 200
+      && master.contentType.includes('mpegurl')
+      && master.text.includes('#EXT-X-STREAM-INF')) {
+      summary.invariants.liveTvHdhrHlsMaster200 = true;
+
+      // GET media playlist (live: no #EXT-X-ENDLIST, >=1 #EXTINF).
+      // Bounded fetch: upstream live.m3u8 may long-poll (never closes connection) so we abort
+      // after timeoutMs with whatever was received. A valid playlist is returned quickly;
+      // if the server hangs the timeout fires and we get an empty or partial response.
+      const mediaPlaylistPath = firstPlaylistUri(master.text);
+      if (mediaPlaylistPath) {
+        const mediaPlaylistUrl = resolveRelativeUrl(hlsTranscodingUrl, mediaPlaylistPath);
+        const media = await browserFetchTextBounded(page, {
+          method: 'GET',
+          url: mediaPlaylistUrl,
+          token: auth.AccessToken,
+          timeoutMs: 35000,
+        });
+        if (media.status === 200
+          && media.text.includes('#EXTINF')
+          && !media.text.includes('#EXT-X-ENDLIST')) {
+          summary.invariants.liveTvHdhrHlsMediaLive = true;
+
+          // GET first segment — probe 1+ byte via AbortController (bounded, does not hang).
+          const segmentPath = firstPlaylistUri(media.text);
+          if (segmentPath) {
+            const segmentUrl = resolveRelativeUrl(mediaPlaylistUrl, segmentPath);
+            const segmentProbe = await browserFetchStreamProbe(page, {
+              url: segmentUrl,
+              token: auth.AccessToken,
+              minBytes: 1,
+            });
+            if ((segmentProbe.status === 200 || segmentProbe.status === 206)
+              && segmentProbe.contentType.includes('video/mp2t')
+              && segmentProbe.byteLength >= 1) {
+              summary.invariants.liveTvHdhrHlsSegment200 = true;
+            }
+          }
+        }
+      }
+    }
+
+    // Check that the session appears in ActiveEncodings (Jellyrin-only: upstream Jellyfin does
+    // not expose GET /Videos/ActiveEncodings, only DELETE). For Jellyrin, verify session is
+    // listed; for upstream, skip the GET to avoid the deadlock that Jellyfin exhibits when
+    // ffmpeg is actively transcoding (GET hangs while ffmpeg runs).
+    const psid = hlsPlaySessionId;
+    if (target.name === 'jellyrin') {
+      const activeEncodings = await browserFetchJson(page, {
+        method: 'GET',
+        url: '/Videos/ActiveEncodings',
+        token: auth.AccessToken,
+      });
+      const sessionListed = Array.isArray(activeEncodings.json)
+        && activeEncodings.json.some((enc) => enc.PlaySessionId === psid || enc.ItemId === hdhrChannel.Id);
+      if (sessionListed) {
+        summary.invariants.liveTvHdhrHlsActiveEncoding = true;
+      }
+    }
+
+    // DELETE ActiveEncodings to stop ffmpeg and clean up.
+    // upstream Jellyfin requires both PlaySessionId AND DeviceId for DELETE; without DeviceId
+    // it returns 400. The harness authenticates with DeviceId="browser-trace" so we include it.
+    if (psid) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(psid)}&DeviceId=browser-trace`,
+        token: auth.AccessToken,
+      }).catch(() => {});
+
+      // Poll until the session disappears from ActiveEncodings (<=5s).
+      // Jellyrin-only: upstream does not support GET /Videos/ActiveEncodings so skip the poll.
+      if (target.name === 'jellyrin') {
+        const deleteDeadlineMs = 5000;
+        const deletePollIntervalMs = 200;
+        const deleteDeadline = Date.now() + deleteDeadlineMs;
+        let sessionGone = false;
+        while (Date.now() < deleteDeadline) {
+          const activeAfterDelete = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/Videos/ActiveEncodings',
+            token: auth.AccessToken,
+          });
+          const stillListed = Array.isArray(activeAfterDelete.json)
+            && activeAfterDelete.json.some((enc) => enc.PlaySessionId === psid);
+          if (!stillListed) { sessionGone = true; break; }
+          await new Promise((resolve) => { setTimeout(resolve, deletePollIntervalMs); });
+        }
+
+        // liveTvHdhrHlsActiveEncoding is true if the session was listed before DELETE AND
+        // it disappears within the bounded timeout after DELETE.
+        if (!sessionGone) {
+          summary.invariants.liveTvHdhrHlsActiveEncoding = false;
+        }
+      }
+
+      // Jellyrin-only: verify /stats currentConcurrent[/auto/vN] drops to 0 (no orphan ffmpeg).
+      if (target.name === 'jellyrin' && hdhrSimUrl) {
+        const guideNumber = (
+          hdhrChannel.ChannelNumber
+          || (typeof hdhrChannel.Id === 'string' ? hdhrChannel.Id.replace(/^hdhr_/, '') : '')
+        );
+        const simChannelPath = `/auto/v${guideNumber}`;
+        const reaperDeadline = Date.now() + 5000;
+        let reaped = false;
+        while (Date.now() < reaperDeadline) {
+          const stats = await nodeHttpJson('GET', `${hdhrSimUrl}/stats`).catch(() => null);
+          const current = stats?.json?.currentConcurrentByChannel?.[simChannelPath] ?? -1;
+          if (current === 0) { reaped = true; break; }
+          await new Promise((resolve) => { setTimeout(resolve, 200); });
+        }
+        summary.invariants.liveTvHdhrHlsFfmpegReaped = reaped;
+      }
+    }
+  }
+
   // Clean up the simulator tuner host so no residual HDHomeRun config is left
   // behind on either target (the simulator URL is gone after this run).
   await browserFetchJson(page, {
@@ -3889,8 +4112,10 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
     token: auth.AccessToken,
   }).catch(() => {});
 
-  await page.goto(`${summary.baseUrl}/web/#/livetv`, { waitUntil: 'domcontentloaded' });
-  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.goto(`${summary.baseUrl}/web/#/livetv`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  // Short timeout: the live TV page makes continuous background requests so networkidle never
+  // fires naturally; we just need the DOM to load for the screenshot.
+  await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
   summary.item = {
     id: liveTvFlowChannelId,
     name: 'Jellyrin Live TV',
@@ -5024,6 +5249,46 @@ async function browserFetchText(page, request) {
       text: await response.text(),
     };
   }, request);
+}
+
+// Like browserFetchText but bounded: aborts after timeoutMs if the server does not close the
+// response (e.g. upstream live.m3u8 may long-poll indefinitely). Reads body as chunks via
+// ReadableStream and decodes with TextDecoder; returns whatever was received before timeout.
+// Use this for HLS playlist endpoints that may hang on a live/long-polling server.
+async function browserFetchTextBounded(page, request) {
+  return page.evaluate(async ({ method, url, token, timeoutMs }) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers: { 'X-Emby-Token': token },
+        signal: controller.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      return { status: 0, contentType: '', text: '', error: String(err) };
+    }
+    const contentType = response.headers.get('content-type') || '';
+    const decoder = new TextDecoder();
+    let text = '';
+    try {
+      const reader = response.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+    } catch (_) {
+      // Abort or partial read: return what we have.
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
+    return { status: response.status, contentType, text };
+  }, { ...request, timeoutMs: request.timeoutMs ?? 20000 });
 }
 
 async function browserFetchBinary(page, request) {
@@ -6941,7 +7206,7 @@ function mediaType(contentType) {
 }
 
 function invariantFailures(summary) {
-  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore', 'migration-import'].includes(flow) || summary.status !== 'completed') {
+  if (!['startup-wizard', 'p0-direct-play', 'resume', 'transcode-hls', 'admin-dashboard', 'libraries', 'subtitles-trickplay', 'audio-hls-legacy', 'music', 'series', 'playlists-collections', 'images', 'metadata-search', 'auth-users', 'sessions-websocket', 'syncplay', 'channels', 'non-web-client', 'scheduled-tasks', 'backup-restore', 'migration-import', 'live-tv'].includes(flow) || summary.status !== 'completed') {
     return [];
   }
   const failures = [];
@@ -7246,12 +7511,21 @@ function invariantFailures(summary) {
       ['liveTvHdhrStream200', 'live tv HDHomeRun stream bytes'],
       ['liveTvHdhrTwoClientStream', 'live tv HDHomeRun two-client sharing (maxConcurrent===1)'],
       ['liveTvHdhrStreamRefcountReleased', 'live tv HDHomeRun refcount released (currentConcurrent===0)'],
+      ['liveTvHdhrHlsMaster200', 'live tv HDHomeRun HLS master playlist 200'],
+      ['liveTvHdhrHlsMediaLive', 'live tv HDHomeRun HLS media playlist live (no ENDLIST)'],
+      ['liveTvHdhrHlsSegment200', 'live tv HDHomeRun HLS segment 200 (video/mp2t bytes>0)'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);
       }
     }
     // Synthetic M3U/XMLTV and jellyrin-only invariants; upstream skips this block by design.
+    // liveTvHdhrHlsMediaLive and liveTvHdhrHlsSegment200 ARE upstream-comparable (checked above for
+    // both targets): once the simulator serves a monotonic-DTS continuous TS, upstream's ffmpeg
+    // produces real HLS segments too (verified: 90 h264 packets in an upstream segment).
+    // liveTvHdhrHlsActiveEncoding is jellyrin-only: upstream Jellyfin does not expose GET
+    // /Videos/ActiveEncodings (returns 405, only DELETE allowed), so it cannot be tested on upstream;
+    // upstream cleanup is validated via DELETE instead.
     if (summary.target === 'jellyrin') {
       for (const [field, label] of [
         ['liveTvConfigUpdated', 'live tv config update'],
@@ -7267,6 +7541,9 @@ function invariantFailures(summary) {
         ['liveTvSeriesTimerCreated', 'live tv series timer create'],
         ['liveTvSeriesTimerDeleted', 'live tv series timer delete'],
         ['liveTvHdhrTwoClientByteCheck', 'live tv HDHomeRun two-client byte check (2nd consumer bytes>=1)'],
+        ['liveTvHdhrHlsActiveEncoding', 'live tv HDHomeRun HLS listed in ActiveEncodings + removed after DELETE'],
+        ['liveTvHdhrHlsTranscodeUrl', 'live tv HDHomeRun TranscodingUrl with SupportsTranscoding:true + hls'],
+        ['liveTvHdhrHlsFfmpegReaped', 'live tv HDHomeRun HLS ffmpeg reaped (/stats currentConcurrent===0)'],
       ]) {
         if (!summary.invariants[field]) {
           failures.push(`missing ${label} invariant`);
@@ -7478,7 +7755,20 @@ function allowedFailedResponse(response) {
   if (flow === 'syncplay' && response.status() === 404 && /\/SyncPlay\/[^/]+$/i.test(new URL(url).pathname)) {
     return true;
   }
-  return response.status() === 400 && new URL(url).pathname === '/SyncPlay/List';
+  if (response.status() === 400 && new URL(url).pathname === '/SyncPlay/List') {
+    return true;
+  }
+  // upstream Jellyfin's DELETE /Videos/ActiveEncodings requires DeviceId in addition to
+  // PlaySessionId; without it the server returns 400. This exception is scoped to the
+  // upstream target URL so it never silently hides Jellyrin errors on this path.
+  // The DeviceId "browser-trace" is included in the DELETE URL so this should not trigger
+  // in practice; kept as a safety net for the upstream target only.
+  if (flow === 'live-tv' && response.status() === 400
+    && new URL(url).pathname === '/Videos/ActiveEncodings'
+    && url.startsWith(process.env.JELLYFIN_UPSTREAM_URL || 'http://127.0.0.1:8096')) {
+    return true;
+  }
+  return false;
 }
 
 async function responseShape(response) {
