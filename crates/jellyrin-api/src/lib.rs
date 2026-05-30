@@ -10472,6 +10472,31 @@ fn legacy_hdhomerun_control_port(tuner_host: &serde_json::Value) -> u16 {
         .unwrap_or(HDHOMERUN_DISCOVERY_PORT)
 }
 
+struct LegacyHdhomerunStreamParams {
+    tuner_host_url: String,
+    control_port: u16,
+    num_tuners: usize,
+}
+
+async fn legacy_hdhomerun_stream_params_for_host(
+    db: &Database,
+    tuner_host_id: Option<&str>,
+) -> Result<LegacyHdhomerunStreamParams, ApiError> {
+    let Some(tuner_host_id) = tuner_host_id else {
+        return Err(ApiError::not_found("HDHomeRun tuner host not found"));
+    };
+    let tuner_host = live_tv_tuner_host_by_id(db, tuner_host_id)
+        .await
+        .ok_or_else(|| ApiError::not_found("HDHomeRun tuner host not found"))?;
+    let tuner_host_url = json_string_field(&tuner_host, "Url")
+        .ok_or_else(|| ApiError::bad_request("HDHomeRun tuner host URL is required"))?;
+    Ok(LegacyHdhomerunStreamParams {
+        tuner_host_url,
+        control_port: legacy_hdhomerun_control_port(&tuner_host),
+        num_tuners: legacy_hdhomerun_scan_tuner_count(&tuner_host),
+    })
+}
+
 async fn legacy_hdhomerun_control_addr(
     tuner_url: &str,
     control_port: u16,
@@ -11185,7 +11210,7 @@ async fn live_tv_stream_file(
     }
     let channel = live_tv_channel_by_id(&state.db, &stream_id).await?;
     let path = live_tv_channel_path(&channel)?;
-    if !live_tv_channel_is_remote(&path) {
+    if !live_tv_channel_is_remote(&path) && !live_tv_channel_is_legacy_hdhomerun_path(&path) {
         let path_container = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -11349,22 +11374,16 @@ async fn stream_live_tv_channel(
     let path = live_tv_channel_path(&channel)?;
     if live_tv_channel_is_legacy_hdhomerun_path(&path) {
         let tuner_host_id = json_string_field(&channel, "TunerHostId");
-        let tuner_host = match tuner_host_id.as_deref() {
-            Some(host_id) => live_tv_tuner_host_by_id(db, host_id).await,
+        let params = legacy_hdhomerun_stream_params_for_host(db, tuner_host_id.as_deref()).await?;
+        let tuner_count = match &tuner_host_id {
+            Some(host_id) => tuner_count_for_host(db, host_id).await,
             None => None,
-        }
-        .ok_or_else(|| ApiError::not_found("HDHomeRun tuner host not found"))?;
-        let tuner_host_url = json_string_field(&tuner_host, "Url")
-            .ok_or_else(|| ApiError::bad_request("HDHomeRun tuner host URL is required"))?;
-        let tuner_count = tuner_host_id
-            .as_deref()
-            .and_then(|_| live_tv_u64_field(&tuner_host, "TunerCount"))
-            .filter(|count| *count > 0);
+        };
         return proxy_live_tv_legacy_hdhomerun_url(
             path.to_string_lossy().into_owned(),
-            tuner_host_url,
-            legacy_hdhomerun_control_port(&tuner_host),
-            legacy_hdhomerun_scan_tuner_count(&tuner_host),
+            params.tuner_host_url,
+            params.control_port,
+            params.num_tuners,
             tuner_host_id,
             tuner_count,
         )
@@ -11415,21 +11434,25 @@ impl Drop for LiveStreamRefGuard {
     }
 }
 
-fn live_tv_broadcast_stream_response(
-    url: String,
+struct LiveTvBroadcastSubscription {
+    key: String,
     generation: u64,
     receiver: broadcast::Receiver<Bytes>,
     consumer_tuner_lease: Option<LiveTunerLeaseGuard>,
+}
+
+fn live_tv_broadcast_stream_response(
+    subscription: LiveTvBroadcastSubscription,
 ) -> axum::response::Response {
     // Build a streaming body that forwards broadcast chunks to this consumer.
     // The guard decrements refcount when the response body finishes or the client disconnects.
     let guard = LiveStreamRefGuard {
-        url,
-        generation,
-        _tuner_lease: consumer_tuner_lease,
+        url: subscription.key,
+        generation: subscription.generation,
+        _tuner_lease: subscription.consumer_tuner_lease,
     };
     let body_stream = futures_util::stream::unfold(
-        (receiver, guard),
+        (subscription.receiver, guard),
         |(mut rx, guard): (broadcast::Receiver<Bytes>, LiveStreamRefGuard)| async move {
             loop {
                 match rx.recv().await {
@@ -11595,21 +11618,23 @@ async fn proxy_live_tv_channel_url(
     };
 
     Ok(live_tv_broadcast_stream_response(
-        url,
-        generation,
-        receiver,
-        consumer_tuner_lease,
+        LiveTvBroadcastSubscription {
+            key: url,
+            generation,
+            receiver,
+            consumer_tuner_lease,
+        },
     ))
 }
 
-async fn proxy_live_tv_legacy_hdhomerun_url(
+async fn subscribe_legacy_hdhomerun_stream(
     channel_url: String,
     tuner_host_url: String,
     control_port: u16,
     num_tuners: usize,
     tuner_host_id: Option<String>,
     tuner_count: Option<u64>,
-) -> Result<axum::response::Response, ApiError> {
+) -> Result<LiveTvBroadcastSubscription, ApiError> {
     let control_addr = legacy_hdhomerun_control_addr(&tuner_host_url, control_port).await?;
     let stream_key = format!("legacy-hdhomerun:{control_addr}:{channel_url}");
 
@@ -11704,12 +11729,32 @@ async fn proxy_live_tv_legacy_hdhomerun_url(
         }
     };
 
-    Ok(live_tv_broadcast_stream_response(
-        stream_key,
+    Ok(LiveTvBroadcastSubscription {
+        key: stream_key,
         generation,
         receiver,
         consumer_tuner_lease,
-    ))
+    })
+}
+
+async fn proxy_live_tv_legacy_hdhomerun_url(
+    channel_url: String,
+    tuner_host_url: String,
+    control_port: u16,
+    num_tuners: usize,
+    tuner_host_id: Option<String>,
+    tuner_count: Option<u64>,
+) -> Result<axum::response::Response, ApiError> {
+    let subscription = subscribe_legacy_hdhomerun_stream(
+        channel_url,
+        tuner_host_url,
+        control_port,
+        num_tuners,
+        tuner_host_id,
+        tuner_count,
+    )
+    .await?;
+    Ok(live_tv_broadcast_stream_response(subscription))
 }
 
 async fn live_tv_recording_folders(
@@ -12637,7 +12682,9 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
         Ok(p) => p,
         Err(_) => return false,
     };
-    if !live_tv_channel_is_remote(&channel_path) {
+    if !live_tv_channel_is_remote(&channel_path)
+        && !live_tv_channel_is_legacy_hdhomerun_path(&channel_path)
+    {
         // Local channel — not supported in this subgate.
         return false;
     }
@@ -12721,12 +12768,58 @@ async fn record_channel_to_file(
         return;
     }
     let duration = recording_end - now;
+    let is_legacy_hdhomerun = channel_url.to_ascii_lowercase().starts_with("hdhomerun");
 
-    let _tuner_lease = match acquire_live_tuner_lease(tuner_host_id, &channel_url, tuner_count) {
-        Ok(lease) => lease,
-        Err(error) => {
-            tracing::warn!("skipping Live TV recording because tuner limit was reached: {error:?}");
-            return;
+    let legacy_source = if is_legacy_hdhomerun {
+        let params =
+            match legacy_hdhomerun_stream_params_for_host(&db, tuner_host_id.as_deref()).await {
+                Ok(params) => params,
+                Err(error) => {
+                    tracing::warn!("skipping legacy HDHomeRun recording: {error:?}");
+                    return;
+                }
+            };
+        match subscribe_legacy_hdhomerun_stream(
+            channel_url.clone(),
+            params.tuner_host_url,
+            params.control_port,
+            params.num_tuners,
+            tuner_host_id.clone(),
+            tuner_count,
+        )
+        .await
+        {
+            Ok(subscription) => Some(subscription),
+            Err(error) => {
+                tracing::warn!(
+                    "skipping legacy HDHomeRun recording because stream open failed: {error:?}"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    }
+    .map(|subscription| {
+        let guard = LiveStreamRefGuard {
+            url: subscription.key,
+            generation: subscription.generation,
+            _tuner_lease: subscription.consumer_tuner_lease,
+        };
+        (subscription.receiver, guard)
+    });
+
+    let _tuner_lease = if is_legacy_hdhomerun {
+        None
+    } else {
+        match acquire_live_tuner_lease(tuner_host_id, &channel_url, tuner_count) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(
+                    "skipping Live TV recording because tuner limit was reached: {error:?}"
+                );
+                return;
+            }
         }
     };
 
@@ -12807,23 +12900,7 @@ async fn record_channel_to_file(
         );
     }
 
-    // Open the upstream HTTP stream (paridad DirectRecorder.RecordFromMediaSource).
-    let upstream_resp = match HttpClient::new().get(&channel_url).send().await {
-        Ok(resp) if resp.status().is_success() => resp,
-        Ok(resp) => {
-            tracing::error!(url = %channel_url, status = %resp.status(), "upstream channel returned non-2xx for recording");
-            cleanup_failed_recording(&db, &timer_id, &recording_id, &recording_path).await;
-            return;
-        }
-        Err(err) => {
-            tracing::error!(url = %channel_url, "failed to open channel stream for recording: {err}");
-            cleanup_failed_recording(&db, &timer_id, &recording_id, &recording_path).await;
-            return;
-        }
-    };
-
     // Copy bytes from the channel stream to the file until duration expires or cancel fires.
-    let mut byte_stream = upstream_resp.bytes_stream();
     let duration_std = std::time::Duration::from_secs_f64(duration.as_seconds_f64().max(0.0));
     let sleep_fut = tokio::time::sleep(duration_std);
     tokio::pin!(sleep_fut);
@@ -12833,32 +12910,80 @@ async fn record_channel_to_file(
     use tokio::io::AsyncWriteExt;
 
     let mut bytes_written: u64 = 0;
-    loop {
-        tokio::select! {
-            _ = &mut sleep_fut => {
-                // Duration expired — stop recording normally.
-                break;
-            }
-            _ = &mut cancel_rx => {
-                // External cancel (e.g. server shutdown).
-                break;
-            }
-            chunk = byte_stream.next() => {
-                match chunk {
-                    Some(Ok(bytes)) => {
-                        if let Err(err) = file.write_all(&bytes).await {
-                            tracing::error!(path = %recording_path.display(), "write error during recording: {err}");
+    if let Some((mut receiver, _stream_guard)) = legacy_source {
+        loop {
+            tokio::select! {
+                _ = &mut sleep_fut => {
+                    // Duration expired — stop recording normally.
+                    break;
+                }
+                _ = &mut cancel_rx => {
+                    // External cancel (e.g. server shutdown).
+                    break;
+                }
+                chunk = receiver.recv() => {
+                    match chunk {
+                        Ok(bytes) => {
+                            if let Err(err) = file.write_all(&bytes).await {
+                                tracing::error!(path = %recording_path.display(), "write error during recording: {err}");
+                                break;
+                            }
+                            bytes_written += bytes.len() as u64;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("legacy HDHomeRun recording lagged, dropped {n} chunks");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
                             break;
                         }
-                        bytes_written += bytes.len() as u64;
                     }
-                    Some(Err(err)) => {
-                        tracing::warn!(url = %channel_url, "stream error during recording: {err}");
-                        break;
-                    }
-                    None => {
-                        // Stream ended (source closed).
-                        break;
+                }
+            }
+        }
+    } else {
+        // Open the upstream HTTP stream (paridad DirectRecorder.RecordFromMediaSource).
+        let upstream_resp = match HttpClient::new().get(&channel_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            Ok(resp) => {
+                tracing::error!(url = %channel_url, status = %resp.status(), "upstream channel returned non-2xx for recording");
+                cleanup_failed_recording(&db, &timer_id, &recording_id, &recording_path).await;
+                return;
+            }
+            Err(err) => {
+                tracing::error!(url = %channel_url, "failed to open channel stream for recording: {err}");
+                cleanup_failed_recording(&db, &timer_id, &recording_id, &recording_path).await;
+                return;
+            }
+        };
+        let mut byte_stream = upstream_resp.bytes_stream();
+        loop {
+            tokio::select! {
+                _ = &mut sleep_fut => {
+                    // Duration expired — stop recording normally.
+                    break;
+                }
+                _ = &mut cancel_rx => {
+                    // External cancel (e.g. server shutdown).
+                    break;
+                }
+                chunk = byte_stream.next() => {
+                    match chunk {
+                        Some(Ok(bytes)) => {
+                            if let Err(err) = file.write_all(&bytes).await {
+                                tracing::error!(path = %recording_path.display(), "write error during recording: {err}");
+                                break;
+                            }
+                            bytes_written += bytes.len() as u64;
+                        }
+                        Some(Err(err)) => {
+                            tracing::warn!(url = %channel_url, "stream error during recording: {err}");
+                            break;
+                        }
+                        None => {
+                            // Stream ended (source closed).
+                            break;
+                        }
                     }
                 }
             }
@@ -51902,6 +52027,142 @@ mod tests {
                 target_none < lockkey_none,
                 "cleanup must clear target before lockkey: {events:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn live_tv_legacy_hdhomerun_stream_file_route_serves_direct_ts() {
+            use axum::{body::Body, http::Request};
+            use http_body_util::BodyExt;
+            use tower::ServiceExt;
+
+            let db = jellyrin_db::Database::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let user = db
+                .update_first_user("legacy-route-user".to_string(), "secret")
+                .await
+                .unwrap();
+            let api_key = db
+                .issue_api_key_for_user(user.id, "legacy-route-key")
+                .await
+                .unwrap();
+            let channel_url = "hdhomerun://103B4218-0/ch7-3".to_string();
+            let (control_port, _events) = start_fake_legacy_hdhomerun(b"ROUTE-TS").await;
+
+            let mut config = crate::default_live_tv_configuration();
+            config["TunerHosts"] = serde_json::json!([{
+                "Id": "legacy-route-tuner",
+                "Type": "hdhomerun",
+                "Url": "http://127.0.0.1",
+                "LegacyControlPort": control_port,
+                "TunerCount": 1,
+                "Channels": [{
+                    "Id": "hdhr_7",
+                    "Name": "Legacy 7",
+                    "Number": "7",
+                    "Path": channel_url,
+                    "ChannelType": "TV"
+                }]
+            }]);
+            db.update_named_configuration("livetv", crate::live_tv_configuration_json(config))
+                .await
+                .unwrap();
+
+            let app = crate::router(crate::AppState {
+                db,
+                web_dir: ".".into(),
+                log_dir: ".".into(),
+                local_address: "http://127.0.0.1:8097".to_string(),
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/LiveTv/LiveStreamFiles/hdhr_7/stream.ts")
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+            let mut body = response.into_body();
+            let frame = tokio::time::timeout(tokio::time::Duration::from_secs(2), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let data = frame.into_data().unwrap_or_else(|_| Bytes::new());
+            assert_eq!(data.as_ref(), b"ROUTE-TS");
+            drop(body);
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        #[tokio::test]
+        async fn live_tv_legacy_hdhomerun_recording_writes_bytes_to_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let log_dir = dir.path().join("logs");
+            tokio::fs::create_dir_all(&log_dir).await.unwrap();
+            let db = jellyrin_db::Database::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let channel_url = "hdhomerun://103B4218-0/ch9".to_string();
+            let (control_port, _events) = start_fake_legacy_hdhomerun(b"REC-TS").await;
+
+            let mut config = crate::default_live_tv_configuration();
+            config["TunerHosts"] = serde_json::json!([{
+                "Id": "legacy-recording-tuner",
+                "Type": "hdhomerun",
+                "Url": "http://127.0.0.1",
+                "LegacyControlPort": control_port,
+                "TunerCount": 1,
+                "Channels": [{
+                    "Id": "hdhr_9",
+                    "Name": "Legacy 9",
+                    "Number": "9",
+                    "Path": channel_url,
+                    "ChannelType": "TV"
+                }]
+            }]);
+            db.update_named_configuration("livetv", crate::live_tv_configuration_json(config))
+                .await
+                .unwrap();
+
+            let now = time::OffsetDateTime::now_utc();
+            let timer = serde_json::json!({
+                "Id": "legacy-recording-timer",
+                "Name": "Legacy Recording",
+                "ChannelId": "hdhr_9",
+                "StartDate": crate::format_time_for_json(now - time::Duration::seconds(1)),
+                "EndDate": crate::format_time_for_json(now + time::Duration::seconds(1)),
+                "PostPaddingSeconds": 0,
+                "IsSeries": false,
+            });
+
+            crate::record_channel_to_file(
+                db.clone(),
+                log_dir,
+                timer,
+                channel_url,
+                Some("legacy-recording-tuner".to_string()),
+                Some(1),
+                None,
+            )
+            .await;
+
+            let recordings = db
+                .named_configuration("livetv")
+                .await
+                .unwrap()
+                .and_then(|config| config["Recordings"].as_array().cloned())
+                .unwrap_or_default();
+            let completed = recordings
+                .iter()
+                .find(|recording| recording["Status"].as_str() == Some("Completed"))
+                .expect("legacy recording must complete");
+            let path = completed["Path"].as_str().expect("recording Path");
+            let bytes = tokio::fs::read(path).await.unwrap();
+            assert_eq!(bytes, b"REC-TS");
         }
 
         #[tokio::test]
