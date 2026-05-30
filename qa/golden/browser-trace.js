@@ -343,6 +343,10 @@ async function captureTarget(browser, flowDir, target) {
       liveTvHdhrRecordingCompleted: false,
       liveTvHdhrRecordingPlayable: false,
       liveTvHdhrRecordingCleanup: false,
+      liveTvHdhrSeriesTimerCreated: false,
+      liveTvHdhrSeriesTimerGeneratesTimers: false,
+      liveTvHdhrSeriesRecordingPlayable: false,
+      liveTvHdhrSeriesTimerCleanup: false,
       liveTvHdhrTunerLimitFirstOpen: false,
       liveTvHdhrTunerLimitConflict: false,
       liveTvHdhrTunerLimitRecovery: false,
@@ -4377,6 +4381,437 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
     }
   }
 
+  // ── SeriesTimer HDHomeRun block ───────────────────────────────────────────
+  // Validates series timer creation with a real EPG program from an XMLTV listing provider.
+  //
+  // Camino A (both targets): XMLTV file served locally; ListingProvider added; RefreshGuide
+  // triggered; ProgramId obtained from GET /LiveTv/Programs; POST /LiveTv/SeriesTimers;
+  // GET /LiveTv/Timers filtered by SeriesTimerId (>=1 timer expected); poll Recordings Completed;
+  // download + ffprobe (>=1 video packet, reuse helper from recording block); cleanup (jellyrin-only).
+  //
+  // liveTvHdhrSeriesTimerCreated (upstreamComparable): POST SeriesTimers with real ProgramId -> 204
+  //   returns 204 (upstream) or 200 (Jellyrin); series timer appears in GET /LiveTv/SeriesTimers.
+  // liveTvHdhrSeriesTimerGeneratesTimers (upstreamComparable): GET /LiveTv/Timers filtered by
+  //   SeriesTimerId returns >=1 timer with ProgramId and ChannelId for the hdhr channel.
+  // liveTvHdhrSeriesRecordingPlayable (upstreamComparable): recording Completed for series program;
+  //   download + ffprobe >=1 video packet in BOTH targets.
+  // liveTvHdhrSeriesTimerCleanup (jellyrinOnly): /stats===0 + DELETE SeriesTimer 204 + cascades
+  //   child timers absent from GET /LiveTv/Timers.
+  //
+  // R-UPSTREAM-FRESH: upstream must be fresh (fresh SQLite) before this golden run.
+  // R-CREATE-REQUIRES-PROGRAM: upstream CreateSeriesTimer lanza si ProgramId no resuelve;
+  //   ProgramId real se obtiene de GET /LiveTv/Programs upstream tras RefreshGuide.
+  // R-XMLTV-WINDOW: el programa debe cubrir la ventana de grabación actual (StartDate≈now, EndDate≈now+recordSecs).
+  if (hdhrSimUrl) {
+    let seriesListingId = null;
+    let seriesTimerId = null;
+    let xmltvFilePath = null;
+    try {
+      const seriesRecordSecs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_SECS || '4', 10);
+      // Series timer recording poll timeout is longer than the regular recording poll (90s default)
+      // because the child timer recording window includes a ~40s buffer above seriesRecordSecs to
+      // survive the RefreshGuide latency on upstream. The recording completes after ~seriesRecordSecs+40s.
+      const seriesPollTimeoutMs = Number.parseInt(process.env.JELLYRIN_LIVETV_SERIES_POLL_TIMEOUT_MS || '90000', 10);
+      const seriesPollIntervalMs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_POLL_INTERVAL_MS || '1000', 10);
+      const seriesName = `Jellyrin Series Timer Test ${Date.now()}`;
+
+      // Build XMLTV covering now..now+seriesRecordSecs for the hdhr channel guide number.
+      // The XMLTV channel-id must match the GuideNumber that the HDHomeRun tuner exposes.
+      const guideNumber = (
+        hdhrChannel.ChannelNumber
+        || (typeof hdhrChannel.Id === 'string' ? hdhrChannel.Id.replace(/^hdhr_/, '') : '')
+      );
+
+      const xmltvNow = new Date();
+      // The program window starts slightly in the past so the recording is immediately eligible.
+      // EndDate = now + seriesRecordSecs + 40s:
+      //   - The 40s buffer covers the time between XMLTV creation and spawn (RefreshGuide ~5-15s on
+      //     upstream, guide poll, ListingProvider processing). By the time record_channel_to_file
+      //     starts, the remaining window is approximately seriesRecordSecs seconds, so the recording
+      //     completes within the poll timeout.
+      //   - For Jellyrin: spawn happens immediately after POST SeriesTimers; remaining window ≈
+      //     seriesRecordSecs + 35-40s. We rely on the recording actually stopping after seriesRecordSecs
+      //     in the Completed poll below (Completed recording in config is the signal, not file age).
+      //   - The poll timeout is extended to 90s for series timers (see seriesPollTimeoutMs override below).
+      const xmltvStart = new Date(xmltvNow.getTime() - 5000);
+      const xmltvEnd = new Date(xmltvNow.getTime() + seriesRecordSecs * 1000 + 40000);
+
+      function padXmlTv(n) { return String(n).padStart(2, '0'); }
+      function toXmlTvDate(d) {
+        return `${d.getUTCFullYear()}${padXmlTv(d.getUTCMonth() + 1)}${padXmlTv(d.getUTCDate())}${padXmlTv(d.getUTCHours())}${padXmlTv(d.getUTCMinutes())}${padXmlTv(d.getUTCSeconds())} +0000`;
+      }
+
+      const xmltvContent = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<!DOCTYPE tv SYSTEM "xmltv.dtd">',
+        '<tv>',
+        `  <channel id="${guideNumber}">`,
+        `    <display-name>${guideNumber}</display-name>`,
+        '  </channel>',
+        `  <programme start="${toXmlTvDate(xmltvStart)}" stop="${toXmlTvDate(xmltvEnd)}" channel="${guideNumber}">`,
+        `    <title lang="en">${seriesName}</title>`,
+        '    <desc lang="en">Jellyrin Series Timer E2 Test</desc>',
+        '    <episode-num system="onscreen">1x01</episode-num>',
+        '  </programme>',
+        '</tv>',
+      ].join('\n');
+
+      // Write XMLTV to temp file.
+      const { writeFileSync } = require('node:fs');
+      xmltvFilePath = `/tmp/jellyrin-series-timer-${target.name}-${Date.now()}.xml`;
+      writeFileSync(xmltvFilePath, xmltvContent, 'utf8');
+
+      // Add XMLTV ListingProvider mapped to the main hdhr tuner.
+      const addListing = await browserFetchJson(page, {
+        method: 'POST',
+        url: '/LiveTv/ListingProviders',
+        token: auth.AccessToken,
+        body: {
+          Type: 'xmltv',
+          Path: xmltvFilePath,
+          EnabledTuners: [addTuner.json.Id],
+          EnableAllTuners: false,
+          ChannelMappings: [],
+        },
+      });
+      if (![200, 204].includes(addListing.status)) {
+        throw new Error(`LiveTv/ListingProviders add returned HTTP ${addListing.status}`);
+      }
+      seriesListingId = addListing.json?.Id || null;
+
+      // Trigger RefreshGuide scheduled task.
+      let scheduledTasksResp = await browserFetchJson(page, {
+        method: 'GET',
+        url: '/ScheduledTasks',
+        token: auth.AccessToken,
+      });
+      let guideTaskId = null;
+      if (scheduledTasksResp.status === 200 && Array.isArray(scheduledTasksResp.json)) {
+        const guideTask = scheduledTasksResp.json.find(
+          (t) => (t.Key === 'RefreshGuide' || (typeof t.Name === 'string' && /refresh guide/i.test(t.Name))),
+        );
+        if (guideTask?.Id) { guideTaskId = guideTask.Id; }
+      }
+      if (guideTaskId) {
+        await browserFetchJson(page, {
+          method: 'POST',
+          url: `/ScheduledTasks/Running/${encodeURIComponent(guideTaskId)}`,
+          token: auth.AccessToken,
+        }).catch(() => {});
+        // Wait for guide refresh to complete (bounded poll).
+        const guideRefreshDeadline = Date.now() + 15000;
+        while (Date.now() < guideRefreshDeadline) {
+          const taskStatus = await browserFetchJson(page, {
+            method: 'GET',
+            url: `/ScheduledTasks/${encodeURIComponent(guideTaskId)}`,
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0 }));
+          if (taskStatus.json?.State === 'Idle') break;
+          await new Promise((resolve) => { setTimeout(resolve, 500); });
+        }
+      }
+
+      // Poll GET /LiveTv/Programs for the channel to find our program.
+      // We need the real ProgramId that upstream has persisted in its guide.
+      let seriesProgramId = null;
+      const programPollDeadline = Date.now() + 10000;
+      while (Date.now() < programPollDeadline) {
+        const programs = await browserFetchJson(page, {
+          method: 'GET',
+          url: `/LiveTv/Programs?ChannelIds=${encodeURIComponent(hdhrChannel.Id)}&Limit=20`,
+          token: auth.AccessToken,
+        }).catch(() => ({ status: 0, json: null }));
+        if (programs.status === 200 && Array.isArray(programs.json?.Items)) {
+          const match = programs.json.Items.find(
+            (p) => typeof p.Name === 'string' && p.Name === seriesName,
+          );
+          if (match?.Id) { seriesProgramId = match.Id; break; }
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 500); });
+      }
+
+      if (!seriesProgramId) {
+        // Jellyrin can inject programs directly without a guide refresh;
+        // for Jellyrin, try GET /LiveTv/Programs without ChannelId filter.
+        if (target.name === 'jellyrin') {
+          const allPrograms = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/LiveTv/Programs?Limit=50',
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          if (allPrograms.status === 200 && Array.isArray(allPrograms.json?.Items)) {
+            const match = allPrograms.json.Items.find(
+              (p) => typeof p.Name === 'string' && p.Name === seriesName,
+            );
+            if (match?.Id) { seriesProgramId = match.Id; }
+          }
+        }
+      }
+
+      if (!seriesProgramId) {
+        throw new Error(`Series timer: no program found in guide for "${seriesName}" on channel ${hdhrChannel.Id}`);
+      }
+
+      // POST /LiveTv/SeriesTimers with real ProgramId.
+      const createSeriesTimer = await browserFetchJson(page, {
+        method: 'POST',
+        url: '/LiveTv/SeriesTimers',
+        token: auth.AccessToken,
+        body: {
+          ProgramId: seriesProgramId,
+          ChannelId: hdhrChannel.Id,
+          Name: seriesName,
+          RecordAnyTime: true,
+          RecordAnyChannel: false,
+          PrePaddingSeconds: 0,
+          PostPaddingSeconds: 0,
+          KeepUntil: 'UntilDeleted',
+          Days: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
+          ServiceName: 'Emby',
+        },
+      });
+      // Upstream: 204; Jellyrin: 200 with body.
+      if (![200, 204].includes(createSeriesTimer.status)) {
+        throw new Error(`LiveTv/SeriesTimers create returned HTTP ${createSeriesTimer.status}`);
+      }
+
+      // Resolve the series timer Id: from body (Jellyrin) or from GET /LiveTv/SeriesTimers poll.
+      seriesTimerId = createSeriesTimer.json?.Id || null;
+      if (!seriesTimerId) {
+        const stPollDeadline = Date.now() + 5000;
+        while (Date.now() < stPollDeadline) {
+          const stList = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/LiveTv/SeriesTimers',
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          if (stList.status === 200 && Array.isArray(stList.json?.Items)) {
+            const found = stList.json.Items.find(
+              (st) => typeof st.Name === 'string' && st.Name === seriesName,
+            );
+            if (found?.Id) { seriesTimerId = found.Id; break; }
+          }
+          await new Promise((resolve) => { setTimeout(resolve, 500); });
+        }
+      }
+
+      summary.invariants.liveTvHdhrSeriesTimerCreated = Boolean(seriesTimerId);
+
+      if (!seriesTimerId) {
+        throw new Error('Series timer Id not resolved after creation');
+      }
+
+      // GET /LiveTv/Timers and filter by SeriesTimerId to verify timer generation.
+      let seriesChildTimers = [];
+      const timerGenPollDeadline = Date.now() + 10000;
+      while (Date.now() < timerGenPollDeadline) {
+        const timersList = await browserFetchJson(page, {
+          method: 'GET',
+          url: '/LiveTv/Timers',
+          token: auth.AccessToken,
+        }).catch(() => ({ status: 0, json: null }));
+        if (timersList.status === 200 && Array.isArray(timersList.json?.Items)) {
+          seriesChildTimers = timersList.json.Items.filter(
+            (t) => t.SeriesTimerId === seriesTimerId,
+          );
+          if (seriesChildTimers.length >= 1) break;
+        }
+        await new Promise((resolve) => { setTimeout(resolve, 500); });
+      }
+
+      summary.invariants.liveTvHdhrSeriesTimerGeneratesTimers = seriesChildTimers.length >= 1;
+
+      // Poll for a Completed recording triggered by the series timer.
+      const seriesPollDeadline = Date.now() + seriesPollTimeoutMs;
+      let seriesCompletedRecording = null;
+      let seriesLibraryScanTriggered = false;
+      const seriesLibraryScanAt = Date.now() + (seriesRecordSecs + 2) * 1000;
+
+      while (Date.now() < seriesPollDeadline) {
+        if (!seriesLibraryScanTriggered && Date.now() >= seriesLibraryScanAt) {
+          seriesLibraryScanTriggered = true;
+          await browserFetchJson(page, {
+            method: 'POST',
+            url: '/Library/Refresh',
+            token: auth.AccessToken,
+          }).catch(() => {});
+        }
+
+        const recordings = await browserFetchJson(page, {
+          method: 'GET',
+          url: '/LiveTv/Recordings',
+          token: auth.AccessToken,
+        }).catch(() => ({ status: 0, json: null }));
+        if (recordings.status === 200 && Array.isArray(recordings.json?.Items)) {
+          // Match by series name (includes unique timestamp suffix — no false positive risk).
+          seriesCompletedRecording = recordings.json.Items.find(
+            (r) => r.Status === 'Completed'
+              && typeof r.Name === 'string'
+              && r.Name === seriesName,
+          ) || null;
+          if (!seriesCompletedRecording) {
+            seriesCompletedRecording = recordings.json.Items.find(
+              (r) => typeof r.Name === 'string'
+                && r.Name === seriesName
+                && r.Status !== 'InProgress'
+                && r.RunTimeTicks != null
+                && r.RunTimeTicks > 0,
+            ) || null;
+          }
+          if (seriesCompletedRecording) break;
+        }
+        // Also check timer status for the child timers.
+        if (!seriesCompletedRecording && seriesChildTimers.length > 0) {
+          for (const ct of seriesChildTimers) {
+            const timerStatus = await browserFetchJson(page, {
+              method: 'GET',
+              url: `/LiveTv/Timers/${encodeURIComponent(ct.Id)}`,
+              token: auth.AccessToken,
+            }).catch(() => ({ status: 0 }));
+            if (timerStatus.status === 200 && timerStatus.json?.Status === 'Completed') {
+              seriesCompletedRecording = { Id: timerStatus.json.Id, Status: 'Completed', _timerData: timerStatus.json };
+              break;
+            }
+          }
+          if (seriesCompletedRecording) break;
+        }
+        if (Date.now() + seriesPollIntervalMs < seriesPollDeadline) {
+          await new Promise((resolve) => { setTimeout(resolve, seriesPollIntervalMs); });
+        } else {
+          break;
+        }
+      }
+
+      if (seriesCompletedRecording) {
+        // ffprobe verify >=1 video packet.
+        const seriesRecId = seriesCompletedRecording.Id;
+        const ffprobeBin = process.env.FFPROBE_BIN || '/usr/bin/ffprobe';
+        const altFfprobeBin = '/usr/lib/jellyfin-ffmpeg/ffprobe';
+        const tmpSeriesFile = `/tmp/jellyrin-series-rec-probe-${target.name}-${Date.now()}.ts`;
+        let seriesDownloadOk = false;
+
+        const seriesStreamPaths = [
+          `/LiveTv/LiveRecordings/${encodeURIComponent(seriesRecId)}/stream`,
+          `/Videos/${encodeURIComponent(seriesRecId)}/stream`,
+          `/Items/${encodeURIComponent(seriesRecId)}/Download`,
+        ];
+        for (const streamPath of seriesStreamPaths) {
+          try {
+            const resp = await page.request.get(`${summary.baseUrl}${streamPath}`, {
+              headers: { 'X-Emby-Token': auth.AccessToken },
+            });
+            if (resp.ok()) {
+              const bodyBuf = await resp.body();
+              if (bodyBuf && bodyBuf.length > 0) {
+                const { writeFileSync } = require('node:fs');
+                writeFileSync(tmpSeriesFile, bodyBuf);
+                seriesDownloadOk = true;
+                break;
+              }
+            }
+          } catch (_) { /* try next path */ }
+        }
+
+        if (seriesDownloadOk) {
+          const actualFfprobe = (() => {
+            try { const { status: s } = spawnSync(ffprobeBin, ['-version'], { stdio: 'ignore' }); if (s === 0) return ffprobeBin; } catch (_) { /* ignore */ }
+            try { const { status: s } = spawnSync(altFfprobeBin, ['-version'], { stdio: 'ignore' }); if (s === 0) return altFfprobeBin; } catch (_) { /* ignore */ }
+            return null;
+          })();
+
+          if (actualFfprobe) {
+            const probeResult = spawnSync(actualFfprobe, [
+              '-v', 'error',
+              '-show_packets',
+              '-select_streams', 'v',
+              '-read_intervals', '%+#1',
+              tmpSeriesFile,
+            ], { encoding: 'utf8', timeout: 10000 });
+            const probeOutput = (probeResult.stdout || '') + (probeResult.stderr || '');
+            if (probeOutput.includes('[PACKET]') || probeOutput.includes('codec_type=video')) {
+              summary.invariants.liveTvHdhrSeriesRecordingPlayable = true;
+            }
+          }
+          try { require('node:fs').unlinkSync(tmpSeriesFile); } catch (_) { /* ignore */ }
+        }
+
+        // Jellyrin-only cleanup: /stats===0 + DELETE SeriesTimer 204 + child timers absent.
+        if (target.name === 'jellyrin' && hdhrSimUrl) {
+          const simChannelPath = `/auto/v${guideNumber}`;
+          const seriesStatsDeadline = Date.now() + 5000;
+          let seriesStatsOk = false;
+          while (Date.now() < seriesStatsDeadline) {
+            const stats = await nodeHttpJson('GET', `${hdhrSimUrl}/stats`).catch(() => null);
+            const current = stats?.json?.currentConcurrentByChannel?.[simChannelPath] ?? -1;
+            if (current === 0) { seriesStatsOk = true; break; }
+            await new Promise((resolve) => { setTimeout(resolve, 200); });
+          }
+
+          const deleteSeriesTimer = await browserFetchJson(page, {
+            method: 'DELETE',
+            url: `/LiveTv/SeriesTimers/${encodeURIComponent(seriesTimerId)}`,
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0 }));
+          seriesTimerId = null;
+
+          // Verify series timer is absent.
+          const stAfterDelete = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/LiveTv/SeriesTimers',
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          const stStillPresent = Array.isArray(stAfterDelete.json?.Items)
+            && stAfterDelete.json.Items.some((st) => st.Name === seriesName);
+
+          // Verify child timers are absent (cascade delete).
+          const timersAfterDelete = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/LiveTv/Timers',
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          // Note: seriesChildTimers may have been cleared by the cascade; check by SeriesTimerId.
+          // Since we deleted the series timer, its Id is the one we captured before.
+          const childTimersGone = !Array.isArray(timersAfterDelete.json?.Items)
+            || timersAfterDelete.json.Items.every(
+              (t) => !(typeof t.SeriesTimerId === 'string'
+                && seriesChildTimers.some((ct) => ct.SeriesTimerId === t.SeriesTimerId)),
+            );
+
+          summary.invariants.liveTvHdhrSeriesTimerCleanup = (
+            seriesStatsOk
+            && [200, 204].includes(deleteSeriesTimer.status)
+            && !stStillPresent
+            && childTimersGone
+          );
+        }
+      }
+    } catch (err) {
+      console.warn(`[series-timer] block error for ${target.name}: ${err.message}`);
+    } finally {
+      // Clean up listing provider.
+      if (seriesListingId) {
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/LiveTv/ListingProviders?id=${encodeURIComponent(seriesListingId)}`,
+          token: auth.AccessToken,
+        }).catch(() => {});
+      }
+      // Clean up series timer if it was not deleted in the cleanup block.
+      if (seriesTimerId) {
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/LiveTv/SeriesTimers/${encodeURIComponent(seriesTimerId)}`,
+          token: auth.AccessToken,
+        }).catch(() => {});
+      }
+      // Clean up temp XMLTV file.
+      if (xmltvFilePath) {
+        try { require('node:fs').unlinkSync(xmltvFilePath); } catch (_) { /* ignore */ }
+      }
+    }
+  }
+  // ── End of SeriesTimer HDHomeRun block ────────────────────────────────────
+
   // ── TunerCount limit block ────────────────────────────────────────────────
   // Validates the HDHomeRun TunerCount=1 limit enforcement:
   //   FirstOpen: open channel 4.1 → 200 + bytes (both targets).
@@ -8170,6 +8605,9 @@ function invariantFailures(summary) {
       ['liveTvHdhrHlsMaster200', 'live tv HDHomeRun HLS master playlist 200'],
       ['liveTvHdhrHlsMediaLive', 'live tv HDHomeRun HLS media playlist live (no ENDLIST)'],
       ['liveTvHdhrHlsSegment200', 'live tv HDHomeRun HLS segment 200 (video/mp2t bytes>0)'],
+      ['liveTvHdhrSeriesTimerCreated', 'live tv HDHomeRun series timer created from real guide ProgramId'],
+      ['liveTvHdhrSeriesTimerGeneratesTimers', 'live tv HDHomeRun series timer generated child timers'],
+      ['liveTvHdhrSeriesRecordingPlayable', 'live tv HDHomeRun series timer recording playable by ffprobe'],
       ['liveTvHdhrTunerLimitFirstOpen', 'live tv HDHomeRun TunerCount=1 first open (200 + bytes)'],
       ['liveTvHdhrTunerLimitConflict', 'live tv HDHomeRun TunerCount=1 conflict (HTTP 500)'],
       ['liveTvHdhrTunerLimitRecovery', 'live tv HDHomeRun TunerCount=1 recovery after close (200 + bytes)'],
@@ -8206,6 +8644,7 @@ function invariantFailures(summary) {
         ['liveTvHdhrHlsActiveEncoding', 'live tv HDHomeRun HLS listed in ActiveEncodings + removed after DELETE'],
         ['liveTvHdhrHlsTranscodeUrl', 'live tv HDHomeRun TranscodingUrl with SupportsTranscoding:true + hls'],
         ['liveTvHdhrHlsFfmpegReaped', 'live tv HDHomeRun HLS ffmpeg reaped (/stats currentConcurrent===0)'],
+        ['liveTvHdhrSeriesTimerCleanup', 'live tv HDHomeRun series timer cleanup + child timer cascade'],
         ['liveTvHdhrTunerLimitSharingExempt', 'live tv HDHomeRun TunerCount=1 sharing exempt (same channel, maxConcurrent===1)'],
       ]) {
         if (!summary.invariants[field]) {

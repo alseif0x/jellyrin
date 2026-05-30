@@ -4529,16 +4529,15 @@ async fn ensure_auth_not_locked(key: &str) -> Result<(), ApiError> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .await;
-    if let Some(state) = failures.get(key) {
-        if state
+    if let Some(state) = failures.get(key)
+        && state
             .locked_until_epoch
             .is_some_and(|locked_until| locked_until > now)
-        {
-            return Err(ApiError {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                error: anyhow::anyhow!("Too many failed login attempts"),
-            });
-        }
+    {
+        return Err(ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error: anyhow::anyhow!("Too many failed login attempts"),
+        });
     }
     if failures
         .get(key)
@@ -9240,15 +9239,14 @@ fn syncplay_apply_command_to_state(
                 object
                     .get_mut("Queue")
                     .and_then(serde_json::Value::as_array_mut),
-            ) {
-                if from >= 0
-                    && to >= 0
-                    && (from as usize) < queue.len()
-                    && (to as usize) < queue.len()
-                {
-                    let item = queue.remove(from as usize);
-                    queue.insert(to as usize, item);
-                }
+            )
+                && from >= 0
+                && to >= 0
+                && (from as usize) < queue.len()
+                && (to as usize) < queue.len()
+            {
+                let item = queue.remove(from as usize);
+                queue.insert(to as usize, item);
             }
         }
         "nextitem" => {
@@ -10516,7 +10514,7 @@ async fn proxy_live_tv_channel_url(
                     Ok(resp) if resp.status().is_success() => resp,
                     Ok(resp) => {
                         let mut registry = live_stream_registry().lock().await;
-                        if registry.get(&url).map_or(false, |h| h.generation == handle_gen) {
+                        if registry.get(&url).is_some_and(|h| h.generation == handle_gen) {
                             registry.remove(&url);
                         }
                         return Err(ApiError::internal(format!(
@@ -10526,7 +10524,7 @@ async fn proxy_live_tv_channel_url(
                     }
                     Err(error) => {
                         let mut registry = live_stream_registry().lock().await;
-                        if registry.get(&url).map_or(false, |h| h.generation == handle_gen) {
+                        if registry.get(&url).is_some_and(|h| h.generation == handle_gen) {
                             registry.remove(&url);
                         }
                         return Err(ApiError::internal(format!("HDHomeRun proxy error: {error}")));
@@ -10559,7 +10557,7 @@ async fn proxy_live_tv_channel_url(
                     // Remove registry entry when producer exits, but only if this is still
                     // the same generation (a new handle may have been inserted already).
                     let mut registry = live_stream_registry().lock().await;
-                    if registry.get(&url_clone).map_or(false, |h| h.generation == handle_gen) {
+                    if registry.get(&url_clone).is_some_and(|h| h.generation == handle_gen) {
                         registry.remove(&url_clone);
                     }
                 });
@@ -11183,6 +11181,247 @@ fn live_tv_recordings_dir(log_dir: &FsPath) -> PathBuf {
     data_root.join("livetv").join("recordings")
 }
 
+// Compute a stable, deterministic Id for a timer generated from a series timer.
+// Paridad: DefaultLiveTvService.CreateTimer Id=MD5(seriesTimerId+program.ExternalId).
+// We use the same FNV-based stable_entity_id pattern used elsewhere in Jellyrin.
+fn series_timer_child_id(series_timer_id: &str, program_id: &str) -> String {
+    stable_entity_id("SeriesTimerChild", &format!("{series_timer_id}+{program_id}"))
+}
+
+// Generate child timers in config["Timers"] for programs that match this series timer.
+// Paridad: DefaultLiveTvService.UpdateTimersForSeriesTimer + GetTimersForSeries.
+// Match rules (DS2 subset):
+//   - Name case-insensitive match OR SeriesId match.
+//   - Scope: ChannelId must match unless RecordAnyChannel==true.
+//   - Window: program EndDate >= now (expired programs skip).
+// Each matched program gets a child timer (IsSeries=false, SeriesTimerId set, Id stable).
+// maybe_spawn_live_tv_recording is called for each child timer so in-window programs
+// start recording immediately (paridad TimerManager.AddOrUpdateSystemTimer fire-on-create).
+async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_json::Value) {
+    let series_timer_id = match json_string_field(series_timer, "Id") {
+        Some(id) if !id.is_empty() => id,
+        _ => return,
+    };
+    let series_name = json_string_field(series_timer, "Name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let series_series_id = json_string_field(series_timer, "SeriesId");
+    let record_any_channel = series_timer
+        .get("RecordAnyChannel")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let series_channel_id = json_string_field(series_timer, "ChannelId");
+
+    let now = OffsetDateTime::now_utc();
+
+    let config = match state.db.named_configuration("livetv").await {
+        Ok(Some(c)) => c,
+        Ok(None) => default_live_tv_configuration(),
+        Err(_) => return,
+    };
+
+    let server_id = match state.db.server_state().await {
+        Ok(state) => state.server_id.to_string(),
+        Err(error) => {
+            tracing::warn!("failed to resolve server id for series timer materialisation: {error}");
+            String::new()
+        }
+    };
+    let programs = live_tv_program_items(&config, &server_id);
+
+    let mut new_timers: Vec<serde_json::Value> = Vec::new();
+
+    for program in &programs {
+        let program_id = match json_string_field(program, "Id") {
+            Some(id) if !id.is_empty() => id,
+            _ => continue,
+        };
+
+        // Window check: program EndDate must be >= now.
+        let end_date = match json_string_field(program, "EndDate")
+            .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+        {
+            Some(dt) => dt,
+            None => continue,
+        };
+        if end_date < now {
+            continue;
+        }
+
+        // Name / SeriesId match.
+        let program_name = json_string_field(program, "Name")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let program_series_id = json_string_field(program, "SeriesId");
+        let name_match = !series_name.is_empty() && program_name == series_name;
+        let series_id_match = series_series_id.is_some()
+            && series_series_id == program_series_id;
+        if !name_match && !series_id_match {
+            continue;
+        }
+
+        // Channel scope check.
+        // Program ChannelId may be an XMLTV guide number (e.g. "4.1") while the series timer
+        // ChannelId is the Jellyrin channel Id (e.g. "hdhr_4.1"). Accept both forms.
+        let program_channel_id = json_string_field(program, "ChannelId")
+            .unwrap_or_default();
+        // Resolve the effective channel Id for the child timer: prefer the series timer's
+        // channel Id if it matches (so maybe_spawn can find the channel), else use the program's.
+        let effective_channel_id = if let Some(ref scid) = series_channel_id {
+            let guide_from_series = scid.strip_prefix("hdhr_").unwrap_or(scid.as_str());
+            let guide_from_program = program_channel_id.strip_prefix("hdhr_").unwrap_or(program_channel_id.as_str());
+            if guide_from_series.eq_ignore_ascii_case(guide_from_program)
+                || scid.eq_ignore_ascii_case(&program_channel_id)
+            {
+                scid.clone()
+            } else {
+                program_channel_id.clone()
+            }
+        } else {
+            program_channel_id.clone()
+        };
+        if !record_any_channel
+            && let Some(ref scid) = series_channel_id
+        {
+            let guide_from_series = scid.strip_prefix("hdhr_").unwrap_or(scid.as_str());
+            let guide_from_program = program_channel_id
+                .strip_prefix("hdhr_")
+                .unwrap_or(program_channel_id.as_str());
+            let channel_matches = scid.eq_ignore_ascii_case(&program_channel_id)
+                || guide_from_series.eq_ignore_ascii_case(guide_from_program);
+            if !channel_matches {
+                continue;
+            }
+        }
+
+        let child_id = series_timer_child_id(&series_timer_id, &program_id);
+        let start_date_val = program
+            .get("StartDate")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let end_date_val = program
+            .get("EndDate")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let channel_id_val = serde_json::json!(effective_channel_id);
+        let name_val = program
+            .get("Name")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(""));
+
+        let child_timer = serde_json::json!({
+            "Id": child_id,
+            "SeriesTimerId": series_timer_id,
+            "ProgramId": program_id,
+            "ChannelId": channel_id_val,
+            "Name": name_val,
+            "StartDate": start_date_val,
+            "EndDate": end_date_val,
+            "PrePaddingSeconds": 0,
+            "PostPaddingSeconds": 0,
+            "Priority": 0,
+            "IsPrePaddingRequired": false,
+            "IsPostPaddingRequired": false,
+            "KeepUntil": "UntilDeleted",
+            "RecordAnyTime": false,
+            "SkipEpisodesInLibrary": false,
+            "RecordAnyChannel": false,
+            "NewOnly": false,
+            "Days": [],
+            "IsSeries": false,
+        });
+        new_timers.push(child_timer);
+    }
+
+    if new_timers.is_empty() {
+        return;
+    }
+
+    // Upsert all child timers into config["Timers"].
+    let mut config = match state.db.named_configuration("livetv").await {
+        Ok(Some(c)) => c,
+        Ok(None) => default_live_tv_configuration(),
+        Err(_) => return,
+    };
+    let mut timers = config
+        .get("Timers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for child in &new_timers {
+        let child_id = json_string_field(child, "Id").unwrap_or_default();
+        // Idempotent: skip if timer already exists (same Id).
+        if timers.iter().any(|t| {
+            json_string_field(t, "Id")
+                .is_some_and(|id| id.eq_ignore_ascii_case(&child_id))
+        }) {
+            continue;
+        }
+        timers.push(child.clone());
+    }
+    config["Timers"] = serde_json::json!(timers);
+    if let Err(err) = state
+        .db
+        .update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await
+    {
+        tracing::error!("failed to persist series timer child timers: {err}");
+        return;
+    }
+
+    // Fire recordings for timers that are in-window.
+    for child in &new_timers {
+        maybe_spawn_live_tv_recording(state, child).await;
+    }
+}
+
+// Cascade-delete timers in config["Timers"] that belong to the given series timer
+// and are not currently being recorded (not in LIVE_TV_RECORDING_REGISTRY).
+// Paridad: DefaultLiveTvService.CancelSeriesTimer (cancels pending child timers).
+async fn cascade_delete_series_timer_timers(db: &Database, series_timer_id: &str) {
+    let active_timer_ids: Vec<String> = {
+        let registry = live_tv_recording_registry().lock().await;
+        registry.keys().cloned().collect()
+    };
+
+    let mut config = match db.named_configuration("livetv").await {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(_) => return,
+    };
+
+    let timers = match config
+        .get("Timers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+    {
+        Some(t) => t,
+        None => return,
+    };
+
+    let kept: Vec<serde_json::Value> = timers
+        .into_iter()
+        .filter(|timer| {
+            let belongs = json_string_field(timer, "SeriesTimerId")
+                .is_some_and(|stid| stid.eq_ignore_ascii_case(series_timer_id));
+            if !belongs {
+                return true;
+            }
+            // Keep if currently recording (in active registry).
+            let timer_id = json_string_field(timer, "Id").unwrap_or_default();
+            active_timer_ids
+                .iter()
+                .any(|active| active.eq_ignore_ascii_case(&timer_id))
+        })
+        .collect();
+
+    config["Timers"] = serde_json::json!(kept);
+    let _ = db
+        .update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await;
+}
+
 // Check whether the timer should trigger an immediate recording and, if so, spawn the task.
 // Trigger condition (paridad TimerManager.AddOrUpdateSystemTimer :101-104):
 //   StartDate <= now && EndDate+PostPaddingSeconds > now && key == "Timers" && !is_series.
@@ -11757,7 +11996,9 @@ async fn create_live_tv_series_timer(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    upsert_live_tv_timer(&state.db, "SeriesTimers", None, payload).await
+    let result = upsert_live_tv_timer(&state.db, "SeriesTimers", None, payload).await?;
+    materialize_series_timer_timers(&state, &result.0).await;
+    Ok(result)
 }
 
 async fn update_live_tv_timer(
@@ -11801,6 +12042,8 @@ async fn delete_live_tv_series_timer(
     Path(timer_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    // Cascade: remove child timers that belong to this series and are not actively recording.
+    cascade_delete_series_timer_timers(&state.db, &timer_id).await;
     delete_persisted_live_tv_timer(&state.db, "SeriesTimers", &timer_id).await
 }
 
@@ -17144,15 +17387,14 @@ fn direct_play_profile_matches(item: &MediaItem, profile: &DirectPlayProfileMatc
         }
     }
 
-    if !profile.audio_codecs.is_empty() {
-        if let Some(audio_codec) = media_item_stream_codec(item, "Audio")
-            && !profile
-                .audio_codecs
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(&audio_codec))
-        {
-            return false;
-        }
+    if !profile.audio_codecs.is_empty()
+        && let Some(audio_codec) = media_item_stream_codec(item, "Audio")
+        && !profile
+            .audio_codecs
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&audio_codec))
+    {
+        return false;
     }
 
     true
@@ -20165,10 +20407,10 @@ async fn active_hls_transcode_session_for_live_tv(
     // Check for an existing active session by play_session_id.
     {
         let registry = live_hls_session_registry().lock().await;
-        if let Some(entry) = registry.get(play_session_id) {
-            if matches!(entry.status.as_str(), "starting" | "running") {
-                return Ok(live_hls_entry_to_transcode_session(entry));
-            }
+        if let Some(entry) = registry.get(play_session_id)
+            && matches!(entry.status.as_str(), "starting" | "running")
+        {
+            return Ok(live_hls_entry_to_transcode_session(entry));
         }
     }
 
@@ -26309,20 +26551,22 @@ mod tests {
         AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, SystemLifecycleCommand, backup_restore_snapshot_json,
-        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
-        direct_play_profile_matches, encoding_configuration_json, format_time_for_json,
-        get_valid_filename, hdhomerun_bool_field,
+        cascade_delete_series_timer_timers, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
+        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
+        format_time_for_json, get_valid_filename, hdhomerun_bool_field,
         hls_transcode_dedupe_key, json_string_field, json_value_i64, last_system_lifecycle_command,
         is_live_tv_channel_id, live_tv_channel_is_remote, live_tv_channel_media_source,
-        live_tv_channel_stable_uuid, live_tv_recording_name, load_countries, load_cultures,
+        live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_recording_name,
+        load_countries, load_cultures, materialize_series_timer_timers,
         media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
         parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
         reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
-        router, spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
-        subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        router, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
+        subscribe_playback_events, subscribe_system_lifecycle_commands, syncplay_groups,
+        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -49814,5 +50058,340 @@ mod tests {
             live_stream_registry().lock().await.remove(&url_a);
             live_stream_registry().lock().await.remove(&url_b);
         }
+    }
+
+    // DS4 / Spec (f): Id of generated timer is stable/deterministic.
+    // Same inputs must produce the same output; different inputs must differ.
+    #[test]
+    fn series_timer_child_id_is_stable_and_deterministic() {
+        let id1 = series_timer_child_id("series-abc", "program-xyz");
+        let id2 = series_timer_child_id("series-abc", "program-xyz");
+        assert_eq!(id1, id2, "same inputs must produce the same Id");
+
+        let id_diff_program = series_timer_child_id("series-abc", "program-OTHER");
+        assert_ne!(id1, id_diff_program, "different program_id must give different Id");
+
+        let id_diff_series = series_timer_child_id("series-OTHER", "program-xyz");
+        assert_ne!(id1, id_diff_series, "different series_timer_id must give different Id");
+    }
+
+    // DS1 / Spec (a): match by Name generates a child timer with SeriesTimerId set.
+    #[tokio::test]
+    async fn series_timer_name_match_generates_child_timer_with_series_timer_id() {
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+
+        // Inject a program via TunerHosts[0].Programs.
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "tuner-test",
+            "Programs": [{
+                "Id": "prog-001",
+                "Name": "Serie Test",
+                "ChannelId": "hdhr_4.1",
+                "StartDate": format_time_for_json(now - Duration::seconds(30)),
+                "EndDate": format_time_for_json(now + Duration::seconds(60)),
+            }]
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: "/tmp".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        let series_timer = serde_json::json!({
+            "Id": "st-001",
+            "Name": "Serie Test",
+            "ChannelId": "hdhr_4.1",
+            "RecordAnyChannel": false,
+        });
+        materialize_series_timer_timers(&state, &series_timer).await;
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers = config["Timers"].as_array().cloned().unwrap_or_default();
+        let child = timers.iter().find(|t| {
+            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-001")
+        });
+        assert!(child.is_some(), "must generate at least one child timer with SeriesTimerId");
+        let child = child.unwrap();
+        assert_eq!(child["IsSeries"], false, "child timer IsSeries must be false");
+        assert_eq!(child["ProgramId"].as_str(), Some("prog-001"));
+        assert_eq!(child["Name"].as_str(), Some("Serie Test"));
+    }
+
+    // DS2 / Spec (b): scope by ChannelId — wrong channel does not generate unless RecordAnyChannel.
+    #[tokio::test]
+    async fn series_timer_channel_scope_excludes_wrong_channel() {
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "tuner-test",
+            "Programs": [{
+                "Id": "prog-ch5",
+                "Name": "Serie Test",
+                "ChannelId": "hdhr_5.1",
+                "StartDate": format_time_for_json(now - Duration::seconds(10)),
+                "EndDate": format_time_for_json(now + Duration::seconds(60)),
+            }]
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: "/tmp".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        // Series timer scoped to hdhr_4.1 — program is on hdhr_5.1 → no child timer.
+        let series_timer_scoped = serde_json::json!({
+            "Id": "st-scoped",
+            "Name": "Serie Test",
+            "ChannelId": "hdhr_4.1",
+            "RecordAnyChannel": false,
+        });
+        materialize_series_timer_timers(&state, &series_timer_scoped).await;
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers = config["Timers"].as_array().cloned().unwrap_or_default();
+        let child = timers.iter().find(|t| {
+            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-scoped")
+        });
+        assert!(child.is_none(), "wrong channel must not generate a child timer without RecordAnyChannel");
+
+        // With RecordAnyChannel=true the program on hdhr_5.1 must match.
+        let series_timer_any = serde_json::json!({
+            "Id": "st-any",
+            "Name": "Serie Test",
+            "ChannelId": "hdhr_4.1",
+            "RecordAnyChannel": true,
+        });
+        materialize_series_timer_timers(&state, &series_timer_any).await;
+
+        let config2 = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers2 = config2["Timers"].as_array().cloned().unwrap_or_default();
+        let child_any = timers2.iter().find(|t| {
+            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-any")
+        });
+        assert!(child_any.is_some(), "RecordAnyChannel must match program on any channel");
+    }
+
+    // DS2 / Spec (c): program EndDate < now (expired) does not generate a timer.
+    #[tokio::test]
+    async fn series_timer_expired_program_does_not_generate_timer() {
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "tuner-test",
+            "Programs": [{
+                "Id": "prog-expired",
+                "Name": "Serie Past",
+                "ChannelId": "hdhr_4.1",
+                "StartDate": format_time_for_json(now - Duration::seconds(120)),
+                "EndDate": format_time_for_json(now - Duration::seconds(60)),
+            }]
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: "/tmp".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        let series_timer = serde_json::json!({
+            "Id": "st-expired",
+            "Name": "Serie Past",
+            "ChannelId": "hdhr_4.1",
+            "RecordAnyChannel": false,
+        });
+        materialize_series_timer_timers(&state, &series_timer).await;
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers = config["Timers"].as_array().cloned().unwrap_or_default();
+        let child = timers.iter().find(|t| {
+            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-expired")
+        });
+        assert!(child.is_none(), "expired program (EndDate < now) must not generate a timer");
+    }
+
+    // DS1 / DS3 / Spec (d): program in window generates a timer with IsSeries=false.
+    // (maybe_spawn is called but no real recording starts without a live channel URL; the
+    // generated timer in config["Timers"] is the observable invariant of this test.)
+    #[tokio::test]
+    async fn series_timer_in_window_program_generates_is_series_false_timer() {
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "tuner-test",
+            "Programs": [{
+                "Id": "prog-inwindow",
+                "Name": "Serie Live",
+                "ChannelId": "hdhr_4.1",
+                "StartDate": format_time_for_json(now - Duration::seconds(5)),
+                "EndDate": format_time_for_json(now + Duration::seconds(30)),
+            }]
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: "/tmp".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        let series_timer = serde_json::json!({
+            "Id": "st-live",
+            "Name": "Serie Live",
+            "ChannelId": "hdhr_4.1",
+            "RecordAnyChannel": false,
+        });
+        materialize_series_timer_timers(&state, &series_timer).await;
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers = config["Timers"].as_array().cloned().unwrap_or_default();
+        let child = timers.iter().find(|t| {
+            json_string_field(t, "SeriesTimerId").as_deref() == Some("st-live")
+        });
+        assert!(child.is_some(), "in-window program must generate a child timer");
+        let child = child.unwrap();
+        assert_eq!(
+            child["IsSeries"], false,
+            "generated timer must have IsSeries=false so maybe_spawn can fire it"
+        );
+    }
+
+    // DS5 / Spec (e): DELETE series timer cascades — child timers are removed from config["Timers"].
+    #[tokio::test]
+    async fn series_timer_delete_cascades_to_child_timers() {
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+
+        // Directly write child timers into config["Timers"] simulating prior materialisation.
+        let mut config = default_live_tv_configuration();
+        config["Timers"] = serde_json::json!([
+            {
+                "Id": "child-1",
+                "SeriesTimerId": "st-cascade",
+                "Name": "Serie Cascade",
+                "IsSeries": false,
+            },
+            {
+                "Id": "unrelated-1",
+                "Name": "Other Timer",
+                "IsSeries": false,
+            },
+        ]);
+        config["SeriesTimers"] = serde_json::json!([{
+            "Id": "st-cascade",
+            "Name": "Serie Cascade",
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        cascade_delete_series_timer_timers(&db, "st-cascade").await;
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers = config["Timers"].as_array().cloned().unwrap_or_default();
+
+        let child_gone = timers.iter().all(|t| {
+            json_string_field(t, "SeriesTimerId").as_deref() != Some("st-cascade")
+        });
+        assert!(child_gone, "cascade delete must remove child timers with SeriesTimerId=st-cascade");
+
+        let unrelated_kept = timers.iter().any(|t| {
+            json_string_field(t, "Id").as_deref() == Some("unrelated-1")
+        });
+        assert!(unrelated_kept, "cascade delete must keep unrelated timers");
+    }
+
+    // DS4 / Spec (f): calling materialize_series_timer_timers twice with the same program
+    // must not produce duplicate timers — Id is stable (idempotent).
+    #[tokio::test]
+    async fn series_timer_materialize_twice_is_idempotent() {
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "tuner-idem",
+            "Programs": [{
+                "Id": "prog-idem",
+                "Name": "Serie Idem",
+                "ChannelId": "hdhr_4.1",
+                "StartDate": format_time_for_json(now - Duration::seconds(10)),
+                "EndDate": format_time_for_json(now + Duration::seconds(120)),
+            }]
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: "/tmp".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        let series_timer = serde_json::json!({
+            "Id": "st-idem",
+            "Name": "Serie Idem",
+            "ChannelId": "hdhr_4.1",
+            "RecordAnyChannel": false,
+        });
+
+        // First call — creates the child timer.
+        materialize_series_timer_timers(&state, &series_timer).await;
+        let config_after_first = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers_after_first = config_after_first["Timers"].as_array().cloned().unwrap_or_default();
+        let count_first = timers_after_first
+            .iter()
+            .filter(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-idem"))
+            .count();
+        assert_eq!(count_first, 1, "first call must create exactly one child timer");
+
+        let id_first = timers_after_first
+            .iter()
+            .find(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-idem"))
+            .and_then(|t| json_string_field(t, "Id"))
+            .expect("child timer must have an Id");
+
+        // Second call — must not duplicate.
+        materialize_series_timer_timers(&state, &series_timer).await;
+        let config_after_second = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let timers_after_second = config_after_second["Timers"].as_array().cloned().unwrap_or_default();
+        let count_second = timers_after_second
+            .iter()
+            .filter(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-idem"))
+            .count();
+        assert_eq!(count_second, 1, "second call must not create a duplicate timer");
+
+        let id_second = timers_after_second
+            .iter()
+            .find(|t| json_string_field(t, "SeriesTimerId").as_deref() == Some("st-idem"))
+            .and_then(|t| json_string_field(t, "Id"))
+            .expect("child timer must still have an Id after second call");
+
+        assert_eq!(id_first, id_second, "Id must be stable (deterministic) across calls");
     }
 }
