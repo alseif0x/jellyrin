@@ -2699,6 +2699,139 @@ pub async fn reconcile_transcode_sessions_on_startup(db: &Database) -> anyhow::R
     Ok(count)
 }
 
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct LiveTvRecordingStartupRecovery {
+    pub removed_stale_recordings: usize,
+    pub removed_expired_timers: usize,
+    pub restarted_recordings: usize,
+}
+
+pub async fn reconcile_live_tv_recordings_on_startup(
+    db: &Database,
+    log_dir: &std::path::Path,
+) -> anyhow::Result<LiveTvRecordingStartupRecovery> {
+    let Some(mut config) = db.named_configuration("livetv").await? else {
+        return Ok(LiveTvRecordingStartupRecovery::default());
+    };
+
+    let active_timer_ids: Vec<String> = {
+        let registry = live_tv_recording_registry().lock().await;
+        registry.keys().cloned().collect()
+    };
+    let now = OffsetDateTime::now_utc();
+    let mut recovery = LiveTvRecordingStartupRecovery::default();
+    let mut changed = false;
+    let mut stale_recording_paths = Vec::new();
+
+    if let Some(recordings) = config
+        .get("Recordings")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+    {
+        let mut kept_recordings = Vec::new();
+        for recording in recordings {
+            let in_progress = json_string_field(&recording, "Status")
+                .is_some_and(|status| status.eq_ignore_ascii_case("InProgress"));
+            let timer_id = json_string_field(&recording, "TimerId");
+            let has_active_task = timer_id.as_deref().is_some_and(|timer_id| {
+                active_timer_ids
+                    .iter()
+                    .any(|active| active.eq_ignore_ascii_case(timer_id))
+            });
+
+            if in_progress && !has_active_task {
+                recovery.removed_stale_recordings += 1;
+                changed = true;
+                if let Ok(path) = live_tv_recording_path(&recording) {
+                    stale_recording_paths.push(path);
+                }
+                continue;
+            }
+
+            kept_recordings.push(recording);
+        }
+        config["Recordings"] = serde_json::json!(kept_recordings);
+    }
+
+    let mut timers_to_restart = Vec::new();
+    if let Some(timers) = config
+        .get("Timers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+    {
+        let mut kept_timers = Vec::new();
+        for timer in timers {
+            if live_tv_timer_is_terminal(&timer) {
+                kept_timers.push(timer);
+                continue;
+            }
+
+            let recording_end = live_tv_timer_recording_end(&timer);
+            if recording_end.is_some_and(|end| end <= now) {
+                recovery.removed_expired_timers += 1;
+                changed = true;
+                continue;
+            }
+
+            if live_tv_timer_start_date(&timer).is_some_and(|start| start <= now)
+                && recording_end.is_some_and(|end| end > now)
+            {
+                let timer_id = json_string_field(&timer, "Id").unwrap_or_default();
+                let has_active_task = active_timer_ids
+                    .iter()
+                    .any(|active| active.eq_ignore_ascii_case(&timer_id));
+                if !has_active_task {
+                    timers_to_restart.push(timer.clone());
+                }
+            }
+
+            kept_timers.push(timer);
+        }
+        config["Timers"] = serde_json::json!(kept_timers);
+    }
+
+    for path in stale_recording_paths {
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(path = %path.display(), "failed to delete stale Live TV recording: {err}");
+            }
+        }
+    }
+
+    if changed {
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await?;
+    }
+
+    for timer in timers_to_restart {
+        let Some(channel_id) = json_string_field(&timer, "ChannelId").filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Ok(channel) = live_tv_channel_by_id(db, &channel_id).await else {
+            continue;
+        };
+        let Ok(channel_path) = live_tv_channel_path(&channel) else {
+            continue;
+        };
+        if !live_tv_channel_is_remote(&channel_path) {
+            continue;
+        }
+
+        spawn_live_tv_recording(
+            db.clone(),
+            log_dir.to_path_buf(),
+            timer,
+            channel_path.to_string_lossy().into_owned(),
+        );
+        recovery.restarted_recordings += 1;
+    }
+
+    Ok(recovery)
+}
+
 pub fn spawn_periodic_transcode_cleanup(db: Database) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -11181,6 +11314,34 @@ fn live_tv_recordings_dir(log_dir: &FsPath) -> PathBuf {
     data_root.join("livetv").join("recordings")
 }
 
+fn live_tv_timer_start_date(timer: &serde_json::Value) -> Option<OffsetDateTime> {
+    json_string_field(timer, "StartDate")
+        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+}
+
+fn live_tv_timer_post_padding_seconds(timer: &serde_json::Value) -> i64 {
+    json_string_field(timer, "PostPaddingSeconds")
+        .and_then(|value| value.parse::<i64>().ok())
+        .or_else(|| {
+            timer
+                .get("PostPaddingSeconds")
+                .and_then(serde_json::Value::as_i64)
+        })
+        .unwrap_or(0)
+}
+
+fn live_tv_timer_recording_end(timer: &serde_json::Value) -> Option<OffsetDateTime> {
+    json_string_field(timer, "EndDate")
+        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+        .map(|end| end + Duration::seconds(live_tv_timer_post_padding_seconds(timer)))
+}
+
+fn live_tv_timer_is_terminal(timer: &serde_json::Value) -> bool {
+    json_string_field(timer, "Status").is_some_and(|status| {
+        status.eq_ignore_ascii_case("Completed") || status.eq_ignore_ascii_case("Cancelled")
+    })
+}
+
 // Compute a stable, deterministic Id for a timer generated from a series timer.
 // Paridad: DefaultLiveTvService.CreateTimer Id=MD5(seriesTimerId+program.ExternalId).
 // We use the same FNV-based stable_entity_id pattern used elsewhere in Jellyrin.
@@ -11586,6 +11747,9 @@ async fn record_channel_to_file(
             .unwrap_or_default();
         recordings.push(serde_json::json!({
             "Id": recording_id,
+            "TimerId": timer_id,
+            "ProgramId": timer.get("ProgramId").cloned().unwrap_or(serde_json::Value::Null),
+            "SeriesTimerId": timer.get("SeriesTimerId").cloned().unwrap_or(serde_json::Value::Null),
             "Name": name,
             "ChannelId": channel_id,
             "Path": path_str,
@@ -26563,10 +26727,11 @@ mod tests {
         media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
         parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
-        reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
-        router, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
-        subscribe_playback_events, subscribe_system_lifecycle_commands, syncplay_groups,
-        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
+        record_channel_to_file, redact_sensitive_log_text, router, series_timer_child_id,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -33386,6 +33551,180 @@ mod tests {
             .iter()
             .any(|r| r["Status"].as_str() == Some("InProgress"));
         assert!(!in_progress, "0-byte recording must clean up InProgress entry");
+    }
+
+    #[tokio::test]
+    async fn live_tv_startup_reconciliation_removes_stale_in_progress_and_expired_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let stale_file = dir.path().join("livetv/recordings/stale.ts");
+        tokio::fs::create_dir_all(stale_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&stale_file, b"partial").await.unwrap();
+
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+        config["Recordings"] = serde_json::json!([{
+            "Id": "stale-recording",
+            "TimerId": "expired-timer",
+            "Name": "Expired Show",
+            "ChannelId": "hdhr_4.1",
+            "Path": stale_file.to_string_lossy().to_string(),
+            "Status": "InProgress",
+            "StartDate": format_time_for_json(now - Duration::seconds(120)),
+            "EndDate": format_time_for_json(now - Duration::seconds(60)),
+            "DateCreated": format_time_for_json(now - Duration::seconds(120)),
+        }]);
+        config["Timers"] = serde_json::json!([{
+            "Id": "expired-timer",
+            "Name": "Expired Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now - Duration::seconds(120)),
+            "EndDate": format_time_for_json(now - Duration::seconds(60)),
+            "PostPaddingSeconds": 0,
+            "Status": "InProgress",
+            "IsSeries": false,
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let recovery = reconcile_live_tv_recordings_on_startup(&db, &log_dir)
+            .await
+            .unwrap();
+        assert_eq!(recovery.removed_stale_recordings, 1);
+        assert_eq!(recovery.removed_expired_timers, 1);
+        assert_eq!(recovery.restarted_recordings, 0);
+        assert!(!stale_file.exists(), "stale partial recording must be removed");
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap();
+        assert!(config["Recordings"].as_array().unwrap().is_empty());
+        assert!(config["Timers"].as_array().unwrap().is_empty());
+
+        let second = reconcile_live_tv_recordings_on_startup(&db, &log_dir)
+            .await
+            .unwrap();
+        assert_eq!(second, Default::default(), "startup recovery must be idempotent");
+    }
+
+    #[tokio::test]
+    async fn live_tv_startup_reconciliation_restarts_in_window_timer() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ts_payload: Vec<u8> = (0u8..188).cycle().take(1880).collect();
+        let ts_clone = ts_payload.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n",
+                    ts_clone.len()
+                );
+                let _ = writer.write_all(header.as_bytes()).await;
+                let _ = writer.write_all(&ts_clone).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let stale_file = dir.path().join("livetv/recordings/restart.ts");
+        tokio::fs::create_dir_all(stale_file.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&stale_file, b"partial").await.unwrap();
+
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "hdhr-test",
+            "FriendlyName": "HDHomeRun Test",
+            "Channels": [{
+                "Id": "hdhr_4.1",
+                "Name": "Channel 4.1",
+                "Number": "4.1",
+                "Path": format!("http://127.0.0.1:{port}/auto/v4.1"),
+            }]
+        }]);
+        config["Recordings"] = serde_json::json!([{
+            "Id": "stale-recording",
+            "TimerId": "restart-timer",
+            "Name": "Restart Show",
+            "ChannelId": "hdhr_4.1",
+            "Path": stale_file.to_string_lossy().to_string(),
+            "Status": "InProgress",
+            "StartDate": format_time_for_json(now - Duration::seconds(5)),
+            "EndDate": format_time_for_json(now + Duration::seconds(30)),
+            "DateCreated": format_time_for_json(now - Duration::seconds(5)),
+        }]);
+        config["Timers"] = serde_json::json!([{
+            "Id": "restart-timer",
+            "Name": "Restart Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now - Duration::seconds(5)),
+            "EndDate": format_time_for_json(now + Duration::seconds(30)),
+            "PostPaddingSeconds": 0,
+            "Status": "InProgress",
+            "IsSeries": false,
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let recovery = reconcile_live_tv_recordings_on_startup(&db, &log_dir)
+            .await
+            .unwrap();
+        assert_eq!(recovery.removed_stale_recordings, 1);
+        assert_eq!(recovery.removed_expired_timers, 0);
+        assert_eq!(recovery.restarted_recordings, 1);
+        assert!(!stale_file.exists(), "stale file should not block restarted recording");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let config = db.named_configuration("livetv").await.unwrap().unwrap();
+            let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
+            if let Some(completed) = recordings
+                .iter()
+                .find(|r| r["Status"].as_str() == Some("Completed"))
+            {
+                assert_eq!(completed["TimerId"], "restart-timer");
+                let path = completed["Path"].as_str().unwrap();
+                assert!(tokio::fs::metadata(path).await.unwrap().len() > 0);
+                let timers = config["Timers"].as_array().cloned().unwrap_or_default();
+                let timer = timers
+                    .iter()
+                    .find(|timer| timer["Id"].as_str() == Some("restart-timer"))
+                    .unwrap();
+                assert_eq!(timer["Status"], "Completed");
+                assert_eq!(timer["RecordingPath"], path);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "recording did not complete");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let second = reconcile_live_tv_recordings_on_startup(&db, &log_dir)
+            .await
+            .unwrap();
+        assert_eq!(second, Default::default(), "completed recovery must be idempotent");
     }
 
     #[tokio::test]

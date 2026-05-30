@@ -4,8 +4,8 @@ use anyhow::Context;
 use clap::Parser;
 use jellyrin_api::{
     AppState, SystemLifecycleCommand, cleanup_stale_hls_transcodes, last_system_lifecycle_command,
-    reconcile_transcode_sessions_on_startup, router, spawn_periodic_transcode_cleanup,
-    subscribe_system_lifecycle_commands,
+    reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup, router,
+    spawn_periodic_transcode_cleanup, subscribe_system_lifecycle_commands,
 };
 use jellyrin_db::Database;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -93,6 +93,20 @@ async fn main() -> anyhow::Result<()> {
         log_dir: args.log_dir,
         local_address,
     };
+    let live_tv_recovery = reconcile_live_tv_recordings_on_startup(&state.db, &state.log_dir)
+        .await
+        .context("failed to reconcile Live TV recordings")?;
+    if live_tv_recovery.removed_stale_recordings > 0
+        || live_tv_recovery.removed_expired_timers > 0
+        || live_tv_recovery.restarted_recordings > 0
+    {
+        tracing::warn!(
+            removed_stale_recordings = live_tv_recovery.removed_stale_recordings,
+            removed_expired_timers = live_tv_recovery.removed_expired_timers,
+            restarted_recordings = live_tv_recovery.restarted_recordings,
+            "reconciled Live TV recording state from previous run"
+        );
+    }
     let _transcode_cleanup_task = spawn_periodic_transcode_cleanup(db);
 
     let listener = tokio::net::TcpListener::bind(address)
