@@ -4,13 +4,14 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -69,6 +70,11 @@ const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
+const HDHOMERUN_DISCOVERY_PORT: u16 = 65001;
+const HDHOMERUN_DISCOVERY_DURATION_MS: u64 = 3000;
+const HDHOMERUN_DISCOVERY_MESSAGE: [u8; 20] = [
+    0, 2, 0, 12, 1, 4, 255, 255, 255, 255, 2, 4, 255, 255, 255, 255, 115, 204, 125, 143,
+];
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
 static SYSTEM_LIFECYCLE: OnceLock<broadcast::Sender<SystemLifecycleCommand>> = OnceLock::new();
 static SYSTEM_LIFECYCLE_LAST: AtomicU8 = AtomicU8::new(0);
@@ -9917,6 +9923,173 @@ async fn live_tv_hdhomerun_channels_from_payload(
     (!channels.is_empty()).then_some(channels)
 }
 
+async fn live_tv_hdhomerun_tuner_info_from_base_url(
+    base_url: &str,
+    deadline: tokio::time::Instant,
+) -> Option<serde_json::Value> {
+    let base_url = if base_url.starts_with("http://") || base_url.starts_with("https://") {
+        base_url.to_string()
+    } else {
+        format!("http://{base_url}")
+    }
+    .trim_end_matches('/')
+    .to_string();
+
+    let discover_url = format!("{base_url}/discover.json");
+    let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+    let response = tokio::time::timeout(remaining, HttpClient::new().get(&discover_url).send())
+        .await
+        .ok()?
+        .ok()?;
+    let discover: serde_json::Value = if response.status() == reqwest::StatusCode::NOT_FOUND {
+        serde_json::json!({ "ModelNumber": "HDHR" })
+    } else {
+        if !response.status().is_success() {
+            return None;
+        }
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        tokio::time::timeout(remaining, response.json())
+            .await
+            .ok()?
+            .ok()?
+    };
+
+    let device_id = json_string_field(&discover, "DeviceID").unwrap_or_default();
+    let friendly_name = json_string_field(&discover, "FriendlyName").unwrap_or_default();
+    let tuner_count = discover
+        .get("TunerCount")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let name = if friendly_name.is_empty() {
+        base_url.clone()
+    } else {
+        friendly_name.clone()
+    };
+
+    let mut tuner = serde_json::json!({
+        "Id": null,
+        "Name": name,
+        "Type": "hdhomerun",
+        "Url": base_url,
+        "DeviceId": device_id,
+        "FriendlyName": friendly_name,
+        "TunerCount": tuner_count,
+        "ImportFavoritesOnly": false,
+        "AllowHWTranscoding": true,
+        "AllowFmp4TranscodingContainer": false,
+        "AllowStreamSharing": true,
+        "FallbackMaxStreamingBitrate": 30000000,
+        "EnableStreamLooping": false,
+        "Source": null,
+        "UserAgent": null,
+        "IgnoreDts": true,
+        "ReadAtNativeFramerate": false,
+        "IsConfigured": false
+    });
+    for key in [
+        "ModelNumber",
+        "FirmwareName",
+        "FirmwareVersion",
+        "BaseURL",
+        "LineupURL",
+    ] {
+        if let Some(value) = discover.get(key) {
+            tuner[key] = value.clone();
+        }
+    }
+    Some(tuner)
+}
+
+async fn live_tv_discover_hdhomerun_tuners_udp() -> Vec<serde_json::Value> {
+    let socket = match StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::warn!("failed to bind HDHomeRun discovery UDP socket: {error}");
+            return Vec::new();
+        }
+    };
+    if let Err(error) = socket.set_broadcast(true) {
+        tracing::warn!("failed to enable HDHomeRun discovery broadcast: {error}");
+        return Vec::new();
+    }
+    if let Err(error) = socket.set_nonblocking(true) {
+        tracing::warn!("failed to configure HDHomeRun discovery socket nonblocking: {error}");
+        return Vec::new();
+    }
+    let socket = match tokio::net::UdpSocket::from_std(socket) {
+        Ok(socket) => socket,
+        Err(error) => {
+            tracing::warn!("failed to create Tokio HDHomeRun discovery socket: {error}");
+            return Vec::new();
+        }
+    };
+    live_tv_discover_hdhomerun_tuners_with_socket(
+        socket,
+        SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::BROADCAST,
+            HDHOMERUN_DISCOVERY_PORT,
+        )),
+        StdDuration::from_millis(HDHOMERUN_DISCOVERY_DURATION_MS),
+        None,
+    )
+    .await
+}
+
+async fn live_tv_discover_hdhomerun_tuners_with_socket(
+    socket: tokio::net::UdpSocket,
+    discovery_target: SocketAddr,
+    discovery_duration: StdDuration,
+    base_url_override: Option<String>,
+) -> Vec<serde_json::Value> {
+    let mut discovered = Vec::new();
+    let mut seen = HashSet::<String>::new();
+    if let Err(error) = socket
+        .send_to(&HDHOMERUN_DISCOVERY_MESSAGE, discovery_target)
+        .await
+    {
+        tracing::warn!("failed to send HDHomeRun discovery packet: {error}");
+        return discovered;
+    }
+
+    let deadline = tokio::time::Instant::now() + discovery_duration;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            break;
+        };
+        match tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await {
+            Ok(Ok((received, remote))) => {
+                if received <= 13 || buffer[1] != 3 {
+                    continue;
+                }
+                let base_url = base_url_override
+                    .clone()
+                    .unwrap_or_else(|| format!("http://{}", remote.ip()));
+                let Some(mut tuner) =
+                    live_tv_hdhomerun_tuner_info_from_base_url(&base_url, deadline).await
+                else {
+                    continue;
+                };
+                let dedupe_key = json_string_field(&tuner, "DeviceId")
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| json_string_field(&tuner, "Url"))
+                    .unwrap_or_else(|| base_url.clone())
+                    .to_ascii_lowercase();
+                if seen.insert(dedupe_key) {
+                    tuner["IsConfigured"] = serde_json::json!(false);
+                    discovered.push(tuner);
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("failed to receive HDHomeRun discovery reply: {error}");
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    discovered
+}
+
 fn hdhomerun_bool_field(entry: &serde_json::Value, key: &str) -> bool {
     match entry.get(key) {
         Some(serde_json::Value::Bool(b)) => *b,
@@ -12693,10 +12866,22 @@ async fn live_tv_timer_defaults(
     })))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct LiveTvDiscoverTunersQuery {
+    #[serde(alias = "api_key", alias = "ApiKey")]
+    api_key: Option<String>,
+    #[serde(
+        alias = "NewDevicesOnly",
+        alias = "newDevicesOnly",
+        alias = "new_devices_only"
+    )]
+    new_devices_only: Option<bool>,
+}
+
 async fn live_tv_discover_tuners(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<LiveTvDiscoverTunersQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let config = state
@@ -12704,10 +12889,49 @@ async fn live_tv_discover_tuners(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    Ok(Json(live_tv_discovered_tuners(&config)))
+    Ok(Json(
+        live_tv_discovered_tuners(&config, query.new_devices_only.unwrap_or(false)).await,
+    ))
 }
 
-fn live_tv_discovered_tuners(config: &serde_json::Value) -> Vec<serde_json::Value> {
+async fn live_tv_discovered_tuners(
+    config: &serde_json::Value,
+    new_devices_only: bool,
+) -> Vec<serde_json::Value> {
+    let configured_device_ids = live_tv_configured_tuner_summaries(config)
+        .iter()
+        .filter_map(|tuner| json_string_field(tuner, "DeviceId"))
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    let mut discovered = live_tv_discover_hdhomerun_tuners_udp().await;
+    for tuner in &mut discovered {
+        let is_configured = json_string_field(tuner, "DeviceId")
+            .filter(|id| !id.is_empty())
+            .map(|id| configured_device_ids.contains(&id.to_ascii_lowercase()))
+            .unwrap_or(false);
+        tuner["IsConfigured"] = serde_json::json!(is_configured);
+    }
+    if new_devices_only {
+        live_tv_filter_new_hdhomerun_devices(&mut discovered, &configured_device_ids);
+    }
+    discovered
+}
+
+fn live_tv_filter_new_hdhomerun_devices(
+    discovered: &mut Vec<serde_json::Value>,
+    configured_device_ids: &HashSet<String>,
+) {
+    discovered.retain(|tuner| {
+        !json_string_field(tuner, "DeviceId")
+            .filter(|id| !id.is_empty())
+            .map(|id| configured_device_ids.contains(&id.to_ascii_lowercase()))
+            .unwrap_or(false)
+    });
+}
+
+fn live_tv_configured_tuner_summaries(config: &serde_json::Value) -> Vec<serde_json::Value> {
     config
         .get("TunerHosts")
         .and_then(serde_json::Value::as_array)
@@ -31921,11 +32145,10 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let discovered: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(discovered.as_array().unwrap().len(), 1, "{endpoint}");
-            assert_eq!(discovered[0]["Id"], "tuner-1");
-            assert_eq!(discovered[0]["Name"], "Primary tuner");
-            assert_eq!(discovered[0]["ChannelCount"], 2);
-            assert_eq!(discovered[0]["IsConfigured"], true);
+            assert!(
+                discovered.as_array().is_some(),
+                "discovery endpoint must return a JSON array: {endpoint}"
+            );
         }
 
         let response = app
@@ -33560,6 +33783,247 @@ mod tests {
         assert!(
             !hdhomerun_bool_field(&numeric_not_hd, "HD"),
             "numeric 0 is not HD"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_tv_hdhomerun_udp_discovery_fetches_model_info() {
+        use axum::{Json, Router, routing::get};
+        use tokio::net::UdpSocket;
+
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/discover.json",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "FriendlyName": "HDHomeRun UDP Test",
+                        "ModelNumber": "HDHR5-2US",
+                        "FirmwareName": "hdhomerun5_atsc",
+                        "FirmwareVersion": "20260530",
+                        "DeviceID": "ABCDEF01",
+                        "BaseURL": "http://127.0.0.1",
+                        "LineupURL": "http://127.0.0.1/lineup.json",
+                        "TunerCount": 2
+                    }))
+                }),
+            );
+            axum::serve(http_listener, app).await.unwrap();
+        });
+
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (received, peer) = udp_server.recv_from(&mut buffer).await.unwrap();
+            assert_eq!(&buffer[..received], &super::HDHOMERUN_DISCOVERY_MESSAGE);
+            let mut reply = [0u8; 20];
+            reply[1] = 3;
+            udp_server.send_to(&reply, peer).await.unwrap();
+        });
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let discovered = super::live_tv_discover_hdhomerun_tuners_with_socket(
+            client_socket,
+            udp_addr,
+            std::time::Duration::from_millis(500),
+            Some(format!("http://127.0.0.1:{}", http_addr.port())),
+        )
+        .await;
+        udp_task.await.unwrap();
+        http_server.abort();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0]["Type"], "hdhomerun");
+        assert_eq!(discovered[0]["Id"], Value::Null);
+        assert_eq!(discovered[0]["DeviceId"], "ABCDEF01");
+        assert_eq!(discovered[0]["Name"], "HDHomeRun UDP Test");
+        assert_eq!(discovered[0]["FriendlyName"], "HDHomeRun UDP Test");
+        assert_eq!(discovered[0]["TunerCount"], 2);
+        assert_eq!(discovered[0]["AllowStreamSharing"], true);
+        assert_eq!(discovered[0]["IgnoreDts"], true);
+        assert_eq!(discovered[0]["IsConfigured"], false);
+    }
+
+    #[tokio::test]
+    async fn live_tv_hdhomerun_udp_discovery_accepts_legacy_404_model() {
+        use axum::{Router, http::StatusCode as AxumStatusCode, routing::get};
+        use tokio::net::UdpSocket;
+
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/discover.json",
+                get(|| async { AxumStatusCode::NOT_FOUND }),
+            );
+            axum::serve(http_listener, app).await.unwrap();
+        });
+
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (_received, peer) = udp_server.recv_from(&mut buffer).await.unwrap();
+            let mut reply = [0u8; 20];
+            reply[1] = 3;
+            udp_server.send_to(&reply, peer).await.unwrap();
+        });
+
+        let discovered = super::live_tv_discover_hdhomerun_tuners_with_socket(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            udp_addr,
+            std::time::Duration::from_millis(500),
+            Some(format!("http://127.0.0.1:{}", http_addr.port())),
+        )
+        .await;
+        udp_task.await.unwrap();
+        http_server.abort();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0]["Id"], Value::Null);
+        assert_eq!(discovered[0]["Type"], "hdhomerun");
+        assert_eq!(discovered[0]["ModelNumber"], "HDHR");
+        assert_eq!(discovered[0]["DeviceId"], "");
+        assert_eq!(discovered[0]["TunerCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn live_tv_hdhomerun_discovery_filters_configured_devices() {
+        let config = serde_json::json!({
+            "TunerHosts": [{
+                "Id": "configured-hdhr",
+                "Type": "hdhomerun",
+                "Url": "http://192.168.1.100",
+                "FriendlyName": "Configured HDHomeRun",
+                "DeviceId": "ABCDEF01",
+                "TunerCount": 2,
+                "Channels": []
+            }]
+        });
+        let configured = super::live_tv_configured_tuner_summaries(&config);
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0]["DeviceId"], "ABCDEF01");
+        assert_eq!(configured[0]["IsConfigured"], true);
+
+        let mut discovered = vec![serde_json::json!({
+            "Id": "ABCDEF01",
+            "Type": "hdhomerun",
+            "Url": "http://192.168.1.100",
+            "DeviceId": "ABCDEF01",
+            "FriendlyName": "Configured HDHomeRun",
+            "TunerCount": 2
+        })];
+        let configured_ids = configured
+            .iter()
+            .filter_map(|tuner| json_string_field(tuner, "DeviceId"))
+            .map(|id| id.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        super::live_tv_filter_new_hdhomerun_devices(&mut discovered, &configured_ids);
+        assert!(
+            discovered.is_empty(),
+            "newDevicesOnly must remove already configured DeviceId matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_tv_hdhomerun_udp_discovery_dedupes_device_id() {
+        use axum::{Json, Router, routing::get};
+        use tokio::net::UdpSocket;
+
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/discover.json",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "FriendlyName": "Duplicate HDHomeRun",
+                        "DeviceID": "ABCDEF02",
+                        "TunerCount": 4
+                    }))
+                }),
+            );
+            axum::serve(http_listener, app).await.unwrap();
+        });
+
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (_received, peer) = udp_server.recv_from(&mut buffer).await.unwrap();
+            let mut reply = [0u8; 20];
+            reply[1] = 3;
+            udp_server.send_to(&reply, peer).await.unwrap();
+            udp_server.send_to(&reply, peer).await.unwrap();
+        });
+
+        let discovered = super::live_tv_discover_hdhomerun_tuners_with_socket(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            udp_addr,
+            std::time::Duration::from_millis(500),
+            Some(format!("http://127.0.0.1:{}", http_addr.port())),
+        )
+        .await;
+        udp_task.await.unwrap();
+        http_server.abort();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0]["DeviceId"], "ABCDEF02");
+    }
+
+    #[tokio::test]
+    async fn live_tv_hdhomerun_udp_discovery_uses_global_deadline_for_http() {
+        use axum::{Json, Router, routing::get};
+        use tokio::net::UdpSocket;
+
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/discover.json",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    Json(serde_json::json!({
+                        "FriendlyName": "Slow HDHomeRun",
+                        "DeviceID": "SLOW0001",
+                        "TunerCount": 2
+                    }))
+                }),
+            );
+            axum::serve(http_listener, app).await.unwrap();
+        });
+
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            let (_received, peer) = udp_server.recv_from(&mut buffer).await.unwrap();
+            let mut reply = [0u8; 20];
+            reply[1] = 3;
+            udp_server.send_to(&reply, peer).await.unwrap();
+        });
+
+        let started = tokio::time::Instant::now();
+        let discovered = super::live_tv_discover_hdhomerun_tuners_with_socket(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            udp_addr,
+            std::time::Duration::from_millis(150),
+            Some(format!("http://127.0.0.1:{}", http_addr.port())),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        udp_task.await.unwrap();
+        http_server.abort();
+
+        assert!(
+            discovered.is_empty(),
+            "slow discover.json must not materialize a tuner after the deadline"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(350),
+            "HTTP validation must share the discovery deadline, elapsed={elapsed:?}"
         );
     }
 
