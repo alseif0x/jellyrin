@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
+    process::{Child, ChildStdin, Command},
     sync::broadcast,
     task::JoinHandle,
     time::{Instant, sleep},
@@ -98,13 +98,34 @@ impl HlsTranscodeLayout {
 }
 
 pub fn spawn_transcode_process(command: &FfmpegCommandSpec) -> io::Result<TranscodeProcess> {
+    spawn_transcode_process_with_stdin_mode(command, false).map(|(process, _stdin)| process)
+}
+
+pub fn spawn_transcode_process_with_stdin(
+    command: &FfmpegCommandSpec,
+) -> io::Result<(TranscodeProcess, ChildStdin)> {
+    let (process, stdin) = spawn_transcode_process_with_stdin_mode(command, true)?;
+    let stdin =
+        stdin.ok_or_else(|| io::Error::other("transcode process stdin was not captured"))?;
+    Ok((process, stdin))
+}
+
+fn spawn_transcode_process_with_stdin_mode(
+    command: &FfmpegCommandSpec,
+    pipe_stdin: bool,
+) -> io::Result<(TranscodeProcess, Option<ChildStdin>)> {
     let mut child = Command::new(&command.program)
         .args(&command.args)
-        .stdin(Stdio::null())
+        .stdin(if pipe_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    let stdin = if pipe_stdin { child.stdin.take() } else { None };
     let stderr = child
         .stderr
         .take()
@@ -112,12 +133,13 @@ pub fn spawn_transcode_process(command: &FfmpegCommandSpec) -> io::Result<Transc
     let (progress_tx, _) = broadcast::channel(64);
     let stderr_task = tokio::spawn(read_ffmpeg_progress(stderr, progress_tx.clone()));
 
-    Ok(TranscodeProcess {
+    let process = TranscodeProcess {
         child: Some(child),
         progress_tx,
         stderr_task: Some(stderr_task),
         exit: None,
-    })
+    };
+    Ok((process, stdin))
 }
 
 pub fn render_hls_master_playlist(variant: &HlsVariantInfo) -> String {
@@ -308,12 +330,13 @@ fn parse_ffmpeg_progress_line_has_snapshot(progress: &mut FfmpegProgress, line: 
 #[cfg(test)]
 mod tests {
     use jellyrin_core::FfmpegCommandSpec;
+    use tokio::io::AsyncWriteExt;
     use tokio::time::{Duration, timeout};
 
     use super::{
         HLS_MASTER_PLAYLIST_NAME, HLS_MEDIA_PLAYLIST_NAME, HlsSegment, HlsTranscodeLayout,
         HlsVariantInfo, render_hls_master_playlist, render_hls_media_playlist,
-        spawn_transcode_process, wait_for_hls_readiness,
+        spawn_transcode_process, spawn_transcode_process_with_stdin, wait_for_hls_readiness,
     };
 
     #[test]
@@ -527,6 +550,31 @@ mod tests {
             .unwrap();
         assert!(!exit.success);
         assert_eq!(exit, process.stop().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn transcode_process_with_stdin_forwards_pipe_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("stdin.out");
+        let command = FfmpegCommandSpec::new(
+            "sh",
+            vec![
+                "-c".to_string(),
+                format!("cat > {}", output.to_string_lossy()),
+            ],
+        );
+
+        let (mut process, mut stdin) = spawn_transcode_process_with_stdin(&command).unwrap();
+        stdin.write_all(b"pipe-bytes").await.unwrap();
+        stdin.shutdown().await.unwrap();
+        drop(stdin);
+
+        let exit = timeout(Duration::from_secs(5), process.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exit.success);
+        assert_eq!(tokio::fs::read(output).await.unwrap(), b"pipe-bytes");
     }
 
     #[tokio::test]

@@ -264,6 +264,20 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     FfmpegCommandSpec::new("ffmpeg", args)
 }
 
+pub fn build_hls_ffmpeg_command_from_stdin(request: &HlsTranscodeRequest) -> FfmpegCommandSpec {
+    let mut request = request.clone();
+    request.input_path = "pipe:0".to_string();
+    let mut command = build_hls_ffmpeg_command(&request);
+    command.args.retain(|arg| arg != "-nostdin");
+    if let Some(input_index) = command.args.iter().position(|arg| arg == "-i") {
+        command.args.splice(
+            input_index..input_index,
+            ["-f".to_string(), "mpegts".to_string()],
+        );
+    }
+    command
+}
+
 pub fn parse_ffmpeg_progress(input: &str) -> FfmpegProgress {
     let mut progress = FfmpegProgress::default();
     for line in input.lines() {
@@ -328,7 +342,7 @@ fn non_empty(value: &str) -> Option<String> {
 mod tests {
     use super::{
         HlsTranscodeRequest, TranscodeStreamSelection, build_hls_ffmpeg_command,
-        parse_ffmpeg_progress,
+        build_hls_ffmpeg_command_from_stdin, parse_ffmpeg_progress,
     };
 
     #[test]
@@ -464,6 +478,33 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|pair| pair == ["-b:a", "128000"])
+        );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_from_stdin_uses_mpegts_pipe_input() {
+        let request = HlsTranscodeRequest::new(
+            "hdhomerun://103B4218-0/ch7-3",
+            "/tmp/live/main.m3u8",
+            "/tmp/live/segment_%05d.ts",
+            TranscodeStreamSelection {
+                video_stream_index: Some(0),
+                audio_stream_index: Some(0),
+                subtitle_stream_index: None,
+            },
+        );
+
+        let command = build_hls_ffmpeg_command_from_stdin(&request);
+
+        assert!(!command.args.iter().any(|arg| arg == "-nostdin"));
+        assert!(command.args.windows(2).any(|pair| pair == ["-i", "pipe:0"]));
+        assert!(
+            command
+                .args
+                .windows(4)
+                .any(|pair| pair == ["-f", "mpegts", "-i", "pipe:0"]),
+            "stdin HLS command must force the input demuxer before -i: {:?}",
+            command.args
         );
     }
 

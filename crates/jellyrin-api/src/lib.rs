@@ -33,6 +33,7 @@ use jellyrin_compat::{
 use jellyrin_core::{
     DeviceToken, HlsTranscodeRequest, MediaItem, PlaybackState, StartupConfig,
     TranscodeStreamSelection, User, VirtualFolder, build_hls_ffmpeg_command,
+    build_hls_ffmpeg_command_from_stdin,
 };
 use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
@@ -44,7 +45,7 @@ use jellyrin_db::{
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
-    spawn_transcode_process, wait_for_hls_readiness,
+    spawn_transcode_process, spawn_transcode_process_with_stdin, wait_for_hls_readiness,
 };
 use rand_core::{OsRng, RngCore};
 use reqwest::Client as HttpClient;
@@ -11441,23 +11442,35 @@ struct LiveTvBroadcastSubscription {
     consumer_tuner_lease: Option<LiveTunerLeaseGuard>,
 }
 
+struct LiveTvBroadcastConsumer {
+    receiver: broadcast::Receiver<Bytes>,
+    guard: LiveStreamRefGuard,
+}
+
+impl LiveTvBroadcastSubscription {
+    fn into_consumer(self) -> LiveTvBroadcastConsumer {
+        LiveTvBroadcastConsumer {
+            receiver: self.receiver,
+            guard: LiveStreamRefGuard {
+                url: self.key,
+                generation: self.generation,
+                _tuner_lease: self.consumer_tuner_lease,
+            },
+        }
+    }
+}
+
 fn live_tv_broadcast_stream_response(
     subscription: LiveTvBroadcastSubscription,
 ) -> axum::response::Response {
-    // Build a streaming body that forwards broadcast chunks to this consumer.
-    // The guard decrements refcount when the response body finishes or the client disconnects.
-    let guard = LiveStreamRefGuard {
-        url: subscription.key,
-        generation: subscription.generation,
-        _tuner_lease: subscription.consumer_tuner_lease,
-    };
+    let consumer = subscription.into_consumer();
     let body_stream = futures_util::stream::unfold(
-        (subscription.receiver, guard),
-        |(mut rx, guard): (broadcast::Receiver<Bytes>, LiveStreamRefGuard)| async move {
+        consumer,
+        |mut consumer: LiveTvBroadcastConsumer| async move {
             loop {
-                match rx.recv().await {
+                match consumer.receiver.recv().await {
                     Ok(chunk) => {
-                        return Some((Ok::<Bytes, std::convert::Infallible>(chunk), (rx, guard)));
+                        return Some((Ok::<Bytes, std::convert::Infallible>(chunk), consumer));
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("live stream consumer lagged, dropped {n} chunks");
@@ -11466,7 +11479,7 @@ fn live_tv_broadcast_stream_response(
                     // Producer closed: end stream. State (including guard) is dropped here,
                     // which decrements refcount and cancels the producer if it was last consumer.
                     Err(broadcast::error::RecvError::Closed) => {
-                        let _ = (rx, guard);
+                        let _ = consumer;
                         return None;
                     }
                 }
@@ -12011,7 +12024,7 @@ fn live_tv_channel_media_source(
     // The stable play_session_id is embedded in the TranscodingUrl so clients can reuse it
     // across channel-detail fetches without starting a new session each time.
     let (supports_transcoding, transcoding_sub_protocol, transcoding_container, transcoding_url) =
-        if is_http_remote {
+        if is_remote {
             let play_session_id = live_tv_channel_hls_play_session_id(&channel_id);
             let url = format!("/Videos/{channel_id}/master.m3u8?PlaySessionId={play_session_id}");
             (
@@ -12801,12 +12814,8 @@ async fn record_channel_to_file(
         None
     }
     .map(|subscription| {
-        let guard = LiveStreamRefGuard {
-            url: subscription.key,
-            generation: subscription.generation,
-            _tuner_lease: subscription.consumer_tuner_lease,
-        };
-        (subscription.receiver, guard)
+        let consumer = subscription.into_consumer();
+        (consumer.receiver, consumer.guard)
     });
 
     let _tuner_lease = if is_legacy_hdhomerun {
@@ -18511,6 +18520,36 @@ struct LiveHlsTranscodeStart {
     command: jellyrin_core::FfmpegCommandSpec,
     output_path: String,
     tuner_lease: Option<LiveTunerLeaseGuard>,
+    stdin_source: Option<LiveTvBroadcastConsumer>,
+}
+
+async fn feed_live_hls_stdin_from_broadcast(
+    mut stdin: tokio::process::ChildStdin,
+    mut source: LiveTvBroadcastConsumer,
+    play_session_id: String,
+) {
+    loop {
+        match source.receiver.recv().await {
+            Ok(chunk) => {
+                if let Err(error) = stdin.write_all(&chunk).await {
+                    tracing::debug!(
+                        %play_session_id,
+                        %error,
+                        "live HLS stdin feed stopped because ffmpeg stdin closed"
+                    );
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(
+                    %play_session_id,
+                    "live HLS stdin feed lagged, dropped {n} chunks"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    let _ = stdin.shutdown().await;
 }
 
 async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
@@ -18523,6 +18562,7 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
         command,
         output_path,
         tuner_lease,
+        stdin_source,
     } = start;
 
     // Register the stop sender in TRANSCODE_STOPS so DELETE ActiveEncodings can kill ffmpeg.
@@ -18558,8 +18598,20 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
 
     tokio::spawn(async move {
         let _tuner_lease = tuner_lease;
-        let mut process = match spawn_transcode_process(&command) {
-            Ok(process) => process,
+        let spawn_result = if let Some(source) = stdin_source {
+            spawn_transcode_process_with_stdin(&command).map(|(process, stdin)| {
+                let feed_task = tokio::spawn(feed_live_hls_stdin_from_broadcast(
+                    stdin,
+                    source,
+                    play_session_id.clone(),
+                ));
+                (process, Some(feed_task))
+            })
+        } else {
+            spawn_transcode_process(&command).map(|process| (process, None))
+        };
+        let (mut process, stdin_feed_task) = match spawn_result {
+            Ok(spawned) => spawned,
             Err(error) => {
                 tracing::error!(%play_session_id, %error, "failed to spawn live HLS transcode process");
                 let mut registry = live_hls_session_registry().lock().await;
@@ -18605,6 +18657,10 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
         };
 
         drop(process);
+        if let Some(task) = stdin_feed_task {
+            task.abort();
+            let _ = task.await;
+        }
         transcode_stop_registry()
             .lock()
             .await
@@ -21784,9 +21840,9 @@ async fn active_hls_transcode_session_for_live_tv(
     }
 
     let channel = live_tv_channel_by_id(&state.db, channel_id).await?;
-    let channel_url = live_tv_channel_path(&channel)?
-        .to_string_lossy()
-        .to_string();
+    let channel_path = live_tv_channel_path(&channel)?;
+    let is_legacy_hdhomerun = live_tv_channel_is_legacy_hdhomerun_path(&channel_path);
+    let channel_url = channel_path.to_string_lossy().to_string();
     let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(&state.db, &channel).await;
 
     // Check for an existing active session by play_session_id.
@@ -21810,7 +21866,30 @@ async fn active_hls_transcode_session_for_live_tv(
         }
     }
 
-    let tuner_lease = acquire_live_tuner_lease(tuner_host_id, &channel_url, tuner_count)?;
+    let (input_path, tuner_lease, stdin_source) = if is_legacy_hdhomerun {
+        let params =
+            legacy_hdhomerun_stream_params_for_host(&state.db, tuner_host_id.as_deref()).await?;
+        let subscription = subscribe_legacy_hdhomerun_stream(
+            channel_url.clone(),
+            params.tuner_host_url,
+            params.control_port,
+            params.num_tuners,
+            tuner_host_id,
+            tuner_count,
+        )
+        .await?;
+        (
+            "pipe:0".to_string(),
+            None,
+            Some(subscription.into_consumer()),
+        )
+    } else {
+        (
+            channel_url.clone(),
+            acquire_live_tuner_lease(tuner_host_id, &channel_url, tuner_count)?,
+            None,
+        )
+    };
 
     // Start a new live HLS transcode session for this channel.
     let new_play_session_id = play_session_id.to_string();
@@ -21818,7 +21897,7 @@ async fn active_hls_transcode_session_for_live_tv(
     tokio::fs::create_dir_all(&layout.session_dir).await?;
 
     let request = HlsTranscodeRequest::new(
-        channel_url.clone(),
+        input_path,
         layout.media_playlist_path.to_string_lossy().to_string(),
         layout.segment_pattern_string(),
         TranscodeStreamSelection {
@@ -21827,7 +21906,11 @@ async fn active_hls_transcode_session_for_live_tv(
             subtitle_stream_index: None,
         },
     );
-    let command = build_hls_ffmpeg_command(&request);
+    let command = if is_legacy_hdhomerun {
+        build_hls_ffmpeg_command_from_stdin(&request)
+    } else {
+        build_hls_ffmpeg_command(&request)
+    };
     let output_path = layout.media_playlist_path.to_string_lossy().to_string();
 
     spawn_live_hls_transcode_task(LiveHlsTranscodeStart {
@@ -21839,6 +21922,7 @@ async fn active_hls_transcode_session_for_live_tv(
         command,
         output_path,
         tuner_lease,
+        stdin_source,
     })
     .await;
 
@@ -34772,8 +34856,14 @@ mod tests {
         assert_eq!(ms["IsRemote"], true);
         assert_eq!(ms["RequiresOpening"], true);
         assert_eq!(ms["SupportsDirectStream"], true);
-        assert_eq!(ms["SupportsTranscoding"], false);
-        assert_eq!(ms["TranscodingUrl"], Value::Null);
+        assert_eq!(ms["SupportsTranscoding"], true);
+        assert_eq!(ms["TranscodingSubProtocol"], "hls");
+        assert_eq!(ms["TranscodingContainer"], "ts");
+        let url = ms["TranscodingUrl"].as_str().unwrap_or_default();
+        assert!(
+            url.contains("/Videos/hdhr_7/master.m3u8") && url.contains("PlaySessionId="),
+            "legacy TranscodingUrl must expose stable live HLS: {url}"
+        );
     }
 
     // Spec: HlsTranscodeRequest live -> command contains -hls_playlist_type event and -i <url>,
@@ -51904,12 +51994,13 @@ mod tests {
         }
 
         async fn start_fake_legacy_hdhomerun(
-            ts_payload: &'static [u8],
+            ts_payload: impl Into<Vec<u8>>,
         ) -> (u16, Arc<StdMutex<Vec<String>>>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let events = Arc::new(StdMutex::new(Vec::<String>::new()));
             let events_clone = events.clone();
+            let ts_payload = Arc::new(ts_payload.into());
 
             tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -51943,14 +52034,57 @@ mod tests {
                     {
                         let target = target.parse::<std::net::SocketAddr>().unwrap();
                         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                        let mut rtp = vec![0u8; crate::HDHOMERUN_LEGACY_RTP_HEADER_BYTES];
-                        rtp.extend_from_slice(ts_payload);
-                        udp.send_to(&rtp, target).await.unwrap();
+                        for chunk in ts_payload.chunks(188 * 40) {
+                            let mut rtp = vec![0u8; crate::HDHOMERUN_LEGACY_RTP_HEADER_BYTES];
+                            rtp.extend_from_slice(chunk);
+                            udp.send_to(&rtp, target).await.unwrap();
+                            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                        }
                     }
                 }
             });
 
             (port, events)
+        }
+
+        async fn generate_valid_mpegts_payload() -> Vec<u8> {
+            let output = tokio::process::Command::new("ffmpeg")
+                .arg("-hide_banner")
+                .arg("-nostdin")
+                .arg("-y")
+                .arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("testsrc=size=128x72:rate=25")
+                .arg("-t")
+                .arg("14")
+                .arg("-an")
+                .arg("-c:v")
+                .arg("mpeg2video")
+                .arg("-b:v")
+                .arg("90k")
+                .arg("-bf")
+                .arg("0")
+                .arg("-pix_fmt")
+                .arg("yuv420p")
+                .arg("-muxpreload")
+                .arg("0")
+                .arg("-muxdelay")
+                .arg("0")
+                .arg("-f")
+                .arg("mpegts")
+                .arg("pipe:1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "ffmpeg failed to generate TS payload: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.stdout.is_empty(), "generated TS payload is empty");
+            output.stdout
         }
 
         #[tokio::test]
@@ -52163,6 +52297,143 @@ mod tests {
             let path = completed["Path"].as_str().expect("recording Path");
             let bytes = tokio::fs::read(path).await.unwrap();
             assert_eq!(bytes, b"REC-TS");
+        }
+
+        #[tokio::test]
+        async fn live_tv_legacy_hdhomerun_hls_transcodes_udp_ts_from_pipe() {
+            use axum::{body::Body, http::Request};
+            use http_body_util::BodyExt;
+            use tower::ServiceExt;
+
+            let ts_payload = generate_valid_mpegts_payload().await;
+            let channel_url = "hdhomerun://103B4218-0/ch7-3".to_string();
+            let (control_port, events) = start_fake_legacy_hdhomerun(ts_payload).await;
+
+            let db = jellyrin_db::Database::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let user = db
+                .update_first_user("legacy-hls-user".to_string(), "secret")
+                .await
+                .unwrap();
+            let api_key = db
+                .issue_api_key_for_user(user.id, "legacy-hls-key")
+                .await
+                .unwrap();
+
+            let mut config = crate::default_live_tv_configuration();
+            config["TunerHosts"] = serde_json::json!([{
+                "Id": "legacy-hls-tuner",
+                "Type": "hdhomerun",
+                "Url": "http://127.0.0.1",
+                "LegacyControlPort": control_port,
+                "TunerCount": 1,
+                "Channels": [{
+                    "Id": "hdhr_7",
+                    "Name": "Legacy 7",
+                    "Number": "7",
+                    "Path": channel_url,
+                    "ChannelType": "TV"
+                }]
+            }]);
+            db.update_named_configuration("livetv", crate::live_tv_configuration_json(config))
+                .await
+                .unwrap();
+
+            let app = crate::router(crate::AppState {
+                db,
+                web_dir: ".".into(),
+                log_dir: ".".into(),
+                local_address: "http://127.0.0.1:8097".to_string(),
+            });
+            let play_session_id = format!("legacy-hls-{}", uuid::Uuid::new_v4().simple());
+            let query = format!("PlaySessionId={play_session_id}&api_key={api_key}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/Videos/hdhr_7/master.m3u8?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let master_playlist = String::from_utf8_lossy(&body);
+            assert!(
+                master_playlist.contains(&format!("main.m3u8?{query}")),
+                "master playlist must point to live media playlist: {master_playlist}"
+            );
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/Videos/hdhr_7/main.m3u8?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let media_playlist = String::from_utf8_lossy(&body);
+            let segment_uri = media_playlist
+                .lines()
+                .find(|line| line.contains("/Videos/hdhr_7/hls1/main/0.ts"))
+                .unwrap_or_else(|| panic!("media playlist has no first segment: {media_playlist}"));
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(segment_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .unwrap(),
+                "video/mp2t"
+            );
+            let segment_bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                !segment_bytes.is_empty(),
+                "HLS segment must contain TS bytes"
+            );
+
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(axum::http::Method::DELETE)
+                        .uri(format!("/Videos/ActiveEncodings?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+            for _ in 0..20 {
+                let events = events.lock().unwrap().clone();
+                if events.iter().any(|event| event == "/tuner0/target=none")
+                    && events.iter().any(|event| event == "/tuner0/lockkey=none")
+                {
+                    return;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+            panic!(
+                "legacy HLS stop must release tuner: {:?}",
+                events.lock().unwrap()
+            );
         }
 
         #[tokio::test]
