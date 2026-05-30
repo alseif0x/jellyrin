@@ -343,6 +343,10 @@ async function captureTarget(browser, flowDir, target) {
       liveTvHdhrRecordingCompleted: false,
       liveTvHdhrRecordingPlayable: false,
       liveTvHdhrRecordingCleanup: false,
+      liveTvHdhrTunerLimitFirstOpen: false,
+      liveTvHdhrTunerLimitConflict: false,
+      liveTvHdhrTunerLimitRecovery: false,
+      liveTvHdhrTunerLimitSharingExempt: false,
       startupPublicInfoIncomplete: false,
       startupConfig200: false,
       startupConfig204: false,
@@ -4373,6 +4377,357 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
     }
   }
 
+  // ── TunerCount limit block ────────────────────────────────────────────────
+  // Validates the HDHomeRun TunerCount=1 limit enforcement:
+  //   FirstOpen: open channel 4.1 → 200 + bytes (both targets).
+  //   Conflict: with 4.1 active, open 5.1 → HTTP 500 (both targets).
+  //   Recovery: close 4.1, open 5.1 → 200 + bytes (both targets).
+  //   SharingExempt: 2 consumers of the SAME channel 4.1 → maxConcurrent===1, no conflict (Jellyrin only).
+  //
+  // Implementation decision: a DEDICATED limit sim (HDHOMERUN_SIM_TUNER_COUNT=1) is started
+  // exclusively for this block. The main sim (TunerCount=4) is NOT used here. For upstream,
+  // the main tuner host is deleted BEFORE adding the limit tuner so that the limit tuner is
+  // the ONLY running sim for channels 4.1/5.1, ensuring conflict propagates as HTTP 500.
+  // (If multiple running tuners serve the same channels, upstream falls back to the next host
+  // when one hits TunerCount, returning 200 rather than 500.) The main tuner is NOT re-added
+  // after the limit block because the recording block has already completed.
+  // For Jellyrin, the limit check is per tuner_host_id, so deleting the main tuner is not
+  // strictly required, but we delete it anyway for symmetry and to avoid stale state.
+  //
+  // R-CONFLICT-500: upstream returns HTTP 500 via ExceptionMiddleware (LiveTvConflictException not
+  // mapped -> _ => 500). Jellyrin returns HTTP 500 via ApiError::internal.
+  // R-ENFORCE-POINT: upstream enforces at PlaybackInfo (open time), Jellyrin at GET stream.ts.
+  // R-TOCTOU: Jellyrin chequeo+insert atómicos bajo el mismo lock del registro.
+  if (hdhrSimUrl) {
+    let limitSimClose = null;
+    let limitAddTuner = null;
+    let limitChannel41 = null;
+    let limitChannel51 = null;
+    try {
+      // Start the dedicated limit sim with TunerCount=1 and CHANNEL_OFFSET=3 (channels 7.1/8.1).
+      // Using a channel offset ensures these channels have never been opened on upstream before,
+      // avoiding stale _openStreams entries from previous golden runs that would cause upstream
+      // to reuse the old stream (sharing path) and bypass the TunerCount check.
+      const savedTunerCount = process.env.HDHOMERUN_SIM_TUNER_COUNT;
+      const savedChannelOffset = process.env.HDHOMERUN_SIM_CHANNEL_OFFSET;
+      process.env.HDHOMERUN_SIM_TUNER_COUNT = '1';
+      process.env.HDHOMERUN_SIM_CHANNEL_OFFSET = '3';
+      const limitSim = await hdhrSim.start(0);
+      if (savedTunerCount !== undefined) { process.env.HDHOMERUN_SIM_TUNER_COUNT = savedTunerCount; } else { delete process.env.HDHOMERUN_SIM_TUNER_COUNT; }
+      if (savedChannelOffset !== undefined) { process.env.HDHOMERUN_SIM_CHANNEL_OFFSET = savedChannelOffset; } else { delete process.env.HDHOMERUN_SIM_CHANNEL_OFFSET; }
+      const limitSimUrl = limitSim.url;
+      limitSimClose = limitSim.close;
+
+      // Delete the main tuner BEFORE adding the limit tuner (both targets).
+      // For upstream: ensures the limit tuner is the only active tuner for channels 4.1/5.1;
+      // without this, upstream falls back to the main tuner (TunerCount=0 → no limit) and
+      // channel B returns 200 instead of 500.
+      // For Jellyrin: ensures live_tv_channel_by_id("hdhr_4.1") returns the limit tuner's channel
+      // (TunerCount=1), not the main tuner's (TunerCount=4). Without this, Jellyrin streams via
+      // the main tuner's channel and the TunerCount=1 limit never fires.
+      // The recording block has already completed; the main tuner is no longer needed.
+      // The main tuner cleanup at the end of runLiveTvFlow (.catch()) handles any double-delete.
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/LiveTv/TunerHosts?id=${encodeURIComponent(addTuner.json.Id)}`,
+        token: auth.AccessToken,
+      }).catch(() => {});
+
+      // Add the limit tuner with TunerCount=1 explicitly in the body.
+      // Jellyrin reads TunerCount from the stored config; upstream also needs it in the body
+      // (Validate only updates DeviceId, not TunerCount, from discover.json).
+      limitAddTuner = await browserFetchJson(page, {
+        method: 'POST',
+        url: '/LiveTv/TunerHosts',
+        token: auth.AccessToken,
+        body: { Type: 'hdhomerun', Url: limitSimUrl, TunerCount: 1 },
+      });
+      if (![200, 204].includes(limitAddTuner.status) || !limitAddTuner.json?.Id) {
+        throw new Error(`Limit tuner add returned HTTP ${limitAddTuner.status}`);
+      }
+      const limitTunerId = limitAddTuner.json.Id;
+
+      // For upstream: trigger RefreshGuide so channels materialise from the limit sim.
+      if (target.name === 'upstream') {
+        const tasks = await browserFetchJson(page, {
+          method: 'GET', url: '/ScheduledTasks', token: auth.AccessToken,
+        }).catch(() => null);
+        if (tasks?.status === 200 && Array.isArray(tasks.json)) {
+          const rt = tasks.json.find((t) => t.Key === 'RefreshGuide' || (typeof t.Name === 'string' && t.Name.toLowerCase().includes('refresh guide')));
+          if (rt) {
+            await browserFetchJson(page, {
+              method: 'POST', url: `/ScheduledTasks/Running/${encodeURIComponent(rt.Id)}`, token: auth.AccessToken,
+            }).catch(() => {});
+          }
+        }
+      }
+
+      // Poll for channels 7.1 and 8.1 from the limit sim (CHANNEL_OFFSET=3: 4+3=7, 5+3=8).
+      // Using offset channels ensures upstream has no existing streams for these channels,
+      // so PlaybackInfo always opens a FRESH stream via the limit tuner (no sharing path).
+      // For Jellyrin: also filter by TunerHostId===limitTunerId so we get the limit tuner's
+      // channels (TunerCount=1), not the main tuner's (TunerCount=4).
+      const limitNum1 = '7.1';
+      const limitNum2 = '8.1';
+      const limitPollTimeout = 30000;
+      const limitPollInterval = 2000;
+      const limitPollDeadline = Date.now() + limitPollTimeout;
+      const limitChannels = {};
+      while (Date.now() < limitPollDeadline) {
+        const ch = await browserFetchJson(page, {
+          method: 'GET',
+          url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`,
+          token: auth.AccessToken,
+        });
+        if (ch.status === 200 && Array.isArray(ch.json?.Items)) {
+          for (const item of ch.json.Items) {
+            const num = item.ChannelNumber || (typeof item.Id === 'string' ? item.Id.replace(/^hdhr_/, '') : '');
+            // For Jellyrin: require TunerHostId to match the limit tuner so TunerCount=1 applies.
+            // For upstream: TunerHostId is not exposed in channel items; accept any matching number.
+            const tunerMatch = target.name !== 'jellyrin'
+              || (typeof item.TunerHostId === 'string' && item.TunerHostId === limitTunerId);
+            if (num === limitNum1 && !limitChannels[limitNum1] && tunerMatch) limitChannels[limitNum1] = item;
+            if (num === limitNum2 && !limitChannels[limitNum2] && tunerMatch) limitChannels[limitNum2] = item;
+          }
+          if (limitChannels[limitNum1] && limitChannels[limitNum2]) break;
+        }
+        if (Date.now() + limitPollInterval < limitPollDeadline) {
+          await new Promise((resolve) => { setTimeout(resolve, limitPollInterval); });
+        } else break;
+      }
+      limitChannel41 = limitChannels[limitNum1] || null;
+      limitChannel51 = limitChannels[limitNum2] || null;
+
+      if (!limitChannel41 || !limitChannel51) {
+        throw new Error(`Limit sim channels not found: ${limitNum1}=${Boolean(limitChannel41)}, ${limitNum2}=${Boolean(limitChannel51)}`);
+      }
+
+      // ── FirstOpen (4.1) ──
+      // Jellyrin: GET /LiveTv/LiveStreamFiles/{id}/stream.ts via probe.
+      // upstream: POST /Items/{id}/PlaybackInfo?AutoOpenLiveStream=true.
+      let limitLiveStreamIdA = null;
+      let limitStreamPathA = null;
+
+      if (target.name === 'jellyrin') {
+        // Use the channel object from the poll directly (it already includes MediaSources).
+        // We filtered by TunerHostId===limitTunerId above so this is definitely the limit tuner's
+        // channel with TunerCount=1 and Path pointing to the limit sim URL.
+        const ms = limitChannel41.MediaSources?.[0];
+        const directStreamUrl = ms?.DirectStreamUrl;
+        if (!directStreamUrl || !/\/LiveTv\/LiveStreamFiles\//i.test(directStreamUrl)) {
+          throw new Error('Limit tuner channel 4.1 did not include a LiveStreamFiles DirectStreamUrl');
+        }
+        try {
+          const pathUrl = new URL(directStreamUrl, summary.baseUrl);
+          limitStreamPathA = pathUrl.pathname + pathUrl.search;
+        } catch (_) {
+          limitStreamPathA = directStreamUrl;
+        }
+
+        // Open 4.1 and hold it open (overlap probe) so the registry entry stays alive.
+        const probe41 = await browserFetchStreamProbeOverlap(page, {
+          url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 2000,
+        });
+        summary.invariants.liveTvHdhrTunerLimitFirstOpen = (
+          probe41.status === 200 && probe41.byteLength >= 1
+        );
+      } else {
+        // upstream: PlaybackInfo with AutoOpenLiveStream=true opens the stream and keeps it in _openStreams.
+        const pbi = await browserFetchJson(page, {
+          method: 'POST',
+          url: `/Items/${encodeURIComponent(limitChannel41.Id)}/PlaybackInfo`,
+          token: auth.AccessToken,
+          body: { UserId: auth.User.Id, AutoOpenLiveStream: true },
+        });
+        if (pbi.status === 200 && Array.isArray(pbi.json?.MediaSources)) {
+          const ms = pbi.json.MediaSources[0];
+          limitLiveStreamIdA = ms?.LiveStreamId || null;
+          // Probe bytes for firstOpen invariant.
+          let streamPath41 = ms?.Path || '';
+          if (streamPath41) {
+            try {
+              const pathUrl = new URL(streamPath41);
+              const baseUrl = new URL(summary.baseUrl);
+              pathUrl.hostname = baseUrl.hostname;
+              pathUrl.port = baseUrl.port;
+              streamPath41 = pathUrl.pathname + pathUrl.search;
+            } catch (_) { /* keep as-is */ }
+          }
+          if (streamPath41) {
+            const probe41 = await browserFetchStreamProbe(page, {
+              url: streamPath41, token: auth.AccessToken, minBytes: 1,
+            });
+            summary.invariants.liveTvHdhrTunerLimitFirstOpen = (
+              probe41.status === 200 && probe41.byteLength >= 1
+            );
+          }
+        }
+      }
+
+      // ── Conflict (5.1 while 4.1 active) ──
+      // Jellyrin: open a new overlap probe for 4.1 to keep the handle alive, then try 5.1 stream.
+      // upstream: 4.1 is already open in _openStreams (limitLiveStreamIdA not yet closed); try PlaybackInfo for 5.1.
+      if (target.name === 'jellyrin') {
+        // Use limitChannel51 directly (already filtered by TunerHostId===limitTunerId; has MediaSources).
+        const ms51 = limitChannel51.MediaSources?.[0];
+        const directStreamUrl51 = ms51?.DirectStreamUrl;
+        let limitStreamPath51 = directStreamUrl51 || '';
+        if (limitStreamPath51) {
+          try {
+            const pathUrl = new URL(limitStreamPath51, summary.baseUrl);
+            limitStreamPath51 = pathUrl.pathname + pathUrl.search;
+          } catch (_) { /* keep as-is */ }
+        }
+
+        if (limitStreamPath51 && limitStreamPathA) {
+          // Open 4.1 again with overlap so the registry slot is still occupied during conflict check.
+          const overlap41 = browserFetchStreamProbeOverlap(page, {
+            url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 1500,
+          });
+          // Brief pause to ensure 4.1 is registered in the registry before trying 5.1.
+          await new Promise((resolve) => { setTimeout(resolve, 100); });
+          // Try 5.1 — must fail with HTTP 500 (TunerCount limit hit).
+          const probe51 = await browserFetchStreamProbe(page, {
+            url: limitStreamPath51, token: auth.AccessToken, minBytes: 1,
+          });
+          summary.invariants.liveTvHdhrTunerLimitConflict = probe51.status === 500;
+          // Wait for the 4.1 overlap to finish so the registry is cleaned up.
+          await overlap41;
+        }
+      } else {
+        // upstream: 4.1 still open in _openStreams. Try PlaybackInfo for 5.1.
+        const pbi51 = await browserFetchJson(page, {
+          method: 'POST',
+          url: `/Items/${encodeURIComponent(limitChannel51.Id)}/PlaybackInfo`,
+          token: auth.AccessToken,
+          body: { UserId: auth.User.Id, AutoOpenLiveStream: true },
+        });
+        summary.invariants.liveTvHdhrTunerLimitConflict = pbi51.status === 500;
+      }
+
+      // ── Recovery (close 7.1, open 8.1) ──
+      if (target.name === 'jellyrin') {
+        // Poll /stats until current[/auto/v7.1] === 0 (all 7.1 probes closed).
+        // The limit sim uses CHANNEL_OFFSET=3, so channels 4+3=7, 5+3=8.
+        const limitSimChannelPath41 = `/auto/v${limitNum1}`;
+        const recDeadline = Date.now() + 5000;
+        let recCurrent = -1;
+        while (Date.now() < recDeadline) {
+          const st = await nodeHttpJson('GET', `${limitSimUrl}/stats`).catch(() => null);
+          recCurrent = st?.json?.currentConcurrentByChannel?.[limitSimChannelPath41] ?? -1;
+          if (recCurrent === 0) break;
+          await new Promise((resolve) => { setTimeout(resolve, 200); });
+        }
+        if (recCurrent === 0) {
+          // Use limitChannel51 directly (already filtered by TunerHostId; has MediaSources).
+          const ms51 = limitChannel51.MediaSources?.[0];
+          const directStreamUrl51 = ms51?.DirectStreamUrl;
+          let limitStreamPath51 = directStreamUrl51 || '';
+          if (limitStreamPath51) {
+            try {
+              const pathUrl = new URL(limitStreamPath51, summary.baseUrl);
+              limitStreamPath51 = pathUrl.pathname + pathUrl.search;
+            } catch (_) { /* keep as-is */ }
+          }
+          if (limitStreamPath51) {
+            const probe51 = await browserFetchStreamProbe(page, {
+              url: limitStreamPath51, token: auth.AccessToken, minBytes: 1,
+            });
+            summary.invariants.liveTvHdhrTunerLimitRecovery = (
+              probe51.status === 200 && probe51.byteLength >= 1
+            );
+          }
+        }
+      } else {
+        // upstream: close 4.1 via /LiveStreams/Close, then retry PlaybackInfo for 5.1.
+        if (limitLiveStreamIdA) {
+          await browserFetchJson(page, {
+            method: 'POST',
+            url: `/LiveStreams/Close?liveStreamId=${encodeURIComponent(limitLiveStreamIdA)}`,
+            token: auth.AccessToken,
+          }).catch(() => {});
+          // Brief pause for upstream to release the _openStreams slot.
+          await new Promise((resolve) => { setTimeout(resolve, 500); });
+        }
+        const pbi51b = await browserFetchJson(page, {
+          method: 'POST',
+          url: `/Items/${encodeURIComponent(limitChannel51.Id)}/PlaybackInfo`,
+          token: auth.AccessToken,
+          body: { UserId: auth.User.Id, AutoOpenLiveStream: true },
+        });
+        if (pbi51b.status === 200 && Array.isArray(pbi51b.json?.MediaSources)) {
+          const ms51b = pbi51b.json.MediaSources[0];
+          const lsId51 = ms51b?.LiveStreamId;
+          let streamPath51b = ms51b?.Path || '';
+          if (streamPath51b) {
+            try {
+              const pathUrl = new URL(streamPath51b);
+              const baseUrl = new URL(summary.baseUrl);
+              pathUrl.hostname = baseUrl.hostname;
+              pathUrl.port = baseUrl.port;
+              streamPath51b = pathUrl.pathname + pathUrl.search;
+            } catch (_) { /* keep as-is */ }
+          }
+          if (streamPath51b) {
+            const probe51b = await browserFetchStreamProbe(page, {
+              url: streamPath51b, token: auth.AccessToken, minBytes: 1,
+            });
+            summary.invariants.liveTvHdhrTunerLimitRecovery = (
+              probe51b.status === 200 && probe51b.byteLength >= 1
+            );
+          }
+          // Close the recovery live stream to avoid leaving orphans.
+          if (lsId51) {
+            await browserFetchJson(page, {
+              method: 'POST',
+              url: `/LiveStreams/Close?liveStreamId=${encodeURIComponent(lsId51)}`,
+              token: auth.AccessToken,
+            }).catch(() => {});
+          }
+        }
+      }
+
+      // ── SharingExempt (Jellyrin only) ──
+      // 2 consumers of the SAME channel 4.1 with TunerCount=1 must NOT trigger a conflict.
+      // maxConcurrentByChannel[/auto/v4.1]===1 confirms only 1 outgoing connection (sharing).
+      if (target.name === 'jellyrin' && limitStreamPathA) {
+        await nodeHttpJson('POST', `${limitSimUrl}/stats/reset`).catch(() => {});
+        const exemptProbe1 = browserFetchStreamProbeOverlap(page, {
+          url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 800,
+        });
+        await new Promise((resolve) => { setTimeout(resolve, 30); });
+        const exemptProbe2 = browserFetchStreamProbeOverlap(page, {
+          url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 800,
+        });
+        const [ep1, ep2] = await Promise.all([exemptProbe1, exemptProbe2]);
+        const exemptStats = await nodeHttpJson('GET', `${limitSimUrl}/stats`).catch(() => null);
+        const maxConcurrentA = exemptStats?.json?.maxConcurrentByChannel?.[`/auto/v${limitNum1}`] ?? -1;
+        summary.invariants.liveTvHdhrTunerLimitSharingExempt = (
+          ep1.status === 200 && ep1.byteLength >= 1
+          && ep2.status === 200 && ep2.byteLength >= 1
+          && maxConcurrentA === 1
+        );
+      }
+    } catch (err) {
+      // Non-fatal: limit block failure should not crash the whole flow.
+      console.warn(`[tuner-limit] block error for ${target.name}: ${err.message}`);
+    } finally {
+      // Clean up limit tuner if it was added.
+      if (limitAddTuner?.json?.Id) {
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/LiveTv/TunerHosts?id=${encodeURIComponent(limitAddTuner.json.Id)}`,
+          token: auth.AccessToken,
+        }).catch(() => {});
+      }
+      // Stop the dedicated limit sim.
+      if (limitSimClose) {
+        await limitSimClose().catch(() => {});
+      }
+    }
+  }
+  // ── End of TunerCount limit block ─────────────────────────────────────────
+
   // Clean up the simulator tuner host so no residual HDHomeRun config is left
   // behind on either target (the simulator URL is gone after this run).
   await browserFetchJson(page, {
@@ -7815,6 +8170,9 @@ function invariantFailures(summary) {
       ['liveTvHdhrHlsMaster200', 'live tv HDHomeRun HLS master playlist 200'],
       ['liveTvHdhrHlsMediaLive', 'live tv HDHomeRun HLS media playlist live (no ENDLIST)'],
       ['liveTvHdhrHlsSegment200', 'live tv HDHomeRun HLS segment 200 (video/mp2t bytes>0)'],
+      ['liveTvHdhrTunerLimitFirstOpen', 'live tv HDHomeRun TunerCount=1 first open (200 + bytes)'],
+      ['liveTvHdhrTunerLimitConflict', 'live tv HDHomeRun TunerCount=1 conflict (HTTP 500)'],
+      ['liveTvHdhrTunerLimitRecovery', 'live tv HDHomeRun TunerCount=1 recovery after close (200 + bytes)'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);
@@ -7827,6 +8185,9 @@ function invariantFailures(summary) {
     // liveTvHdhrHlsActiveEncoding is jellyrin-only: upstream Jellyfin does not expose GET
     // /Videos/ActiveEncodings (returns 405, only DELETE allowed), so it cannot be tested on upstream;
     // upstream cleanup is validated via DELETE instead.
+    // liveTvHdhrTunerLimitSharingExempt is jellyrin-only: 2 consumers of the same channel are exempt
+    // from the TunerCount limit (sharing path, no new slot consumed). Upstream's stream-sharing path
+    // is not directly comparable via the simulator's concurrent-connection metric.
     if (summary.target === 'jellyrin') {
       for (const [field, label] of [
         ['liveTvConfigUpdated', 'live tv config update'],
@@ -7845,6 +8206,7 @@ function invariantFailures(summary) {
         ['liveTvHdhrHlsActiveEncoding', 'live tv HDHomeRun HLS listed in ActiveEncodings + removed after DELETE'],
         ['liveTvHdhrHlsTranscodeUrl', 'live tv HDHomeRun TranscodingUrl with SupportsTranscoding:true + hls'],
         ['liveTvHdhrHlsFfmpegReaped', 'live tv HDHomeRun HLS ffmpeg reaped (/stats currentConcurrent===0)'],
+        ['liveTvHdhrTunerLimitSharingExempt', 'live tv HDHomeRun TunerCount=1 sharing exempt (same channel, maxConcurrent===1)'],
       ]) {
         if (!summary.invariants[field]) {
           failures.push(`missing ${label} invariant`);
@@ -8029,6 +8391,9 @@ function ignoredConsoleError(text) {
     'A bad HTTP response code (404) was received when fetching the script.',
     'Failed to load resource: the server responded with a status of 404 (Not Found)',
     'Failed to load resource: the server responded with a status of 400 (Bad Request)',
+    // TunerCount limit conflict: expected 500 from /Items/.../PlaybackInfo (upstream) or
+    // /LiveTv/LiveStreamFiles/.../stream.ts (Jellyrin) when TunerCount=1 is exceeded.
+    'Failed to load resource: the server responded with a status of 500 (Internal Server Error)',
     'React Router Future Flag Warning',
     'Not initializing chromecast: chrome object is missing',
     'You rendered descendant <Routes> (or called `useRoutes()`) at "/"',
@@ -8067,6 +8432,17 @@ function allowedFailedResponse(response) {
   if (flow === 'live-tv' && response.status() === 400
     && new URL(url).pathname === '/Videos/ActiveEncodings'
     && url.startsWith(process.env.JELLYFIN_UPSTREAM_URL || 'http://127.0.0.1:8096')) {
+    return true;
+  }
+  // TunerCount limit conflict returns HTTP 500 when TunerCount=1 is reached:
+  //   - Jellyrin: GET /LiveTv/LiveStreamFiles/{id}/stream.ts -> 500 via ApiError::internal.
+  //   - upstream: POST /Items/{id}/PlaybackInfo (AutoOpenLiveStream=true) -> 500 via
+  //     ExceptionMiddleware (LiveTvConflictException -> _ => 500).
+  // Both are expected observable results (R-CONFLICT-500). Scoped to the live-tv flow to
+  // avoid silently hiding real errors in other flows.
+  if (flow === 'live-tv' && response.status() === 500
+    && (/\/LiveTv\/LiveStreamFiles\//i.test(new URL(url).pathname)
+      || /\/Items\/[^/]+\/PlaybackInfo/i.test(new URL(url).pathname))) {
     return true;
   }
   return false;

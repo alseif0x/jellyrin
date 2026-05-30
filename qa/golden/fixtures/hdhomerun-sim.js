@@ -89,44 +89,35 @@ function generateMonotonicClip() {
 
 const TS_CLIP = generateMonotonicClip();
 
-const LINEUP_CHANNELS = [
-  {
-    GuideNumber: '4.1',
-    GuideName: 'NBC HD',
-    VideoCodec: 'mpeg2video',
-    AudioCodec: 'ac3',
-    HD: 1,
-    Favorite: 0,
-    DRM: 0,
-  },
-  {
-    GuideNumber: '5.1',
-    GuideName: 'CBS HD',
-    VideoCodec: 'mpeg2video',
-    AudioCodec: 'ac3',
-    HD: 1,
-    Favorite: 1,
-    DRM: 0,
-  },
-  {
-    GuideNumber: '6.1',
-    GuideName: 'Pay-Per-View',
-    VideoCodec: 'mpeg2video',
-    AudioCodec: 'ac3',
-    HD: 0,
-    Favorite: 0,
-    DRM: 1,
-  },
-];
+// HDHOMERUN_SIM_CHANNEL_OFFSET: integer offset added to each channel's major number.
+// Default 0 -> channels 4.1, 5.1, 6.1 (the historical defaults).
+// Set to e.g. 3 -> channels 7.1, 8.1, 9.1 (useful for conflict tests on a fresh upstream
+// server that has never seen those channel numbers, avoiding stale _openStreams entries).
+// Read at start() time (not module load) so the env var can be set before calling start().
+function buildLineupChannels() {
+  const offset = Number.parseInt(process.env.HDHOMERUN_SIM_CHANNEL_OFFSET || '0', 10) || 0;
+  const base = [
+    { major: 4, minor: 1, GuideName: 'NBC HD', VideoCodec: 'mpeg2video', AudioCodec: 'ac3', HD: 1, Favorite: 0, DRM: 0 },
+    { major: 5, minor: 1, GuideName: 'CBS HD', VideoCodec: 'mpeg2video', AudioCodec: 'ac3', HD: 1, Favorite: 1, DRM: 0 },
+    { major: 6, minor: 1, GuideName: 'Pay-Per-View', VideoCodec: 'mpeg2video', AudioCodec: 'ac3', HD: 0, Favorite: 0, DRM: 1 },
+  ];
+  return base.map(({ major, minor, ...rest }) => ({
+    GuideNumber: `${major + offset}.${minor}`,
+    ...rest,
+  }));
+}
 
+// buildLineupWithUrls is called once per start() invocation (at server-listen time)
+// so the channel offset is captured from process.env at that moment, not per-request.
 function buildLineupWithUrls(baseUrl) {
-  return LINEUP_CHANNELS.map((channel) => ({
+  return buildLineupChannels().map((channel) => ({
     ...channel,
     URL: `${baseUrl}/auto/v${channel.GuideNumber}`,
   }));
 }
 
 function buildDiscoverResponse(baseUrl) {
+  const tunerCount = Number.parseInt(process.env.HDHOMERUN_SIM_TUNER_COUNT || '4', 10) || 4;
   return {
     FriendlyName: 'Jellyrin HDHomeRun Simulator',
     ModelNumber: 'HDHR5-4K',
@@ -136,7 +127,7 @@ function buildDiscoverResponse(baseUrl) {
     DeviceAuth: '',
     BaseURL: baseUrl,
     LineupURL: `${baseUrl}/lineup.json`,
-    TunerCount: 4,
+    TunerCount: tunerCount,
   };
 }
 
@@ -148,7 +139,10 @@ function start(port) {
       const assignedPort = tempServer.address().port;
       tempServer.close(() => {
         const baseUrl = `http://127.0.0.1:${assignedPort}`;
+        // Capture lineup and discover at server-start time so the env vars (TUNER_COUNT,
+        // CHANNEL_OFFSET) are read once and frozen, not re-read on every /lineup.json request.
         const discover = buildDiscoverResponse(baseUrl);
+        const lineup = buildLineupWithUrls(baseUrl);
 
         // Concurrent connection counters keyed by channel path (e.g. '/auto/v4.1').
         // currentConcurrentByChannel: number of live connections right now.
@@ -181,7 +175,7 @@ function start(port) {
           }
 
           if (url === '/lineup.json') {
-            const body = JSON.stringify(buildLineupWithUrls(baseUrl));
+            const body = JSON.stringify(lineup);
             res.writeHead(200, {
               'Content-Type': 'application/json',
               'Content-Length': Buffer.byteLength(body),

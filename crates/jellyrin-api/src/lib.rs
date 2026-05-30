@@ -129,6 +129,9 @@ struct SharedLiveStreamHandle {
     sender: broadcast::Sender<Bytes>,
     // Dropping this cancels the producer task via the oneshot channel.
     _cancel: oneshot::Sender<()>,
+    // The tuner host that owns this stream URL; used for TunerCount limit enforcement.
+    // None for channels without a tuner host (e.g. local-file M3U channels).
+    tuner_host_id: Option<String>,
 }
 
 fn live_stream_registry() -> &'static Mutex<HashMap<String, SharedLiveStreamHandle>> {
@@ -10287,7 +10290,7 @@ async fn live_tv_stream_file(
             return Err(ApiError::not_found("Live TV stream not found"));
         }
     }
-    stream_live_tv_channel(channel, &headers).await
+    stream_live_tv_channel(channel, &headers, &state.db).await
 }
 
 async fn live_tv_recordings(
@@ -10357,13 +10360,46 @@ async fn stream_live_tv_recording(
     stream_path(path, content_type, headers, true).await
 }
 
+// Resolve the TunerCount for a given tuner host ID from the livetv named configuration.
+// Returns None if the host is not found, TunerCount is absent, or is zero (unlimited).
+async fn tuner_count_for_host(db: &Database, tuner_host_id: &str) -> Option<u64> {
+    let config = db
+        .named_configuration("livetv")
+        .await
+        .ok()??;
+    let tuner_count = config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|host| {
+            host.get("Id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.eq_ignore_ascii_case(tuner_host_id))
+        })?
+        .get("TunerCount")
+        .and_then(serde_json::Value::as_u64)?;
+    // TunerCount == 0 means unlimited (no enforcement).
+    if tuner_count == 0 { None } else { Some(tuner_count) }
+}
+
 async fn stream_live_tv_channel(
     channel: serde_json::Value,
     headers: &HeaderMap,
+    db: &Database,
 ) -> Result<axum::response::Response, ApiError> {
     let path = live_tv_channel_path(&channel)?;
     if live_tv_channel_is_remote(&path) {
-        return proxy_live_tv_channel_url(path.to_string_lossy().into_owned()).await;
+        let tuner_host_id = json_string_field(&channel, "TunerHostId");
+        let tuner_count = match &tuner_host_id {
+            Some(host_id) => tuner_count_for_host(db, host_id).await,
+            None => None,
+        };
+        return proxy_live_tv_channel_url(
+            path.to_string_lossy().into_owned(),
+            tuner_host_id,
+            tuner_count,
+        )
+        .await;
     }
     let content_type = live_tv_recording_content_type(&path).to_string();
     stream_path(path, content_type, headers, true).await
@@ -10400,7 +10436,11 @@ impl Drop for LiveStreamRefGuard {
     }
 }
 
-async fn proxy_live_tv_channel_url(url: String) -> Result<axum::response::Response, ApiError> {
+async fn proxy_live_tv_channel_url(
+    url: String,
+    tuner_host_id: Option<String>,
+    tuner_count: Option<u64>,
+) -> Result<axum::response::Response, ApiError> {
     // Look up or create a shared handle for this stream URL.
     // The lock is never held across network I/O to avoid serialising concurrent clients.
     let (receiver, generation) = {
@@ -10408,13 +10448,35 @@ async fn proxy_live_tv_channel_url(url: String) -> Result<axum::response::Respon
         {
             let mut registry = live_stream_registry().lock().await;
             if let Some(handle) = registry.get_mut(&url) {
-                // Existing producer: subscribe a new consumer and increment refcount.
+                // Existing producer for this URL (same channel): subscribe a new consumer and
+                // increment refcount. This is the sharing path — 2 consumers of the SAME channel
+                // are exempt from TunerCount enforcement (same stream, no new tuner slot needed).
                 handle.refcount += 1;
                 let handle_gen = handle.generation;
                 let rx = handle.sender.subscribe();
                 // Lock is released here (end of block).
                 (rx, handle_gen)
             } else {
+                // No existing handle: this is a NEW channel stream (different URL).
+                // Before opening a new upstream connection, enforce the TunerCount limit.
+                // The check and insert are performed atomically under the same lock (no TOCTOU).
+                if let (Some(host_id), Some(limit)) = (&tuner_host_id, tuner_count) {
+                    // Count distinct URLs currently active for this tuner host.
+                    let active = registry
+                        .values()
+                        .filter(|h| {
+                            h.tuner_host_id
+                                .as_deref()
+                                .is_some_and(|id| id.eq_ignore_ascii_case(host_id))
+                        })
+                        .count() as u64;
+                    if active >= limit {
+                        return Err(ApiError::internal(format!(
+                            "HDHomeRun simultaneous stream limit has been reached (TunerCount={limit})"
+                        )));
+                    }
+                }
+
                 // No existing handle. Create the broadcast channel and INSERT the handle into the
                 // registry BEFORE opening the upstream connection. This prevents a concurrent
                 // request from also entering Phase 2 and opening a duplicate simulator connection
@@ -10432,6 +10494,7 @@ async fn proxy_live_tv_channel_url(url: String) -> Result<axum::response::Respon
                         generation: handle_gen,
                         sender: tx,
                         _cancel: cancel_tx,
+                        tuner_host_id: tuner_host_id.clone(),
                     },
                 );
                 // Release the registry lock before doing network I/O.
@@ -49407,7 +49470,7 @@ mod tests {
             live_stream_registry().lock().await.remove(&stream_url);
 
             // Open first consumer.
-            let resp1 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
+            let resp1 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
             assert_eq!(resp1.status(), axum::http::StatusCode::OK);
 
             // Give the producer task time to establish its outgoing connection.
@@ -49415,7 +49478,7 @@ mod tests {
             let connections_after_first = counter.load(std::sync::atomic::Ordering::SeqCst);
 
             // Open second consumer for the SAME URL.
-            let resp2 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
+            let resp2 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
             assert_eq!(resp2.status(), axum::http::StatusCode::OK);
 
             tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
@@ -49446,8 +49509,8 @@ mod tests {
 
             live_stream_registry().lock().await.remove(&stream_url);
 
-            let resp1 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
-            let resp2 = proxy_live_tv_channel_url(stream_url.clone()).await.unwrap();
+            let resp1 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
+            let resp2 = proxy_live_tv_channel_url(stream_url.clone(), None, None).await.unwrap();
 
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
@@ -49489,8 +49552,8 @@ mod tests {
             live_stream_registry().lock().await.remove(&url_a);
             live_stream_registry().lock().await.remove(&url_b);
 
-            let _resp_a = proxy_live_tv_channel_url(url_a.clone()).await.unwrap();
-            let _resp_b = proxy_live_tv_channel_url(url_b.clone()).await.unwrap();
+            let _resp_a = proxy_live_tv_channel_url(url_a.clone(), None, None).await.unwrap();
+            let _resp_b = proxy_live_tv_channel_url(url_b.clone(), None, None).await.unwrap();
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -49547,6 +49610,7 @@ mod tests {
                         generation: handle_gen,
                         sender: tx,
                         _cancel: cancel_tx,
+                        tuner_host_id: None,
                     },
                 );
                 handle_gen
@@ -49579,6 +49643,7 @@ mod tests {
                         generation: handle_gen,
                         sender: tx,
                         _cancel: cancel_tx,
+                        tuner_host_id: None,
                     },
                 );
                 handle_gen
@@ -49612,6 +49677,142 @@ mod tests {
 
             // Cleanup: remove the synthetic handle so it doesn't leak into other tests.
             live_stream_registry().lock().await.remove(&url);
+        }
+
+        // TunerCount limit tests.
+        //
+        // D3: 2 consumers of the SAME channel (same URL) are exempt from TunerCount enforcement
+        // because the second consumer reuses the existing handle (sharing path) and no new
+        // tuner slot is consumed. The check only fires for NEW URLs (different channels).
+
+        // (a) Same channel, TunerCount=1, second consumer -> Ok (sharing exempt, NOT conflict).
+        #[tokio::test]
+        async fn live_tv_tuner_limit_same_channel_second_consumer_ok() {
+            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+
+            let (base_url, _counter, _close) = start_stream_server().await;
+            let stream_url = format!("{base_url}/auto/v4.1_tunerlimit");
+
+            live_stream_registry().lock().await.remove(&stream_url);
+
+            let tuner_host_id = Some("tuner-host-abc".to_string());
+            let tuner_count = Some(1u64);
+
+            // First consumer: opens a new handle. Active count goes from 0 to 1 (==limit).
+            let resp1 = proxy_live_tv_channel_url(
+                stream_url.clone(),
+                tuner_host_id.clone(),
+                tuner_count,
+            )
+            .await
+            .expect("first open must succeed (active=0 < limit=1)");
+            assert_eq!(resp1.status(), axum::http::StatusCode::OK);
+
+            // Second consumer of the SAME URL: hits the sharing path (URL already in registry)
+            // -> refcount++ without a TunerCount check -> must succeed.
+            let resp2 = proxy_live_tv_channel_url(
+                stream_url.clone(),
+                tuner_host_id.clone(),
+                tuner_count,
+            )
+            .await
+            .expect("second consumer of SAME channel must be exempt from TunerCount limit (sharing)");
+            assert_eq!(resp2.status(), axum::http::StatusCode::OK);
+
+            // Verify refcount is 2 (not 1), confirming sharing was used.
+            {
+                let registry = live_stream_registry().lock().await;
+                assert_eq!(
+                    registry.get(&stream_url).map(|h| h.refcount),
+                    Some(2),
+                    "same-channel sharing must increment refcount to 2"
+                );
+            }
+
+            drop(resp1.into_body());
+            drop(resp2.into_body());
+            // Allow async drop tasks to remove the handle.
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            live_stream_registry().lock().await.remove(&stream_url);
+        }
+
+        // (b) Two distinct channels of the same tuner host, TunerCount=1 -> second open is Err.
+        #[tokio::test]
+        async fn live_tv_tuner_limit_distinct_channels_second_open_err() {
+            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+
+            let (base_url, _counter, _close) = start_stream_server().await;
+            let url_a = format!("{base_url}/auto/v4.1_limit_a");
+            let url_b = format!("{base_url}/auto/v5.1_limit_b");
+
+            live_stream_registry().lock().await.remove(&url_a);
+            live_stream_registry().lock().await.remove(&url_b);
+
+            let tuner_host_id = Some("tuner-host-xyz".to_string());
+            let tuner_count = Some(1u64);
+
+            // First channel (A): succeeds (active=0 < limit=1).
+            let _resp_a = proxy_live_tv_channel_url(url_a.clone(), tuner_host_id.clone(), tuner_count)
+                .await
+                .expect("channel A open must succeed");
+
+            // Second channel (B) of the SAME tuner host: fails (active=1 >= limit=1).
+            let result_b =
+                proxy_live_tv_channel_url(url_b.clone(), tuner_host_id.clone(), tuner_count).await;
+            assert!(
+                result_b.is_err(),
+                "channel B open must fail when TunerCount limit is reached"
+            );
+
+            drop(_resp_a.into_body());
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            live_stream_registry().lock().await.remove(&url_a);
+            live_stream_registry().lock().await.remove(&url_b);
+        }
+
+        // (c) After dropping the first channel's guard (refcount -> 0 removes handle),
+        //     the second distinct channel must open successfully (recovery).
+        #[tokio::test]
+        async fn live_tv_tuner_limit_recovery_after_close() {
+            use crate::{proxy_live_tv_channel_url, live_stream_registry};
+
+            let (base_url, _counter, _close) = start_stream_server().await;
+            let url_a = format!("{base_url}/auto/v4.1_recovery_a");
+            let url_b = format!("{base_url}/auto/v5.1_recovery_b");
+
+            live_stream_registry().lock().await.remove(&url_a);
+            live_stream_registry().lock().await.remove(&url_b);
+
+            let tuner_host_id = Some("tuner-host-recover".to_string());
+            let tuner_count = Some(1u64);
+
+            // Open channel A (limit=1, slot consumed).
+            let resp_a =
+                proxy_live_tv_channel_url(url_a.clone(), tuner_host_id.clone(), tuner_count)
+                    .await
+                    .expect("channel A open must succeed");
+
+            // Drop channel A body -> guard fires -> refcount reaches 0 -> handle removed.
+            drop(resp_a.into_body());
+            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+            // Verify channel A handle is gone from the registry.
+            assert!(
+                live_stream_registry().lock().await.get(&url_a).is_none(),
+                "channel A handle must be removed after refcount reaches 0"
+            );
+
+            // Open channel B now: the tuner slot was released, so this must succeed.
+            let resp_b =
+                proxy_live_tv_channel_url(url_b.clone(), tuner_host_id.clone(), tuner_count)
+                    .await
+                    .expect("channel B must open successfully after channel A is closed (recovery)");
+            assert_eq!(resp_b.status(), axum::http::StatusCode::OK);
+
+            drop(resp_b.into_body());
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            live_stream_registry().lock().await.remove(&url_a);
+            live_stream_registry().lock().await.remove(&url_b);
         }
     }
 }

@@ -42,6 +42,9 @@ const upstreamComparable = [
   'liveTvHdhrTimerRecordingCreated',
   'liveTvHdhrRecordingCompleted',
   'liveTvHdhrRecordingPlayable',
+  'liveTvHdhrTunerLimitFirstOpen',
+  'liveTvHdhrTunerLimitConflict',
+  'liveTvHdhrTunerLimitRecovery',
 ];
 
 // Invariants validated only by Jellyrin via the synthetic M3U/XMLTV shortcut. These exercise
@@ -66,6 +69,7 @@ const jellyrinOnly = [
   'liveTvHdhrHlsTranscodeUrl',
   'liveTvHdhrHlsFfmpegReaped',
   'liveTvHdhrRecordingCleanup',
+  'liveTvHdhrTunerLimitSharingExempt',
 ];
 
 const baselineEvidence = {
@@ -152,11 +156,11 @@ function buildEvidence(result, comparison) {
       sourcePhase: 'E2.1',
       evidence: [
         'Live TV HDHomeRun golden completed against both upstream Jellyfin and Jellyrin using the same simulator.',
-        'upstream-validated is decided by the 13 HDHomeRun real-sequence invariants (upstreamComparable) executed by BOTH targets against the same simulator.',
-        'The 17 synthetic M3U/XMLTV + jellyrin-only invariants (jellyrinOnly) are intentionally excluded from the upstream comparison.',
+        'upstream-validated is decided by the 16 HDHomeRun real-sequence invariants (upstreamComparable) executed by BOTH targets against the same simulator.',
+        'The 18 synthetic M3U/XMLTV + jellyrin-only invariants (jellyrinOnly) are intentionally excluded from the upstream comparison.',
         'upstream does not expose the direct System/Configuration/livetv channel injection path used by Jellyrin,',
         'and materialises guide data asynchronously via RefreshGuideScheduledTask rather than eagerly.',
-        'Jellyrin satisfies all 30 invariants (13 HDHomeRun comparable + 17 jellyrin-only). upstream satisfies the 13 HDHomeRun invariants.',
+        'Jellyrin satisfies all 34 invariants (16 HDHomeRun comparable + 18 jellyrin-only). upstream satisfies the 16 HDHomeRun invariants.',
         'liveTvHdhrStream200 (byte delivery via direct TS proxy) is in the comparable set for BOTH targets.',
         'liveTvHdhrHlsMaster200 (HLS transcode master playlist): BOTH targets serve master.m3u8 from the HDHomeRun channel.',
         'Jellyrin: TranscodingUrl embedded in channel MediaSource (SupportsTranscoding:true, TranscodingSubProtocol:hls).',
@@ -178,6 +182,15 @@ function buildEvidence(result, comparison) {
         'liveTvHdhrRecordingCompleted (upstreamComparable): poll GET /LiveTv/Recordings until Status==Completed for our channel within bounded timeout (default 30s); BOTH targets use DirectRecorder COPY pattern (no transcode).',
         'liveTvHdhrRecordingPlayable (upstreamComparable): recording file downloaded from BOTH targets and verified by ffprobe >=1 video packet — genuine byte comparison, not header-only.',
         'liveTvHdhrRecordingCleanup (jellyrin-only): /stats currentConcurrentByChannel===0 after recording + DELETE 204 + recording absent from GET /LiveTv/Recordings.',
+        'liveTvHdhrTunerLimitFirstOpen (upstreamComparable): dedicated limit sim (TunerCount=1) added; opening channel 4.1 returns 200 + bytes on BOTH targets.',
+        'liveTvHdhrTunerLimitConflict (upstreamComparable): with channel 4.1 active, opening channel 5.1 returns HTTP 500 on BOTH targets.',
+        'R-CONFLICT-500: upstream 500 via ExceptionMiddleware (LiveTvConflictException -> _ => 500). Jellyrin 500 via ApiError::internal.',
+        'R-ENFORCE-POINT: upstream enforces at PlaybackInfo (open time); Jellyrin enforces at GET /LiveTv/LiveStreamFiles (stream time). Same observable 500.',
+        'R-TOCTOU: Jellyrin check+insert atomic under the same registry lock. No TOCTOU window.',
+        'liveTvHdhrTunerLimitRecovery (upstreamComparable): after closing channel 4.1 and draining /stats current===0, opening channel 5.1 returns 200 + bytes on BOTH targets.',
+        'liveTvHdhrTunerLimitSharingExempt (jellyrin-only): 2 consumers of channel 4.1 with TunerCount=1 do NOT trigger a conflict; maxConcurrentByChannel[/auto/v4.1]===1 (sharing exempt). Upstream sharing is not directly comparable via the sim metric (upstream uses file-based SharedHttpStream, not broadcast fan-out).',
+        'D5 R-LIMIT-SCOPE: TunerCount limit counts only direct TS proxy streams (LIVE_STREAM_REGISTRY). HLS sessions (LIVE_HLS_SESSIONS) and recordings (LIVE_TV_RECORDING_REGISTRY) use separate registries; unifying them is a future sub-gate.',
+        'Upstream isolation: the main sim tuner is deleted before the limit test on upstream to prevent fallback to the main tuner (TunerCount=0). Only the limit tuner (TunerCount=1) serves channels 4.1/5.1 during the conflict sequence.',
       ].join(' '),
       updatedAt,
       completedTargets,
