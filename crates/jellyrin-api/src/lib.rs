@@ -4,7 +4,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
@@ -50,7 +50,7 @@ use rand_core::{OsRng, RngCore};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Deserializer, de};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio_util::io::ReaderStream;
@@ -72,6 +72,14 @@ const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
 const HDHOMERUN_DISCOVERY_PORT: u16 = 65001;
 const HDHOMERUN_DISCOVERY_DURATION_MS: u64 = 3000;
+const HDHOMERUN_LEGACY_DEFAULT_TUNERS: usize = 2;
+const HDHOMERUN_LEGACY_RTP_HEADER_BYTES: usize = 12;
+const HDHOMERUN_LEGACY_CONTROL_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const HDHOMERUN_LEGACY_GETSET_NAME: u8 = 3;
+const HDHOMERUN_LEGACY_GETSET_VALUE: u8 = 4;
+const HDHOMERUN_LEGACY_GETSET_LOCKKEY: u8 = 21;
+const HDHOMERUN_LEGACY_GETSET_REQUEST: u16 = 4;
+const HDHOMERUN_LEGACY_GETSET_REPLY: u16 = 5;
 const HDHOMERUN_DISCOVERY_MESSAGE: [u8; 20] = [
     0, 2, 0, 12, 1, 4, 255, 255, 255, 255, 2, 4, 255, 255, 255, 255, 115, 204, 125, 143,
 ];
@@ -10098,6 +10106,398 @@ fn hdhomerun_bool_field(entry: &serde_json::Value, key: &str) -> bool {
     }
 }
 
+fn live_tv_channel_is_legacy_hdhomerun_path(path: &FsPath) -> bool {
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .starts_with("hdhomerun")
+}
+
+fn parse_legacy_hdhomerun_channel_commands(url: &str) -> Vec<(String, String)> {
+    let lower = url.to_ascii_lowercase();
+    let Some(start) = lower.find("/ch") else {
+        return Vec::new();
+    };
+    let mut rest = url[start + 3..].chars().peekable();
+    let mut channel = String::new();
+    while let Some(ch) = rest.peek().copied() {
+        if ch.is_ascii_digit() {
+            channel.push(ch);
+            rest.next();
+        } else {
+            break;
+        }
+    }
+    if channel.is_empty() {
+        return Vec::new();
+    }
+
+    let mut commands = vec![("channel".to_string(), channel)];
+    if rest.peek() == Some(&'-') {
+        rest.next();
+        let mut program = String::new();
+        while let Some(ch) = rest.peek().copied() {
+            if ch.is_ascii_digit() {
+                program.push(ch);
+                rest.next();
+            } else {
+                break;
+            }
+        }
+        if !program.is_empty() {
+            commands.push(("program".to_string(), program));
+        }
+    }
+    commands
+}
+
+fn hdhomerun_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        let mut entry = (crc ^ u32::from(*byte)) & 0xff;
+        for _ in 0..8 {
+            if entry & 1 == 1 {
+                entry = (entry >> 1) ^ 0xedb8_8320;
+            } else {
+                entry >>= 1;
+            }
+        }
+        crc = (crc >> 8) ^ entry;
+    }
+    !crc
+}
+
+fn hdhomerun_push_null_terminated_string(
+    packet: &mut Vec<u8>,
+    value: &str,
+) -> Result<(), ApiError> {
+    let value_bytes = value.as_bytes();
+    let len = value_bytes.len() + 1;
+    if len > u8::MAX as usize {
+        return Err(ApiError::bad_request(
+            "HDHomeRun control value is too long for legacy packet encoding",
+        ));
+    }
+    packet.push(len as u8);
+    packet.extend_from_slice(value_bytes);
+    packet.push(0);
+    Ok(())
+}
+
+fn hdhomerun_finish_packet(packet: &mut Vec<u8>) {
+    let payload_len = (packet.len() - 4) as u16;
+    packet[2..4].copy_from_slice(&payload_len.to_be_bytes());
+    let crc = hdhomerun_crc32(packet);
+    packet.extend_from_slice(&crc.to_le_bytes());
+}
+
+fn hdhomerun_write_get_message(tuner: usize, name: &str) -> Result<Vec<u8>, ApiError> {
+    let mut packet = Vec::with_capacity(64);
+    packet.extend_from_slice(&HDHOMERUN_LEGACY_GETSET_REQUEST.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.push(HDHOMERUN_LEGACY_GETSET_NAME);
+    hdhomerun_push_null_terminated_string(&mut packet, &format!("/tuner{tuner}/{name}"))?;
+    hdhomerun_finish_packet(&mut packet);
+    Ok(packet)
+}
+
+fn hdhomerun_write_set_message(
+    tuner: usize,
+    name: &str,
+    value: &str,
+    lockkey: Option<u32>,
+) -> Result<Vec<u8>, ApiError> {
+    let mut packet = Vec::with_capacity(96);
+    packet.extend_from_slice(&HDHOMERUN_LEGACY_GETSET_REQUEST.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.push(HDHOMERUN_LEGACY_GETSET_NAME);
+    hdhomerun_push_null_terminated_string(&mut packet, &format!("/tuner{tuner}/{name}"))?;
+    packet.push(HDHOMERUN_LEGACY_GETSET_VALUE);
+    hdhomerun_push_null_terminated_string(&mut packet, value)?;
+    if let Some(lockkey) = lockkey {
+        packet.push(HDHOMERUN_LEGACY_GETSET_LOCKKEY);
+        packet.push(4);
+        packet.extend_from_slice(&lockkey.to_be_bytes());
+    }
+    hdhomerun_finish_packet(&mut packet);
+    Ok(packet)
+}
+
+#[cfg(test)]
+fn hdhomerun_write_getset_reply(name: &str, value: &str) -> Result<Vec<u8>, ApiError> {
+    let mut packet = Vec::with_capacity(96);
+    packet.extend_from_slice(&HDHOMERUN_LEGACY_GETSET_REPLY.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.push(HDHOMERUN_LEGACY_GETSET_NAME);
+    hdhomerun_push_null_terminated_string(&mut packet, name)?;
+    packet.push(HDHOMERUN_LEGACY_GETSET_VALUE);
+    hdhomerun_push_null_terminated_string(&mut packet, value)?;
+    hdhomerun_finish_packet(&mut packet);
+    Ok(packet)
+}
+
+fn hdhomerun_try_get_return_value(buffer: &[u8]) -> Option<&[u8]> {
+    if buffer.len() < 8 {
+        return None;
+    }
+    let expected_crc = u32::from_le_bytes(buffer[buffer.len() - 4..].try_into().ok()?);
+    if expected_crc != hdhomerun_crc32(&buffer[..buffer.len() - 4]) {
+        return None;
+    }
+    if u16::from_be_bytes(buffer[0..2].try_into().ok()?) != HDHOMERUN_LEGACY_GETSET_REPLY {
+        return None;
+    }
+    let msg_len = u16::from_be_bytes(buffer[2..4].try_into().ok()?) as usize;
+    if buffer.len() != 4 + msg_len + 4 {
+        return None;
+    }
+
+    let mut offset = 4;
+    if buffer.get(offset).copied()? != HDHOMERUN_LEGACY_GETSET_NAME {
+        return None;
+    }
+    offset += 1;
+    let name_len = *buffer.get(offset)? as usize;
+    offset += 1 + name_len;
+    if buffer.get(offset).copied()? != HDHOMERUN_LEGACY_GETSET_VALUE {
+        return None;
+    }
+    offset += 1;
+    let value_len = *buffer.get(offset)? as usize;
+    offset += 1;
+    if value_len == 0 || offset + value_len > buffer.len().saturating_sub(4) {
+        return None;
+    }
+    Some(&buffer[offset..offset + value_len - 1])
+}
+
+async fn hdhomerun_send_control_packet(
+    stream: &mut tokio::net::TcpStream,
+    packet: Vec<u8>,
+) -> Result<Vec<u8>, ApiError> {
+    tokio::time::timeout(HDHOMERUN_LEGACY_CONTROL_TIMEOUT, stream.write_all(&packet))
+        .await
+        .map_err(|_| ApiError::internal("HDHomeRun control write timed out"))?
+        .map_err(|error| ApiError::internal(format!("HDHomeRun control write failed: {error}")))?;
+
+    let mut header = [0u8; 4];
+    tokio::time::timeout(
+        HDHOMERUN_LEGACY_CONTROL_TIMEOUT,
+        stream.read_exact(&mut header),
+    )
+    .await
+    .map_err(|_| ApiError::internal("HDHomeRun control read timed out"))?
+    .map_err(|error| ApiError::internal(format!("HDHomeRun control read failed: {error}")))?;
+
+    let msg_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+    let mut rest = vec![0u8; msg_len + 4];
+    tokio::time::timeout(
+        HDHOMERUN_LEGACY_CONTROL_TIMEOUT,
+        stream.read_exact(&mut rest),
+    )
+    .await
+    .map_err(|_| ApiError::internal("HDHomeRun control read timed out"))?
+    .map_err(|error| ApiError::internal(format!("HDHomeRun control read failed: {error}")))?;
+
+    let mut response = header.to_vec();
+    response.extend_from_slice(&rest);
+    Ok(response)
+}
+
+async fn hdhomerun_get_control_value(
+    stream: &mut tokio::net::TcpStream,
+    tuner: usize,
+    name: &str,
+) -> Result<Option<String>, ApiError> {
+    let packet = hdhomerun_write_get_message(tuner, name)?;
+    let response = hdhomerun_send_control_packet(stream, packet).await?;
+    Ok(hdhomerun_try_get_return_value(&response)
+        .map(|value| String::from_utf8_lossy(value).to_string()))
+}
+
+async fn hdhomerun_set_control_value(
+    stream: &mut tokio::net::TcpStream,
+    tuner: usize,
+    name: &str,
+    value: &str,
+    lockkey: Option<u32>,
+) -> Result<bool, ApiError> {
+    let packet = hdhomerun_write_set_message(tuner, name, value, lockkey)?;
+    let response = hdhomerun_send_control_packet(stream, packet).await?;
+    Ok(hdhomerun_try_get_return_value(&response).is_some())
+}
+
+struct LegacyHdhomerunControl {
+    stream: tokio::net::TcpStream,
+    active_tuner: usize,
+    lockkey: u32,
+}
+
+impl LegacyHdhomerunControl {
+    async fn stop(&mut self) {
+        let _ = hdhomerun_set_control_value(
+            &mut self.stream,
+            self.active_tuner,
+            "target",
+            "none",
+            Some(self.lockkey),
+        )
+        .await;
+        let _ = hdhomerun_set_control_value(
+            &mut self.stream,
+            self.active_tuner,
+            "lockkey",
+            "none",
+            Some(self.lockkey),
+        )
+        .await;
+    }
+}
+
+async fn legacy_hdhomerun_release_tuner(
+    stream: &mut tokio::net::TcpStream,
+    tuner: usize,
+    lockkey: u32,
+) {
+    let _ = hdhomerun_set_control_value(stream, tuner, "target", "none", Some(lockkey)).await;
+    let _ = hdhomerun_set_control_value(stream, tuner, "lockkey", "none", Some(lockkey)).await;
+}
+
+fn ipv4_for_hdhomerun_target(addr: SocketAddr) -> Result<Ipv4Addr, ApiError> {
+    match addr.ip() {
+        IpAddr::V4(ip) => Ok(ip),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().ok_or_else(|| {
+            ApiError::internal("HDHomeRun legacy UDP streaming requires an IPv4 local address")
+        }),
+    }
+}
+
+async fn open_legacy_hdhomerun_udp_source(
+    channel_url: &str,
+    control_addr: SocketAddr,
+    num_tuners: usize,
+) -> Result<(tokio::net::UdpSocket, LegacyHdhomerunControl), ApiError> {
+    let udp_socket = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("failed to bind HDHomeRun UDP socket: {error}"))
+        })?;
+    let local_port = udp_socket
+        .local_addr()
+        .map_err(|error| ApiError::internal(format!("failed to read HDHomeRun UDP port: {error}")))?
+        .port();
+
+    let mut stream = tokio::time::timeout(
+        HDHOMERUN_LEGACY_CONTROL_TIMEOUT,
+        tokio::net::TcpStream::connect(control_addr),
+    )
+    .await
+    .map_err(|_| ApiError::internal("HDHomeRun legacy control connect timed out"))?
+    .map_err(|error| {
+        ApiError::internal(format!("HDHomeRun legacy control connect failed: {error}"))
+    })?;
+    let local_ip = ipv4_for_hdhomerun_target(stream.local_addr().map_err(|error| {
+        ApiError::internal(format!("failed to read HDHomeRun local address: {error}"))
+    })?)?;
+
+    let mut lockkey_bytes = [0u8; 4];
+    OsRng.fill_bytes(&mut lockkey_bytes);
+    let lockkey = u32::from_be_bytes(lockkey_bytes);
+    let commands = parse_legacy_hdhomerun_channel_commands(channel_url);
+    let target = format!("rtp://{local_ip}:{local_port}");
+
+    for tuner in 0..num_tuners.max(1) {
+        let Some(lockkey_value) =
+            hdhomerun_get_control_value(&mut stream, tuner, "lockkey").await?
+        else {
+            continue;
+        };
+        if !lockkey_value.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        if !hdhomerun_set_control_value(&mut stream, tuner, "lockkey", &lockkey.to_string(), None)
+            .await?
+        {
+            continue;
+        }
+
+        let mut commands_ok = true;
+        for (name, value) in &commands {
+            if !hdhomerun_set_control_value(&mut stream, tuner, name, value, Some(lockkey)).await? {
+                commands_ok = false;
+                break;
+            }
+        }
+        if !commands_ok {
+            legacy_hdhomerun_release_tuner(&mut stream, tuner, lockkey).await;
+            continue;
+        }
+
+        if hdhomerun_set_control_value(&mut stream, tuner, "target", &target, Some(lockkey)).await?
+        {
+            return Ok((
+                udp_socket,
+                LegacyHdhomerunControl {
+                    stream,
+                    active_tuner: tuner,
+                    lockkey,
+                },
+            ));
+        }
+        legacy_hdhomerun_release_tuner(&mut stream, tuner, lockkey).await;
+    }
+
+    Err(ApiError::conflict("No HDHomeRun legacy tuners available"))
+}
+
+fn live_tv_u64_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    match value.get(key)? {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn legacy_hdhomerun_scan_tuner_count(tuner_host: &serde_json::Value) -> usize {
+    let count = live_tv_u64_field(tuner_host, "TunerCount")
+        .filter(|count| *count > 0)
+        .unwrap_or(HDHOMERUN_LEGACY_DEFAULT_TUNERS as u64);
+    usize::try_from(count.min(32)).unwrap_or(HDHOMERUN_LEGACY_DEFAULT_TUNERS)
+}
+
+fn legacy_hdhomerun_control_port(tuner_host: &serde_json::Value) -> u16 {
+    live_tv_u64_field(tuner_host, "LegacyControlPort")
+        .or_else(|| live_tv_u64_field(tuner_host, "ControlPort"))
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(HDHOMERUN_DISCOVERY_PORT)
+}
+
+async fn legacy_hdhomerun_control_addr(
+    tuner_url: &str,
+    control_port: u16,
+) -> Result<SocketAddr, ApiError> {
+    let normalized_url = if tuner_url.starts_with("http://") || tuner_url.starts_with("https://") {
+        tuner_url.to_string()
+    } else {
+        format!("http://{tuner_url}")
+    };
+    let url = reqwest::Url::parse(&normalized_url)
+        .map_err(|error| ApiError::bad_request(format!("Invalid HDHomeRun tuner URL: {error}")))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::bad_request("HDHomeRun tuner URL is missing a host"))?;
+    let mut addrs = tokio::net::lookup_host((host, control_port))
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to resolve HDHomeRun host: {error}")))?
+        .collect::<Vec<_>>();
+    addrs
+        .iter()
+        .copied()
+        .find(SocketAddr::is_ipv4)
+        .or_else(|| addrs.pop())
+        .ok_or_else(|| ApiError::internal("HDHomeRun host did not resolve to any address"))
+}
+
 fn parse_live_tv_hdhomerun_channels(lineup: &[serde_json::Value]) -> Vec<serde_json::Value> {
     lineup
         .iter()
@@ -10116,6 +10516,7 @@ fn parse_live_tv_hdhomerun_channels(lineup: &[serde_json::Value]) -> Vec<serde_j
                 .to_string();
             let is_hd = hdhomerun_bool_field(entry, "HD");
             let is_favorite = hdhomerun_bool_field(entry, "Favorite");
+            let is_legacy_tuner = url.to_ascii_lowercase().starts_with("hdhomerun");
             Some(serde_json::json!({
                 "Id": format!("hdhr_{guide_number}"),
                 "Name": guide_name,
@@ -10124,6 +10525,7 @@ fn parse_live_tv_hdhomerun_channels(lineup: &[serde_json::Value]) -> Vec<serde_j
                 "ChannelType": "TV",
                 "IsHD": is_hd,
                 "IsFavorite": is_favorite,
+                "IsLegacyTuner": is_legacy_tuner,
             }))
         })
         .collect()
@@ -10862,11 +11264,9 @@ async fn stream_live_tv_recording(
     stream_path(path, content_type, headers, true).await
 }
 
-// Resolve the TunerCount for a given tuner host ID from the livetv named configuration.
-// Returns None if the host is not found, TunerCount is absent, or is zero (unlimited).
-async fn tuner_count_for_host(db: &Database, tuner_host_id: &str) -> Option<u64> {
+async fn live_tv_tuner_host_by_id(db: &Database, tuner_host_id: &str) -> Option<serde_json::Value> {
     let config = db.named_configuration("livetv").await.ok()??;
-    let tuner_count = config
+    config
         .get("TunerHosts")
         .and_then(serde_json::Value::as_array)?
         .iter()
@@ -10874,9 +11274,15 @@ async fn tuner_count_for_host(db: &Database, tuner_host_id: &str) -> Option<u64>
             host.get("Id")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|id| id.eq_ignore_ascii_case(tuner_host_id))
-        })?
-        .get("TunerCount")
-        .and_then(serde_json::Value::as_u64)?;
+        })
+        .cloned()
+}
+
+// Resolve the TunerCount for a given tuner host ID from the livetv named configuration.
+// Returns None if the host is not found, TunerCount is absent, or is zero (unlimited).
+async fn tuner_count_for_host(db: &Database, tuner_host_id: &str) -> Option<u64> {
+    let tuner_host = live_tv_tuner_host_by_id(db, tuner_host_id).await?;
+    let tuner_count = live_tv_u64_field(&tuner_host, "TunerCount")?;
     // TunerCount == 0 means unlimited (no enforcement).
     if tuner_count == 0 {
         None
@@ -10941,6 +11347,29 @@ async fn stream_live_tv_channel(
     db: &Database,
 ) -> Result<axum::response::Response, ApiError> {
     let path = live_tv_channel_path(&channel)?;
+    if live_tv_channel_is_legacy_hdhomerun_path(&path) {
+        let tuner_host_id = json_string_field(&channel, "TunerHostId");
+        let tuner_host = match tuner_host_id.as_deref() {
+            Some(host_id) => live_tv_tuner_host_by_id(db, host_id).await,
+            None => None,
+        }
+        .ok_or_else(|| ApiError::not_found("HDHomeRun tuner host not found"))?;
+        let tuner_host_url = json_string_field(&tuner_host, "Url")
+            .ok_or_else(|| ApiError::bad_request("HDHomeRun tuner host URL is required"))?;
+        let tuner_count = tuner_host_id
+            .as_deref()
+            .and_then(|_| live_tv_u64_field(&tuner_host, "TunerCount"))
+            .filter(|count| *count > 0);
+        return proxy_live_tv_legacy_hdhomerun_url(
+            path.to_string_lossy().into_owned(),
+            tuner_host_url,
+            legacy_hdhomerun_control_port(&tuner_host),
+            legacy_hdhomerun_scan_tuner_count(&tuner_host),
+            tuner_host_id,
+            tuner_count,
+        )
+        .await;
+    }
     if live_tv_channel_is_remote(&path) {
         let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(db, &channel).await;
         return proxy_live_tv_channel_url(
@@ -10984,6 +11413,50 @@ impl Drop for LiveStreamRefGuard {
             }
         });
     }
+}
+
+fn live_tv_broadcast_stream_response(
+    url: String,
+    generation: u64,
+    receiver: broadcast::Receiver<Bytes>,
+    consumer_tuner_lease: Option<LiveTunerLeaseGuard>,
+) -> axum::response::Response {
+    // Build a streaming body that forwards broadcast chunks to this consumer.
+    // The guard decrements refcount when the response body finishes or the client disconnects.
+    let guard = LiveStreamRefGuard {
+        url,
+        generation,
+        _tuner_lease: consumer_tuner_lease,
+    };
+    let body_stream = futures_util::stream::unfold(
+        (receiver, guard),
+        |(mut rx, guard): (broadcast::Receiver<Bytes>, LiveStreamRefGuard)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(chunk) => {
+                        return Some((Ok::<Bytes, std::convert::Infallible>(chunk), (rx, guard)));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("live stream consumer lagged, dropped {n} chunks");
+                        continue;
+                    }
+                    // Producer closed: end stream. State (including guard) is dropped here,
+                    // which decrements refcount and cancels the producer if it was last consumer.
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = (rx, guard);
+                        return None;
+                    }
+                }
+            }
+        },
+    );
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "video/mp2t")],
+        Body::from_stream(body_stream),
+    )
+        .into_response()
 }
 
 async fn proxy_live_tv_channel_url(
@@ -11121,43 +11594,122 @@ async fn proxy_live_tv_channel_url(
         }
     };
 
-    // Build a streaming body that forwards broadcast chunks to this consumer.
-    // The guard decrements refcount when the response body finishes or the client disconnects.
-    let guard = LiveStreamRefGuard {
+    Ok(live_tv_broadcast_stream_response(
         url,
         generation,
-        _tuner_lease: consumer_tuner_lease,
-    };
-    let body_stream = futures_util::stream::unfold(
-        (receiver, guard),
-        |(mut rx, guard): (broadcast::Receiver<Bytes>, LiveStreamRefGuard)| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(chunk) => {
-                        return Some((Ok::<Bytes, std::convert::Infallible>(chunk), (rx, guard)));
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Slow consumer: some chunks were dropped; log for visibility and keep receiving.
-                        tracing::warn!("live stream consumer lagged, dropped {n} chunks");
-                        continue;
-                    }
-                    // Producer closed: end stream. State (including guard) is dropped here,
-                    // which decrements refcount and cancels the producer if it was last consumer.
-                    Err(broadcast::error::RecvError::Closed) => {
-                        let _ = (rx, guard);
-                        return None;
-                    }
-                }
-            }
-        },
-    );
+        receiver,
+        consumer_tuner_lease,
+    ))
+}
 
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "video/mp2t")],
-        Body::from_stream(body_stream),
-    )
-        .into_response())
+async fn proxy_live_tv_legacy_hdhomerun_url(
+    channel_url: String,
+    tuner_host_url: String,
+    control_port: u16,
+    num_tuners: usize,
+    tuner_host_id: Option<String>,
+    tuner_count: Option<u64>,
+) -> Result<axum::response::Response, ApiError> {
+    let control_addr = legacy_hdhomerun_control_addr(&tuner_host_url, control_port).await?;
+    let stream_key = format!("legacy-hdhomerun:{control_addr}:{channel_url}");
+
+    let (receiver, generation, consumer_tuner_lease) = {
+        {
+            let mut registry = live_stream_registry().lock().await;
+            if let Some(handle) = registry.get_mut(&stream_key) {
+                let consumer_tuner_lease =
+                    acquire_live_tuner_lease(tuner_host_id.clone(), &channel_url, tuner_count)?;
+                handle.refcount += 1;
+                let handle_gen = handle.generation;
+                let rx = handle.sender.subscribe();
+                (rx, handle_gen, consumer_tuner_lease)
+            } else {
+                let tuner_lease =
+                    acquire_live_tuner_lease(tuner_host_id.clone(), &channel_url, tuner_count)?;
+                let consumer_tuner_lease =
+                    acquire_live_tuner_lease(tuner_host_id.clone(), &channel_url, tuner_count)?;
+
+                let handle_gen =
+                    LIVE_STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+                let (tx, rx) = broadcast::channel::<Bytes>(LIVE_STREAM_BROADCAST_CAPACITY);
+                let sender_clone = tx.clone();
+                let stream_key_clone = stream_key.clone();
+                let channel_url_clone = channel_url.clone();
+                registry.insert(
+                    stream_key.clone(),
+                    SharedLiveStreamHandle {
+                        refcount: 1,
+                        generation: handle_gen,
+                        sender: tx,
+                        _cancel: cancel_tx,
+                        _tuner_lease: tuner_lease,
+                    },
+                );
+                drop(registry);
+
+                let (udp_socket, control) =
+                    match open_legacy_hdhomerun_udp_source(&channel_url, control_addr, num_tuners)
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            let mut registry = live_stream_registry().lock().await;
+                            if registry
+                                .get(&stream_key)
+                                .is_some_and(|h| h.generation == handle_gen)
+                            {
+                                registry.remove(&stream_key);
+                            }
+                            return Err(error);
+                        }
+                    };
+
+                tokio::spawn(async move {
+                    let mut control = control;
+                    let mut buffer = vec![0u8; 65_536];
+                    tokio::pin!(cancel_rx);
+                    loop {
+                        tokio::select! {
+                            _ = &mut cancel_rx => break,
+                            received = udp_socket.recv_from(&mut buffer) => {
+                                match received {
+                                    Ok((len, _peer)) if len > HDHOMERUN_LEGACY_RTP_HEADER_BYTES => {
+                                        let payload = Bytes::copy_from_slice(&buffer[HDHOMERUN_LEGACY_RTP_HEADER_BYTES..len]);
+                                        if sender_clone.send(payload).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(_) => continue,
+                                    Err(error) => {
+                                        tracing::warn!(url = %channel_url_clone, "HDHomeRun legacy UDP receive failed: {error}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    control.stop().await;
+                    let mut registry = live_stream_registry().lock().await;
+                    if registry
+                        .get(&stream_key_clone)
+                        .is_some_and(|h| h.generation == handle_gen)
+                    {
+                        registry.remove(&stream_key_clone);
+                    }
+                });
+
+                (rx, handle_gen, consumer_tuner_lease)
+            }
+        }
+    };
+
+    Ok(live_tv_broadcast_stream_response(
+        stream_key,
+        generation,
+        receiver,
+        consumer_tuner_lease,
+    ))
 }
 
 async fn live_tv_recording_folders(
@@ -11391,7 +11943,9 @@ fn live_tv_channel_media_source(
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
     let name = json_string_field(channel, "Name").unwrap_or_else(|| channel_id.clone());
     let path = live_tv_channel_path(channel)?;
-    let is_remote = live_tv_channel_is_remote(&path);
+    let is_legacy_hdhomerun = live_tv_channel_is_legacy_hdhomerun_path(&path);
+    let is_http_remote = live_tv_channel_is_remote(&path);
+    let is_remote = is_http_remote || is_legacy_hdhomerun;
     let container = if is_remote {
         "ts".to_string()
     } else {
@@ -11400,13 +11954,19 @@ fn live_tv_channel_media_source(
             .map(str::to_ascii_lowercase)
             .unwrap_or_else(|| "ts".to_string())
     };
-    let protocol = if is_remote { "Http" } else { "File" };
+    let protocol = if is_legacy_hdhomerun {
+        "Udp"
+    } else if is_http_remote {
+        "Http"
+    } else {
+        "File"
+    };
 
     // Remote (HDHomeRun) channels support HLS transcode in addition to direct TS stream.
     // The stable play_session_id is embedded in the TranscodingUrl so clients can reuse it
     // across channel-detail fetches without starting a new session each time.
     let (supports_transcoding, transcoding_sub_protocol, transcoding_container, transcoding_url) =
-        if is_remote {
+        if is_http_remote {
             let play_session_id = live_tv_channel_hls_play_session_id(&channel_id);
             let url = format!("/Videos/{channel_id}/master.m3u8?PlaySessionId={play_session_id}");
             (
@@ -11443,7 +12003,7 @@ fn live_tv_channel_media_source(
         "SupportsDirectStream": true,
         "SupportsDirectPlay": true,
         "IsInfiniteStream": true,
-        "RequiresOpening": false,
+        "RequiresOpening": is_legacy_hdhomerun,
         "RequiresClosing": true,
         "RequiresLooping": false,
         "SupportsProbing": false,
@@ -33764,6 +34324,7 @@ mod tests {
         assert_eq!(channels[0]["Path"], "http://192.168.1.100:5004/auto/v4.1");
         assert_eq!(channels[0]["IsHD"], true);
         assert_eq!(channels[0]["IsFavorite"], false);
+        assert_eq!(channels[0]["IsLegacyTuner"], false);
         assert_eq!(channels[1]["Id"], "hdhr_5.1");
         assert_eq!(channels[1]["IsFavorite"], true);
 
@@ -33783,6 +34344,39 @@ mod tests {
         assert!(
             !hdhomerun_bool_field(&numeric_not_hd, "HD"),
             "numeric 0 is not HD"
+        );
+    }
+
+    #[test]
+    fn live_tv_hdhomerun_lineup_marks_legacy_urls_and_parses_commands() {
+        use serde_json::json;
+        let lineup = vec![json!({
+            "GuideNumber": "7",
+            "GuideName": "Legacy",
+            "URL": "hdhomerun://103B4218-0/ch7-3",
+            "DRM": 0,
+        })];
+
+        let channels = parse_live_tv_hdhomerun_channels(&lineup);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0]["Path"], "hdhomerun://103B4218-0/ch7-3");
+        assert_eq!(channels[0]["IsLegacyTuner"], true);
+
+        let commands =
+            super::parse_legacy_hdhomerun_channel_commands("hdhomerun://103B4218-0/ch7-3");
+        assert_eq!(
+            commands,
+            vec![
+                ("channel".to_string(), "7".to_string()),
+                ("program".to_string(), "3".to_string())
+            ]
+        );
+        assert_eq!(
+            super::parse_legacy_hdhomerun_channel_commands("hdhomerun://103B4218-0/ch11"),
+            vec![("channel".to_string(), "11".to_string())]
+        );
+        assert!(
+            super::parse_legacy_hdhomerun_channel_commands("http://example/auto/v7").is_empty()
         );
     }
 
@@ -34038,6 +34632,23 @@ mod tests {
         assert!(!live_tv_channel_is_remote(&local_path));
         let rel_path = PathBuf::from("news.ts");
         assert!(!live_tv_channel_is_remote(&rel_path));
+    }
+
+    #[test]
+    fn live_tv_legacy_hdhomerun_media_source_is_udp_direct_stream() {
+        let channel = json!({
+            "Id": "hdhr_7",
+            "Name": "Legacy",
+            "Path": "hdhomerun://103B4218-0/ch7-3",
+        });
+        let ms = live_tv_channel_media_source(&channel).unwrap();
+        assert_eq!(ms["Protocol"], "Udp");
+        assert_eq!(ms["Container"], "ts");
+        assert_eq!(ms["IsRemote"], true);
+        assert_eq!(ms["RequiresOpening"], true);
+        assert_eq!(ms["SupportsDirectStream"], true);
+        assert_eq!(ms["SupportsTranscoding"], false);
+        assert_eq!(ms["TranscodingUrl"], Value::Null);
     }
 
     // Spec: HlsTranscodeRequest live -> command contains -hls_playlist_type event and -i <url>,
@@ -51059,12 +51670,13 @@ mod tests {
     // concurrent accepted TCP connections. Used to validate stream-sharing behaviour without
     // requiring any additional test dependencies.
     mod live_tv_sharing {
+        use bytes::Bytes;
         use std::sync::{
-            Arc,
+            Arc, Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         };
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::TcpListener;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, UdpSocket};
 
         /// Start a local HTTP server that streams video/mp2t chunks indefinitely.
         /// Returns (base_url, connection_counter, close_fn).
@@ -51117,6 +51729,179 @@ mod tests {
             (base_url, counter, move || {
                 let _ = shutdown_tx.send(());
             })
+        }
+
+        fn parse_hdhomerun_request(packet: &[u8]) -> (String, Option<String>) {
+            assert!(packet.len() >= 8, "packet too short");
+            let crc = u32::from_le_bytes(packet[packet.len() - 4..].try_into().unwrap());
+            assert_eq!(crc, crate::hdhomerun_crc32(&packet[..packet.len() - 4]));
+            assert_eq!(
+                u16::from_be_bytes(packet[0..2].try_into().unwrap()),
+                crate::HDHOMERUN_LEGACY_GETSET_REQUEST
+            );
+            let payload_len = u16::from_be_bytes(packet[2..4].try_into().unwrap()) as usize;
+            assert_eq!(packet.len(), 4 + payload_len + 4);
+
+            let mut offset = 4;
+            assert_eq!(packet[offset], crate::HDHOMERUN_LEGACY_GETSET_NAME);
+            offset += 1;
+            let name_len = packet[offset] as usize;
+            offset += 1;
+            let name = String::from_utf8_lossy(&packet[offset..offset + name_len - 1]).to_string();
+            offset += name_len;
+
+            let value = if offset < packet.len() - 4
+                && packet[offset] == crate::HDHOMERUN_LEGACY_GETSET_VALUE
+            {
+                offset += 1;
+                let value_len = packet[offset] as usize;
+                offset += 1;
+                Some(String::from_utf8_lossy(&packet[offset..offset + value_len - 1]).to_string())
+            } else {
+                None
+            };
+            (name, value)
+        }
+
+        async fn read_hdhomerun_packet(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+            let mut header = [0u8; 4];
+            if stream.read_exact(&mut header).await.is_err() {
+                return None;
+            }
+            let payload_len = u16::from_be_bytes([header[2], header[3]]) as usize;
+            let mut rest = vec![0u8; payload_len + 4];
+            if stream.read_exact(&mut rest).await.is_err() {
+                return None;
+            }
+            let mut packet = header.to_vec();
+            packet.extend_from_slice(&rest);
+            Some(packet)
+        }
+
+        async fn start_fake_legacy_hdhomerun(
+            ts_payload: &'static [u8],
+        ) -> (u16, Arc<StdMutex<Vec<String>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let events = Arc::new(StdMutex::new(Vec::<String>::new()));
+            let events_clone = events.clone();
+
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                loop {
+                    let Some(packet) = (match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(2),
+                        read_hdhomerun_packet(&mut stream),
+                    )
+                    .await
+                    {
+                        Ok(packet) => packet,
+                        Err(_) => break,
+                    }) else {
+                        break;
+                    };
+                    let (name, value) = parse_hdhomerun_request(&packet);
+                    if let Some(value) = &value {
+                        events_clone.lock().unwrap().push(format!("{name}={value}"));
+                    } else {
+                        events_clone.lock().unwrap().push(format!("GET {name}"));
+                    }
+
+                    let reply_value = value.clone().unwrap_or_else(|| "none".to_string());
+                    let reply = crate::hdhomerun_write_getset_reply(&name, &reply_value).unwrap();
+                    stream.write_all(&reply).await.unwrap();
+
+                    if name.ends_with("/target")
+                        && let Some(target) =
+                            value.as_deref().and_then(|v| v.strip_prefix("rtp://"))
+                        && target != "none"
+                    {
+                        let target = target.parse::<std::net::SocketAddr>().unwrap();
+                        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                        let mut rtp = vec![0u8; crate::HDHOMERUN_LEGACY_RTP_HEADER_BYTES];
+                        rtp.extend_from_slice(ts_payload);
+                        udp.send_to(&rtp, target).await.unwrap();
+                    }
+                }
+            });
+
+            (port, events)
+        }
+
+        #[tokio::test]
+        async fn live_tv_legacy_hdhomerun_udp_stream_strips_rtp_and_cleans_up() {
+            use crate::{
+                HDHOMERUN_LEGACY_DEFAULT_TUNERS, live_stream_registry,
+                proxy_live_tv_legacy_hdhomerun_url,
+            };
+            use http_body_util::BodyExt;
+
+            let channel_url = "hdhomerun://103B4218-0/ch7-3".to_string();
+            let (control_port, events) = start_fake_legacy_hdhomerun(b"TS-PAYLOAD").await;
+            let stream_key = format!("legacy-hdhomerun:127.0.0.1:{control_port}:{channel_url}");
+            live_stream_registry().lock().await.remove(&stream_key);
+
+            let response = proxy_live_tv_legacy_hdhomerun_url(
+                channel_url.clone(),
+                "http://127.0.0.1".to_string(),
+                control_port,
+                HDHOMERUN_LEGACY_DEFAULT_TUNERS,
+                Some("legacy-tuner".to_string()),
+                Some(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+            let mut body = response.into_body();
+            let frame = tokio::time::timeout(tokio::time::Duration::from_secs(2), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let data = frame.into_data().unwrap_or_else(|_| Bytes::new());
+            assert_eq!(data.as_ref(), b"TS-PAYLOAD");
+
+            drop(body);
+            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+            let events = events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|event| event == "GET /tuner0/lockkey"),
+                "must check tuner lockkey first: {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.starts_with("/tuner0/lockkey=") && !event.ends_with("=none")),
+                "must claim tuner lockkey: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| event == "/tuner0/channel=7"),
+                "must set legacy channel command: {events:?}"
+            );
+            assert!(
+                events.iter().any(|event| event == "/tuner0/program=3"),
+                "must set legacy program command: {events:?}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.starts_with("/tuner0/target=rtp://")),
+                "must set RTP target: {events:?}"
+            );
+            let target_none = events
+                .iter()
+                .position(|event| event == "/tuner0/target=none")
+                .expect("cleanup must clear target");
+            let lockkey_none = events
+                .iter()
+                .position(|event| event == "/tuner0/lockkey=none")
+                .expect("cleanup must release lockkey");
+            assert!(
+                target_none < lockkey_none,
+                "cleanup must clear target before lockkey: {events:?}"
+            );
         }
 
         #[tokio::test]
