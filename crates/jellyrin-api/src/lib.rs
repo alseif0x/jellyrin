@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+mod dlna;
+
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -362,6 +364,76 @@ pub fn router(state: AppState) -> Router {
         .route("/system/configuration", get(system_configuration))
         .route("/System/Configuration", post(update_system_configuration))
         .route("/system/configuration", post(update_system_configuration))
+        .route("/Dlna/{server_id}/description", get(dlna::description))
+        .route("/dlna/{server_id}/description", get(dlna::description))
+        .route("/Dlna/{server_id}/description.xml", get(dlna::description))
+        .route("/dlna/{server_id}/description.xml", get(dlna::description))
+        .route(
+            "/Dlna/{server_id}/ContentDirectory",
+            get(dlna::content_directory_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/contentdirectory",
+            get(dlna::content_directory_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/ContentDirectory/ContentDirectory",
+            get(dlna::content_directory_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/contentdirectory/contentdirectory",
+            get(dlna::content_directory_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/ContentDirectory/ContentDirectory.xml",
+            get(dlna::content_directory_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/contentdirectory/contentdirectory.xml",
+            get(dlna::content_directory_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/ConnectionManager",
+            get(dlna::connection_manager_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/connectionmanager",
+            get(dlna::connection_manager_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/ConnectionManager/ConnectionManager",
+            get(dlna::connection_manager_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/connectionmanager/connectionmanager",
+            get(dlna::connection_manager_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/ConnectionManager/ConnectionManager.xml",
+            get(dlna::connection_manager_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/connectionmanager/connectionmanager.xml",
+            get(dlna::connection_manager_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/ContentDirectory/Control",
+            post(dlna::content_directory_control),
+        )
+        .route(
+            "/dlna/{server_id}/contentdirectory/control",
+            post(dlna::content_directory_control),
+        )
+        .route(
+            "/Dlna/{server_id}/ConnectionManager/Control",
+            post(dlna::connection_manager_control),
+        )
+        .route(
+            "/dlna/{server_id}/connectionmanager/control",
+            post(dlna::connection_manager_control),
+        )
+        .route("/Dlna/{server_id}/icons/{file_name}", get(dlna::icon))
+        .route("/dlna/{server_id}/icons/{file_name}", get(dlna::icon))
         .route(
             "/System/Configuration/MetadataOptions/Default",
             get(default_metadata_options),
@@ -6594,10 +6666,12 @@ async fn delete_device(
 async fn system_configuration(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let enable_upnp = dlna::upnp_enabled(&state.db).await?;
     Ok(Json(system_configuration_json(
         state.db.startup_config().await?,
         state.db.server_state().await?.startup_wizard_completed,
         state.db.system_configuration_payloads().await?,
+        enable_upnp,
     )))
 }
 
@@ -6617,6 +6691,8 @@ struct SystemConfigurationUpdate {
     chapter_image_resolution: Option<String>,
     #[serde(alias = "EnableRemoteAccess")]
     enable_remote_access: Option<bool>,
+    #[serde(alias = "EnableUPnP")]
+    enable_upnp: Option<bool>,
     #[serde(alias = "CachePath")]
     cache_path: Option<String>,
     #[serde(alias = "MetadataPath")]
@@ -6663,6 +6739,7 @@ async fn update_system_configuration(
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let current = state.db.startup_config().await?;
+    let enable_upnp_update = payload.enable_upnp;
     let chapter_image_resolution = match payload.chapter_image_resolution.as_deref() {
         Some(value) => validate_chapter_image_resolution(value, &current.chapter_image_resolution)?,
         None => current.chapter_image_resolution,
@@ -6714,6 +6791,18 @@ async fn update_system_configuration(
             server_options,
         })
         .await?;
+    if let Some(enable_upnp) = enable_upnp_update {
+        let mut network = state
+            .db
+            .named_configuration("network")
+            .await?
+            .unwrap_or_else(default_network_configuration);
+        network["EnableUPnP"] = serde_json::json!(enable_upnp);
+        state
+            .db
+            .update_named_configuration("network", network_configuration_json(network))
+            .await?;
+    }
     record_activity(
         &state.db,
         "Server configuration updated",
@@ -6902,6 +6991,7 @@ fn system_configuration_json(
     config: StartupConfig,
     startup_wizard_completed: bool,
     payloads: SystemConfigurationPayloads,
+    enable_upnp: bool,
 ) -> serde_json::Value {
     let mut server_options = default_server_configuration_options();
     if let serde_json::Value::Object(current) = payloads.server_options {
@@ -6917,7 +7007,7 @@ fn system_configuration_json(
         "DummyChapterDuration": config.dummy_chapter_duration,
         "ChapterImageResolution": config.chapter_image_resolution,
         "EnableRemoteAccess": config.enable_remote_access,
-        "EnableUPnP": false,
+        "EnableUPnP": enable_upnp,
         "IsStartupWizardCompleted": startup_wizard_completed,
         "LibraryMonitorDelay": 60,
         "EnableRealtimeMonitor": false,
@@ -27993,6 +28083,13 @@ impl ApiError {
         }
     }
 
+    fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: anyhow::anyhow!(message.into()),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -31062,6 +31159,7 @@ mod tests {
         assert_eq!(defaults["EnableIPv4"], true);
         assert_eq!(defaults["EnableIPv6"], false);
         assert_eq!(defaults["EnableRemoteAccess"], true);
+        assert_eq!(defaults["EnableUPnP"], false);
         assert!(defaults["LocalNetworkSubnets"].is_array());
         assert!(defaults["KnownProxies"].is_array());
         assert!(defaults["PublishedServerUriBySubnet"].is_array());
@@ -31091,6 +31189,7 @@ mod tests {
             "PublicHttpPort": 80,
             "PublicHttpsPort": 443,
             "AutoDiscovery": false,
+            "EnableUPnP": true,
             "EnableIPv4": true,
             "EnableIPv6": true,
             "EnableRemoteAccess": false,
@@ -31137,6 +31236,7 @@ mod tests {
         assert_eq!(config["PublicHttpPort"], 80);
         assert_eq!(config["PublicHttpsPort"], 443);
         assert_eq!(config["AutoDiscovery"], false);
+        assert_eq!(config["EnableUPnP"], true);
         assert_eq!(config["EnableIPv6"], true);
         assert_eq!(config["EnableRemoteAccess"], false);
         assert_eq!(config["LocalNetworkSubnets"], json!(["192.168.1.0/24"]));
@@ -31151,6 +31251,234 @@ mod tests {
 
         let startup = db.startup_config().await.unwrap();
         assert!(!startup.enable_remote_access);
+    }
+
+    #[tokio::test]
+    async fn dlna_descriptors_and_basic_soap_follow_upnp_contract() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        db.upsert_virtual_folder("Movies", Some("movies"), vec!["/media/movies".into()])
+            .await
+            .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Dlna/{server_id}/description.xml"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let system_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(system_config["EnableUPnP"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "EnableUPnP": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let system_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(system_config["EnableUPnP"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Dlna/{server_id}/description.xml"))
+                    .header(header::HOST, "media.example.test:8097")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/xml; charset=utf-8")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let description = String::from_utf8(body.to_vec()).unwrap();
+        assert!(description.contains("urn:schemas-upnp-org:device:MediaServer:1"));
+        assert!(description.contains(&format!("<UDN>uuid:{server_id}</UDN>")));
+        assert!(
+            description.contains("<serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId>")
+        );
+        assert!(
+            description.contains("<serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>")
+        );
+        assert!(description.contains(&format!(
+            "http://media.example.test:8097/dlna/{server_id}/contentdirectory/contentdirectory.xml"
+        )));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/contentdirectory/contentdirectory.xml"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let content_directory = String::from_utf8(body.to_vec()).unwrap();
+        assert!(content_directory.contains("<action><name>Browse</name>"));
+        assert!(
+            content_directory
+                .contains("<stateVariable sendEvents=\"yes\"><name>SystemUpdateID</name>")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/connectionmanager/connectionmanager.xml"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let connection_manager = String::from_utf8(body.to_vec()).unwrap();
+        assert!(connection_manager.contains("<action><name>GetProtocolInfo</name>"));
+        assert!(connection_manager.contains("<name>SourceProtocolInfo</name>"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/icons/logo.png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"\x89PNG"));
+
+        let browse = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1" xmlns:d="urn:test">
+      <d:ObjectID>0</d:ObjectID>
+      <d:BrowseFlag>BrowseDirectChildren</d:BrowseFlag>
+      <d:Filter>*</d:Filter>
+      <d:StartingIndex>0</d:StartingIndex>
+      <d:RequestedCount>0</d:RequestedCount>
+      <d:SortCriteria></d:SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(browse))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let browse_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(browse_response.contains("<u:BrowseResponse"));
+        assert!(browse_response.contains("&lt;dc:title&gt;Movies&lt;/dc:title&gt;"));
+        assert!(browse_response.contains("<NumberReturned>1</NumberReturned>"));
+
+        let protocol_info = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:GetProtocolInfo xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1" />
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(protocol_info))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let protocol_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(protocol_response.contains("<u:GetProtocolInfoResponse"));
+        assert!(protocol_response.contains("http-get:*:video/mp4:*"));
+        assert!(protocol_response.contains("http-get:*:image/png:*"));
     }
 
     #[tokio::test]
