@@ -68,6 +68,7 @@ const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
+const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
 static SYSTEM_LIFECYCLE: OnceLock<broadcast::Sender<SystemLifecycleCommand>> = OnceLock::new();
 static SYSTEM_LIFECYCLE_LAST: AtomicU8 = AtomicU8::new(0);
@@ -107,6 +108,8 @@ const LIVE_HLS_READINESS_TIMEOUT_SECS: u64 = 15;
 // recordings and resolve the path for streaming. Mirrors LIVE_STREAM_REGISTRY layout.
 static LIVE_TV_RECORDING_REGISTRY: OnceLock<Mutex<HashMap<String, LiveTvRecordingHandle>>> =
     OnceLock::new();
+
+static LIVE_TV_RECORDING_STARTING: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 
 // Shared HDHomeRun tuner-slot accounting across direct TS, live HLS and recordings.
 // Keyed by tuner host + resolved channel URL so multiple consumers of the same channel
@@ -174,8 +177,52 @@ struct LiveTvRecordingHandle {
     path: String,
 }
 
+struct LiveTvRecordingStartGuard {
+    timer_id: String,
+}
+
+impl Drop for LiveTvRecordingStartGuard {
+    fn drop(&mut self) {
+        let Ok(mut starting) = live_tv_recording_starting_registry().lock() else {
+            tracing::error!("live TV recording starting registry lock poisoned while releasing");
+            return;
+        };
+        starting.remove(&self.timer_id);
+    }
+}
+
+fn live_tv_recording_starting_registry() -> &'static StdMutex<HashSet<String>> {
+    LIVE_TV_RECORDING_STARTING.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn reserve_live_tv_recording_start(timer_id: &str) -> Option<LiveTvRecordingStartGuard> {
+    let normalized = timer_id.to_ascii_lowercase();
+    let Ok(mut starting) = live_tv_recording_starting_registry().lock() else {
+        tracing::error!("live TV recording starting registry lock poisoned");
+        return None;
+    };
+    if !starting.insert(normalized.clone()) {
+        return None;
+    }
+    Some(LiveTvRecordingStartGuard {
+        timer_id: normalized,
+    })
+}
+
 fn live_tv_recording_registry() -> &'static Mutex<HashMap<String, LiveTvRecordingHandle>> {
     LIVE_TV_RECORDING_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn active_live_tv_recording_timer_ids() -> Vec<String> {
+    let registry = live_tv_recording_registry().lock().await;
+    registry.keys().cloned().collect()
+}
+
+async fn live_tv_recording_is_active(timer_id: &str) -> bool {
+    let registry = live_tv_recording_registry().lock().await;
+    registry
+        .keys()
+        .any(|active| active.eq_ignore_ascii_case(timer_id))
 }
 
 struct SharedLiveStreamHandle {
@@ -2761,6 +2808,12 @@ pub struct LiveTvRecordingStartupRecovery {
     pub restarted_recordings: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct LiveTvTimerSchedulerRun {
+    pub removed_expired_timers: usize,
+    pub started_recordings: usize,
+}
+
 pub async fn reconcile_live_tv_recordings_on_startup(
     db: &Database,
     log_dir: &std::path::Path,
@@ -2883,11 +2936,99 @@ pub async fn reconcile_live_tv_recordings_on_startup(
             channel_path.to_string_lossy().into_owned(),
             tuner_host_id,
             tuner_count,
+            None,
         );
         recovery.restarted_recordings += 1;
     }
 
     Ok(recovery)
+}
+
+pub async fn run_due_live_tv_timers(state: &AppState) -> anyhow::Result<LiveTvTimerSchedulerRun> {
+    let Some(mut config) = state.db.named_configuration("livetv").await? else {
+        return Ok(LiveTvTimerSchedulerRun::default());
+    };
+
+    let active_timer_ids = active_live_tv_recording_timer_ids().await;
+    let now = OffsetDateTime::now_utc();
+    let mut result = LiveTvTimerSchedulerRun::default();
+    let mut changed = false;
+    let mut timers_to_start = Vec::new();
+
+    if let Some(timers) = config
+        .get("Timers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+    {
+        let mut kept_timers = Vec::new();
+        for timer in timers {
+            if live_tv_timer_is_terminal(&timer) {
+                kept_timers.push(timer);
+                continue;
+            }
+
+            let recording_end = live_tv_timer_recording_end(&timer);
+            if recording_end.is_some_and(|end| end <= now) {
+                result.removed_expired_timers += 1;
+                changed = true;
+                continue;
+            }
+
+            if live_tv_timer_start_date(&timer).is_some_and(|start| start <= now)
+                && recording_end.is_some_and(|end| end > now)
+            {
+                let timer_id = json_string_field(&timer, "Id").unwrap_or_default();
+                let has_active_task = active_timer_ids
+                    .iter()
+                    .any(|active| active.eq_ignore_ascii_case(&timer_id));
+                if !has_active_task {
+                    timers_to_start.push(timer.clone());
+                }
+            }
+
+            kept_timers.push(timer);
+        }
+        config["Timers"] = serde_json::json!(kept_timers);
+    }
+
+    if changed {
+        state
+            .db
+            .update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await?;
+    }
+
+    for timer in timers_to_start {
+        if maybe_spawn_live_tv_recording(state, &timer).await {
+            result.started_recordings += 1;
+        }
+    }
+
+    Ok(result)
+}
+
+pub fn spawn_periodic_live_tv_timer_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match run_due_live_tv_timers(&state).await {
+                Ok(run) if run.removed_expired_timers > 0 || run.started_recordings > 0 => {
+                    tracing::info!(
+                        removed_expired_timers = run.removed_expired_timers,
+                        started_recordings = run.started_recordings,
+                        "processed due Live TV timers"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to process due Live TV timers");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS,
+            ))
+            .await;
+        }
+    })
 }
 
 pub fn spawn_periodic_transcode_cleanup(db: Database) -> tokio::task::JoinHandle<()> {
@@ -11685,14 +11826,30 @@ async fn cascade_delete_series_timer_timers(db: &Database, series_timer_id: &str
 //   StartDate <= now && EndDate+PostPaddingSeconds > now && key == "Timers" && !is_series.
 // Channel must be a known remote (HDHomeRun) channel; local channels are left to the
 // normal recording path (out of scope for this subgate).
-async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Value) {
+async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Value) -> bool {
     // Only manual (non-series) timers in the Timers key trigger immediate recording.
     if timer
         .get("IsSeries")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        return;
+        return false;
+    }
+    if live_tv_timer_is_terminal(timer) {
+        return false;
+    }
+    let timer_id = match json_string_field(timer, "Id") {
+        Some(id) if !id.is_empty() => id,
+        _ => return false,
+    };
+    {
+        let registry = live_tv_recording_registry().lock().await;
+        if registry
+            .keys()
+            .any(|active| active.eq_ignore_ascii_case(&timer_id))
+        {
+            return false;
+        }
     }
 
     let now = OffsetDateTime::now_utc();
@@ -11702,11 +11859,10 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
         .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
     {
         Some(dt) => dt,
-        None => return,
+        None => return false,
     };
     if start_date > now {
-        // Future timer: no immediate recording in this subgate.
-        return;
+        return false;
     }
 
     // Parse EndDate + PostPaddingSeconds — window must still be open.
@@ -11714,7 +11870,7 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
         .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
     {
         Some(dt) => dt,
-        None => return,
+        None => return false,
     };
     let post_padding = timer
         .get("PostPaddingSeconds")
@@ -11723,28 +11879,35 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
     let recording_end = end_date + Duration::seconds(post_padding);
     if recording_end <= now {
         // Window already expired — nothing to record.
-        return;
+        return false;
     }
 
     // Resolve the channel URL.
     let channel_id = match json_string_field(timer, "ChannelId") {
         Some(id) if !id.is_empty() => id,
-        _ => return,
+        _ => return false,
     };
     let channel = match live_tv_channel_by_id(&state.db, &channel_id).await {
         Ok(ch) => ch,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let channel_path = match live_tv_channel_path(&channel) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if !live_tv_channel_is_remote(&channel_path) {
         // Local channel — not supported in this subgate.
-        return;
+        return false;
     }
     let channel_url = channel_path.to_string_lossy().into_owned();
     let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(&state.db, &channel).await;
+
+    if live_tv_recording_is_active(&timer_id).await {
+        return false;
+    }
+    let Some(start_guard) = reserve_live_tv_recording_start(&timer_id) else {
+        return false;
+    };
 
     spawn_live_tv_recording(
         state.db.clone(),
@@ -11753,7 +11916,9 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
         channel_url,
         tuner_host_id,
         tuner_count,
+        Some(start_guard),
     );
+    true
 }
 
 // Spawn a recording task for the given timer onto the given channel.
@@ -11766,9 +11931,19 @@ fn spawn_live_tv_recording(
     channel_url: String,
     tuner_host_id: Option<String>,
     tuner_count: Option<u64>,
+    start_guard: Option<LiveTvRecordingStartGuard>,
 ) {
     tokio::spawn(async move {
-        record_channel_to_file(db, log_dir, timer, channel_url, tuner_host_id, tuner_count).await;
+        record_channel_to_file(
+            db,
+            log_dir,
+            timer,
+            channel_url,
+            tuner_host_id,
+            tuner_count,
+            start_guard,
+        )
+        .await;
     });
 }
 
@@ -11779,7 +11954,9 @@ async fn record_channel_to_file(
     channel_url: String,
     tuner_host_id: Option<String>,
     tuner_count: Option<u64>,
+    start_guard: Option<LiveTvRecordingStartGuard>,
 ) {
+    let _start_guard = start_guard;
     let timer_id = json_string_field(&timer, "Id").unwrap_or_default();
     let name = json_string_field(&timer, "Name").unwrap_or_else(|| "Recording".to_string());
     let channel_id = json_string_field(&timer, "ChannelId").unwrap_or_default();
@@ -26843,23 +27020,24 @@ mod tests {
     use super::{
         AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
-        DirectPlayProfileMatcher, ItemsQuery, SystemLifecycleCommand, backup_restore_snapshot_json,
-        cascade_delete_series_timer_timers, cleanup_orphan_hls_transcode_dirs,
-        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
-        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
-        encoding_configuration_json, format_time_for_json, get_valid_filename,
-        hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id, json_string_field,
-        json_value_i64, last_system_lifecycle_command, live_tv_channel_is_remote,
-        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
-        live_tv_recording_name, load_countries, load_cultures, materialize_series_timer_timers,
-        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
-        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
-        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun, SystemLifecycleCommand,
+        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
+        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
+        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
+        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
+        live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
+        live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
+        materialize_series_timer_timers, media_item_by_id, media_item_streams,
+        package_install_task_key, paged_media_items, parse_authorization_token,
+        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
-        record_channel_to_file, redact_sensitive_log_text, router, series_timer_child_id,
-        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
-        subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
+        run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
+        subscribe_playback_events, subscribe_system_lifecycle_commands, syncplay_groups,
+        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use axum::{
         body::Body,
@@ -33613,7 +33791,7 @@ mod tests {
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
         let channel_url = format!("http://127.0.0.1:{port}/stream");
 
-        record_channel_to_file(db.clone(), log_dir, timer, channel_url, None, None).await;
+        record_channel_to_file(db.clone(), log_dir, timer, channel_url, None, None, None).await;
 
         // After recording, config["Recordings"] should have a Completed entry.
         let config = db
@@ -33731,7 +33909,7 @@ mod tests {
         });
         let channel_url = format!("http://127.0.0.1:{port}/stream");
 
-        record_channel_to_file(db.clone(), log_dir, timer, channel_url, None, None).await;
+        record_channel_to_file(db.clone(), log_dir, timer, channel_url, None, None, None).await;
 
         let config = db
             .named_configuration("livetv")
@@ -33950,6 +34128,205 @@ mod tests {
             Default::default(),
             "completed recovery must be idempotent"
         );
+    }
+
+    #[tokio::test]
+    async fn live_tv_timer_scheduler_starts_future_timer_when_due() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ts_payload: Vec<u8> = (0u8..188).cycle().take(1880).collect();
+        let ts_clone = ts_payload.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n",
+                    ts_clone.len()
+                );
+                let _ = writer.write_all(header.as_bytes()).await;
+                let _ = writer.write_all(&ts_clone).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "hdhr-scheduler",
+            "FriendlyName": "HDHomeRun Scheduler",
+            "Channels": [{
+                "Id": "hdhr_4.1",
+                "Name": "Channel 4.1",
+                "Number": "4.1",
+                "Path": format!("http://127.0.0.1:{port}/auto/v4.1"),
+            }]
+        }]);
+        config["Timers"] = serde_json::json!([{
+            "Id": "future-timer",
+            "Name": "Future Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now + Duration::milliseconds(120)),
+            "EndDate": format_time_for_json(now + Duration::seconds(5)),
+            "PostPaddingSeconds": 0,
+            "IsSeries": false,
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir,
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        let early = run_due_live_tv_timers(&state).await.unwrap();
+        assert_eq!(
+            early,
+            LiveTvTimerSchedulerRun::default(),
+            "future timer must not start before StartDate"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(160)).await;
+        let due = run_due_live_tv_timers(&state).await.unwrap();
+        assert_eq!(due.started_recordings, 1);
+        assert_eq!(due.removed_expired_timers, 0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let config = db.named_configuration("livetv").await.unwrap().unwrap();
+            let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
+            if let Some(completed) = recordings
+                .iter()
+                .find(|r| r["Status"].as_str() == Some("Completed"))
+            {
+                assert_eq!(completed["TimerId"], "future-timer");
+                let path = completed["Path"].as_str().unwrap();
+                assert!(tokio::fs::metadata(path).await.unwrap().len() > 0);
+                let timer = config["Timers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|timer| timer["Id"].as_str() == Some("future-timer"))
+                    .unwrap();
+                assert_eq!(timer["Status"], "Completed");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scheduled future recording did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn live_tv_timer_scheduler_removes_expired_non_terminal_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+        config["Timers"] = serde_json::json!([{
+            "Id": "expired-scheduled-timer",
+            "Name": "Expired Scheduled Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now - Duration::seconds(30)),
+            "EndDate": format_time_for_json(now - Duration::seconds(5)),
+            "PostPaddingSeconds": 0,
+            "Status": "Scheduled",
+            "IsSeries": false,
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir,
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        let run = run_due_live_tv_timers(&state).await.unwrap();
+        assert_eq!(run.removed_expired_timers, 1);
+        assert_eq!(run.started_recordings, 0);
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap();
+        assert!(config["Timers"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_tv_timer_scheduler_skips_start_reserved_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let mut config = default_live_tv_configuration();
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "hdhr-reserved",
+            "FriendlyName": "HDHomeRun Reserved",
+            "Channels": [{
+                "Id": "hdhr_4.1",
+                "Name": "Channel 4.1",
+                "Number": "4.1",
+                "Path": "http://127.0.0.1:9/auto/v4.1",
+            }]
+        }]);
+        config["Timers"] = serde_json::json!([{
+            "Id": "reserved-timer",
+            "Name": "Reserved Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now - Duration::seconds(1)),
+            "EndDate": format_time_for_json(now + Duration::seconds(30)),
+            "PostPaddingSeconds": 0,
+            "Status": "New",
+            "IsSeries": false,
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir,
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+
+        let guard = reserve_live_tv_recording_start("reserved-timer")
+            .expect("setup reservation must succeed");
+        let run = run_due_live_tv_timers(&state).await.unwrap();
+        assert_eq!(run.started_recordings, 0);
+        assert_eq!(run.removed_expired_timers, 0);
+        drop(guard);
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap();
+        assert_eq!(config["Timers"].as_array().unwrap().len(), 1);
+        assert!(config["Recordings"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -50854,6 +51231,7 @@ mod tests {
                 url_b.to_string(),
                 Some(host.to_string()),
                 Some(1),
+                None,
             )
             .await;
 

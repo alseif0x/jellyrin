@@ -17,7 +17,7 @@ FIXTURE (sustituir para invariantes nuevos): live_tv_recording_items (lib.rs:109
 REAL a reusar: proxy_live_tv_channel_url (:10385-~10490) patrón HttpClient.get(url).bytes_stream() para leer el stream; live_tv_channel_by_id (:10135), live_tv_channel_path (:10713), live_tv_channel_is_remote (:10721); HttpClient=reqwest::Client (:49); AppState (:121-126) SIN estado de grabaciones -> añadir static OnceLock<Mutex<HashMap>> análogo a LIVE_STREAM_REGISTRY (:84)/LIVE_HLS_SESSIONS (:99); patrón tokio::spawn+oneshot+cancel ya usado en proxy/HLS.
 
 ## Decisiones (0030)
-D1 Trigger fire-on-create SÍNCRONO (no scheduler global): en upsert/create timer (key Timers, no series) si StartDate<=now y EndDate+PostPadding>now -> tokio::spawn tarea grabación. Timers futuros FUERA (test usa StartDate≈now). 
+D1 Trigger fire-on-create SÍNCRONO: en upsert/create timer (key Timers, no series) si StartDate<=now y EndDate+PostPadding>now -> tokio::spawn tarea grabación. Timers futuros ya cubiertos por el scheduler persistente E2.12 (`run_due_live_tv_timers` + task periódico del server).
 D2 Recorder=COPY directo (no transcode, no ffmpeg): GET stream + copy de bytes a FileStream hasta duration. Container .ts. Reusa HttpClient.get(url).bytes_stream().
 D3 Duración test 4s (env JELLYRIN_LIVETV_RECORD_SECS default 4), Pre/PostPadding=0; golden poll Completed bounded (timeout env default 30s, intervalo 1s).
 D4 Almacenamiento: al completar persistir en config["Recordings"] un recording REAL {Id (distinto del fixture), Name, ChannelId, Path(fichero .ts real), Status:"Completed", StartDate, EndDate, DateCreated}. Path: DataPath/livetv/recordings/<ValidFilename(Name+" "+StartDate "yyyy_MM_dd_HH_mm_ss")>.ts (paridad naming).
@@ -44,4 +44,4 @@ D alcance: diff qa/golden <=2; sim sin tocar; sin ficheros fuera de scope.
 R-LIBSCAN, R-TRIGGER (solo StartDate≈now), R8 refill (/stats cleanup jellyrinOnly; reset /stats antes del bloque), R-DETERMINISM (throttle ~13kB/s -> ~52KB/4s suficiente ffprobe; subir RECORD_SECS si hace falta, no degradar aserción), R-INPROGRESS (gate valida Completed final), R-RACE (guard cancel en drop, sin conexión huérfana).
 
 ## Fuera de alcance
-Series-timer real (solo timer simple/manual; series fixture jellyrinOnly sin cambio), timers futuros/scheduler, post-scan librería (D5), restart recovery, TunerCount, UDP discovery, tuner legacy, EncodedRecorder/transcode (copy es paridad), padding no-cero, retry/keep, post-processor, metadata.
+Series-timer real (solo timer simple/manual; series fixture jellyrinOnly sin cambio), post-scan librería (D5), restart recovery, TunerCount, UDP discovery, tuner legacy, EncodedRecorder/transcode (copy es paridad), padding no-cero, retry/keep, post-processor, metadata.
