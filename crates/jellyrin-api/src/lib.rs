@@ -10788,6 +10788,7 @@ async fn stream_live_tv_channel(
 struct LiveStreamRefGuard {
     url: String,
     generation: u64,
+    _tuner_lease: Option<LiveTunerLeaseGuard>,
 }
 
 impl Drop for LiveStreamRefGuard {
@@ -10819,11 +10820,13 @@ async fn proxy_live_tv_channel_url(
 ) -> Result<axum::response::Response, ApiError> {
     // Look up or create a shared handle for this stream URL.
     // The lock is never held across network I/O to avoid serialising concurrent clients.
-    let (receiver, generation) = {
+    let (receiver, generation, consumer_tuner_lease) = {
         // Phase 1: check for an existing live handle under the lock.
         {
             let mut registry = live_stream_registry().lock().await;
             if let Some(handle) = registry.get_mut(&url) {
+                let consumer_tuner_lease =
+                    acquire_live_tuner_lease(tuner_host_id.clone(), &url, tuner_count)?;
                 // Existing producer for this URL (same channel): subscribe a new consumer and
                 // increment refcount. This is the sharing path — 2 consumers of the SAME channel
                 // share the same tuner lease (same stream, no new tuner slot needed).
@@ -10831,12 +10834,14 @@ async fn proxy_live_tv_channel_url(
                 let handle_gen = handle.generation;
                 let rx = handle.sender.subscribe();
                 // Lock is released here (end of block).
-                (rx, handle_gen)
+                (rx, handle_gen, consumer_tuner_lease)
             } else {
                 // No existing handle: this is a NEW channel stream (different URL).
                 // Before opening a new upstream connection, acquire a shared tuner lease.
                 // The lease registry is global across direct TS, live HLS and recordings.
                 let tuner_lease =
+                    acquire_live_tuner_lease(tuner_host_id.clone(), &url, tuner_count)?;
+                let consumer_tuner_lease =
                     acquire_live_tuner_lease(tuner_host_id.clone(), &url, tuner_count)?;
 
                 // No existing handle. Create the broadcast channel and INSERT the handle into the
@@ -10938,14 +10943,18 @@ async fn proxy_live_tv_channel_url(
                     }
                 });
 
-                (rx, handle_gen)
+                (rx, handle_gen, consumer_tuner_lease)
             }
         }
     };
 
     // Build a streaming body that forwards broadcast chunks to this consumer.
     // The guard decrements refcount when the response body finishes or the client disconnects.
-    let guard = LiveStreamRefGuard { url, generation };
+    let guard = LiveStreamRefGuard {
+        url,
+        generation,
+        _tuner_lease: consumer_tuner_lease,
+    };
     let body_stream = futures_util::stream::unfold(
         (receiver, guard),
         |(mut rx, guard): (broadcast::Receiver<Bytes>, LiveStreamRefGuard)| async move {
@@ -50832,6 +50841,7 @@ mod tests {
                 let guard_a = LiveStreamRefGuard {
                     url: url.clone(),
                     generation: gen_a,
+                    _tuner_lease: None,
                 };
                 drop(guard_a);
             }
@@ -50871,6 +50881,7 @@ mod tests {
                 let stale_guard = LiveStreamRefGuard {
                     url: url.clone(),
                     generation: gen_a,
+                    _tuner_lease: None,
                 };
                 drop(stale_guard);
             }
@@ -51033,6 +51044,62 @@ mod tests {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             live_stream_registry().lock().await.remove(&url_a);
             live_stream_registry().lock().await.remove(&url_b);
+        }
+
+        #[tokio::test]
+        async fn live_tv_direct_consumer_lease_survives_shared_handle_removal() {
+            use crate::{live_stream_registry, proxy_live_tv_channel_url};
+
+            let (base_url, _counter, _close) = start_stream_server().await;
+            let url_a = format!("{base_url}/auto/v4.1_consumer_lease_a");
+            let url_b = format!("{base_url}/auto/v5.1_consumer_lease_b");
+            let tuner_host_id = Some("tuner-host-consumer-lease".to_string());
+            let tuner_count = Some(1u64);
+
+            live_stream_registry().lock().await.remove(&url_a);
+            live_stream_registry().lock().await.remove(&url_b);
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| {
+                    !key.tuner_host_id.eq_ignore_ascii_case(
+                        tuner_host_id.as_deref().expect("host id must be present"),
+                    )
+                });
+
+            let resp_a =
+                proxy_live_tv_channel_url(url_a.clone(), tuner_host_id.clone(), tuner_count)
+                    .await
+                    .expect("channel A open must succeed");
+
+            // Simulate producer/handle cleanup racing ahead of the HTTP response body lifetime.
+            // The per-consumer guard must keep the tuner slot occupied until resp_a is dropped.
+            live_stream_registry().lock().await.remove(&url_a);
+            assert!(
+                crate::acquire_live_tuner_lease(tuner_host_id.clone(), &url_b, tuner_count)
+                    .is_err(),
+                "channel B must still conflict while the direct response body is alive"
+            );
+
+            drop(resp_a.into_body());
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            let lease_b =
+                crate::acquire_live_tuner_lease(tuner_host_id.clone(), &url_b, tuner_count)
+                    .expect("channel B must acquire after the direct response body is dropped");
+            assert!(lease_b.is_some());
+            drop(lease_b);
+
+            live_stream_registry().lock().await.remove(&url_a);
+            live_stream_registry().lock().await.remove(&url_b);
+            crate::live_tuner_lease_registry()
+                .lock()
+                .expect("live tuner lease registry")
+                .retain(|key, _| {
+                    !key.tuner_host_id.eq_ignore_ascii_case(
+                        tuner_host_id.as_deref().expect("host id must be present"),
+                    )
+                });
         }
 
         #[tokio::test]

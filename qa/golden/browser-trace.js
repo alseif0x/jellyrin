@@ -350,6 +350,10 @@ async function captureTarget(browser, flowDir, target) {
       liveTvHdhrTunerLimitFirstOpen: false,
       liveTvHdhrTunerLimitConflict: false,
       liveTvHdhrTunerLimitRecovery: false,
+      liveTvHdhrTunerLimitHlsConflict: false,
+      liveTvHdhrTunerLimitRecordingConflict: false,
+      liveTvHdhrTunerLimitHlsRecovery: false,
+      liveTvHdhrTunerLimitRecordingNoZombie: false,
       liveTvHdhrTunerLimitSharingExempt: false,
       startupPublicInfoIncomplete: false,
       startupConfig200: false,
@@ -4814,15 +4818,17 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
 
   // ── TunerCount limit block ────────────────────────────────────────────────
   // Validates the HDHomeRun TunerCount=1 limit enforcement:
-  //   FirstOpen: open channel 4.1 → 200 + bytes (both targets).
-  //   Conflict: with 4.1 active, open 5.1 → HTTP 500 (both targets).
-  //   Recovery: close 4.1, open 5.1 → 200 + bytes (both targets).
-  //   SharingExempt: 2 consumers of the SAME channel 4.1 → maxConcurrent===1, no conflict (Jellyrin only).
+  //   FirstOpen: open offset channel 7.1 → 200 + bytes (both targets).
+  //   Conflict: with 7.1 active, open 8.1 → HTTP 500 (both targets).
+  //   Cross-mode: with 7.1 active via direct TS, HLS and recording attempts on 8.1 are blocked.
+  //   Recovery: close 7.1, open 8.1 → 200 + bytes (both targets).
+  //   HlsRecovery: close 7.1, play 8.1 via HLS → master/media/segment bytes (both targets).
+  //   SharingExempt: 2 consumers of the SAME channel 7.1 → maxConcurrent===1, no conflict (Jellyrin only).
   //
   // Implementation decision: a DEDICATED limit sim (HDHOMERUN_SIM_TUNER_COUNT=1) is started
   // exclusively for this block. The main sim (TunerCount=4) is NOT used here. For upstream,
   // the main tuner host is deleted BEFORE adding the limit tuner so that the limit tuner is
-  // the ONLY running sim for channels 4.1/5.1, ensuring conflict propagates as HTTP 500.
+  // the ONLY running sim for offset channels 7.1/8.1, ensuring conflict propagates as HTTP 500.
   // (If multiple running tuners serve the same channels, upstream falls back to the next host
   // when one hits TunerCount, returning 200 rather than 500.) The main tuner is NOT re-added
   // after the limit block because the recording block has already completed.
@@ -4854,10 +4860,10 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
       limitSimClose = limitSim.close;
 
       // Delete the main tuner BEFORE adding the limit tuner (both targets).
-      // For upstream: ensures the limit tuner is the only active tuner for channels 4.1/5.1;
+      // For upstream: ensures the limit tuner is the only active tuner for offset channels 7.1/8.1;
       // without this, upstream falls back to the main tuner (TunerCount=0 → no limit) and
       // channel B returns 200 instead of 500.
-      // For Jellyrin: ensures live_tv_channel_by_id("hdhr_4.1") returns the limit tuner's channel
+      // For Jellyrin: ensures live_tv_channel_by_id("hdhr_7.1") returns the limit tuner's channel
       // (TunerCount=1), not the main tuner's (TunerCount=4). Without this, Jellyrin streams via
       // the main tuner's channel and the TunerCount=1 limit never fires.
       // The recording block has already completed; the main tuner is no longer needed.
@@ -4937,7 +4943,116 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
         throw new Error(`Limit sim channels not found: ${limitNum1}=${Boolean(limitChannel41)}, ${limitNum2}=${Boolean(limitChannel51)}`);
       }
 
-      // ── FirstOpen (4.1) ──
+      const cleanupTimerById = async (timerId) => {
+        if (!timerId) return;
+        await browserFetchJson(page, {
+          method: 'DELETE',
+          url: `/LiveTv/Timers/${encodeURIComponent(timerId)}`,
+          token: auth.AccessToken,
+        }).catch(() => {});
+      };
+
+      const findTimerIdByName = async (name) => {
+        const timersPollDeadline = Date.now() + 3000;
+        while (Date.now() < timersPollDeadline) {
+          const timers = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/LiveTv/Timers',
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          if (timers.status === 200 && Array.isArray(timers.json?.Items)) {
+            const found = timers.json.Items.find((timer) => timer.Name === name);
+            if (found?.Id) return found.Id;
+          }
+          await new Promise((resolve) => { setTimeout(resolve, 300); });
+        }
+        return null;
+      };
+
+      const assertRecordingBlockedByActiveTuner = async (channel) => {
+        const recordSecs = 2;
+        const timerName = `Jellyrin TunerLimit Recording Conflict ${target.name} ${Date.now()}`;
+        const recordStart = new Date();
+        const recordEnd = new Date(recordStart.getTime() + recordSecs * 1000);
+        const createTimer = await browserFetchJson(page, {
+          method: 'POST',
+          url: '/LiveTv/Timers',
+          token: auth.AccessToken,
+          body: {
+            ChannelId: channel.Id,
+            Name: timerName,
+            StartDate: recordStart.toISOString(),
+            EndDate: recordEnd.toISOString(),
+            PrePaddingSeconds: 0,
+            PostPaddingSeconds: 0,
+            Priority: 0,
+            IsPrePaddingRequired: false,
+            IsPostPaddingRequired: false,
+            KeepUntil: 'UntilDeleted',
+            RecordAnyTime: false,
+            RecordAnyChannel: false,
+            IsManual: true,
+            ServiceName: 'Emby',
+          },
+        }).catch(() => ({ status: 0, json: null }));
+
+        const pollRecordingPresence = async (deadlineMs) => {
+          const pollDeadline = Date.now() + deadlineMs;
+          let libraryScanTriggered = false;
+          let lastPresence = { completed: false, inProgress: false, matches: [] };
+          while (Date.now() < pollDeadline) {
+            if (!libraryScanTriggered && Date.now() >= recordEnd.getTime() + 1000) {
+              libraryScanTriggered = true;
+              await browserFetchJson(page, {
+                method: 'POST',
+                url: '/Library/Refresh',
+                token: auth.AccessToken,
+              }).catch(() => {});
+            }
+            lastPresence = await liveTvRecordingPresenceByName(page, auth, timerName);
+            if (lastPresence.completed) break;
+            await new Promise((resolve) => { setTimeout(resolve, 500); });
+          }
+          return lastPresence;
+        };
+
+        let timerId = createTimer.json?.Id || null;
+        if (createTimer.status === 500) {
+          const rejectedPresence = await pollRecordingPresence(2500);
+          return {
+            blocked: true,
+            noZombie: !rejectedPresence.completed && !rejectedPresence.inProgress,
+            createStatus: createTimer.status,
+          };
+        }
+        if (![200, 204].includes(createTimer.status)) {
+          return { blocked: false, noZombie: false, createStatus: createTimer.status };
+        }
+        if (!timerId) {
+          timerId = await findTimerIdByName(timerName);
+        }
+
+        const lastPresence = await pollRecordingPresence(5500);
+
+        await cleanupTimerById(timerId);
+        for (const recording of lastPresence.matches) {
+          if (recording.Id) {
+            await browserFetchJson(page, {
+              method: 'DELETE',
+              url: `/LiveTv/Recordings/${encodeURIComponent(recording.Id)}`,
+              token: auth.AccessToken,
+            }).catch(() => {});
+          }
+        }
+
+        return {
+          blocked: !lastPresence.completed,
+          noZombie: !lastPresence.completed && !lastPresence.inProgress,
+          createStatus: createTimer.status,
+        };
+      };
+
+      // ── FirstOpen (7.1) ──
       // Jellyrin: GET /LiveTv/LiveStreamFiles/{id}/stream.ts via probe.
       // upstream: POST /Items/{id}/PlaybackInfo?AutoOpenLiveStream=true.
       let limitLiveStreamIdA = null;
@@ -4950,7 +5065,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
         const ms = limitChannel41.MediaSources?.[0];
         const directStreamUrl = ms?.DirectStreamUrl;
         if (!directStreamUrl || !/\/LiveTv\/LiveStreamFiles\//i.test(directStreamUrl)) {
-          throw new Error('Limit tuner channel 4.1 did not include a LiveStreamFiles DirectStreamUrl');
+          throw new Error('Limit tuner channel 7.1 did not include a LiveStreamFiles DirectStreamUrl');
         }
         try {
           const pathUrl = new URL(directStreamUrl, summary.baseUrl);
@@ -4959,7 +5074,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
           limitStreamPathA = directStreamUrl;
         }
 
-        // Open 4.1 and hold it open (overlap probe) so the registry entry stays alive.
+        // Open 7.1 and hold it open (overlap probe) so the registry entry stays alive.
         const probe41 = await browserFetchStreamProbeOverlap(page, {
           url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 2000,
         });
@@ -4999,9 +5114,9 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
         }
       }
 
-      // ── Conflict (5.1 while 4.1 active) ──
-      // Jellyrin: open a new overlap probe for 4.1 to keep the handle alive, then try 5.1 stream.
-      // upstream: 4.1 is already open in _openStreams (limitLiveStreamIdA not yet closed); try PlaybackInfo for 5.1.
+      // ── Conflict (8.1 while 7.1 active) ──
+      // Jellyrin: open a new overlap probe for 7.1 to keep the handle alive, then try 8.1 stream.
+      // upstream: 7.1 is already open in _openStreams (limitLiveStreamIdA not yet closed); try PlaybackInfo for 8.1.
       if (target.name === 'jellyrin') {
         // Use limitChannel51 directly (already filtered by TunerHostId===limitTunerId; has MediaSources).
         const ms51 = limitChannel51.MediaSources?.[0];
@@ -5015,22 +5130,22 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
         }
 
         if (limitStreamPath51 && limitStreamPathA) {
-          // Open 4.1 again with overlap so the registry slot is still occupied during conflict check.
+          // Open 7.1 again with overlap so the registry slot is still occupied during conflict check.
           const overlap41 = browserFetchStreamProbeOverlap(page, {
             url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 1500,
           });
-          // Brief pause to ensure 4.1 is registered in the registry before trying 5.1.
+          // Brief pause to ensure 7.1 is registered in the registry before trying 8.1.
           await new Promise((resolve) => { setTimeout(resolve, 100); });
-          // Try 5.1 — must fail with HTTP 500 (TunerCount limit hit).
+          // Try 8.1 — must fail with HTTP 500 (TunerCount limit hit).
           const probe51 = await browserFetchStreamProbe(page, {
             url: limitStreamPath51, token: auth.AccessToken, minBytes: 1,
           });
           summary.invariants.liveTvHdhrTunerLimitConflict = probe51.status === 500;
-          // Wait for the 4.1 overlap to finish so the registry is cleaned up.
+          // Wait for the 7.1 overlap to finish so the registry is cleaned up.
           await overlap41;
         }
       } else {
-        // upstream: 4.1 still open in _openStreams. Try PlaybackInfo for 5.1.
+        // upstream: 7.1 still open in _openStreams. Try PlaybackInfo for 8.1.
         const pbi51 = await browserFetchJson(page, {
           method: 'POST',
           url: `/Items/${encodeURIComponent(limitChannel51.Id)}/PlaybackInfo`,
@@ -5038,6 +5153,49 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
           body: { UserId: auth.User.Id, AutoOpenLiveStream: true },
         });
         summary.invariants.liveTvHdhrTunerLimitConflict = pbi51.status === 500;
+      }
+
+      // ── Cross-mode conflict: direct TS on 7.1 blocks HLS on 8.1 ──
+      if (target.name === 'jellyrin') {
+        if (limitStreamPathA) {
+          const directBlocker = browserFetchStreamProbeOverlap(page, {
+            url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 8000,
+          });
+          await new Promise((resolve) => { setTimeout(resolve, 100); });
+          const hlsBlocked = await probeLiveTvHlsPlayback(page, summary, auth, target, limitChannel51, {
+            cleanup: true,
+            masterTimeoutMs: 5000,
+            mediaTimeoutMs: 5000,
+          });
+          summary.invariants.liveTvHdhrTunerLimitHlsConflict = hlsBlocked.status === 500;
+          await directBlocker;
+        }
+      } else {
+        // upstream: 7.1 remains open from PlaybackInfo until /LiveStreams/Close below.
+        const hlsBlocked = await probeLiveTvHlsPlayback(page, summary, auth, target, limitChannel51, {
+          cleanup: true,
+          masterTimeoutMs: 5000,
+          mediaTimeoutMs: 5000,
+        });
+        summary.invariants.liveTvHdhrTunerLimitHlsConflict = hlsBlocked.status === 500;
+      }
+
+      // ── Cross-mode conflict: direct TS on 7.1 blocks recording on 8.1 ──
+      if (target.name === 'jellyrin') {
+        if (limitStreamPathA) {
+          const directBlocker = browserFetchStreamProbeOverlap(page, {
+            url: limitStreamPathA, token: auth.AccessToken, minBytes: 1, holdMs: 9000,
+          });
+          await new Promise((resolve) => { setTimeout(resolve, 100); });
+          const recordingBlocked = await assertRecordingBlockedByActiveTuner(limitChannel51);
+          summary.invariants.liveTvHdhrTunerLimitRecordingConflict = recordingBlocked.blocked;
+          summary.invariants.liveTvHdhrTunerLimitRecordingNoZombie = recordingBlocked.noZombie;
+          await directBlocker;
+        }
+      } else {
+        // upstream: 7.1 remains open from PlaybackInfo until /LiveStreams/Close below.
+        const recordingBlocked = await assertRecordingBlockedByActiveTuner(limitChannel51);
+        summary.invariants.liveTvHdhrTunerLimitRecordingConflict = recordingBlocked.blocked;
       }
 
       // ── Recovery (close 7.1, open 8.1) ──
@@ -5054,6 +5212,11 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
           await new Promise((resolve) => { setTimeout(resolve, 200); });
         }
         if (recCurrent === 0) {
+          const hlsRecovery = await probeLiveTvHlsPlayback(page, summary, auth, target, limitChannel51, {
+            cleanup: true,
+          });
+          summary.invariants.liveTvHdhrTunerLimitHlsRecovery = hlsRecovery.ok;
+
           // Use limitChannel51 directly (already filtered by TunerHostId; has MediaSources).
           const ms51 = limitChannel51.MediaSources?.[0];
           const directStreamUrl51 = ms51?.DirectStreamUrl;
@@ -5074,7 +5237,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
           }
         }
       } else {
-        // upstream: close 4.1 via /LiveStreams/Close, then retry PlaybackInfo for 5.1.
+        // upstream: close 7.1 via /LiveStreams/Close, then retry PlaybackInfo for 8.1.
         if (limitLiveStreamIdA) {
           await browserFetchJson(page, {
             method: 'POST',
@@ -5084,6 +5247,11 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
           // Brief pause for upstream to release the _openStreams slot.
           await new Promise((resolve) => { setTimeout(resolve, 500); });
         }
+        const hlsRecovery = await probeLiveTvHlsPlayback(page, summary, auth, target, limitChannel51, {
+          cleanup: true,
+        });
+        summary.invariants.liveTvHdhrTunerLimitHlsRecovery = hlsRecovery.ok;
+
         const pbi51b = await browserFetchJson(page, {
           method: 'POST',
           url: `/Items/${encodeURIComponent(limitChannel51.Id)}/PlaybackInfo`,
@@ -5123,8 +5291,8 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
       }
 
       // ── SharingExempt (Jellyrin only) ──
-      // 2 consumers of the SAME channel 4.1 with TunerCount=1 must NOT trigger a conflict.
-      // maxConcurrentByChannel[/auto/v4.1]===1 confirms only 1 outgoing connection (sharing).
+      // 2 consumers of the SAME channel 7.1 with TunerCount=1 must NOT trigger a conflict.
+      // maxConcurrentByChannel[/auto/v7.1]===1 confirms only 1 outgoing connection (sharing).
       if (target.name === 'jellyrin' && limitStreamPathA) {
         await nodeHttpJson('POST', `${limitSimUrl}/stats/reset`).catch(() => {});
         const exemptProbe1 = browserFetchStreamProbeOverlap(page, {
@@ -6547,6 +6715,159 @@ function nodeHttpBinary(method, absoluteUrl, token, destFile) {
     req.setTimeout(15000, () => { req.destroy(); resolve({ ok: false, bytes: 0 }); });
     req.end();
   });
+}
+
+function playSessionIdFromTranscodingUrl(transcodingUrl) {
+  try {
+    const url = new URL(transcodingUrl, 'http://placeholder.invalid');
+    return url.searchParams.get('PlaySessionId') || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function deleteLiveTvHlsSession(page, auth, playSessionId) {
+  if (!playSessionId) return;
+  await browserFetchJson(page, {
+    method: 'DELETE',
+    url: `/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playSessionId)}&DeviceId=browser-trace`,
+    token: auth.AccessToken,
+  }).catch(() => {});
+}
+
+async function probeLiveTvHlsPlayback(page, summary, auth, target, channel, options = {}) {
+  const result = {
+    ok: false,
+    status: 0,
+    phase: 'init',
+    playSessionId: null,
+    transcodingUrl: null,
+    master200: false,
+    mediaLive: false,
+    segment200: false,
+  };
+  try {
+    if (target.name === 'jellyrin' && /^hdhr_/.test(channel.Id || '')) {
+      let ms = channel.MediaSources?.[0] || null;
+      const channelDetail = await browserFetchJson(page, {
+        method: 'GET',
+        url: `/LiveTv/Channels/${encodeURIComponent(channel.Id)}?fields=MediaSources`,
+        token: auth.AccessToken,
+      });
+      if (channelDetail.status !== 200 && !ms) {
+        return { ...result, status: channelDetail.status, phase: 'channel-detail' };
+      }
+      ms = channelDetail.json?.MediaSources?.[0] || ms;
+      const transcodingUrl = ms?.TranscodingUrl;
+      if (!transcodingUrl) {
+        return { ...result, phase: 'transcoding-url' };
+      }
+      result.transcodingUrl = transcodingUrl;
+      result.playSessionId = playSessionIdFromTranscodingUrl(transcodingUrl);
+    } else {
+      const playbackInfo = await browserFetchJson(page, {
+        method: 'POST',
+        url: `/Items/${encodeURIComponent(channel.Id)}/PlaybackInfo`,
+        token: auth.AccessToken,
+        body: {
+          UserId: auth.User.Id,
+          EnableTranscoding: true,
+          EnableDirectPlay: false,
+          EnableDirectStream: false,
+          AutoOpenLiveStream: true,
+          DeviceProfile: hlsTranscodeDeviceProfile(),
+        },
+      });
+      if (playbackInfo.status !== 200) {
+        return { ...result, status: playbackInfo.status, phase: 'playback-info' };
+      }
+      const transcodingUrl = playbackInfo.json?.MediaSources?.[0]?.TranscodingUrl;
+      if (!transcodingUrl) {
+        return { ...result, status: playbackInfo.status, phase: 'transcoding-url' };
+      }
+      result.transcodingUrl = transcodingUrl;
+      result.playSessionId = playbackInfo.json?.PlaySessionId || playSessionIdFromTranscodingUrl(transcodingUrl);
+    }
+
+    const master = await browserFetchTextBounded(page, {
+      method: 'GET',
+      url: result.transcodingUrl,
+      token: auth.AccessToken,
+      timeoutMs: options.masterTimeoutMs || 20000,
+    });
+    result.status = master.status;
+    result.phase = 'master';
+    result.master200 = master.status === 200
+      && master.contentType.includes('mpegurl')
+      && master.text.includes('#EXT-X-STREAM-INF');
+    if (!result.master200) {
+      return result;
+    }
+
+    const mediaPlaylistPath = firstPlaylistUri(master.text);
+    if (!mediaPlaylistPath) {
+      result.phase = 'media-uri';
+      return result;
+    }
+    const mediaPlaylistUrl = resolveRelativeUrl(result.transcodingUrl, mediaPlaylistPath);
+    const media = await browserFetchTextBounded(page, {
+      method: 'GET',
+      url: mediaPlaylistUrl,
+      token: auth.AccessToken,
+      timeoutMs: options.mediaTimeoutMs || 35000,
+    });
+    result.status = media.status;
+    result.phase = 'media';
+    result.mediaLive = media.status === 200
+      && media.text.includes('#EXTINF')
+      && !media.text.includes('#EXT-X-ENDLIST');
+    if (!result.mediaLive) {
+      return result;
+    }
+
+    const segmentPath = firstPlaylistUri(media.text);
+    if (!segmentPath) {
+      result.phase = 'segment-uri';
+      return result;
+    }
+    const segmentUrl = resolveRelativeUrl(mediaPlaylistUrl, segmentPath);
+    const segmentProbe = await browserFetchStreamProbe(page, {
+      url: segmentUrl,
+      token: auth.AccessToken,
+      minBytes: 1,
+    });
+    result.status = segmentProbe.status;
+    result.phase = 'segment';
+    result.segment200 = (segmentProbe.status === 200 || segmentProbe.status === 206)
+      && segmentProbe.contentType.includes('video/mp2t')
+      && segmentProbe.byteLength >= 1;
+    result.ok = result.segment200;
+    return result;
+  } finally {
+    if (options.cleanup !== false) {
+      await deleteLiveTvHlsSession(page, auth, result.playSessionId);
+    }
+  }
+}
+
+async function liveTvRecordingPresenceByName(page, auth, name) {
+  const recordings = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/LiveTv/Recordings',
+    token: auth.AccessToken,
+  }).catch(() => ({ status: 0, json: null }));
+  const items = recordings.status === 200 && Array.isArray(recordings.json?.Items)
+    ? recordings.json.Items.filter((item) => item.Name === name)
+    : [];
+  return {
+    status: recordings.status,
+    matches: items,
+    completed: items.some(
+      (item) => item.Status === 'Completed'
+        || (item.Status !== 'InProgress' && item.RunTimeTicks != null && item.RunTimeTicks > 0),
+    ),
+    inProgress: items.some((item) => item.Status === 'InProgress'),
+  };
 }
 
 async function authenticateTarget(page, summary, target) {
@@ -8610,7 +8931,10 @@ function invariantFailures(summary) {
       ['liveTvHdhrSeriesRecordingPlayable', 'live tv HDHomeRun series timer recording playable by ffprobe'],
       ['liveTvHdhrTunerLimitFirstOpen', 'live tv HDHomeRun TunerCount=1 first open (200 + bytes)'],
       ['liveTvHdhrTunerLimitConflict', 'live tv HDHomeRun TunerCount=1 conflict (HTTP 500)'],
+      ['liveTvHdhrTunerLimitHlsConflict', 'live tv HDHomeRun TunerCount=1 direct TS blocks HLS cross-mode conflict'],
+      ['liveTvHdhrTunerLimitRecordingConflict', 'live tv HDHomeRun TunerCount=1 direct TS blocks recording cross-mode conflict'],
       ['liveTvHdhrTunerLimitRecovery', 'live tv HDHomeRun TunerCount=1 recovery after close (200 + bytes)'],
+      ['liveTvHdhrTunerLimitHlsRecovery', 'live tv HDHomeRun TunerCount=1 HLS recovery after close (segment bytes)'],
     ]) {
       if (!summary.invariants[field]) {
         failures.push(`missing ${label} invariant`);
@@ -8645,6 +8969,7 @@ function invariantFailures(summary) {
         ['liveTvHdhrHlsTranscodeUrl', 'live tv HDHomeRun TranscodingUrl with SupportsTranscoding:true + hls'],
         ['liveTvHdhrHlsFfmpegReaped', 'live tv HDHomeRun HLS ffmpeg reaped (/stats currentConcurrent===0)'],
         ['liveTvHdhrSeriesTimerCleanup', 'live tv HDHomeRun series timer cleanup + child timer cascade'],
+        ['liveTvHdhrTunerLimitRecordingNoZombie', 'live tv HDHomeRun TunerCount=1 recording conflict leaves no InProgress zombie'],
         ['liveTvHdhrTunerLimitSharingExempt', 'live tv HDHomeRun TunerCount=1 sharing exempt (same channel, maxConcurrent===1)'],
       ]) {
         if (!summary.invariants[field]) {
@@ -8842,25 +9167,27 @@ function ignoredConsoleError(text) {
 
 function allowedFailedResponse(response) {
   const url = response.url();
+  const pathname = new URL(url).pathname;
+  const method = response.request().method().toUpperCase();
   if (url.includes('/Branding/Splashscreen')) {
     return true;
   }
-  if (response.status() === 404 && new URL(url).pathname === '/web/undefined') {
+  if (response.status() === 404 && pathname === '/web/undefined') {
     return true;
   }
-  if (response.status() === 400 && url.startsWith('http://127.0.0.1:8096/') && /\/Playlists\/[^/]+\/Items\/[^/]+\/Move\/\d+$/i.test(new URL(url).pathname)) {
+  if (response.status() === 400 && url.startsWith('http://127.0.0.1:8096/') && /\/Playlists\/[^/]+\/Items\/[^/]+\/Move\/\d+$/i.test(pathname)) {
     return true;
   }
-  if (response.status() === 400 && url.startsWith('http://127.0.0.1:8096/') && /\/Playlists\/[^/]+$/i.test(new URL(url).pathname)) {
+  if (response.status() === 400 && url.startsWith('http://127.0.0.1:8096/') && /\/Playlists\/[^/]+$/i.test(pathname)) {
     return true;
   }
   if (flow === 'plugins-packages' && response.status() === 409) {
     return true;
   }
-  if (flow === 'syncplay' && response.status() === 404 && /\/SyncPlay\/[^/]+$/i.test(new URL(url).pathname)) {
+  if (flow === 'syncplay' && response.status() === 404 && /\/SyncPlay\/[^/]+$/i.test(pathname)) {
     return true;
   }
-  if (response.status() === 400 && new URL(url).pathname === '/SyncPlay/List') {
+  if (response.status() === 400 && pathname === '/SyncPlay/List') {
     return true;
   }
   // upstream Jellyfin's DELETE /Videos/ActiveEncodings requires DeviceId in addition to
@@ -8869,19 +9196,30 @@ function allowedFailedResponse(response) {
   // The DeviceId "browser-trace" is included in the DELETE URL so this should not trigger
   // in practice; kept as a safety net for the upstream target only.
   if (flow === 'live-tv' && response.status() === 400
-    && new URL(url).pathname === '/Videos/ActiveEncodings'
+    && pathname === '/Videos/ActiveEncodings'
     && url.startsWith(process.env.JELLYFIN_UPSTREAM_URL || 'http://127.0.0.1:8096')) {
+    return true;
+  }
+  // Cleanup calls are intentionally idempotent in the Live TV golden. A conflict can fail
+  // before an HLS session exists, and a short timer can disappear before explicit cleanup.
+  if (flow === 'live-tv' && response.status() === 404
+    && ((method === 'DELETE' && pathname === '/Videos/ActiveEncodings')
+      || (method === 'DELETE' && /\/LiveTv\/Timers\/[^/]+$/i.test(pathname)))) {
     return true;
   }
   // TunerCount limit conflict returns HTTP 500 when TunerCount=1 is reached:
   //   - Jellyrin: GET /LiveTv/LiveStreamFiles/{id}/stream.ts -> 500 via ApiError::internal.
+  //   - Jellyrin HLS: GET /Videos/{id}/master.m3u8 -> 500 via the shared tuner lease.
+  //   - Recording timers may synchronously surface the same conflict via POST /LiveTv/Timers.
   //   - upstream: POST /Items/{id}/PlaybackInfo (AutoOpenLiveStream=true) -> 500 via
   //     ExceptionMiddleware (LiveTvConflictException -> _ => 500).
   // Both are expected observable results (R-CONFLICT-500). Scoped to the live-tv flow to
   // avoid silently hiding real errors in other flows.
   if (flow === 'live-tv' && response.status() === 500
-    && (/\/LiveTv\/LiveStreamFiles\//i.test(new URL(url).pathname)
-      || /\/Items\/[^/]+\/PlaybackInfo/i.test(new URL(url).pathname))) {
+    && ((method === 'GET' && /\/LiveTv\/LiveStreamFiles\//i.test(pathname))
+      || (method === 'GET' && /\/Videos\/[^/]+\/master\.m3u8/i.test(pathname))
+      || (method === 'POST' && /\/LiveTv\/Timers$/i.test(pathname))
+      || (method === 'POST' && /\/Items\/[^/]+\/PlaybackInfo/i.test(pathname)))) {
     return true;
   }
   return false;
