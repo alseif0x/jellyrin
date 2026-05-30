@@ -7,10 +7,24 @@ use axum::{
 use jellyrin_core::VirtualFolder;
 use jellyrin_db::Database;
 use serde_json::Value;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
+    time::Duration as StdDuration,
+};
+use tokio::{net::UdpSocket, task::JoinHandle, time};
 use uuid::Uuid;
 
-use crate::{ApiError, AppState, COMPATIBLE_PRODUCT_NAME, default_network_configuration};
+use crate::{
+    ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION,
+    default_network_configuration, subscribe_system_lifecycle_commands,
+};
 
+const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+const SSDP_PORT: u16 = 1900;
+const SSDP_CACHE_SECONDS: u32 = 1800;
+const SSDP_NOTIFY_INTERVAL_SECONDS: u64 = 60;
+const SSDP_CONFIG_CHECK_SECONDS: u64 = 5;
 const UPNP_DEVICE_NS: &str = "urn:schemas-upnp-org:device-1-0";
 const DLNA_DEVICE_NS: &str = "urn:schemas-dlna-org:device-1-0";
 const UPNP_SERVICE_NS: &str = "urn:schemas-upnp-org:service-1-0";
@@ -19,6 +33,8 @@ const CONTENT_DIRECTORY_SERVICE: &str = "urn:schemas-upnp-org:service:ContentDir
 const CONNECTION_MANAGER_SERVICE: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
 const CONTENT_DIRECTORY_ID: &str = "urn:upnp-org:serviceId:ContentDirectory";
 const CONNECTION_MANAGER_ID: &str = "urn:upnp-org:serviceId:ConnectionManager";
+const UPNP_ROOT_DEVICE: &str = "upnp:rootdevice";
+const MEDIA_SERVER_DEVICE: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 const DLNA_PROTOCOL_INFO: &str = concat!(
     "http-get:*:video/mpeg:*,",
     "http-get:*:video/mp4:*,",
@@ -45,6 +61,30 @@ const ONE_BY_ONE_PNG: &[u8] = &[
     0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae,
     0x42, 0x60, 0x82,
 ];
+
+pub fn spawn_dlna_ssdp_service(state: AppState) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match upnp_enabled(&state.db).await {
+                Ok(true) => match bind_ssdp_socket().await {
+                    Ok(socket) => {
+                        if let Err(error) = run_ssdp_service(state.clone(), socket).await {
+                            tracing::warn!(%error, "DLNA SSDP service stopped");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to bind DLNA SSDP socket");
+                    }
+                },
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(?error, "failed to read DLNA SSDP configuration");
+                }
+            }
+            time::sleep(StdDuration::from_secs(SSDP_CONFIG_CHECK_SECONDS)).await;
+        }
+    })
+}
 
 pub(crate) async fn description(
     State(state): State<AppState>,
@@ -167,6 +207,287 @@ pub(crate) async fn upnp_enabled(db: &Database) -> Result<bool, ApiError> {
         .get("EnableUPnP")
         .and_then(Value::as_bool)
         .unwrap_or(false))
+}
+
+async fn bind_ssdp_socket() -> anyhow::Result<UdpSocket> {
+    let socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT))?;
+    socket.set_nonblocking(true)?;
+    socket.set_multicast_loop_v4(true)?;
+    socket.set_multicast_ttl_v4(4)?;
+    socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)?;
+    Ok(UdpSocket::from_std(socket)?)
+}
+
+async fn run_ssdp_service(state: AppState, socket: UdpSocket) -> anyhow::Result<()> {
+    let multicast = SocketAddrV4::new(SSDP_MULTICAST_ADDR, SSDP_PORT);
+    let mut notify_interval = time::interval(StdDuration::from_secs(SSDP_NOTIFY_INTERVAL_SECONDS));
+    let mut config_interval = time::interval(StdDuration::from_secs(SSDP_CONFIG_CHECK_SECONDS));
+    let mut lifecycle = subscribe_system_lifecycle_commands();
+    let mut buffer = vec![0_u8; 2048];
+
+    send_ssdp_notify(&socket, multicast, &state, SsdpNotificationKind::Alive).await?;
+
+    loop {
+        tokio::select! {
+            result = socket.recv_from(&mut buffer) => {
+                match result {
+                    Ok((len, peer)) => {
+                        let server = state.db.server_state().await?;
+                        let base_url = ssdp_base_url_for_peer(&state.local_address, peer);
+                        respond_to_ssdp_search(
+                            &socket,
+                            &buffer[..len],
+                            peer,
+                            server.server_id,
+                            &base_url,
+                        ).await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            _ = notify_interval.tick() => {
+                send_ssdp_notify(&socket, multicast, &state, SsdpNotificationKind::Alive).await?;
+            }
+            _ = config_interval.tick() => {
+                match upnp_enabled(&state.db).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        send_ssdp_notify(&socket, multicast, &state, SsdpNotificationKind::Byebye).await?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "failed to refresh DLNA SSDP configuration");
+                        send_ssdp_notify(&socket, multicast, &state, SsdpNotificationKind::Byebye).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            command = lifecycle.recv() => {
+                if command.is_ok() {
+                    send_ssdp_notify(&socket, multicast, &state, SsdpNotificationKind::Byebye).await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn send_ssdp_notify(
+    socket: &UdpSocket,
+    multicast: SocketAddrV4,
+    state: &AppState,
+    kind: SsdpNotificationKind,
+) -> anyhow::Result<()> {
+    let server = state.db.server_state().await?;
+    let base_url = ssdp_base_url_for_peer(&state.local_address, SocketAddr::V4(multicast));
+    let location = ssdp_description_location(&base_url, server.server_id);
+    for message in ssdp_notify_messages(server.server_id, &location, kind) {
+        socket.send_to(message.as_bytes(), multicast).await?;
+    }
+    Ok(())
+}
+
+async fn respond_to_ssdp_search(
+    socket: &UdpSocket,
+    data: &[u8],
+    peer: SocketAddr,
+    server_id: Uuid,
+    base_url: &str,
+) -> anyhow::Result<usize> {
+    let Some(request) = parse_ssdp_search(data) else {
+        return Ok(0);
+    };
+    let location = ssdp_description_location(base_url, server_id);
+    let mut sent = 0;
+    for target in matching_ssdp_targets(server_id, &request.search_target) {
+        let response = ssdp_search_response(server_id, &location, target);
+        socket.send_to(response.as_bytes(), peer).await?;
+        sent += 1;
+    }
+    Ok(sent)
+}
+
+#[derive(Clone, Copy)]
+enum SsdpNotificationKind {
+    Alive,
+    Byebye,
+}
+
+struct SsdpSearchRequest {
+    search_target: String,
+}
+
+fn parse_ssdp_search(data: &[u8]) -> Option<SsdpSearchRequest> {
+    let packet = std::str::from_utf8(data).ok()?;
+    let mut lines = packet.lines();
+    let request_line = lines.next()?.trim();
+    if !request_line.eq_ignore_ascii_case("M-SEARCH * HTTP/1.1") {
+        return None;
+    }
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+
+    let man = headers.get("man")?;
+    if !man.trim_matches('"').eq_ignore_ascii_case("ssdp:discover") {
+        return None;
+    }
+    let search_target = headers.get("st")?.trim().to_string();
+    if search_target.is_empty() {
+        return None;
+    }
+    Some(SsdpSearchRequest { search_target })
+}
+
+fn matching_ssdp_targets(server_id: Uuid, search_target: &str) -> Vec<String> {
+    let requested = search_target.trim();
+    let targets = ssdp_advertised_targets(server_id);
+    if requested.eq_ignore_ascii_case("ssdp:all") {
+        return targets;
+    }
+    targets
+        .into_iter()
+        .filter(|target| target.eq_ignore_ascii_case(requested))
+        .collect()
+}
+
+fn ssdp_advertised_targets(server_id: Uuid) -> Vec<String> {
+    vec![
+        UPNP_ROOT_DEVICE.to_string(),
+        format!("uuid:{server_id}"),
+        MEDIA_SERVER_DEVICE.to_string(),
+        CONTENT_DIRECTORY_SERVICE.to_string(),
+        CONNECTION_MANAGER_SERVICE.to_string(),
+    ]
+}
+
+fn ssdp_search_response(server_id: Uuid, location: &str, search_target: String) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         CACHE-CONTROL: max-age={SSDP_CACHE_SECONDS}\r\n\
+         EXT:\r\n\
+         LOCATION: {location}\r\n\
+         SERVER: {server_header}\r\n\
+         ST: {search_target}\r\n\
+         USN: {usn}\r\n\
+         BOOTID.UPNP.ORG: 1\r\n\
+         CONFIGID.UPNP.ORG: 1\r\n\
+         \r\n",
+        server_header = ssdp_server_header(),
+        usn = ssdp_usn(server_id, &search_target),
+    )
+}
+
+fn ssdp_notify_messages(
+    server_id: Uuid,
+    location: &str,
+    kind: SsdpNotificationKind,
+) -> Vec<String> {
+    ssdp_advertised_targets(server_id)
+        .into_iter()
+        .map(|target| ssdp_notify_message(server_id, location, &target, kind))
+        .collect()
+}
+
+fn ssdp_notify_message(
+    server_id: Uuid,
+    location: &str,
+    notification_type: &str,
+    kind: SsdpNotificationKind,
+) -> String {
+    let notification_sub_type = match kind {
+        SsdpNotificationKind::Alive => "ssdp:alive",
+        SsdpNotificationKind::Byebye => "ssdp:byebye",
+    };
+    let location = match kind {
+        SsdpNotificationKind::Alive => format!("LOCATION: {location}\r\n"),
+        SsdpNotificationKind::Byebye => String::new(),
+    };
+    let server = match kind {
+        SsdpNotificationKind::Alive => format!("SERVER: {}\r\n", ssdp_server_header()),
+        SsdpNotificationKind::Byebye => String::new(),
+    };
+    let cache_control = match kind {
+        SsdpNotificationKind::Alive => {
+            format!("CACHE-CONTROL: max-age={SSDP_CACHE_SECONDS}\r\n")
+        }
+        SsdpNotificationKind::Byebye => String::new(),
+    };
+    format!(
+        "NOTIFY * HTTP/1.1\r\n\
+         HOST: {SSDP_MULTICAST_ADDR}:{SSDP_PORT}\r\n\
+         {cache_control}\
+         {location}\
+         NT: {notification_type}\r\n\
+         NTS: {notification_sub_type}\r\n\
+         {server}\
+         USN: {usn}\r\n\
+         BOOTID.UPNP.ORG: 1\r\n\
+         CONFIGID.UPNP.ORG: 1\r\n\
+         \r\n",
+        usn = ssdp_usn(server_id, notification_type),
+    )
+}
+
+fn ssdp_usn(server_id: Uuid, target: &str) -> String {
+    let uuid = format!("uuid:{server_id}");
+    if target.eq_ignore_ascii_case(&uuid) {
+        uuid
+    } else {
+        format!("{uuid}::{target}")
+    }
+}
+
+fn ssdp_server_header() -> String {
+    format!(
+        "Jellyrin/{COMPATIBLE_SERVER_VERSION} UPnP/1.0 {COMPATIBLE_PRODUCT_NAME}/{COMPATIBLE_SERVER_VERSION}"
+    )
+}
+
+fn ssdp_description_location(base_url: &str, server_id: Uuid) -> String {
+    format!(
+        "{}/dlna/{server_id}/description.xml",
+        base_url.trim_end_matches('/')
+    )
+}
+
+fn ssdp_base_url_for_peer(configured_base_url: &str, peer: SocketAddr) -> String {
+    let configured_base_url = configured_base_url.trim_end_matches('/');
+    if !configured_base_url.contains("://0.0.0.0:")
+        && !configured_base_url.contains("://[::]:")
+        && !configured_base_url.contains("://:::")
+    {
+        return configured_base_url.to_string();
+    }
+
+    let scheme = configured_base_url
+        .split_once("://")
+        .map_or("http", |(scheme, _)| scheme);
+    let port = configured_base_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .unwrap_or(8096);
+    let ip = local_ip_for_peer(peer).unwrap_or_else(|| peer.ip());
+    match ip {
+        IpAddr::V4(ip) => format!("{scheme}://{ip}:{port}"),
+        IpAddr::V6(ip) => format!("{scheme}://[{ip}]:{port}"),
+    }
+}
+
+fn local_ip_for_peer(peer: SocketAddr) -> Option<IpAddr> {
+    let bind_addr = if peer.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0))
+    };
+    let socket = StdUdpSocket::bind(bind_addr).ok()?;
+    socket.connect(peer).ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip())
 }
 
 struct DlnaContext {
@@ -961,3 +1282,139 @@ const CONNECTION_MANAGER_STATE_VARIABLES: &[DlnaStateVariable] = &[
         allowed_values: &[],
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{Duration, timeout};
+
+    fn test_server_id() -> Uuid {
+        Uuid::parse_str("58deb718-f9ee-4ac5-a1d4-05286d64cf42").unwrap()
+    }
+
+    #[test]
+    fn ssdp_search_response_matches_upnp_contract() {
+        let server_id = test_server_id();
+        let response = ssdp_search_response(
+            server_id,
+            "http://192.168.1.46:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml",
+            MEDIA_SERVER_DEVICE.to_string(),
+        );
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("CACHE-CONTROL: max-age=1800\r\n"));
+        assert!(response.contains("EXT:\r\n"));
+        assert!(response.contains("LOCATION: http://192.168.1.46:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml\r\n"));
+        assert!(response.contains("ST: urn:schemas-upnp-org:device:MediaServer:1\r\n"));
+        assert!(response.contains("USN: uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42::urn:schemas-upnp-org:device:MediaServer:1\r\n"));
+        assert!(response.contains("BOOTID.UPNP.ORG: 1\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn ssdp_matching_targets_cover_root_uuid_device_and_services() {
+        let server_id = test_server_id();
+        let all = matching_ssdp_targets(server_id, "ssdp:all");
+        assert_eq!(all.len(), 5);
+        assert!(all.contains(&UPNP_ROOT_DEVICE.to_string()));
+        assert!(all.contains(&format!("uuid:{server_id}")));
+        assert!(all.contains(&MEDIA_SERVER_DEVICE.to_string()));
+        assert!(all.contains(&CONTENT_DIRECTORY_SERVICE.to_string()));
+        assert!(all.contains(&CONNECTION_MANAGER_SERVICE.to_string()));
+
+        let service = matching_ssdp_targets(server_id, CONTENT_DIRECTORY_SERVICE);
+        assert_eq!(service, vec![CONTENT_DIRECTORY_SERVICE.to_string()]);
+        assert!(matching_ssdp_targets(server_id, "urn:example:unknown").is_empty());
+    }
+
+    #[test]
+    fn ssdp_notify_alive_and_byebye_use_expected_headers() {
+        let server_id = test_server_id();
+        let alive = ssdp_notify_message(
+            server_id,
+            "http://127.0.0.1:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml",
+            UPNP_ROOT_DEVICE,
+            SsdpNotificationKind::Alive,
+        );
+        assert!(alive.starts_with("NOTIFY * HTTP/1.1\r\n"));
+        assert!(alive.contains("HOST: 239.255.255.250:1900\r\n"));
+        assert!(alive.contains("NTS: ssdp:alive\r\n"));
+        assert!(alive.contains("LOCATION: http://127.0.0.1:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml\r\n"));
+        assert!(
+            alive.contains("USN: uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42::upnp:rootdevice\r\n")
+        );
+
+        let byebye = ssdp_notify_message(
+            server_id,
+            "http://127.0.0.1:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml",
+            UPNP_ROOT_DEVICE,
+            SsdpNotificationKind::Byebye,
+        );
+        assert!(byebye.contains("NTS: ssdp:byebye\r\n"));
+        assert!(!byebye.contains("LOCATION:"));
+        assert!(
+            byebye.contains("USN: uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42::upnp:rootdevice\r\n")
+        );
+    }
+
+    #[test]
+    fn ssdp_base_url_replaces_unspecified_bind_address_for_peer() {
+        let peer: SocketAddr = "127.0.0.1:55321".parse().unwrap();
+        assert_eq!(
+            ssdp_base_url_for_peer("http://0.0.0.0:8097", peer),
+            "http://127.0.0.1:8097"
+        );
+        assert_eq!(
+            ssdp_base_url_for_peer("http://192.168.1.46:8097", peer),
+            "http://192.168.1.46:8097"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires UDP bind permission; run explicitly for local/device validation"]
+    async fn ssdp_udp_handler_responds_to_msearch() {
+        let server_id = test_server_id();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = concat!(
+            "M-SEARCH * HTTP/1.1\r\n",
+            "HOST: 239.255.255.250:1900\r\n",
+            "MAN: \"ssdp:discover\"\r\n",
+            "MX: 1\r\n",
+            "ST: urn:schemas-upnp-org:device:MediaServer:1\r\n",
+            "\r\n"
+        );
+
+        client
+            .send_to(request.as_bytes(), server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut request_buffer = vec![0_u8; 1024];
+        let (len, peer) = server.recv_from(&mut request_buffer).await.unwrap();
+
+        let sent = respond_to_ssdp_search(
+            &server,
+            &request_buffer[..len],
+            peer,
+            server_id,
+            "http://127.0.0.1:8097",
+        )
+        .await
+        .unwrap();
+        assert_eq!(sent, 1);
+
+        let mut response_buffer = vec![0_u8; 2048];
+        let (len, _) = timeout(
+            Duration::from_secs(2),
+            client.recv_from(&mut response_buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = std::str::from_utf8(&response_buffer[..len]).unwrap();
+        assert!(response.contains("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("ST: urn:schemas-upnp-org:device:MediaServer:1\r\n"));
+        assert!(response.contains("USN: uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42::urn:schemas-upnp-org:device:MediaServer:1\r\n"));
+        assert!(response.contains("LOCATION: http://127.0.0.1:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml\r\n"));
+    }
+}

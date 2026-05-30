@@ -265,6 +265,8 @@ pub struct AppState {
     pub local_address: String,
 }
 
+pub use dlna::spawn_dlna_ssdp_service;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SystemLifecycleCommand {
     Restart,
@@ -5470,7 +5472,7 @@ pub fn last_system_lifecycle_command() -> Option<SystemLifecycleCommand> {
     }
 }
 
-fn publish_system_lifecycle_command(command: SystemLifecycleCommand) {
+pub fn publish_system_lifecycle_command(command: SystemLifecycleCommand) {
     SYSTEM_LIFECYCLE_LAST.store(
         match command {
             SystemLifecycleCommand::Restart => 1,

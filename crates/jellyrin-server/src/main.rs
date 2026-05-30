@@ -4,7 +4,8 @@ use anyhow::Context;
 use clap::Parser;
 use jellyrin_api::{
     AppState, SystemLifecycleCommand, cleanup_stale_hls_transcodes, last_system_lifecycle_command,
-    reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup, router,
+    publish_system_lifecycle_command, reconcile_live_tv_recordings_on_startup,
+    reconcile_transcode_sessions_on_startup, router, spawn_dlna_ssdp_service,
     spawn_periodic_live_tv_timer_scheduler, spawn_periodic_transcode_cleanup,
     subscribe_system_lifecycle_commands,
 };
@@ -114,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind {address}"))?;
+    let _dlna_ssdp_task = spawn_dlna_ssdp_service(state.clone());
 
     tracing::info!(%address, "jellyrin listening");
     axum::serve(listener, router(state))
@@ -189,8 +191,12 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        _ = ctrl_c => {
+            publish_system_lifecycle_command(SystemLifecycleCommand::Shutdown);
+        },
+        _ = terminate => {
+            publish_system_lifecycle_command(SystemLifecycleCommand::Shutdown);
+        },
         command = lifecycle.recv() => {
             if let Ok(command) = command {
                 tracing::warn!(?command, "received system lifecycle command");
