@@ -3,7 +3,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const http = require('node:http');
-const { execFile } = require('node:child_process');
+const { execFile, spawnSync } = require('node:child_process');
 const { promisify } = require('node:util');
 const { chromium } = require('playwright');
 const execFileAsync = promisify(execFile);
@@ -339,6 +339,10 @@ async function captureTarget(browser, flowDir, target) {
       liveTvHdhrHlsActiveEncoding: false,
       liveTvHdhrHlsTranscodeUrl: false,
       liveTvHdhrHlsFfmpegReaped: false,
+      liveTvHdhrTimerRecordingCreated: false,
+      liveTvHdhrRecordingCompleted: false,
+      liveTvHdhrRecordingPlayable: false,
+      liveTvHdhrRecordingCleanup: false,
       startupPublicInfoIncomplete: false,
       startupConfig200: false,
       startupConfig204: false,
@@ -4104,6 +4108,271 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
     }
   }
 
+  // Recording block — POST a short timer, poll until Completed, ffprobe verify >=1 video packet.
+  // Runs for BOTH targets against the same simulator (upstreamComparable set).
+  // Jellyrin: record_channel_to_file copies bytes from the HDHomeRun simulator TS stream.
+  // upstream: DirectRecorder.RecordFromMediaSource copies bytes from the same sim TS stream.
+  // Both: the recording file must be a valid MPEG-2 TS with >=1 video packet.
+  //
+  // liveTvHdhrTimerRecordingCreated: POST /LiveTv/Timers returns 200 with an Id.
+  // liveTvHdhrRecordingCompleted: GET /LiveTv/Recordings (poll) finds Status=="Completed" for our channel.
+  // liveTvHdhrRecordingPlayable: download the recording bytes, run ffprobe, assert >=1 video packet.
+  // liveTvHdhrRecordingCleanup (jellyrin-only): /stats currentConcurrent===0 + DELETE 204 + absent.
+  {
+    const recordSecs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_SECS || '4', 10);
+    const pollTimeoutMs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_POLL_TIMEOUT_MS || '30000', 10);
+    const pollIntervalMs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_POLL_INTERVAL_MS || '1000', 10);
+
+    const recordStart = new Date();
+    const recordEnd = new Date(recordStart.getTime() + recordSecs * 1000);
+
+    // ServiceName is required by upstream Jellyfin's LiveTvManager.CreateTimer (GetService call).
+    // "Emby" is the service name for DefaultLiveTvService (the service that handles HDHomeRun timers).
+    // Jellyrin ignores this field (it doesn't route via service name).
+    const timerBody = {
+      ChannelId: hdhrChannel.Id,
+      Name: `Jellyrin HDHomeRun Recording Test ${Date.now()}`,
+      StartDate: recordStart.toISOString(),
+      EndDate: recordEnd.toISOString(),
+      PrePaddingSeconds: 0,
+      PostPaddingSeconds: 0,
+      Priority: 0,
+      IsPrePaddingRequired: false,
+      IsPostPaddingRequired: false,
+      KeepUntil: 'UntilDeleted',
+      RecordAnyTime: false,
+      RecordAnyChannel: false,
+      IsManual: true,
+      ServiceName: 'Emby',
+    };
+
+    const timerName = timerBody.Name;
+    const createTimer = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/LiveTv/Timers',
+      token: auth.AccessToken,
+      body: timerBody,
+    });
+    // Jellyrin returns 200 with timer body; upstream returns 204 with no body.
+    let timerId = createTimer.json?.Id || null;
+    if ([200, 204].includes(createTimer.status)) {
+      // If no Id in response (upstream 204), poll GET /LiveTv/Timers to find the newly created timer.
+      if (!timerId) {
+        const timersPollDeadline = Date.now() + 5000;
+        while (Date.now() < timersPollDeadline) {
+          const timersList = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/LiveTv/Timers',
+            token: auth.AccessToken,
+          });
+          if (timersList.status === 200 && Array.isArray(timersList.json?.Items)) {
+            const found = timersList.json.Items.find(
+              (t) => t.ChannelId === hdhrChannel.Id
+                || (typeof t.Name === 'string' && t.Name.includes('HDHomeRun Recording Test')),
+            );
+            if (found?.Id) { timerId = found.Id; break; }
+          }
+          await new Promise((resolve) => { setTimeout(resolve, 500); });
+        }
+      }
+      summary.invariants.liveTvHdhrTimerRecordingCreated = Boolean(timerId);
+
+      // Poll until a recording for our channel appears (or timeout).
+      // Jellyrin: recordings appear directly in GET /LiveTv/Recordings with Status="Completed".
+      // upstream: Jellyfin scans completed recordings into the library as Movie items with
+      //   Status=null (not "Completed"); we match by the unique timer name since ChannelId is
+      //   null in library items. upstream does NOT expose timer RecordingPath after the fact so
+      //   we must wait for library scan. To accelerate the scan we POST /Library/Refresh after
+      //   the recording window and then wait up to pollTimeoutMs for the named item to appear.
+      const pollDeadline = Date.now() + pollTimeoutMs;
+      let completedRecording = null;
+      let libraryScanTriggered = false;
+      const libraryScanAfterMs = (recordSecs + 2) * 1000; // trigger scan ~2s after recording window
+      const libraryScanAt = Date.now() + libraryScanAfterMs;
+
+      while (Date.now() < pollDeadline) {
+        // For upstream: trigger a library scan once the recording window is likely over.
+        // This is necessary because upstream's library scanner runs asynchronously;
+        // without an explicit trigger, new recordings may not appear within 30s.
+        if (!libraryScanTriggered && Date.now() >= libraryScanAt) {
+          libraryScanTriggered = true;
+          await browserFetchJson(page, {
+            method: 'POST',
+            url: '/Library/Refresh',
+            token: auth.AccessToken,
+          }).catch(() => {});
+        }
+
+        const recordings = await browserFetchJson(page, {
+          method: 'GET',
+          url: '/LiveTv/Recordings',
+          token: auth.AccessToken,
+        });
+        if (recordings.status === 200 && Array.isArray(recordings.json?.Items)) {
+          // Primary: Status=="Completed" with channel or name match (Jellyrin path).
+          completedRecording = recordings.json.Items.find(
+            (r) => r.Status === 'Completed'
+              && (r.ChannelId === hdhrChannel.Id
+                || (typeof r.Name === 'string' && r.Name === timerName)),
+          ) || null;
+          // Secondary: name match for upstream library items (Status=null, not "InProgress").
+          // upstream completed recordings are Movie items with Status=null and RunTimeTicks>0.
+          // Exclude InProgress (Jellyrin) and any item that is explicitly not yet done.
+          if (!completedRecording) {
+            completedRecording = recordings.json.Items.find(
+              (r) => typeof r.Name === 'string'
+                && r.Name === timerName
+                && r.Status !== 'InProgress'
+                && r.RunTimeTicks != null
+                && r.RunTimeTicks > 0,
+            ) || null;
+          }
+          if (completedRecording) break;
+        }
+        // Also check timer status (works before library scan on upstream).
+        if (timerId && !completedRecording) {
+          const timerStatus = await browserFetchJson(page, {
+            method: 'GET',
+            url: `/LiveTv/Timers/${encodeURIComponent(timerId)}`,
+            token: auth.AccessToken,
+          });
+          if (timerStatus.status === 200 && timerStatus.json?.Status === 'Completed') {
+            // Timer completed but recording not yet in library — treat as recorded (upstream path).
+            // We'll use the timer's RecordingPath to verify bytes.
+            completedRecording = { Id: timerStatus.json.Id, Status: 'Completed', _timerData: timerStatus.json };
+            break;
+          }
+        }
+        if (Date.now() + pollIntervalMs < pollDeadline) {
+          await new Promise((resolve) => { setTimeout(resolve, pollIntervalMs); });
+        } else {
+          break;
+        }
+      }
+
+      if (completedRecording) {
+        summary.invariants.liveTvHdhrRecordingCompleted = true;
+
+        // Download the recording and run ffprobe to verify >=1 video packet.
+        // Jellyrin: GET /LiveTv/LiveRecordings/{id}/stream serves the completed recording file.
+        // upstream: the recording Item is a media item; GET /Items/{id}/Download or PlaybackInfo
+        //   gives the stream URL. For simplicity we try the LiveRecordings stream path first
+        //   (upstream may return 404 for Completed; fallback to /Videos/{id}/stream).
+        const recId = completedRecording.Id;
+        const ffprobeBin = process.env.FFPROBE_BIN || '/usr/bin/ffprobe';
+        const altFfprobeBin = '/usr/lib/jellyfin-ffmpeg/ffprobe';
+
+        // Download recording bytes using Playwright's page.request API (proven to work with auth).
+        // Try multiple stream paths: LiveRecordings (Jellyrin completed + InProgress),
+        // Videos stream (upstream completed recordings served as library items).
+        const tmpRecFile = `/tmp/jellyrin-recording-probe-${target.name}-${Date.now()}.ts`;
+        let downloadOk = false;
+
+        // Jellyrin: /LiveTv/LiveRecordings/{id}/stream serves both InProgress and Completed recordings.
+        // upstream: /LiveTv/LiveRecordings/{id}/stream only serves InProgress (active) recordings;
+        //   Completed recordings are library items served via /Videos/{id}/stream or /Items/{id}/Download.
+        const streamPaths = [
+          `/LiveTv/LiveRecordings/${encodeURIComponent(recId)}/stream`,
+          `/Videos/${encodeURIComponent(recId)}/stream`,
+          `/Items/${encodeURIComponent(recId)}/Download`,
+        ];
+        for (const streamPath of streamPaths) {
+          try {
+            const resp = await page.request.get(`${summary.baseUrl}${streamPath}`, {
+              headers: { 'X-Emby-Token': auth.AccessToken },
+            });
+            if (resp.ok()) {
+              const bodyBuf = await resp.body();
+              if (bodyBuf && bodyBuf.length > 0) {
+                const { writeFileSync } = require('node:fs');
+                writeFileSync(tmpRecFile, bodyBuf);
+                downloadOk = true;
+                break;
+              }
+            }
+          } catch (_) {
+            // Try next path.
+          }
+        }
+
+        if (downloadOk) {
+          // Run ffprobe to count video packets: assert >=1 packet.
+          // ffprobe uses single-dash flags; -version (not --version) exits 0 on success.
+          const actualFfprobe = (() => {
+            try {
+              const { status: s } = spawnSync(ffprobeBin, ['-version'], { stdio: 'ignore' });
+              if (s === 0) return ffprobeBin;
+            } catch (_) { /* ignore */ }
+            try {
+              const { status: s } = spawnSync(altFfprobeBin, ['-version'], { stdio: 'ignore' });
+              if (s === 0) return altFfprobeBin;
+            } catch (_) { /* ignore */ }
+            return null;
+          })();
+
+          if (actualFfprobe) {
+            const probeResult = spawnSync(actualFfprobe, [
+              '-v', 'error',
+              '-show_packets',
+              '-select_streams', 'v',
+              '-read_intervals', '%+#1',
+              tmpRecFile,
+            ], { encoding: 'utf8', timeout: 10000 });
+            const probeOutput = (probeResult.stdout || '') + (probeResult.stderr || '');
+            const hasVideoPacket = probeOutput.includes('[PACKET]') || probeOutput.includes('codec_type=video');
+            if (hasVideoPacket) {
+              summary.invariants.liveTvHdhrRecordingPlayable = true;
+            }
+          }
+
+          // Clean up tmp file.
+          try { require('node:fs').unlinkSync(tmpRecFile); } catch (_) { /* ignore */ }
+        }
+
+        // Jellyrin-only cleanup: /stats currentConcurrent===0 + DELETE recording 204 + absent.
+        if (target.name === 'jellyrin' && hdhrSimUrl) {
+          const guideNumber = (
+            hdhrChannel.ChannelNumber
+            || (typeof hdhrChannel.Id === 'string' ? hdhrChannel.Id.replace(/^hdhr_/, '') : '')
+          );
+          const simChannelPath = `/auto/v${guideNumber}`;
+
+          // Poll /stats until currentConcurrent===0 (no orphan connections from recording).
+          const statsDeadline = Date.now() + 5000;
+          let statsOk = false;
+          while (Date.now() < statsDeadline) {
+            const stats = await nodeHttpJson('GET', `${hdhrSimUrl}/stats`).catch(() => null);
+            const current = stats?.json?.currentConcurrentByChannel?.[simChannelPath] ?? -1;
+            if (current === 0) { statsOk = true; break; }
+            await new Promise((resolve) => { setTimeout(resolve, 200); });
+          }
+
+          // DELETE recording.
+          const deleteRec = await browserFetchJson(page, {
+            method: 'DELETE',
+            url: `/LiveTv/Recordings/${encodeURIComponent(recId)}`,
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0 }));
+
+          // Verify recording is absent.
+          const afterDelete = await browserFetchJson(page, {
+            method: 'GET',
+            url: '/LiveTv/Recordings',
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          const stillPresent = Array.isArray(afterDelete.json?.Items)
+            && afterDelete.json.Items.some((r) => r.Id === recId);
+
+          summary.invariants.liveTvHdhrRecordingCleanup = (
+            statsOk
+            && [200, 204].includes(deleteRec.status)
+            && !stillPresent
+          );
+        }
+      }
+    }
+  }
+
   // Clean up the simulator tuner host so no residual HDHomeRun config is left
   // behind on either target (the simulator URL is gone after this run).
   await browserFetchJson(page, {
@@ -5454,6 +5723,38 @@ function nodeHttpJson(method, absoluteUrl, body) {
     });
     req.on('error', () => resolve({ status: 0, json: null }));
     if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// Download the body of an authenticated HTTP GET request to a local file.
+// Used to save recording files for ffprobe analysis.
+// Returns { ok: boolean, bytes: number } where ok is true when status 200 and bytes > 0.
+function nodeHttpBinary(method, absoluteUrl, token, destFile) {
+  const fsSync = require('node:fs');
+  return new Promise((resolve) => {
+    const parsed = new URL(absoluteUrl);
+    const options = {
+      hostname: parsed.hostname,
+      port: parseInt(parsed.port, 10) || 80,
+      path: parsed.pathname + parsed.search,
+      method,
+      headers: token ? { 'X-Emby-Token': token } : {},
+    };
+    const req = http.request(options, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        resolve({ ok: false, bytes: 0 });
+        return;
+      }
+      const out = fsSync.createWriteStream(destFile);
+      let bytes = 0;
+      res.on('data', (chunk) => { bytes += chunk.length; out.write(chunk); });
+      res.on('end', () => { out.end(); resolve({ ok: true, bytes }); });
+      res.on('error', () => { out.destroy(); resolve({ ok: false, bytes }); });
+    });
+    req.on('error', () => resolve({ ok: false, bytes: 0 }));
+    req.setTimeout(15000, () => { req.destroy(); resolve({ ok: false, bytes: 0 }); });
     req.end();
   });
 }

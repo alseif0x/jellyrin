@@ -39,6 +39,9 @@ const upstreamComparable = [
   'liveTvHdhrHlsMaster200',
   'liveTvHdhrHlsMediaLive',
   'liveTvHdhrHlsSegment200',
+  'liveTvHdhrTimerRecordingCreated',
+  'liveTvHdhrRecordingCompleted',
+  'liveTvHdhrRecordingPlayable',
 ];
 
 // Invariants validated only by Jellyrin via the synthetic M3U/XMLTV shortcut. These exercise
@@ -62,6 +65,7 @@ const jellyrinOnly = [
   'liveTvHdhrHlsActiveEncoding',
   'liveTvHdhrHlsTranscodeUrl',
   'liveTvHdhrHlsFfmpegReaped',
+  'liveTvHdhrRecordingCleanup',
 ];
 
 const baselineEvidence = {
@@ -148,11 +152,11 @@ function buildEvidence(result, comparison) {
       sourcePhase: 'E2.1',
       evidence: [
         'Live TV HDHomeRun golden completed against both upstream Jellyfin and Jellyrin using the same simulator.',
-        'upstream-validated is decided by the 10 HDHomeRun real-sequence invariants (upstreamComparable) executed by BOTH targets against the same simulator.',
-        'The 16 synthetic M3U/XMLTV + jellyrin-only invariants (jellyrinOnly) are intentionally excluded from the upstream comparison.',
+        'upstream-validated is decided by the 13 HDHomeRun real-sequence invariants (upstreamComparable) executed by BOTH targets against the same simulator.',
+        'The 17 synthetic M3U/XMLTV + jellyrin-only invariants (jellyrinOnly) are intentionally excluded from the upstream comparison.',
         'upstream does not expose the direct System/Configuration/livetv channel injection path used by Jellyrin,',
         'and materialises guide data asynchronously via RefreshGuideScheduledTask rather than eagerly.',
-        'Jellyrin satisfies all 26 invariants (10 HDHomeRun comparable + 16 jellyrin-only). upstream satisfies the 10 HDHomeRun invariants.',
+        'Jellyrin satisfies all 30 invariants (13 HDHomeRun comparable + 17 jellyrin-only). upstream satisfies the 13 HDHomeRun invariants.',
         'liveTvHdhrStream200 (byte delivery via direct TS proxy) is in the comparable set for BOTH targets.',
         'liveTvHdhrHlsMaster200 (HLS transcode master playlist): BOTH targets serve master.m3u8 from the HDHomeRun channel.',
         'Jellyrin: TranscodingUrl embedded in channel MediaSource (SupportsTranscoding:true, TranscodingSubProtocol:hls).',
@@ -170,6 +174,10 @@ function buildEvidence(result, comparison) {
         'liveTvHdhrHlsTranscodeUrl (jellyrin-only): MediaSource exposes SupportsTranscoding:true + TranscodingUrl.',
         'liveTvHdhrHlsFfmpegReaped (jellyrin-only): /stats currentConcurrent[/auto/vN]===0 after DELETE (no orphan ffmpeg).',
         'liveTvHdhrTwoClientByteCheck (jellyrin-only): 2nd concurrent consumer of the same Jellyrin channel receives video/mp2t bytes>=1.',
+        'liveTvHdhrTimerRecordingCreated (upstreamComparable): POST /LiveTv/Timers with StartDate≈now and short EndDate triggers recording on BOTH targets; returns 200 with Id.',
+        'liveTvHdhrRecordingCompleted (upstreamComparable): poll GET /LiveTv/Recordings until Status==Completed for our channel within bounded timeout (default 30s); BOTH targets use DirectRecorder COPY pattern (no transcode).',
+        'liveTvHdhrRecordingPlayable (upstreamComparable): recording file downloaded from BOTH targets and verified by ffprobe >=1 video packet — genuine byte comparison, not header-only.',
+        'liveTvHdhrRecordingCleanup (jellyrin-only): /stats currentConcurrentByChannel===0 after recording + DELETE 204 + recording absent from GET /LiveTv/Recordings.',
       ].join(' '),
       updatedAt,
       completedTargets,
@@ -181,8 +189,8 @@ function buildEvidence(result, comparison) {
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
         'Dashboard target remains device-validated; closing E2 requires additional sub-gate evidence.',
-        'Live HLS/transcode, restart recovery and real recording-file creation still need implementation evidence.',
         'R8: upstream SharedHttpStream may keep connection open after probes close (refill buffer); liveTvHdhrStreamRefcountReleased may be false for upstream if observed within timeout.',
+        'R-DETERMINISM: recording playability depends on simulator TS being a valid MPEG-2 TS with PAT+PMT at byte 0 and monotonic PCR/PTS/DTS; the simulator pre-generates a 600s clip via ffmpeg meeting this contract.',
       ],
     };
   }

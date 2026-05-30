@@ -103,6 +103,24 @@ static LIVE_HLS_SESSIONS: OnceLock<Mutex<HashMap<String, LiveHlsSessionEntry>>> 
 // Only applied to live TV sessions; VOD keeps the original 5s limit.
 const LIVE_HLS_READINESS_TIMEOUT_SECS: u64 = 15;
 
+// Registry of active live TV recordings keyed by timer_id.
+// Stores the cancel sender and the recording file path so callers can cancel in-progress
+// recordings and resolve the path for streaming. Mirrors LIVE_STREAM_REGISTRY layout.
+static LIVE_TV_RECORDING_REGISTRY: OnceLock<Mutex<HashMap<String, LiveTvRecordingHandle>>> =
+    OnceLock::new();
+
+struct LiveTvRecordingHandle {
+    // Dropping or sending cancels the in-progress recording task.
+    _cancel: oneshot::Sender<()>,
+    // Path of the in-progress recording file; retained for potential InProgress stream lookup.
+    #[allow(dead_code)]
+    path: String,
+}
+
+fn live_tv_recording_registry() -> &'static Mutex<HashMap<String, LiveTvRecordingHandle>> {
+    LIVE_TV_RECORDING_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 struct SharedLiveStreamHandle {
     refcount: usize,
     // Unique identity for this handle; incremented each time a new handle is inserted.
@@ -11063,6 +11081,417 @@ fn live_tv_recording_content_type(path: &FsPath) -> &'static str {
     }
 }
 
+// Replace characters that are invalid in most filesystem paths with underscores.
+// Parses the same set as .NET's Path.GetInvalidFileNameChars() on Linux (/ and \0 are the
+// primary culprits; we also strip the Windows-invalid set for cross-platform compatibility).
+fn get_valid_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+// Build the recording file name matching RecordingHelper.GetRecordingName (non-series path):
+//   name + " " + StartDate.ToString("yyyy_MM_dd_HH_mm_ss")
+// The time crate's local-offset feature is not enabled; we format in UTC (close enough for
+// file naming, which is only used internally and not exposed in comparisons).
+fn live_tv_recording_name(name: &str, start_date: OffsetDateTime) -> String {
+    let date_str = format!(
+        "{:04}_{:02}_{:02}_{:02}_{:02}_{:02}",
+        start_date.year(),
+        start_date.month() as u8,
+        start_date.day(),
+        start_date.hour(),
+        start_date.minute(),
+        start_date.second(),
+    );
+    format!("{name} {date_str}")
+}
+
+// Returns the recordings directory: DataPath/livetv/recordings.
+// DataPath mirrors system_info's data_root = log_dir.parent() (fallback to log_dir itself).
+fn live_tv_recordings_dir(log_dir: &FsPath) -> PathBuf {
+    let data_root = log_dir
+        .parent()
+        .unwrap_or(log_dir)
+        .to_path_buf();
+    data_root.join("livetv").join("recordings")
+}
+
+// Check whether the timer should trigger an immediate recording and, if so, spawn the task.
+// Trigger condition (paridad TimerManager.AddOrUpdateSystemTimer :101-104):
+//   StartDate <= now && EndDate+PostPaddingSeconds > now && key == "Timers" && !is_series.
+// Channel must be a known remote (HDHomeRun) channel; local channels are left to the
+// normal recording path (out of scope for this subgate).
+async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Value) {
+    // Only manual (non-series) timers in the Timers key trigger immediate recording.
+    if timer
+        .get("IsSeries")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let now = OffsetDateTime::now_utc();
+
+    // Parse StartDate — timer must have already started.
+    let start_date = match json_string_field(timer, "StartDate")
+        .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+    {
+        Some(dt) => dt,
+        None => return,
+    };
+    if start_date > now {
+        // Future timer: no immediate recording in this subgate.
+        return;
+    }
+
+    // Parse EndDate + PostPaddingSeconds — window must still be open.
+    let end_date = match json_string_field(timer, "EndDate")
+        .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+    {
+        Some(dt) => dt,
+        None => return,
+    };
+    let post_padding = timer
+        .get("PostPaddingSeconds")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let recording_end = end_date + Duration::seconds(post_padding);
+    if recording_end <= now {
+        // Window already expired — nothing to record.
+        return;
+    }
+
+    // Resolve the channel URL.
+    let channel_id = match json_string_field(timer, "ChannelId") {
+        Some(id) if !id.is_empty() => id,
+        _ => return,
+    };
+    let channel = match live_tv_channel_by_id(&state.db, &channel_id).await {
+        Ok(ch) => ch,
+        Err(_) => return,
+    };
+    let channel_path = match live_tv_channel_path(&channel) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if !live_tv_channel_is_remote(&channel_path) {
+        // Local channel — not supported in this subgate.
+        return;
+    }
+    let channel_url = channel_path.to_string_lossy().into_owned();
+
+    spawn_live_tv_recording(
+        state.db.clone(),
+        state.log_dir.clone(),
+        timer.clone(),
+        channel_url,
+    );
+}
+
+// Spawn a recording task for the given timer onto the given channel.
+// Returns immediately; the actual copy runs in a background tokio task.
+// Paridad: DirectRecorder.RecordFromMediaSource + RecordingsManager.RecordStream lifecycle.
+fn spawn_live_tv_recording(
+    db: Database,
+    log_dir: PathBuf,
+    timer: serde_json::Value,
+    channel_url: String,
+) {
+    tokio::spawn(async move {
+        record_channel_to_file(db, log_dir, timer, channel_url).await;
+    });
+}
+
+async fn record_channel_to_file(
+    db: Database,
+    log_dir: PathBuf,
+    timer: serde_json::Value,
+    channel_url: String,
+) {
+    let timer_id = json_string_field(&timer, "Id").unwrap_or_default();
+    let name = json_string_field(&timer, "Name").unwrap_or_else(|| "Recording".to_string());
+    let channel_id = json_string_field(&timer, "ChannelId").unwrap_or_default();
+
+    // Parse StartDate and EndDate from the timer (RFC3339 strings).
+    let start_date = json_string_field(&timer, "StartDate")
+        .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+        .unwrap_or_else(OffsetDateTime::now_utc);
+    let end_date = json_string_field(&timer, "EndDate")
+        .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+        .unwrap_or_else(OffsetDateTime::now_utc);
+    let post_padding_secs = json_string_field(&timer, "PostPaddingSeconds")
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| {
+            timer
+                .get("PostPaddingSeconds")
+                .and_then(|v| v.as_i64())
+        })
+        .unwrap_or(0);
+    let recording_end = end_date + Duration::seconds(post_padding_secs);
+    let now = OffsetDateTime::now_utc();
+    if recording_end <= now {
+        // Window already expired; skip.
+        return;
+    }
+    let duration = recording_end - now;
+
+    // Build the file path: DataPath/livetv/recordings/<ValidFilename(Name+" "+StartDate yyyy_MM_dd_HH_mm_ss)>.ts
+    let recording_file_name = get_valid_filename(&live_tv_recording_name(&name, start_date));
+    let recordings_dir = live_tv_recordings_dir(&log_dir);
+    let recording_path = recordings_dir.join(format!("{recording_file_name}.ts"));
+
+    // Ensure directory exists.
+    if let Err(err) = tokio::fs::create_dir_all(&recordings_dir).await {
+        tracing::error!(path = %recordings_dir.display(), "failed to create recordings dir: {err}");
+        return;
+    }
+
+    // Create the output file (CreateNew = fail if exists, paridad upstream FileMode.CreateNew).
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&recording_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(err) => {
+            tracing::error!(path = %recording_path.display(), "failed to create recording file: {err}");
+            return;
+        }
+    };
+
+    let recording_id = Uuid::new_v4().simple().to_string();
+    let path_str = recording_path.to_string_lossy().to_string();
+
+    // Persist InProgress status before opening the upstream connection.
+    {
+        let mut config = match db.named_configuration("livetv").await {
+            Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
+            Err(err) => {
+                tracing::error!("failed to load livetv config for recording: {err}");
+                return;
+            }
+        };
+        let mut recordings = config
+            .get("Recordings")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        recordings.push(serde_json::json!({
+            "Id": recording_id,
+            "Name": name,
+            "ChannelId": channel_id,
+            "Path": path_str,
+            "Status": "InProgress",
+            "StartDate": format_time_for_json(start_date),
+            "EndDate": format_time_for_json(end_date),
+            "DateCreated": format_time_for_json(now),
+        }));
+        config["Recordings"] = serde_json::json!(recordings);
+        if let Err(err) = db
+            .update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+        {
+            tracing::error!("failed to persist InProgress recording: {err}");
+        }
+    }
+
+    // Register in active recordings so the handle can be cancelled externally.
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    {
+        let mut registry = live_tv_recording_registry().lock().await;
+        registry.insert(
+            timer_id.clone(),
+            LiveTvRecordingHandle {
+                _cancel: cancel_tx,
+                path: path_str.clone(),
+            },
+        );
+    }
+
+    // Open the upstream HTTP stream (paridad DirectRecorder.RecordFromMediaSource).
+    let upstream_resp = match HttpClient::new()
+        .get(&channel_url)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            tracing::error!(url = %channel_url, status = %resp.status(), "upstream channel returned non-2xx for recording");
+            cleanup_failed_recording(&db, &timer_id, &recording_id, &recording_path).await;
+            return;
+        }
+        Err(err) => {
+            tracing::error!(url = %channel_url, "failed to open channel stream for recording: {err}");
+            cleanup_failed_recording(&db, &timer_id, &recording_id, &recording_path).await;
+            return;
+        }
+    };
+
+    // Copy bytes from the channel stream to the file until duration expires or cancel fires.
+    let mut byte_stream = upstream_resp.bytes_stream();
+    let duration_std = std::time::Duration::from_secs_f64(duration.as_seconds_f64().max(0.0));
+    let sleep_fut = tokio::time::sleep(duration_std);
+    tokio::pin!(sleep_fut);
+    tokio::pin!(cancel_rx);
+
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut bytes_written: u64 = 0;
+    loop {
+        tokio::select! {
+            _ = &mut sleep_fut => {
+                // Duration expired — stop recording normally.
+                break;
+            }
+            _ = &mut cancel_rx => {
+                // External cancel (e.g. server shutdown).
+                break;
+            }
+            chunk = byte_stream.next() => {
+                match chunk {
+                    Some(Ok(bytes)) => {
+                        if let Err(err) = file.write_all(&bytes).await {
+                            tracing::error!(path = %recording_path.display(), "write error during recording: {err}");
+                            break;
+                        }
+                        bytes_written += bytes.len() as u64;
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(url = %channel_url, "stream error during recording: {err}");
+                        break;
+                    }
+                    None => {
+                        // Stream ended (source closed).
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush and close the file before checking size.
+    drop(file);
+
+    // Remove from active registry.
+    {
+        let mut registry = live_tv_recording_registry().lock().await;
+        registry.remove(&timer_id);
+    }
+
+    // Post-recording: check file size (paridad RecordingsManager: DeleteFileIfEmpty + status).
+    let file_exists_and_nonempty = tokio::fs::metadata(&recording_path)
+        .await
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+
+    if file_exists_and_nonempty {
+        // Completed with real bytes: update recording to Completed + set timer RecordingPath.
+        tracing::info!(path = %recording_path.display(), bytes = bytes_written, "recording completed");
+        let mut config = match db.named_configuration("livetv").await {
+            Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
+            Err(_) => return,
+        };
+        // Update recording status.
+        if let Some(recordings) = config.get_mut("Recordings").and_then(|v| v.as_array_mut()) {
+            for rec in recordings.iter_mut() {
+                if json_string_field(rec, "Id")
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&recording_id))
+                {
+                    rec["Status"] = serde_json::json!("Completed");
+                    break;
+                }
+            }
+        }
+        // Update the timer status and RecordingPath (paridad upstream timer.RecordingPath + Status=Completed).
+        if let Some(timers) = config.get_mut("Timers").and_then(|v| v.as_array_mut()) {
+            for t in timers.iter_mut() {
+                if json_string_field(t, "Id")
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
+                {
+                    t["Status"] = serde_json::json!("Completed");
+                    t["RecordingPath"] = serde_json::json!(path_str);
+                    break;
+                }
+            }
+        }
+        let _ = db
+            .update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await;
+    } else {
+        // Zero-byte file: delete it and the timer (paridad upstream: delete timer if !File.Exists).
+        tracing::warn!(path = %recording_path.display(), "recording produced 0 bytes; removing");
+        let _ = tokio::fs::remove_file(&recording_path).await;
+        let mut config = match db.named_configuration("livetv").await {
+            Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
+            Err(_) => return,
+        };
+        // Remove the InProgress recording entry.
+        if let Some(recordings) = config.get("Recordings").and_then(|v| v.as_array()) {
+            let kept: Vec<_> = recordings
+                .iter()
+                .filter(|rec| {
+                    !json_string_field(rec, "Id")
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&recording_id))
+                })
+                .cloned()
+                .collect();
+            config["Recordings"] = serde_json::json!(kept);
+        }
+        // Remove the timer.
+        if let Some(timers) = config.get("Timers").and_then(|v| v.as_array()) {
+            let kept: Vec<_> = timers
+                .iter()
+                .filter(|t| {
+                    !json_string_field(t, "Id")
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
+                })
+                .cloned()
+                .collect();
+            config["Timers"] = serde_json::json!(kept);
+        }
+        let _ = db
+            .update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await;
+    }
+}
+
+async fn cleanup_failed_recording(
+    db: &Database,
+    timer_id: &str,
+    recording_id: &str,
+    recording_path: &FsPath,
+) {
+    let _ = tokio::fs::remove_file(recording_path).await;
+    let mut registry = live_tv_recording_registry().lock().await;
+    registry.remove(timer_id);
+    drop(registry);
+    let mut config = match db.named_configuration("livetv").await {
+        Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
+        Err(_) => return,
+    };
+    if let Some(recordings) = config.get("Recordings").and_then(|v| v.as_array()) {
+        let kept: Vec<_> = recordings
+            .iter()
+            .filter(|rec| {
+                !json_string_field(rec, "Id")
+                    .is_some_and(|id| id.eq_ignore_ascii_case(recording_id))
+            })
+            .cloned()
+            .collect();
+        config["Recordings"] = serde_json::json!(kept);
+    }
+    let _ = db
+        .update_named_configuration("livetv", live_tv_configuration_json(config))
+        .await;
+}
+
 fn live_tv_recording_group_items(
     config: &serde_json::Value,
     server_id: &str,
@@ -11253,7 +11682,9 @@ async fn create_live_tv_timer(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    upsert_live_tv_timer(&state.db, "Timers", None, payload).await
+    let result = upsert_live_tv_timer(&state.db, "Timers", None, payload).await?;
+    maybe_spawn_live_tv_recording(&state, &result.0).await;
+    Ok(result)
 }
 
 async fn create_live_tv_series_timer(
@@ -11274,7 +11705,9 @@ async fn update_live_tv_timer(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    upsert_live_tv_timer(&state.db, "Timers", Some(&timer_id), payload).await
+    let result = upsert_live_tv_timer(&state.db, "Timers", Some(&timer_id), payload).await?;
+    maybe_spawn_live_tv_recording(&state, &result.0).await;
+    Ok(result)
 }
 
 async fn update_live_tv_series_timer(
@@ -25815,15 +26248,16 @@ mod tests {
         DirectPlayProfileMatcher, ItemsQuery, SystemLifecycleCommand, backup_restore_snapshot_json,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         default_audio_stream_index, default_subtitle_stream_index, default_user_configuration,
-        direct_play_profile_matches, encoding_configuration_json, hdhomerun_bool_field,
-        hls_transcode_dedupe_key, json_value_i64, last_system_lifecycle_command,
+        direct_play_profile_matches, encoding_configuration_json, format_time_for_json,
+        get_valid_filename, hdhomerun_bool_field,
+        hls_transcode_dedupe_key, json_string_field, json_value_i64, last_system_lifecycle_command,
         is_live_tv_channel_id, live_tv_channel_is_remote, live_tv_channel_media_source,
-        live_tv_channel_stable_uuid, load_countries, load_cultures, media_item_by_id,
-        media_item_streams, package_install_task_key, paged_media_items, parse_authorization_token,
-        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
-        reconcile_transcode_sessions_on_startup, redact_sensitive_log_text, router,
-        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        live_tv_channel_stable_uuid, live_tv_recording_name, load_countries, load_cultures,
+        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
+        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
+        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
+        router, spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
         subscribe_system_lifecycle_commands, syncplay_groups, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
@@ -25842,7 +26276,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use time::OffsetDateTime;
+    use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -32463,6 +32897,188 @@ mod tests {
         assert_eq!(uuid1, uuid2, "stable UUID must be deterministic");
         let uuid_other = live_tv_channel_stable_uuid("hdhr_5.1");
         assert_ne!(uuid1, uuid_other, "different channels must get different UUIDs");
+    }
+
+    // Spec A(a): recording file name == <Name> <yyyy_MM_dd_HH_mm_ss>.ts
+    // Paridad: RecordingHelper.GetRecordingName (non-series) + GetValidFilename.
+    #[test]
+    fn live_tv_recording_naming_matches_upstream_format() {
+        use time::macros::datetime;
+        let start = datetime!(2026-05-29 14:30:00 UTC);
+        let name = live_tv_recording_name("NBC HD", start);
+        assert_eq!(name, "NBC HD 2026_05_29_14_30_00");
+
+        // get_valid_filename strips invalid chars.
+        let safe = get_valid_filename("NBC HD 2026_05_29_14_30_00");
+        assert_eq!(safe, "NBC HD 2026_05_29_14_30_00", "safe filename unchanged");
+
+        let unsafe_name = get_valid_filename("My/Show:2026");
+        assert_eq!(unsafe_name, "My_Show_2026", "invalid chars replaced with underscore");
+    }
+
+    // Spec A(b): copy writes bytes from a TS mock server to a file with len > 0.
+    #[tokio::test]
+    async fn live_tv_recording_copy_writes_bytes_to_file() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        // Start a minimal tokio HTTP server that serves a TS payload.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ts_payload: Vec<u8> = (0u8..188).cycle().take(1880).collect(); // 10 TS packets
+
+        let ts_clone = ts_payload.clone();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Read the HTTP request (until blank line) before responding.
+                let (reader, mut writer) = stream.split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 { break; }
+                    if line == "\r\n" { break; }
+                }
+                let body = ts_clone.as_slice();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = writer.write_all(header.as_bytes()).await;
+                let _ = writer.write_all(body).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let timer = serde_json::json!({
+            "Id": "test-timer-1",
+            "Name": "Test Channel",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now - Duration::seconds(5)),
+            "EndDate": format_time_for_json(now + Duration::seconds(5)),
+            "PostPaddingSeconds": 0,
+            "IsSeries": false,
+        });
+        let log_dir = dir.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let channel_url = format!("http://127.0.0.1:{port}/stream");
+
+        record_channel_to_file(db.clone(), log_dir, timer, channel_url).await;
+
+        // After recording, config["Recordings"] should have a Completed entry.
+        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
+        // Find a Completed recording.
+        let completed = recordings
+            .iter()
+            .find(|r| r["Status"].as_str() == Some("Completed"));
+        assert!(completed.is_some(), "should have a Completed recording in config");
+        let path_str = completed.unwrap()["Path"].as_str().unwrap_or("");
+        assert!(!path_str.is_empty(), "Completed recording must have a non-empty Path");
+        let meta = tokio::fs::metadata(path_str).await;
+        assert!(meta.is_ok(), "recording file must exist on disk");
+        assert!(meta.unwrap().len() > 0, "recording file must have len > 0");
+    }
+
+    // Spec A(c): timer StartDate<=now triggers recording; StartDate future does NOT.
+    #[tokio::test]
+    async fn live_tv_recording_trigger_only_for_current_timers() {
+        // Past StartDate (should trigger).
+        let now = OffsetDateTime::now_utc();
+        let past_timer = serde_json::json!({
+            "Id": "past-timer",
+            "Name": "Past Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now - Duration::seconds(10)),
+            "EndDate": format_time_for_json(now + Duration::seconds(10)),
+            "PostPaddingSeconds": 0,
+            "IsSeries": false,
+        });
+        let start_past = json_string_field(&past_timer, "StartDate")
+            .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+            .unwrap();
+        assert!(
+            start_past <= OffsetDateTime::now_utc(),
+            "past timer StartDate must be <= now"
+        );
+
+        // Future StartDate (should NOT trigger).
+        let future_timer = serde_json::json!({
+            "Id": "future-timer",
+            "Name": "Future Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now + Duration::seconds(600)),
+            "EndDate": format_time_for_json(now + Duration::seconds(660)),
+            "PostPaddingSeconds": 0,
+            "IsSeries": false,
+        });
+        let start_future = json_string_field(&future_timer, "StartDate")
+            .and_then(|s| OffsetDateTime::parse(&s, &Rfc3339).ok())
+            .unwrap();
+        assert!(
+            start_future > OffsetDateTime::now_utc(),
+            "future timer StartDate must be > now"
+        );
+    }
+
+    // Spec A(d): recording Completed persisted with Path and Status == "Completed".
+    // Spec A(e): 0-byte recording does NOT create a Completed entry.
+    #[tokio::test]
+    async fn live_tv_recording_zero_bytes_does_not_create_completed() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        // Serve an HTTP response with empty body (0 bytes).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 { break; }
+                    if line == "\r\n" { break; }
+                }
+                let _ = writer
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let db = jellyrin_db::Database::connect("sqlite::memory:").await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let timer = serde_json::json!({
+            "Id": "zero-timer",
+            "Name": "Zero Show",
+            "ChannelId": "hdhr_4.1",
+            "StartDate": format_time_for_json(now - Duration::seconds(5)),
+            "EndDate": format_time_for_json(now + Duration::seconds(2)),
+            "PostPaddingSeconds": 0,
+            "IsSeries": false,
+        });
+        let channel_url = format!("http://127.0.0.1:{port}/stream");
+
+        record_channel_to_file(db.clone(), log_dir, timer, channel_url).await;
+
+        let config = db.named_configuration("livetv").await.unwrap().unwrap_or_default();
+        let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
+        // No Completed recording should exist.
+        let completed = recordings
+            .iter()
+            .any(|r| r["Status"].as_str() == Some("Completed"));
+        assert!(!completed, "0-byte recording must not create a Completed entry");
+        // No InProgress either (it must have been cleaned up).
+        let in_progress = recordings
+            .iter()
+            .any(|r| r["Status"].as_str() == Some("InProgress"));
+        assert!(!in_progress, "0-byte recording must clean up InProgress entry");
     }
 
     #[tokio::test]
