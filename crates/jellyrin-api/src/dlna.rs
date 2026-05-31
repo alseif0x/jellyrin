@@ -146,8 +146,9 @@ pub(crate) async fn connection_manager_control(
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
     let request = String::from_utf8_lossy(&body);
-    let action =
-        soap_action(&request).ok_or_else(|| ApiError::bad_request("Invalid SOAP action"))?;
+    let Some(action) = soap_action(&request) else {
+        return Ok(soap_fault_response(401, "Invalid Action"));
+    };
     let body = match action.as_str() {
         "getprotocolinfo" => format!(
             "<Source>{}</Source><Sink></Sink>",
@@ -165,9 +166,7 @@ pub(crate) async fn connection_manager_control(
         )
         .to_string(),
         _ => {
-            return Err(ApiError::not_found(
-                "Unsupported ConnectionManager SOAP action",
-            ));
+            return Ok(soap_fault_response(401, "Invalid Action"));
         }
     };
     Ok(soap_response(
@@ -186,21 +185,26 @@ pub(crate) async fn content_directory_control(
     let context = dlna_context(&state, &server_id).await?;
     let server_address = request_server_address(&headers, &state);
     let request = String::from_utf8_lossy(&body);
-    let action =
-        soap_action(&request).ok_or_else(|| ApiError::bad_request("Invalid SOAP action"))?;
+    let Some(action) = soap_action(&request) else {
+        return Ok(soap_fault_response(401, "Invalid Action"));
+    };
     let response_body = match action.as_str() {
         "getsearchcapabilities" => "<SearchCaps></SearchCaps>".to_string(),
         "getsortcapabilities" => "<SortCaps>dc:title</SortCaps>".to_string(),
         "getsystemupdateid" => "<Id>0</Id>".to_string(),
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
         "browse" => {
-            browse_response(&state.db, &request, context.server_id, &server_address).await?
+            match browse_response(&state.db, &request, context.server_id, &server_address).await {
+                Ok(response) => response,
+                Err(error) if error.status == StatusCode::NOT_FOUND => {
+                    return Ok(soap_fault_response(701, "No such object"));
+                }
+                Err(error) => return Err(error),
+            }
         }
         "search" => empty_browse_like_response(),
         _ => {
-            return Err(ApiError::not_found(
-                "Unsupported ContentDirectory SOAP action",
-            ));
+            return Ok(soap_fault_response(401, "Invalid Action"));
         }
     };
     Ok(soap_response(
@@ -1263,6 +1267,33 @@ fn soap_response(service_type: &str, action_response: String, body: String) -> R
         .into_response()
 }
 
+fn soap_fault_response(error_code: u16, description: &str) -> Response {
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+         <SOAP-ENV:Envelope xmlns:SOAP-ENV=\"{SOAP_ENV_NS}\" SOAP-ENV:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+         <SOAP-ENV:Body><SOAP-ENV:Fault>\
+         <faultcode>SOAP-ENV:Client</faultcode>\
+         <faultstring>UPnPError</faultstring>\
+         <detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\">\
+         <errorCode>{error_code}</errorCode>\
+         <errorDescription>{}</errorDescription>\
+         </UPnPError></detail>\
+         </SOAP-ENV:Fault></SOAP-ENV:Body>\
+         </SOAP-ENV:Envelope>",
+        escape_xml(description)
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [
+            (header::CONTENT_TYPE, "text/xml; charset=utf-8".to_string()),
+            (header::CONTENT_LENGTH, xml.len().to_string()),
+            (header::HeaderName::from_static("ext"), String::new()),
+        ],
+        xml,
+    )
+        .into_response()
+}
+
 fn xml_response(xml: String) -> Response {
     (
         StatusCode::OK,
@@ -1294,6 +1325,58 @@ fn soap_action(xml: &str) -> Option<String> {
             || xml.contains(&format!("\"{action}\""))
     })
     .map(|action| action.to_ascii_lowercase())
+    .or_else(|| soap_body_action(xml))
+}
+
+fn soap_body_action(xml: &str) -> Option<String> {
+    let mut offset = 0;
+    while let Some(open_rel) = xml[offset..].find('<') {
+        let open_start = offset + open_rel;
+        let Some(open_end_rel) = xml[open_start..].find('>') else {
+            break;
+        };
+        let open_end = open_start + open_end_rel;
+        let tag = xml[open_start + 1..open_end].trim();
+        if tag.starts_with('/') || tag.starts_with('?') || tag.starts_with('!') {
+            offset = open_end + 1;
+            continue;
+        }
+        let tag_name = tag.split_whitespace().next().unwrap_or_default();
+        let tag_name = tag_name.trim_end_matches('/');
+        if !tag_local_name(tag_name).eq_ignore_ascii_case("Body") {
+            offset = open_end + 1;
+            continue;
+        }
+
+        let mut body_offset = open_end + 1;
+        while let Some(body_open_rel) = xml[body_offset..].find('<') {
+            let body_open = body_offset + body_open_rel;
+            let Some(body_open_end_rel) = xml[body_open..].find('>') else {
+                break;
+            };
+            let body_open_end = body_open + body_open_end_rel;
+            let body_tag = xml[body_open + 1..body_open_end].trim();
+            if body_tag.starts_with('/') {
+                return None;
+            }
+            if body_tag.starts_with('?') || body_tag.starts_with('!') {
+                body_offset = body_open_end + 1;
+                continue;
+            }
+            let body_tag_name = body_tag
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            let local_name = tag_local_name(body_tag_name);
+            if local_name.is_empty() {
+                return None;
+            }
+            return Some(local_name.to_ascii_lowercase());
+        }
+        return None;
+    }
+    None
 }
 
 fn action_response_name(action: &str) -> String {

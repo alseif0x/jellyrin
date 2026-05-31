@@ -31877,6 +31877,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlna_control_errors_are_upnp_soap_faults() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let unsupported_action = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:UnsupportedAction xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1" />
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(unsupported_action))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/xml; charset=utf-8")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fault = String::from_utf8(body.to_vec()).unwrap();
+        assert!(fault.contains("<SOAP-ENV:Fault>"));
+        assert!(fault.contains("<faultstring>UPnPError</faultstring>"));
+        assert!(fault.contains("<errorCode>401</errorCode>"));
+        assert!(fault.contains("<errorDescription>Invalid Action</errorDescription>"));
+        assert!(!fault.contains("\"Error\""));
+
+        let unsupported_connection_action = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:UnsupportedAction xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1" />
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(unsupported_connection_action))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fault = String::from_utf8(body.to_vec()).unwrap();
+        assert!(fault.contains("<errorCode>401</errorCode>"));
+        assert!(fault.contains("<errorDescription>Invalid Action</errorDescription>"));
+
+        let missing_folder = Uuid::new_v4();
+        let browse_missing_folder = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>folder:{missing_folder}</ObjectID>
+      <BrowseFlag>BrowseDirectChildren</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria></SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/dlna/{server_id}/contentdirectory/control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(browse_missing_folder))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fault = String::from_utf8(body.to_vec()).unwrap();
+        assert!(fault.contains("<errorCode>701</errorCode>"));
+        assert!(fault.contains("<errorDescription>No such object</errorDescription>"));
+    }
+
+    #[tokio::test]
     async fn live_tv_named_configuration_round_trips_dashboard_contract() {
         let tmp = tempfile::tempdir().unwrap();
         let recording_file = tmp.path().join("Morning News.ts");
