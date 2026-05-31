@@ -496,6 +496,13 @@ async function requireExistingArtifact(errors, artifact, index) {
   }
   requireArtifactExtension(errors, artifact.type, artifactPath, index);
   try {
+    const realArtifactsDir = await fs.realpath(artifactsDir);
+    const realArtifactPath = await fs.realpath(artifactPath);
+    const realRelativeToArtifacts = path.relative(realArtifactsDir, realArtifactPath);
+    if (realRelativeToArtifacts.startsWith('..') || path.isAbsolute(realRelativeToArtifacts)) {
+      errors.push(`artifacts[${index}].pathOrUrl real path must stay under ${artifactsDir}`);
+      return;
+    }
     const stat = await fs.stat(artifactPath);
     if (!stat.isFile()) {
       errors.push(`artifacts[${index}].pathOrUrl must point to a file`);
@@ -721,6 +728,18 @@ async function selfTest() {
     await assertInvalid(outsideArtifactsDir, 'artifacts[0].pathOrUrl must stay under');
     await fs.rm(nonArtifactsDirArtifactPath, { force: true });
 
+    const symlinkOutsideArtifactPath = path.join(manualEvidenceDir, 'artifacts', 'symlink-outside.log');
+    const symlinkOutsideTargetPath = path.join(manualEvidenceDir, 'symlink-target.log');
+    await fs.writeFile(symlinkOutsideTargetPath, 'symlink target\n');
+    await fs.symlink(symlinkOutsideTargetPath, symlinkOutsideArtifactPath);
+    const symlinkOutsideArtifact = {
+      ...valid,
+      artifacts: [{ type: 'client-log', pathOrUrl: path.relative(plansDir, symlinkOutsideArtifactPath) }],
+    };
+    await assertInvalid(symlinkOutsideArtifact, 'artifacts[0].pathOrUrl real path must stay under');
+    await fs.rm(symlinkOutsideArtifactPath, { force: true });
+    await fs.rm(symlinkOutsideTargetPath, { force: true });
+
     await fs.writeFile(emptyArtifactPath, '');
     const emptyArtifact = {
       ...valid,
@@ -734,6 +753,8 @@ async function selfTest() {
     await fs.rm(artifactPath, { force: true });
     await fs.rm(emptyArtifactPath, { force: true });
     await fs.rm(path.join(manualEvidenceDir, 'not-an-artifact.txt'), { force: true });
+    await fs.rm(path.join(manualEvidenceDir, 'artifacts', 'symlink-outside.log'), { force: true });
+    await fs.rm(path.join(manualEvidenceDir, 'symlink-target.log'), { force: true });
   }
 }
 
