@@ -7,7 +7,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jellyrin_core::{MediaItem, VirtualFolder};
 use jellyrin_db::Database;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
@@ -48,6 +48,7 @@ const CONNECTION_MANAGER_ID: &str = "urn:upnp-org:serviceId:ConnectionManager";
 const MEDIA_RECEIVER_REGISTRAR_ID: &str = "urn:microsoft.com:serviceId:X_MS_MediaReceiverRegistrar";
 const UPNP_ROOT_DEVICE: &str = "upnp:rootdevice";
 const MEDIA_SERVER_DEVICE: &str = "urn:schemas-upnp-org:device:MediaServer:1";
+const DLNA_STATE_CONFIGURATION_KEY: &str = "dlna";
 static DLNA_EVENT_SUBSCRIPTIONS: LazyLock<StdMutex<HashMap<String, DlnaEventSubscription>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 static DLNA_SYSTEM_UPDATE_ID: AtomicU32 = AtomicU32::new(0);
@@ -159,6 +160,7 @@ pub(crate) async fn description(
     Path(server_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let context = dlna_context(&state, &server_id).await?;
+    sync_dlna_system_update_id_from_db(&state.db).await?;
     let server_address = request_server_address(&headers, &state);
     Ok(xml_response(root_device_xml(&context, &server_address)))
 }
@@ -322,6 +324,7 @@ pub(crate) async fn content_directory_events(
     Path(server_id): Path<String>,
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
+    sync_dlna_system_update_id_from_db(&state.db).await?;
     event_subscription_response(DlnaEventService::ContentDirectory, &method, &headers)
 }
 
@@ -810,17 +813,56 @@ fn dlna_event_subscriptions()
         .map_err(|_| ApiError::internal("DLNA event subscription lock poisoned"))
 }
 
-pub(crate) fn notify_dlna_content_directory_changed() {
+pub(crate) async fn notify_dlna_content_directory_changed(db: &Database) -> Result<u32, ApiError> {
+    sync_dlna_system_update_id_from_db(db).await?;
     let update_id = DLNA_SYSTEM_UPDATE_ID
         .fetch_add(1, Ordering::Relaxed)
         .wrapping_add(1);
+    persist_dlna_system_update_id(db, update_id).await?;
     let body =
         event_property_set_xml_from_properties(vec![("SystemUpdateID", update_id.to_string())]);
     notify_event_subscribers(DlnaEventService::ContentDirectory, body);
+    Ok(update_id)
 }
 
 pub(crate) fn dlna_system_update_id() -> u32 {
     DLNA_SYSTEM_UPDATE_ID.load(Ordering::Relaxed)
+}
+
+async fn sync_dlna_system_update_id_from_db(db: &Database) -> Result<u32, ApiError> {
+    let Some(persisted) = persisted_dlna_system_update_id(db).await? else {
+        return Ok(dlna_system_update_id());
+    };
+    let mut current = dlna_system_update_id();
+    while persisted > current {
+        match DLNA_SYSTEM_UPDATE_ID.compare_exchange(
+            current,
+            persisted,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(persisted),
+            Err(actual) => current = actual,
+        }
+    }
+    Ok(current)
+}
+
+async fn persisted_dlna_system_update_id(db: &Database) -> Result<Option<u32>, ApiError> {
+    Ok(db
+        .named_configuration(DLNA_STATE_CONFIGURATION_KEY)
+        .await?
+        .and_then(|value| value.get("SystemUpdateID").and_then(Value::as_u64))
+        .and_then(|value| u32::try_from(value).ok()))
+}
+
+async fn persist_dlna_system_update_id(db: &Database, update_id: u32) -> Result<(), ApiError> {
+    db.update_named_configuration(
+        DLNA_STATE_CONFIGURATION_KEY,
+        json!({ "SystemUpdateID": update_id }),
+    )
+    .await?;
+    Ok(())
 }
 
 fn notify_event_subscribers(service: DlnaEventService, body: String) {
@@ -3916,6 +3958,31 @@ mod tests {
         sort_media_items(&mut items, "-dc:title");
         assert_eq!(items[0].name, "Bravo");
         assert_eq!(items[1].name, "Alpha");
+    }
+
+    #[tokio::test]
+    async fn dlna_system_update_id_restores_and_persists_named_state() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let restore_target = dlna_system_update_id().saturating_add(100);
+        db.update_named_configuration(
+            DLNA_STATE_CONFIGURATION_KEY,
+            json!({ "SystemUpdateID": restore_target }),
+        )
+        .await
+        .unwrap();
+
+        let restored = sync_dlna_system_update_id_from_db(&db).await.unwrap();
+        assert_eq!(restored, restore_target);
+        assert_eq!(dlna_system_update_id(), restore_target);
+
+        let update_id = notify_dlna_content_directory_changed(&db).await.unwrap();
+        assert_eq!(update_id, restore_target + 1);
+        let stored = db
+            .named_configuration(DLNA_STATE_CONFIGURATION_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored["SystemUpdateID"], json!(update_id));
     }
 
     fn test_media_item(path: &str, media_type: &str) -> MediaItem {

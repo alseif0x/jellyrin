@@ -58,6 +58,15 @@ const goldenCommands = [
     'test',
     '-p',
     'jellyrin-api',
+    'dlna_system_update_id_restores_and_persists_named_state',
+    '--',
+    '--nocapture',
+  ],
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
     'ssdp',
     '--',
     '--nocapture',
@@ -142,10 +151,10 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? (discoveryPassed && eventsPassed ? 96 : discoveryPassed ? 95 : 94) : 87,
+    percent: passed ? (discoveryPassed && eventsPassed ? 97 : discoveryPassed ? 96 : 95) : 87,
     closed: false,
     sourcePhase: passed
-      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
+      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.2h/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
@@ -158,7 +167,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
           eventsPassed
             ? 'The companion dlna-events golden validates real local TCP callback delivery for initial and follow-up GENA NOTIFY messages.'
             : 'The companion dlna-events golden has not been completed in the current generated evidence.',
-          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
+          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,
@@ -182,7 +191,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
       'Browse covers root, virtual folders, physical directory hierarchy, direct media items and music album containers; broader metadata-derived grouping for series/artists without folders remains pending.',
       'ContentDirectory Search supports a practical subset of criteria; full UPnP SearchCriteria grammar remains pending.',
       'Thumbnails and text subtitle links are advertised; automatic video frame extraction and graphical subtitle support remain pending.',
-      'SystemUpdateID is consistent across GENA and SOAP during process lifetime; persistence across server restart remains pending.',
+      'SystemUpdateID is persisted in named configuration and restored into process state; full restart validation with a packaged service remains pending.',
       'MediaReceiverRegistrar is implemented as LAN-open under EnableUPnP; granular renderer authorization remains pending.',
       'Basic protocolInfo/profile hints and HLS fallback routes are implemented; renderer-specific Samsung/LG/Sony/VLC profile rules and video DLNA.ORG_PN codec/profile decisions remain pending.',
     ],

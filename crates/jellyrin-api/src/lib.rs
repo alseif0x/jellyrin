@@ -8127,7 +8127,7 @@ async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
         scanned += db.scan_virtual_folder_items(folder.id).await?;
     }
     if scanned > 0 {
-        dlna::notify_dlna_content_directory_changed();
+        dlna::notify_dlna_content_directory_changed(db).await?;
     }
     Ok(scanned)
 }
@@ -14087,7 +14087,7 @@ async fn add_virtual_folder(
         .upsert_virtual_folder(&query.name, query.collection_type.as_deref(), locations)
         .await?;
     state.db.scan_virtual_folder_items(folder.id).await?;
-    dlna::notify_dlna_content_directory_changed();
+    dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
         &state.db,
         "Library added",
@@ -14135,7 +14135,7 @@ async fn add_virtual_folder_path(
         .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
         .ok_or_else(|| ApiError::bad_request("Virtual folder not found"))?;
     state.db.scan_virtual_folder_items(folder.id).await?;
-    dlna::notify_dlna_content_directory_changed();
+    dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
         &state.db,
         "Library path added",
@@ -14166,7 +14166,7 @@ async fn delete_virtual_folder(
     )
     .await?;
     if state.db.delete_virtual_folder(&query.name).await? {
-        dlna::notify_dlna_content_directory_changed();
+        dlna::notify_dlna_content_directory_changed(&state.db).await?;
         record_activity(
             &state.db,
             "Library deleted",
@@ -14206,7 +14206,7 @@ async fn delete_virtual_folder_path(
         .remove_virtual_folder_path(&query.name, &query.path)
         .await?
     {
-        dlna::notify_dlna_content_directory_changed();
+        dlna::notify_dlna_content_directory_changed(&state.db).await?;
         record_activity(
             &state.db,
             "Library path deleted",
@@ -14267,7 +14267,7 @@ async fn update_virtual_folder_library_options(
         .upsert_virtual_folder(&existing.name, collection_type, locations)
         .await?;
     state.db.scan_virtual_folder_items(folder.id).await?;
-    dlna::notify_dlna_content_directory_changed();
+    dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
         &state.db,
         "Library options updated",
@@ -14322,7 +14322,7 @@ async fn rename_virtual_folder(
         .rename_virtual_folder(&query.name, &query.new_name)
         .await?
     {
-        dlna::notify_dlna_content_directory_changed();
+        dlna::notify_dlna_content_directory_changed(&state.db).await?;
         record_activity(
             &state.db,
             "Library renamed",
@@ -14415,7 +14415,7 @@ async fn update_virtual_folder_path(
             .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
             .ok_or_else(|| ApiError::not_found("Virtual folder not found"))?;
         state.db.scan_virtual_folder_items(folder.id).await?;
-        dlna::notify_dlna_content_directory_changed();
+        dlna::notify_dlna_content_directory_changed(&state.db).await?;
         record_activity(
             &state.db,
             "Library path updated",
@@ -31679,6 +31679,7 @@ mod tests {
             .await
             .unwrap();
         let server_id = db.server_state().await.unwrap().server_id;
+        let dlna_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -31867,7 +31868,9 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(b"\x89PNG"));
 
-        dlna::notify_dlna_content_directory_changed();
+        dlna::notify_dlna_content_directory_changed(&dlna_db)
+            .await
+            .unwrap();
         let expected_update_id = dlna::dlna_system_update_id();
         let get_system_update_id = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -33410,6 +33413,7 @@ mod tests {
             .await
             .unwrap();
         let server_id = db.server_state().await.unwrap().server_id;
+        let dlna_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -33445,7 +33449,9 @@ mod tests {
             .unwrap();
         assert!(initial.to_ascii_lowercase().contains("\r\nseq: 0\r\n"));
 
-        dlna::notify_dlna_content_directory_changed();
+        dlna::notify_dlna_content_directory_changed(&dlna_db)
+            .await
+            .unwrap();
         let followup = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx.recv())
             .await
             .unwrap()
