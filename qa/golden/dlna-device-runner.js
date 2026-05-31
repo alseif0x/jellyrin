@@ -269,7 +269,8 @@ function browseItemBody(itemId) {
 }
 
 async function probeHlsFallback(baseUrl, serverId, itemId) {
-  const master = await fetchChecked(new URL(`/dlna/${serverId}/items/${encodeURIComponent(itemId)}/transcode.m3u8`, baseUrl));
+  const masterUrl = new URL(`/dlna/${serverId}/items/${encodeURIComponent(itemId)}/transcode.m3u8`, baseUrl);
+  const master = await fetchChecked(masterUrl);
   if (master.status !== 200 || !master.text.includes('#EXTM3U')) {
     throw new Error('HLS master playlist was not fetched');
   }
@@ -277,7 +278,8 @@ async function probeHlsFallback(baseUrl, serverId, itemId) {
   if (!mediaLine) {
     throw new Error('HLS master playlist did not contain a media playlist URL');
   }
-  const media = await fetchChecked(new URL(mediaLine, baseUrl));
+  const mediaUrl = resolvePlaylistUrl(mediaLine, masterUrl);
+  const media = await fetchChecked(mediaUrl);
   if (media.status !== 200 || !media.text.includes('#EXTM3U')) {
     throw new Error('HLS media playlist was not fetched');
   }
@@ -285,7 +287,7 @@ async function probeHlsFallback(baseUrl, serverId, itemId) {
   if (!segmentLine) {
     throw new Error('HLS media playlist did not contain a segment URL');
   }
-  const segment = await fetchChecked(new URL(segmentLine, baseUrl));
+  const segment = await fetchChecked(resolvePlaylistUrl(segmentLine, mediaUrl));
   return {
     profileRequiresTranscode: true,
     hlsPlaylistFetched: true,
@@ -295,6 +297,10 @@ async function probeHlsFallback(baseUrl, serverId, itemId) {
     segmentMime: segment.contentType.split(';')[0],
     segmentBytesVerified: segment.bytes.length > 0 && segment.bytes[0] === 0x47,
   };
+}
+
+function resolvePlaylistUrl(line, playlistUrl) {
+  return new URL(line.trim(), playlistUrl);
 }
 
 async function ssdpDiscover(serverId, timeoutMs) {
@@ -412,6 +418,21 @@ function selfTest() {
   assertEqual(parsed.baseUrl, 'http://192.168.1.46:8097/web/index.html?x=1', 'parse baseUrl');
   assertEqual(normalizeBaseUrl(parsed.baseUrl), 'http://192.168.1.46:8097', 'normalizeBaseUrl');
   assertEqual(headerValue('HTTP/1.1 200 OK\r\nLOCATION: http://host/dlna.xml\r\n', 'location'), 'http://host/dlna.xml', 'headerValue');
+  assertEqual(
+    resolvePlaylistUrl('variant/stream.m3u8', new URL('http://host/dlna/item/transcode.m3u8')).toString(),
+    'http://host/dlna/item/variant/stream.m3u8',
+    'resolve media playlist relative URL',
+  );
+  assertEqual(
+    resolvePlaylistUrl('../segments/00001.ts', new URL('http://host/dlna/item/variant/stream.m3u8')).toString(),
+    'http://host/dlna/item/segments/00001.ts',
+    'resolve segment relative URL',
+  );
+  assertEqual(
+    resolvePlaylistUrl('/dlna/item/segments/00001.ts', new URL('http://host/dlna/item/variant/stream.m3u8')).toString(),
+    'http://host/dlna/item/segments/00001.ts',
+    'resolve root-relative segment URL',
+  );
   const escaped = browseItemBody('abc<&"');
   if (!escaped.includes('abc&lt;&amp;&quot;')) {
     throw new Error(`browseItemBody did not XML-escape ObjectID: ${escaped}`);
@@ -447,4 +468,5 @@ module.exports = {
   normalizeBaseUrl,
   parseArgs,
   probeHlsFallback,
+  resolvePlaylistUrl,
 };
