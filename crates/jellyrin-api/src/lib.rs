@@ -7268,6 +7268,10 @@ fn default_network_configuration() -> serde_json::Value {
         "VirtualInterfaceNames": ["vEthernet*", "utun*", "docker*", "veth*"],
         "EnablePublishedServerUriByRequest": false,
         "PublishedServerUriBySubnet": [],
+        "DlnaAllowedDeviceIds": [],
+        "DlnaDeniedDeviceIds": [],
+        "DlnaAllowedRenderers": [],
+        "DlnaDeniedRenderers": [],
         "RemoteIPFilter": [],
         "IsRemoteIPFilterBlacklist": false
     })
@@ -7296,6 +7300,10 @@ fn network_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     merge_known_network_value(&mut config, &payload, "VirtualInterfaceNames");
     merge_known_network_value(&mut config, &payload, "EnablePublishedServerUriByRequest");
     merge_known_network_value(&mut config, &payload, "PublishedServerUriBySubnet");
+    merge_known_network_value(&mut config, &payload, "DlnaAllowedDeviceIds");
+    merge_known_network_value(&mut config, &payload, "DlnaDeniedDeviceIds");
+    merge_known_network_value(&mut config, &payload, "DlnaAllowedRenderers");
+    merge_known_network_value(&mut config, &payload, "DlnaDeniedRenderers");
     merge_known_network_value(&mut config, &payload, "RemoteIPFilter");
     merge_known_network_value(&mut config, &payload, "IsRemoteIPFilterBlacklist");
     config
@@ -31574,6 +31582,10 @@ mod tests {
         assert!(defaults["LocalNetworkSubnets"].is_array());
         assert!(defaults["KnownProxies"].is_array());
         assert!(defaults["PublishedServerUriBySubnet"].is_array());
+        assert!(defaults["DlnaAllowedDeviceIds"].is_array());
+        assert!(defaults["DlnaDeniedDeviceIds"].is_array());
+        assert!(defaults["DlnaAllowedRenderers"].is_array());
+        assert!(defaults["DlnaDeniedRenderers"].is_array());
 
         let response = app
             .clone()
@@ -31610,6 +31622,10 @@ mod tests {
             "RemoteIPFilter": ["203.0.113.10"],
             "IsRemoteIPFilterBlacklist": true,
             "PublishedServerUriBySubnet": ["all=https://media.example.test"],
+            "DlnaAllowedDeviceIds": ["uuid:allowed-renderer"],
+            "DlnaDeniedDeviceIds": ["uuid:denied-renderer"],
+            "DlnaAllowedRenderers": ["samsung"],
+            "DlnaDeniedRenderers": ["vlc"],
             "UnknownNetworkField": "ignored"
         });
         let response = app
@@ -31658,6 +31674,16 @@ mod tests {
             config["PublishedServerUriBySubnet"],
             json!(["all=https://media.example.test"])
         );
+        assert_eq!(
+            config["DlnaAllowedDeviceIds"],
+            json!(["uuid:allowed-renderer"])
+        );
+        assert_eq!(
+            config["DlnaDeniedDeviceIds"],
+            json!(["uuid:denied-renderer"])
+        );
+        assert_eq!(config["DlnaAllowedRenderers"], json!(["samsung"]));
+        assert_eq!(config["DlnaDeniedRenderers"], json!(["vlc"]));
         assert!(config.get("UnknownNetworkField").is_none());
 
         let startup = db.startup_config().await.unwrap();
@@ -32066,6 +32092,111 @@ mod tests {
         let authorization_response = String::from_utf8(body.to_vec()).unwrap();
         assert!(authorization_response.contains("<u:IsAuthorizedResponse"));
         assert!(authorization_response.contains("<Result>1</Result>"));
+
+        dlna_db
+            .update_named_configuration(
+                "network",
+                json!({
+                    "EnableUPnP": true,
+                    "DlnaDeniedRenderers": ["samsung"],
+                    "DlnaDeniedDeviceIds": ["uuid:blocked-renderer"]
+                }),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/MediaReceiverRegistrar/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .header(header::USER_AGENT, "Samsung DLNADOC/1.50")
+                    .body(Body::from(is_authorized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let blocked_renderer_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(blocked_renderer_response.contains("<Result>0</Result>"));
+
+        let blocked_device = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:IsValidated xmlns:u="urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1">
+      <DeviceID>uuid:blocked-renderer</DeviceID>
+    </u:IsValidated>
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/MediaReceiverRegistrar/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(blocked_device))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let blocked_device_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(blocked_device_response.contains("<u:IsValidatedResponse"));
+        assert!(blocked_device_response.contains("<Result>0</Result>"));
+
+        dlna_db
+            .update_named_configuration(
+                "network",
+                json!({
+                    "EnableUPnP": true,
+                    "DlnaAllowedRenderers": ["vlc"]
+                }),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/MediaReceiverRegistrar/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .header(header::USER_AGENT, "VLC/3.0.20 LibVLC")
+                    .body(Body::from(is_authorized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let allowed_vlc_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(allowed_vlc_response.contains("<Result>1</Result>"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/MediaReceiverRegistrar/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(is_authorized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let generic_not_allowlisted_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(generic_not_allowlisted_response.contains("<Result>0</Result>"));
+
+        dlna_db
+            .update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
 
         let register_device = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">

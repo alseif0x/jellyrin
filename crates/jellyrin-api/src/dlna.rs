@@ -188,6 +188,16 @@ impl DlnaRendererProfile {
     fn video_pn_enabled(self) -> bool {
         matches!(self, Self::Samsung | Self::Lg | Self::Sony)
     }
+
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::Vlc => "vlc",
+            Self::Samsung => "samsung",
+            Self::Lg => "lg",
+            Self::Sony => "sony",
+        }
+    }
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -197,6 +207,51 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn dlna_renderer_authorized(
+    network: &Value,
+    device_id: &str,
+    renderer_profile: DlnaRendererProfile,
+) -> bool {
+    let device_id = normalized_renderer_rule_value(device_id);
+    let renderer = renderer_profile.config_name();
+    let denied = network_rule_values(network, "DlnaDeniedDeviceIds")
+        .iter()
+        .any(|value| value == &device_id)
+        || network_rule_values(network, "DlnaDeniedRenderers")
+            .iter()
+            .any(|value| value == renderer);
+    if denied {
+        return false;
+    }
+
+    let allowed_device_ids = network_rule_values(network, "DlnaAllowedDeviceIds");
+    let allowed_renderers = network_rule_values(network, "DlnaAllowedRenderers");
+    if allowed_device_ids.is_empty() && allowed_renderers.is_empty() {
+        return true;
+    }
+    allowed_device_ids.iter().any(|value| value == &device_id)
+        || allowed_renderers.iter().any(|value| value == renderer)
+}
+
+fn network_rule_values(network: &Value, key: &str) -> Vec<String> {
+    network
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter_map(Value::as_str)
+        .map(normalized_renderer_rule_value)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn normalized_renderer_rule_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("uuid:")
+        .to_ascii_lowercase()
 }
 
 pub fn spawn_dlna_ssdp_service(state: AppState) -> JoinHandle<()> {
@@ -337,16 +392,27 @@ pub(crate) async fn connection_manager_control(
 
 pub(crate) async fn media_receiver_registrar_control(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     body: BodyBytes,
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
+    let network = state
+        .db
+        .named_configuration("network")
+        .await?
+        .unwrap_or_else(default_network_configuration);
+    let renderer_profile = DlnaRendererProfile::from_headers(&headers);
     let request = String::from_utf8_lossy(&body);
     let Some(action) = soap_action(&request) else {
         return Ok(soap_fault_response(401, "Invalid Action"));
     };
     let body = match action.as_str() {
-        "isauthorized" | "isvalidated" => "<Result>1</Result>".to_string(),
+        "isauthorized" | "isvalidated" => {
+            let device_id = soap_param(&request, "DeviceID").unwrap_or_default();
+            let authorized = dlna_renderer_authorized(&network, &device_id, renderer_profile);
+            format!("<Result>{}</Result>", u8::from(authorized))
+        }
         "registerdevice" => "<RegistrationRespMsg></RegistrationRespMsg>".to_string(),
         _ => {
             return Ok(soap_fault_response(401, "Invalid Action"));
