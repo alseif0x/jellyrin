@@ -17,6 +17,14 @@ const draftsDir = path.join(manualEvidenceDir, 'drafts');
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.help) {
+    printUsage();
+    return;
+  }
+  if (options.selfTest) {
+    selfTest();
+    return;
+  }
   const baseUrl = normalizeBaseUrl(options.baseUrl || process.env.JELLYRIN_BASE_URL || 'http://127.0.0.1:8097');
   const serverInfo = await fetchJson(new URL('/System/Info/Public', baseUrl));
   const serverId = requiredString(serverInfo.Id || serverInfo.ServerId, 'System/Info/Public Id');
@@ -161,22 +169,35 @@ function parseArgs(args) {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === '--base-url') {
-      options.baseUrl = args[index + 1];
+      options.baseUrl = requireArgValue(args, index, arg);
       index += 1;
     } else if (arg === '--item-id') {
-      options.itemId = args[index + 1];
+      options.itemId = requireArgValue(args, index, arg);
       index += 1;
     } else if (arg === '--subtitle-index') {
-      options.subtitleIndex = args[index + 1];
+      options.subtitleIndex = requireArgValue(args, index, arg);
       index += 1;
+    } else if (arg === '--self-test') {
+      options.selfTest = true;
     } else if (arg === '--help' || arg === '-h') {
-      console.log('Usage: node qa/golden/dlna-device-preflight.js [--base-url http://host:8097] [--item-id <uuid>] [--subtitle-index <n>]');
-      process.exit(0);
+      options.help = true;
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
   }
   return options;
+}
+
+function requireArgValue(args, index, flag) {
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith('--')) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
+}
+
+function printUsage() {
+  console.log('Usage: node qa/golden/dlna-device-preflight.js [--base-url http://host:8097] [--item-id <uuid>] [--subtitle-index <n>] [--self-test]');
 }
 
 function normalizeBaseUrl(value) {
@@ -357,6 +378,39 @@ async function writeDraft(draft) {
   return outputPath;
 }
 
+function selfTest() {
+  const parsed = parseArgs([
+    '--base-url',
+    'http://192.168.1.46:8097/web/index.html?x=1',
+    '--item-id',
+    'item-1',
+    '--subtitle-index',
+    '2',
+  ]);
+  assertEqual(parsed.baseUrl, 'http://192.168.1.46:8097/web/index.html?x=1', 'parse baseUrl');
+  assertEqual(parsed.itemId, 'item-1', 'parse itemId');
+  assertEqual(parsed.subtitleIndex, '2', 'parse subtitleIndex');
+  assertEqual(normalizeBaseUrl(parsed.baseUrl), 'http://192.168.1.46:8097', 'normalizeBaseUrl');
+  assertEqual(resolveServerUrl('/dlna/server/icons/logo.png', parsed.baseUrl).toString(), 'http://192.168.1.46:8097/dlna/server/icons/logo.png', 'resolveServerUrl');
+  assertIncludes(soapEnvelope('<x />'), '<s:Body><x /></s:Body>', 'soapEnvelope body');
+  let missingValueFailed = false;
+  try {
+    parseArgs(['--base-url', '--item-id', 'x']);
+  } catch {
+    missingValueFailed = true;
+  }
+  if (!missingValueFailed) {
+    throw new Error('parseArgs should reject missing option values');
+  }
+  console.log(JSON.stringify({ status: 'self-test-ok' }, null, 2));
+}
+
+function assertEqual(actual, expected, label) {
+  if (actual !== expected) {
+    throw new Error(`${label}: expected ${expected}, got ${actual}`);
+  }
+}
+
 if (require.main === module) {
   main().catch((error) => {
     console.error(error.message || error);
@@ -367,6 +421,7 @@ if (require.main === module) {
 module.exports = {
   buildDraftEvidence,
   normalizeBaseUrl,
+  parseArgs,
   resolveServerUrl,
   soapEnvelope,
 };
