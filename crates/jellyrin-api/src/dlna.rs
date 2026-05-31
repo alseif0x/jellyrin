@@ -2103,6 +2103,37 @@ async fn browse_response(
                 render_context,
             )
         }
+    } else if let Some((folder_id, artist_name)) = parse_artist_object_id(&object_id) {
+        let folder = db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        if !is_music_folder(&folder) {
+            return Err(ApiError::not_found("DLNA artist not found"));
+        }
+        let items = media_items_for_folder(db, folder.id).await?;
+        let metadata = media_item_metadata_map(db).await?;
+        let artist_items = music_artist_items(&items, &metadata, &artist_name);
+        if artist_items.is_empty() {
+            return Err(ApiError::not_found("DLNA artist not found"));
+        }
+        if browse_metadata {
+            BrowsePayload::metadata(didl_artist_metadata(
+                folder.id,
+                &artist_name,
+                artist_items.len(),
+            ))
+        } else {
+            music_metadata_items_browse_payload(
+                artist_object_id(folder.id, &artist_name),
+                artist_items,
+                (starting_index, requested_count),
+                &sort_criteria,
+                render_context,
+            )
+        }
     } else if let Some((folder_id, relative_path)) = parse_directory_object_id(&object_id) {
         let folder = db
             .virtual_folders()
@@ -2186,7 +2217,9 @@ async fn search_response(
     sort_media_items(&mut items, &sort_criteria);
     let total_matches = items.len();
     let paged_items = paged_slice(&items, starting_index, requested_count);
-    let parent_override = parse_album_object_id(&container_id).map(|_| container_id.as_str());
+    let parent_override = parse_album_object_id(&container_id)
+        .or_else(|| parse_artist_object_id(&container_id))
+        .map(|_| container_id.as_str());
     let didl = didl_search_media_items(paged_items, &folders, parent_override, render_context);
     Ok(format!(
         "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>{}</UpdateID>",
@@ -2231,6 +2264,26 @@ async fn search_container_items(
             return Err(ApiError::not_found("DLNA album not found"));
         }
         return Ok(album_items);
+    }
+
+    if let Some((folder_id, artist_name)) = parse_artist_object_id(container_id) {
+        let folder = folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        if !is_music_folder(folder) {
+            return Err(ApiError::not_found("DLNA artist not found"));
+        }
+        let items = media_items_for_folder(db, folder_id).await?;
+        let metadata = media_item_metadata_map(db).await?;
+        let artist_items = items
+            .into_iter()
+            .filter(|item| item_has_artist(item, &metadata, &artist_name))
+            .collect::<Vec<_>>();
+        if artist_items.is_empty() {
+            return Err(ApiError::not_found("DLNA artist not found"));
+        }
+        return Ok(artist_items);
     }
 
     if let Some((folder_id, relative_path)) = parse_directory_object_id(container_id) {
@@ -2393,12 +2446,14 @@ fn music_album_browse_entries<'a>(
 ) -> Vec<DlnaBrowseEntry<'a>> {
     let mut child_dirs = BTreeSet::new();
     let mut albums = BTreeMap::<String, usize>::new();
+    let mut artists = BTreeMap::<String, usize>::new();
     let mut direct_items = Vec::new();
 
     for item in items {
         let item_parent = item_parent_relative_path(folder, item).unwrap_or_default();
         if item_parent.is_empty() {
             let titles = item_album_titles(item, metadata);
+            let artist_names = item_artist_names(item, metadata);
             if titles.is_empty() {
                 direct_items.push(item);
             } else {
@@ -2406,12 +2461,16 @@ fn music_album_browse_entries<'a>(
                     *albums.entry(title).or_default() += 1;
                 }
             }
+            for artist_name in artist_names {
+                *artists.entry(artist_name).or_default() += 1;
+            }
         } else if let Some(child_name) = next_child_directory(&item_parent, "") {
             child_dirs.insert(child_name);
         }
     }
 
-    let mut entries = Vec::with_capacity(child_dirs.len() + albums.len() + direct_items.len());
+    let mut entries =
+        Vec::with_capacity(child_dirs.len() + albums.len() + artists.len() + direct_items.len());
     for child_name in child_dirs {
         let child_count = directory_child_count(folder, items, &child_name);
         entries.push(DlnaBrowseEntry::Container {
@@ -2429,6 +2488,15 @@ fn music_album_browse_entries<'a>(
             title: album_title,
             child_count,
             class: "object.container.album.musicAlbum",
+        });
+    }
+    for (artist_name, child_count) in artists {
+        entries.push(DlnaBrowseEntry::Container {
+            id: artist_object_id(folder.id, &artist_name),
+            parent_id: format!("folder:{}", folder.id),
+            title: artist_name,
+            child_count,
+            class: "object.container.person.musicArtist",
         });
     }
     for item in direct_items {
@@ -2458,6 +2526,17 @@ fn music_album_items<'a>(
         .collect()
 }
 
+fn music_artist_items<'a>(
+    items: &'a [MediaItem],
+    metadata: &HashMap<Uuid, Value>,
+    artist_name: &str,
+) -> Vec<&'a MediaItem> {
+    items
+        .iter()
+        .filter(|item| item_has_artist(item, metadata, artist_name))
+        .collect()
+}
+
 fn music_album_items_browse_payload(
     folder_id: Uuid,
     album_title: &str,
@@ -2466,8 +2545,23 @@ fn music_album_items_browse_payload(
     sort_criteria: &str,
     render_context: DlnaRenderContext<'_>,
 ) -> BrowsePayload {
+    music_metadata_items_browse_payload(
+        album_object_id(folder_id, album_title),
+        items,
+        browse_window,
+        sort_criteria,
+        render_context,
+    )
+}
+
+fn music_metadata_items_browse_payload(
+    parent_id: String,
+    items: Vec<&MediaItem>,
+    browse_window: (usize, usize),
+    sort_criteria: &str,
+    render_context: DlnaRenderContext<'_>,
+) -> BrowsePayload {
     let (starting_index, requested_count) = browse_window;
-    let parent_id = album_object_id(folder_id, album_title);
     let mut entries = items
         .into_iter()
         .map(|item| DlnaBrowseEntry::Item {
@@ -2638,6 +2732,20 @@ fn didl_album_metadata(folder_id: Uuid, album_title: &str, child_count: usize) -
     didl.push_str("\"><dc:title>");
     didl.push_str(&escape_xml(album_title));
     didl.push_str("</dc:title><upnp:class>object.container.album.musicAlbum</upnp:class></container></DIDL-Lite>");
+    didl
+}
+
+fn didl_artist_metadata(folder_id: Uuid, artist_name: &str, child_count: usize) -> String {
+    let mut didl = didl_prefix();
+    didl.push_str("<container id=\"");
+    didl.push_str(&escape_xml(&artist_object_id(folder_id, artist_name)));
+    didl.push_str("\" parentID=\"");
+    didl.push_str(&escape_xml(&format!("folder:{folder_id}")));
+    didl.push_str("\" restricted=\"1\" searchable=\"1\" childCount=\"");
+    didl.push_str(&child_count.to_string());
+    didl.push_str("\"><dc:title>");
+    didl.push_str(&escape_xml(artist_name));
+    didl.push_str("</dc:title><upnp:class>object.container.person.musicArtist</upnp:class></container></DIDL-Lite>");
     didl
 }
 
@@ -3149,6 +3257,16 @@ fn parse_album_object_id(object_id: &str) -> Option<(Uuid, String)> {
     (!album_title.is_empty()).then(|| (folder_id, album_title.to_string()))
 }
 
+fn parse_artist_object_id(object_id: &str) -> Option<(Uuid, String)> {
+    let value = object_id.trim().strip_prefix("artist:")?;
+    let (folder_id, encoded_artist) = value.split_once(':')?;
+    let folder_id = Uuid::parse_str(folder_id).ok()?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded_artist).ok()?;
+    let artist_name = String::from_utf8(decoded).ok()?;
+    let artist_name = artist_name.trim();
+    (!artist_name.is_empty()).then(|| (folder_id, artist_name.to_string()))
+}
+
 fn parse_prefixed_object_uuid(object_id: &str, prefix: &str) -> Option<Uuid> {
     object_id
         .trim()
@@ -3167,6 +3285,13 @@ fn album_object_id(folder_id: Uuid, album_title: &str) -> String {
     format!(
         "album:{folder_id}:{}",
         URL_SAFE_NO_PAD.encode(album_title.trim().as_bytes())
+    )
+}
+
+fn artist_object_id(folder_id: Uuid, artist_name: &str) -> String {
+    format!(
+        "artist:{folder_id}:{}",
+        URL_SAFE_NO_PAD.encode(artist_name.trim().as_bytes())
     )
 }
 
@@ -3277,6 +3402,23 @@ fn item_album_titles(item: &MediaItem, metadata: &HashMap<Uuid, Value>) -> Vec<S
     metadata
         .get(&item.id)
         .map(|value| metadata_string_values(value, &["Album", "AlbumName", "Albums"]))
+        .unwrap_or_default()
+}
+
+fn item_has_artist(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    expected_artist_name: &str,
+) -> bool {
+    item_artist_names(item, metadata)
+        .iter()
+        .any(|artist| artist.eq_ignore_ascii_case(expected_artist_name))
+}
+
+fn item_artist_names(item: &MediaItem, metadata: &HashMap<Uuid, Value>) -> Vec<String> {
+    metadata
+        .get(&item.id)
+        .map(|value| metadata_string_values(value, &["Artists", "AlbumArtists", "ArtistItems"]))
         .unwrap_or_default()
 }
 

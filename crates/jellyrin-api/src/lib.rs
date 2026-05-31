@@ -33426,6 +33426,11 @@ mod tests {
             folder.id,
             URL_SAFE_NO_PAD.encode("Example Album".as_bytes())
         );
+        let artist_id = format!(
+            "artist:{}:{}",
+            folder.id,
+            URL_SAFE_NO_PAD.encode("Example Artist".as_bytes())
+        );
 
         let browse_body = |object_id: &str, flag: &str| {
             format!(
@@ -33468,10 +33473,13 @@ mod tests {
             "BrowseDirectChildren".to_string(),
         )
         .await;
-        assert!(folder_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(folder_response.contains("<NumberReturned>3</NumberReturned>"));
         assert!(folder_response.contains("Example Album"));
         assert!(folder_response.contains(&format!("id=&quot;{}&quot;", album_id)));
         assert!(folder_response.contains("object.container.album.musicAlbum"));
+        assert!(folder_response.contains("Example Artist"));
+        assert!(folder_response.contains(&format!("id=&quot;{}&quot;", artist_id)));
+        assert!(folder_response.contains("object.container.person.musicArtist"));
         assert!(folder_response.contains("childCount=&quot;2&quot;"));
         assert!(folder_response.contains("Loose Track"));
         assert!(!folder_response.contains("Track One"));
@@ -33490,6 +33498,26 @@ mod tests {
         assert!(!album_response.contains("Loose Track"));
         assert!(album_response.contains(&format!("parentID=&quot;{}&quot;", album_id)));
 
+        let artist_metadata_response =
+            browse(app.clone(), artist_id.clone(), "BrowseMetadata".to_string()).await;
+        assert!(artist_metadata_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(artist_metadata_response.contains("Example Artist"));
+        assert!(artist_metadata_response.contains("object.container.person.musicArtist"));
+        assert!(artist_metadata_response.contains("childCount=&quot;2&quot;"));
+
+        let artist_response = browse(
+            app.clone(),
+            artist_id.clone(),
+            "BrowseDirectChildren".to_string(),
+        )
+        .await;
+        assert!(artist_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(artist_response.contains("<TotalMatches>2</TotalMatches>"));
+        assert!(artist_response.contains("Track One"));
+        assert!(artist_response.contains("Track Two"));
+        assert!(!artist_response.contains("Loose Track"));
+        assert!(artist_response.contains(&format!("parentID=&quot;{}&quot;", artist_id)));
+
         let search_album = format!(
             r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -33506,6 +33534,7 @@ mod tests {
 </s:Envelope>"#
         );
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -33528,6 +33557,45 @@ mod tests {
             search_response.find("Track Two").unwrap() < search_response.find("Track One").unwrap()
         );
         assert!(search_response.contains(&format!("parentID=&quot;{}&quot;", album_id)));
+
+        let search_artist = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ContainerID>{artist_id}</ContainerID>
+      <SearchCriteria>dc:title contains "Track"</SearchCriteria>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria>+dc:title</SortCriteria>
+    </u:Search>
+  </s:Body>
+</s:Envelope>"#
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::HOST, "media.example.test:8097")
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(search_artist))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let search_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(search_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(search_response.contains("Track One"));
+        assert!(search_response.contains("Track Two"));
+        assert!(!search_response.contains("Loose Track"));
+        assert!(
+            search_response.find("Track One").unwrap() < search_response.find("Track Two").unwrap()
+        );
+        assert!(search_response.contains(&format!("parentID=&quot;{}&quot;", artist_id)));
     }
 
     #[tokio::test]
