@@ -4,11 +4,12 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jellyrin_core::{MediaItem, VirtualFolder};
 use jellyrin_db::Database;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::Path as FsPath,
     sync::{LazyLock, Mutex as StdMutex},
@@ -1025,15 +1026,46 @@ async fn browse_response(
             .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
         let items = media_items_for_folder(db, folder.id).await?;
         if browse_metadata {
-            BrowsePayload::metadata(didl_folder_metadata(&folder, items.len()))
+            let child_count = directory_child_count(&folder, &items, "");
+            BrowsePayload::metadata(didl_folder_metadata(&folder, child_count))
         } else {
-            let total_matches = items.len();
-            let paged_items = paged_slice(&items, starting_index, requested_count);
-            BrowsePayload::children(
-                didl_media_items(paged_items, server_id, server_address),
-                paged_items.len(),
-                total_matches,
-            )
+            directory_browse_payload(
+                &folder,
+                &items,
+                "",
+                starting_index,
+                requested_count,
+                server_id,
+                server_address,
+            )?
+        }
+    } else if let Some((folder_id, relative_path)) = parse_directory_object_id(&object_id) {
+        let folder = db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        let items = media_items_for_folder(db, folder.id).await?;
+        if !directory_exists(&folder, &items, &relative_path) {
+            return Err(ApiError::not_found("DLNA directory not found"));
+        }
+        if browse_metadata {
+            BrowsePayload::metadata(didl_directory_metadata(
+                &folder,
+                &relative_path,
+                directory_child_count(&folder, &items, &relative_path),
+            ))
+        } else {
+            directory_browse_payload(
+                &folder,
+                &items,
+                &relative_path,
+                starting_index,
+                requested_count,
+                server_id,
+                server_address,
+            )?
         }
     } else if let Some(item_id) = parse_item_object_id(&object_id) {
         let item = db
@@ -1145,7 +1177,8 @@ fn didl_root_metadata(child_count: usize) -> String {
 async fn didl_root_children(db: &Database, folders: &[VirtualFolder]) -> Result<String, ApiError> {
     let mut didl = didl_prefix();
     for folder in folders {
-        let child_count = media_items_for_folder(db, folder.id).await?.len();
+        let items = media_items_for_folder(db, folder.id).await?;
+        let child_count = directory_child_count(folder, &items, "");
         didl.push_str("<container id=\"");
         didl.push_str(&escape_xml(&format!("folder:{}", folder.id)));
         didl.push_str("\" parentID=\"0\" restricted=\"1\" searchable=\"1\" childCount=\"");
@@ -1158,6 +1191,121 @@ async fn didl_root_children(db: &Database, folders: &[VirtualFolder]) -> Result<
     }
     didl.push_str("</DIDL-Lite>");
     Ok(didl)
+}
+
+fn directory_browse_payload(
+    folder: &VirtualFolder,
+    items: &[MediaItem],
+    relative_path: &str,
+    starting_index: usize,
+    requested_count: usize,
+    server_id: Uuid,
+    server_address: &str,
+) -> Result<BrowsePayload, ApiError> {
+    let entries = directory_browse_entries(folder, items, relative_path);
+    let total_matches = entries.len();
+    let paged_entries = paged_slice(&entries, starting_index, requested_count);
+    Ok(BrowsePayload::children(
+        didl_browse_entries(paged_entries, server_id, server_address),
+        paged_entries.len(),
+        total_matches,
+    ))
+}
+
+fn directory_browse_entries<'a>(
+    folder: &VirtualFolder,
+    items: &'a [MediaItem],
+    relative_path: &str,
+) -> Vec<DlnaBrowseEntry<'a>> {
+    let parent_id = if relative_path.is_empty() {
+        format!("folder:{}", folder.id)
+    } else {
+        directory_object_id(folder.id, relative_path)
+    };
+    let mut child_dirs = BTreeSet::new();
+    let mut direct_items = Vec::new();
+
+    for item in items {
+        let item_parent = item_parent_relative_path(folder, item).unwrap_or_default();
+        if item_parent == relative_path {
+            direct_items.push(item);
+        } else if let Some(child_name) = next_child_directory(&item_parent, relative_path) {
+            child_dirs.insert(child_name);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(child_dirs.len() + direct_items.len());
+    for child_name in child_dirs {
+        let child_path = join_relative_path(relative_path, &child_name);
+        entries.push(DlnaBrowseEntry::Container {
+            id: directory_object_id(folder.id, &child_path),
+            parent_id: parent_id.clone(),
+            title: child_name,
+            child_count: directory_child_count(folder, items, &child_path),
+            class: directory_container_class(folder.collection_type.as_deref()),
+        });
+    }
+    for item in direct_items {
+        entries.push(DlnaBrowseEntry::Item {
+            item,
+            parent_id: parent_id.clone(),
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.title()
+            .to_ascii_lowercase()
+            .cmp(&right.title().to_ascii_lowercase())
+            .then_with(|| left.id().cmp(&right.id()))
+    });
+    entries
+}
+
+fn directory_child_count(
+    folder: &VirtualFolder,
+    items: &[MediaItem],
+    relative_path: &str,
+) -> usize {
+    directory_browse_entries(folder, items, relative_path).len()
+}
+
+fn directory_exists(folder: &VirtualFolder, items: &[MediaItem], relative_path: &str) -> bool {
+    !relative_path.is_empty()
+        && items.iter().any(|item| {
+            let item_parent = item_parent_relative_path(folder, item).unwrap_or_default();
+            item_parent == relative_path
+                || next_child_directory(&item_parent, relative_path).is_some()
+        })
+}
+
+enum DlnaBrowseEntry<'a> {
+    Container {
+        id: String,
+        parent_id: String,
+        title: String,
+        child_count: usize,
+        class: &'static str,
+    },
+    Item {
+        item: &'a MediaItem,
+        parent_id: String,
+    },
+}
+
+impl DlnaBrowseEntry<'_> {
+    fn title(&self) -> &str {
+        match self {
+            Self::Container { title, .. } => title,
+            Self::Item { item, .. } => &item.name,
+        }
+    }
+
+    fn id(&self) -> String {
+        match self {
+            Self::Container { id, .. } => id.clone(),
+            Self::Item { item, .. } => format!("item:{}", item.id),
+        }
+    }
 }
 
 fn didl_folder_metadata(folder: &VirtualFolder, child_count: usize) -> String {
@@ -1174,25 +1322,111 @@ fn didl_folder_metadata(folder: &VirtualFolder, child_count: usize) -> String {
     didl
 }
 
-fn didl_media_items(items: &[MediaItem], server_id: Uuid, server_address: &str) -> String {
+fn didl_directory_metadata(
+    folder: &VirtualFolder,
+    relative_path: &str,
+    child_count: usize,
+) -> String {
     let mut didl = didl_prefix();
-    for item in items {
-        didl.push_str("<item id=\"");
-        didl.push_str(&escape_xml(&format!("item:{}", item.id)));
-        didl.push_str("\" parentID=\"");
-        didl.push_str(&escape_xml(&format!("folder:{}", item.virtual_folder_id)));
-        didl.push_str("\" restricted=\"1\"><dc:title>");
-        didl.push_str(&escape_xml(&item.name));
-        didl.push_str("</dc:title><upnp:class>");
-        didl.push_str(didl_item_class(item));
-        didl.push_str("</upnp:class>");
-        if let Some(resource) = didl_resource(item, server_id, server_address) {
-            didl.push_str(&resource);
+    didl.push_str("<container id=\"");
+    didl.push_str(&escape_xml(&directory_object_id(folder.id, relative_path)));
+    didl.push_str("\" parentID=\"");
+    didl.push_str(&escape_xml(&directory_parent_object_id(
+        folder.id,
+        relative_path,
+    )));
+    didl.push_str("\" restricted=\"1\" searchable=\"1\" childCount=\"");
+    didl.push_str(&child_count.to_string());
+    didl.push_str("\"><dc:title>");
+    didl.push_str(&escape_xml(&directory_title(relative_path)));
+    didl.push_str("</dc:title><upnp:class>");
+    didl.push_str(directory_container_class(folder.collection_type.as_deref()));
+    didl.push_str("</upnp:class></container></DIDL-Lite>");
+    didl
+}
+
+fn didl_browse_entries(
+    entries: &[DlnaBrowseEntry<'_>],
+    server_id: Uuid,
+    server_address: &str,
+) -> String {
+    let mut didl = didl_prefix();
+    for entry in entries {
+        match entry {
+            DlnaBrowseEntry::Container {
+                id,
+                parent_id,
+                title,
+                child_count,
+                class,
+            } => {
+                append_didl_container(&mut didl, id, parent_id, title, *child_count, class);
+            }
+            DlnaBrowseEntry::Item { item, parent_id } => {
+                append_didl_media_item(&mut didl, item, parent_id, server_id, server_address);
+            }
         }
-        didl.push_str("</item>");
     }
     didl.push_str("</DIDL-Lite>");
     didl
+}
+
+fn didl_media_items(items: &[MediaItem], server_id: Uuid, server_address: &str) -> String {
+    let mut didl = didl_prefix();
+    for item in items {
+        append_didl_media_item(
+            &mut didl,
+            item,
+            &format!("folder:{}", item.virtual_folder_id),
+            server_id,
+            server_address,
+        );
+    }
+    didl.push_str("</DIDL-Lite>");
+    didl
+}
+
+fn append_didl_container(
+    didl: &mut String,
+    id: &str,
+    parent_id: &str,
+    title: &str,
+    child_count: usize,
+    class: &str,
+) {
+    didl.push_str("<container id=\"");
+    didl.push_str(&escape_xml(id));
+    didl.push_str("\" parentID=\"");
+    didl.push_str(&escape_xml(parent_id));
+    didl.push_str("\" restricted=\"1\" searchable=\"1\" childCount=\"");
+    didl.push_str(&child_count.to_string());
+    didl.push_str("\"><dc:title>");
+    didl.push_str(&escape_xml(title));
+    didl.push_str("</dc:title><upnp:class>");
+    didl.push_str(class);
+    didl.push_str("</upnp:class></container>");
+}
+
+fn append_didl_media_item(
+    didl: &mut String,
+    item: &MediaItem,
+    parent_id: &str,
+    server_id: Uuid,
+    server_address: &str,
+) {
+    didl.push_str("<item id=\"");
+    didl.push_str(&escape_xml(&format!("item:{}", item.id)));
+    didl.push_str("\" parentID=\"");
+    didl.push_str(&escape_xml(parent_id));
+    didl.push_str("\" restricted=\"1\"><dc:title>");
+    didl.push_str(&escape_xml(&item.name));
+    didl.push_str("</dc:title><upnp:class>");
+    didl.push_str(didl_item_class(item));
+    didl.push_str("</upnp:class>");
+    if let Some(resource) = didl_resource(item, server_id, server_address) {
+        didl.push_str(&resource);
+    }
+    didl.push_str("</item>");
 }
 
 fn empty_didl() -> String {
@@ -1219,6 +1453,19 @@ fn didl_container_class(collection_type: Option<&str>) -> &'static str {
         "music" => "object.container.album.musicAlbum",
         "photos" | "homevideos" => "object.container.storageFolder",
         "tvshows" => "object.container.genre.movieGenre",
+        _ => "object.container.storageFolder",
+    }
+}
+
+fn directory_container_class(collection_type: Option<&str>) -> &'static str {
+    match collection_type
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "music" => "object.container.album.musicAlbum",
+        "photos" | "homevideos" => "object.container.storageFolder",
+        "tvshows" => "object.container.videoContainer",
         _ => "object.container.storageFolder",
     }
 }
@@ -1331,11 +1578,107 @@ fn parse_item_object_id(object_id: &str) -> Option<Uuid> {
     parse_prefixed_object_uuid(object_id, "item:")
 }
 
+fn parse_directory_object_id(object_id: &str) -> Option<(Uuid, String)> {
+    let value = object_id.trim().strip_prefix("dir:")?;
+    let (folder_id, encoded_path) = value.split_once(':')?;
+    let folder_id = Uuid::parse_str(folder_id).ok()?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded_path).ok()?;
+    let relative_path = String::from_utf8(decoded).ok()?;
+    if relative_path.is_empty() {
+        return None;
+    }
+    Some((folder_id, normalize_relative_path(&relative_path)))
+}
+
 fn parse_prefixed_object_uuid(object_id: &str, prefix: &str) -> Option<Uuid> {
     object_id
         .trim()
         .strip_prefix(prefix)
         .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+fn directory_object_id(folder_id: Uuid, relative_path: &str) -> String {
+    format!(
+        "dir:{folder_id}:{}",
+        URL_SAFE_NO_PAD.encode(normalize_relative_path(relative_path).as_bytes())
+    )
+}
+
+fn directory_parent_object_id(folder_id: Uuid, relative_path: &str) -> String {
+    let mut components = relative_components(relative_path);
+    if components.len() <= 1 {
+        format!("folder:{folder_id}")
+    } else {
+        components.pop();
+        directory_object_id(folder_id, &components.join("/"))
+    }
+}
+
+fn directory_title(relative_path: &str) -> String {
+    relative_components(relative_path)
+        .pop()
+        .unwrap_or_else(|| relative_path.to_string())
+}
+
+fn item_parent_relative_path(folder: &VirtualFolder, item: &MediaItem) -> Option<String> {
+    let item_path = FsPath::new(&item.path);
+    folder
+        .locations
+        .iter()
+        .find_map(|location| {
+            item_path
+                .strip_prefix(FsPath::new(location))
+                .ok()
+                .map(relative_path_from_file_path)
+        })
+        .or_else(|| Some(String::new()))
+}
+
+fn relative_path_from_file_path(relative_file_path: &FsPath) -> String {
+    let mut components = relative_file_path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    components.pop();
+    components.join("/")
+}
+
+fn relative_components(relative_path: &str) -> Vec<String> {
+    relative_path
+        .split('/')
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_relative_path(relative_path: &str) -> String {
+    relative_components(relative_path).join("/")
+}
+
+fn next_child_directory(item_parent: &str, current_relative_path: &str) -> Option<String> {
+    let parent_components = relative_components(item_parent);
+    let current_components = relative_components(current_relative_path);
+    if parent_components.len() <= current_components.len() {
+        return None;
+    }
+    if parent_components
+        .iter()
+        .zip(current_components.iter())
+        .any(|(parent, current)| parent != current)
+    {
+        return None;
+    }
+    parent_components.get(current_components.len()).cloned()
+}
+
+fn join_relative_path(parent: &str, child: &str) -> String {
+    let parent = normalize_relative_path(parent);
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}/{child}")
+    }
 }
 
 fn parse_dlna_uuid(value: &str) -> Result<Uuid, ApiError> {

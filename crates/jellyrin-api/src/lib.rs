@@ -31752,6 +31752,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlna_browse_physical_directory_hierarchy() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let media_root = tempfile::tempdir().unwrap();
+        let season_one = media_root.path().join("Example Show").join("Season 01");
+        let season_two = media_root.path().join("Example Show").join("Season 02");
+        let other_show = media_root.path().join("Second Show").join("Season 01");
+        tokio::fs::create_dir_all(&season_one).await.unwrap();
+        tokio::fs::create_dir_all(&season_two).await.unwrap();
+        tokio::fs::create_dir_all(&other_show).await.unwrap();
+        tokio::fs::write(season_one.join("S01E01 Pilot.mp4"), b"pilot")
+            .await
+            .unwrap();
+        tokio::fs::write(season_one.join("S01E02 Next.mp4"), b"next")
+            .await
+            .unwrap();
+        tokio::fs::write(season_two.join("S02E01 Return.mp4"), b"return")
+            .await
+            .unwrap();
+        tokio::fs::write(other_show.join("S01E01 Start.mp4"), b"start-show")
+            .await
+            .unwrap();
+
+        let db_path = media_root.path().join("dlna-hierarchy.sqlite");
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+        let db = Database::connect(&db_url).await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "TV",
+                Some("tvshows"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 4);
+        let scanned_names = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|item| item.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scanned_names,
+            vec![
+                "S01E01 Pilot".to_string(),
+                "S01E01 Start".to_string(),
+                "S01E02 Next".to_string(),
+                "S02E01 Return".to_string()
+            ]
+        );
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let dir_id = |relative_path: &str| {
+            format!(
+                "dir:{}:{}",
+                folder.id,
+                URL_SAFE_NO_PAD.encode(relative_path.as_bytes())
+            )
+        };
+        let browse_body = |object_id: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>{object_id}</ObjectID>
+      <BrowseFlag>BrowseDirectChildren</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria></SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#
+            )
+        };
+        let browse = |app: axum::Router, object_id: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                        .header(header::HOST, "media.example.test:8097")
+                        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                        .body(Body::from(browse_body(&object_id)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+
+        let root_response = browse(app.clone(), format!("folder:{}", folder.id)).await;
+        assert!(root_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(root_response.contains("<TotalMatches>2</TotalMatches>"));
+        assert!(root_response.contains("Example Show"));
+        assert!(root_response.contains("Second Show"));
+        assert!(root_response.contains("object.container.videoContainer"));
+        assert!(!root_response.contains("S01E01 Pilot"));
+
+        let show_id = dir_id("Example Show");
+        let show_response = browse(app.clone(), show_id.clone()).await;
+        assert!(show_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(show_response.contains("Season 01"));
+        assert!(show_response.contains("Season 02"));
+        assert!(!show_response.contains("S01E01 Pilot"));
+
+        let season_id = dir_id("Example Show/Season 01");
+        let season_response = browse(app, season_id.clone()).await;
+        assert!(
+            season_response.contains("<NumberReturned>2</NumberReturned>"),
+            "{season_response}"
+        );
+        assert!(
+            season_response.contains("<TotalMatches>2</TotalMatches>"),
+            "{season_response}"
+        );
+        assert!(season_response.contains("S01E01 Pilot"));
+        assert!(season_response.contains("S01E02 Next"));
+        assert!(season_response.contains(&format!("parentID=&quot;{}&quot;", season_id)));
+        assert!(season_response.contains("object.item.videoItem"));
+    }
+
+    #[tokio::test]
     async fn dlna_event_subscription_endpoints_follow_upnp_contract() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
