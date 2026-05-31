@@ -235,6 +235,11 @@ pub(crate) async fn connection_manager_control(
             "<Status>OK</Status>"
         )
         .to_string(),
+        "prepareforconnection" => {
+            "<ConnectionID>0</ConnectionID><AVTransportID>-1</AVTransportID><RcsID>-1</RcsID>"
+                .to_string()
+        }
+        "connectioncomplete" => String::new(),
         _ => {
             return Ok(soap_fault_response(401, "Invalid Action"));
         }
@@ -3292,6 +3297,8 @@ fn soap_action(xml: &str) -> Option<String> {
         "GetProtocolInfo",
         "GetCurrentConnectionIDs",
         "GetCurrentConnectionInfo",
+        "PrepareForConnection",
+        "ConnectionComplete",
         "GetSearchCapabilities",
         "GetSortCapabilities",
         "GetSystemUpdateID",
@@ -3368,6 +3375,8 @@ fn action_response_name(action: &str) -> String {
         "getprotocolinfo" => "GetProtocolInfoResponse",
         "getcurrentconnectionids" => "GetCurrentConnectionIDsResponse",
         "getcurrentconnectioninfo" => "GetCurrentConnectionInfoResponse",
+        "prepareforconnection" => "PrepareForConnectionResponse",
+        "connectioncomplete" => "ConnectionCompleteResponse",
         "getsearchcapabilities" => "GetSearchCapabilitiesResponse",
         "getsortcapabilities" => "GetSortCapabilitiesResponse",
         "getsystemupdateid" => "GetSystemUpdateIDResponse",
@@ -3622,6 +3631,54 @@ const CONNECTION_MANAGER_ACTIONS: &[DlnaAction] = &[
                 related_state_variable: "SinkProtocolInfo",
             },
         ],
+    },
+    DlnaAction {
+        name: "PrepareForConnection",
+        arguments: &[
+            DlnaArgument {
+                name: "RemoteProtocolInfo",
+                direction: "in",
+                related_state_variable: "A_ARG_TYPE_ProtocolInfo",
+            },
+            DlnaArgument {
+                name: "PeerConnectionManager",
+                direction: "in",
+                related_state_variable: "A_ARG_TYPE_ConnectionManager",
+            },
+            DlnaArgument {
+                name: "PeerConnectionID",
+                direction: "in",
+                related_state_variable: "A_ARG_TYPE_ConnectionID",
+            },
+            DlnaArgument {
+                name: "Direction",
+                direction: "in",
+                related_state_variable: "A_ARG_TYPE_Direction",
+            },
+            DlnaArgument {
+                name: "ConnectionID",
+                direction: "out",
+                related_state_variable: "A_ARG_TYPE_ConnectionID",
+            },
+            DlnaArgument {
+                name: "AVTransportID",
+                direction: "out",
+                related_state_variable: "A_ARG_TYPE_AVTransportID",
+            },
+            DlnaArgument {
+                name: "RcsID",
+                direction: "out",
+                related_state_variable: "A_ARG_TYPE_RcsID",
+            },
+        ],
+    },
+    DlnaAction {
+        name: "ConnectionComplete",
+        arguments: &[DlnaArgument {
+            name: "ConnectionID",
+            direction: "in",
+            related_state_variable: "A_ARG_TYPE_ConnectionID",
+        }],
     },
     DlnaAction {
         name: "GetCurrentConnectionIDs",

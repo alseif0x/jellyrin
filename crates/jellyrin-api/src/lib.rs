@@ -31825,6 +31825,9 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let connection_manager = String::from_utf8(body.to_vec()).unwrap();
         assert!(connection_manager.contains("<action><name>GetProtocolInfo</name>"));
+        assert!(connection_manager.contains("<action><name>PrepareForConnection</name>"));
+        assert!(connection_manager.contains("<action><name>ConnectionComplete</name>"));
+        assert!(connection_manager.contains("<name>RemoteProtocolInfo</name>"));
         assert!(connection_manager.contains("<name>SourceProtocolInfo</name>"));
 
         let response = app
@@ -31981,6 +31984,62 @@ mod tests {
         assert!(
             protocol_response.contains("http-get:*:image/png:DLNA.ORG_PN=PNG_LRG;DLNA.ORG_OP=01")
         );
+
+        let prepare_for_connection = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:PrepareForConnection xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
+      <RemoteProtocolInfo>http-get:*:video/mp4:*</RemoteProtocolInfo>
+      <PeerConnectionManager></PeerConnectionManager>
+      <PeerConnectionID>-1</PeerConnectionID>
+      <Direction>Output</Direction>
+    </u:PrepareForConnection>
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(prepare_for_connection))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let prepare_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(prepare_response.contains("<u:PrepareForConnectionResponse"));
+        assert!(prepare_response.contains("<ConnectionID>0</ConnectionID>"));
+        assert!(prepare_response.contains("<AVTransportID>-1</AVTransportID>"));
+        assert!(prepare_response.contains("<RcsID>-1</RcsID>"));
+
+        let connection_complete = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:ConnectionComplete xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
+      <ConnectionID>0</ConnectionID>
+    </u:ConnectionComplete>
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(connection_complete))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let complete_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(complete_response.contains("<u:ConnectionCompleteResponse"));
 
         let is_authorized = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
