@@ -311,6 +311,9 @@ function resolveEvidenceOutputPath(value) {
   if (relativeToManualEvidence.startsWith('..') || path.isAbsolute(relativeToManualEvidence)) {
     throw new Error(`--output must stay under ${manualEvidenceDir} so npm run golden:dlna can count the evidence`);
   }
+  if (path.dirname(outputPath) !== manualEvidenceDir) {
+    throw new Error(`--output must be a top-level JSON file in ${manualEvidenceDir}; nested files are not scanned by npm run golden:dlna`);
+  }
   if (path.extname(outputPath).toLowerCase() !== '.json') {
     throw new Error('--output must be a .json evidence file');
   }
@@ -500,6 +503,15 @@ function selfTest() {
   }
   if (!outsideOutputFailed) {
     throw new Error('resolveEvidenceOutputPath should reject output outside manual evidence directory');
+  }
+  let nestedOutputFailed = false;
+  try {
+    resolveEvidenceOutputPath(path.join(manualEvidenceDir, 'runs', 'device-self-test.json'));
+  } catch {
+    nestedOutputFailed = true;
+  }
+  if (!nestedOutputFailed) {
+    throw new Error('resolveEvidenceOutputPath should reject nested output below manual evidence directory');
   }
   let nonJsonOutputFailed = false;
   try {
