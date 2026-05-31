@@ -59,6 +59,7 @@ const DLNA_PROTOCOL_INFO_ENTRIES: &[DlnaProtocolInfoEntry] = &[
     DlnaProtocolInfoEntry::new("video/mp4", None),
     DlnaProtocolInfoEntry::new("video/vnd.dlna.mpeg-tts", None),
     DlnaProtocolInfoEntry::new("video/x-msvideo", None),
+    DlnaProtocolInfoEntry::new("video/x-ms-asf", None),
     DlnaProtocolInfoEntry::new("video/x-matroska", None),
     DlnaProtocolInfoEntry::new("video/webm", None),
     DlnaProtocolInfoEntry::new("video/quicktime", None),
@@ -2220,8 +2221,10 @@ fn dlna_mime_type(item: &MediaItem) -> Option<&'static str> {
         "webm" => Some("video/webm"),
         "mov" => Some("video/quicktime"),
         "avi" => Some("video/x-msvideo"),
+        "asf" => Some("video/x-ms-asf"),
         "wmv" => Some("video/x-ms-wmv"),
-        "ts" | "mpeg" | "mpg" => Some("video/mpeg"),
+        "ts" | "mpegts" | "m2ts" | "mts" => Some("video/vnd.dlna.mpeg-tts"),
+        "mpeg" | "mpg" => Some("video/mpeg"),
         "mp3" => Some("audio/mpeg"),
         "m4a" => Some("audio/mp4"),
         "aac" => Some("audio/aac"),
@@ -3258,8 +3261,55 @@ mod tests {
         assert!(source.contains("http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01"));
         assert!(source.contains("http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01"));
         assert!(source.contains("http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0"));
+        assert!(source.contains("http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_OP=01"));
+        assert!(source.contains("http-get:*:video/x-ms-asf:DLNA.ORG_OP=01"));
         assert!(source.contains("DLNA.ORG_FLAGS=01500000000000000000000000000000"));
         assert!(!dlna_protocol_info_value("video/mp4", None).contains("DLNA.ORG_PN="));
+    }
+
+    #[test]
+    fn dlna_video_mime_matrix_covers_direct_play_containers_without_false_pn() {
+        let mp4 = test_media_item("/media/movie.mp4", "Video");
+        assert_eq!(dlna_mime_type(&mp4), Some("video/mp4"));
+        assert_eq!(dlna_profile_name_for_item(&mp4, "video/mp4"), None);
+        assert!(!dlna_protocol_info_for_item(&mp4, "video/mp4").contains("DLNA.ORG_PN="));
+
+        let mpeg_ps = test_media_item("/media/movie.mpg", "Video");
+        assert_eq!(dlna_mime_type(&mpeg_ps), Some("video/mpeg"));
+        assert_eq!(dlna_profile_name_for_item(&mpeg_ps, "video/mpeg"), None);
+
+        let mpeg_ts = test_media_item("/media/movie.ts", "Video");
+        assert_eq!(dlna_mime_type(&mpeg_ts), Some("video/vnd.dlna.mpeg-tts"));
+        assert_eq!(
+            dlna_profile_name_for_item(&mpeg_ts, "video/vnd.dlna.mpeg-tts"),
+            None
+        );
+
+        let m2ts = test_media_item("/media/movie.m2ts", "Video");
+        assert_eq!(dlna_mime_type(&m2ts), Some("video/vnd.dlna.mpeg-tts"));
+
+        let asf = test_media_item("/media/movie.asf", "Video");
+        assert_eq!(dlna_mime_type(&asf), Some("video/x-ms-asf"));
+        assert_eq!(dlna_profile_name_for_item(&asf, "video/x-ms-asf"), None);
+    }
+
+    fn test_media_item(path: &str, media_type: &str) -> MediaItem {
+        MediaItem {
+            id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            virtual_folder_id: Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            name: "Test".to_string(),
+            path: path.to_string(),
+            media_type: media_type.to_string(),
+            collection_type: Some("movies".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: ::time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: ::time::OffsetDateTime::UNIX_EPOCH,
+        }
     }
 
     #[tokio::test]

@@ -29,6 +29,15 @@ const goldenCommands = [
     'test',
     '-p',
     'jellyrin-api',
+    'dlna_video_mime_matrix_covers_direct_play_containers_without_false_pn',
+    '--',
+    '--nocapture',
+  ],
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
     'ssdp',
     '--',
     '--nocapture',
@@ -103,17 +112,17 @@ function buildEvidence(result) {
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? 91 : 87,
+    percent: passed ? 92 : 87,
     closed: false,
     sourcePhase: passed
-      ? 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b/E3.6c/E3.7a'
+      ? 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a'
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
           'Jellyrin DLNA/UPnP local golden completed as a control-point flow.',
           'The trace generates a real MP4 fixture with ffmpeg, enables UPnP, publishes a library, fetches the root device descriptor, browses ContentDirectory, validates a direct DLNA Range stream, requests tokenless transcode.m3u8, waits for the real ffmpeg HLS media playlist, then fetches a rewritten DLNA TS segment with content-type video/mp2t and MPEG-TS sync bytes.',
           'The SSDP contract test verifies M-SEARCH/NOTIFY targets including ContentDirectory, ConnectionManager and X_MS_MediaReceiverRegistrar.',
-          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, direct stream URLs and HLS fallback route contracts.',
+          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,
