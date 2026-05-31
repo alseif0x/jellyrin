@@ -25,9 +25,9 @@ use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION, ImageOwner,
-    default_network_configuration, dlna_hls_master_playlist_response,
-    dlna_hls_media_playlist_response, dlna_hls_segment_response, stream_media_item,
-    subscribe_system_lifecycle_commands,
+    SubtitleStreamRoute, default_network_configuration, dlna_hls_master_playlist_response,
+    dlna_hls_media_playlist_response, dlna_hls_segment_response, parse_subtitle_stream_query,
+    stream_media_item, subscribe_system_lifecycle_commands, subtitle_stream_response,
 };
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
@@ -726,6 +726,29 @@ pub(crate) async fn item_thumbnail_head(
         &item,
         false,
         DlnaThumbnailSizing::from_raw_query(raw_query.as_deref()),
+    )
+    .await
+}
+
+pub(crate) async fn item_subtitle_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id, index, format)): Path<(String, String, i64, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let query = parse_subtitle_stream_query(raw_query.as_deref());
+    subtitle_stream_response(
+        &state,
+        &headers,
+        SubtitleStreamRoute {
+            item_id: item_id.clone(),
+            media_source_id: item_id,
+            index,
+            start_position_ticks: 0,
+            format,
+        },
+        query,
     )
     .await
 }
@@ -3449,6 +3472,7 @@ fn append_didl_media_item(
     append_didl_subtitles(
         didl,
         item,
+        render_context.server_id,
         render_context.server_address,
         render_context.renderer_profile,
     );
@@ -3605,14 +3629,14 @@ fn append_didl_hls_transcode_resource(
 fn append_didl_subtitles(
     didl: &mut String,
     item: &MediaItem,
+    server_id: Uuid,
     server_address: &str,
     renderer_profile: DlnaRendererProfile,
 ) {
     for subtitle in dlna_subtitle_streams(item) {
         let url = format!(
-            "{}/Videos/{}/{}/Subtitles/{}/Stream.{}",
+            "{}/dlna/{server_id}/items/{}/subtitles/{}/stream.{}",
             server_address.trim_end_matches('/'),
-            item.id,
             item.id,
             subtitle.index,
             subtitle.format

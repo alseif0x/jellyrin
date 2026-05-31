@@ -534,6 +534,18 @@ pub fn router(state: AppState) -> Router {
             get(dlna::item_thumbnail).head(dlna::item_thumbnail_head),
         )
         .route(
+            "/Dlna/{server_id}/Items/{item_id}/Subtitles/{index}/Stream.{format}",
+            get(dlna::item_subtitle_stream),
+        )
+        .route(
+            "/Dlna/{server_id}/Items/{item_id}/Subtitles/{index}/stream.{format}",
+            get(dlna::item_subtitle_stream),
+        )
+        .route(
+            "/dlna/{server_id}/items/{item_id}/subtitles/{index}/stream.{format}",
+            get(dlna::item_subtitle_stream),
+        )
+        .route(
             "/System/Configuration/MetadataOptions/Default",
             get(default_metadata_options),
         )
@@ -21278,7 +21290,7 @@ struct SubtitlePlaylistQuery {
 }
 
 #[derive(Debug, Default)]
-struct SubtitleStreamQuery {
+pub(crate) struct SubtitleStreamQuery {
     _api_key: Option<String>,
     item_id: Option<String>,
     media_source_id: Option<String>,
@@ -21291,12 +21303,12 @@ struct SubtitleStreamQuery {
 }
 
 #[derive(Debug)]
-struct SubtitleStreamRoute {
-    item_id: String,
-    media_source_id: String,
-    index: i64,
-    start_position_ticks: i64,
-    format: String,
+pub(crate) struct SubtitleStreamRoute {
+    pub(crate) item_id: String,
+    pub(crate) media_source_id: String,
+    pub(crate) index: i64,
+    pub(crate) start_position_ticks: i64,
+    pub(crate) format: String,
 }
 
 async fn subtitle_playlist(
@@ -21406,7 +21418,7 @@ async fn subtitle_stream_with_ticks(
     .await
 }
 
-async fn subtitle_stream_response(
+pub(crate) async fn subtitle_stream_response(
     state: &AppState,
     _headers: &HeaderMap,
     route: SubtitleStreamRoute,
@@ -21582,7 +21594,7 @@ fn subtitle_add_vtt_time_map(output: Vec<u8>) -> Vec<u8> {
     output
 }
 
-fn parse_subtitle_stream_query(raw_query: Option<&str>) -> SubtitleStreamQuery {
+pub(crate) fn parse_subtitle_stream_query(raw_query: Option<&str>) -> SubtitleStreamQuery {
     let mut query = SubtitleStreamQuery::default();
     let Some(raw_query) = raw_query else {
         return query;
@@ -32305,6 +32317,13 @@ mod tests {
             .into_iter()
             .find(|item| item.name == "DLNA & Movie")
             .unwrap();
+        let subtitle_path = log_root.path().join("dlna-subtitle.vtt");
+        tokio::fs::write(
+            &subtitle_path,
+            b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nDLNA subtitle text\n",
+        )
+        .await
+        .unwrap();
         db.update_media_item_media_info(
             item.id,
             Some(90_000_000),
@@ -32327,9 +32346,10 @@ mod tests {
                 json!({
                     "Type": "Subtitle",
                     "Index": 2,
-                    "Codec": "subrip",
+                    "Codec": "webvtt",
                     "Language": "eng",
-                    "IsTextSubtitleStream": true
+                    "IsTextSubtitleStream": true,
+                    "Path": subtitle_path.to_string_lossy().to_string()
                 }),
             ],
         )
@@ -32394,8 +32414,8 @@ mod tests {
         );
         assert!(browse_response.contains(&thumbnail_url));
         let subtitle_url = format!(
-            "http://media.example.test:8097/Videos/{}/{}/Subtitles/2/Stream.vtt",
-            item.id, item.id
+            "http://media.example.test:8097/dlna/{server_id}/items/{}/subtitles/2/stream.vtt",
+            item.id
         );
         assert!(browse_response.contains("sec:CaptionInfoEx"));
         assert!(browse_response.contains("protocolInfo=&quot;http-get:*:text/vtt:*&quot;"));
@@ -32502,6 +32522,31 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], &primary_bytes[..4]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/subtitles/2/stream.vtt",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/vtt; charset=utf-8")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let subtitle = String::from_utf8(body.to_vec()).unwrap();
+        assert!(subtitle.contains("DLNA subtitle text"));
 
         let response = app
             .clone()
