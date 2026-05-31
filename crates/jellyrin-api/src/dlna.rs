@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
-    path::Path as FsPath,
+    path::{Path as FsPath, PathBuf},
     sync::{LazyLock, Mutex as StdMutex},
     time::{Duration as StdDuration, Instant},
 };
@@ -271,6 +271,160 @@ pub(crate) async fn media_stream_head(
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
     stream_media_item(item, &headers, false).await
+}
+
+pub(crate) async fn item_thumbnail(
+    State(state): State<AppState>,
+    Path((server_id, item_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    let item = state
+        .db
+        .media_item_by_id(item_id)
+        .await
+        .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
+    dlna_thumbnail_response(&state, &item, true).await
+}
+
+pub(crate) async fn item_thumbnail_head(
+    State(state): State<AppState>,
+    Path((server_id, item_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    let item = state
+        .db
+        .media_item_by_id(item_id)
+        .await
+        .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
+    dlna_thumbnail_response(&state, &item, false).await
+}
+
+async fn dlna_thumbnail_response(
+    state: &AppState,
+    item: &MediaItem,
+    include_body: bool,
+) -> Result<Response, ApiError> {
+    let (content_type, bytes) = match find_dlna_item_thumbnail(state, item).await? {
+        Some(path) => (dlna_image_content_type(&path), tokio::fs::read(path).await?),
+        None => ("image/png", ONE_BY_ONE_PNG.to_vec()),
+    };
+    let content_length = bytes.len().to_string();
+    let body = if include_body { bytes } else { Vec::new() };
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::CONTENT_LENGTH, content_length),
+            (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+async fn find_dlna_item_thumbnail(
+    state: &AppState,
+    item: &MediaItem,
+) -> Result<Option<PathBuf>, ApiError> {
+    if let Some(path) = find_dlna_stored_item_thumbnail(state, item).await? {
+        return Ok(Some(path));
+    }
+    find_dlna_local_item_thumbnail(item).await
+}
+
+async fn find_dlna_stored_item_thumbnail(
+    state: &AppState,
+    item: &MediaItem,
+) -> Result<Option<PathBuf>, ApiError> {
+    let base = state
+        .log_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(&state.log_dir)
+        .join("metadata")
+        .join("images")
+        .join("items");
+    for item_id in [item.id.to_string(), item.id.simple().to_string()] {
+        let dir = base.join(sanitize_dlna_image_path_segment(&item_id));
+        for extension in DLNA_IMAGE_EXTENSIONS {
+            let path = dir.join(format!("primary_0.{extension}"));
+            if tokio::fs::metadata(&path)
+                .await
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+            {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn find_dlna_local_item_thumbnail(item: &MediaItem) -> Result<Option<PathBuf>, ApiError> {
+    let Some(item_dir) = FsPath::new(&item.path).parent().map(FsPath::to_path_buf) else {
+        return Ok(None);
+    };
+    let canonical_dir = match tokio::fs::canonicalize(&item_dir).await {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    for stem in ["poster", "folder", "cover", "default", "movie", "thumb"] {
+        for extension in DLNA_IMAGE_EXTENSIONS {
+            let path = item_dir.join(format!("{stem}.{extension}"));
+            let canonical_path = match tokio::fs::canonicalize(&path).await {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if !canonical_path.starts_with(&canonical_dir) {
+                continue;
+            }
+            if tokio::fs::metadata(&canonical_path)
+                .await
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+            {
+                return Ok(Some(canonical_path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+const DLNA_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+fn dlna_image_content_type(path: &FsPath) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "image/png",
+    }
+}
+
+fn sanitize_dlna_image_path_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "image".to_string()
+    } else {
+        sanitized
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1509,9 +1663,11 @@ fn append_didl_media_item(
     didl.push_str("</dc:title><upnp:class>");
     didl.push_str(didl_item_class(item));
     didl.push_str("</upnp:class>");
+    append_didl_thumbnail(didl, item, server_id, server_address);
     if let Some(resource) = didl_resource(item, server_id, server_address) {
         didl.push_str(&resource);
     }
+    append_didl_subtitles(didl, item, server_address);
     didl.push_str("</item>");
 }
 
@@ -1525,7 +1681,9 @@ fn didl_prefix() -> String {
     concat!(
         "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ",
         "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" ",
-        "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">"
+        "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" ",
+        "xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\" ",
+        "xmlns:sec=\"http://www.sec.co.kr/\">"
     )
     .to_string()
 }
@@ -1603,6 +1761,106 @@ fn didl_resource(item: &MediaItem, server_id: Uuid, server_address: &str) -> Opt
         item.id
     );
     Some(format!("<res {attributes}>{}</res>", escape_xml(&url)))
+}
+
+fn append_didl_thumbnail(
+    didl: &mut String,
+    item: &MediaItem,
+    server_id: Uuid,
+    server_address: &str,
+) {
+    let url = format!(
+        "{}/dlna/{server_id}/items/{}/thumbnail.png",
+        server_address.trim_end_matches('/'),
+        item.id
+    );
+    didl.push_str("<upnp:albumArtURI dlna:profileID=\"PNG_TN\">");
+    didl.push_str(&escape_xml(&url));
+    didl.push_str("</upnp:albumArtURI>");
+}
+
+fn append_didl_subtitles(didl: &mut String, item: &MediaItem, server_address: &str) {
+    for subtitle in dlna_subtitle_streams(item) {
+        let url = format!(
+            "{}/Videos/{}/{}/Subtitles/{}/Stream.{}",
+            server_address.trim_end_matches('/'),
+            item.id,
+            item.id,
+            subtitle.index,
+            subtitle.format
+        );
+        didl.push_str("<res protocolInfo=\"http-get:*:");
+        didl.push_str(subtitle.mime_type);
+        didl.push_str(":*\">");
+        didl.push_str(&escape_xml(&url));
+        didl.push_str("</res>");
+        didl.push_str("<sec:CaptionInfoEx sec:type=\"");
+        didl.push_str(subtitle.format);
+        didl.push_str("\">");
+        didl.push_str(&escape_xml(&url));
+        didl.push_str("</sec:CaptionInfoEx>");
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DlnaSubtitleStream {
+    index: i64,
+    format: &'static str,
+    mime_type: &'static str,
+}
+
+fn dlna_subtitle_streams(item: &MediaItem) -> Vec<DlnaSubtitleStream> {
+    item.media_streams
+        .iter()
+        .filter(|stream| {
+            json_string_case_insensitive(stream, "Type")
+                .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+        })
+        .filter_map(|stream| {
+            let index = json_i64_case_insensitive(stream, "Index")?;
+            let codec = json_string_case_insensitive(stream, "Codec").unwrap_or_default();
+            let (format, mime_type) = dlna_subtitle_format(&codec)?;
+            Some(DlnaSubtitleStream {
+                index,
+                format,
+                mime_type,
+            })
+        })
+        .collect()
+}
+
+fn dlna_subtitle_format(codec: &str) -> Option<(&'static str, &'static str)> {
+    match codec.to_ascii_lowercase().as_str() {
+        "srt" | "subrip" | "ass" | "ssa" | "webvtt" | "vtt" => Some(("vtt", "text/vtt")),
+        _ => None,
+    }
+}
+
+fn json_field_case_insensitive<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+    value.as_object()?.iter().find_map(|(key, value)| {
+        if key.eq_ignore_ascii_case(field) {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn json_string_case_insensitive(value: &Value, field: &str) -> Option<String> {
+    let value = json_field_case_insensitive(value, field)?;
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn json_i64_case_insensitive(value: &Value, field: &str) -> Option<i64> {
+    let value = json_field_case_insensitive(value, field)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 fn dlna_container(item: &MediaItem) -> Option<&str> {

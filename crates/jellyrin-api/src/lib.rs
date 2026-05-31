@@ -461,6 +461,14 @@ pub fn router(state: AppState) -> Router {
             get(dlna::media_stream).head(dlna::media_stream_head),
         )
         .route(
+            "/Dlna/{server_id}/Items/{item_id}/thumbnail.png",
+            get(dlna::item_thumbnail).head(dlna::item_thumbnail_head),
+        )
+        .route(
+            "/dlna/{server_id}/items/{item_id}/thumbnail.png",
+            get(dlna::item_thumbnail).head(dlna::item_thumbnail_head),
+        )
+        .route(
             "/System/Configuration/MetadataOptions/Default",
             get(default_metadata_options),
         )
@@ -28458,6 +28466,7 @@ mod tests {
         }
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -28530,6 +28539,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/Users/{}/Views", viewer.id))
@@ -28646,6 +28656,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Sessions")
@@ -31607,6 +31618,31 @@ mod tests {
             .into_iter()
             .find(|item| item.name == "DLNA & Movie")
             .unwrap();
+        db.update_media_item_media_info(
+            item.id,
+            Some(90_000_000),
+            Some(1_500_000),
+            Some(1920),
+            Some(1080),
+            vec![
+                json!({
+                    "Type": "Video",
+                    "Index": 0,
+                    "Codec": "h264",
+                    "Width": 1920,
+                    "Height": 1080
+                }),
+                json!({
+                    "Type": "Subtitle",
+                    "Index": 2,
+                    "Codec": "subrip",
+                    "Language": "eng",
+                    "IsTextSubtitleStream": true
+                }),
+            ],
+        )
+        .await
+        .unwrap();
         let server_id = db.server_state().await.unwrap().server_id;
         let app = router(AppState {
             db,
@@ -31655,6 +31691,19 @@ mod tests {
         assert!(browse_response.contains("object.item.videoItem.movie"));
         assert!(browse_response.contains("protocolInfo=&quot;http-get:*:video/mp4:*&quot;"));
         assert!(browse_response.contains(&format!("size=&quot;{}&quot;", primary_bytes.len())));
+        assert!(browse_response.contains("upnp:albumArtURI"));
+        let thumbnail_url = format!(
+            "http://media.example.test:8097/dlna/{server_id}/items/{}/thumbnail.png",
+            item.id
+        );
+        assert!(browse_response.contains(&thumbnail_url));
+        let subtitle_url = format!(
+            "http://media.example.test:8097/Videos/{}/{}/Subtitles/2/Stream.vtt",
+            item.id, item.id
+        );
+        assert!(browse_response.contains("sec:CaptionInfoEx"));
+        assert!(browse_response.contains("protocolInfo=&quot;http-get:*:text/vtt:*&quot;"));
+        assert!(browse_response.contains(&subtitle_url));
         let resource_url = format!(
             "http://media.example.test:8097/dlna/{server_id}/items/{}/stream.mp4",
             item.id
@@ -31729,6 +31778,7 @@ mod tests {
         assert_eq!(&body[..], &primary_bytes[..4]);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::HEAD)
@@ -31749,6 +31799,27 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{}/thumbnail.png", item.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"\x89PNG"));
     }
 
     #[tokio::test]
