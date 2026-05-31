@@ -156,7 +156,7 @@ async function main() {
     throw new Error(`generated evidence is invalid:\n${errors.join('\n')}`);
   }
 
-  const outputPath = path.resolve(options.output || path.join(manualEvidenceDir, `device-${stamp(startedAt)}.json`));
+  const outputPath = resolveEvidenceOutputPath(options.output || path.join(manualEvidenceDir, `device-${stamp(startedAt)}.json`));
   await fs.mkdir(path.dirname(outputPath), { recursive: true });
   await fs.writeFile(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);
   console.log(JSON.stringify({
@@ -303,6 +303,18 @@ async function probeHlsFallback(baseUrl, serverId, itemId) {
 
 function resolvePlaylistUrl(line, playlistUrl) {
   return new URL(line.trim(), playlistUrl);
+}
+
+function resolveEvidenceOutputPath(value) {
+  const outputPath = path.resolve(value);
+  const relativeToManualEvidence = path.relative(manualEvidenceDir, outputPath);
+  if (relativeToManualEvidence.startsWith('..') || path.isAbsolute(relativeToManualEvidence)) {
+    throw new Error(`--output must stay under ${manualEvidenceDir} so npm run golden:dlna can count the evidence`);
+  }
+  if (path.extname(outputPath).toLowerCase() !== '.json') {
+    throw new Error('--output must be a .json evidence file');
+  }
+  return outputPath;
 }
 
 async function ssdpDiscover(serverId, timeoutMs) {
@@ -475,6 +487,29 @@ function selfTest() {
     'http://host/dlna/item/segments/00001.ts',
     'resolve root-relative segment URL',
   );
+  assertEqual(
+    resolveEvidenceOutputPath(path.join(manualEvidenceDir, 'device-self-test.json')),
+    path.join(manualEvidenceDir, 'device-self-test.json'),
+    'resolve evidence output path',
+  );
+  let outsideOutputFailed = false;
+  try {
+    resolveEvidenceOutputPath('/tmp/device-self-test.json');
+  } catch {
+    outsideOutputFailed = true;
+  }
+  if (!outsideOutputFailed) {
+    throw new Error('resolveEvidenceOutputPath should reject output outside manual evidence directory');
+  }
+  let nonJsonOutputFailed = false;
+  try {
+    resolveEvidenceOutputPath(path.join(manualEvidenceDir, 'device-self-test.txt'));
+  } catch {
+    nonJsonOutputFailed = true;
+  }
+  if (!nonJsonOutputFailed) {
+    throw new Error('resolveEvidenceOutputPath should reject non-json output');
+  }
   const escaped = browseItemBody('abc<&"');
   if (!escaped.includes('abc&lt;&amp;&quot;')) {
     throw new Error(`browseItemBody did not XML-escape ObjectID: ${escaped}`);
@@ -510,6 +545,7 @@ module.exports = {
   normalizeBaseUrl,
   parseArgs,
   probeHlsFallback,
+  resolveEvidenceOutputPath,
   resolvePlaylistUrl,
   sha256,
   summarizeDescriptor,
