@@ -6081,6 +6081,42 @@ mod tests {
         assert_eq!(stored["SystemUpdateID"], json!(update_id));
     }
 
+    #[tokio::test]
+    async fn dlna_system_update_id_survives_sqlite_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("dlna-restart.sqlite");
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
+
+        let first_db = Database::connect(&db_url).await.unwrap();
+        let first_update_id = notify_dlna_content_directory_changed(&first_db)
+            .await
+            .unwrap();
+        let first_stored = first_db
+            .named_configuration(DLNA_STATE_CONFIGURATION_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_stored["SystemUpdateID"], json!(first_update_id));
+        drop(first_db);
+
+        let reopened_db = Database::connect(&db_url).await.unwrap();
+        let restored = sync_dlna_system_update_id_from_db(&reopened_db)
+            .await
+            .unwrap();
+        assert!(restored >= first_update_id);
+        let next_update_id = notify_dlna_content_directory_changed(&reopened_db)
+            .await
+            .unwrap();
+        assert_eq!(next_update_id, restored.wrapping_add(1));
+
+        let reopened_stored = reopened_db
+            .named_configuration(DLNA_STATE_CONFIGURATION_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened_stored["SystemUpdateID"], json!(next_update_id));
+    }
+
     fn test_media_item(path: &str, media_type: &str) -> MediaItem {
         MediaItem {
             id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),

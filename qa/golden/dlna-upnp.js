@@ -125,6 +125,15 @@ const goldenCommands = [
     'test',
     '-p',
     'jellyrin-api',
+    'dlna_system_update_id_survives_sqlite_reopen',
+    '--',
+    '--nocapture',
+  ],
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
     'ssdp',
     '--',
     '--nocapture',
@@ -216,7 +225,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence, manualEvidence
     percent: deviceValidated ? 100 : localPercent,
     closed: deviceValidated,
     sourcePhase: passed
-      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.1d/E3.1e/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.2h/E3.2i/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.3g/E3.3h/E3.3i/E3.3j/E3.3k/E3.4b/E3.4c/E3.4d/E3.4e/E3.4f/E3.4g/E3.4h/E3.4i/E3.4j/E3.4k/E3.4l/E3.5a/E3.5b/E3.5c/E3.6a/E3.6b/E3.6c/E3.7a/E3.7b`
+      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.1d/E3.1e/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.2h/E3.2i/E3.2j/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.3g/E3.3h/E3.3i/E3.3j/E3.3k/E3.4b/E3.4c/E3.4d/E3.4e/E3.4f/E3.4g/E3.4h/E3.4i/E3.4j/E3.4k/E3.4l/E3.5a/E3.5b/E3.5c/E3.6a/E3.6b/E3.6c/E3.7a/E3.7b`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
@@ -229,7 +238,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence, manualEvidence
           eventsPassed
             ? 'The companion dlna-events golden validates real local TCP callback delivery for initial and follow-up GENA NOTIFY messages.'
             : 'The companion dlna-events golden has not been completed in the current generated evidence.',
-          'Existing focused coverage also verifies descriptors/SCPD with multi-size PNG iconList, MediaReceiverRegistrar SOAP with default-open behavior plus opt-in allow/deny policy by DeviceID, renderer family and peer IP/CIDR, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state, SOAP Browse/Search/GetProtocolInfo/PrepareForConnection/ConnectionComplete, advanced SearchCriteria handling including boolean, not, relational and common metadata/vendor fields, SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-artist-series-season-containers/thumbnails/subtitles with tokenless DLNA VTT stream routes, SSDP PublishedServerUriBySubnet LOCATION selection, configurable SSDP multicast joins from LocalNetworkAddresses, Jellyfin-like local artwork resolution, generated video-frame thumbnails, non-contradictory albumArtURI metadata, DLNA thumbnail profile metadata/contentFeatures, MaxWidth/MaxHeight thumbnail sizing negotiation through ffmpeg, DLNA image headers, generic profile hints, renderer header detection for VLC/Samsung/LG/Sony, metadata-gated AVC MP4 AAC DLNA.ORG_PN for Samsung/LG/Sony, conservative generic video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs, HLS fallback route contracts and Docker host-network DLNA packaging guidance.',
+          'Existing focused coverage also verifies descriptors/SCPD with multi-size PNG iconList, MediaReceiverRegistrar SOAP with default-open behavior plus opt-in allow/deny policy by DeviceID, renderer family and peer IP/CIDR, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state across SQLite reopen, SOAP Browse/Search/GetProtocolInfo/PrepareForConnection/ConnectionComplete, advanced SearchCriteria handling including boolean, not, relational and common metadata/vendor fields, SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-artist-series-season-containers/thumbnails/subtitles with tokenless DLNA VTT stream routes, SSDP PublishedServerUriBySubnet LOCATION selection, configurable SSDP multicast joins from LocalNetworkAddresses, Jellyfin-like local artwork resolution, generated video-frame thumbnails, non-contradictory albumArtURI metadata, DLNA thumbnail profile metadata/contentFeatures, MaxWidth/MaxHeight thumbnail sizing negotiation through ffmpeg, DLNA image headers, generic profile hints, renderer header detection for VLC/Samsung/LG/Sony, metadata-gated AVC MP4 AAC DLNA.ORG_PN for Samsung/LG/Sony, conservative generic video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs, HLS fallback route contracts and Docker host-network DLNA packaging guidance.',
           'Manual device evidence schema v3 requires the renderer/control-point run to prove iconList, thumbnail and tokenless subtitle route fetches in addition to discovery, Browse and playback.',
           deviceValidated
             ? `${deviceEvidence.validCount} real DLNA renderer/control-point evidence file(s) passed manual validation.`
@@ -259,7 +268,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence, manualEvidence
       'Browse covers root, virtual folders, physical directory hierarchy, direct media items and music album/artist plus TV series/season metadata containers; broader metadata-derived grouping still requires real renderer validation.',
       'ContentDirectory Search supports a broad practical subset of criteria including boolean, not, relational operators and common metadata/vendor fields; obscure renderer-specific SearchCriteria fields may still require device traces.',
       'Thumbnails advertise DLNA profile metadata/contentFeatures, support bounded MaxWidth/MaxHeight sizing locally and text subtitle links resolve through tokenless DLNA VTT routes; graphical subtitle support and real renderer-specific image sizing behavior remain pending.',
-      'SystemUpdateID is persisted in named configuration and restored into process state; full restart validation with a packaged service remains pending.',
+      'SystemUpdateID is persisted in named configuration, restored into process state and covered across SQLite reopen; full restart validation with a packaged service remains pending.',
       'MediaReceiverRegistrar supports optional allow/deny policy by DeviceID, renderer family and peer IP/CIDR while staying LAN-open by default for compatibility; real-device behavior remains pending.',
       'Renderer header detection and metadata-gated AVC MP4 AAC protocolInfo are implemented for Samsung/LG/Sony while VLC keeps generic tolerant DIDL; broader renderer-specific transcode policy and real-device profile validation remain pending.',
     ],
