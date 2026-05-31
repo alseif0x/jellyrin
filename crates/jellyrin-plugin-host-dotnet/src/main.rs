@@ -471,15 +471,15 @@ fn handle_invoke_capability(
             format!("Capability {} is not registered.", request.capability),
         );
     }
-    success(
-        envelope.correlation_id,
-        CapabilityResult {
-            value: json!({
+    let value = manifest_capability_handler(&plugin.manifest, &request.capability)
+        .map(|handler| execute_manifest_capability_handler(&request, handler))
+        .unwrap_or_else(|| {
+            json!({
                 "Status": "NotExecuted",
-                "Reason": "DotNet assembly execution is not wired in this milestone."
-            }),
-        },
-    )
+                "Reason": "DotNet assembly execution is not wired for this capability yet."
+            })
+        });
+    success(envelope.correlation_id, CapabilityResult { value })
 }
 
 fn handle_health(
@@ -569,6 +569,49 @@ fn manifest_capabilities(manifest: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn manifest_capability_handler<'a>(manifest: &'a Value, capability: &str) -> Option<&'a Value> {
+    let handlers = manifest
+        .get("CapabilityHandlers")
+        .or_else(|| manifest.get("Handlers"))?;
+    if let Some(handler) = handlers.get(capability) {
+        return Some(handler);
+    }
+    handlers.as_array()?.iter().find(|handler| {
+        handler
+            .get("Capability")
+            .or_else(|| handler.get("Name"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(capability))
+    })
+}
+
+fn execute_manifest_capability_handler(
+    request: &InvokeCapabilityRequest,
+    handler: &Value,
+) -> Value {
+    let mut result = handler
+        .get("Result")
+        .or_else(|| handler.get("Response"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !result.is_object() {
+        result = json!({ "Value": result });
+    }
+    result["Status"] = result
+        .get("Status")
+        .cloned()
+        .unwrap_or_else(|| json!("Executed"));
+    result["Capability"] = json!(request.capability);
+    if handler
+        .get("EchoArguments")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        result["Arguments"] = request.arguments.clone();
+    }
+    result
 }
 
 fn manifest_configuration(manifest: &Value) -> Value {
@@ -784,7 +827,15 @@ mod tests {
                         "ImageType": "Primary",
                         "Path": "logo.png",
                         "MimeType": "image/png"
-                    }]
+                    }],
+                    "CapabilityHandlers": {
+                        "MetadataProvider": {
+                            "EchoArguments": true,
+                            "Result": {
+                                "Provider": "DotNet Fixture"
+                            }
+                        }
+                    }
                 }),
                 permissions: Vec::new(),
             },
@@ -869,6 +920,27 @@ mod tests {
             response.result.as_ref().unwrap()["Base64Data"],
             general_purpose::STANDARD.encode(b"dotnet-image")
         );
+
+        let invoke = PluginRpcEnvelope::new(
+            "corr-invoke",
+            PluginRpcMethod::InvokeCapability,
+            InvokeCapabilityRequest {
+                plugin_id: "dotnet-fixture".to_string(),
+                capability: "MetadataProvider".to_string(),
+                arguments: json!({ "ItemId": "movie-1" }),
+                timeout_ms: 1000,
+            },
+        );
+        let response = client
+            .call::<_, Value>(&invoke, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        let value = &response.result.as_ref().unwrap()["Value"];
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], "MetadataProvider");
+        assert_eq!(value["Provider"], "DotNet Fixture");
+        assert_eq!(value["Arguments"]["ItemId"], "movie-1");
 
         let health = PluginRpcEnvelope::new("corr-health", PluginRpcMethod::Health, identity);
         let response = client
