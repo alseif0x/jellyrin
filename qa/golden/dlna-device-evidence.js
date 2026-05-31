@@ -13,6 +13,7 @@ const plansDir = process.env.JELLYRIN_PLANS_DIR || defaultPlansDir;
 const manualEvidenceDir = process.env.JELLYRIN_DLNA_DEVICE_EVIDENCE_DIR
   || path.join(plansDir, 'manual', 'dlna-upnp');
 const templatePath = path.join(manualEvidenceDir, 'template.json');
+const artifactsDir = path.join(manualEvidenceDir, 'artifacts');
 const allowedDeviceTypes = ['vlc', 'tv', 'console', 'upnp-control-point', 'renderer'];
 const allowedArtifactTypes = ['screenshot', 'client-log', 'server-log', 'packet-capture', 'screen-recording'];
 let currentCommitCache = null;
@@ -448,6 +449,11 @@ async function requireExistingArtifact(errors, pathOrUrl, index) {
     errors.push(`artifacts[${index}].pathOrUrl must stay under ${manualEvidenceDir}`);
     return;
   }
+  const relativeToArtifacts = path.relative(artifactsDir, artifactPath);
+  if (relativeToArtifacts.startsWith('..') || path.isAbsolute(relativeToArtifacts)) {
+    errors.push(`artifacts[${index}].pathOrUrl must stay under ${artifactsDir}`);
+    return;
+  }
   try {
     const stat = await fs.stat(artifactPath);
     if (!stat.isFile()) {
@@ -631,6 +637,15 @@ async function selfTest() {
     };
     await assertInvalid(outsideArtifact, 'artifacts[0].pathOrUrl must stay under');
 
+    const nonArtifactsDirArtifactPath = path.join(manualEvidenceDir, 'not-an-artifact.txt');
+    await fs.writeFile(nonArtifactsDirArtifactPath, 'not an artifact\n');
+    const outsideArtifactsDir = {
+      ...valid,
+      artifacts: [{ type: 'client-log', pathOrUrl: path.relative(plansDir, nonArtifactsDirArtifactPath) }],
+    };
+    await assertInvalid(outsideArtifactsDir, 'artifacts[0].pathOrUrl must stay under');
+    await fs.rm(nonArtifactsDirArtifactPath, { force: true });
+
     await fs.writeFile(emptyArtifactPath, '');
     const emptyArtifact = {
       ...valid,
@@ -643,6 +658,7 @@ async function selfTest() {
   } finally {
     await fs.rm(artifactPath, { force: true });
     await fs.rm(emptyArtifactPath, { force: true });
+    await fs.rm(path.join(manualEvidenceDir, 'not-an-artifact.txt'), { force: true });
   }
 }
 
