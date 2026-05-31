@@ -8213,11 +8213,61 @@ async fn try_activate_rust_wasi_plugin(
     activate_rust_wasi_plugin_with_host_path(db, plugin, actor_user_id, host_path).await
 }
 
+async fn try_activate_dotnet_plugin(
+    db: &Database,
+    plugin: &serde_json::Value,
+    actor_user_id: Option<Uuid>,
+) -> Result<bool, ApiError> {
+    let Some(host_path) = dotnet_host_binary_path() else {
+        return Ok(false);
+    };
+    activate_dotnet_plugin_with_host_path(db, plugin, actor_user_id, host_path).await
+}
+
 async fn activate_rust_wasi_plugin_with_host_path(
     db: &Database,
     plugin: &serde_json::Value,
     actor_user_id: Option<Uuid>,
     host_path: PathBuf,
+) -> Result<bool, ApiError> {
+    activate_plugin_with_host_path(
+        db,
+        plugin,
+        actor_user_id,
+        host_path,
+        PluginRuntime::RustWasi,
+        "RustWasi",
+        "RustWasi",
+    )
+    .await
+}
+
+async fn activate_dotnet_plugin_with_host_path(
+    db: &Database,
+    plugin: &serde_json::Value,
+    actor_user_id: Option<Uuid>,
+    host_path: PathBuf,
+) -> Result<bool, ApiError> {
+    activate_plugin_with_host_path(
+        db,
+        plugin,
+        actor_user_id,
+        host_path,
+        PluginRuntime::DotNetJellyfin,
+        "DotNetJellyfin",
+        "DotNet",
+    )
+    .await
+}
+
+async fn activate_plugin_with_host_path(
+    db: &Database,
+    plugin: &serde_json::Value,
+    actor_user_id: Option<Uuid>,
+    host_path: PathBuf,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
 ) -> Result<bool, ApiError> {
     let Some(plugin_id) = json_string_field(plugin, "Id") else {
         return Ok(false);
@@ -8232,13 +8282,15 @@ async fn activate_rust_wasi_plugin_with_host_path(
         return Ok(false);
     };
 
-    let mut client = PluginHostStdioClient::spawn(&mut Command::new(&host_path))
-        .map_err(|error| ApiError::internal(format!("RustWasi host failed to start: {error}")))?;
+    let mut client =
+        PluginHostStdioClient::spawn(&mut Command::new(&host_path)).map_err(|error| {
+            ApiError::internal(format!("{error_prefix} host failed to start: {error}"))
+        })?;
     let handshake = PluginRpcEnvelope::new(
         format!("{plugin_id}:handshake"),
         PluginRpcMethod::Handshake,
         HandshakeRequest {
-            runtime: PluginRuntime::RustWasi,
+            runtime: runtime.clone(),
             runtime_version: "0.1.0".to_string(),
             host_id: "jellyrin-api".to_string(),
             supported_protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION],
@@ -8248,7 +8300,9 @@ async fn activate_rust_wasi_plugin_with_host_path(
     let handshake_response = client
         .call::<_, HandshakeResponse>(&handshake, StdDuration::from_secs(5))
         .await
-        .map_err(|error| ApiError::internal(format!("RustWasi host handshake failed: {error}")))?;
+        .map_err(|error| {
+            ApiError::internal(format!("{error_prefix} host handshake failed: {error}"))
+        })?;
     let Some(handshake_result) = rpc_result(handshake_response)? else {
         return Ok(false);
     };
@@ -8260,7 +8314,7 @@ async fn activate_rust_wasi_plugin_with_host_path(
             plugin_id: plugin_id.clone(),
             name: json_string_field(plugin, "Name").unwrap_or_else(|| plugin_id.clone()),
             version: version.clone(),
-            runtime: PluginRuntime::RustWasi,
+            runtime: runtime.clone(),
             target_abi: json_string_field(plugin, "TargetAbi").unwrap_or_default(),
             install_path,
             manifest: manifest.clone(),
@@ -8270,7 +8324,7 @@ async fn activate_rust_wasi_plugin_with_host_path(
     let load_response = client
         .call::<_, LoadedPlugin>(&load, StdDuration::from_secs(5))
         .await
-        .map_err(|error| ApiError::internal(format!("RustWasi host load failed: {error}")))?;
+        .map_err(|error| ApiError::internal(format!("{error_prefix} host load failed: {error}")))?;
     let Some(loaded) = rpc_result(load_response)? else {
         return Ok(false);
     };
@@ -8286,7 +8340,9 @@ async fn activate_rust_wasi_plugin_with_host_path(
     let health_response = client
         .call::<_, PluginHealth>(&health, StdDuration::from_secs(5))
         .await
-        .map_err(|error| ApiError::internal(format!("RustWasi host health failed: {error}")))?;
+        .map_err(|error| {
+            ApiError::internal(format!("{error_prefix} host health failed: {error}"))
+        })?;
     let Some(health) = rpc_result(health_response)? else {
         return Ok(false);
     };
@@ -8294,7 +8350,7 @@ async fn activate_rust_wasi_plugin_with_host_path(
     db.upsert_plugin_runtime_instance(
         PluginRuntimeInstanceUpsert {
             plugin_id,
-            runtime: "RustWasi".to_string(),
+            runtime: runtime_name.to_string(),
             runtime_version: handshake_result.server_version,
             status: "Active".to_string(),
             process_id: None,
@@ -8330,19 +8386,22 @@ fn rpc_result<T>(
 }
 
 fn rust_wasi_host_binary_path() -> Option<PathBuf> {
-    std::env::var_os("JELLYRIN_PLUGIN_HOST_WASI")
+    plugin_host_binary_path("JELLYRIN_PLUGIN_HOST_WASI", "jellyrin-plugin-host-wasi")
+}
+
+fn dotnet_host_binary_path() -> Option<PathBuf> {
+    plugin_host_binary_path("JELLYRIN_PLUGIN_HOST_DOTNET", "jellyrin-plugin-host-dotnet")
+}
+
+fn plugin_host_binary_path(env_var: &str, binary_name: &str) -> Option<PathBuf> {
+    std::env::var_os(env_var)
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .or_else(|| {
             std::env::current_exe()
                 .ok()
                 .and_then(|path| path.parent().map(FsPath::to_path_buf))
-                .map(|dir| {
-                    dir.join(format!(
-                        "jellyrin-plugin-host-wasi{}",
-                        std::env::consts::EXE_SUFFIX
-                    ))
-                })
+                .map(|dir| dir.join(format!("{binary_name}{}", std::env::consts::EXE_SUFFIX)))
                 .filter(|path| path.is_file())
         })
 }
@@ -8378,6 +8437,12 @@ async fn enable_plugin(
     if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await?
         && json_string_field(&plugin, "Runtime").as_deref() == Some("RustWasi")
         && try_activate_rust_wasi_plugin(&state.db, &plugin, Some(user.id)).await?
+    {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await?
+        && json_string_field(&plugin, "Runtime").as_deref() == Some("DotNetJellyfin")
+        && try_activate_dotnet_plugin(&state.db, &plugin, Some(user.id)).await?
     {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -30677,15 +30742,15 @@ mod tests {
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun,
         PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
-        SystemLifecycleCommand, activate_rust_wasi_plugin_with_host_path,
-        await_package_install_cancelable, backup_restore_snapshot_json,
-        cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
-        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
-        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
-        ensure_package_install_not_cancelled, filter_package_list, format_time_for_json,
-        get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id,
-        json_string_field, json_value_i64, last_system_lifecycle_command,
+        SystemLifecycleCommand, activate_dotnet_plugin_with_host_path,
+        activate_rust_wasi_plugin_with_host_path, await_package_install_cancelable,
+        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
+        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
+        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
+        encoding_configuration_json, ensure_package_install_not_cancelled, filter_package_list,
+        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
         live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
         live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
@@ -31291,6 +31356,62 @@ mod tests {
         assert_eq!(plugin["RecentEvents"][0]["EventType"], "RuntimeStatus");
     }
 
+    #[tokio::test]
+    async fn dotnet_activation_uses_stdio_host_and_persists_runtime_state() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "66666666-6666-6666-6666-666666666666";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("Jellyfin.Plugin.Activatable.dll"), b"dll")
+            .await
+            .unwrap();
+        let host_path = fake_dotnet_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Activatable DotNet".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "DotNetJellyfin".to_string(),
+                target_abi: "12.0.0.0".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Activatable DotNet",
+                    "Runtime": "DotNetJellyfin"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Activatable DotNet",
+                    "Version": "1.0.0.0",
+                    "Runtime": "DotNetJellyfin",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["MetadataProvider"]
+                }),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_dotnet_plugin_with_host_path(&db, &plugin, None, host_path)
+                .await
+                .unwrap()
+        );
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert_eq!(plugin["Status"], "Active");
+        assert_eq!(plugin["RuntimeVersion"], "fake-dotnet-host-0.1");
+        assert_eq!(plugin["Health"]["Status"], "Healthy");
+        assert_eq!(plugin["Capabilities"][0], "MetadataProvider");
+        assert_eq!(plugin["RuntimeInstances"][0]["Status"], "Active");
+        assert_eq!(plugin["RecentEvents"][0]["EventType"], "RuntimeStatus");
+    }
+
     async fn fake_rust_wasi_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-wasi-host.sh");
         tokio::fs::write(
@@ -31310,6 +31431,48 @@ while IFS= read -r line; do
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"55555555-5555-5555-5555-555555555555","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    async fn fake_dotnet_host_script(root: &std::path::Path) -> PathBuf {
+        let path = root.join("fake-dotnet-host.sh");
+        tokio::fs::write(
+            &path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-dotnet-host","ServerVersion":"fake-dotnet-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"66666666-6666-6666-6666-666666666666","Runtime":"DotNetJellyfin","RuntimeVersion":"fake-dotnet-host-0.1","Status":"Healthy","Manifest":{"Name":"Activatable DotNet"},"Capabilities":["MetadataProvider"]}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"66666666-6666-6666-6666-666666666666","Runtime":"DotNetJellyfin","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
       ;;
     Shutdown)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
