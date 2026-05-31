@@ -395,6 +395,7 @@ async function captureTarget(browser, flowDir, target) {
       syncplayUnpause204: false,
       syncplayUnpauseFanout: false,
       syncplayGuestReconnectDeduped: false,
+      syncplayGuestLogoutRemoved: false,
       syncplayGuestLeft: false,
       syncplayOwnerLeft: false,
       syncplayCleanupConfirmed: false,
@@ -1285,16 +1286,31 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     guestToken = guestReconnectToken;
     summary.invariants.syncplayGuestReconnectDeduped = true;
 
-    const guestLeave = await browserFetchJson(page, {
+    const guestLogout = await browserFetchJson(page, {
       method: 'POST',
-      url: '/SyncPlay/Leave',
+      url: '/Sessions/Logout',
       token: guestToken,
       authorization: guestAuthorization,
     });
-    if (![200, 204].includes(guestLeave.status)) {
-      throw new Error(`SyncPlay/Leave guest returned HTTP ${guestLeave.status}`);
+    if (![200, 204].includes(guestLogout.status)) {
+      throw new Error(`Sessions/Logout guest returned HTTP ${guestLogout.status}`);
     }
+    const afterGuestLogout = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/SyncPlay/${encodeURIComponent(groupId)}`,
+      token: ownerToken,
+      authorization: ownerAuthorization,
+    });
+    const afterGuestLogoutParticipants = afterGuestLogout.json?.Participants || [];
+    if (afterGuestLogout.status !== 200 || afterGuestLogoutParticipants.length !== 1) {
+      throw new Error(`SyncPlay guest logout cleanup returned HTTP ${afterGuestLogout.status}`);
+    }
+    if (afterGuestLogoutParticipants.some((participant) => participant.UserName === guestName)) {
+      throw new Error('SyncPlay guest logout left the guest participant in the group');
+    }
+    summary.invariants.syncplayGuestLogoutRemoved = true;
     guestInGroup = false;
+    guestToken = null;
     summary.invariants.syncplayGuestLeft = true;
 
     const ownerLeave = await browserFetchJson(page, {
@@ -9089,6 +9105,7 @@ function invariantFailures(summary) {
       ['syncplayUnpause204', 'unpause command'],
       ['syncplayUnpauseFanout', 'unpause fanout'],
       ['syncplayGuestReconnectDeduped', 'guest reconnect dedupe'],
+      ['syncplayGuestLogoutRemoved', 'guest logout cleanup'],
       ['syncplayGuestLeft', 'guest leave'],
       ['syncplayOwnerLeft', 'owner leave'],
       ['syncplayCleanupConfirmed', 'group cleanup'],

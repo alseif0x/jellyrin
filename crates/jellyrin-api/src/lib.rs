@@ -5428,6 +5428,7 @@ async fn logout(
         Some(user.id),
     )
     .await?;
+    syncplay_remove_session(&token, "Leave").await;
     state.db.revoke_token(&token).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -9594,31 +9595,41 @@ async fn syncplay_leave(
     Query(query): Query<AuthQuery>,
 ) -> Result<StatusCode, ApiError> {
     let (_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    syncplay_remove_session(&token.access_token, "Leave").await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn syncplay_remove_session(session_id: &str, reason: &str) {
     let mut updates = Vec::new();
     {
         let mut groups = syncplay_groups().lock().await;
         let mut empty_groups = Vec::new();
         for group in groups.values_mut() {
-            if group.participants.remove(&token.access_token).is_some() {
-                group.updated_at = OffsetDateTime::now_utc();
-                if group.participants.is_empty() {
-                    empty_groups.push(group.id.clone());
-                } else {
-                    updates.push((
-                        syncplay_group_json(group),
-                        group.participants.keys().cloned().collect::<Vec<_>>(),
-                    ));
-                }
+            let Some(removed) = group.participants.remove(session_id) else {
+                continue;
+            };
+            group.updated_at = OffsetDateTime::now_utc();
+            if group.participants.is_empty() {
+                empty_groups.push(group.id.clone());
+                continue;
             }
+            if removed.user_id == group.owner_user_id
+                && let Some(next_owner) = group.participants.values().next()
+            {
+                group.owner_user_id = next_owner.user_id;
+            }
+            updates.push((
+                syncplay_group_json(group),
+                group.participants.keys().cloned().collect::<Vec<_>>(),
+            ));
         }
         for group_id in empty_groups {
             groups.remove(&group_id);
         }
     }
     for (group_json, participant_session_ids) in updates {
-        broadcast_syncplay_group_update(&participant_session_ids, &group_json, "Leave");
+        broadcast_syncplay_group_update(&participant_session_ids, &group_json, reason);
     }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn syncplay_ping(
@@ -41586,6 +41597,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn syncplay_logout_removes_participant_and_transfers_owner() {
+        syncplay_groups().lock().await.clear();
+        let group_id = Uuid::new_v4().to_string();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let owner = db
+            .update_first_user("owner".to_string(), "secret")
+            .await
+            .unwrap();
+        let owner_key = db
+            .issue_api_key_for_user(owner.id, &format!("syncplay-owner-{group_id}"))
+            .await
+            .unwrap();
+        let guest = db.create_user("guest", Some("secret")).await.unwrap();
+        let guest_key = db
+            .issue_api_key_for_user(guest.id, &format!("syncplay-guest-{group_id}"))
+            .await
+            .unwrap();
+        db.complete_startup_wizard().await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &owner_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Join")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut guest_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Logout")
+                    .header("X-Emby-Token", &owner_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let owner_logout_event =
+            next_playback_event_type(&mut guest_events, &guest_key, "SyncPlayGroupUpdate").await;
+        assert_eq!(owner_logout_event["Data"]["Reason"], "Leave");
+        let participants = owner_logout_event["Data"]["Group"]["Participants"]
+            .as_array()
+            .unwrap();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0]["UserName"], "guest");
+        assert_eq!(participants[0]["IsGroupOwner"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let group: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(group["Participants"].as_array().unwrap().len(), 1);
+        assert_eq!(group["Participants"][0]["IsGroupOwner"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Logout")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!syncplay_groups().lock().await.contains_key(&group_id));
     }
 
     #[tokio::test]
