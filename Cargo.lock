@@ -999,6 +999,7 @@ name = "jellyrin-plugin-host-dotnet"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "jellyrin-plugin-rpc",
  "serde",
  "serde_json",
@@ -1011,6 +1012,7 @@ name = "jellyrin-plugin-host-wasi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "jellyrin-plugin-rpc",
  "serde",
  "serde_json",

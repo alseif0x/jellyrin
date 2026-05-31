@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose};
 use jellyrin_plugin_rpc::{
-    CapabilityResult, DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES, HandshakeRequest, HandshakeResponse,
-    InvokeCapabilityRequest, LoadPluginRequest, LoadedPlugin, PLUGIN_RPC_PROTOCOL_VERSION,
-    PluginHealth, PluginHealthStatus, PluginIdentity, PluginRpcEnvelope, PluginRpcError,
-    PluginRpcErrorCode, PluginRpcMethod, PluginRpcResponse, PluginRuntime, decode_json_line,
-    encode_json_line,
+    CapabilityResult, DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES, EmbeddedImageRequest, HandshakeRequest,
+    HandshakeResponse, InvokeCapabilityRequest, LoadPluginRequest, LoadedPlugin,
+    PLUGIN_RPC_PROTOCOL_VERSION, PluginHealth, PluginHealthStatus, PluginIdentity,
+    PluginRpcEnvelope, PluginRpcError, PluginRpcErrorCode, PluginRpcMethod, PluginRpcResponse,
+    PluginRuntime, PluginWebPage, UpdateConfigurationRequest, decode_json_line, encode_json_line,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const HOST_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -18,6 +22,10 @@ const HOST_CAPABILITIES: &[&str] = &[
     "LoadPlugin",
     "UnloadPlugin",
     "GetManifest",
+    "GetConfiguration",
+    "UpdateConfiguration",
+    "ListWebPages",
+    "GetEmbeddedImage",
     "ListCapabilities",
     "InvokeCapability",
     "Health",
@@ -37,6 +45,7 @@ struct LoadedDotNetPlugin {
     version: String,
     install_path: String,
     manifest: Value,
+    configuration: Value,
     capabilities: Vec<String>,
 }
 
@@ -107,6 +116,10 @@ async fn handle_envelope(
         PluginRpcMethod::LoadPlugin => handle_load_plugin(state, envelope).await,
         PluginRpcMethod::UnloadPlugin => handle_unload_plugin(state, envelope),
         PluginRpcMethod::GetManifest => handle_get_manifest(state, envelope),
+        PluginRpcMethod::GetConfiguration => handle_get_configuration(state, envelope),
+        PluginRpcMethod::UpdateConfiguration => handle_update_configuration(state, envelope),
+        PluginRpcMethod::ListWebPages => handle_list_web_pages(state, envelope),
+        PluginRpcMethod::GetEmbeddedImage => handle_get_embedded_image(state, envelope).await,
         PluginRpcMethod::ListCapabilities => handle_list_capabilities(state, envelope),
         PluginRpcMethod::InvokeCapability => handle_invoke_capability(state, envelope),
         PluginRpcMethod::Health => handle_health(state, envelope),
@@ -114,14 +127,6 @@ async fn handle_envelope(
             state.shutting_down = true;
             success(envelope.correlation_id, json!({ "Status": "Stopped" }))
         }
-        PluginRpcMethod::GetConfiguration
-        | PluginRpcMethod::UpdateConfiguration
-        | PluginRpcMethod::ListWebPages
-        | PluginRpcMethod::GetEmbeddedImage => failure(
-            envelope.correlation_id,
-            PluginRpcErrorCode::UnsupportedMethod,
-            "DotNet host metadata-only milestone does not implement this method yet.",
-        ),
     }
 }
 
@@ -213,6 +218,7 @@ async fn handle_load_plugin(
         version: request.version.clone(),
         install_path: request.install_path.clone(),
         manifest: request.manifest.clone(),
+        configuration: manifest_configuration(&request.manifest),
         capabilities: capabilities.clone(),
     };
     state
@@ -277,6 +283,136 @@ fn handle_get_manifest(
         );
     };
     success(envelope.correlation_id, plugin.manifest.clone())
+}
+
+fn handle_get_configuration(
+    state: &DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let identity = match serde_json::from_value::<PluginIdentity>(envelope.payload) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get(&identity.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    success(envelope.correlation_id, plugin.configuration.clone())
+}
+
+fn handle_update_configuration(
+    state: &mut DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let request = match serde_json::from_value::<UpdateConfigurationRequest>(envelope.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get_mut(&request.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    plugin.configuration = request.configuration;
+    success(envelope.correlation_id, plugin.configuration.clone())
+}
+
+fn handle_list_web_pages(
+    state: &DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let identity = match serde_json::from_value::<PluginIdentity>(envelope.payload) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get(&identity.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    success(envelope.correlation_id, manifest_web_pages(plugin))
+}
+
+async fn handle_get_embedded_image(
+    state: &DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let request = match serde_json::from_value::<EmbeddedImageRequest>(envelope.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get(&request.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    let Some(image) = manifest_embedded_image(&plugin.manifest, &request.image_type) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotFound,
+            format!("Embedded image {} is not registered.", request.image_type),
+        );
+    };
+    let Some(relative_path) = image.path.and_then(|path| safe_relative_path(&path)) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::InvalidRequest,
+            "Embedded image path is invalid.",
+        );
+    };
+    let image_path = Path::new(&plugin.install_path).join(relative_path);
+    let bytes = match tokio::fs::read(&image_path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::PluginNotFound,
+                format!("Embedded image could not be read: {error}"),
+            );
+        }
+    };
+    success(
+        envelope.correlation_id,
+        json!({
+            "PluginId": plugin.plugin_id,
+            "ImageType": request.image_type,
+            "MimeType": image.mime_type.unwrap_or_else(|| mime_type_for_path(&image_path).to_string()),
+            "Base64Data": general_purpose::STANDARD.encode(bytes)
+        }),
+    )
 }
 
 fn handle_list_capabilities(
@@ -435,6 +571,130 @@ fn manifest_capabilities(manifest: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn manifest_configuration(manifest: &Value) -> Value {
+    manifest
+        .get("Configuration")
+        .or_else(|| manifest.get("DefaultConfiguration"))
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn manifest_web_pages(plugin: &LoadedDotNetPlugin) -> Vec<PluginWebPage> {
+    plugin
+        .manifest
+        .get("WebPages")
+        .or_else(|| plugin.manifest.get("ConfigurationPages"))
+        .and_then(Value::as_array)
+        .map(|pages| {
+            pages
+                .iter()
+                .filter_map(|page| manifest_web_page(plugin, page))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn manifest_web_page(plugin: &LoadedDotNetPlugin, page: &Value) -> Option<PluginWebPage> {
+    let name = page.get("Name").and_then(Value::as_str)?.to_string();
+    let display_name = page
+        .get("DisplayName")
+        .and_then(Value::as_str)
+        .unwrap_or(&name)
+        .to_string();
+    let path = page
+        .get("Path")
+        .or_else(|| page.get("EmbeddedResourcePath"))
+        .and_then(Value::as_str)
+        .unwrap_or(&name)
+        .to_string();
+    Some(PluginWebPage {
+        plugin_id: plugin.plugin_id.clone(),
+        name,
+        display_name,
+        path,
+        enable_in_main_menu: page
+            .get("EnableInMainMenu")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+struct ManifestEmbeddedImage {
+    path: Option<String>,
+    mime_type: Option<String>,
+}
+
+fn manifest_embedded_image(
+    manifest: &Value,
+    requested_type: &str,
+) -> Option<ManifestEmbeddedImage> {
+    let images = manifest
+        .get("Images")
+        .or_else(|| manifest.get("EmbeddedImages"))?;
+    if let Some(array) = images.as_array() {
+        return array
+            .iter()
+            .find(|image| {
+                image
+                    .get("ImageType")
+                    .or_else(|| image.get("Type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|image_type| image_type.eq_ignore_ascii_case(requested_type))
+            })
+            .map(|image| ManifestEmbeddedImage {
+                path: image
+                    .get("Path")
+                    .or_else(|| image.get("File"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                mime_type: image
+                    .get("MimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+    }
+    images
+        .get(requested_type)
+        .and_then(Value::as_str)
+        .map(|path| ManifestEmbeddedImage {
+            path: Some(path.to_string()),
+            mime_type: None,
+        })
+}
+
+fn safe_relative_path(value: &str) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => safe.push(part),
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!safe.as_os_str().is_empty()).then_some(safe)
+}
+
+fn mime_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
 fn success<T: Serialize>(correlation_id: String, result: T) -> PluginRpcResponse<Value> {
     match serde_json::to_value(result) {
         Ok(value) => PluginRpcResponse::success(correlation_id, value),
@@ -467,6 +727,9 @@ mod tests {
         let plugin_dir = temp.path().join("plugin");
         tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
         tokio::fs::write(plugin_dir.join("Jellyfin.Plugin.Fixture.dll"), b"dll")
+            .await
+            .unwrap();
+        tokio::fs::write(plugin_dir.join("logo.png"), b"dotnet-image")
             .await
             .unwrap();
 
@@ -509,7 +772,19 @@ mod tests {
                 install_path: plugin_dir.to_string_lossy().to_string(),
                 manifest: json!({
                     "Name": "DotNet Fixture",
-                    "Capabilities": ["MetadataProvider"]
+                    "Capabilities": ["MetadataProvider"],
+                    "Configuration": { "Enabled": true },
+                    "WebPages": [{
+                        "Name": "dotnet-config",
+                        "DisplayName": "DotNet Config",
+                        "Path": "configuration.html",
+                        "EnableInMainMenu": true
+                    }],
+                    "Images": [{
+                        "ImageType": "Primary",
+                        "Path": "logo.png",
+                        "MimeType": "image/png"
+                    }]
                 }),
                 permissions: Vec::new(),
             },
@@ -525,14 +800,77 @@ mod tests {
             "MetadataProvider"
         );
 
-        let health = PluginRpcEnvelope::new(
-            "corr-health",
-            PluginRpcMethod::Health,
-            PluginIdentity {
+        let identity = PluginIdentity {
+            plugin_id: "dotnet-fixture".to_string(),
+            version: "1.0.0.0".to_string(),
+        };
+        let configuration = PluginRpcEnvelope::new(
+            "corr-config",
+            PluginRpcMethod::GetConfiguration,
+            identity.clone(),
+        );
+        let response = client
+            .call::<_, Value>(&configuration, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result.as_ref().unwrap()["Enabled"], true);
+
+        let update_configuration = PluginRpcEnvelope::new(
+            "corr-update-config",
+            PluginRpcMethod::UpdateConfiguration,
+            UpdateConfigurationRequest {
                 plugin_id: "dotnet-fixture".to_string(),
-                version: "1.0.0.0".to_string(),
+                configuration: json!({ "Enabled": false }),
             },
         );
+        let response = client
+            .call::<_, Value>(&update_configuration, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result.as_ref().unwrap()["Enabled"], false);
+
+        let pages = PluginRpcEnvelope::new(
+            "corr-pages",
+            PluginRpcMethod::ListWebPages,
+            identity.clone(),
+        );
+        let response = client
+            .call::<_, Value>(&pages, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            response.result.as_ref().unwrap()[0]["Name"],
+            "dotnet-config"
+        );
+        assert_eq!(
+            response.result.as_ref().unwrap()[0]["EnableInMainMenu"],
+            true
+        );
+
+        let image = PluginRpcEnvelope::new(
+            "corr-image",
+            PluginRpcMethod::GetEmbeddedImage,
+            EmbeddedImageRequest {
+                plugin_id: "dotnet-fixture".to_string(),
+                version: "1.0.0.0".to_string(),
+                image_type: "Primary".to_string(),
+            },
+        );
+        let response = client
+            .call::<_, Value>(&image, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result.as_ref().unwrap()["MimeType"], "image/png");
+        assert_eq!(
+            response.result.as_ref().unwrap()["Base64Data"],
+            general_purpose::STANDARD.encode(b"dotnet-image")
+        );
+
+        let health = PluginRpcEnvelope::new("corr-health", PluginRpcMethod::Health, identity);
         let response = client
             .call::<_, Value>(&health, std::time::Duration::from_secs(1))
             .await
@@ -551,7 +889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dotnet_host_rejects_missing_dll_and_unsupported_method() {
+    async fn dotnet_host_rejects_missing_dll_and_unloaded_configuration() {
         let temp = tempdir().unwrap();
         let plugin_dir = temp.path().join("plugin");
         tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
@@ -579,20 +917,20 @@ mod tests {
             PluginRpcErrorCode::PluginNotFound
         );
 
-        let unsupported = PluginRpcEnvelope::new(
+        let unloaded_config = PluginRpcEnvelope::new(
             "corr-config",
-            PluginRpcMethod::UpdateConfiguration,
-            serde_json::to_value(UpdateConfigurationRequest {
+            PluginRpcMethod::GetConfiguration,
+            serde_json::to_value(PluginIdentity {
                 plugin_id: "missing".to_string(),
-                configuration: json!({}),
+                version: "1.0.0.0".to_string(),
             })
             .unwrap(),
         );
-        let response = handle_envelope(&mut state, unsupported).await;
+        let response = handle_envelope(&mut state, unloaded_config).await;
         assert!(!response.ok);
         assert_eq!(
             response.error.as_ref().unwrap().code,
-            PluginRpcErrorCode::UnsupportedMethod
+            PluginRpcErrorCode::PluginNotLoaded
         );
     }
 }

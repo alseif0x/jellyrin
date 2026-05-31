@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 jellyrin-plugin-rpc = { path = "../jellyrin-plugin-rpc" }
 serde.workspace = true
 serde_json.workspace = true
