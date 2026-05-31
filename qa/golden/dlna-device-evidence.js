@@ -16,6 +16,7 @@ const templatePath = path.join(manualEvidenceDir, 'template.json');
 const artifactsDir = path.join(manualEvidenceDir, 'artifacts');
 const allowedDeviceTypes = ['vlc', 'tv', 'console', 'upnp-control-point', 'renderer'];
 const allowedArtifactTypes = ['screenshot', 'client-log', 'server-log', 'packet-capture', 'screen-recording'];
+const manualEvidenceMaxAgeMs = 30 * 24 * 60 * 60 * 1000;
 const artifactExtensionsByType = {
   screenshot: ['.png', '.jpg', '.jpeg', '.webp'],
   'client-log': ['.json', '.log', '.txt', '.har'],
@@ -128,9 +129,7 @@ async function validateManualDlnaEvidence(evidence) {
   for (const field of ['deviceName', 'deviceType', 'controlPointName', 'controlPointVersion', 'testedAt', 'tester', 'jellyrinBaseUrl', 'result']) {
     requireString(errors, evidence, field);
   }
-  if (evidence.testedAt && Number.isNaN(Date.parse(evidence.testedAt))) {
-    errors.push('testedAt must be an ISO-compatible date string');
-  }
+  validateTestedAt(errors, evidence.testedAt);
   if (evidence.result !== 'pass') {
     errors.push('result must be "pass"');
   }
@@ -442,6 +441,24 @@ function validateTranscodeFallback(errors, transcodeFallback) {
   }
 }
 
+function validateTestedAt(errors, testedAt) {
+  if (typeof testedAt !== 'string' || testedAt.trim() === '' || looksLikeTemplatePlaceholder(testedAt)) {
+    return;
+  }
+  const timestamp = Date.parse(testedAt);
+  if (Number.isNaN(timestamp)) {
+    errors.push('testedAt must be an ISO-compatible date string');
+    return;
+  }
+  const now = Date.now();
+  if (timestamp > now + 5 * 60 * 1000) {
+    errors.push('testedAt must not be in the future');
+  }
+  if (now - timestamp > manualEvidenceMaxAgeMs) {
+    errors.push('testedAt must be within the last 30 days');
+  }
+}
+
 async function requireExistingArtifact(errors, artifact, index) {
   const pathOrUrl = artifact.pathOrUrl;
   if (typeof pathOrUrl !== 'string' || pathOrUrl.trim() === '' || looksLikeTemplatePlaceholder(pathOrUrl)) {
@@ -604,6 +621,18 @@ async function selfTest() {
       server: { ...valid.server, commit: '0123456789abcdef0123456789abcdef01234567' },
     };
     await assertInvalid(staleCommit, 'server.commit must match current git HEAD');
+
+    const futureTestedAt = {
+      ...valid,
+      testedAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    };
+    await assertInvalid(futureTestedAt, 'testedAt must not be in the future');
+
+    const oldTestedAt = {
+      ...valid,
+      testedAt: '2020-01-01T00:00:00.000Z',
+    };
+    await assertInvalid(oldTestedAt, 'testedAt must be within the last 30 days');
 
     const loopbackBaseUrl = {
       ...valid,
