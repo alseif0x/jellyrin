@@ -6248,7 +6248,8 @@ async fn install_package(
     Query(query): Query<PackageQuery>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let (user, session_id) =
+        require_admin_session(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let mut package = package_infos_from_repositories(
         &state
             .db
@@ -6287,6 +6288,7 @@ async fn install_package(
     })?;
     update_package_install_task_progress(
         &state.db,
+        &session_id,
         run.id,
         PackageInstallTaskProgress {
             plugin_id: &plugin_id,
@@ -6299,19 +6301,21 @@ async fn install_package(
     )
     .await?;
     let install_result = async {
-        let artifact = prepare_plugin_package_artifact(
-            &state,
-            &plugin_id,
-            &version,
-            &package,
-            &selected_version,
-            &task_key,
-            run.id,
-        )
+        let artifact = prepare_plugin_package_artifact(PackageInstallArtifactRequest {
+            state: &state,
+            plugin_id: &plugin_id,
+            version: &version,
+            package: &package,
+            selected_version: &selected_version,
+            task_key: &task_key,
+            run_id: run.id,
+            session_id: &session_id,
+        })
         .await?;
         ensure_package_install_not_cancelled(&state.db, &task_key, run.id).await?;
         update_package_install_task_progress(
             &state.db,
+            &session_id,
             run.id,
             PackageInstallTaskProgress {
                 plugin_id: &plugin_id,
@@ -6347,24 +6351,47 @@ async fn install_package(
             .db
             .fail_task_run(run.id, &format!("{:#}", error.error))
             .await;
+        broadcast_package_task_event(
+            &session_id,
+            "PackageInstall",
+            &task_key,
+            run.id,
+            "Failed",
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Name": package_name,
+                "Version": version,
+                "Runtime": runtime,
+                "Operation": operation,
+                "Status": "Failed",
+                "Phase": "Failed",
+                "ErrorMessage": format!("{:#}", error.error)
+            }),
+        );
         return Err(error);
     }
+    let completed_result = serde_json::json!({
+        "PluginId": plugin_id.clone(),
+        "Name": package_name.clone(),
+        "Version": version.clone(),
+        "Runtime": runtime.clone(),
+        "Operation": operation.clone(),
+        "Status": "Installed",
+        "Phase": "Completed",
+        "ProgressPercentage": 100.0
+    });
     state
         .db
-        .complete_task_run(
-            run.id,
-            serde_json::json!({
-                "PluginId": plugin_id.clone(),
-                "Name": package_name.clone(),
-                "Version": version.clone(),
-                "Runtime": runtime.clone(),
-                "Operation": operation.clone(),
-                "Status": "Installed",
-                "Phase": "Completed",
-                "ProgressPercentage": 100.0
-            }),
-        )
+        .complete_task_run(run.id, completed_result.clone())
         .await?;
+    broadcast_package_task_event(
+        &session_id,
+        "PackageInstall",
+        &task_key,
+        run.id,
+        "Completed",
+        completed_result,
+    );
     let details = format!(
         "{package_name} {version} was registered with runtime status NotSupported ({operation})."
     );
@@ -6385,12 +6412,27 @@ async fn cancel_package_installation(
     Query(query): Query<AuthQuery>,
     Path(package_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (_user, session_id) =
+        require_admin_session(&state.db, &headers, query.api_key.as_deref()).await?;
     let task_key = package_install_task_key(&package_id);
     let _ = state
         .db
         .fail_current_task_run(&task_key, "Package installation cancelled.")
         .await?;
+    broadcast_package_task_event(
+        &session_id,
+        "PackageInstall",
+        &task_key,
+        Uuid::nil(),
+        "Failed",
+        serde_json::json!({
+            "PluginId": package_id,
+            "Status": "Cancelled",
+            "Phase": "Cancelled",
+            "ProgressPercentage": serde_json::Value::Null,
+            "ErrorMessage": "Package installation cancelled."
+        }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6426,22 +6468,28 @@ struct PackageInstallTaskProgress<'a> {
 
 async fn update_package_install_task_progress(
     db: &Database,
+    session_id: &str,
     run_id: Uuid,
     progress: PackageInstallTaskProgress<'_>,
 ) -> Result<(), ApiError> {
-    db.update_task_run_progress(
+    let result = serde_json::json!({
+        "PluginId": progress.plugin_id,
+        "Name": progress.name,
+        "Version": progress.version,
+        "Operation": progress.operation,
+        "Status": "Running",
+        "Phase": progress.phase,
+        "ProgressPercentage": progress.progress_percentage,
+    });
+    db.update_task_run_progress(run_id, result.clone()).await?;
+    broadcast_package_task_event(
+        session_id,
+        "PackageInstall",
+        &package_install_task_key(progress.plugin_id),
         run_id,
-        serde_json::json!({
-            "PluginId": progress.plugin_id,
-            "Name": progress.name,
-            "Version": progress.version,
-            "Operation": progress.operation,
-            "Status": "Running",
-            "Phase": progress.phase,
-            "ProgressPercentage": progress.progress_percentage,
-        }),
-    )
-    .await?;
+        "Running",
+        result,
+    );
     Ok(())
 }
 
@@ -6464,6 +6512,50 @@ fn package_task_run_json(run: &TaskRun) -> serde_json::Value {
         "ProgressPercentage": result.get("ProgressPercentage").cloned().unwrap_or(serde_json::Value::Null),
         "Result": result,
     })
+}
+
+async fn update_and_broadcast_package_task_progress(
+    db: &Database,
+    session_id: &str,
+    message_type: &str,
+    task_key: &str,
+    run_id: Uuid,
+    result: serde_json::Value,
+) -> Result<(), ApiError> {
+    db.update_task_run_progress(run_id, result.clone()).await?;
+    broadcast_package_task_event(
+        session_id,
+        message_type,
+        task_key,
+        run_id,
+        "Running",
+        result,
+    );
+    Ok(())
+}
+
+fn broadcast_package_task_event(
+    session_id: &str,
+    message_type: &str,
+    task_key: &str,
+    run_id: Uuid,
+    status: &str,
+    result: serde_json::Value,
+) {
+    broadcast_session_message(
+        session_id,
+        serde_json::json!({
+            "MessageType": message_type,
+            "Data": {
+                "Id": run_id.to_string(),
+                "Key": task_key,
+                "Status": status,
+                "Phase": result.get("Phase").cloned().unwrap_or(serde_json::Value::Null),
+                "ProgressPercentage": result.get("ProgressPercentage").cloned().unwrap_or(serde_json::Value::Null),
+                "Result": result,
+            }
+        }),
+    );
 }
 
 fn task_run_status_name(run: &TaskRun) -> &'static str {
@@ -6514,31 +6606,48 @@ fn parse_plugin_version_parts(version: &str) -> Vec<u64> {
         .collect()
 }
 
-async fn prepare_plugin_package_artifact(
-    state: &AppState,
-    plugin_id: &str,
-    version: &str,
-    package: &serde_json::Value,
-    selected_version: &serde_json::Value,
-    task_key: &str,
+struct PackageInstallArtifactRequest<'a> {
+    state: &'a AppState,
+    plugin_id: &'a str,
+    version: &'a str,
+    package: &'a serde_json::Value,
+    selected_version: &'a serde_json::Value,
+    task_key: &'a str,
     run_id: Uuid,
+    session_id: &'a str,
+}
+
+async fn prepare_plugin_package_artifact(
+    request: PackageInstallArtifactRequest<'_>,
 ) -> Result<serde_json::Value, ApiError> {
+    let PackageInstallArtifactRequest {
+        state,
+        plugin_id,
+        version,
+        package,
+        selected_version,
+        task_key,
+        run_id,
+        session_id,
+    } = request;
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     let Some(source_url) = plugin_package_source_url(package, selected_version) else {
-        state
-            .db
-            .update_task_run_progress(
-                run_id,
-                serde_json::json!({
-                    "PluginId": plugin_id,
-                    "Name": json_string_field(package, "Name").unwrap_or_default(),
-                    "Version": version,
-                    "Status": "Running",
-                    "Phase": "MetadataOnly",
-                    "ProgressPercentage": 80.0,
-                }),
-            )
-            .await?;
+        update_and_broadcast_package_task_progress(
+            &state.db,
+            session_id,
+            "PackageInstall",
+            task_key,
+            run_id,
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Name": json_string_field(package, "Name").unwrap_or_default(),
+                "Version": version,
+                "Status": "Running",
+                "Phase": "MetadataOnly",
+                "ProgressPercentage": 80.0,
+            }),
+        )
+        .await?;
         return Ok(serde_json::json!({
             "Mode": "metadata-only",
             "Reason": "Package version has no SourceUrl."
@@ -6566,105 +6675,117 @@ async fn prepare_plugin_package_artifact(
         tokio::fs::create_dir_all(parent).await?;
     }
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
-    state
-        .db
-        .update_task_run_progress(
-            run_id,
-            serde_json::json!({
-                "PluginId": plugin_id,
-                "Version": version,
-                "Status": "Running",
-                "Phase": "Downloading",
-                "ProgressPercentage": 25.0,
-                "SourceUrl": source_url.clone(),
-            }),
-        )
-        .await?;
+    update_and_broadcast_package_task_progress(
+        &state.db,
+        session_id,
+        "PackageInstall",
+        task_key,
+        run_id,
+        serde_json::json!({
+            "PluginId": plugin_id,
+            "Version": version,
+            "Status": "Running",
+            "Phase": "Downloading",
+            "ProgressPercentage": 25.0,
+            "SourceUrl": source_url.clone(),
+        }),
+    )
+    .await?;
     let bytes = read_plugin_package_source(&state.db, task_key, run_id, &source_url).await?;
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
-    state
-        .db
-        .update_task_run_progress(
-            run_id,
-            serde_json::json!({
-                "PluginId": plugin_id,
-                "Version": version,
-                "Status": "Running",
-                "Phase": "VerifyingChecksum",
-                "ProgressPercentage": 45.0,
-                "BytesDownloaded": bytes.len(),
-            }),
-        )
-        .await?;
+    update_and_broadcast_package_task_progress(
+        &state.db,
+        session_id,
+        "PackageInstall",
+        task_key,
+        run_id,
+        serde_json::json!({
+            "PluginId": plugin_id,
+            "Version": version,
+            "Status": "Running",
+            "Phase": "VerifyingChecksum",
+            "ProgressPercentage": 45.0,
+            "BytesDownloaded": bytes.len(),
+        }),
+    )
+    .await?;
     let checksum = verify_plugin_package_checksum(package, selected_version, &bytes)?;
-    state
-        .db
-        .update_task_run_progress(
-            run_id,
-            serde_json::json!({
-                "PluginId": plugin_id,
-                "Version": version,
-                "Status": "Running",
-                "Phase": "WritingArchive",
-                "ProgressPercentage": 55.0,
-            }),
-        )
-        .await?;
+    update_and_broadcast_package_task_progress(
+        &state.db,
+        session_id,
+        "PackageInstall",
+        task_key,
+        run_id,
+        serde_json::json!({
+            "PluginId": plugin_id,
+            "Version": version,
+            "Status": "Running",
+            "Phase": "WritingArchive",
+            "ProgressPercentage": 55.0,
+        }),
+    )
+    .await?;
     tokio::fs::write(&archive_path, bytes).await?;
 
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
-    state
-        .db
-        .update_task_run_progress(
-            run_id,
-            serde_json::json!({
-                "PluginId": plugin_id,
-                "Version": version,
-                "Status": "Running",
-                "Phase": "ListingArchive",
-                "ProgressPercentage": 65.0,
-            }),
-        )
-        .await?;
+    update_and_broadcast_package_task_progress(
+        &state.db,
+        session_id,
+        "PackageInstall",
+        task_key,
+        run_id,
+        serde_json::json!({
+            "PluginId": plugin_id,
+            "Version": version,
+            "Status": "Running",
+            "Phase": "ListingArchive",
+            "ProgressPercentage": 65.0,
+        }),
+    )
+    .await?;
     let entries = list_safe_zip_entries(&state.db, task_key, run_id, &archive_path).await?;
     if entries.is_empty() {
         let _ = tokio::fs::remove_file(&archive_path).await;
         return Err(ApiError::bad_request("Plugin package archive is empty"));
     }
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
-    state
-        .db
-        .update_task_run_progress(
-            run_id,
-            serde_json::json!({
-                "PluginId": plugin_id,
-                "Version": version,
-                "Status": "Running",
-                "Phase": "ExtractingArchive",
-                "ProgressPercentage": 75.0,
-                "EntryCount": entries.len(),
-            }),
-        )
-        .await?;
+    update_and_broadcast_package_task_progress(
+        &state.db,
+        session_id,
+        "PackageInstall",
+        task_key,
+        run_id,
+        serde_json::json!({
+            "PluginId": plugin_id,
+            "Version": version,
+            "Status": "Running",
+            "Phase": "ExtractingArchive",
+            "ProgressPercentage": 75.0,
+            "EntryCount": entries.len(),
+        }),
+    )
+    .await?;
     extract_zip_archive(&state.db, task_key, run_id, &archive_path, &staging_dir).await?;
 
     if let Err(error) = ensure_package_install_not_cancelled(&state.db, task_key, run_id).await {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         return Err(error);
     }
-    state
-        .db
-        .update_task_run_progress(
-            run_id,
-            serde_json::json!({
-                "PluginId": plugin_id,
-                "Version": version,
-                "Status": "Running",
-                "Phase": "Publishing",
-                "ProgressPercentage": 85.0,
-            }),
-        )
-        .await?;
+    update_and_broadcast_package_task_progress(
+        &state.db,
+        session_id,
+        "PackageInstall",
+        task_key,
+        run_id,
+        serde_json::json!({
+            "PluginId": plugin_id,
+            "Version": version,
+            "Status": "Running",
+            "Phase": "Publishing",
+            "ProgressPercentage": 85.0,
+        }),
+    )
+    .await?;
     if tokio::fs::try_exists(&install_dir).await? {
         if tokio::fs::try_exists(&rollback_dir).await? {
             tokio::fs::remove_dir_all(&rollback_dir).await?;
@@ -7180,7 +7301,8 @@ async fn refresh_package_repositories(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, session_id) =
+        require_admin_session(&state.db, &headers, query.api_key.as_deref()).await?;
     let run = state
         .db
         .start_task_run(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
@@ -7200,18 +7322,20 @@ async fn refresh_package_repositories(
         if repositories.is_empty() {
             repositories = default_plugin_repositories();
         }
-        state
-            .db
-            .update_task_run_progress(
-                run.id,
-                serde_json::json!({
-                    "Status": "Running",
-                    "Phase": "Preparing",
-                    "ProgressPercentage": 5.0,
-                    "RepositoryCount": repositories.len(),
-                }),
-            )
-            .await?;
+        update_and_broadcast_package_task_progress(
+            &state.db,
+            &session_id,
+            "PackageRepositoriesRefresh",
+            PACKAGE_REPOSITORIES_REFRESH_TASK_KEY,
+            run.id,
+            serde_json::json!({
+                "Status": "Running",
+                "Phase": "Preparing",
+                "ProgressPercentage": 5.0,
+                "RepositoryCount": repositories.len(),
+            }),
+        )
+        .await?;
 
         let refreshed_at = format_time_for_json(OffsetDateTime::now_utc());
         let mut refreshed_repositories = Vec::with_capacity(repositories.len());
@@ -7229,6 +7353,7 @@ async fn refresh_package_repositories(
                 refreshed_repositories.push(repository);
                 update_package_repository_refresh_progress(
                     &state.db,
+                    &session_id,
                     run.id,
                     PackageRepositoryRefreshProgress {
                         completed_repositories: index + 1,
@@ -7245,6 +7370,7 @@ async fn refresh_package_repositories(
 
             update_package_repository_refresh_progress(
                 &state.db,
+                &session_id,
                 run.id,
                 PackageRepositoryRefreshProgress {
                     completed_repositories: index,
@@ -7287,6 +7413,7 @@ async fn refresh_package_repositories(
             }
             update_package_repository_refresh_progress(
                 &state.db,
+                &session_id,
                 run.id,
                 PackageRepositoryRefreshProgress {
                     completed_repositories: index + 1,
@@ -7300,21 +7427,23 @@ async fn refresh_package_repositories(
             .await?;
         }
 
-        state
-            .db
-            .update_task_run_progress(
-                run.id,
-                serde_json::json!({
-                    "Status": "Running",
-                    "Phase": "PersistingCatalog",
-                    "ProgressPercentage": 95.0,
-                    "RepositoryCount": refreshed_urls.len() + failed_repositories.len() + skipped_repositories.len(),
-                    "PackageCount": total_packages,
-                    "FailedRepositoryCount": failed_repositories.len(),
-                    "SkippedRepositoryCount": skipped_repositories.len(),
-                }),
-            )
-            .await?;
+        update_and_broadcast_package_task_progress(
+            &state.db,
+            &session_id,
+            "PackageRepositoriesRefresh",
+            PACKAGE_REPOSITORIES_REFRESH_TASK_KEY,
+            run.id,
+            serde_json::json!({
+                "Status": "Running",
+                "Phase": "PersistingCatalog",
+                "ProgressPercentage": 95.0,
+                "RepositoryCount": refreshed_urls.len() + failed_repositories.len() + skipped_repositories.len(),
+                "PackageCount": total_packages,
+                "FailedRepositoryCount": failed_repositories.len(),
+                "SkippedRepositoryCount": skipped_repositories.len(),
+            }),
+        )
+        .await?;
         current_payloads.plugin_repositories = serde_json::Value::Array(refreshed_repositories);
         state
             .db
@@ -7340,11 +7469,34 @@ async fn refresh_package_repositories(
                 .db
                 .fail_task_run(run.id, &format!("{:#}", error.error))
                 .await;
+            broadcast_package_task_event(
+                &session_id,
+                "PackageRepositoriesRefresh",
+                PACKAGE_REPOSITORIES_REFRESH_TASK_KEY,
+                run.id,
+                "Failed",
+                serde_json::json!({
+                    "Status": "Failed",
+                    "Phase": "Failed",
+                    "ErrorMessage": format!("{:#}", error.error)
+                }),
+            );
             return Err(error);
         }
     };
 
-    state.db.complete_task_run(run.id, task_result).await?;
+    state
+        .db
+        .complete_task_run(run.id, task_result.clone())
+        .await?;
+    broadcast_package_task_event(
+        &session_id,
+        "PackageRepositoriesRefresh",
+        PACKAGE_REPOSITORIES_REFRESH_TASK_KEY,
+        run.id,
+        "Completed",
+        task_result,
+    );
     record_activity(
         &state.db,
         "Plugin repositories refreshed",
@@ -7385,13 +7537,18 @@ struct PackageRepositoryRefreshProgress<'a> {
 
 async fn update_package_repository_refresh_progress(
     db: &Database,
+    session_id: &str,
     run_id: Uuid,
     progress: PackageRepositoryRefreshProgress<'_>,
 ) -> Result<(), ApiError> {
     let progress_percentage = 10.0
         + ((progress.completed_repositories as f64 / progress.repository_count.max(1) as f64)
             * 80.0);
-    db.update_task_run_progress(
+    update_and_broadcast_package_task_progress(
+        db,
+        session_id,
+        "PackageRepositoriesRefresh",
+        PACKAGE_REPOSITORIES_REFRESH_TASK_KEY,
         run_id,
         serde_json::json!({
             "Status": "Running",
@@ -29957,6 +30114,19 @@ async fn require_admin(
     }
 }
 
+async fn require_admin_session(
+    db: &Database,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<(User, String), ApiError> {
+    let (user, token) = require_user(db, headers, query_token).await?;
+    if user.is_administrator {
+        Ok((user, token.access_token))
+    } else {
+        Err(ApiError::forbidden("Administrator access required"))
+    }
+}
+
 fn ensure_user_access(auth_user: &User, requested_user_id: Uuid) -> Result<(), ApiError> {
     if auth_user.id == requested_user_id || auth_user.is_administrator {
         Ok(())
@@ -31307,7 +31477,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
         let response = app
             .clone()
             .oneshot(
@@ -39926,6 +40095,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
+        let mut install_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -39939,6 +40109,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let install_running =
+            next_playback_event_type(&mut install_events, &api_key, "PackageInstall").await;
+        assert_eq!(
+            install_running["Data"]["Key"],
+            package_install_task_key("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(install_running["Data"]["Status"], "Running");
+        assert_eq!(
+            install_running["Data"]["Result"]["PluginId"],
+            "11111111-1111-1111-1111-111111111111"
+        );
 
         let response = app
             .clone()
@@ -39996,6 +40177,7 @@ mod tests {
             format!("file://{}", plugin_zip.to_string_lossy())
         );
 
+        let mut update_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -40056,6 +40238,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let update_completed = next_playback_event_type_with_status(
+            &mut update_events,
+            &api_key,
+            "PackageInstall",
+            "Completed",
+        )
+        .await;
+        assert_eq!(
+            update_completed["Data"]["Key"],
+            package_install_task_key("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(update_completed["Data"]["Result"]["Operation"], "Update");
+        assert_eq!(update_completed["Data"]["Result"]["Version"], "1.1.0.0");
 
         let package_task_key = package_install_task_key("11111111-1111-1111-1111-111111111111");
         assert!(
@@ -40511,6 +40706,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        let mut refresh_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -40524,6 +40720,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let refresh_running =
+            next_playback_event_type(&mut refresh_events, &api_key, "PackageRepositoriesRefresh")
+                .await;
+        assert_eq!(
+            refresh_running["Data"]["Key"],
+            PACKAGE_REPOSITORIES_REFRESH_TASK_KEY
+        );
+        assert_eq!(refresh_running["Data"]["Status"], "Running");
+        let refresh_completed = next_playback_event_type_with_status(
+            &mut refresh_events,
+            &api_key,
+            "PackageRepositoriesRefresh",
+            "Completed",
+        )
+        .await;
+        assert_eq!(refresh_completed["Data"]["Status"], "Completed");
+        assert_eq!(refresh_completed["Data"]["Result"]["PackageCount"], 1);
 
         let response = app
             .clone()
@@ -43483,6 +43696,26 @@ mod tests {
             }
         }
         panic!("no {message_type} playback websocket event for session {session_id}");
+    }
+
+    async fn next_playback_event_type_with_status(
+        receiver: &mut tokio::sync::broadcast::Receiver<super::PlaybackEvent>,
+        session_id: &str,
+        message_type: &str,
+        status: &str,
+    ) -> Value {
+        for _ in 0..40 {
+            let event = next_playback_event_type(receiver, session_id, message_type).await;
+            if event["Data"]["Status"]
+                .as_str()
+                .is_some_and(|value| value == status)
+            {
+                return event;
+            }
+        }
+        panic!(
+            "no {message_type} playback websocket event with status {status} for session {session_id}"
+        );
     }
 
     #[tokio::test]
