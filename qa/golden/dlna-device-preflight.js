@@ -45,6 +45,44 @@ async function main() {
   assertIncludes(scpd, '<name>Browse</name>', 'ContentDirectory Browse action');
   assertIncludes(scpd, '<name>Search</name>', 'ContentDirectory Search action');
 
+  const connectionManager = await postSoap(
+    new URL(`/dlna/${serverId}/connectionmanager/control`, baseUrl),
+    'urn:schemas-upnp-org:service:ConnectionManager:1',
+    'GetProtocolInfo',
+    '<u:GetProtocolInfo xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1" />',
+  );
+  assertIncludes(connectionManager, '<u:GetProtocolInfoResponse', 'ConnectionManager GetProtocolInfo response');
+  assertIncludes(connectionManager, '<Source>', 'ConnectionManager SourceProtocolInfo');
+  assertIncludes(connectionManager, 'http-get:*:video/mp4:', 'ConnectionManager video protocol info');
+
+  const registrarUrl = new URL(`/dlna/${serverId}/mediareceiverregistrar/control`, baseUrl);
+  const isAuthorized = await postSoap(
+    registrarUrl,
+    'urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1',
+    'IsAuthorized',
+    '<u:IsAuthorized xmlns:u="urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1"><DeviceID>uuid:jellyrin-preflight</DeviceID></u:IsAuthorized>',
+  );
+  assertIncludes(isAuthorized, '<u:IsAuthorizedResponse', 'MediaReceiverRegistrar IsAuthorized response');
+  assertIncludes(isAuthorized, '<Result>1</Result>', 'MediaReceiverRegistrar IsAuthorized result');
+
+  const isValidated = await postSoap(
+    registrarUrl,
+    'urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1',
+    'IsValidated',
+    '<u:IsValidated xmlns:u="urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1"><DeviceID>uuid:jellyrin-preflight</DeviceID></u:IsValidated>',
+  );
+  assertIncludes(isValidated, '<u:IsValidatedResponse', 'MediaReceiverRegistrar IsValidated response');
+  assertIncludes(isValidated, '<Result>1</Result>', 'MediaReceiverRegistrar IsValidated result');
+
+  const registerDevice = await postSoap(
+    registrarUrl,
+    'urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1',
+    'RegisterDevice',
+    '<u:RegisterDevice xmlns:u="urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1"><RegistrationReqMsg></RegistrationReqMsg></u:RegisterDevice>',
+  );
+  assertIncludes(registerDevice, '<u:RegisterDeviceResponse', 'MediaReceiverRegistrar RegisterDevice response');
+  assertIncludes(registerDevice, '<RegistrationRespMsg>', 'MediaReceiverRegistrar RegisterDevice payload');
+
   const draft = buildDraftEvidence({
     baseUrl,
     commit,
@@ -61,6 +99,12 @@ async function main() {
     commit,
     descriptor: descriptionUrl.toString(),
     iconBytes: icon.length,
+    soapChecks: [
+      'ConnectionManager.GetProtocolInfo',
+      'MediaReceiverRegistrar.IsAuthorized',
+      'MediaReceiverRegistrar.IsValidated',
+      'MediaReceiverRegistrar.RegisterDevice',
+    ],
     draftPath: path.relative(plansDir, outputPath),
     nextStep: 'Replace placeholders in the draft after VLC/TV discovery, playback, thumbnail and subtitle checks.',
   }, null, 2));
@@ -116,6 +160,29 @@ async function fetchBytes(url) {
     throw new Error(`GET ${url} failed with HTTP ${response.status}`);
   }
   return Buffer.from(await response.arrayBuffer());
+}
+
+async function postSoap(url, serviceType, action, body) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'text/xml; charset=utf-8',
+      soapaction: `"${serviceType}#${action}"`,
+    },
+    body: soapEnvelope(body),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`POST ${url} ${action} failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
+  }
+  return text;
+}
+
+function soapEnvelope(body) {
+  return `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>${body}</s:Body>
+</s:Envelope>`;
 }
 
 function requiredString(value, label) {
@@ -177,4 +244,5 @@ if (require.main === module) {
 module.exports = {
   buildDraftEvidence,
   normalizeBaseUrl,
+  soapEnvelope,
 };
