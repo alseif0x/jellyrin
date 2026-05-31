@@ -23,7 +23,7 @@ use axum::{
     extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Redirect},
-    routing::{delete, get, head, post},
+    routing::{any, delete, get, head, post},
 };
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
@@ -427,12 +427,28 @@ pub fn router(state: AppState) -> Router {
             post(dlna::content_directory_control),
         )
         .route(
+            "/Dlna/{server_id}/ContentDirectory/Events",
+            any(dlna::content_directory_events),
+        )
+        .route(
+            "/dlna/{server_id}/contentdirectory/events",
+            any(dlna::content_directory_events),
+        )
+        .route(
             "/Dlna/{server_id}/ConnectionManager/Control",
             post(dlna::connection_manager_control),
         )
         .route(
             "/dlna/{server_id}/connectionmanager/control",
             post(dlna::connection_manager_control),
+        )
+        .route(
+            "/Dlna/{server_id}/ConnectionManager/Events",
+            any(dlna::connection_manager_events),
+        )
+        .route(
+            "/dlna/{server_id}/connectionmanager/events",
+            any(dlna::connection_manager_events),
         )
         .route("/Dlna/{server_id}/icons/{file_name}", get(dlna::icon))
         .route("/dlna/{server_id}/icons/{file_name}", get(dlna::icon))
@@ -31378,6 +31394,12 @@ mod tests {
         assert!(description.contains(&format!(
             "http://media.example.test:8097/dlna/{server_id}/contentdirectory/contentdirectory.xml"
         )));
+        assert!(description.contains(&format!(
+            "http://media.example.test:8097/dlna/{server_id}/contentdirectory/events"
+        )));
+        assert!(description.contains(&format!(
+            "http://media.example.test:8097/dlna/{server_id}/connectionmanager/events"
+        )));
 
         let response = app
             .clone()
@@ -31672,6 +31694,186 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dlna_event_subscription_endpoints_follow_upnp_contract() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
+                    .header("CALLBACK", "<http://callback.example.test/events>")
+                    .header("NT", "upnp:event")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "EnableUPnP": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
+                    .header("CALLBACK", "<http://callback.example.test/events>")
+                    .header("NT", "upnp:event")
+                    .header("TIMEOUT", "Second-120")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sid = response
+            .headers()
+            .get("sid")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(sid.starts_with("uuid:"));
+        assert_eq!(
+            response
+                .headers()
+                .get("timeout")
+                .and_then(|value| value.to_str().ok()),
+            Some("Second-120")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/dlna/{server_id}/contentdirectory/events"))
+                    .header("SID", &sid)
+                    .header("TIMEOUT", "Second-240")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("sid")
+                .and_then(|value| value.to_str().ok()),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("timeout")
+                .and_then(|value| value.to_str().ok()),
+            Some("Second-240")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
+                    .header("SID", &sid)
+                    .header("NT", "upnp:event")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Events"))
+                    .header("SID", &sid)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Events"))
+                    .header("CALLBACK", "<https://callback.example.test/events>")
+                    .header("NT", "upnp:event")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("UNSUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
+                    .header("SID", &sid)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
+                    .header("SID", &sid)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
     }
 
     #[tokio::test]

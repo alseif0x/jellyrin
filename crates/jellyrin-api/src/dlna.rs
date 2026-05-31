@@ -1,7 +1,7 @@
 use axum::{
     body::Bytes as BodyBytes,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use jellyrin_core::{MediaItem, VirtualFolder};
@@ -11,6 +11,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::Path as FsPath,
+    sync::{LazyLock, Mutex as StdMutex},
     time::Duration as StdDuration,
 };
 use tokio::{net::UdpSocket, task::JoinHandle, time};
@@ -26,6 +27,8 @@ const SSDP_PORT: u16 = 1900;
 const SSDP_CACHE_SECONDS: u32 = 1800;
 const SSDP_NOTIFY_INTERVAL_SECONDS: u64 = 60;
 const SSDP_CONFIG_CHECK_SECONDS: u64 = 5;
+const UPNP_EVENT_DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
+const UPNP_EVENT_MAX_TIMEOUT_SECONDS: u64 = 7200;
 const UPNP_DEVICE_NS: &str = "urn:schemas-upnp-org:device-1-0";
 const DLNA_DEVICE_NS: &str = "urn:schemas-dlna-org:device-1-0";
 const UPNP_SERVICE_NS: &str = "urn:schemas-upnp-org:service-1-0";
@@ -36,6 +39,8 @@ const CONTENT_DIRECTORY_ID: &str = "urn:upnp-org:serviceId:ContentDirectory";
 const CONNECTION_MANAGER_ID: &str = "urn:upnp-org:serviceId:ConnectionManager";
 const UPNP_ROOT_DEVICE: &str = "upnp:rootdevice";
 const MEDIA_SERVER_DEVICE: &str = "urn:schemas-upnp-org:device:MediaServer:1";
+static DLNA_EVENT_SUBSCRIPTIONS: LazyLock<StdMutex<HashMap<String, DlnaEventSubscription>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 const DLNA_PROTOCOL_INFO: &str = concat!(
     "http-get:*:video/mpeg:*,",
     "http-get:*:video/mp4:*,",
@@ -205,6 +210,26 @@ pub(crate) async fn content_directory_control(
     ))
 }
 
+pub(crate) async fn content_directory_events(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    event_subscription_response(DlnaEventService::ContentDirectory, &method, &headers)
+}
+
+pub(crate) async fn connection_manager_events(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    event_subscription_response(DlnaEventService::ConnectionManager, &method, &headers)
+}
+
 pub(crate) async fn media_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -233,6 +258,151 @@ pub(crate) async fn media_stream_head(
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
     stream_media_item(item, &headers, false).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DlnaEventService {
+    ContentDirectory,
+    ConnectionManager,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DlnaEventSubscription {
+    service: DlnaEventService,
+}
+
+fn event_subscription_response(
+    service: DlnaEventService,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    match method.as_str() {
+        "SUBSCRIBE" => subscribe_event_response(service, headers),
+        "UNSUBSCRIBE" => unsubscribe_event_response(service, headers),
+        _ => Ok((StatusCode::METHOD_NOT_ALLOWED, BodyBytes::new()).into_response()),
+    }
+}
+
+fn subscribe_event_response(
+    service: DlnaEventService,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let timeout = requested_event_timeout(headers);
+    if let Some(sid) = event_header(headers, "sid") {
+        if event_header(headers, "callback").is_some() || event_header(headers, "nt").is_some() {
+            return Err(ApiError::bad_request(
+                "DLNA event renewal cannot include CALLBACK or NT",
+            ));
+        }
+        let sid = normalize_event_sid(&sid)?;
+        let mut subscriptions = dlna_event_subscriptions()?;
+        let Some(subscription) = subscriptions.get_mut(&sid) else {
+            return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+        };
+        if subscription.service != service {
+            return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+        }
+        return Ok(event_subscription_ok_response(&sid, timeout));
+    }
+
+    let callback = event_header(headers, "callback");
+    let nt = event_header(headers, "nt");
+    if callback
+        .as_deref()
+        .is_none_or(|callback| !valid_event_callback(callback))
+        || nt
+            .as_deref()
+            .is_none_or(|nt| !nt.eq_ignore_ascii_case("upnp:event"))
+    {
+        return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+    }
+
+    let sid = format!("uuid:{}", Uuid::new_v4());
+    dlna_event_subscriptions()?.insert(sid.clone(), DlnaEventSubscription { service });
+    Ok(event_subscription_ok_response(&sid, timeout))
+}
+
+fn unsubscribe_event_response(
+    service: DlnaEventService,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let Some(sid) = event_header(headers, "sid") else {
+        return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+    };
+    let sid = normalize_event_sid(&sid)?;
+    let mut subscriptions = dlna_event_subscriptions()?;
+    let Some(subscription) = subscriptions.get(&sid) else {
+        return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+    };
+    if subscription.service != service {
+        return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+    }
+    subscriptions.remove(&sid);
+    Ok((StatusCode::OK, BodyBytes::new()).into_response())
+}
+
+fn event_subscription_ok_response(sid: &str, timeout: u64) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::HeaderName::from_static("sid"), sid.to_string()),
+            (
+                header::HeaderName::from_static("timeout"),
+                format!("Second-{timeout}"),
+            ),
+            (header::CONTENT_LENGTH, "0".to_string()),
+        ],
+        BodyBytes::new(),
+    )
+        .into_response()
+}
+
+fn requested_event_timeout(headers: &HeaderMap) -> u64 {
+    event_header(headers, "timeout")
+        .and_then(|value| {
+            value
+                .strip_prefix("Second-")
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .map(|seconds| seconds.clamp(1, UPNP_EVENT_MAX_TIMEOUT_SECONDS))
+        .unwrap_or(UPNP_EVENT_DEFAULT_TIMEOUT_SECONDS)
+}
+
+fn event_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn valid_event_callback(callback: &str) -> bool {
+    callback
+        .split('>')
+        .filter_map(|part| part.trim().strip_prefix('<'))
+        .any(|url| {
+            let url = url.trim();
+            url.starts_with("http://")
+        })
+}
+
+fn normalize_event_sid(sid: &str) -> Result<String, ApiError> {
+    let sid = sid.trim();
+    let uuid_value = sid
+        .strip_prefix("uuid:")
+        .or_else(|| sid.strip_prefix("UUID:"))
+        .ok_or_else(|| ApiError::bad_request("Invalid DLNA event SID"))?;
+    let uuid =
+        Uuid::parse_str(uuid_value).map_err(|_| ApiError::bad_request("Invalid DLNA event SID"))?;
+    Ok(format!("uuid:{uuid}"))
+}
+
+fn dlna_event_subscriptions()
+-> Result<std::sync::MutexGuard<'static, HashMap<String, DlnaEventSubscription>>, ApiError> {
+    DLNA_EVENT_SUBSCRIPTIONS
+        .lock()
+        .map_err(|_| ApiError::internal("DLNA event subscription lock poisoned"))
 }
 
 pub(crate) async fn upnp_enabled(db: &Database) -> Result<bool, ApiError> {
