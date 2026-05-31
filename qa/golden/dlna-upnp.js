@@ -48,6 +48,15 @@ const goldenCommands = [
     'test',
     '-p',
     'jellyrin-api',
+    'dlna_browse_music_album_metadata_groups_tracks_without_album_folders',
+    '--',
+    '--nocapture',
+  ],
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
     'ssdp',
     '--',
     '--nocapture',
@@ -127,10 +136,10 @@ function buildEvidence(result, discoveryEvidence) {
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? (discoveryPassed ? 94 : 93) : 87,
+    percent: passed ? (discoveryPassed ? 95 : 94) : 87,
     closed: false,
     sourcePhase: passed
-      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
+      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
@@ -140,7 +149,7 @@ function buildEvidence(result, discoveryEvidence) {
           discoveryPassed
             ? 'The companion dlna-discovery golden validates a real local UDP M-SEARCH round trip.'
             : 'The companion dlna-discovery golden has not been completed in the current generated evidence.',
-          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
+          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,
@@ -160,7 +169,7 @@ function buildEvidence(result, discoveryEvidence) {
     openRisks: [
       'Dashboard target remains device-validated; closing E3 still requires real renderer/VLC/TV validation on LAN.',
       'SSDP uses a single IPv4 socket on 0.0.0.0:1900; multi-interface binding and firewall/systemd packaging remain pending.',
-      'Browse covers root, virtual folders, physical directory hierarchy and direct media items; metadata-derived virtual grouping for albums/series without folders remains pending.',
+      'Browse covers root, virtual folders, physical directory hierarchy, direct media items and music album containers; broader metadata-derived grouping for series/artists without folders remains pending.',
       'ContentDirectory Search supports a practical subset of criteria; full UPnP SearchCriteria grammar remains pending.',
       'Thumbnails and text subtitle links are advertised; automatic video frame extraction and graphical subtitle support remain pending.',
       'SystemUpdateID is consistent across GENA and SOAP during process lifetime; persistence across server restart remains pending.',
