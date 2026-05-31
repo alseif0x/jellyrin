@@ -58,6 +58,15 @@ const goldenCommands = [
     'test',
     '-p',
     'jellyrin-api',
+    'dlna_thumbnail_resolver_matches_jellyfin_local_artwork_rules',
+    '--',
+    '--nocapture',
+  ],
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
     'dlna_video_thumbnail_generates_real_frame_with_ffmpeg',
     '--',
     '--nocapture',
@@ -160,10 +169,10 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? (discoveryPassed && eventsPassed ? 98 : discoveryPassed ? 97 : 96) : 87,
+    percent: passed ? (discoveryPassed && eventsPassed ? 99 : discoveryPassed ? 98 : 97) : 87,
     closed: false,
     sourcePhase: passed
-      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.2h/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.4f/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
+      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.2h/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.4f/E3.4g/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
@@ -176,7 +185,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
           eventsPassed
             ? 'The companion dlna-events golden validates real local TCP callback delivery for initial and follow-up GENA NOTIFY messages.'
             : 'The companion dlna-events golden has not been completed in the current generated evidence.',
-          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, generated video-frame thumbnails, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
+          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, Jellyfin-like local artwork resolution, generated video-frame thumbnails, non-contradictory albumArtURI metadata, DLNA image headers, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,
@@ -199,7 +208,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
       'SSDP uses a single IPv4 socket on 0.0.0.0:1900; multi-interface binding and firewall/systemd packaging remain pending.',
       'Browse covers root, virtual folders, physical directory hierarchy, direct media items and music album containers; broader metadata-derived grouping for series/artists without folders remains pending.',
       'ContentDirectory Search supports a practical subset of criteria; full UPnP SearchCriteria grammar remains pending.',
-      'Thumbnails and text subtitle links are advertised; graphical subtitle support and renderer-specific thumbnail profile quirks remain pending.',
+      'Thumbnails and text subtitle links are advertised; graphical subtitle support and renderer-specific image sizing/profile negotiation remain pending.',
       'SystemUpdateID is persisted in named configuration and restored into process state; full restart validation with a packaged service remains pending.',
       'MediaReceiverRegistrar is implemented as LAN-open under EnableUPnP; granular renderer authorization remains pending.',
       'Basic protocolInfo/profile hints and HLS fallback routes are implemented; renderer-specific Samsung/LG/Sony/VLC profile rules and video DLNA.ORG_PN codec/profile decisions remain pending.',

@@ -26609,7 +26609,7 @@ fn placeholder_png_response() -> axum::response::Response {
         .into_response()
 }
 
-enum ImageOwner<'a> {
+pub(crate) enum ImageOwner<'a> {
     Item(&'a str),
     User(&'a str),
     Branding,
@@ -27014,7 +27014,7 @@ async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response
     Ok((headers, bytes).into_response())
 }
 
-async fn find_stored_image(
+pub(crate) async fn find_stored_image(
     state: &AppState,
     owner: ImageOwner<'_>,
     image_type: &str,
@@ -27038,7 +27038,7 @@ async fn find_stored_image(
     Ok(None)
 }
 
-fn stored_image_owner_dir(state: &AppState, owner: ImageOwner<'_>) -> PathBuf {
+pub(crate) fn stored_image_owner_dir(state: &AppState, owner: ImageOwner<'_>) -> PathBuf {
     let base = state
         .log_dir
         .parent()
@@ -32141,6 +32141,7 @@ mod tests {
         assert!(browse_response.contains(&format!("&lt;item id=&quot;item:{}&quot;", item.id)));
         assert!(browse_response.contains("DLNA &amp;amp; Movie"));
         assert!(browse_response.contains("object.item.videoItem.movie"));
+        assert!(!browse_response.contains("PNG_TN"));
         assert!(browse_response.contains(
             "protocolInfo=&quot;http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS="
         ));
@@ -32404,8 +32405,199 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("image/png")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get("transfermode.dlna.org")
+                .and_then(|value| value.to_str().ok()),
+            Some("Interactive")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("realtimeinfo.dlna.org")
+                .and_then(|value| value.to_str().ok()),
+            Some("DLNA.ORG_TLAG=*")
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(b"\x89PNG"));
+    }
+
+    #[tokio::test]
+    async fn dlna_thumbnail_resolver_matches_jellyfin_local_artwork_rules() {
+        let media_root = tempfile::tempdir().unwrap();
+        let log_root = tempfile::tempdir().unwrap();
+        let tv_dir = media_root.path().join("tv").join("Show").join("Season 01");
+        let movie_dir = media_root.path().join("movies");
+        let music_dir = media_root.path().join("music");
+        let photo_dir = media_root.path().join("photos");
+        tokio::fs::create_dir_all(tv_dir.join("metadata"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&movie_dir).await.unwrap();
+        tokio::fs::create_dir_all(&music_dir).await.unwrap();
+        tokio::fs::create_dir_all(&photo_dir).await.unwrap();
+
+        let episode_jpeg = b"\xff\xd8\xff\xe0episode-thumb\xff\xd9";
+        let movie_webp = b"RIFF\x10\x00\x00\x00WEBPmovie-poster";
+        let album_png = b"\x89PNG\r\n\x1a\nalbumart";
+        let photo_jpeg = b"\xff\xd8\xff\xe0photo-primary\xff\xd9";
+        tokio::fs::write(tv_dir.join("Pilot.mp4"), b"fake episode")
+            .await
+            .unwrap();
+        tokio::fs::write(movie_dir.join("Mixed Movie.mp4"), b"fake movie")
+            .await
+            .unwrap();
+        tokio::fs::write(music_dir.join("Track One.mp3"), b"fake audio")
+            .await
+            .unwrap();
+        tokio::fs::write(photo_dir.join("Photo Sample.jpg"), photo_jpeg)
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        for (name, collection_type, dir) in [
+            ("TV", "tvshows", media_root.path().join("tv")),
+            ("Movies", "movies", movie_dir.clone()),
+            ("Music", "music", music_dir.clone()),
+            ("Photos", "photos", photo_dir.clone()),
+        ] {
+            let folder = db
+                .upsert_virtual_folder(
+                    name,
+                    Some(collection_type),
+                    vec![dir.to_string_lossy().to_string()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        }
+        tokio::fs::write(
+            tv_dir.join("metadata").join("Pilot-thumb.jpg"),
+            episode_jpeg,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(movie_dir.join("Mixed Movie-poster.webp"), movie_webp)
+            .await
+            .unwrap();
+        tokio::fs::write(music_dir.join("albumart.png"), album_png)
+            .await
+            .unwrap();
+        let items = db.media_items().await.unwrap();
+        let item_id = |name: &str| {
+            items
+                .iter()
+                .find(|item| item.name == name)
+                .unwrap_or_else(|| panic!("missing {name}; items={items:?}"))
+                .id
+        };
+        let episode_id = item_id("Pilot");
+        let movie_id = item_id("Mixed Movie");
+        let track_id = item_id("Track One");
+        let photo_id = item_id("Photo Sample");
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: log_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{episode_id}/thumbnail.png"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/jpeg")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], episode_jpeg);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{movie_id}/thumbnail.png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/webp")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], movie_webp);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{track_id}/thumbnail.png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], album_png);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{photo_id}/thumbnail.png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("transfermode.dlna.org")
+                .and_then(|value| value.to_str().ok()),
+            Some("Interactive")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], photo_jpeg);
     }
 
     #[tokio::test]

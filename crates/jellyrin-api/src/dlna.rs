@@ -23,7 +23,7 @@ use tokio::{net::UdpSocket, process::Command, task::JoinHandle, time};
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION,
+    ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION, ImageOwner,
     default_network_configuration, dlna_hls_master_playlist_response,
     dlna_hls_media_playlist_response, dlna_hls_segment_response, stream_media_item,
     subscribe_system_lifecycle_commands,
@@ -520,16 +520,16 @@ async fn dlna_thumbnail_response(
     };
     let content_length = bytes.len().to_string();
     let body = if include_body { bytes } else { Vec::new() };
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, content_type.to_string()),
-            (header::CONTENT_LENGTH, content_length),
-            (header::CACHE_CONTROL, "public, max-age=3600".to_string()),
-        ],
-        body,
-    )
-        .into_response())
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    headers.insert(header::CONTENT_LENGTH, content_length.parse().unwrap());
+    headers.insert(
+        header::CACHE_CONTROL,
+        "public, max-age=3600".parse().unwrap(),
+    );
+    headers.insert("transfermode.dlna.org", "Interactive".parse().unwrap());
+    headers.insert("realtimeinfo.dlna.org", "DLNA.ORG_TLAG=*".parse().unwrap());
+    Ok((StatusCode::OK, headers, body).into_response())
 }
 
 async fn find_dlna_item_thumbnail(
@@ -549,62 +549,137 @@ async fn find_dlna_stored_item_thumbnail(
     state: &AppState,
     item: &MediaItem,
 ) -> Result<Option<PathBuf>, ApiError> {
-    let base = dlna_item_image_base_dir(state);
     for item_id in [item.id.to_string(), item.id.simple().to_string()] {
-        let dir = base.join(sanitize_dlna_image_path_segment(&item_id));
-        for extension in DLNA_IMAGE_EXTENSIONS {
-            let path = dir.join(format!("primary_0.{extension}"));
-            if tokio::fs::metadata(&path)
-                .await
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false)
-            {
-                return Ok(Some(path));
-            }
+        if let Some(path) =
+            crate::find_stored_image(state, ImageOwner::Item(&item_id), "Primary", 0).await?
+        {
+            return Ok(Some(path));
         }
     }
     Ok(None)
 }
 
-fn dlna_item_image_base_dir(state: &AppState) -> PathBuf {
-    state
-        .log_dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(&state.log_dir)
-        .join("metadata")
-        .join("images")
-        .join("items")
+fn dlna_item_image_dir(state: &AppState, item_id: &str) -> PathBuf {
+    crate::stored_image_owner_dir(state, ImageOwner::Item(item_id))
 }
 
 async fn find_dlna_local_item_thumbnail(item: &MediaItem) -> Result<Option<PathBuf>, ApiError> {
-    let Some(item_dir) = FsPath::new(&item.path).parent().map(FsPath::to_path_buf) else {
+    let item_path = FsPath::new(&item.path);
+    let Some(item_dir) = item_path.parent().map(FsPath::to_path_buf) else {
         return Ok(None);
     };
     let canonical_dir = match tokio::fs::canonicalize(&item_dir).await {
         Ok(path) => path,
         Err(_) => return Ok(None),
     };
-    for stem in ["poster", "folder", "cover", "default", "movie", "thumb"] {
-        for extension in DLNA_IMAGE_EXTENSIONS {
-            let path = item_dir.join(format!("{stem}.{extension}"));
-            let canonical_path = match tokio::fs::canonicalize(&path).await {
-                Ok(path) => path,
-                Err(_) => continue,
-            };
-            if !canonical_path.starts_with(&canonical_dir) {
-                continue;
-            }
-            if tokio::fs::metadata(&canonical_path)
-                .await
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false)
-            {
-                return Ok(Some(canonical_path));
+
+    if item.media_type.eq_ignore_ascii_case("Photo")
+        && dlna_image_extension(item_path)
+        && let Some(path) = canonical_local_image_candidate(item_path, &canonical_dir).await?
+    {
+        return Ok(Some(path));
+    }
+
+    let stems = dlna_local_thumbnail_stems(item);
+    let directories = [item_dir.clone(), item_dir.join("metadata")];
+    for directory in directories {
+        for stem in &stems {
+            for extension in DLNA_IMAGE_EXTENSIONS {
+                let path = directory.join(format!("{stem}.{extension}"));
+                if let Some(path) = canonical_local_image_candidate(&path, &canonical_dir).await? {
+                    return Ok(Some(path));
+                }
             }
         }
     }
     Ok(None)
+}
+
+async fn canonical_local_image_candidate(
+    path: &FsPath,
+    canonical_root: &FsPath,
+) -> Result<Option<PathBuf>, ApiError> {
+    let canonical_path = match tokio::fs::canonicalize(path).await {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !canonical_path.starts_with(canonical_root) {
+        return Ok(None);
+    }
+    if tokio::fs::metadata(&canonical_path)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(Some(canonical_path));
+    }
+    Ok(None)
+}
+
+fn dlna_local_thumbnail_stems(item: &MediaItem) -> Vec<String> {
+    let mut stems = Vec::new();
+    let path = FsPath::new(&item.path);
+    let file_stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty());
+
+    if let Some(file_stem) = file_stem {
+        if item.media_type.eq_ignore_ascii_case("Video") {
+            push_unique_dlna_stem(&mut stems, file_stem);
+            push_unique_dlna_stem(&mut stems, &format!("{file_stem}-poster"));
+            push_unique_dlna_stem(&mut stems, &format!("{file_stem}-folder"));
+        }
+        if dlna_item_is_episode(item) {
+            push_unique_dlna_stem(&mut stems, &format!("{file_stem}-thumb"));
+        }
+    }
+
+    if item.media_type.eq_ignore_ascii_case("Audio") {
+        for stem in ["folder", "poster", "cover", "jacket", "default", "albumart"] {
+            push_unique_dlna_stem(&mut stems, stem);
+        }
+    } else {
+        for stem in [
+            "poster",
+            "folder",
+            "cover",
+            "default",
+            "movie",
+            "landscape",
+            "thumb",
+        ] {
+            push_unique_dlna_stem(&mut stems, stem);
+        }
+    }
+
+    stems
+}
+
+fn push_unique_dlna_stem(stems: &mut Vec<String>, stem: &str) {
+    if !stems.iter().any(|existing| existing == stem) {
+        stems.push(stem.to_string());
+    }
+}
+
+fn dlna_item_is_episode(item: &MediaItem) -> bool {
+    item.media_type.eq_ignore_ascii_case("Video")
+        && item.collection_type.as_deref().is_some_and(|collection| {
+            matches!(
+                collection.to_ascii_lowercase().as_str(),
+                "tvshows" | "tvshow" | "series"
+            )
+        })
+}
+
+fn dlna_image_extension(path: &FsPath) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|candidate| {
+            DLNA_IMAGE_EXTENSIONS
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case(candidate))
+        })
 }
 
 async fn find_dlna_generated_video_thumbnail(
@@ -614,8 +689,8 @@ async fn find_dlna_generated_video_thumbnail(
     if !item.media_type.eq_ignore_ascii_case("Video") {
         return Ok(None);
     }
-    let dir = dlna_item_image_base_dir(state)
-        .join(sanitize_dlna_image_path_segment(&item.id.to_string()));
+    let item_id = item.id.to_string();
+    let dir = dlna_item_image_dir(state, &item_id);
     let path = dir.join("dlna_frame_0.jpg");
     if tokio::fs::metadata(&path)
         .await
@@ -686,7 +761,7 @@ fn dlna_thumbnail_seek_seconds(item: &MediaItem) -> &'static str {
     }
 }
 
-const DLNA_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+const DLNA_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
 
 fn dlna_image_content_type(path: &FsPath) -> &'static str {
     match path
@@ -699,25 +774,8 @@ fn dlna_image_content_type(path: &FsPath) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
+        "bmp" => "image/bmp",
         _ => "image/png",
-    }
-}
-
-fn sanitize_dlna_image_path_segment(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                character.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "image".to_string()
-    } else {
-        sanitized
     }
 }
 
@@ -2436,7 +2494,7 @@ fn append_didl_thumbnail(
         server_address.trim_end_matches('/'),
         item.id
     );
-    didl.push_str("<upnp:albumArtURI dlna:profileID=\"PNG_TN\">");
+    didl.push_str("<upnp:albumArtURI>");
     didl.push_str(&escape_xml(&url));
     didl.push_str("</upnp:albumArtURI>");
 }
