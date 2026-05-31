@@ -994,6 +994,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jellyrin-plugin-rpc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "jellyrin-server"
 version = "0.1.0"
 dependencies = [

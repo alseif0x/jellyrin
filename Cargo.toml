@@ -4,6 +4,7 @@ members = [
     "crates/jellyrin-compat",
     "crates/jellyrin-core",
     "crates/jellyrin-db",
+    "crates/jellyrin-plugin-rpc",
     "crates/jellyrin-server",
     "crates/jellyrin-transcode",
 ]
