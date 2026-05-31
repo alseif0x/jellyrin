@@ -31800,6 +31800,31 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(b"\x89PNG"));
 
+        dlna::notify_dlna_content_directory_changed();
+        let expected_update_id = dlna::dlna_system_update_id();
+        let get_system_update_id = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:GetSystemUpdateID xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1" />
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(get_system_update_id))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let update_id_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(update_id_response.contains(&format!("<Id>{expected_update_id}</Id>")));
+
         let browse = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Body>
@@ -31831,6 +31856,7 @@ mod tests {
         assert!(browse_response.contains("<u:BrowseResponse"));
         assert!(browse_response.contains("&lt;dc:title&gt;Movies&lt;/dc:title&gt;"));
         assert!(browse_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(browse_response.contains(&format!("<UpdateID>{expected_update_id}</UpdateID>")));
 
         let protocol_info = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -32469,6 +32495,7 @@ mod tests {
         assert!(root_response.contains("<u:SearchResponse"));
         assert!(root_response.contains("<NumberReturned>2</NumberReturned>"));
         assert!(root_response.contains("<TotalMatches>2</TotalMatches>"));
+        assert!(root_response.contains("<UpdateID>"));
         assert!(root_response.contains("Match Movie"));
         assert!(root_response.contains("Nested Match"));
         assert!(!root_response.contains("Match Song"));

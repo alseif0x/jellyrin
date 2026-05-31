@@ -246,7 +246,7 @@ pub(crate) async fn content_directory_control(
     let response_body = match action.as_str() {
         "getsearchcapabilities" => "<SearchCaps>dc:title,upnp:class,@id</SearchCaps>".to_string(),
         "getsortcapabilities" => "<SortCaps>dc:title</SortCaps>".to_string(),
-        "getsystemupdateid" => "<Id>0</Id>".to_string(),
+        "getsystemupdateid" => format!("<Id>{}</Id>", dlna_system_update_id()),
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
         "browse" => {
             match browse_response(&state.db, &request, context.server_id, &server_address).await {
@@ -768,6 +768,10 @@ pub(crate) fn notify_dlna_content_directory_changed() {
     let body =
         event_property_set_xml_from_properties(vec![("SystemUpdateID", update_id.to_string())]);
     notify_event_subscribers(DlnaEventService::ContentDirectory, body);
+}
+
+pub(crate) fn dlna_system_update_id() -> u32 {
+    DLNA_SYSTEM_UPDATE_ID.load(Ordering::Relaxed)
 }
 
 fn notify_event_subscribers(service: DlnaEventService, body: String) {
@@ -1476,10 +1480,11 @@ async fn browse_response(
         BrowsePayload::empty()
     };
     Ok(format!(
-        "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>0</UpdateID>",
+        "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>{}</UpdateID>",
         escape_xml(&payload.didl),
         payload.number_returned,
-        payload.total_matches
+        payload.total_matches,
+        dlna_system_update_id()
     ))
 }
 
@@ -1511,10 +1516,11 @@ async fn search_response(
     let paged_items = paged_slice(&items, starting_index, requested_count);
     let didl = didl_search_media_items(paged_items, &folders, server_id, server_address);
     Ok(format!(
-        "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>0</UpdateID>",
+        "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>{}</UpdateID>",
         escape_xml(&didl),
         paged_items.len(),
-        total_matches
+        total_matches,
+        dlna_system_update_id()
     ))
 }
 
