@@ -170,6 +170,7 @@ async function validateManualDlnaEvidence(evidence) {
     }
     requireLanIpv4(errors, evidence.network.serverIp, 'network.serverIp');
     requireLanIpv4(errors, evidence.network.deviceIp, 'network.deviceIp');
+    requireDistinctIpv4(errors, evidence.network.serverIp, evidence.network.deviceIp, 'network.serverIp', 'network.deviceIp');
     requireUrl(errors, evidence.network, 'network.ssdpLocation', 'ssdpLocation');
     requireLanLocation(errors, evidence.network.ssdpLocation, 'network.ssdpLocation');
     requireLocationHostMatchesIp(errors, evidence.network.ssdpLocation, evidence.network.serverIp, 'network.ssdpLocation', 'network.serverIp');
@@ -366,6 +367,20 @@ function requireLanIpv4(errors, value, label) {
     [first, second, third, fourth].some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
   ) {
     errors.push(`${label} must be a LAN-reachable IPv4 address, not loopback, link-local, multicast, broadcast or unspecified`);
+  }
+}
+
+function requireDistinctIpv4(errors, firstIp, secondIp, firstLabel, secondLabel) {
+  if (
+    typeof firstIp !== 'string' ||
+    typeof secondIp !== 'string' ||
+    looksLikeTemplatePlaceholder(firstIp) ||
+    looksLikeTemplatePlaceholder(secondIp)
+  ) {
+    return;
+  }
+  if (net.isIP(firstIp) === 4 && net.isIP(secondIp) === 4 && firstIp === secondIp) {
+    errors.push(`${secondLabel} must be a different LAN device than ${firstLabel}`);
   }
 }
 
@@ -657,6 +672,12 @@ async function selfTest() {
       network: { ...valid.network, deviceIp: 'not-an-ip' },
     };
     await assertInvalid(invalidDeviceIp, 'network.deviceIp must be an IPv4 address');
+
+    const sameDeviceAndServerIp = {
+      ...valid,
+      network: { ...valid.network, deviceIp: valid.network.serverIp },
+    };
+    await assertInvalid(sameDeviceAndServerIp, 'network.deviceIp must be a different LAN device than network.serverIp');
 
     const loopbackSsdpLocation = {
       ...valid,
