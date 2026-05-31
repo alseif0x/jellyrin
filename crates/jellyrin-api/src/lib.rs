@@ -32971,6 +32971,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlna_thumbnail_sizing_negotiates_max_dimensions_with_ffmpeg() {
+        let media_root = tempfile::tempdir().unwrap();
+        let log_root = tempfile::tempdir().unwrap();
+        let movie_path = media_root.path().join("Sized Thumbnail Movie.mp4");
+        let poster_path = media_root.path().join("Sized Thumbnail Movie-poster.jpg");
+        tokio::fs::write(&movie_path, b"fake movie").await.unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Sized Thumbnail Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        let ffmpeg_output = tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=96x54:rate=1")
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-q:v")
+            .arg("2")
+            .arg(&poster_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            ffmpeg_output.status.success(),
+            "ffmpeg failed to generate DLNA thumbnail sizing fixture: {}",
+            String::from_utf8_lossy(&ffmpeg_output.stderr)
+        );
+        let item = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "Sized Thumbnail Movie")
+            .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: log_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/thumbnail.png?MaxWidth=32&MaxHeight=32",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("contentfeatures.dlna.org")
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "DLNA.ORG_PN=JPEG_TN;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+            )
+        );
+        let resized_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(resized_bytes.starts_with(&[0xff, 0xd8]));
+        let resized_path = log_root.path().join("resized-thumb.jpg");
+        tokio::fs::write(&resized_path, &resized_bytes)
+            .await
+            .unwrap();
+        let ffprobe_output = tokio::process::Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-select_streams")
+            .arg("v:0")
+            .arg("-show_entries")
+            .arg("stream=width,height")
+            .arg("-of")
+            .arg("csv=s=x:p=0")
+            .arg(&resized_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            ffprobe_output.status.success(),
+            "ffprobe failed to inspect resized DLNA thumbnail: {}",
+            String::from_utf8_lossy(&ffprobe_output.stderr)
+        );
+        let dimensions = String::from_utf8_lossy(&ffprobe_output.stdout);
+        let (width, height) = dimensions.trim().split_once('x').unwrap();
+        assert_eq!(width.parse::<u32>().unwrap(), 32);
+        assert!(
+            height.parse::<u32>().unwrap() <= 32,
+            "resized dimensions should fit max bounds, got {}",
+            dimensions.trim()
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/thumbnail.png?width=32&height=32",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok()),
+            Some(resized_bytes.len())
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
     async fn dlna_control_point_golden_direct_stream_and_real_hls_transcode() {
         let media_root = tempfile::tempdir().unwrap();
         let video_path = media_root.path().join("Golden DLNA Movie.mp4");

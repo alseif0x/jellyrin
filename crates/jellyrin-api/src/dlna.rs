@@ -1,7 +1,7 @@
 use axum::{
     Extension,
     body::Bytes as BodyBytes,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, RawQuery, State},
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -677,17 +677,31 @@ pub(crate) async fn media_hls_segment_head(
 pub(crate) async fn item_thumbnail(
     State(state): State<AppState>,
     Path((server_id, item_id)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError> {
     let item = dlna_media_item(&state, &server_id, &item_id).await?;
-    dlna_thumbnail_response(&state, &item, true).await
+    dlna_thumbnail_response(
+        &state,
+        &item,
+        true,
+        DlnaThumbnailSizing::from_raw_query(raw_query.as_deref()),
+    )
+    .await
 }
 
 pub(crate) async fn item_thumbnail_head(
     State(state): State<AppState>,
     Path((server_id, item_id)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiError> {
     let item = dlna_media_item(&state, &server_id, &item_id).await?;
-    dlna_thumbnail_response(&state, &item, false).await
+    dlna_thumbnail_response(
+        &state,
+        &item,
+        false,
+        DlnaThumbnailSizing::from_raw_query(raw_query.as_deref()),
+    )
+    .await
 }
 
 async fn dlna_media_item(
@@ -708,9 +722,21 @@ async fn dlna_thumbnail_response(
     state: &AppState,
     item: &MediaItem,
     include_body: bool,
+    sizing: Option<DlnaThumbnailSizing>,
 ) -> Result<Response, ApiError> {
     let (content_type, bytes) = match find_dlna_item_thumbnail(state, item).await? {
-        Some(path) => (dlna_image_content_type(&path), tokio::fs::read(path).await?),
+        Some(path) => {
+            let content_type = dlna_image_content_type(&path);
+            match sizing {
+                Some(sizing) if dlna_thumbnail_sizing_supported(content_type) => {
+                    match resize_dlna_thumbnail(&path, sizing).await {
+                        Some(bytes) => ("image/jpeg", bytes),
+                        None => (content_type, tokio::fs::read(path).await?),
+                    }
+                }
+                _ => (content_type, tokio::fs::read(path).await?),
+            }
+        }
         None => ("image/png", ONE_BY_ONE_PNG.to_vec()),
     };
     let content_length = bytes.len().to_string();
@@ -732,6 +758,109 @@ async fn dlna_thumbnail_response(
         );
     }
     Ok((StatusCode::OK, headers, body).into_response())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DlnaThumbnailSizing {
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+}
+
+impl DlnaThumbnailSizing {
+    fn from_raw_query(raw_query: Option<&str>) -> Option<Self> {
+        let raw_query = raw_query?;
+        let mut sizing = Self {
+            max_width: None,
+            max_height: None,
+        };
+        for pair in raw_query.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next().unwrap_or_default();
+            let value = parts.next().unwrap_or_default();
+            let Some(value) = parse_dlna_thumbnail_dimension(value) else {
+                continue;
+            };
+            match key.to_ascii_lowercase().as_str() {
+                "maxwidth" | "width" => sizing.max_width = min_some(sizing.max_width, value),
+                "maxheight" | "height" => sizing.max_height = min_some(sizing.max_height, value),
+                _ => {}
+            }
+        }
+        if sizing.max_width.is_some() || sizing.max_height.is_some() {
+            Some(sizing)
+        } else {
+            None
+        }
+    }
+
+    fn ffmpeg_scale_filter(self) -> String {
+        match (self.max_width, self.max_height) {
+            (Some(width), Some(height)) => format!(
+                "scale=w='min(iw,{width})':h='min(ih,{height})':force_original_aspect_ratio=decrease"
+            ),
+            (Some(width), None) => format!("scale=w='min(iw,{width})':h=-2"),
+            (None, Some(height)) => format!("scale=w=-2:h='min(ih,{height})'"),
+            (None, None) => "scale=w=iw:h=ih".to_string(),
+        }
+    }
+}
+
+fn parse_dlna_thumbnail_dimension(value: &str) -> Option<u32> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| (1..=4096).contains(value))
+}
+
+fn min_some(current: Option<u32>, value: u32) -> Option<u32> {
+    Some(current.map_or(value, |current| current.min(value)))
+}
+
+fn dlna_thumbnail_sizing_supported(content_type: &str) -> bool {
+    matches!(
+        content_type,
+        "image/jpeg" | "image/png" | "image/webp" | "image/gif" | "image/bmp"
+    )
+}
+
+async fn resize_dlna_thumbnail(path: &FsPath, sizing: DlnaThumbnailSizing) -> Option<Vec<u8>> {
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(path)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg(sizing.ffmpeg_scale_filter())
+        .arg("-q:v")
+        .arg("4")
+        .arg("-f")
+        .arg("image2pipe")
+        .arg("-c:v")
+        .arg("mjpeg")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(512)
+            .collect::<String>();
+        tracing::warn!(
+            path = %path.display(),
+            status = %output.status,
+            stderr = %stderr,
+            "ffmpeg failed to resize DLNA thumbnail"
+        );
+        return None;
+    }
+    Some(output.stdout)
 }
 
 async fn find_dlna_item_thumbnail(
