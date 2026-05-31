@@ -6117,16 +6117,29 @@ async fn installed_plugins(
 async fn available_packages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<PackageListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(package_infos_from_repositories(
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let packages = package_infos_from_repositories(
         &state
             .db
             .system_configuration_payloads()
             .await?
             .plugin_repositories,
-    )))
+    );
+    Ok(Json(filter_package_list(packages, &query)))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PackageListQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "Runtime")]
+    runtime: Option<String>,
+    #[serde(alias = "TargetAbi")]
+    target_abi: Option<String>,
+    #[serde(alias = "ServerVersion")]
+    server_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6957,7 +6970,7 @@ fn default_plugin_repositories() -> Vec<serde_json::Value> {
 }
 
 fn package_infos_from_repositories(value: &serde_json::Value) -> Vec<serde_json::Value> {
-    let mut packages = BTreeMap::<String, serde_json::Value>::new();
+    let mut packages = Vec::<serde_json::Value>::new();
     let serde_json::Value::Array(repositories) = value else {
         return Vec::new();
     };
@@ -6973,14 +6986,142 @@ fn package_infos_from_repositories(value: &serde_json::Value) -> Vec<serde_json:
         };
         for package in repository_packages {
             if let Some(package) = normalize_package_info(package, repository_url.as_deref()) {
-                let key = json_string_field(&package, "Name")
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                packages.entry(key).or_insert(package);
+                if let Some(existing) = packages
+                    .iter_mut()
+                    .find(|existing| packages_should_merge(existing, &package))
+                {
+                    merge_package_info(existing, package);
+                } else {
+                    packages.push(package);
+                }
             }
         }
     }
-    packages.into_values().collect()
+    packages
+}
+
+fn packages_should_merge(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    let left_guid = json_string_field(left, "Guid");
+    let right_guid = json_string_field(right, "Guid");
+    match (left_guid.as_deref(), right_guid.as_deref()) {
+        (Some(left_guid), Some(right_guid)) => left_guid.eq_ignore_ascii_case(right_guid),
+        _ => {
+            let left_name = json_string_field(left, "Name");
+            let right_name = json_string_field(right, "Name");
+            left_name
+                .as_deref()
+                .zip(right_name.as_deref())
+                .is_some_and(|(left_name, right_name)| left_name.eq_ignore_ascii_case(right_name))
+        }
+    }
+}
+
+fn merge_package_info(existing: &mut serde_json::Value, package: serde_json::Value) {
+    if json_string_field(existing, "Guid").is_none()
+        && let Some(guid) = json_string_field(&package, "Guid")
+    {
+        existing["Guid"] = serde_json::json!(guid);
+    }
+    for field in [
+        "Overview",
+        "Description",
+        "Owner",
+        "Category",
+        "ImageUrl",
+        "ImagePath",
+    ] {
+        if json_string_field(existing, field).is_none()
+            && let Some(value) = json_string_field(&package, field)
+        {
+            existing[field] = serde_json::json!(value);
+        }
+    }
+
+    let mut versions = package_versions(existing);
+    for version in package_versions(&package) {
+        if !versions.iter().any(|existing| {
+            package_version_merge_key(existing) == package_version_merge_key(&version)
+        }) {
+            versions.push(version);
+        }
+    }
+    existing["Versions"] = serde_json::Value::Array(versions);
+}
+
+fn package_version_merge_key(version: &serde_json::Value) -> String {
+    let version_value =
+        json_string_field(version, "Version").unwrap_or_else(|| "0.0.0.0".to_string());
+    let runtime = package_version_runtime(version);
+    let target_abi = json_string_field(version, "TargetAbi").unwrap_or_default();
+    let source_url = json_string_field(version, "SourceUrl").unwrap_or_default();
+    let repository_url = json_string_field(version, "RepositoryUrl").unwrap_or_default();
+    format!(
+        "{}|{}|{}|{}|{}",
+        version_value.to_ascii_lowercase(),
+        runtime.to_ascii_lowercase(),
+        target_abi.to_ascii_lowercase(),
+        source_url.to_ascii_lowercase(),
+        repository_url.to_ascii_lowercase()
+    )
+}
+
+fn filter_package_list(
+    packages: Vec<serde_json::Value>,
+    query: &PackageListQuery,
+) -> Vec<serde_json::Value> {
+    packages
+        .into_iter()
+        .filter_map(|mut package| {
+            let versions = package_versions(&package)
+                .into_iter()
+                .filter(|version| package_version_matches_list_query(version, query))
+                .collect::<Vec<_>>();
+            if versions.is_empty() {
+                None
+            } else {
+                package["Versions"] = serde_json::Value::Array(versions);
+                Some(package)
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+fn package_version_matches_list_query(
+    version: &serde_json::Value,
+    query: &PackageListQuery,
+) -> bool {
+    let runtime_matches = query.runtime.as_ref().is_none_or(|runtime| {
+        package_version_runtime(version).eq_ignore_ascii_case(runtime.trim())
+    });
+    let target_abi_matches = query.target_abi.as_ref().is_none_or(|target_abi| {
+        json_string_field(version, "TargetAbi")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(target_abi.trim())
+    });
+    let server_version_matches = query
+        .server_version
+        .as_ref()
+        .is_none_or(|server_version| package_version_supports_server(version, server_version));
+    runtime_matches && target_abi_matches && server_version_matches
+}
+
+fn package_version_runtime(version: &serde_json::Value) -> String {
+    json_string_field(version, "Runtime").unwrap_or_else(|| "DotNetJellyfin".to_string())
+}
+
+fn package_version_supports_server(version: &serde_json::Value, server_version: &str) -> bool {
+    let Some(target_abi) = json_string_field(version, "TargetAbi") else {
+        return true;
+    };
+    if target_abi.trim().is_empty() {
+        return true;
+    }
+    if parse_plugin_version_parts(server_version).is_empty()
+        || parse_plugin_version_parts(&target_abi).is_empty()
+    {
+        return true;
+    }
+    compare_plugin_versions(server_version, &target_abi) != std::cmp::Ordering::Less
 }
 
 fn normalize_package_info(
@@ -7001,6 +7142,9 @@ fn normalize_package_info(
         json_string_field(value, "ImageUrl").or_else(|| json_string_field(value, "ThumbImage"));
     let image_path =
         json_string_field(value, "ImagePath").or_else(|| json_string_field(value, "Path"));
+    let runtime =
+        json_string_field(value, "Runtime").unwrap_or_else(|| "DotNetJellyfin".to_string());
+    let target_abi = json_string_field(value, "TargetAbi").unwrap_or_default();
     let versions = normalized_package_versions(value, repository_url);
     let mut package = serde_json::json!({
         "Name": name,
@@ -7009,6 +7153,8 @@ fn normalize_package_info(
         "Description": description,
         "Owner": owner,
         "Category": category,
+        "Runtime": runtime,
+        "TargetAbi": target_abi,
         "Versions": versions
     });
     if let Some(image_url) = image_url {
@@ -7027,30 +7173,47 @@ fn normalized_package_versions(
     let Some(versions) =
         json_field_case_insensitive(value, "Versions").and_then(serde_json::Value::as_array)
     else {
-        return vec![normalize_package_version(value, repository_url)];
+        return vec![normalize_package_version(value, value, repository_url)];
     };
     versions
         .iter()
-        .map(|version| normalize_package_version(version, repository_url))
+        .map(|version| normalize_package_version(version, value, repository_url))
         .collect()
 }
 
 fn normalize_package_version(
     value: &serde_json::Value,
+    package: &serde_json::Value,
     repository_url: Option<&str>,
 ) -> serde_json::Value {
     let version = json_string_field(value, "Version").unwrap_or_else(|| "0.0.0.0".to_string());
-    serde_json::json!({
+    let mut normalized = serde_json::json!({
         "Version": version,
         "Changelog": json_string_field(value, "Changelog").unwrap_or_default(),
         "SourceUrl": json_string_field(value, "SourceUrl")
             .or_else(|| json_string_field(value, "Url"))
             .or_else(|| repository_url.map(ToOwned::to_owned)),
         "Checksum": json_string_field(value, "Checksum"),
-        "TargetAbi": json_string_field(value, "TargetAbi").unwrap_or_default(),
+        "Runtime": json_string_field(value, "Runtime")
+            .or_else(|| json_string_field(package, "Runtime"))
+            .unwrap_or_else(|| "DotNetJellyfin".to_string()),
+        "TargetAbi": json_string_field(value, "TargetAbi")
+            .or_else(|| json_string_field(package, "TargetAbi"))
+            .unwrap_or_default(),
         "ImagePath": json_string_field(value, "ImagePath").or_else(|| json_string_field(value, "Path")),
         "Timestamp": json_string_field(value, "Timestamp"),
-    })
+    });
+    for field in ["RepositoryName", "RepositoryUrl"] {
+        if let Some(value) = json_string_field(value, field) {
+            normalized[field] = serde_json::json!(value);
+        }
+    }
+    if normalized["RepositoryUrl"].is_null()
+        && let Some(repository_url) = repository_url
+    {
+        normalized["RepositoryUrl"] = serde_json::json!(repository_url);
+    }
+    normalized
 }
 
 fn package_matches_query(package: &serde_json::Value, name: &str, query: &PackageQuery) -> bool {
@@ -7062,8 +7225,9 @@ fn package_matches_query(package: &serde_json::Value, name: &str, query: &Packag
     });
     let matches_repository = query.repository_url.as_ref().is_none_or(|repository_url| {
         package_versions(package).iter().any(|version| {
-            json_string_field(version, "SourceUrl")
-                .is_some_and(|source_url| source_url.eq_ignore_ascii_case(repository_url.trim()))
+            json_string_field(version, "RepositoryUrl")
+                .or_else(|| json_string_field(version, "SourceUrl"))
+                .is_some_and(|url| url.eq_ignore_ascii_case(repository_url.trim()))
         })
     });
     let matches_version = query.version.as_ref().is_none_or(|requested_version| {
@@ -29380,26 +29544,26 @@ mod tests {
         AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun,
-        PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
+        PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
         SystemLifecycleCommand, backup_restore_snapshot_json, cascade_delete_series_timer_timers,
         cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
         cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
         default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
-        encoding_configuration_json, ensure_package_install_not_cancelled, format_time_for_json,
-        get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id,
-        json_string_field, json_value_i64, last_system_lifecycle_command,
+        encoding_configuration_json, ensure_package_install_not_cancelled, filter_package_list,
+        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
         live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
         live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
-        package_install_task_key, paged_media_items, parse_authorization_token,
-        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs, plugin_package_operation,
-        reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
-        record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
-        run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
-        subscribe_playback_events, subscribe_system_lifecycle_commands,
-        syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        package_infos_from_repositories, package_install_task_key, paged_media_items,
+        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
+        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        plugin_package_operation, reconcile_live_tv_recordings_on_startup,
+        reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
+        reserve_live_tv_recording_start, router, run_due_live_tv_timers, series_timer_child_id,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
+        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
         validate_zip_entry_path, verify_plugin_package_checksum,
     };
     use crate::dlna;
@@ -29562,6 +29726,121 @@ mod tests {
             plugin_package_operation(Some(&previous), "1.2.0.0"),
             "Reinstall"
         );
+    }
+
+    #[test]
+    fn package_catalog_merges_duplicates_and_filters_incompatible_versions() {
+        let repositories = json!([
+            {
+                "Name": "Stable",
+                "Url": "https://repo.example/stable.json",
+                "Enabled": true,
+                "Packages": [{
+                    "Name": "Merged Plugin",
+                    "Guid": "44444444-4444-4444-4444-444444444444",
+                    "Versions": [
+                        {
+                            "Version": "1.0.0.0",
+                            "TargetAbi": "12.0.0.0",
+                            "SourceUrl": "https://repo.example/merged-1.zip"
+                        },
+                        {
+                            "Version": "2.0.0.0",
+                            "TargetAbi": "99.0.0.0",
+                            "SourceUrl": "https://repo.example/merged-2.zip"
+                        }
+                    ]
+                }]
+            },
+            {
+                "Name": "Beta",
+                "Url": "https://repo.example/beta.json",
+                "Enabled": true,
+                "Packages": [{
+                    "Name": "Merged Plugin Renamed",
+                    "Guid": "44444444-4444-4444-4444-444444444444",
+                    "Versions": [{
+                        "Version": "1.1.0.0",
+                        "TargetAbi": "11.0.0.0",
+                        "SourceUrl": "https://repo.example/merged-1.1.zip",
+                        "Runtime": "RustWasi"
+                    }]
+                }]
+            },
+            {
+                "Name": "Future",
+                "Url": "https://repo.example/future.json",
+                "Enabled": true,
+                "Packages": [{
+                    "Name": "Future Only Plugin",
+                    "Guid": "55555555-5555-5555-5555-555555555555",
+                    "Versions": [{
+                        "Version": "1.0.0.0",
+                        "TargetAbi": "99.0.0.0"
+                    }]
+                }]
+            },
+            {
+                "Name": "Disabled",
+                "Url": "https://repo.example/disabled.json",
+                "Enabled": false,
+                "Packages": [{
+                    "Name": "Disabled Plugin",
+                    "Guid": "66666666-6666-6666-6666-666666666666",
+                    "Versions": [{ "Version": "1.0.0.0" }]
+                }]
+            }
+        ]);
+
+        let packages = package_infos_from_repositories(&repositories);
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0]["Name"], "Merged Plugin");
+        assert_eq!(packages[0]["Guid"], "44444444-4444-4444-4444-444444444444");
+        let versions = packages[0]["Versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0]["Version"], "1.0.0.0");
+        assert_eq!(
+            versions[0]["RepositoryUrl"],
+            "https://repo.example/stable.json"
+        );
+        assert_eq!(versions[1]["Version"], "2.0.0.0");
+        assert_eq!(
+            versions[1]["RepositoryUrl"],
+            "https://repo.example/stable.json"
+        );
+        assert_eq!(versions[2]["Version"], "1.1.0.0");
+        assert_eq!(versions[2]["Runtime"], "RustWasi");
+        assert_eq!(
+            versions[2]["RepositoryUrl"],
+            "https://repo.example/beta.json"
+        );
+        assert_eq!(packages[1]["Name"], "Future Only Plugin");
+
+        let compatible = filter_package_list(
+            packages.clone(),
+            &PackageListQuery {
+                server_version: Some(COMPATIBLE_SERVER_VERSION.to_string()),
+                ..PackageListQuery::default()
+            },
+        );
+        assert_eq!(compatible.len(), 1);
+        assert_eq!(compatible[0]["Name"], "Merged Plugin");
+        let compatible_versions = compatible[0]["Versions"].as_array().unwrap();
+        assert_eq!(compatible_versions.len(), 2);
+        assert_eq!(compatible_versions[0]["Version"], "1.0.0.0");
+        assert_eq!(compatible_versions[1]["Version"], "1.1.0.0");
+
+        let rust_wasi = filter_package_list(
+            packages,
+            &PackageListQuery {
+                runtime: Some("RustWasi".to_string()),
+                ..PackageListQuery::default()
+            },
+        );
+        assert_eq!(rust_wasi.len(), 1);
+        assert_eq!(rust_wasi[0]["Name"], "Merged Plugin");
+        assert_eq!(rust_wasi[0]["Versions"].as_array().unwrap().len(), 1);
+        assert_eq!(rust_wasi[0]["Versions"][0]["Version"], "1.1.0.0");
     }
 
     #[tokio::test]
