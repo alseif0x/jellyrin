@@ -395,6 +395,7 @@ async function captureTarget(browser, flowDir, target) {
       syncplayUnpause204: false,
       syncplayUnpauseFanout: false,
       syncplayRaceSequenced: false,
+      syncplayDriftCorrection: false,
       syncplayGuestReconnectDeduped: false,
       syncplayStaleCleanup: false,
       syncplayGuestLogoutRemoved: false,
@@ -1324,6 +1325,43 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       }
     }
     summary.invariants.syncplayRaceSequenced = true;
+
+    const driftWhen = new Date(Date.now() - 2000).toISOString();
+    const drift = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Play',
+      token: ownerToken,
+      authorization: ownerAuthorization,
+      body: {
+        PositionTicks: 1_000_000,
+        When: driftWhen,
+      },
+    });
+    if (![200, 204].includes(drift.status)) {
+      throw new Error(`SyncPlay drift Play returned HTTP ${drift.status}`);
+    }
+    const stateAfterDrift = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/SyncPlay/${encodeURIComponent(groupId)}`,
+      token: ownerToken,
+      authorization: ownerAuthorization,
+    });
+    if (stateAfterDrift.status !== 200 || stateAfterDrift.json?.Participants?.length !== 2) {
+      throw new Error(`SyncPlay drift state returned HTTP ${stateAfterDrift.status}`);
+    }
+    if (target.name === 'jellyrin') {
+      const timeline = stateAfterDrift.json?.State?.Timeline || {};
+      if (timeline.ClientWhen !== driftWhen || timeline.IsCorrectionRequired !== true) {
+        throw new Error('SyncPlay drift correction did not preserve client timing');
+      }
+      if (Number(timeline.DriftTicks || 0) < 5_000_000) {
+        throw new Error(`SyncPlay drift ticks below threshold: ${timeline.DriftTicks}`);
+      }
+      if (Number(stateAfterDrift.json?.State?.CorrectionPositionTicks || 0) <= 1_000_000) {
+        throw new Error('SyncPlay correction position was not advanced from client position');
+      }
+    }
+    summary.invariants.syncplayDriftCorrection = true;
 
     const guestReconnectLogin = await browserFetchJson(page, {
       method: 'POST',
@@ -9241,6 +9279,7 @@ function invariantFailures(summary) {
       ['syncplayUnpause204', 'unpause command'],
       ['syncplayUnpauseFanout', 'unpause fanout'],
       ['syncplayRaceSequenced', 'race sequencing'],
+      ['syncplayDriftCorrection', 'drift correction'],
       ['syncplayGuestReconnectDeduped', 'guest reconnect dedupe'],
       ['syncplayStaleCleanup', 'stale cleanup'],
       ['syncplayGuestLogoutRemoved', 'guest logout cleanup'],

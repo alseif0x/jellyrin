@@ -68,6 +68,8 @@ const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 const SYNCPLAY_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
 const SYNCPLAY_STALE_TIMEOUT_MS: i64 = 120_000;
+const SYNCPLAY_TICKS_PER_SECOND: i64 = 10_000_000;
+const SYNCPLAY_DRIFT_THRESHOLD_TICKS: i64 = 5_000_000;
 const IMAGE_UPLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
@@ -9812,6 +9814,9 @@ fn syncplay_command_message_payload(
         "When": when,
         "EmittedAt": emitted_at,
         "CommandSequence": command_sequence,
+        "Timeline": group_json["State"]["Timeline"].clone(),
+        "DriftTicks": group_json["State"]["DriftTicks"].clone(),
+        "CorrectionPositionTicks": group_json["State"]["CorrectionPositionTicks"].clone(),
         "PositionTicks": position_ticks,
         "PlaylistItemId": playlist_item_id
     })
@@ -9864,6 +9869,7 @@ fn syncplay_apply_command_to_state(
     if !state.is_object() {
         *state = serde_json::json!({});
     }
+    let timeline_drift = syncplay_timeline_drift_json(state, payload, now);
     let object = state.as_object_mut().expect("syncplay state object");
     object.insert("LastCommand".to_string(), payload.clone());
     object.insert(
@@ -9894,6 +9900,18 @@ fn syncplay_apply_command_to_state(
     }
     if let Some(item_id) = json_string_any_field(payload, &["PlaylistItemId", "ItemId"]) {
         object.insert("PlaylistItemId".to_string(), serde_json::json!(item_id));
+    }
+    if let Some(timeline) = timeline_drift {
+        object.insert("Timeline".to_string(), timeline.clone());
+        object.insert("DriftTicks".to_string(), timeline["DriftTicks"].clone());
+        object.insert(
+            "CorrectionPositionTicks".to_string(),
+            timeline["CorrectionPositionTicks"].clone(),
+        );
+        object.insert(
+            "IsDriftCorrectionRequired".to_string(),
+            timeline["IsCorrectionRequired"].clone(),
+        );
     }
 
     match command.to_ascii_lowercase().as_str() {
@@ -10032,6 +10050,44 @@ fn syncplay_apply_command_to_state(
         }
         _ => {}
     }
+}
+
+fn syncplay_timeline_drift_json(
+    state: &serde_json::Value,
+    payload: &serde_json::Value,
+    now: OffsetDateTime,
+) -> Option<serde_json::Value> {
+    let client_position_ticks = syncplay_position_ticks_from_payload(payload)?;
+    let client_when = json_string_any_field(payload, &["When", "when"])?;
+    let parsed_client_when = OffsetDateTime::parse(&client_when, &Rfc3339).ok()?;
+    let elapsed_ticks = syncplay_duration_to_ticks(now - parsed_client_when);
+    let estimated_server_position_ticks = client_position_ticks.saturating_add(elapsed_ticks);
+    let server_position_ticks = state
+        .get("PositionTicks")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(client_position_ticks);
+    let drift_ticks = estimated_server_position_ticks.saturating_sub(server_position_ticks);
+    let correction_position_ticks = (drift_ticks.abs() >= SYNCPLAY_DRIFT_THRESHOLD_TICKS)
+        .then_some(estimated_server_position_ticks);
+
+    Some(serde_json::json!({
+        "ClientWhen": client_when,
+        "ServerReceivedAt": format_time_for_json(now),
+        "ClientPositionTicks": client_position_ticks,
+        "ClientElapsedTicks": elapsed_ticks,
+        "ServerPositionTicks": server_position_ticks,
+        "EstimatedServerPositionTicks": estimated_server_position_ticks,
+        "DriftTicks": drift_ticks,
+        "DriftThresholdTicks": SYNCPLAY_DRIFT_THRESHOLD_TICKS,
+        "IsCorrectionRequired": correction_position_ticks.is_some(),
+        "CorrectionPositionTicks": correction_position_ticks
+    }))
+}
+
+fn syncplay_duration_to_ticks(duration: Duration) -> i64 {
+    let ticks =
+        duration.whole_nanoseconds() * i128::from(SYNCPLAY_TICKS_PER_SECOND) / 1_000_000_000_i128;
+    ticks.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 fn syncplay_position_ticks_from_payload(payload: &serde_json::Value) -> Option<i64> {
@@ -28617,19 +28673,20 @@ mod tests {
     use super::{
         AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
-        DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun, SystemLifecycleCommand,
-        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
-        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
-        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
-        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
-        encoding_configuration_json, format_time_for_json, get_valid_filename,
-        hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id, json_string_field,
-        json_value_i64, last_system_lifecycle_command, live_tv_channel_is_remote,
-        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
-        live_tv_recording_name, load_countries, load_cultures, materialize_series_timer_timers,
-        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
-        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
-        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun,
+        SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand, backup_restore_snapshot_json,
+        cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
+        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
+        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
+        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
+        live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
+        live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
+        materialize_series_timer_timers, media_item_by_id, media_item_streams,
+        package_install_task_key, paged_media_items, parse_authorization_token,
+        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
         record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
         run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
@@ -42025,6 +42082,99 @@ mod tests {
         assert!(
             ["Pause", "Seek"].contains(&group["State"]["LastCommandName"].as_str().unwrap()),
             "last command must be one of the raced commands: {group}"
+        );
+    }
+
+    #[tokio::test]
+    async fn syncplay_timeline_drift_emits_correction() {
+        let _guard = syncplay_test_lock().await;
+        syncplay_groups().lock().await.clear();
+        let group_id = Uuid::new_v4().to_string();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("owner".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, &format!("syncplay-drift-{group_id}"))
+            .await
+            .unwrap();
+        db.complete_startup_wizard().await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let client_when = format_time_for_json(OffsetDateTime::now_utc() - Duration::seconds(2));
+        let mut command_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Play")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(
+                        json!({
+                            "PositionTicks": 1_000_000,
+                            "When": client_when
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let event =
+            next_playback_event_type(&mut command_events, &api_key, "SyncPlayCommand").await;
+        assert_eq!(event["Data"]["Command"], "Play");
+        assert_eq!(event["Data"]["Timeline"]["ClientPositionTicks"], 1_000_000);
+        assert_eq!(event["Data"]["Timeline"]["IsCorrectionRequired"], true);
+        assert!(
+            event["Data"]["Timeline"]["DriftTicks"].as_i64().unwrap()
+                >= SYNCPLAY_DRIFT_THRESHOLD_TICKS
+        );
+        assert!(
+            event["Data"]["CorrectionPositionTicks"].as_i64().unwrap()
+                >= 1_000_000 + SYNCPLAY_DRIFT_THRESHOLD_TICKS
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let group: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(group["State"]["Timeline"]["ClientWhen"], client_when);
+        assert_eq!(group["State"]["IsDriftCorrectionRequired"], true);
+        assert_eq!(
+            group["State"]["CorrectionPositionTicks"],
+            group["State"]["Timeline"]["CorrectionPositionTicks"]
         );
     }
 
