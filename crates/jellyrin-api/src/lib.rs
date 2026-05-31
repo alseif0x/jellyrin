@@ -72,6 +72,7 @@ const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
+const DLNA_TRANSCODE_DEVICE_ID: &str = "dlna-upnp";
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
 const HDHOMERUN_DISCOVERY_PORT: u16 = 65001;
 const HDHOMERUN_DISCOVERY_DURATION_MS: u64 = 3000;
@@ -459,6 +460,30 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/dlna/{server_id}/items/{item_id}/stream.{container}",
             get(dlna::media_stream).head(dlna::media_stream_head),
+        )
+        .route(
+            "/Dlna/{server_id}/Items/{item_id}/transcode.m3u8",
+            get(dlna::media_hls_master_playlist).head(dlna::media_hls_master_playlist_head),
+        )
+        .route(
+            "/dlna/{server_id}/items/{item_id}/transcode.m3u8",
+            get(dlna::media_hls_master_playlist).head(dlna::media_hls_master_playlist_head),
+        )
+        .route(
+            "/Dlna/{server_id}/Items/{item_id}/hls/{play_session_id}/main.m3u8",
+            get(dlna::media_hls_playlist).head(dlna::media_hls_playlist_head),
+        )
+        .route(
+            "/dlna/{server_id}/items/{item_id}/hls/{play_session_id}/main.m3u8",
+            get(dlna::media_hls_playlist).head(dlna::media_hls_playlist_head),
+        )
+        .route(
+            "/Dlna/{server_id}/Items/{item_id}/hls/{play_session_id}/{segment_file}",
+            get(dlna::media_hls_segment).head(dlna::media_hls_segment_head),
+        )
+        .route(
+            "/dlna/{server_id}/items/{item_id}/hls/{play_session_id}/{segment_file}",
+            get(dlna::media_hls_segment).head(dlna::media_hls_segment_head),
         )
         .route(
             "/Dlna/{server_id}/Items/{item_id}/thumbnail.png",
@@ -19860,6 +19885,185 @@ async fn hls_segment_response_for(
     .await
 }
 
+pub(crate) async fn dlna_hls_master_playlist_response(
+    state: &AppState,
+    _headers: &HeaderMap,
+    item: MediaItem,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    if item.media_type != "Video" {
+        return Err(ApiError::not_found("DLNA HLS transcode not found"));
+    }
+    let session = ensure_dlna_hls_transcode_session(state, &item).await?;
+    let playlist = render_hls_master_playlist(&HlsVariantInfo {
+        uri: format!("hls/{}/main.m3u8", session.play_session_id),
+        bandwidth: item.bitrate.and_then(positive_u32).unwrap_or(1_000_000),
+        resolution: item
+            .width
+            .and_then(|value| positive_u32(i64::from(value)))
+            .zip(item.height.and_then(|value| positive_u32(i64::from(value)))),
+        codecs: hls_codecs(&item),
+    });
+    playlist_response(playlist, include_body)
+}
+
+pub(crate) async fn dlna_hls_media_playlist_response(
+    state: &AppState,
+    _headers: &HeaderMap,
+    server_id: Uuid,
+    item_id: Uuid,
+    play_session_id: &str,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let session = dlna_hls_transcode_session_for(state, item_id, play_session_id).await?;
+    let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
+    let ready = wait_for_hls_readiness(
+        &layout.media_playlist_path,
+        layout.segment_path(0),
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    if !ready {
+        return Err(ApiError::not_found("DLNA HLS playlist is not ready"));
+    }
+
+    let playlist = tokio::fs::read_to_string(&layout.media_playlist_path).await?;
+    let playlist =
+        rewrite_dlna_hls_media_playlist(&playlist, server_id, item_id, &session.play_session_id);
+    playlist_response(playlist, include_body)
+}
+
+pub(crate) async fn dlna_hls_segment_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    item_id: Uuid,
+    play_session_id: &str,
+    segment_file: &str,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let (segment_id, container) = parse_hls_segment_file(segment_file)?;
+    if segment_id < 0 || !container.eq_ignore_ascii_case("ts") {
+        return Err(ApiError::not_found("DLNA HLS segment not found"));
+    }
+    let session = dlna_hls_transcode_session_for(state, item_id, play_session_id).await?;
+    let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
+    let segment_id =
+        u32::try_from(segment_id).map_err(|_| ApiError::not_found("DLNA HLS segment not found"))?;
+    stream_path(
+        layout.segment_path(segment_id),
+        "video/mp2t".to_string(),
+        headers,
+        include_body,
+    )
+    .await
+}
+
+async fn ensure_dlna_hls_transcode_session(
+    state: &AppState,
+    item: &MediaItem,
+) -> Result<TranscodeSession, ApiError> {
+    let user = state.db.first_user().await?;
+    let streams = media_item_streams(item);
+    let selection = TranscodeStreamSelection {
+        video_stream_index: first_stream_index(&streams, "Video"),
+        audio_stream_index: default_audio_stream_index(&streams),
+        subtitle_stream_index: Some(-1),
+    };
+    let base_key = hls_transcode_dedupe_key(user.id, item, &selection, 0);
+    let dedupe_key = format!("dlna:{base_key}");
+    let dedupe_lock = transcode_dedupe_lock(&dedupe_key).await;
+    let _dedupe_guard = dedupe_lock.lock().await;
+
+    if let Some(session) = reusable_hls_transcode_session(&state.db, &dedupe_key).await? {
+        return Ok(session);
+    }
+
+    let play_session_id = Uuid::new_v4().simple().to_string();
+    let layout = HlsTranscodeLayout::new(transcode_temp_root(), &play_session_id);
+    tokio::fs::create_dir_all(&layout.session_dir).await?;
+    let mut request = HlsTranscodeRequest::new(
+        item.path.clone(),
+        layout.media_playlist_path.to_string_lossy().to_string(),
+        layout.segment_pattern_string(),
+        selection.clone(),
+    );
+    request.include_video = true;
+    let command = build_hls_ffmpeg_command(&request);
+    let (session, claimed_new_session) = state
+        .db
+        .claim_transcode_session(
+            &dedupe_key,
+            UpsertTranscodeSession {
+                play_session_id,
+                dedupe_key: Some(dedupe_key.clone()),
+                device_id: Some(DLNA_TRANSCODE_DEVICE_ID.to_string()),
+                user_id: user.id,
+                item_id: item.id,
+                media_source_id: Some(item.id.simple().to_string()),
+                audio_stream_index: selection.audio_stream_index,
+                subtitle_stream_index: selection.subtitle_stream_index,
+                video_stream_index: selection.video_stream_index,
+                output_path: layout.media_playlist_path.to_string_lossy().to_string(),
+                process_id: None,
+                status: "starting".to_string(),
+                progress_percent: None,
+                position_ticks: 0,
+            },
+        )
+        .await?;
+    if claimed_new_session {
+        spawn_hls_transcode_task(state.db.clone(), session.play_session_id.clone(), command).await;
+    } else {
+        cleanup_hls_transcode_dir(&layout.session_dir).await;
+    }
+    Ok(session)
+}
+
+async fn dlna_hls_transcode_session_for(
+    state: &AppState,
+    item_id: Uuid,
+    play_session_id: &str,
+) -> Result<TranscodeSession, ApiError> {
+    let session = state
+        .db
+        .transcode_session_by_play_session_id(play_session_id.trim())
+        .await?
+        .ok_or_else(|| ApiError::not_found("DLNA HLS transcode session not found"))?;
+    if session.item.id != item_id
+        || session.item.media_type != "Video"
+        || session.device_id.as_deref() != Some(DLNA_TRANSCODE_DEVICE_ID)
+        || !matches!(
+            session.status.as_str(),
+            "starting" | "running" | "completed"
+        )
+    {
+        return Err(ApiError::not_found("DLNA HLS transcode session not found"));
+    }
+    Ok(session)
+}
+
+fn rewrite_dlna_hls_media_playlist(
+    playlist: &str,
+    server_id: Uuid,
+    item_id: Uuid,
+    play_session_id: &str,
+) -> String {
+    let mut rewritten = String::with_capacity(playlist.len());
+    for line in playlist.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            rewritten.push_str(line);
+        } else if let Some(segment_id) = hls_segment_id_from_uri(line) {
+            rewritten.push_str(&format!(
+                "/dlna/{server_id}/items/{item_id}/hls/{play_session_id}/{segment_id}.ts"
+            ));
+        } else {
+            rewritten.push_str(line);
+        }
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
 async fn audio_hls_master_playlist(
     State(state): State<AppState>,
     Path(item_id): Path<String>,
@@ -31718,6 +31922,7 @@ mod tests {
         .await
         .unwrap();
         let server_id = db.server_state().await.unwrap().server_id;
+        let test_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -31785,6 +31990,14 @@ mod tests {
             item.id
         );
         assert!(browse_response.contains(&resource_url));
+        let transcode_url = format!(
+            "http://media.example.test:8097/dlna/{server_id}/items/{}/transcode.m3u8",
+            item.id
+        );
+        assert!(browse_response.contains(&transcode_url));
+        assert!(browse_response.contains(
+            "protocolInfo=&quot;http-get:*:application/vnd.apple.mpegurl:DLNA.ORG_OP=01"
+        ));
         assert!(!browse_response.contains("Second Movie"));
 
         let browse_item_metadata = format!(
@@ -31875,6 +32088,130 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/transcode.m3u8",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.apple.mpegurl")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let master_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(master_playlist.starts_with("#EXTM3U\n"));
+        let dlna_session = test_db
+            .transcode_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|session| {
+                session.item.id == item.id
+                    && session.device_id.as_deref() == Some("dlna-upnp")
+                    && session
+                        .dedupe_key
+                        .as_deref()
+                        .is_some_and(|key| key.starts_with("dlna:hls:ts:"))
+            })
+            .expect("DLNA HLS transcode session was not created");
+        assert!(
+            master_playlist.contains(&format!("hls/{}/main.m3u8", dlna_session.play_session_id))
+        );
+
+        let ready_transcode_root = tempfile::tempdir().unwrap();
+        let ready_transcode_dir = ready_transcode_root.path().join("dlna-ready-session");
+        tokio::fs::create_dir_all(&ready_transcode_dir)
+            .await
+            .unwrap();
+        let ready_playlist = ready_transcode_dir.join("main.m3u8");
+        let ready_segment = ready_transcode_dir.join("segment_00000.ts");
+        tokio::fs::write(
+            &ready_playlist,
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.000,\nsegment_00000.ts\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&ready_segment, b"ts segment bytes")
+            .await
+            .unwrap();
+        let dlna_user = test_db.first_user().await.unwrap();
+        test_db
+            .upsert_transcode_session(UpsertTranscodeSession {
+                play_session_id: "dlna-ready-session".to_string(),
+                dedupe_key: Some("dlna:test-ready".to_string()),
+                device_id: Some("dlna-upnp".to_string()),
+                user_id: dlna_user.id,
+                item_id: item.id,
+                media_source_id: Some(item.id.simple().to_string()),
+                audio_stream_index: None,
+                subtitle_stream_index: Some(-1),
+                video_stream_index: Some(0),
+                output_path: ready_playlist.to_string_lossy().to_string(),
+                process_id: None,
+                status: "running".to_string(),
+                progress_percent: None,
+                position_ticks: 0,
+            })
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/hls/dlna-ready-session/main.m3u8",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let media_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(media_playlist.contains(&format!(
+            "/dlna/{server_id}/items/{}/hls/dlna-ready-session/0.ts",
+            item.id
+        )));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/hls/dlna-ready-session/0.ts",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp2t")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"ts segment bytes");
 
         let response = app
             .clone()

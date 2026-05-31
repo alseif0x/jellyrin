@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION,
-    default_network_configuration, stream_media_item, subscribe_system_lifecycle_commands,
+    default_network_configuration, dlna_hls_master_playlist_response,
+    dlna_hls_media_playlist_response, dlna_hls_segment_response, stream_media_item,
+    subscribe_system_lifecycle_commands,
 };
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
@@ -59,6 +61,7 @@ const DLNA_PROTOCOL_INFO_ENTRIES: &[DlnaProtocolInfoEntry] = &[
     DlnaProtocolInfoEntry::new("video/quicktime", None),
     DlnaProtocolInfoEntry::new("video/x-ms-wmv", None),
     DlnaProtocolInfoEntry::new("video/wtv", None),
+    DlnaProtocolInfoEntry::new("application/vnd.apple.mpegurl", None),
     DlnaProtocolInfoEntry::new("audio/mpeg", Some("MP3")),
     DlnaProtocolInfoEntry::new("audio/mp4", None),
     DlnaProtocolInfoEntry::new("audio/aac", None),
@@ -324,17 +327,111 @@ pub(crate) async fn media_stream_head(
     stream_media_item(item, &headers, false).await
 }
 
+pub(crate) async fn media_hls_master_playlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let item = dlna_media_item(&state, &server_id, &item_id).await?;
+    dlna_hls_master_playlist_response(&state, &headers, item, true).await
+}
+
+pub(crate) async fn media_hls_master_playlist_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let item = dlna_media_item(&state, &server_id, &item_id).await?;
+    dlna_hls_master_playlist_response(&state, &headers, item, false).await
+}
+
+pub(crate) async fn media_hls_playlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id, play_session_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let context = dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    dlna_hls_media_playlist_response(
+        &state,
+        &headers,
+        context.server_id,
+        item_id,
+        &play_session_id,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn media_hls_playlist_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id, play_session_id)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    let context = dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    dlna_hls_media_playlist_response(
+        &state,
+        &headers,
+        context.server_id,
+        item_id,
+        &play_session_id,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn media_hls_segment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id, play_session_id, segment_file)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    dlna_hls_segment_response(
+        &state,
+        &headers,
+        item_id,
+        &play_session_id,
+        &segment_file,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn media_hls_segment_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id, play_session_id, segment_file)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    dlna_hls_segment_response(
+        &state,
+        &headers,
+        item_id,
+        &play_session_id,
+        &segment_file,
+        false,
+    )
+    .await
+}
+
 pub(crate) async fn item_thumbnail(
     State(state): State<AppState>,
     Path((server_id, item_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    dlna_context(&state, &server_id).await?;
-    let item_id = parse_dlna_uuid(&item_id)?;
-    let item = state
-        .db
-        .media_item_by_id(item_id)
-        .await
-        .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
+    let item = dlna_media_item(&state, &server_id, &item_id).await?;
     dlna_thumbnail_response(&state, &item, true).await
 }
 
@@ -342,14 +439,22 @@ pub(crate) async fn item_thumbnail_head(
     State(state): State<AppState>,
     Path((server_id, item_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    dlna_context(&state, &server_id).await?;
-    let item_id = parse_dlna_uuid(&item_id)?;
-    let item = state
+    let item = dlna_media_item(&state, &server_id, &item_id).await?;
+    dlna_thumbnail_response(&state, &item, false).await
+}
+
+async fn dlna_media_item(
+    state: &AppState,
+    server_id: &str,
+    item_id: &str,
+) -> Result<MediaItem, ApiError> {
+    dlna_context(state, server_id).await?;
+    let item_id = parse_dlna_uuid(item_id)?;
+    state
         .db
         .media_item_by_id(item_id)
         .await
-        .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
-    dlna_thumbnail_response(&state, &item, false).await
+        .map_err(|_| ApiError::not_found("DLNA media item not found"))
 }
 
 async fn dlna_thumbnail_response(
@@ -1795,6 +1900,7 @@ fn append_didl_media_item(
     if let Some(resource) = didl_resource(item, server_id, server_address) {
         didl.push_str(&resource);
     }
+    append_didl_hls_transcode_resource(didl, item, server_id, server_address);
     append_didl_subtitles(didl, item, server_address);
     didl.push_str("</item>");
 }
@@ -1906,6 +2012,42 @@ fn append_didl_thumbnail(
     didl.push_str("<upnp:albumArtURI dlna:profileID=\"PNG_TN\">");
     didl.push_str(&escape_xml(&url));
     didl.push_str("</upnp:albumArtURI>");
+}
+
+fn append_didl_hls_transcode_resource(
+    didl: &mut String,
+    item: &MediaItem,
+    server_id: Uuid,
+    server_address: &str,
+) {
+    if item.media_type != "Video" {
+        return;
+    }
+    let protocol_info = dlna_protocol_info_value("application/vnd.apple.mpegurl", None);
+    let mut attributes = format!("protocolInfo=\"{}\"", escape_xml(&protocol_info));
+    if let Some(duration) = item.runtime_ticks.and_then(format_dlna_duration) {
+        attributes.push_str(" duration=\"");
+        attributes.push_str(&duration);
+        attributes.push('"');
+    }
+    if let (Some(width), Some(height)) = (item.width, item.height)
+        && width > 0
+        && height > 0
+    {
+        attributes.push_str(" resolution=\"");
+        attributes.push_str(&format!("{width}x{height}"));
+        attributes.push('"');
+    }
+    let url = format!(
+        "{}/dlna/{server_id}/items/{}/transcode.m3u8",
+        server_address.trim_end_matches('/'),
+        item.id
+    );
+    didl.push_str("<res ");
+    didl.push_str(&attributes);
+    didl.push('>');
+    didl.push_str(&escape_xml(&url));
+    didl.push_str("</res>");
 }
 
 fn append_didl_subtitles(didl: &mut String, item: &MediaItem, server_address: &str) {
