@@ -8,7 +8,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::{Path as FsPath, PathBuf},
-    process::Stdio,
+    process::{Output, Stdio},
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicU8, Ordering as AtomicOrdering},
@@ -88,6 +88,7 @@ const HDHOMERUN_LEGACY_GETSET_NAME: u8 = 3;
 const HDHOMERUN_LEGACY_GETSET_VALUE: u8 = 4;
 const HDHOMERUN_LEGACY_GETSET_LOCKKEY: u8 = 21;
 const HDHOMERUN_LEGACY_GETSET_REQUEST: u16 = 4;
+const PACKAGE_INSTALL_CANCEL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
 const HDHOMERUN_LEGACY_GETSET_REPLY: u16 = 5;
 const HDHOMERUN_DISCOVERY_MESSAGE: [u8; 20] = [
     0, 2, 0, 12, 1, 4, 255, 255, 255, 255, 2, 4, 255, 255, 255, 255, 115, 204, 125, 143,
@@ -6577,7 +6578,7 @@ async fn prepare_plugin_package_artifact(
             }),
         )
         .await?;
-    let bytes = read_plugin_package_source(&source_url).await?;
+    let bytes = read_plugin_package_source(&state.db, task_key, run_id, &source_url).await?;
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     state
         .db
@@ -6623,7 +6624,7 @@ async fn prepare_plugin_package_artifact(
             }),
         )
         .await?;
-    let entries = list_safe_zip_entries(&archive_path).await?;
+    let entries = list_safe_zip_entries(&state.db, task_key, run_id, &archive_path).await?;
     if entries.is_empty() {
         let _ = tokio::fs::remove_file(&archive_path).await;
         return Err(ApiError::bad_request("Plugin package archive is empty"));
@@ -6643,7 +6644,7 @@ async fn prepare_plugin_package_artifact(
             }),
         )
         .await?;
-    extract_zip_archive(&archive_path, &staging_dir).await?;
+    extract_zip_archive(&state.db, task_key, run_id, &archive_path, &staging_dir).await?;
 
     if let Err(error) = ensure_package_install_not_cancelled(&state.db, task_key, run_id).await {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -6703,6 +6704,26 @@ async fn ensure_package_install_not_cancelled(
         Ok(())
     } else {
         Err(ApiError::conflict("Package installation cancelled."))
+    }
+}
+
+async fn await_package_install_cancelable<T, F>(
+    db: &Database,
+    task_key: &str,
+    run_id: Uuid,
+    operation: F,
+) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, ApiError>>,
+{
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => return result,
+            _ = tokio::time::sleep(PACKAGE_INSTALL_CANCEL_POLL_INTERVAL) => {
+                ensure_package_install_not_cancelled(db, task_key, run_id).await?;
+            }
+        }
     }
 }
 
@@ -6819,48 +6840,78 @@ fn safe_plugin_path_segment(value: &str) -> String {
     }
 }
 
-async fn read_plugin_package_source(source_url: &str) -> Result<Vec<u8>, ApiError> {
+async fn read_plugin_package_source(
+    db: &Database,
+    task_key: &str,
+    run_id: Uuid,
+    source_url: &str,
+) -> Result<Vec<u8>, ApiError> {
     if let Some(path) = source_url.strip_prefix("file://") {
-        return tokio::fs::read(PathBuf::from(path)).await.map_err(|error| {
-            ApiError::bad_request(format!("Plugin package file read failed: {error}"))
-        });
+        return await_package_install_cancelable(db, task_key, run_id, async move {
+            tokio::fs::read(PathBuf::from(path)).await.map_err(|error| {
+                ApiError::bad_request(format!("Plugin package file read failed: {error}"))
+            })
+        })
+        .await;
     }
     if source_url.starts_with("http://") || source_url.starts_with("https://") {
-        let response = HttpClient::new()
-            .get(source_url)
-            .send()
-            .await
-            .map_err(|error| {
-                ApiError::bad_request(format!("Plugin package download failed: {error}"))
-            })?;
+        let response = await_package_install_cancelable(db, task_key, run_id, async {
+            HttpClient::new()
+                .get(source_url)
+                .send()
+                .await
+                .map_err(|error| {
+                    ApiError::bad_request(format!("Plugin package download failed: {error}"))
+                })
+        })
+        .await?;
         if !response.status().is_success() {
             return Err(ApiError::bad_request(format!(
                 "Plugin package download returned {}",
                 response.status()
             )));
         }
-        return response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| {
-                ApiError::bad_request(format!("Plugin package body read failed: {error}"))
-            });
+        return await_package_install_cancelable(db, task_key, run_id, async move {
+            response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| {
+                    ApiError::bad_request(format!("Plugin package download failed: {error}"))
+                })
+        })
+        .await;
     }
-    tokio::fs::read(PathBuf::from(source_url))
-        .await
-        .map_err(|error| ApiError::bad_request(format!("Plugin package file read failed: {error}")))
+    await_package_install_cancelable(db, task_key, run_id, async move {
+        tokio::fs::read(PathBuf::from(source_url))
+            .await
+            .map_err(|error| {
+                ApiError::bad_request(format!("Plugin package file read failed: {error}"))
+            })
+    })
+    .await
 }
 
-async fn list_safe_zip_entries(archive_path: &FsPath) -> Result<Vec<String>, ApiError> {
-    let output = Command::new("unzip")
+async fn list_safe_zip_entries(
+    db: &Database,
+    task_key: &str,
+    run_id: Uuid,
+    archive_path: &FsPath,
+) -> Result<Vec<String>, ApiError> {
+    let mut command = Command::new("unzip");
+    command
         .arg("-Z1")
         .arg(archive_path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| ApiError::internal(format!("unzip listing failed to start: {error}")))?;
+        .stderr(Stdio::piped());
+    let output = run_cancelable_process_output(
+        db,
+        task_key,
+        run_id,
+        command,
+        "unzip listing failed to start",
+    )
+    .await?;
     if !output.status.success() {
         return Err(ApiError::bad_request(format!(
             "Plugin package archive listing failed: {}",
@@ -6902,23 +6953,33 @@ fn validate_zip_entry_path(entry: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn extract_zip_archive(archive_path: &FsPath, staging_dir: &FsPath) -> Result<(), ApiError> {
+async fn extract_zip_archive(
+    db: &Database,
+    task_key: &str,
+    run_id: Uuid,
+    archive_path: &FsPath,
+    staging_dir: &FsPath,
+) -> Result<(), ApiError> {
     if tokio::fs::try_exists(staging_dir).await? {
         tokio::fs::remove_dir_all(staging_dir).await?;
     }
     tokio::fs::create_dir_all(staging_dir).await?;
-    let output = Command::new("unzip")
+    let mut command = Command::new("unzip");
+    command
         .arg("-qq")
         .arg(archive_path)
         .arg("-d")
         .arg(staging_dir)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| {
-            ApiError::internal(format!("unzip extraction failed to start: {error}"))
-        })?;
+        .stderr(Stdio::piped());
+    let output = run_cancelable_process_output(
+        db,
+        task_key,
+        run_id,
+        command,
+        "unzip extraction failed to start",
+    )
+    .await?;
     if output.status.success() {
         Ok(())
     } else {
@@ -6928,6 +6989,26 @@ async fn extract_zip_archive(archive_path: &FsPath, staging_dir: &FsPath) -> Res
             String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
+}
+
+async fn run_cancelable_process_output(
+    db: &Database,
+    task_key: &str,
+    run_id: Uuid,
+    mut command: Command,
+    start_error: &'static str,
+) -> Result<Output, ApiError> {
+    command.kill_on_drop(true);
+    let child = command
+        .spawn()
+        .map_err(|error| ApiError::internal(format!("{start_error}: {error}")))?;
+    await_package_install_cancelable(db, task_key, run_id, async move {
+        child
+            .wait_with_output()
+            .await
+            .map_err(|error| ApiError::internal(format!("{start_error}: {error}")))
+    })
+    .await
 }
 
 async fn package_repositories(
@@ -29954,17 +30035,18 @@ mod tests {
     use std::fs;
 
     use super::{
-        AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
+        AUTH_LOCKOUT_FAILURE_LIMIT, ApiError, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun,
         PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
-        SystemLifecycleCommand, backup_restore_snapshot_json, cascade_delete_series_timer_timers,
-        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
-        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
-        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
-        encoding_configuration_json, ensure_package_install_not_cancelled, filter_package_list,
-        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
-        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
+        SystemLifecycleCommand, await_package_install_cancelable, backup_restore_snapshot_json,
+        cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
+        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
+        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
+        ensure_package_install_not_cancelled, filter_package_list, format_time_for_json,
+        get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id,
+        json_string_field, json_value_i64, last_system_lifecycle_command,
         live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
         live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
@@ -30272,6 +30354,40 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn package_install_cancelable_operation_aborts_in_flight_step() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let task_key = package_install_task_key("slow-plugin");
+        let run = db.start_task_run(&task_key).await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let cancel_db = db.clone();
+        let cancel_task_key = task_key.clone();
+        let cancel_task = tokio::spawn(async move {
+            started_rx.await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_db
+                .fail_current_task_run(&cancel_task_key, "Package installation cancelled.")
+                .await
+                .unwrap();
+        });
+
+        let started_at = std::time::Instant::now();
+        let error = await_package_install_cancelable(&db, &task_key, run.id, async move {
+            started_tx.send(()).unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok::<(), ApiError>(())
+        })
+        .await
+        .unwrap_err();
+        cancel_task.await.unwrap();
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_secs(5),
+            "cancelable operation did not abort promptly"
+        );
     }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)
