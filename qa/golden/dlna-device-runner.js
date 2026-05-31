@@ -24,6 +24,10 @@ async function main() {
     printUsage();
     return;
   }
+  if (options.selfTest) {
+    selfTest();
+    return;
+  }
   requireOption(options, 'baseUrl');
   requireOption(options, 'itemId');
   requireOption(options, 'deviceName');
@@ -169,8 +173,14 @@ function parseArgs(args) {
     const arg = args[index];
     if (arg === '--help' || arg === '-h') {
       options.help = true;
+    } else if (arg === '--self-test') {
+      options.selfTest = true;
     } else if (arg.startsWith('--')) {
       const key = arg.slice(2).replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith('--')) {
+        throw new Error(`${arg} requires a value`);
+      }
       options[key] = args[index + 1];
       index += 1;
     } else {
@@ -185,7 +195,7 @@ function printUsage() {
     'Usage: node qa/golden/dlna-device-runner.js --base-url http://<server-lan-ip>:8097 --item-id <id> --device-name <name> --tester <name> --playback-seconds <n> [options]',
     '',
     'Run this from the real control-point/renderer LAN host after playback has started and remained stable for at least 10 seconds.',
-    'Useful options: --subtitle-index 2 --device-ip <lan-ip> --server-ip <lan-ip> --output <plans/manual/dlna-upnp/file.json>',
+    'Useful options: --subtitle-index 2 --device-ip <lan-ip> --server-ip <lan-ip> --output <plans/manual/dlna-upnp/file.json> --self-test',
   ].join('\n'));
 }
 
@@ -386,6 +396,44 @@ function stamp(value) {
   return value.replace(/[:.]/g, '-');
 }
 
+function selfTest() {
+  const parsed = parseArgs([
+    '--base-url',
+    'http://192.168.1.46:8097/web/index.html?x=1',
+    '--item-id',
+    'item-1',
+    '--device-name',
+    'VLC laptop',
+    '--tester',
+    'qa',
+    '--playback-seconds',
+    '30',
+  ]);
+  assertEqual(parsed.baseUrl, 'http://192.168.1.46:8097/web/index.html?x=1', 'parse baseUrl');
+  assertEqual(normalizeBaseUrl(parsed.baseUrl), 'http://192.168.1.46:8097', 'normalizeBaseUrl');
+  assertEqual(headerValue('HTTP/1.1 200 OK\r\nLOCATION: http://host/dlna.xml\r\n', 'location'), 'http://host/dlna.xml', 'headerValue');
+  const escaped = browseItemBody('abc<&"');
+  if (!escaped.includes('abc&lt;&amp;&quot;')) {
+    throw new Error(`browseItemBody did not XML-escape ObjectID: ${escaped}`);
+  }
+  let missingValueFailed = false;
+  try {
+    parseArgs(['--base-url', '--item-id', 'x']);
+  } catch {
+    missingValueFailed = true;
+  }
+  if (!missingValueFailed) {
+    throw new Error('parseArgs should reject missing option values');
+  }
+  console.log(JSON.stringify({ status: 'self-test-ok' }, null, 2));
+}
+
+function assertEqual(actual, expected, label) {
+  if (actual !== expected) {
+    throw new Error(`${label}: expected ${expected}, got ${actual}`);
+  }
+}
+
 if (require.main === module) {
   main().catch((error) => {
     console.error(error.message || error);
@@ -394,6 +442,9 @@ if (require.main === module) {
 }
 
 module.exports = {
+  browseItemBody,
+  headerValue,
+  normalizeBaseUrl,
   parseArgs,
   probeHlsFallback,
 };
