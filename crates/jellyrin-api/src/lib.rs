@@ -7272,6 +7272,8 @@ fn default_network_configuration() -> serde_json::Value {
         "DlnaDeniedDeviceIds": [],
         "DlnaAllowedRenderers": [],
         "DlnaDeniedRenderers": [],
+        "DlnaRemoteIPFilter": [],
+        "DlnaIsRemoteIPFilterBlacklist": false,
         "RemoteIPFilter": [],
         "IsRemoteIPFilterBlacklist": false
     })
@@ -7304,6 +7306,8 @@ fn network_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     merge_known_network_value(&mut config, &payload, "DlnaDeniedDeviceIds");
     merge_known_network_value(&mut config, &payload, "DlnaAllowedRenderers");
     merge_known_network_value(&mut config, &payload, "DlnaDeniedRenderers");
+    merge_known_network_value(&mut config, &payload, "DlnaRemoteIPFilter");
+    merge_known_network_value(&mut config, &payload, "DlnaIsRemoteIPFilterBlacklist");
     merge_known_network_value(&mut config, &payload, "RemoteIPFilter");
     merge_known_network_value(&mut config, &payload, "IsRemoteIPFilterBlacklist");
     config
@@ -31586,6 +31590,8 @@ mod tests {
         assert!(defaults["DlnaDeniedDeviceIds"].is_array());
         assert!(defaults["DlnaAllowedRenderers"].is_array());
         assert!(defaults["DlnaDeniedRenderers"].is_array());
+        assert!(defaults["DlnaRemoteIPFilter"].is_array());
+        assert_eq!(defaults["DlnaIsRemoteIPFilterBlacklist"], false);
 
         let response = app
             .clone()
@@ -31626,6 +31632,8 @@ mod tests {
             "DlnaDeniedDeviceIds": ["uuid:denied-renderer"],
             "DlnaAllowedRenderers": ["samsung"],
             "DlnaDeniedRenderers": ["vlc"],
+            "DlnaRemoteIPFilter": ["192.168.1.0/24"],
+            "DlnaIsRemoteIPFilterBlacklist": true,
             "UnknownNetworkField": "ignored"
         });
         let response = app
@@ -31684,6 +31692,8 @@ mod tests {
         );
         assert_eq!(config["DlnaAllowedRenderers"], json!(["samsung"]));
         assert_eq!(config["DlnaDeniedRenderers"], json!(["vlc"]));
+        assert_eq!(config["DlnaRemoteIPFilter"], json!(["192.168.1.0/24"]));
+        assert_eq!(config["DlnaIsRemoteIPFilterBlacklist"], true);
         assert!(config.get("UnknownNetworkField").is_none());
 
         let startup = db.startup_config().await.unwrap();

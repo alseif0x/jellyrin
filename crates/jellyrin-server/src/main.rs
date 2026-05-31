@@ -118,10 +118,13 @@ async fn main() -> anyhow::Result<()> {
     let _dlna_ssdp_task = spawn_dlna_ssdp_service(state.clone());
 
     tracing::info!(%address, "jellyrin listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server failed")?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server failed")?;
     if last_system_lifecycle_command() == Some(SystemLifecycleCommand::Restart) {
         anyhow::bail!("restart requested");
     }

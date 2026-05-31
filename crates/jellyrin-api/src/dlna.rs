@@ -1,6 +1,7 @@
 use axum::{
+    Extension,
     body::Bytes as BodyBytes,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -211,9 +212,13 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn dlna_renderer_authorized(
     network: &Value,
+    peer_ip: Option<IpAddr>,
     device_id: &str,
     renderer_profile: DlnaRendererProfile,
 ) -> bool {
+    if !dlna_peer_ip_authorized(network, peer_ip) {
+        return false;
+    }
     let device_id = normalized_renderer_rule_value(device_id);
     let renderer = renderer_profile.config_name();
     let denied = network_rule_values(network, "DlnaDeniedDeviceIds")
@@ -233,6 +238,33 @@ fn dlna_renderer_authorized(
     }
     allowed_device_ids.iter().any(|value| value == &device_id)
         || allowed_renderers.iter().any(|value| value == renderer)
+}
+
+fn dlna_peer_ip_authorized(network: &Value, peer_ip: Option<IpAddr>) -> bool {
+    let filters = network_rule_values(network, "DlnaRemoteIPFilter");
+    if filters.is_empty() {
+        return true;
+    }
+    let Some(peer_ip) = peer_ip else {
+        return false;
+    };
+    let matched = filters
+        .iter()
+        .any(|filter| ip_filter_matches(filter, peer_ip));
+    let blacklist = network
+        .get("DlnaIsRemoteIPFilterBlacklist")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if blacklist { !matched } else { matched }
+}
+
+fn ip_filter_matches(filter: &str, ip: IpAddr) -> bool {
+    if filter.contains('/') {
+        return cidr_contains_ip(filter, ip);
+    }
+    filter
+        .parse::<IpAddr>()
+        .is_ok_and(|filter_ip| filter_ip == ip)
 }
 
 fn network_rule_values(network: &Value, key: &str) -> Vec<String> {
@@ -392,6 +424,7 @@ pub(crate) async fn connection_manager_control(
 
 pub(crate) async fn media_receiver_registrar_control(
     State(state): State<AppState>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Path(server_id): Path<String>,
     body: BodyBytes,
@@ -410,7 +443,12 @@ pub(crate) async fn media_receiver_registrar_control(
     let body = match action.as_str() {
         "isauthorized" | "isvalidated" => {
             let device_id = soap_param(&request, "DeviceID").unwrap_or_default();
-            let authorized = dlna_renderer_authorized(&network, &device_id, renderer_profile);
+            let authorized = dlna_renderer_authorized(
+                &network,
+                connect_info.map(|Extension(ConnectInfo(peer))| peer.ip()),
+                &device_id,
+                renderer_profile,
+            );
             format!("<Result>{}</Result>", u8::from(authorized))
         }
         "registerdevice" => "<RegistrationRespMsg></RegistrationRespMsg>".to_string(),
@@ -4638,6 +4676,79 @@ mod tests {
             DlnaRendererProfile::from_headers(&headers),
             DlnaRendererProfile::Sony
         );
+    }
+
+    #[test]
+    fn dlna_renderer_authorization_respects_ip_filters() {
+        let allowlist = json!({ "DlnaRemoteIPFilter": ["192.168.1.0/24"] });
+        assert!(dlna_renderer_authorized(
+            &allowlist,
+            Some("192.168.1.42".parse().unwrap()),
+            "uuid:test-renderer",
+            DlnaRendererProfile::Generic,
+        ));
+        assert!(!dlna_renderer_authorized(
+            &allowlist,
+            Some("10.0.0.42".parse().unwrap()),
+            "uuid:test-renderer",
+            DlnaRendererProfile::Generic,
+        ));
+        assert!(!dlna_renderer_authorized(
+            &allowlist,
+            None,
+            "uuid:test-renderer",
+            DlnaRendererProfile::Generic,
+        ));
+
+        let blacklist = json!({
+            "DlnaRemoteIPFilter": ["10.0.0.42"],
+            "DlnaIsRemoteIPFilterBlacklist": true
+        });
+        assert!(!dlna_renderer_authorized(
+            &blacklist,
+            Some("10.0.0.42".parse().unwrap()),
+            "uuid:test-renderer",
+            DlnaRendererProfile::Generic,
+        ));
+        assert!(dlna_renderer_authorized(
+            &blacklist,
+            Some("10.0.0.43".parse().unwrap()),
+            "uuid:test-renderer",
+            DlnaRendererProfile::Generic,
+        ));
+    }
+
+    #[test]
+    fn dlna_renderer_authorization_combines_ip_device_and_renderer_policy() {
+        let policy = json!({
+            "DlnaRemoteIPFilter": ["192.168.1.0/24"],
+            "DlnaAllowedRenderers": ["samsung"],
+            "DlnaDeniedDeviceIds": ["uuid:blocked-renderer"]
+        });
+        assert!(dlna_renderer_authorized(
+            &policy,
+            Some("192.168.1.10".parse().unwrap()),
+            "uuid:allowed-renderer",
+            DlnaRendererProfile::Samsung,
+        ));
+        assert!(!dlna_renderer_authorized(
+            &policy,
+            Some("192.168.1.10".parse().unwrap()),
+            "uuid:blocked-renderer",
+            DlnaRendererProfile::Samsung,
+        ));
+        assert!(!dlna_renderer_authorized(
+            &policy,
+            Some("192.168.1.10".parse().unwrap()),
+            "uuid:allowed-renderer",
+            DlnaRendererProfile::Vlc,
+        ));
+        assert!(!dlna_renderer_authorized(
+            &policy,
+            Some("10.0.0.10".parse().unwrap()),
+            "uuid:allowed-renderer",
+            DlnaRendererProfile::Samsung,
+        ));
     }
 
     #[test]
