@@ -3685,7 +3685,9 @@ fn dlna_subtitle_streams(item: &MediaItem) -> Vec<DlnaSubtitleStream> {
 
 fn dlna_subtitle_format(codec: &str) -> Option<(&'static str, &'static str)> {
     match codec.to_ascii_lowercase().as_str() {
-        "srt" | "subrip" | "ass" | "ssa" | "webvtt" | "vtt" => Some(("vtt", "text/vtt")),
+        "srt" | "subrip" | "ass" | "ssa" | "webvtt" | "vtt" | "mov_text" | "text" => {
+            Some(("vtt", "text/vtt"))
+        }
         _ => None,
     }
 }
@@ -5899,6 +5901,28 @@ mod tests {
             dlna_profile_name_for_item(&mp4, "video/mp4", DlnaRendererProfile::Samsung),
             None
         );
+    }
+
+    #[test]
+    fn dlna_subtitle_streams_advertise_convertible_text_only() {
+        let mut item = test_media_item("/media/movie.mp4", "Video");
+        item.media_streams = vec![
+            json!({ "Type": "Subtitle", "Index": 2, "Codec": "srt" }),
+            json!({ "Type": "Subtitle", "Index": 3, "Codec": "mov_text" }),
+            json!({ "Type": "Subtitle", "Index": 4, "Codec": "ass" }),
+            json!({ "Type": "Subtitle", "Index": 5, "Codec": "hdmv_pgs_subtitle" }),
+            json!({ "Type": "Subtitle", "Index": 6, "Codec": "dvd_subtitle" }),
+            json!({ "Type": "Subtitle", "Index": 7, "Codec": "dvb_subtitle" }),
+        ];
+
+        let streams = dlna_subtitle_streams(&item);
+        let indexes = streams
+            .iter()
+            .map(|stream| stream.index)
+            .collect::<Vec<_>>();
+        assert_eq!(indexes, vec![2, 3, 4]);
+        assert!(streams.iter().all(|stream| stream.format == "vtt"));
+        assert!(streams.iter().all(|stream| stream.mime_type == "text/vtt"));
     }
 
     #[test]
