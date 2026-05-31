@@ -15,47 +15,26 @@ const defaultOutputDir = path.join(manualEvidenceDir, 'fixture');
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const outputDir = path.resolve(options.outputDir || process.env.JELLYRIN_DLNA_FIXTURE_DIR || defaultOutputDir);
-  await fs.mkdir(outputDir, { recursive: true });
-
-  const subtitlePath = path.join(outputDir, 'E3-DLNA-Manual-Fixture.srt');
-  const videoPath = path.join(outputDir, 'E3-DLNA-Manual-Fixture.mkv');
-  const nfoPath = path.join(outputDir, 'E3-DLNA-Manual-Fixture.nfo');
-  const runbookPath = path.join(outputDir, 'RUNBOOK.md');
-
-  await fs.writeFile(
-    subtitlePath,
-    [
-      '1',
-      '00:00:00,000 --> 00:00:02,000',
-      'Jellyrin E3 DLNA subtitle probe',
-      '',
-      '2',
-      '00:00:02,000 --> 00:00:04,000',
-      'Browse, thumbnail, subtitle and playback validation',
-      '',
-    ].join('\n'),
-  );
-
-  await createVideoFixture(videoPath, subtitlePath);
-  await fs.writeFile(nfoPath, nfoMetadata());
-  await fs.writeFile(runbookPath, runbook(outputDir, videoPath));
-
-  const probe = await ffprobe(videoPath);
-  const subtitleStream = probe.streams.find((stream) => stream.codec_type === 'subtitle');
-  if (!subtitleStream) {
-    throw new Error('fixture must contain an embedded subtitle stream');
+  if (options.help) {
+    printUsage();
+    return;
   }
+  if (options.selfTest) {
+    await selfTest();
+    return;
+  }
+  const outputDir = path.resolve(options.outputDir || process.env.JELLYRIN_DLNA_FIXTURE_DIR || defaultOutputDir);
+  const fixture = await createFixture(outputDir);
 
   console.log(JSON.stringify({
     status: 'ready',
     outputDir,
-    mediaPath: videoPath,
-    subtitlePath,
-    nfoPath,
-    runbookPath,
-    expectedSubtitleIndex: subtitleStream.index,
-    streams: probe.streams.map((stream) => ({
+    mediaPath: fixture.videoPath,
+    subtitlePath: fixture.subtitlePath,
+    nfoPath: fixture.nfoPath,
+    runbookPath: fixture.runbookPath,
+    expectedSubtitleIndex: fixture.subtitleStream.index,
+    streams: fixture.probe.streams.map((stream) => ({
       index: stream.index,
       type: stream.codec_type,
       codec: stream.codec_name,
@@ -69,16 +48,71 @@ function parseArgs(args) {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === '--out-dir') {
-      options.outputDir = args[index + 1];
+      options.outputDir = requireArgValue(args, index, arg);
       index += 1;
+    } else if (arg === '--self-test') {
+      options.selfTest = true;
     } else if (arg === '--help' || arg === '-h') {
-      console.log('Usage: node qa/golden/dlna-device-fixture.js [--out-dir <directory>]');
-      process.exit(0);
+      options.help = true;
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
   }
   return options;
+}
+
+function requireArgValue(args, index, flag) {
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith('--')) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return value;
+}
+
+function printUsage() {
+  console.log('Usage: node qa/golden/dlna-device-fixture.js [--out-dir <directory>] [--self-test]');
+}
+
+async function createFixture(outputDir) {
+  await fs.mkdir(outputDir, { recursive: true });
+
+  const subtitlePath = path.join(outputDir, 'E3-DLNA-Manual-Fixture.srt');
+  const videoPath = path.join(outputDir, 'E3-DLNA-Manual-Fixture.mkv');
+  const nfoPath = path.join(outputDir, 'E3-DLNA-Manual-Fixture.nfo');
+  const runbookPath = path.join(outputDir, 'RUNBOOK.md');
+
+  await fs.writeFile(subtitlePath, subtitlePayload());
+  await createVideoFixture(videoPath, subtitlePath);
+  await fs.writeFile(nfoPath, nfoMetadata());
+  await fs.writeFile(runbookPath, runbook(outputDir, videoPath));
+
+  const probe = await ffprobe(videoPath);
+  const subtitleStream = probe.streams.find((stream) => stream.codec_type === 'subtitle');
+  if (!subtitleStream) {
+    throw new Error('fixture must contain an embedded subtitle stream');
+  }
+  return {
+    outputDir,
+    subtitlePath,
+    videoPath,
+    nfoPath,
+    runbookPath,
+    probe,
+    subtitleStream,
+  };
+}
+
+function subtitlePayload() {
+  return [
+    '1',
+    '00:00:00,000 --> 00:00:02,000',
+    'Jellyrin E3 DLNA subtitle probe',
+    '',
+    '2',
+    '00:00:02,000 --> 00:00:04,000',
+    'Browse, thumbnail, subtitle and playback validation',
+    '',
+  ].join('\n');
 }
 
 async function createVideoFixture(videoPath, subtitlePath) {
@@ -196,6 +230,55 @@ function runbook(outputDir, videoPath) {
   ].join('\n');
 }
 
+async function selfTest() {
+  const parsed = parseArgs(['--out-dir', '/tmp/jellyrin-dlna-fixture-self-test']);
+  assertEqual(parsed.outputDir, '/tmp/jellyrin-dlna-fixture-self-test', 'parse output dir');
+  let missingValueFailed = false;
+  try {
+    parseArgs(['--out-dir', '--self-test']);
+  } catch {
+    missingValueFailed = true;
+  }
+  if (!missingValueFailed) {
+    throw new Error('parseArgs should reject missing option values');
+  }
+
+  const tempRoot = await fs.mkdtemp('/tmp/jellyrin-dlna-fixture-');
+  try {
+    const fixture = await createFixture(tempRoot);
+    const streamTypes = fixture.probe.streams.map((stream) => stream.codec_type);
+    for (const expected of ['video', 'audio', 'subtitle']) {
+      if (!streamTypes.includes(expected)) {
+        throw new Error(`fixture self-test missing ${expected} stream`);
+      }
+    }
+    assertEqual(fixture.subtitleStream.index, 2, 'subtitle stream index');
+    const subtitleText = await fs.readFile(fixture.subtitlePath, 'utf8');
+    if (!subtitleText.includes('Jellyrin E3 DLNA subtitle probe')) {
+      throw new Error('subtitle payload did not contain probe cue');
+    }
+    const nfoText = await fs.readFile(fixture.nfoPath, 'utf8');
+    if (!nfoText.includes('<title>E3 DLNA Manual Fixture</title>')) {
+      throw new Error('NFO metadata did not contain fixture title');
+    }
+    const runbookText = await fs.readFile(fixture.runbookPath, 'utf8');
+    for (const expected of ['golden:dlna:device-preflight', 'same LAN', 'subtitle stream index `2`']) {
+      if (!runbookText.includes(expected)) {
+        throw new Error(`RUNBOOK missing ${expected}`);
+      }
+    }
+    console.log(JSON.stringify({ status: 'self-test-ok' }, null, 2));
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
+function assertEqual(actual, expected, label) {
+  if (actual !== expected) {
+    throw new Error(`${label}: expected ${expected}, got ${actual}`);
+  }
+}
+
 if (require.main === module) {
   main().catch((error) => {
     console.error(error.message || error);
@@ -204,8 +287,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  createFixture,
   createVideoFixture,
   ffprobe,
   nfoMetadata,
   parseArgs,
+  subtitlePayload,
 };
