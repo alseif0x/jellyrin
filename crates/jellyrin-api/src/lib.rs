@@ -49,7 +49,7 @@ use jellyrin_db::{
 use jellyrin_plugin_rpc::{
     HandshakeRequest, HandshakeResponse, LoadPluginRequest, LoadedPlugin,
     PLUGIN_RPC_PROTOCOL_VERSION, PluginHealth, PluginHostStdioClient, PluginIdentity,
-    PluginRpcEnvelope, PluginRpcMethod, PluginRuntime,
+    PluginRpcEnvelope, PluginRpcMethod, PluginRuntime, UpdateConfigurationRequest,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -8131,6 +8131,11 @@ async fn plugin_configuration(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(configuration) =
+        plugin_configuration_from_runtime_host(&state.db, &plugin_id).await?
+    {
+        return Ok(Json(configuration));
+    }
     state
         .db
         .plugin_configuration_json(&plugin_id)
@@ -8147,6 +8152,10 @@ async fn update_plugin_configuration(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let payload =
+        update_plugin_configuration_via_runtime_host(&state.db, &plugin_id, payload.clone())
+            .await?
+            .unwrap_or(payload);
     if state
         .db
         .update_plugin_configuration_json(&plugin_id, payload)
@@ -8156,6 +8165,139 @@ async fn update_plugin_configuration(
     } else {
         Err(ApiError::not_found("Plugin not found"))
     }
+}
+
+async fn plugin_configuration_from_runtime_host(
+    db: &Database,
+    plugin_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Ok(None);
+    };
+    let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(&plugin)
+    else {
+        return Ok(None);
+    };
+    plugin_configuration_from_runtime_host_path(
+        db,
+        plugin_id,
+        &plugin,
+        runtime,
+        runtime_name,
+        error_prefix,
+        host_path,
+    )
+    .await
+}
+
+async fn plugin_configuration_from_runtime_host_path(
+    db: &Database,
+    plugin_id: &str,
+    plugin: &serde_json::Value,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
+    host_path: PathBuf,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some((mut client, version)) =
+        load_plugin_runtime_host_with_path(plugin, runtime, runtime_name, error_prefix, host_path)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if let Some(configuration) = db.plugin_configuration_json(plugin_id).await? {
+        let update = PluginRpcEnvelope::new(
+            format!("{plugin_id}:configuration-sync"),
+            PluginRpcMethod::UpdateConfiguration,
+            UpdateConfigurationRequest {
+                plugin_id: plugin_id.to_string(),
+                configuration,
+            },
+        );
+        rpc_result(
+            client
+                .call::<_, serde_json::Value>(&update, StdDuration::from_secs(5))
+                .await
+                .map_err(|error| {
+                    ApiError::internal(format!("Plugin host configuration sync failed: {error}"))
+                })?,
+        )?;
+    }
+    let get = PluginRpcEnvelope::new(
+        format!("{plugin_id}:configuration-get"),
+        PluginRpcMethod::GetConfiguration,
+        PluginIdentity {
+            plugin_id: plugin_id.to_string(),
+            version,
+        },
+    );
+    let response = client
+        .call::<_, serde_json::Value>(&get, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("Plugin host configuration read failed: {error}"))
+        })?;
+    let result = rpc_result(response)?;
+    let _ = client.shutdown().await;
+    Ok(result)
+}
+
+async fn update_plugin_configuration_via_runtime_host(
+    db: &Database,
+    plugin_id: &str,
+    configuration: serde_json::Value,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Ok(None);
+    };
+    let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(&plugin)
+    else {
+        return Ok(None);
+    };
+    update_plugin_configuration_via_runtime_host_path(
+        plugin_id,
+        &plugin,
+        configuration,
+        runtime,
+        runtime_name,
+        error_prefix,
+        host_path,
+    )
+    .await
+}
+
+async fn update_plugin_configuration_via_runtime_host_path(
+    plugin_id: &str,
+    plugin: &serde_json::Value,
+    configuration: serde_json::Value,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
+    host_path: PathBuf,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some((mut client, _version)) =
+        load_plugin_runtime_host_with_path(plugin, runtime, runtime_name, error_prefix, host_path)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let update = PluginRpcEnvelope::new(
+        format!("{plugin_id}:configuration-update"),
+        PluginRpcMethod::UpdateConfiguration,
+        UpdateConfigurationRequest {
+            plugin_id: plugin_id.to_string(),
+            configuration,
+        },
+    );
+    let response = client
+        .call::<_, serde_json::Value>(&update, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("Plugin host configuration update failed: {error}"))
+        })?;
+    let result = rpc_result(response)?;
+    let _ = client.shutdown().await;
+    Ok(result)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -8258,6 +8400,86 @@ async fn activate_dotnet_plugin_with_host_path(
         "DotNet",
     )
     .await
+}
+
+async fn load_plugin_runtime_host_with_path(
+    plugin: &serde_json::Value,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
+    host_path: PathBuf,
+) -> Result<Option<(PluginHostStdioClient, String)>, ApiError> {
+    let Some(plugin_id) = json_string_field(plugin, "Id") else {
+        return Ok(None);
+    };
+    let version = json_string_field(plugin, "Version").unwrap_or_default();
+    let manifest = plugin
+        .get("Manifest")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(install_path) = plugin_install_path(plugin).or_else(|| plugin_install_path(&manifest))
+    else {
+        return Ok(None);
+    };
+
+    let mut client =
+        PluginHostStdioClient::spawn(&mut Command::new(&host_path)).map_err(|error| {
+            ApiError::internal(format!("{error_prefix} host failed to start: {error}"))
+        })?;
+    let handshake = PluginRpcEnvelope::new(
+        format!("{plugin_id}:host-handshake"),
+        PluginRpcMethod::Handshake,
+        HandshakeRequest {
+            runtime: runtime.clone(),
+            runtime_version: "0.1.0".to_string(),
+            host_id: "jellyrin-api".to_string(),
+            supported_protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION],
+            capabilities: vec![
+                "LoadPlugin".to_string(),
+                "GetConfiguration".to_string(),
+                "UpdateConfiguration".to_string(),
+            ],
+        },
+    );
+    let handshake_response = client
+        .call::<_, HandshakeResponse>(&handshake, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("{error_prefix} host handshake failed: {error}"))
+        })?;
+    if rpc_result(handshake_response)?.is_none() {
+        let _ = client.shutdown().await;
+        return Ok(None);
+    }
+
+    let load = PluginRpcEnvelope::new(
+        format!("{plugin_id}:host-load"),
+        PluginRpcMethod::LoadPlugin,
+        LoadPluginRequest {
+            plugin_id: plugin_id.clone(),
+            name: json_string_field(plugin, "Name").unwrap_or_else(|| plugin_id.clone()),
+            version: version.clone(),
+            runtime,
+            target_abi: json_string_field(plugin, "TargetAbi").unwrap_or_default(),
+            install_path,
+            manifest,
+            permissions: plugin_string_array(plugin.get("Permissions")),
+        },
+    );
+    let load_response = client
+        .call::<_, LoadedPlugin>(&load, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| ApiError::internal(format!("{error_prefix} host load failed: {error}")))?;
+    if rpc_result(load_response)?.is_none() {
+        let _ = client.shutdown().await;
+        return Ok(None);
+    }
+    tracing::debug!(
+        plugin_id,
+        runtime = runtime_name,
+        "loaded plugin runtime host"
+    );
+    Ok(Some((client, version)))
 }
 
 async fn activate_plugin_with_host_path(
@@ -8391,6 +8613,24 @@ fn rust_wasi_host_binary_path() -> Option<PathBuf> {
 
 fn dotnet_host_binary_path() -> Option<PathBuf> {
     plugin_host_binary_path("JELLYRIN_PLUGIN_HOST_DOTNET", "jellyrin-plugin-host-dotnet")
+}
+
+fn plugin_runtime_host_path(
+    plugin: &serde_json::Value,
+) -> Option<(PluginRuntime, &'static str, &'static str, PathBuf)> {
+    match json_string_field(plugin, "Runtime").as_deref() {
+        Some("RustWasi") => rust_wasi_host_binary_path()
+            .map(|path| (PluginRuntime::RustWasi, "RustWasi", "RustWasi", path)),
+        Some("DotNetJellyfin") => dotnet_host_binary_path().map(|path| {
+            (
+                PluginRuntime::DotNetJellyfin,
+                "DotNetJellyfin",
+                "DotNet",
+                path,
+            )
+        }),
+        _ => None,
+    }
 }
 
 fn plugin_host_binary_path(env_var: &str, binary_name: &str) -> Option<PathBuf> {
@@ -30757,13 +30997,15 @@ mod tests {
         package_infos_from_repositories, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
         parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
-        plugin_package_operation, plugin_packages_root, reconcile_live_tv_recordings_on_startup,
+        plugin_configuration_from_runtime_host_path, plugin_package_operation,
+        plugin_packages_root, reconcile_live_tv_recordings_on_startup,
         reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
         reserve_live_tv_recording_start, router, run_due_live_tv_timers, series_timer_child_id,
         spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
         subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
         transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
-        validate_zip_entry_path, verify_plugin_package_checksum,
+        update_plugin_configuration_via_runtime_host_path, validate_zip_entry_path,
+        verify_plugin_package_checksum,
     };
     use crate::dlna;
     use axum::{
@@ -30778,6 +31020,7 @@ mod tests {
         BrandingConfig, Database, InstallPluginPackage, SystemConfigurationPayloads,
         UpsertPlaybackState, UpsertTranscodeSession,
     };
+    use jellyrin_plugin_rpc::PluginRuntime;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
@@ -31412,6 +31655,88 @@ mod tests {
         assert_eq!(plugin["RecentEvents"][0]["EventType"], "RuntimeStatus");
     }
 
+    #[tokio::test]
+    async fn dotnet_configuration_uses_stdio_host_and_persists_update() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "77777777-7777-7777-7777-777777777777";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("Jellyfin.Plugin.Configurable.dll"), b"dll")
+            .await
+            .unwrap();
+        let host_path = fake_dotnet_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Configurable DotNet".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "DotNetJellyfin".to_string(),
+                target_abi: "12.0.0.0".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Configurable DotNet",
+                    "Runtime": "DotNetJellyfin"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Configurable DotNet",
+                    "Version": "1.0.0.0",
+                    "Runtime": "DotNetJellyfin",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Configuration": { "Enabled": true }
+                }),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        let configuration = plugin_configuration_from_runtime_host_path(
+            &db,
+            plugin_id,
+            &plugin,
+            PluginRuntime::DotNetJellyfin,
+            "DotNetJellyfin",
+            "DotNet",
+            host_path.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(configuration["Enabled"], true);
+
+        let configuration = update_plugin_configuration_via_runtime_host_path(
+            plugin_id,
+            &plugin,
+            json!({ "Enabled": false }),
+            PluginRuntime::DotNetJellyfin,
+            "DotNetJellyfin",
+            "DotNet",
+            host_path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(configuration["Enabled"], false);
+        assert!(
+            db.update_plugin_configuration_json(plugin_id, configuration)
+                .await
+                .unwrap()
+        );
+
+        let persisted = db
+            .plugin_configuration_json(plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted["Enabled"], false);
+    }
+
     async fn fake_rust_wasi_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-wasi-host.sh");
         tokio::fs::write(
@@ -31470,6 +31795,12 @@ while IFS= read -r line; do
       ;;
     LoadPlugin)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"66666666-6666-6666-6666-666666666666","Runtime":"DotNetJellyfin","RuntimeVersion":"fake-dotnet-host-0.1","Status":"Healthy","Manifest":{"Name":"Activatable DotNet"},"Capabilities":["MetadataProvider"]}}\n' "$corr"
+      ;;
+    GetConfiguration)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Enabled":true}}\n' "$corr"
+      ;;
+    UpdateConfiguration)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Enabled":false}}\n' "$corr"
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"66666666-6666-6666-6666-666666666666","Runtime":"DotNetJellyfin","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
