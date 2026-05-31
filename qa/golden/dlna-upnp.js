@@ -13,6 +13,7 @@ const tracePath = path.join(traceDir, 'golden-run.log');
 const traceJsonPath = path.join(traceDir, 'golden-run.json');
 const evidencePath = path.join(generatedDir, 'dlna-upnp.json');
 const evidenceMarkdownPath = path.join(generatedDir, 'dlna-upnp.md');
+const discoveryEvidencePath = path.join(generatedDir, 'dlna-discovery.json');
 
 const goldenCommands = [
   [
@@ -52,7 +53,8 @@ async function main() {
   await fs.writeFile(tracePath, result.output);
   await fs.writeFile(traceJsonPath, `${JSON.stringify(result, null, 2)}\n`);
 
-  const evidence = buildEvidence(result);
+  const discoveryEvidence = await readJsonIfExists(discoveryEvidencePath);
+  const evidence = buildEvidence(result, discoveryEvidence);
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence));
   console.log(`wrote ${evidencePath}`);
@@ -107,21 +109,28 @@ function runCommand(command) {
   });
 }
 
-function buildEvidence(result) {
+function buildEvidence(result, discoveryEvidence) {
   const passed = result.code === 0;
+  const discoveryPassed =
+    discoveryEvidence?.status === 'implemented' &&
+    discoveryEvidence?.failedTargets?.length === 0 &&
+    discoveryEvidence?.completedTargets?.includes('local-udp');
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? 92 : 87,
+    percent: passed ? (discoveryPassed ? 93 : 92) : 87,
     closed: false,
     sourcePhase: passed
-      ? 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a'
+      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
           'Jellyrin DLNA/UPnP local golden completed as a control-point flow.',
           'The trace generates a real MP4 fixture with ffmpeg, enables UPnP, publishes a library, fetches the root device descriptor, browses ContentDirectory, validates a direct DLNA Range stream, requests tokenless transcode.m3u8, waits for the real ffmpeg HLS media playlist, then fetches a rewritten DLNA TS segment with content-type video/mp2t and MPEG-TS sync bytes.',
           'The SSDP contract test verifies M-SEARCH/NOTIFY targets including ContentDirectory, ConnectionManager and X_MS_MediaReceiverRegistrar.',
+          discoveryPassed
+            ? 'The companion dlna-discovery golden validates a real local UDP M-SEARCH round trip.'
+            : 'The companion dlna-discovery golden has not been completed in the current generated evidence.',
           'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
@@ -132,6 +141,7 @@ function buildEvidence(result) {
     tracePath: path.relative(plansDir, tracePath),
     validatedCommands: [
       ...goldenCommands.map((command) => command.join(' ')),
+      ...(discoveryPassed ? ['npm run golden:dlna-discovery'] : []),
       'cargo test -p jellyrin-api dlna_ -- --nocapture',
       'cargo check -p jellyrin-api',
       'cargo check -p jellyrin-server',
@@ -149,6 +159,17 @@ function buildEvidence(result) {
       'Basic protocolInfo/profile hints and HLS fallback routes are implemented; renderer-specific Samsung/LG/Sony/VLC profile rules and video DLNA.ORG_PN codec/profile decisions remain pending.',
     ],
   };
+}
+
+async function readJsonIfExists(filePath) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
 }
 
 function renderMarkdown(evidence) {
