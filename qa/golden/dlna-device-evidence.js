@@ -369,6 +369,8 @@ async function requireExistingArtifact(errors, pathOrUrl, index) {
     const stat = await fs.stat(artifactPath);
     if (!stat.isFile()) {
       errors.push(`artifacts[${index}].pathOrUrl must point to a file`);
+    } else if (stat.size === 0) {
+      errors.push(`artifacts[${index}].pathOrUrl file must not be empty`);
     }
   } catch {
     errors.push(`artifacts[${index}].pathOrUrl file does not exist: ${artifactPath}`);
@@ -438,6 +440,7 @@ function printUsage() {
 
 async function selfTest() {
   const artifactPath = path.join(manualEvidenceDir, 'artifacts', 'self-test-artifact.txt');
+  const emptyArtifactPath = path.join(manualEvidenceDir, 'artifacts', 'empty-self-test-artifact.txt');
   await fs.mkdir(path.dirname(artifactPath), { recursive: true });
   await fs.writeFile(artifactPath, 'self-test\n');
   try {
@@ -494,9 +497,18 @@ async function selfTest() {
     };
     await assertInvalid(outsideArtifact, 'artifacts[0].pathOrUrl must stay under');
 
+    await fs.writeFile(emptyArtifactPath, '');
+    const emptyArtifact = {
+      ...valid,
+      artifacts: [{ type: 'client-log', pathOrUrl: path.relative(plansDir, emptyArtifactPath) }],
+    };
+    await assertInvalid(emptyArtifact, 'artifacts[0].pathOrUrl file must not be empty');
+    await fs.rm(emptyArtifactPath, { force: true });
+
     console.log(JSON.stringify({ status: 'self-test-ok' }, null, 2));
   } finally {
     await fs.rm(artifactPath, { force: true });
+    await fs.rm(emptyArtifactPath, { force: true });
   }
 }
 
