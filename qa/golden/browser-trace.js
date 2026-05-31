@@ -395,6 +395,7 @@ async function captureTarget(browser, flowDir, target) {
       syncplayUnpause204: false,
       syncplayUnpauseFanout: false,
       syncplayGuestReconnectDeduped: false,
+      syncplayStaleCleanup: false,
       syncplayGuestLogoutRemoved: false,
       syncplayGuestLeft: false,
       syncplayOwnerLeft: false,
@@ -1015,15 +1016,20 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
 
   const ownerName = `${syncplayFlowPrefix} Owner ${target.name}`;
   const guestName = `${syncplayFlowPrefix} Guest ${target.name}`;
+  const staleName = `${syncplayFlowPrefix} Stale ${target.name}`;
   const groupName = `Jellyrin SyncPlay ${target.name}`;
   const ownerAuthorization = `MediaBrowser Client="Jellyrin Browser Trace", Device="SyncPlay Owner ${target.name}", DeviceId="syncplay-owner-${target.name}", Version="dev"`;
   const guestAuthorization = `MediaBrowser Client="Jellyrin Browser Trace", Device="SyncPlay Guest ${target.name}", DeviceId="syncplay-guest-${target.name}", Version="dev"`;
+  const staleAuthorization = `MediaBrowser Client="Jellyrin Browser Trace", Device="SyncPlay Stale ${target.name}", DeviceId="syncplay-stale-${target.name}", Version="dev"`;
   let createdOwnerId = null;
   let createdGuestId = null;
+  let createdStaleId = null;
   let ownerToken = null;
   let guestToken = null;
+  let staleToken = null;
   let ownerInGroup = false;
   let guestInGroup = false;
+  let staleInGroup = false;
   let groupId = null;
 
   async function cleanupExistingUsers() {
@@ -1036,7 +1042,7 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       throw new Error(`syncplay cleanup user list returned HTTP ${users.status}`);
     }
     for (const user of users.json || []) {
-      if ([ownerName, guestName].includes(user?.Name) && user.Id) {
+      if ([ownerName, guestName, staleName].includes(user?.Name) && user.Id) {
         await browserFetchJson(page, {
           method: 'DELETE',
           url: `/Users/${encodeURIComponent(user.Id)}`,
@@ -1077,6 +1083,20 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     }
     createdGuestId = createdGuest.json.Id;
 
+    const createdStale = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/New',
+      token: admin.AccessToken,
+      body: {
+        Name: staleName,
+        Password: syncplayFlowPassword,
+      },
+    });
+    if (createdStale.status !== 200 || !createdStale.json?.Id || createdStale.json.Name !== staleName) {
+      throw new Error(`syncplay stale Users/New returned HTTP ${createdStale.status}`);
+    }
+    createdStaleId = createdStale.json.Id;
+
     const ownerLogin = await browserFetchJson(page, {
       method: 'POST',
       url: '/Users/AuthenticateByName',
@@ -1104,6 +1124,20 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       throw new Error(`syncplay guest login returned HTTP ${guestLogin.status}`);
     }
     guestToken = guestLogin.json.AccessToken;
+
+    const staleLogin = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/AuthenticateByName',
+      authorization: staleAuthorization,
+      body: {
+        Username: staleName,
+        Pw: syncplayFlowPassword,
+      },
+    });
+    if (staleLogin.status !== 200 || !staleLogin.json?.AccessToken) {
+      throw new Error(`syncplay stale login returned HTTP ${staleLogin.status}`);
+    }
+    staleToken = staleLogin.json.AccessToken;
 
     await startWebsocketProbe(page, summary.baseUrl, [
       { name: 'owner', token: ownerToken, deviceId: `syncplay-owner-${target.name}` },
@@ -1336,6 +1370,41 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     }
     summary.invariants.syncplayCleanupConfirmed = true;
 
+    const staleGroupName = `Jellyrin SyncPlay Stale ${target.name}`;
+    const staleGroup = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/New',
+      token: staleToken,
+      authorization: staleAuthorization,
+      body: {
+        GroupName: staleGroupName,
+      },
+    });
+    const staleGroupId = staleGroup.json?.GroupId || staleGroup.json?.Id || null;
+    if (staleGroup.status !== 200 || !staleGroupId) {
+      throw new Error(`SyncPlay stale group New returned HTTP ${staleGroup.status}`);
+    }
+    staleInGroup = true;
+    const staleTimeoutMs = Number.parseInt(process.env.JELLYRIN_SYNCPLAY_STALE_TIMEOUT_MS || '120000', 10);
+    if (!Number.isFinite(staleTimeoutMs) || staleTimeoutMs > 5000) {
+      throw new Error('SyncPlay stale cleanup golden requires JELLYRIN_SYNCPLAY_STALE_TIMEOUT_MS <= 5000');
+    }
+    await page.waitForTimeout(staleTimeoutMs + 50);
+    const listAfterStale = await browserFetchJson(page, {
+      method: 'GET',
+      url: '/SyncPlay/List',
+      token: ownerToken,
+      authorization: ownerAuthorization,
+    });
+    if (listAfterStale.status !== 200) {
+      throw new Error(`SyncPlay stale cleanup List returned HTTP ${listAfterStale.status}`);
+    }
+    if ((listAfterStale.json || []).some((group) => group.GroupId === staleGroupId || group.Id === staleGroupId)) {
+      throw new Error('SyncPlay stale cleanup left the stale group in the list');
+    }
+    staleInGroup = false;
+    summary.invariants.syncplayStaleCleanup = true;
+
     await closeWebsocketProbe(page);
     summary.item = {
       id: groupId,
@@ -1345,6 +1414,14 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     };
   } finally {
     await closeWebsocketProbe(page).catch(() => {});
+    if (staleToken && staleInGroup) {
+      await browserFetchJson(page, {
+        method: 'POST',
+        url: '/SyncPlay/Leave',
+        token: staleToken,
+        authorization: staleAuthorization,
+      }).catch(() => {});
+    }
     if (ownerToken && ownerInGroup) {
       await browserFetchJson(page, {
         method: 'POST',
@@ -1368,6 +1445,13 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
         token: guestToken,
       }).catch(() => {});
     }
+    if (staleToken) {
+      await browserFetchJson(page, {
+        method: 'POST',
+        url: '/Sessions/Logout',
+        token: staleToken,
+      }).catch(() => {});
+    }
     if (ownerToken) {
       await browserFetchJson(page, {
         method: 'POST',
@@ -1379,6 +1463,13 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       await browserFetchJson(page, {
         method: 'DELETE',
         url: `/Users/${encodeURIComponent(createdGuestId)}`,
+        token: admin.AccessToken,
+      }).catch(() => {});
+    }
+    if (createdStaleId) {
+      await browserFetchJson(page, {
+        method: 'DELETE',
+        url: `/Users/${encodeURIComponent(createdStaleId)}`,
         token: admin.AccessToken,
       }).catch(() => {});
     }
@@ -9105,6 +9196,7 @@ function invariantFailures(summary) {
       ['syncplayUnpause204', 'unpause command'],
       ['syncplayUnpauseFanout', 'unpause fanout'],
       ['syncplayGuestReconnectDeduped', 'guest reconnect dedupe'],
+      ['syncplayStaleCleanup', 'stale cleanup'],
       ['syncplayGuestLogoutRemoved', 'guest logout cleanup'],
       ['syncplayGuestLeft', 'guest leave'],
       ['syncplayOwnerLeft', 'owner leave'],

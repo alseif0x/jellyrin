@@ -67,6 +67,7 @@ const DEFAULT_AUTHENTICATION_PROVIDER_ID: &str =
 const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 const SYNCPLAY_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
+const SYNCPLAY_STALE_TIMEOUT_MS: i64 = 120_000;
 const IMAGE_UPLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
@@ -9477,6 +9478,15 @@ fn syncplay_insert_participant(
     participants.insert(participant.session_id.clone(), participant);
 }
 
+fn syncplay_stale_timeout() -> Duration {
+    std::env::var("JELLYRIN_SYNCPLAY_STALE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::milliseconds)
+        .unwrap_or_else(|| Duration::milliseconds(SYNCPLAY_STALE_TIMEOUT_MS))
+}
+
 fn syncplay_group_json(group: &SyncPlayGroup) -> serde_json::Value {
     let participants = group
         .participants
@@ -9511,6 +9521,7 @@ async fn syncplay_list(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    syncplay_cleanup_stale_participants("Stale").await;
     let groups = syncplay_groups().lock().await;
     Ok(Json(groups.values().map(syncplay_group_json).collect()))
 }
@@ -9522,6 +9533,7 @@ async fn syncplay_group(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    syncplay_cleanup_stale_participants("Stale").await;
     let groups = syncplay_groups().lock().await;
     let group = groups
         .get(id.trim())
@@ -9536,6 +9548,7 @@ async fn syncplay_new(
     body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    syncplay_cleanup_stale_participants("Stale").await;
     let payload = optional_json_body(body).await?;
     let group_id = json_string_any_field(&payload, &["GroupId", "Id"])
         .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -9569,6 +9582,7 @@ async fn syncplay_join(
     body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    syncplay_cleanup_stale_participants("Stale").await;
     let payload = optional_json_body(body).await?;
     let group_id = json_string_any_field(&payload, &["GroupId", "Id"])
         .ok_or_else(|| ApiError::bad_request("SyncPlay group id is required"))?;
@@ -9632,6 +9646,54 @@ async fn syncplay_remove_session(session_id: &str, reason: &str) {
     }
 }
 
+async fn syncplay_cleanup_stale_participants(reason: &str) {
+    let now = OffsetDateTime::now_utc();
+    let timeout = syncplay_stale_timeout();
+    let mut updates = Vec::new();
+    {
+        let mut groups = syncplay_groups().lock().await;
+        let mut empty_groups = Vec::new();
+        for group in groups.values_mut() {
+            let stale_session_ids = group
+                .participants
+                .iter()
+                .filter(|(_, participant)| now - participant.last_seen_at > timeout)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            if stale_session_ids.is_empty() {
+                continue;
+            }
+            let owner_removed = stale_session_ids.iter().any(|session_id| {
+                group
+                    .participants
+                    .get(session_id)
+                    .is_some_and(|participant| participant.user_id == group.owner_user_id)
+            });
+            for session_id in stale_session_ids {
+                group.participants.remove(&session_id);
+            }
+            group.updated_at = now;
+            if group.participants.is_empty() {
+                empty_groups.push(group.id.clone());
+                continue;
+            }
+            if owner_removed && let Some(next_owner) = group.participants.values().next() {
+                group.owner_user_id = next_owner.user_id;
+            }
+            updates.push((
+                syncplay_group_json(group),
+                group.participants.keys().cloned().collect::<Vec<_>>(),
+            ));
+        }
+        for group_id in empty_groups {
+            groups.remove(&group_id);
+        }
+    }
+    for (group_json, participant_session_ids) in updates {
+        broadcast_syncplay_group_update(&participant_session_ids, &group_json, reason);
+    }
+}
+
 async fn syncplay_ping(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9656,6 +9718,7 @@ async fn syncplay_ping(
     for (group_json, participant_session_ids) in updates {
         broadcast_syncplay_group_update(&participant_session_ids, &group_json, "Ping");
     }
+    syncplay_cleanup_stale_participants("Stale").await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -9676,6 +9739,9 @@ async fn syncplay_group_command(
             .values_mut()
             .find(|group| group.participants.contains_key(&token.access_token))
             .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
+        if let Some(participant) = group.participants.get_mut(&token.access_token) {
+            participant.last_seen_at = now;
+        }
         syncplay_apply_participant_command(group, &token.access_token, &command, &payload, now);
         syncplay_apply_command_to_state(&mut group.state, &command, &payload, now);
         group.updated_at = now;
@@ -9696,6 +9762,7 @@ async fn syncplay_group_command(
             }),
         );
     }
+    syncplay_cleanup_stale_participants("Stale").await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -28536,8 +28603,9 @@ mod tests {
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
         record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
         run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
-        subscribe_playback_events, subscribe_system_lifecycle_commands, syncplay_groups,
-        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        subscribe_playback_events, subscribe_system_lifecycle_commands,
+        syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
     use crate::dlna;
     use axum::{
@@ -28554,11 +28622,20 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    static SYNCPLAY_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    async fn syncplay_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        SYNCPLAY_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)
     {
@@ -41003,6 +41080,7 @@ mod tests {
 
     #[tokio::test]
     async fn syncplay_routes_manage_in_memory_group_shell() {
+        let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
         let group_id = Uuid::new_v4().to_string();
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -41601,6 +41679,7 @@ mod tests {
 
     #[tokio::test]
     async fn syncplay_logout_removes_participant_and_transfers_owner() {
+        let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
         let group_id = Uuid::new_v4().to_string();
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -41719,6 +41798,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!syncplay_groups().lock().await.contains_key(&group_id));
+    }
+
+    #[tokio::test]
+    async fn syncplay_stale_cleanup_removes_participants_and_transfers_owner() {
+        let _guard = syncplay_test_lock().await;
+        syncplay_groups().lock().await.clear();
+        let group_id = Uuid::new_v4().to_string();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let owner = db
+            .update_first_user("owner".to_string(), "secret")
+            .await
+            .unwrap();
+        let owner_key = db
+            .issue_api_key_for_user(owner.id, &format!("syncplay-stale-owner-{group_id}"))
+            .await
+            .unwrap();
+        let guest = db.create_user("guest", Some("secret")).await.unwrap();
+        let guest_key = db
+            .issue_api_key_for_user(guest.id, &format!("syncplay-stale-guest-{group_id}"))
+            .await
+            .unwrap();
+        db.complete_startup_wizard().await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &owner_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Join")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        {
+            let mut groups = syncplay_groups().lock().await;
+            let group = groups.get_mut(&group_id).unwrap();
+            group.participants.get_mut(&owner_key).unwrap().last_seen_at =
+                OffsetDateTime::now_utc() - Duration::seconds(121);
+        }
+
+        let mut guest_events = subscribe_playback_events();
+        syncplay_cleanup_stale_participants("Stale").await;
+        let stale_event =
+            next_playback_event_type(&mut guest_events, &guest_key, "SyncPlayGroupUpdate").await;
+        assert_eq!(stale_event["Data"]["Reason"], "Stale");
+        let participants = stale_event["Data"]["Group"]["Participants"]
+            .as_array()
+            .unwrap();
+        assert_eq!(participants.len(), 1);
+        assert_eq!(participants[0]["UserName"], "guest");
+        assert_eq!(participants[0]["IsGroupOwner"], true);
+
+        {
+            let mut groups = syncplay_groups().lock().await;
+            let group = groups.get_mut(&group_id).unwrap();
+            group.participants.get_mut(&guest_key).unwrap().last_seen_at =
+                OffsetDateTime::now_utc() - Duration::seconds(121);
+        }
+        syncplay_cleanup_stale_participants("Stale").await;
         assert!(!syncplay_groups().lock().await.contains_key(&group_id));
     }
 
