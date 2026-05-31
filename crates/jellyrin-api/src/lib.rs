@@ -7299,10 +7299,10 @@ async fn update_package_repositories(
 async fn refresh_package_repositories(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<PackageRepositoryRefreshQuery>,
 ) -> Result<StatusCode, ApiError> {
     let (user, session_id) =
-        require_admin_session(&state.db, &headers, query.api_key.as_deref()).await?;
+        require_admin_session(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let run = state
         .db
         .start_task_run(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
@@ -7337,9 +7337,11 @@ async fn refresh_package_repositories(
         )
         .await?;
 
-        let refreshed_at = format_time_for_json(OffsetDateTime::now_utc());
+        let refreshed_at_time = OffsetDateTime::now_utc();
+        let refreshed_at = format_time_for_json(refreshed_at_time);
         let mut refreshed_repositories = Vec::with_capacity(repositories.len());
         let mut refreshed_urls = Vec::<String>::new();
+        let mut cached_urls = Vec::<String>::new();
         let mut failed_repositories = Vec::<serde_json::Value>::new();
         let mut skipped_repositories = Vec::<String>::new();
         let mut total_packages = 0_usize;
@@ -7359,6 +7361,37 @@ async fn refresh_package_repositories(
                         completed_repositories: index + 1,
                         repository_count,
                         phase: "SkippingDisabledRepository",
+                        package_count: total_packages,
+                        failed_repository_count: failed_repositories.len(),
+                        skipped_repository_count: skipped_repositories.len(),
+                    },
+                )
+                .await?;
+                continue;
+            }
+            let cache_ttl_seconds = repository_cache_ttl_seconds(&repository, &query);
+            if repository_refresh_can_use_cache(&repository, &query, refreshed_at_time) {
+                let mut cached_repository = repository;
+                total_packages += repository_package_count(&cached_repository);
+                cached_repository["LastRefreshCacheStatus"] = serde_json::json!("Fresh");
+                cached_repository["LastRefreshCacheTtlSeconds"] =
+                    serde_json::json!(cache_ttl_seconds);
+                if let Some(expires_at) =
+                    repository_cache_expires_at(&cached_repository, cache_ttl_seconds)
+                {
+                    cached_repository["LastRefreshCacheExpiresAt"] =
+                        serde_json::json!(format_time_for_json(expires_at));
+                }
+                cached_urls.push(url.clone());
+                refreshed_repositories.push(cached_repository);
+                update_package_repository_refresh_progress(
+                    &state.db,
+                    &session_id,
+                    run.id,
+                    PackageRepositoryRefreshProgress {
+                        completed_repositories: index + 1,
+                        repository_count,
+                        phase: "UsingCachedManifest",
                         package_count: total_packages,
                         failed_repository_count: failed_repositories.len(),
                         skipped_repository_count: skipped_repositories.len(),
@@ -7394,6 +7427,17 @@ async fn refresh_package_repositories(
                     refreshed_repository["LastRefreshError"] = serde_json::Value::Null;
                     refreshed_repository["LastRefreshPackageCount"] =
                         serde_json::json!(refreshed_repository["Packages"].as_array().map_or(0, Vec::len));
+                    refreshed_repository["LastRefreshCacheStatus"] =
+                        serde_json::json!("Refreshed");
+                    refreshed_repository["LastRefreshCacheTtlSeconds"] =
+                        serde_json::json!(cache_ttl_seconds);
+                    if cache_ttl_seconds > 0 {
+                        refreshed_repository["LastRefreshCacheExpiresAt"] = serde_json::json!(
+                            format_time_for_json(
+                                refreshed_at_time + Duration::seconds(cache_ttl_seconds)
+                            )
+                        );
+                    }
                     refreshed_urls.push(url);
                     refreshed_repositories.push(refreshed_repository);
                 }
@@ -7437,8 +7481,9 @@ async fn refresh_package_repositories(
                 "Status": "Running",
                 "Phase": "PersistingCatalog",
                 "ProgressPercentage": 95.0,
-                "RepositoryCount": refreshed_urls.len() + failed_repositories.len() + skipped_repositories.len(),
+                "RepositoryCount": refreshed_urls.len() + cached_urls.len() + failed_repositories.len() + skipped_repositories.len(),
                 "PackageCount": total_packages,
+                "CachedRepositoryCount": cached_urls.len(),
                 "FailedRepositoryCount": failed_repositories.len(),
                 "SkippedRepositoryCount": skipped_repositories.len(),
             }),
@@ -7451,8 +7496,9 @@ async fn refresh_package_repositories(
             .await?;
         Ok::<serde_json::Value, ApiError>(serde_json::json!({
             "Status": "Completed",
-            "RepositoryCount": refreshed_urls.len() + failed_repositories.len() + skipped_repositories.len(),
+            "RepositoryCount": refreshed_urls.len() + cached_urls.len() + failed_repositories.len() + skipped_repositories.len(),
             "RefreshedRepositories": refreshed_urls,
+            "CachedRepositories": cached_urls,
             "FailedRepositories": failed_repositories,
             "SkippedRepositories": skipped_repositories,
             "PackageCount": total_packages,
@@ -7524,6 +7570,18 @@ async fn package_repositories_refresh_status(
             .await?)
         .ok_or_else(|| ApiError::not_found("Package repository refresh task not found"))?;
     Ok(Json(package_task_run_json(&run)))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PackageRepositoryRefreshQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "Force", alias = "forceRefresh")]
+    force: Option<bool>,
+    #[serde(alias = "IfStale", alias = "onlyIfStale")]
+    if_stale: Option<bool>,
+    #[serde(alias = "CacheTtlSeconds", alias = "cacheDurationSeconds")]
+    cache_ttl_seconds: Option<i64>,
 }
 
 struct PackageRepositoryRefreshProgress<'a> {
@@ -7687,10 +7745,15 @@ fn normalize_repository_info(value: serde_json::Value) -> Option<serde_json::Val
         );
     }
     for field in [
+        "CacheTtlSeconds",
+        "CacheDurationSeconds",
         "LastRefreshStatus",
         "LastRefreshedAt",
         "LastRefreshPackageCount",
         "LastRefreshError",
+        "LastRefreshCacheStatus",
+        "LastRefreshCacheTtlSeconds",
+        "LastRefreshCacheExpiresAt",
     ] {
         if let Some(value) =
             json_field_case_insensitive(&serde_json::Value::Object(repository.clone()), field)
@@ -7699,6 +7762,58 @@ fn normalize_repository_info(value: serde_json::Value) -> Option<serde_json::Val
         }
     }
     Some(normalized)
+}
+
+const DEFAULT_PACKAGE_REPOSITORY_CACHE_TTL_SECONDS: i64 = 24 * 60 * 60;
+
+fn repository_refresh_can_use_cache(
+    repository: &serde_json::Value,
+    query: &PackageRepositoryRefreshQuery,
+    now: OffsetDateTime,
+) -> bool {
+    let force = query.force.unwrap_or(!query.if_stale.unwrap_or(false));
+    if force {
+        return false;
+    }
+    let ttl_seconds = repository_cache_ttl_seconds(repository, query);
+    ttl_seconds > 0
+        && repository_package_count(repository) > 0
+        && repository_last_refreshed_at(repository).is_some_and(|last_refreshed_at| {
+            now - last_refreshed_at <= Duration::seconds(ttl_seconds)
+        })
+}
+
+fn repository_cache_ttl_seconds(
+    repository: &serde_json::Value,
+    query: &PackageRepositoryRefreshQuery,
+) -> i64 {
+    query
+        .cache_ttl_seconds
+        .or_else(|| json_i64_field(repository, "CacheTtlSeconds"))
+        .or_else(|| json_i64_field(repository, "CacheDurationSeconds"))
+        .unwrap_or(DEFAULT_PACKAGE_REPOSITORY_CACHE_TTL_SECONDS)
+}
+
+fn repository_last_refreshed_at(repository: &serde_json::Value) -> Option<OffsetDateTime> {
+    json_string_field(repository, "LastRefreshedAt")
+        .and_then(|value| OffsetDateTime::parse(value.trim(), &Rfc3339).ok())
+}
+
+fn repository_cache_expires_at(
+    repository: &serde_json::Value,
+    ttl_seconds: i64,
+) -> Option<OffsetDateTime> {
+    if ttl_seconds <= 0 {
+        return None;
+    }
+    repository_last_refreshed_at(repository)
+        .map(|last_refreshed_at| last_refreshed_at + Duration::seconds(ttl_seconds))
+}
+
+fn repository_package_count(repository: &serde_json::Value) -> usize {
+    json_field_case_insensitive(repository, "Packages")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 fn default_plugin_repositories() -> Vec<serde_json::Value> {
@@ -40824,6 +40939,134 @@ mod tests {
         assert_eq!(refresh_status["Phase"], "Completed");
         assert_eq!(refresh_status["ProgressPercentage"], 100.0);
         assert_eq!(refresh_status["Result"]["PackageCount"], 1);
+
+        let manifest_v2 = json!([
+            {
+                "guid": "22222222-2222-2222-2222-222222222222",
+                "name": "Remote Plugin",
+                "overview": "Remote plugin from refreshed repository manifest",
+                "description": "Remote plugin",
+                "owner": "Jellyfin",
+                "category": "Metadata",
+                "versions": [{
+                    "version": "2.0.0.0",
+                    "targetAbi": "12.0.0.0",
+                    "sourceUrl": "https://repo.example/remote-plugin.zip",
+                    "checksum": "0123456789abcdef0123456789abcdef01234567",
+                    "timestamp": "2026-05-31T00:00:00Z"
+                }]
+            },
+            {
+                "guid": "77777777-7777-7777-7777-777777777777",
+                "name": "TTL Refresh Plugin",
+                "overview": "Plugin visible only after cache expiry",
+                "versions": [{
+                    "version": "1.0.0.0",
+                    "targetAbi": "12.0.0.0",
+                    "sourceUrl": "https://repo.example/ttl-refresh-plugin.zip"
+                }]
+            }
+        ]);
+        tokio::fs::write(&manifest_path, manifest_v2.to_string())
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Repositories/Refresh?IfStale=true&CacheTtlSeconds=86400")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let task = db_for_assertions
+            .last_task_result(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
+            .await
+            .unwrap()
+            .expect("completed repository refresh task");
+        let task_result = task.result_json.unwrap();
+        assert_eq!(
+            task_result["CachedRepositories"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            task_result["RefreshedRepositories"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(task_result["PackageCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Packages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let packages: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(packages.as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Repositories/Refresh?IfStale=true&CacheTtlSeconds=0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let task = db_for_assertions
+            .last_task_result(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
+            .await
+            .unwrap()
+            .expect("completed repository refresh task");
+        let task_result = task.result_json.unwrap();
+        assert_eq!(
+            task_result["CachedRepositories"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(
+            task_result["RefreshedRepositories"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(task_result["PackageCount"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Packages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let packages: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(packages.as_array().unwrap().len(), 2);
+        assert_eq!(packages[1]["Name"], "TTL Refresh Plugin");
 
         let response = app
             .oneshot(
