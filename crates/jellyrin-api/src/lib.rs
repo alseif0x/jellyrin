@@ -28185,8 +28185,63 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
     use uuid::Uuid;
+
+    async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut scratch = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut scratch).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                buffer.extend_from_slice(&scratch[..read]);
+                if let Some(end) = http_header_end(&buffer) {
+                    break end;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while buffer.len() < header_end + content_length {
+                let read = stream.read(&mut scratch).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&scratch[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let request =
+                String::from_utf8_lossy(&buffer[..buffer.len().min(header_end + content_length)])
+                    .to_string();
+            let _ = tx.send(request);
+        });
+        (format!("http://{addr}/events"), rx)
+    }
+
+    fn http_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)
+    }
 
     fn assert_hls_transcode_playback_info(info: &Value, item_id: &str, api_key: &str) -> String {
         assert_eq!(info["ErrorCode"], Value::Null);
@@ -31751,7 +31806,7 @@ mod tests {
                 Request::builder()
                     .method("SUBSCRIBE")
                     .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
-                    .header("CALLBACK", "<http://callback.example.test/events>")
+                    .header("CALLBACK", "<http://127.0.0.1:9/events>")
                     .header("NT", "upnp:event")
                     .header("TIMEOUT", "Second-120")
                     .body(Body::empty())
@@ -31839,6 +31894,42 @@ mod tests {
                 Request::builder()
                     .method("SUBSCRIBE")
                     .uri(format!("/Dlna/{server_id}/ConnectionManager/Events"))
+                    .header("CALLBACK", "<http://127.0.0.1:9/events>")
+                    .header("NT", "upnp:event")
+                    .header("TIMEOUT", "Second-1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let expiring_sid = response
+            .headers()
+            .get("sid")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Events"))
+                    .header("SID", &expiring_sid)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Events"))
                     .header("CALLBACK", "<https://callback.example.test/events>")
                     .header("NT", "upnp:event")
                     .body(Body::empty())
@@ -31874,6 +31965,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local TCP bind permission for callback validation"]
+    async fn dlna_initial_event_subscribe_sends_notify_seq_zero() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let (callback_url, callback_rx) = spawn_single_http_request_recorder().await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
+                    .header("CALLBACK", format!("<{callback_url}>"))
+                    .header("NT", "upnp:event")
+                    .header("TIMEOUT", "Second-120")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sid = response
+            .headers()
+            .get("sid")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let notify = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(notify.starts_with("NOTIFY /events HTTP/1.1"));
+        let notify_lower = notify.to_ascii_lowercase();
+        assert!(notify_lower.contains("\r\nnt: upnp:event\r\n"));
+        assert!(notify_lower.contains("\r\nnts: upnp:propchange\r\n"));
+        assert!(notify_lower.contains(&format!("\r\nsid: {}\r\n", sid).to_ascii_lowercase()));
+        assert!(notify_lower.contains("\r\nseq: 0\r\n"));
+        assert!(notify.contains("<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"));
+        assert!(notify.contains("<SystemUpdateID>0</SystemUpdateID>"));
+
+        let (callback_url, callback_rx) = spawn_single_http_request_recorder().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ConnectionManager/Events"))
+                    .header("CALLBACK", format!("<{callback_url}>"))
+                    .header("NT", "upnp:event")
+                    .header("TIMEOUT", "Second-120")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let notify = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(notify.contains("<SourceProtocolInfo>"));
+        assert!(notify.contains("<CurrentConnectionIDs>0</CurrentConnectionIDs>"));
     }
 
     #[tokio::test]

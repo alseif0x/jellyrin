@@ -12,7 +12,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::Path as FsPath,
     sync::{LazyLock, Mutex as StdMutex},
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, Instant},
 };
 use tokio::{net::UdpSocket, task::JoinHandle, time};
 use uuid::Uuid;
@@ -273,6 +273,7 @@ enum DlnaEventService {
 #[derive(Clone, Copy, Debug)]
 struct DlnaEventSubscription {
     service: DlnaEventService,
+    expires_at: Instant,
 }
 
 fn event_subscription_response(
@@ -280,6 +281,7 @@ fn event_subscription_response(
     method: &Method,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
+    cleanup_expired_event_subscriptions()?;
     match method.as_str() {
         "SUBSCRIBE" => subscribe_event_response(service, headers),
         "UNSUBSCRIBE" => unsubscribe_event_response(service, headers),
@@ -306,6 +308,7 @@ fn subscribe_event_response(
         if subscription.service != service {
             return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
         }
+        subscription.expires_at = event_expires_at(timeout);
         return Ok(event_subscription_ok_response(&sid, timeout));
     }
 
@@ -320,9 +323,20 @@ fn subscribe_event_response(
     {
         return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
     }
+    let callback_urls = event_callback_urls(callback.as_deref().unwrap_or_default());
+    if callback_urls.is_empty() {
+        return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+    }
 
     let sid = format!("uuid:{}", Uuid::new_v4());
-    dlna_event_subscriptions()?.insert(sid.clone(), DlnaEventSubscription { service });
+    dlna_event_subscriptions()?.insert(
+        sid.clone(),
+        DlnaEventSubscription {
+            service,
+            expires_at: event_expires_at(timeout),
+        },
+    );
+    spawn_initial_event_notify(service, sid.clone(), callback_urls);
     Ok(event_subscription_ok_response(&sid, timeout))
 }
 
@@ -372,6 +386,16 @@ fn requested_event_timeout(headers: &HeaderMap) -> u64 {
         .unwrap_or(UPNP_EVENT_DEFAULT_TIMEOUT_SECONDS)
 }
 
+fn event_expires_at(timeout: u64) -> Instant {
+    Instant::now() + StdDuration::from_secs(timeout)
+}
+
+fn cleanup_expired_event_subscriptions() -> Result<(), ApiError> {
+    let now = Instant::now();
+    dlna_event_subscriptions()?.retain(|_, subscription| subscription.expires_at > now);
+    Ok(())
+}
+
 fn event_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
     headers
         .get(name)
@@ -382,13 +406,18 @@ fn event_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
 }
 
 fn valid_event_callback(callback: &str) -> bool {
+    !event_callback_urls(callback).is_empty()
+}
+
+fn event_callback_urls(callback: &str) -> Vec<String> {
     callback
         .split('>')
         .filter_map(|part| part.trim().strip_prefix('<'))
-        .any(|url| {
+        .filter_map(|url| {
             let url = url.trim();
-            url.starts_with("http://")
+            url.starts_with("http://").then(|| url.to_string())
         })
+        .collect()
 }
 
 fn normalize_event_sid(sid: &str) -> Result<String, ApiError> {
@@ -407,6 +436,71 @@ fn dlna_event_subscriptions()
     DLNA_EVENT_SUBSCRIPTIONS
         .lock()
         .map_err(|_| ApiError::internal("DLNA event subscription lock poisoned"))
+}
+
+fn spawn_initial_event_notify(service: DlnaEventService, sid: String, callback_urls: Vec<String>) {
+    let body = event_property_set_xml(service);
+    tokio::spawn(async move {
+        for callback_url in callback_urls {
+            if let Err(error) = send_event_notify(&callback_url, &sid, 0, body.clone()).await {
+                tracing::warn!(%error, %callback_url, "DLNA initial event notification failed");
+            }
+        }
+    });
+}
+
+async fn send_event_notify(
+    callback_url: &str,
+    sid: &str,
+    seq: u32,
+    body: String,
+) -> anyhow::Result<()> {
+    let method = reqwest::Method::from_bytes(b"NOTIFY")?;
+    let response = reqwest::Client::new()
+        .request(method, callback_url)
+        .header("NT", "upnp:event")
+        .header("NTS", "upnp:propchange")
+        .header("SID", sid)
+        .header("SEQ", seq.to_string())
+        .header(header::CONTENT_TYPE.as_str(), "text/xml; charset=\"utf-8\"")
+        .header("USER-AGENT", ssdp_server_header())
+        .body(body)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!("callback returned HTTP {}", response.status());
+    }
+    Ok(())
+}
+
+fn event_property_set_xml(service: DlnaEventService) -> String {
+    let mut xml = concat!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+        "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
+    )
+    .to_string();
+    for (name, value) in event_initial_properties(service) {
+        xml.push_str("<e:property><");
+        xml.push_str(name);
+        xml.push('>');
+        xml.push_str(&escape_xml(&value));
+        xml.push_str("</");
+        xml.push_str(name);
+        xml.push_str("></e:property>");
+    }
+    xml.push_str("</e:propertyset>");
+    xml
+}
+
+fn event_initial_properties(service: DlnaEventService) -> Vec<(&'static str, String)> {
+    match service {
+        DlnaEventService::ContentDirectory => vec![("SystemUpdateID", "0".to_string())],
+        DlnaEventService::ConnectionManager => vec![
+            ("SourceProtocolInfo", DLNA_PROTOCOL_INFO.to_string()),
+            ("SinkProtocolInfo", String::new()),
+            ("CurrentConnectionIDs", "0".to_string()),
+        ],
+    }
 }
 
 pub(crate) async fn upnp_enabled(db: &Database) -> Result<bool, ApiError> {
