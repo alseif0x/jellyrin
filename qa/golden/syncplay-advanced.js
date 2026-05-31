@@ -38,7 +38,7 @@ async function main() {
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
 
-  if (evidence.status !== 'upstream-validated') {
+  if (evidence.failedTargets?.length > 0 || evidence.traceExitCode) {
     process.exitCode = result.code || 1;
   }
 }
@@ -89,29 +89,38 @@ function buildEvidence(result, comparison) {
   if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream')) {
     return {
       gate: 'syncplay-advanced',
-      status: 'upstream-validated',
-      percent: 100,
-      closed: true,
-      sourcePhase: 'E4.2a',
-      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures.',
+      status: 'implemented',
+      percent: 65,
+      closed: false,
+      sourcePhase: 'E4.2a/E4.3a/E4.4a',
+      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures for group creation, join/list/get, Play/Pause/Seek/Unpause fanout and cleanup. E4 stays open until reconnect, stale cleanup and race handling have dedicated upstream-validated sub-gates.',
       updatedAt,
       completedTargets,
       skippedTargets,
       failedTargets,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
-        'Timeline/drift/reconnect/race handling still need deeper E4 sub-gates if scope expands beyond current golden.',
+        'Reconnect with the same device/session must still prove that participants are not duplicated.',
+        'Stale participant/group cleanup and owner disconnect behavior still need dedicated tests.',
+        'Simultaneous command race handling still needs deterministic harness coverage.',
       ],
     };
   }
 
   const jellyrinCompleted = completedTargets.includes('jellyrin');
+  const jellyrinSummary = summaries.find((summary) => summary.target === 'jellyrin');
+  const jellyrinPlayFanout =
+    jellyrinSummary?.invariants?.syncplayPlay204 === true &&
+    jellyrinSummary?.invariants?.syncplayPlayFanout === true;
   return {
     ...baselineEvidence,
-    percent: jellyrinCompleted ? 35 : baselineEvidence.percent,
+    percent: jellyrinCompleted ? (jellyrinPlayFanout ? 50 : 35) : baselineEvidence.percent,
+    sourcePhase: jellyrinPlayFanout ? 'E4.2a/E4.3a/E4.4a' : baselineEvidence.sourcePhase,
     updatedAt,
-    evidence: jellyrinCompleted
-      ? 'Jellyrin SyncPlay browser trace completed, but E4 is not upstream-validated yet.'
+    evidence: jellyrinCompleted && jellyrinPlayFanout
+      ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout and cleanup. E4 still needs upstream comparable execution plus reconnect, stale cleanup and race sub-gates.'
+      : jellyrinCompleted
+        ? 'Jellyrin SyncPlay browser trace completed, but E4 is not upstream-validated yet.'
       : `${baselineEvidence.evidence} Browser trace did not complete enough targets for E4 closure.`,
     completedTargets,
     skippedTargets,

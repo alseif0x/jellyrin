@@ -386,6 +386,8 @@ async function captureTarget(browser, flowDir, target) {
       syncplayGuestJoined: false,
       syncplayList200: false,
       syncplayGet200: false,
+      syncplayPlay204: false,
+      syncplayPlayFanout: false,
       syncplayPause204: false,
       syncplayPauseFanout: false,
       syncplaySeek204: false,
@@ -1164,6 +1166,25 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       throw new Error(`SyncPlay/{id} returned HTTP ${getGroup.status}`);
     }
     summary.invariants.syncplayGet200 = true;
+
+    const beforePlayMessages = await websocketReceivedCounts(page, ['SyncPlayCommand', 'SyncPlayGroupUpdate']);
+    const play = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Play',
+      token: ownerToken,
+      authorization: ownerAuthorization,
+      body: {
+        PlaylistItemId: 'browser-trace-playlist-item',
+        StartPositionTicks: 500,
+        When: '2026-05-31T16:00:00Z',
+      },
+    });
+    if (![200, 204].includes(play.status)) {
+      throw new Error(`SyncPlay/Play returned HTTP ${play.status}`);
+    }
+    summary.invariants.syncplayPlay204 = true;
+    await waitForAdditionalWebsocketMessages(page, beforePlayMessages);
+    summary.invariants.syncplayPlayFanout = true;
 
     const beforePauseMessages = await websocketReceivedCounts(page, ['SyncPlayCommand', 'SyncPlayGroupUpdate']);
     const pause = await browserFetchJson(page, {
@@ -7648,6 +7669,9 @@ function captureFlowInvariants(summary, record, requestPostData) {
     if (record.method === 'GET' && /\/SyncPlay\/[^/]+$/i.test(pathname) && record.status === 200) {
       summary.invariants.syncplayGet200 = true;
     }
+    if (record.method === 'POST' && pathname === '/SyncPlay/Play' && [200, 204].includes(record.status)) {
+      summary.invariants.syncplayPlay204 = true;
+    }
     if (record.method === 'POST' && pathname === '/SyncPlay/Pause' && [200, 204].includes(record.status)) {
       summary.invariants.syncplayPause204 = true;
     }
@@ -7801,6 +7825,9 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Pause') {
     return 'syncplay-pause';
+  }
+  if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Play') {
+    return 'syncplay-play';
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Seek') {
     return 'syncplay-seek';
@@ -8194,7 +8221,7 @@ function compareCompletedTargets(summaries) {
                           : flow === 'sessions-websocket'
                             ? ['sessions-list', 'sessions-capabilities', 'sessions-add-user', 'sessions-remote-play', 'sessions-remote-playstate', 'sessions-remote-stop']
                             : flow === 'syncplay'
-                              ? ['syncplay-new', 'syncplay-join', 'syncplay-list', 'syncplay-get', 'syncplay-pause', 'syncplay-seek', 'syncplay-unpause']
+                              ? ['syncplay-new', 'syncplay-join', 'syncplay-list', 'syncplay-get', 'syncplay-play', 'syncplay-pause', 'syncplay-seek', 'syncplay-unpause']
                             : flow === 'plugins-packages'
                               ? ['plugins-list', 'plugin-repositories', 'plugin-packages']
                               : flow === 'live-tv'
@@ -8330,7 +8357,7 @@ function compareCriticalRequest(key, upstreamRequest, jellyrinRequest) {
     return reasons;
   }
   if (key.startsWith('syncplay-')) {
-    const syncplayMutationKeys = ['syncplay-join', 'syncplay-pause', 'syncplay-seek', 'syncplay-unpause'];
+    const syncplayMutationKeys = ['syncplay-join', 'syncplay-play', 'syncplay-pause', 'syncplay-seek', 'syncplay-unpause'];
     if (syncplayMutationKeys.includes(key)) {
       if (![200, 204].includes(upstreamRequest.status) || ![200, 204].includes(jellyrinRequest.status)) {
         reasons.push(`cross-target ${key}: mutation status ${upstreamRequest.status} != compatible ${jellyrinRequest.status}`);
@@ -9012,6 +9039,8 @@ function invariantFailures(summary) {
       ['syncplayGuestJoined', 'guest join'],
       ['syncplayList200', 'group list'],
       ['syncplayGet200', 'group detail'],
+      ['syncplayPlay204', 'play command'],
+      ['syncplayPlayFanout', 'play fanout'],
       ['syncplayPause204', 'pause command'],
       ['syncplayPauseFanout', 'pause fanout'],
       ['syncplaySeek204', 'seek command'],

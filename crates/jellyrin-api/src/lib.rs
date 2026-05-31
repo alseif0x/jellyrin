@@ -1096,6 +1096,8 @@ pub fn router(state: AppState) -> Router {
         .route("/syncplay/nextitem", post(syncplay_group_command))
         .route("/SyncPlay/Pause", post(syncplay_group_command))
         .route("/syncplay/pause", post(syncplay_group_command))
+        .route("/SyncPlay/Play", post(syncplay_group_command))
+        .route("/syncplay/play", post(syncplay_group_command))
         .route("/SyncPlay/PreviousItem", post(syncplay_group_command))
         .route("/syncplay/previousitem", post(syncplay_group_command))
         .route("/SyncPlay/Queue", post(syncplay_group_command))
@@ -9660,20 +9662,47 @@ async fn syncplay_group_command(
         )
     };
     for session_id in participant_session_ids {
+        let command_payload =
+            syncplay_command_message_payload(&group_id, &command, &payload, &group_json, now);
         broadcast_session_message(
             &session_id,
             serde_json::json!({
                 "MessageType": "SyncPlayCommand",
-                "Data": {
-                    "GroupId": group_id,
-                    "Command": command.clone(),
-                    "Payload": payload.clone(),
-                    "Group": group_json.clone()
-                }
+                "Data": command_payload
             }),
         );
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn syncplay_command_message_payload(
+    group_id: &str,
+    command: &str,
+    payload: &serde_json::Value,
+    group_json: &serde_json::Value,
+    now: OffsetDateTime,
+) -> serde_json::Value {
+    let position_ticks = syncplay_position_ticks_from_payload(payload);
+    let emitted_at = format_time_for_json(now);
+    let when =
+        json_string_any_field(payload, &["When", "when"]).unwrap_or_else(|| emitted_at.clone());
+    let playlist_item_id = json_string_any_field(payload, &["PlaylistItemId", "ItemId"])
+        .unwrap_or_else(|| {
+            group_json["State"]["PlaylistItemId"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        });
+    serde_json::json!({
+        "GroupId": group_id,
+        "Command": command,
+        "Payload": payload,
+        "Group": group_json,
+        "When": when,
+        "EmittedAt": emitted_at,
+        "PositionTicks": position_ticks,
+        "PlaylistItemId": playlist_item_id
+    })
 }
 
 fn syncplay_apply_participant_command(
@@ -9733,17 +9762,36 @@ fn syncplay_apply_command_to_state(
         serde_json::Value::String(format_time_for_json(now)),
     );
 
-    if let Some(position_ticks) = json_i64_any_field(
-        payload,
-        &["PositionTicks", "SeekPositionTicks", "NewPositionTicks"],
-    ) {
+    if let Some(position_ticks) = syncplay_position_ticks_from_payload(payload) {
         object.insert(
             "PositionTicks".to_string(),
             serde_json::json!(position_ticks),
         );
     }
+    if let Some(when) = json_string_any_field(payload, &["When", "when"]) {
+        object.insert("LastClientWhen".to_string(), serde_json::json!(when));
+    }
+    if let Some(item_id) = json_string_any_field(payload, &["PlaylistItemId", "ItemId"]) {
+        object.insert("PlaylistItemId".to_string(), serde_json::json!(item_id));
+    }
 
     match command.to_ascii_lowercase().as_str() {
+        "play" => {
+            object.insert("IsPaused".to_string(), serde_json::json!(false));
+            object.insert("PlayState".to_string(), serde_json::json!("Playing"));
+            if let Some(queue) = payload
+                .get("Queue")
+                .or_else(|| payload.get("Items"))
+                .or_else(|| payload.get("ItemIds"))
+                .filter(|value| value.is_array())
+            {
+                object.insert("Queue".to_string(), queue.clone());
+                object.insert(
+                    "QueueVersion".to_string(),
+                    serde_json::json!(now.unix_timestamp_nanos().to_string()),
+                );
+            }
+        }
         "pause" => {
             object.insert("IsPaused".to_string(), serde_json::json!(true));
             object.insert("PlayState".to_string(), serde_json::json!("Paused"));
@@ -9863,6 +9911,18 @@ fn syncplay_apply_command_to_state(
         }
         _ => {}
     }
+}
+
+fn syncplay_position_ticks_from_payload(payload: &serde_json::Value) -> Option<i64> {
+    json_i64_any_field(
+        payload,
+        &[
+            "PositionTicks",
+            "SeekPositionTicks",
+            "NewPositionTicks",
+            "StartPositionTicks",
+        ],
+    )
 }
 
 fn syncplay_queue_item_matches(item: &serde_json::Value, item_id: &str) -> bool {
@@ -41070,6 +41130,52 @@ mod tests {
             next_playback_event_type(&mut join_guest_events, &guest_key, "SyncPlayGroupUpdate")
                 .await;
         assert_eq!(join_guest_event["Data"]["Reason"], "Join");
+
+        let mut play_owner_events = subscribe_playback_events();
+        let mut play_guest_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Play")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(
+                        json!({
+                            "PlaylistItemId": "playlist-item-a",
+                            "StartPositionTicks": 500,
+                            "When": "2026-05-31T16:00:00Z"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let play_owner_event =
+            next_playback_event_type(&mut play_owner_events, &api_key, "SyncPlayCommand").await;
+        let play_guest_event =
+            next_playback_event_type(&mut play_guest_events, &guest_key, "SyncPlayCommand").await;
+        for event in [play_owner_event, play_guest_event] {
+            assert_eq!(event["Data"]["GroupId"], group_id);
+            assert_eq!(event["Data"]["Command"], "Play");
+            assert_eq!(event["Data"]["When"], "2026-05-31T16:00:00Z");
+            assert!(event["Data"]["EmittedAt"].as_str().unwrap().contains('T'));
+            assert_eq!(event["Data"]["PositionTicks"], 500);
+            assert_eq!(event["Data"]["PlaylistItemId"], "playlist-item-a");
+            assert_eq!(event["Data"]["Group"]["State"]["IsPaused"], false);
+            assert_eq!(event["Data"]["Group"]["State"]["PlayState"], "Playing");
+            assert_eq!(event["Data"]["Group"]["State"]["PositionTicks"], 500);
+            assert_eq!(
+                event["Data"]["Group"]["State"]["PlaylistItemId"],
+                "playlist-item-a"
+            );
+            assert_eq!(
+                event["Data"]["Group"]["State"]["LastClientWhen"],
+                "2026-05-31T16:00:00Z"
+            );
+        }
 
         let mut pause_owner_events = subscribe_playback_events();
         let mut pause_guest_events = subscribe_playback_events();
