@@ -31888,6 +31888,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlna_search_filters_by_title_class_and_container() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let media_root = tempfile::tempdir().unwrap();
+        let nested = media_root.path().join("Nested");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(
+            media_root.path().join("Match Movie.mp4"),
+            b"match movie payload",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            media_root.path().join("Match Song.mp3"),
+            b"match song payload data",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            media_root.path().join("Other Movie.mp4"),
+            b"other movie separate payload",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            nested.join("Nested Match.mp4"),
+            b"nested match payload bytes",
+        )
+        .await
+        .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Mixed",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 4);
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let search_body = |container_id: &str, criteria: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ContainerID>{container_id}</ContainerID>
+      <SearchCriteria>{criteria}</SearchCriteria>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria></SortCriteria>
+    </u:Search>
+  </s:Body>
+</s:Envelope>"#
+            )
+        };
+        let search = |app: axum::Router, container_id: String, criteria: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                        .header(header::HOST, "media.example.test:8097")
+                        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                        .body(Body::from(search_body(&container_id, &criteria)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+
+        let root_response = search(
+            app.clone(),
+            "0".to_string(),
+            r#"upnp:class derivedfrom "object.item.videoItem" and dc:title contains "Match""#
+                .to_string(),
+        )
+        .await;
+        assert!(root_response.contains("<u:SearchResponse"));
+        assert!(root_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(root_response.contains("<TotalMatches>2</TotalMatches>"));
+        assert!(root_response.contains("Match Movie"));
+        assert!(root_response.contains("Nested Match"));
+        assert!(!root_response.contains("Match Song"));
+        assert!(!root_response.contains("Other Movie"));
+
+        let nested_id = format!(
+            "dir:{}:{}",
+            folder.id,
+            URL_SAFE_NO_PAD.encode("Nested".as_bytes())
+        );
+        let nested_response = search(app, nested_id.clone(), "*".to_string()).await;
+        assert!(nested_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(nested_response.contains("Nested Match"));
+        assert!(nested_response.contains(&format!("parentID=&quot;{}&quot;", nested_id)));
+        assert!(!nested_response.contains("Match Movie"));
+    }
+
+    #[tokio::test]
     async fn dlna_event_subscription_endpoints_follow_upnp_contract() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db

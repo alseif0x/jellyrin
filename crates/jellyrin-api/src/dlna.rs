@@ -190,7 +190,7 @@ pub(crate) async fn content_directory_control(
         return Ok(soap_fault_response(401, "Invalid Action"));
     };
     let response_body = match action.as_str() {
-        "getsearchcapabilities" => "<SearchCaps></SearchCaps>".to_string(),
+        "getsearchcapabilities" => "<SearchCaps>dc:title,upnp:class,@id</SearchCaps>".to_string(),
         "getsortcapabilities" => "<SortCaps>dc:title</SortCaps>".to_string(),
         "getsystemupdateid" => "<Id>0</Id>".to_string(),
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
@@ -203,7 +203,15 @@ pub(crate) async fn content_directory_control(
                 Err(error) => return Err(error),
             }
         }
-        "search" => empty_browse_like_response(),
+        "search" => {
+            match search_response(&state.db, &request, context.server_id, &server_address).await {
+                Ok(response) => response,
+                Err(error) if error.status == StatusCode::NOT_FOUND => {
+                    return Ok(soap_fault_response(701, "No such object"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         _ => {
             return Ok(soap_fault_response(401, "Invalid Action"));
         }
@@ -1100,6 +1108,63 @@ async fn media_items_for_folder(
         .collect())
 }
 
+async fn search_response(
+    db: &Database,
+    request: &str,
+    server_id: Uuid,
+    server_address: &str,
+) -> Result<String, ApiError> {
+    let container_id = soap_param(request, "ContainerID").unwrap_or_else(|| "0".to_string());
+    let criteria = soap_param(request, "SearchCriteria").unwrap_or_else(|| "*".to_string());
+    let (starting_index, requested_count) = browse_window(request);
+    let folders = db.virtual_folders().await?;
+    let mut items = search_container_items(db, &folders, &container_id).await?;
+    items.retain(|item| dlna_search_criteria_matches(item, &criteria));
+    let total_matches = items.len();
+    let paged_items = paged_slice(&items, starting_index, requested_count);
+    let didl = didl_search_media_items(paged_items, &folders, server_id, server_address);
+    Ok(format!(
+        "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>0</UpdateID>",
+        escape_xml(&didl),
+        paged_items.len(),
+        total_matches
+    ))
+}
+
+async fn search_container_items(
+    db: &Database,
+    folders: &[VirtualFolder],
+    container_id: &str,
+) -> Result<Vec<MediaItem>, ApiError> {
+    if is_root_object_id(container_id) {
+        return Ok(db.media_items().await?);
+    }
+
+    if let Some(folder_id) = parse_folder_object_id(container_id) {
+        if !folders.iter().any(|folder| folder.id == folder_id) {
+            return Err(ApiError::not_found("DLNA folder not found"));
+        }
+        return media_items_for_folder(db, folder_id).await;
+    }
+
+    if let Some((folder_id, relative_path)) = parse_directory_object_id(container_id) {
+        let folder = folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        let items = media_items_for_folder(db, folder_id).await?;
+        if !directory_exists(folder, &items, &relative_path) {
+            return Err(ApiError::not_found("DLNA directory not found"));
+        }
+        return Ok(items
+            .into_iter()
+            .filter(|item| item_is_in_directory_subtree(folder, item, &relative_path))
+            .collect());
+    }
+
+    Err(ApiError::not_found("DLNA container not found"))
+}
+
 struct BrowsePayload {
     didl: String,
     number_returned: usize,
@@ -1154,13 +1219,6 @@ fn paged_slice<T>(items: &[T], starting_index: usize, requested_count: usize) ->
             .min(items.len())
     };
     &items[starting_index..end]
-}
-
-fn empty_browse_like_response() -> String {
-    format!(
-        "<Result>{}</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>0</UpdateID>",
-        escape_xml(&empty_didl())
-    )
 }
 
 fn didl_root_metadata(child_count: usize) -> String {
@@ -1278,6 +1336,15 @@ fn directory_exists(folder: &VirtualFolder, items: &[MediaItem], relative_path: 
         })
 }
 
+fn item_is_in_directory_subtree(
+    folder: &VirtualFolder,
+    item: &MediaItem,
+    relative_path: &str,
+) -> bool {
+    let item_parent = item_parent_relative_path(folder, item).unwrap_or_default();
+    item_parent == relative_path || next_child_directory(&item_parent, relative_path).is_some()
+}
+
 enum DlnaBrowseEntry<'a> {
     Container {
         id: String,
@@ -1381,6 +1448,25 @@ fn didl_media_items(items: &[MediaItem], server_id: Uuid, server_address: &str) 
             server_id,
             server_address,
         );
+    }
+    didl.push_str("</DIDL-Lite>");
+    didl
+}
+
+fn didl_search_media_items(
+    items: &[MediaItem],
+    folders: &[VirtualFolder],
+    server_id: Uuid,
+    server_address: &str,
+) -> String {
+    let mut didl = didl_prefix();
+    for item in items {
+        let parent_id = folders
+            .iter()
+            .find(|folder| folder.id == item.virtual_folder_id)
+            .map(|folder| item_parent_object_id(folder, item))
+            .unwrap_or_else(|| format!("folder:{}", item.virtual_folder_id));
+        append_didl_media_item(&mut didl, item, &parent_id, server_id, server_address);
     }
     didl.push_str("</DIDL-Lite>");
     didl
@@ -1634,6 +1720,15 @@ fn item_parent_relative_path(folder: &VirtualFolder, item: &MediaItem) -> Option
         .or_else(|| Some(String::new()))
 }
 
+fn item_parent_object_id(folder: &VirtualFolder, item: &MediaItem) -> String {
+    let relative_path = item_parent_relative_path(folder, item).unwrap_or_default();
+    if relative_path.is_empty() {
+        format!("folder:{}", folder.id)
+    } else {
+        directory_object_id(folder.id, &relative_path)
+    }
+}
+
 fn relative_path_from_file_path(relative_file_path: &FsPath) -> String {
     let mut components = relative_file_path
         .components()
@@ -1678,6 +1773,85 @@ fn join_relative_path(parent: &str, child: &str) -> String {
         child.to_string()
     } else {
         format!("{parent}/{child}")
+    }
+}
+
+fn dlna_search_criteria_matches(item: &MediaItem, criteria: &str) -> bool {
+    let criteria = unescape_xml(criteria.trim());
+    if criteria.is_empty() || criteria == "*" {
+        return true;
+    }
+
+    let mut recognized = false;
+    if let Some(value) = search_criteria_value(&criteria, "dc:title contains") {
+        recognized = true;
+        if !item
+            .name
+            .to_ascii_lowercase()
+            .contains(&value.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
+    if let Some(value) = search_criteria_value(&criteria, "dc:title =") {
+        recognized = true;
+        if !item.name.eq_ignore_ascii_case(&value) {
+            return false;
+        }
+    }
+    if let Some(value) = search_criteria_value(&criteria, "upnp:class derivedfrom") {
+        recognized = true;
+        let class = didl_item_class(item).to_ascii_lowercase();
+        if !class.starts_with(&value.to_ascii_lowercase()) {
+            return false;
+        }
+    }
+    if let Some(value) = search_criteria_value(&criteria, "upnp:class =") {
+        recognized = true;
+        let class = didl_item_class(item).to_ascii_lowercase();
+        let value = value.to_ascii_lowercase();
+        if class != value && !class.starts_with(&format!("{value}.")) {
+            return false;
+        }
+    }
+    if let Some(value) = search_criteria_value(&criteria, "@id =") {
+        recognized = true;
+        let item_id = format!("item:{}", item.id);
+        if !item_id.eq_ignore_ascii_case(&value)
+            && !item.id.to_string().eq_ignore_ascii_case(&value)
+        {
+            return false;
+        }
+    }
+
+    recognized
+}
+
+fn search_criteria_value(criteria: &str, token: &str) -> Option<String> {
+    let lower = criteria.to_ascii_lowercase();
+    let token_lower = token.to_ascii_lowercase();
+    let start = lower.find(&token_lower)? + token.len();
+    let rest = criteria.get(start..)?.trim_start();
+    quoted_or_bare_search_value(rest)
+}
+
+fn quoted_or_bare_search_value(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    match chars.next()? {
+        '"' => chars
+            .as_str()
+            .split_once('"')
+            .map(|(quoted, _)| quoted.to_string()),
+        '\'' => chars
+            .as_str()
+            .split_once('\'')
+            .map(|(quoted, _)| quoted.to_string()),
+        _ => value
+            .split_whitespace()
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
     }
 }
 
