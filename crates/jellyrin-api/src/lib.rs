@@ -6156,7 +6156,7 @@ async fn install_package(
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    let package = package_infos_from_repositories(
+    let mut package = package_infos_from_repositories(
         &state
             .db
             .system_configuration_payloads()
@@ -6180,19 +6180,62 @@ async fn install_package(
         .or_else(|| json_string_field(&package, "TargetAbi"))
         .unwrap_or_default();
     let manifest = plugin_manifest_from_package(package.clone());
+    let task_key = package_install_task_key(&plugin_id);
+    let run = state.db.start_task_run(&task_key).await.map_err(|error| {
+        if format!("{error:#}").contains("task is already running") {
+            ApiError::conflict(format!(
+                "Package installation is already running: {plugin_id}"
+            ))
+        } else {
+            error.into()
+        }
+    })?;
+    let install_result = async {
+        let artifact = prepare_plugin_package_artifact(
+            &state,
+            &plugin_id,
+            &version,
+            &package,
+            &selected_version,
+        )
+        .await?;
+        package["Installation"] = artifact;
+        state
+            .db
+            .install_plugin_package(
+                InstallPluginPackage {
+                    plugin_id: plugin_id.clone(),
+                    name: package_name.clone(),
+                    version: version.clone(),
+                    runtime: runtime.clone(),
+                    target_abi,
+                    package,
+                    manifest,
+                },
+                Some(user.id),
+            )
+            .await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = install_result {
+        let _ = state
+            .db
+            .fail_task_run(run.id, &format!("{:#}", error.error))
+            .await;
+        return Err(error);
+    }
     state
         .db
-        .install_plugin_package(
-            InstallPluginPackage {
-                plugin_id: plugin_id.clone(),
-                name: package_name.clone(),
-                version: version.clone(),
-                runtime: runtime.clone(),
-                target_abi,
-                package,
-                manifest,
-            },
-            Some(user.id),
+        .complete_task_run(
+            run.id,
+            serde_json::json!({
+                "PluginId": plugin_id.clone(),
+                "Name": package_name.clone(),
+                "Version": version.clone(),
+                "Runtime": runtime.clone(),
+                "Status": "Installed"
+            }),
         )
         .await?;
     let details =
@@ -6225,6 +6268,232 @@ async fn cancel_package_installation(
 
 fn package_install_task_key(package_id: &str) -> String {
     format!("PackageInstall:{}", package_id.trim().to_ascii_lowercase())
+}
+
+async fn prepare_plugin_package_artifact(
+    state: &AppState,
+    plugin_id: &str,
+    version: &str,
+    package: &serde_json::Value,
+    selected_version: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let Some(source_url) = plugin_package_source_url(package, selected_version) else {
+        return Ok(serde_json::json!({
+            "Mode": "metadata-only",
+            "Reason": "Package version has no SourceUrl."
+        }));
+    };
+
+    let plugin_root = plugin_packages_root(&state.log_dir);
+    let download_dir = plugin_root.join(".downloads");
+    let staging_root = plugin_root.join(".staging");
+    let plugin_segment = safe_plugin_path_segment(plugin_id);
+    let version_segment = safe_plugin_path_segment(version);
+    let archive_dir = download_dir.join(&plugin_segment).join(&version_segment);
+    let archive_path = archive_dir.join("package.zip");
+    let staging_dir = staging_root.join(format!("{}-{}", plugin_segment, Uuid::new_v4().simple()));
+    let install_dir = plugin_root.join(&plugin_segment).join(&version_segment);
+    let rollback_dir = plugin_root.join(&plugin_segment).join(format!(
+        ".rollback-{}-{}",
+        version_segment,
+        Uuid::new_v4().simple()
+    ));
+
+    tokio::fs::create_dir_all(&archive_dir).await?;
+    tokio::fs::create_dir_all(&staging_root).await?;
+    if let Some(parent) = install_dir.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let bytes = read_plugin_package_source(&source_url).await?;
+    tokio::fs::write(&archive_path, bytes).await?;
+
+    let entries = list_safe_zip_entries(&archive_path).await?;
+    if entries.is_empty() {
+        let _ = tokio::fs::remove_file(&archive_path).await;
+        return Err(ApiError::bad_request("Plugin package archive is empty"));
+    }
+    extract_zip_archive(&archive_path, &staging_dir).await?;
+
+    if tokio::fs::try_exists(&install_dir).await? {
+        if tokio::fs::try_exists(&rollback_dir).await? {
+            tokio::fs::remove_dir_all(&rollback_dir).await?;
+        }
+        tokio::fs::rename(&install_dir, &rollback_dir).await?;
+    }
+    let swap_result = tokio::fs::rename(&staging_dir, &install_dir).await;
+    if let Err(error) = swap_result {
+        if tokio::fs::try_exists(&rollback_dir).await.unwrap_or(false) {
+            let _ = tokio::fs::rename(&rollback_dir, &install_dir).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(ApiError::internal(format!(
+            "Plugin package install swap failed: {error}"
+        )));
+    }
+    if tokio::fs::try_exists(&rollback_dir).await? {
+        tokio::fs::remove_dir_all(&rollback_dir).await?;
+    }
+
+    Ok(serde_json::json!({
+        "Mode": "extracted",
+        "SourceUrl": source_url,
+        "ArchivePath": archive_path.to_string_lossy(),
+        "InstallPath": install_dir.to_string_lossy(),
+        "EntryCount": entries.len(),
+        "Entries": entries,
+    }))
+}
+
+fn plugin_package_source_url(
+    package: &serde_json::Value,
+    selected_version: &serde_json::Value,
+) -> Option<String> {
+    json_string_field(selected_version, "SourceUrl")
+        .or_else(|| json_string_field(selected_version, "Url"))
+        .or_else(|| json_string_field(package, "SourceUrl"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn plugin_packages_root(log_dir: &FsPath) -> PathBuf {
+    log_dir
+        .parent()
+        .unwrap_or(log_dir)
+        .join("plugins")
+        .join("packages")
+}
+
+fn safe_plugin_path_segment(value: &str) -> String {
+    let segment = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim_matches('_')
+        .to_string();
+    if segment.is_empty() {
+        stable_entity_id("PluginPath", value)
+    } else {
+        segment
+    }
+}
+
+async fn read_plugin_package_source(source_url: &str) -> Result<Vec<u8>, ApiError> {
+    if let Some(path) = source_url.strip_prefix("file://") {
+        return tokio::fs::read(PathBuf::from(path)).await.map_err(|error| {
+            ApiError::bad_request(format!("Plugin package file read failed: {error}"))
+        });
+    }
+    if source_url.starts_with("http://") || source_url.starts_with("https://") {
+        let response = HttpClient::new()
+            .get(source_url)
+            .send()
+            .await
+            .map_err(|error| {
+                ApiError::bad_request(format!("Plugin package download failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            return Err(ApiError::bad_request(format!(
+                "Plugin package download returned {}",
+                response.status()
+            )));
+        }
+        return response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| {
+                ApiError::bad_request(format!("Plugin package body read failed: {error}"))
+            });
+    }
+    tokio::fs::read(PathBuf::from(source_url))
+        .await
+        .map_err(|error| ApiError::bad_request(format!("Plugin package file read failed: {error}")))
+}
+
+async fn list_safe_zip_entries(archive_path: &FsPath) -> Result<Vec<String>, ApiError> {
+    let output = Command::new("unzip")
+        .arg("-Z1")
+        .arg(archive_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| ApiError::internal(format!("unzip listing failed to start: {error}")))?;
+    if !output.status.success() {
+        return Err(ApiError::bad_request(format!(
+            "Plugin package archive listing failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let mut entries = Vec::new();
+    for raw_entry in String::from_utf8_lossy(&output.stdout).lines() {
+        let entry = raw_entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        validate_zip_entry_path(entry)?;
+        entries.push(entry.to_string());
+    }
+    Ok(entries)
+}
+
+fn validate_zip_entry_path(entry: &str) -> Result<(), ApiError> {
+    let path = FsPath::new(entry);
+    if path.is_absolute()
+        || entry.starts_with('/')
+        || entry.starts_with('\\')
+        || entry.contains('\\')
+        || entry.contains(':')
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ApiError::bad_request(format!(
+            "Plugin package archive contains unsafe path: {entry}"
+        )));
+    }
+    Ok(())
+}
+
+async fn extract_zip_archive(archive_path: &FsPath, staging_dir: &FsPath) -> Result<(), ApiError> {
+    if tokio::fs::try_exists(staging_dir).await? {
+        tokio::fs::remove_dir_all(staging_dir).await?;
+    }
+    tokio::fs::create_dir_all(staging_dir).await?;
+    let output = Command::new("unzip")
+        .arg("-qq")
+        .arg(archive_path)
+        .arg("-d")
+        .arg(staging_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("unzip extraction failed to start: {error}"))
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let _ = tokio::fs::remove_dir_all(staging_dir).await;
+        Err(ApiError::bad_request(format!(
+            "Plugin package archive extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 async fn package_repositories(
@@ -28777,6 +29046,7 @@ mod tests {
         subscribe_playback_events, subscribe_system_lifecycle_commands,
         syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        validate_zip_entry_path,
     };
     use crate::dlna;
     use axum::{
@@ -28806,6 +29076,96 @@ mod tests {
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await
+    }
+
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let offset = out.len() as u32;
+            let crc = crc32(data);
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+            out.extend_from_slice(&20_u16.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0_u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&20_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u16.to_le_bytes());
+            central.extend_from_slice(&0_u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+        let central_offset = out.len() as u32;
+        let central_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&central_size.to_le_bytes());
+        out.extend_from_slice(&central_offset.to_le_bytes());
+        out.extend_from_slice(&0_u16.to_le_bytes());
+        out
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = 0_u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320_u32 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn plugin_zip_entry_validation_rejects_zip_slip_paths() {
+        for safe in [
+            "plugin.dll",
+            "config/settings.json",
+            "runtimes/linux-x64/native.so",
+        ] {
+            assert!(validate_zip_entry_path(safe).is_ok(), "{safe}");
+        }
+        for unsafe_entry in [
+            "../plugin.dll",
+            "config/../../plugin.dll",
+            "/absolute/plugin.dll",
+            "\\absolute\\plugin.dll",
+            "C:/plugins/plugin.dll",
+            "nested\\plugin.dll",
+        ] {
+            assert!(
+                validate_zip_entry_path(unsafe_entry).is_err(),
+                "{unsafe_entry}"
+            );
+        }
     }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)
@@ -29369,7 +29729,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
 
         let response = app
             .clone()
@@ -37632,10 +37999,25 @@ mod tests {
         tokio::fs::write(&plugin_image, &plugin_image_bytes)
             .await
             .unwrap();
+        let plugin_zip = tmp.path().join("example-plugin.zip");
+        tokio::fs::write(
+            &plugin_zip,
+            stored_zip(&[
+                (
+                    "Jellyfin.Plugin.Example.dll",
+                    b"example dotnet plugin assembly placeholder".as_slice(),
+                ),
+                ("meta.json", br#"{"name":"Example Plugin"}"#.as_slice()),
+            ]),
+        )
+        .await
+        .unwrap();
+        let log_dir = tmp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
-            log_dir: ".".into(),
+            log_dir: log_dir.clone(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
         let repository_payload = json!([
@@ -37653,7 +38035,7 @@ mod tests {
                     "Versions": [{
                         "Version": "1.0.0.0",
                         "TargetAbi": "12.0.0.0",
-                        "SourceUrl": "https://repo.example/packages/example.zip",
+                        "SourceUrl": format!("file://{}", plugin_zip.to_string_lossy()),
                         "Checksum": "abc123",
                         "ImagePath": plugin_image.to_string_lossy()
                     }]
@@ -37797,7 +38179,7 @@ mod tests {
         assert_eq!(packages[0]["Versions"][0]["Version"], "1.0.0.0");
         assert_eq!(
             packages[0]["Versions"][0]["SourceUrl"],
-            "https://repo.example/packages/example.zip"
+            format!("file://{}", plugin_zip.to_string_lossy())
         );
 
         let response = app
@@ -37918,11 +38300,24 @@ mod tests {
         assert_eq!(installed_plugins[0]["Version"], "1.0.0.0");
         assert_eq!(installed_plugins[0]["Runtime"], "DotNetJellyfin");
         assert_eq!(installed_plugins[0]["Status"], "NotSupported");
+        assert_eq!(installed_plugins[0]["Manifest"]["Name"], "Example Plugin");
         assert!(
             installed_plugins[0]["LastError"]
                 .as_str()
                 .unwrap()
                 .contains("runtime host is not implemented")
+        );
+        let installed_file = log_dir
+            .parent()
+            .unwrap()
+            .join("plugins")
+            .join("packages")
+            .join("11111111-1111-1111-1111-111111111111")
+            .join("1.0.0.0")
+            .join("Jellyfin.Plugin.Example.dll");
+        assert_eq!(
+            tokio::fs::read_to_string(&installed_file).await.unwrap(),
+            "example dotnet plugin assembly placeholder"
         );
 
         let response = app
@@ -37994,6 +38389,13 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let package_task = db_for_assertions
+            .last_task_result(&package_task_key)
+            .await
+            .unwrap()
+            .expect("completed package install task");
+        assert_eq!(package_task.status, "completed");
+        assert_eq!(package_task.result_json.unwrap()["Status"], "Installed");
 
         let response = app
             .clone()
@@ -38008,12 +38410,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert!(
+        assert_eq!(
             db_for_assertions
                 .last_task_result(&package_task_key)
                 .await
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .status,
+            "completed"
         );
 
         let response = app

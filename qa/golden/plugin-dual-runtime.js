@@ -33,14 +33,16 @@ async function main() {
   const evidence = {
     gate: 'plugin-dual-runtime',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 22 : 5,
+    percent: passed ? 32 : 5,
     closed: false,
-    sourcePhase: passed ? 'E1.P1/E1.P2a/E1.P3a' : 'E1.P1/P2-attempted',
+    sourcePhase: passed ? 'E1.P1/E1.P2a/E1.P2b/E1.P3a' : 'E1.P1/P2-attempted',
     evidence: passed
-      ? 'E1/P1 persistent plugin platform model is implemented and verified; E1/P2a/P3a safe package lifecycle is implemented and verified: installing from a configured repository records package_installations, installed_plugins, manifest/config/permissions and audit state; /Plugins lists the installed plugin as NotSupported until a runtime host exists; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
+      ? 'E1/P1 persistent plugin platform model is implemented and verified; E1/P2a/P2b/P3a safe package lifecycle is implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, and completes a PackageInstall task; /Plugins lists the installed plugin as NotSupported until a runtime host exists; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
       : 'E1/P1/P2 persistent plugin platform or safe lifecycle tests failed; inspect command output before advancing plugin runtime work.',
     updatedAt: new Date().toISOString(),
-    completedTargets: passed ? ['persistent-plugin-model', 'safe-plugin-lifecycle'] : [],
+    completedTargets: passed
+      ? ['persistent-plugin-model', 'safe-plugin-lifecycle', 'zip-package-extraction']
+      : [],
     failedTargets: passed ? [] : ['persistent-plugin-model-or-safe-plugin-lifecycle'],
     validatedCommands: [
       'cargo test -p jellyrin-db plugin_platform_state -- --nocapture',
@@ -49,7 +51,8 @@ async function main() {
     openRisks: [
       'DotNetJellyfin sidecar host is not implemented yet.',
       'RustWasi host and SDK are not implemented yet.',
-      'Package install records a safe NotSupported state; real host load/execute/unload is still pending.',
+      'Package install extracts package artifacts and records a safe NotSupported state; real host load/execute/unload is still pending.',
+      'Remote repository refresh, checksum policy, update/downgrade and async cancellation still need full P2 coverage.',
       'No real plugin fixture has been loaded or executed yet.',
     ],
   };
