@@ -85,6 +85,14 @@ async function main() {
     '--',
     '--nocapture',
   ]);
+  const filesystemDiscoveryTestResult = await runCommand('cargo', [
+    'test',
+    '-p',
+    'jellyrin-api',
+    'plugin_filesystem_discovery',
+    '--',
+    '--nocapture',
+  ]);
   const passed =
     dbTestResult.code === 0 &&
     apiTestResult.code === 0 &&
@@ -94,17 +102,18 @@ async function main() {
     catalogMergeTestResult.code === 0 &&
     taskProgressTestResult.code === 0 &&
     taskFailedProgressTestResult.code === 0 &&
-    backupRestoreTestResult.code === 0;
+    backupRestoreTestResult.code === 0 &&
+    filesystemDiscoveryTestResult.code === 0;
   const evidence = {
     gate: 'plugin-dual-runtime',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 73 : 5,
+    percent: passed ? 76 : 5,
     closed: false,
     sourcePhase: passed
-      ? 'E1.P1/E1.P1b/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P2f/E1.P2f2/E1.P2g/E1.P2h/E1.P3a'
+      ? 'E1.P1/E1.P1b/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P2f/E1.P2f2/E1.P2g/E1.P2h/E1.P3a/E1.P3b'
       : 'E1.P1/P2-attempted',
     evidence: passed
-      ? 'E1/P1 persistent plugin platform model is implemented and verified, including backup/restore of plugin repositories, package catalog cache, package installations, installed plugin rows, manifests, configurations, permissions, runtime instances, host events and audit log metadata without copying plugin binaries; E1/P2a/P2b/P2c/P2d/P2e/P2f/P2f2/P2g/P2h/P3a safe package lifecycle is implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, verifies SHA256/SHA1 checksums when provided, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, completes PackageInstall tasks, handles update/downgrade by marking previous package_installations as Superseded while switching the active installed_plugins version, refreshes enabled plugin repository manifests into the persisted catalog/task evidence while preserving disabled repositories and previous package state on partial failures, observes PackageInstall cancellation before destructive/DB commit checkpoints and aborts cancelable in-flight package operations while waiting on downloads, file reads and unzip child processes, merges duplicate package catalog entries while preserving dual-runtime versions and optional Runtime/TargetAbi/ServerVersion filters, persists lifecycle progress in task_runs.result_json and exposes GET status endpoints for PackageInstall and PackageRepositoriesRefresh; /Plugins lists the active plugin as NotSupported until a runtime host exists; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
+      ? 'E1/P1 persistent plugin platform model is implemented and verified, including backup/restore of plugin repositories, package catalog cache, package installations, installed plugin rows, manifests, configurations, permissions, runtime instances, host events and audit log metadata without copying plugin binaries; E1/P2a/P2b/P2c/P2d/P2e/P2f/P2f2/P2g/P2h/P3a/P3b safe package lifecycle and registry discovery are implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, verifies SHA256/SHA1 checksums when provided, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, completes PackageInstall tasks, handles update/downgrade by marking previous package_installations as Superseded while switching the active installed_plugins version, refreshes enabled plugin repository manifests into the persisted catalog/task evidence while preserving disabled repositories and previous package state on partial failures, observes PackageInstall cancellation before destructive/DB commit checkpoints and aborts cancelable in-flight package operations while waiting on downloads, file reads and unzip child processes, merges duplicate package catalog entries while preserving dual-runtime versions and optional Runtime/TargetAbi/ServerVersion filters, persists lifecycle progress in task_runs.result_json and exposes GET status endpoints for PackageInstall and PackageRepositoriesRefresh; /Plugins discovers package directories from filesystem, maps .dll artifacts to DotNetJellyfin and .wasm artifacts to RustWasi, ignores unsafe/incomplete package directories, and preserves existing status/configuration instead of overwriting persisted state; discovered plugins remain NotSupported until a runtime host exists; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
       : 'E1/P1/P2 persistent plugin platform or safe lifecycle tests failed; inspect command output before advancing plugin runtime work.',
     updatedAt: new Date().toISOString(),
     completedTargets: passed
@@ -120,6 +129,7 @@ async function main() {
           'package-catalog-merge-and-filters',
           'task-lifecycle-progress-status',
           'plugin-state-backup-restore',
+          'plugin-filesystem-discovery',
         ]
       : [],
     failedTargets: passed ? [] : ['persistent-plugin-model-or-safe-plugin-lifecycle'],
@@ -133,6 +143,7 @@ async function main() {
       'cargo test -p jellyrin-db task_runs_track_current_and_last_result -- --nocapture',
       'cargo test -p jellyrin-db task_runs_can_be_cancelled_and_stale_runs_expire -- --nocapture',
       'cargo test -p jellyrin-api backup_endpoints_list_create_manifest_and_reject_restore -- --nocapture',
+      'cargo test -p jellyrin-api plugin_filesystem_discovery -- --nocapture',
     ],
     openRisks: [
       'DotNetJellyfin sidecar host is not implemented yet.',
@@ -154,6 +165,7 @@ async function main() {
       taskProgressTestResult,
       taskFailedProgressTestResult,
       backupRestoreTestResult,
+      filesystemDiscoveryTestResult,
     ]),
   );
   console.log(`wrote ${evidencePath}`);

@@ -40,10 +40,11 @@ use jellyrin_core::{
 use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
     ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
-    DeviceSession, InstallPluginPackage, MediaItemMetadata, MediaList, MediaListItem,
-    MediaListUserPermission, QuickConnectSession, SortDirection, SystemConfigurationPayloads,
-    TaskRun, TranscodeSession, TrickplayInfo, UpsertActivePlaybackSession,
-    UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
+    DeviceSession, DiscoveredPluginPackage, InstallPluginPackage, MediaItemMetadata, MediaList,
+    MediaListItem, MediaListUserPermission, QuickConnectSession, SortDirection,
+    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -6177,6 +6178,7 @@ async fn installed_plugins(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    discover_installed_plugins_from_filesystem(&state).await?;
     Ok(Json(state.db.installed_plugins_json().await?))
 }
 
@@ -6816,6 +6818,123 @@ fn plugin_packages_root(log_dir: &FsPath) -> PathBuf {
         .unwrap_or(log_dir)
         .join("plugins")
         .join("packages")
+}
+
+async fn discover_installed_plugins_from_filesystem(state: &AppState) -> Result<(), ApiError> {
+    let root = plugin_packages_root(&state.log_dir);
+    if !tokio::fs::try_exists(&root).await? {
+        return Ok(());
+    }
+    let mut plugin_dirs = tokio::fs::read_dir(&root).await?;
+    while let Some(plugin_dir) = plugin_dirs.next_entry().await? {
+        if !plugin_dir.file_type().await?.is_dir() {
+            continue;
+        }
+        let plugin_id = plugin_dir.file_name().to_string_lossy().to_string();
+        if !safe_discovered_plugin_segment(&plugin_id) {
+            continue;
+        }
+        let mut version_dirs = match tokio::fs::read_dir(plugin_dir.path()).await {
+            Ok(version_dirs) => version_dirs,
+            Err(_) => continue,
+        };
+        while let Some(version_dir) = version_dirs.next_entry().await? {
+            if !version_dir.file_type().await?.is_dir() {
+                continue;
+            }
+            let version = version_dir.file_name().to_string_lossy().to_string();
+            if !safe_discovered_plugin_segment(&version) {
+                continue;
+            }
+            if let Some(package) =
+                discovered_plugin_package_from_dir(&plugin_id, &version, version_dir.path()).await?
+            {
+                state.db.upsert_discovered_plugin_package(package).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn discovered_plugin_package_from_dir(
+    plugin_id: &str,
+    version_segment: &str,
+    install_path: PathBuf,
+) -> Result<Option<DiscoveredPluginPackage>, ApiError> {
+    let runtime = discovered_plugin_runtime(&install_path).await?;
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+    let manifest = read_discovered_plugin_manifest(&install_path)
+        .await?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let name = json_string_field(&manifest, "Name").unwrap_or_else(|| plugin_id.to_string());
+    let version = json_string_field(&manifest, "Version").unwrap_or_else(|| version_segment.into());
+    let target_abi = json_string_field(&manifest, "TargetAbi").unwrap_or_default();
+    Ok(Some(DiscoveredPluginPackage {
+        plugin_id: plugin_id.to_string(),
+        name,
+        version,
+        runtime,
+        target_abi,
+        manifest,
+        install_path: install_path.to_string_lossy().to_string(),
+    }))
+}
+
+async fn discovered_plugin_runtime(install_path: &FsPath) -> Result<Option<String>, ApiError> {
+    let mut stack = vec![install_path.to_path_buf()];
+    let mut has_dotnet = false;
+    while let Some(path) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&path).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let extension = entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if extension == "wasm" {
+                return Ok(Some("RustWasi".to_string()));
+            }
+            if extension == "dll" {
+                has_dotnet = true;
+            }
+        }
+    }
+    Ok(has_dotnet.then(|| "DotNetJellyfin".to_string()))
+}
+
+async fn read_discovered_plugin_manifest(
+    install_path: &FsPath,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    for name in ["meta.json", "manifest.json"] {
+        let path = install_path.join(name);
+        if !tokio::fs::try_exists(&path).await? {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path).await?;
+        let manifest = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+            ApiError::bad_request(format!("Plugin manifest is invalid: {error}"))
+        })?;
+        return Ok(Some(manifest));
+    }
+    Ok(None)
+}
+
+fn safe_discovered_plugin_segment(value: &str) -> bool {
+    !value.starts_with('.') && safe_plugin_path_segment(value) == value
 }
 
 fn safe_plugin_path_segment(value: &str) -> String {
@@ -7810,6 +7929,7 @@ async fn uninstall_plugin_by_version(
         .uninstall_plugin_state(&plugin_id, Some(user.id))
         .await?
     {
+        remove_plugin_package_files(&state, &plugin_id).await?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("Plugin not found"))
@@ -7828,10 +7948,19 @@ async fn uninstall_plugin(
         .uninstall_plugin_state(&plugin_id, Some(user.id))
         .await?
     {
+        remove_plugin_package_files(&state, &plugin_id).await?;
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("Plugin not found"))
     }
+}
+
+async fn remove_plugin_package_files(state: &AppState, plugin_id: &str) -> Result<(), ApiError> {
+    let plugin_dir = plugin_packages_root(&state.log_dir).join(safe_plugin_path_segment(plugin_id));
+    if tokio::fs::try_exists(&plugin_dir).await? {
+        tokio::fs::remove_dir_all(&plugin_dir).await?;
+    }
+    Ok(())
 }
 
 async fn require_installed_plugin_version(
@@ -30053,7 +30182,7 @@ mod tests {
         package_infos_from_repositories, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
         parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
-        plugin_package_operation, reconcile_live_tv_recordings_on_startup,
+        plugin_package_operation, plugin_packages_root, reconcile_live_tv_recordings_on_startup,
         reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
         reserve_live_tv_recording_start, router, run_due_live_tv_timers, series_timer_child_id,
         spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
@@ -30388,6 +30517,212 @@ mod tests {
             started_at.elapsed() < std::time::Duration::from_secs(5),
             "cancelable operation did not abort promptly"
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_filesystem_discovery_registers_dotnet_and_wasi_as_not_supported() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let plugin_root = plugin_packages_root(&log_dir);
+        let dotnet_dir = plugin_root
+            .join("11111111-1111-1111-1111-111111111111")
+            .join("1.0.0.0");
+        tokio::fs::create_dir_all(&dotnet_dir).await.unwrap();
+        tokio::fs::write(dotnet_dir.join("Jellyfin.Plugin.Discovered.dll"), b"dll")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dotnet_dir.join("meta.json"),
+            json!({
+                "Name": "Discovered DotNet",
+                "Version": "1.0.0.0",
+                "TargetAbi": "12.0.0.0"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let wasi_dir = plugin_root
+            .join("22222222-2222-2222-2222-222222222222")
+            .join("2.0.0.0");
+        tokio::fs::create_dir_all(&wasi_dir).await.unwrap();
+        tokio::fs::write(wasi_dir.join("plugin.wasm"), b"wasm")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            wasi_dir.join("manifest.json"),
+            json!({
+                "Name": "Discovered WASI",
+                "Version": "2.0.0.0",
+                "TargetAbi": "jellyrin-wasi-0.1"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let incomplete_dir = plugin_root
+            .join("33333333-3333-3333-3333-333333333333")
+            .join("1.0.0.0");
+        tokio::fs::create_dir_all(&incomplete_dir).await.unwrap();
+        tokio::fs::write(incomplete_dir.join("readme.txt"), b"no runtime")
+            .await
+            .unwrap();
+        let unsafe_dir = plugin_root.join("Unsafe Name").join("1.0.0.0");
+        tokio::fs::create_dir_all(&unsafe_dir).await.unwrap();
+        tokio::fs::write(unsafe_dir.join("plugin.wasm"), b"ignored")
+            .await
+            .unwrap();
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir,
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let plugins: Value = serde_json::from_slice(&body).unwrap();
+        let plugins = plugins.as_array().unwrap();
+        assert_eq!(plugins.len(), 2);
+        let dotnet = plugins
+            .iter()
+            .find(|plugin| plugin["Name"] == "Discovered DotNet")
+            .unwrap();
+        assert_eq!(dotnet["Runtime"], "DotNetJellyfin");
+        assert_eq!(dotnet["Status"], "NotSupported");
+        assert_eq!(dotnet["TargetAbi"], "12.0.0.0");
+        assert!(
+            dotnet["LastError"]
+                .as_str()
+                .unwrap()
+                .contains("runtime host is not implemented")
+        );
+        let wasi = plugins
+            .iter()
+            .find(|plugin| plugin["Name"] == "Discovered WASI")
+            .unwrap();
+        assert_eq!(wasi["Runtime"], "RustWasi");
+        assert_eq!(wasi["Status"], "NotSupported");
+        assert_eq!(wasi["TargetAbi"], "jellyrin-wasi-0.1");
+    }
+
+    #[tokio::test]
+    async fn plugin_filesystem_discovery_preserves_persisted_status_and_config() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "44444444-4444-4444-4444-444444444444";
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Persisted Plugin".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({ "Guid": plugin_id, "Name": "Persisted Plugin" }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Persisted Plugin",
+                    "Version": "1.0.0.0",
+                    "Runtime": "RustWasi"
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        db.update_plugin_configuration_json(
+            plugin_id,
+            json!({
+                "Preserved": true,
+                "Quality": "existing"
+            }),
+        )
+        .await
+        .unwrap();
+        db.set_installed_plugin_status(plugin_id, "Disabled", None, Some(user.id))
+            .await
+            .unwrap();
+
+        let db_for_assertions = db.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+        let discovered_dir = plugin_packages_root(&log_dir)
+            .join(plugin_id)
+            .join("2.0.0.0");
+        tokio::fs::create_dir_all(&discovered_dir).await.unwrap();
+        tokio::fs::write(discovered_dir.join("plugin.wasm"), b"wasm")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            discovered_dir.join("manifest.json"),
+            json!({
+                "Name": "Filesystem Should Not Override",
+                "Version": "2.0.0.0",
+                "Runtime": "RustWasi"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir,
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let plugins: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(plugins.as_array().unwrap().len(), 1);
+        assert_eq!(plugins[0]["Name"], "Persisted Plugin");
+        assert_eq!(plugins[0]["Version"], "1.0.0.0");
+        assert_eq!(plugins[0]["Status"], "Disabled");
+        assert_eq!(plugins[0]["LastError"], Value::Null);
+
+        let configuration = db_for_assertions
+            .plugin_configuration_json(plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(configuration["Preserved"], true);
+        assert_eq!(configuration["Quality"], "existing");
     }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)

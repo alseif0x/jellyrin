@@ -366,6 +366,17 @@ pub struct InstallPluginPackage {
     pub manifest: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct DiscoveredPluginPackage {
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub runtime: String,
+    pub target_abi: String,
+    pub manifest: Value,
+    pub install_path: String,
+}
+
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let mut options = database_url
@@ -1165,6 +1176,132 @@ impl Database {
         rows.into_iter()
             .map(|row| plugin_row_to_json(&row))
             .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    pub async fn upsert_discovered_plugin_package(
+        &self,
+        package: DiscoveredPluginPackage,
+    ) -> anyhow::Result<bool> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let runtime_missing = format!("{} runtime host is not implemented yet.", package.runtime);
+        let mut manifest = package.manifest;
+        if !manifest.is_object() {
+            manifest = json!({});
+        }
+        manifest["Guid"] = json!(package.plugin_id);
+        manifest["Name"] = json!(package.name);
+        manifest["Version"] = json!(package.version);
+        manifest["Runtime"] = json!(package.runtime);
+        manifest["TargetAbi"] = json!(package.target_abi);
+        manifest["Installation"] = json!({
+            "Mode": "filesystem-discovered",
+            "InstallPath": package.install_path
+        });
+
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO installed_plugins (
+                plugin_id, name, version, runtime, target_abi, server_compatibility_json,
+                status, capabilities_json, permissions_json, configuration_state, last_error,
+                health_json, manifest_json, installed_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, '{}', 'NotSupported', '[]', '[]', 'Default', ?6, ?7, ?8, ?9, ?9)
+            ON CONFLICT(plugin_id) DO NOTHING
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(&package.name)
+        .bind(&package.version)
+        .bind(&package.runtime)
+        .bind(&package.target_abi)
+        .bind(&runtime_missing)
+        .bind(serde_json::to_string(&json!({
+            "Status": "NotSupported",
+            "Message": runtime_missing
+        }))?)
+        .bind(serde_json::to_string(&manifest)?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_manifests (plugin_id, manifest_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(plugin_id) DO NOTHING
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(serde_json::to_string(&manifest)?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at)
+            VALUES (?1, '{}', ?2)
+            ON CONFLICT(plugin_id) DO NOTHING
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_permissions (plugin_id, permissions_json, updated_at)
+            VALUES (?1, '[]', ?2)
+            ON CONFLICT(plugin_id) DO NOTHING
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_host_events (id, plugin_id, runtime, event_type, severity, message, payload_json, created_at)
+            VALUES (?1, ?2, ?3, 'Discovery', 'Information', ?4, ?5, ?6)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&package.plugin_id)
+        .bind(&package.runtime)
+        .bind(format!(
+            "{} {} discovered from filesystem.",
+            package.name, package.version
+        ))
+        .bind(serde_json::to_string(&json!({
+            "InstallPath": package.install_path,
+            "Runtime": package.runtime
+        }))?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_audit_log (id, plugin_id, action, actor_user_id, status, payload_json, created_at)
+            VALUES (?1, ?2, 'Discover', NULL, 'NotSupported', ?3, ?4)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&package.plugin_id)
+        .bind(serde_json::to_string(&json!({
+            "Name": package.name,
+            "Version": package.version,
+            "Runtime": package.runtime,
+            "InstallPath": package.install_path
+        }))?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn package_installations_json(&self, plugin_id: &str) -> anyhow::Result<Vec<Value>> {
