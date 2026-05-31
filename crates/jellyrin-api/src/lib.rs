@@ -295,6 +295,7 @@ struct SyncPlayParticipant {
     user_id: Uuid,
     user_name: String,
     session_id: String,
+    device_id: String,
     is_ready: bool,
     is_buffering: bool,
     last_seen_at: OffsetDateTime,
@@ -9456,10 +9457,23 @@ fn syncplay_participant(user: &User, token: &DeviceToken) -> SyncPlayParticipant
         user_id: user.id,
         user_name: user.name.clone(),
         session_id: token.access_token.clone(),
+        device_id: token.device_id.clone(),
         is_ready: false,
         is_buffering: false,
         last_seen_at: OffsetDateTime::now_utc(),
     }
+}
+
+fn syncplay_insert_participant(
+    participants: &mut BTreeMap<String, SyncPlayParticipant>,
+    participant: SyncPlayParticipant,
+) {
+    participants.retain(|session_id, existing| {
+        session_id == &participant.session_id
+            || existing.user_id != participant.user_id
+            || existing.device_id != participant.device_id
+    });
+    participants.insert(participant.session_id.clone(), participant);
 }
 
 fn syncplay_group_json(group: &SyncPlayGroup) -> serde_json::Value {
@@ -9471,6 +9485,7 @@ fn syncplay_group_json(group: &SyncPlayGroup) -> serde_json::Value {
                 "UserId": participant.user_id,
                 "UserName": participant.user_name,
                 "SessionId": participant.session_id,
+                "DeviceId": participant.device_id,
                 "IsGroupOwner": participant.user_id == group.owner_user_id,
                 "IsReady": participant.is_ready,
                 "IsBuffering": participant.is_buffering,
@@ -9527,7 +9542,7 @@ async fn syncplay_new(
         .unwrap_or_else(|| format!("{}'s group", user.name));
     let participant = syncplay_participant(&user, &token);
     let mut participants = BTreeMap::new();
-    participants.insert(participant.session_id.clone(), participant);
+    syncplay_insert_participant(&mut participants, participant);
     let group = SyncPlayGroup {
         id: group_id.clone(),
         name,
@@ -9562,9 +9577,7 @@ async fn syncplay_join(
             .get_mut(group_id.trim())
             .ok_or_else(|| ApiError::not_found("SyncPlay group not found"))?;
         let participant = syncplay_participant(&user, &token);
-        group
-            .participants
-            .insert(participant.session_id.clone(), participant);
+        syncplay_insert_participant(&mut group.participants, participant);
         group.updated_at = OffsetDateTime::now_utc();
         (
             syncplay_group_json(group),
@@ -40991,11 +41004,13 @@ mod tests {
             .await
             .unwrap();
         let guest = db.create_user("guest", Some("secret")).await.unwrap();
-        let guest_key = db
-            .issue_api_key_for_user(guest.id, &format!("syncplay-guest-key-{group_id}"))
+        let guest_key_name = format!("syncplay-guest-key-{group_id}");
+        let mut guest_key = db
+            .issue_api_key_for_user(guest.id, &guest_key_name)
             .await
             .unwrap();
         db.complete_startup_wizard().await.unwrap();
+        let test_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -41259,6 +41274,56 @@ mod tests {
             assert_eq!(event["Data"]["Group"]["State"]["PlayState"], "Playing");
             assert_eq!(event["Data"]["Group"]["State"]["PositionTicks"], 42_000);
         }
+
+        let reconnected_guest_key = test_db
+            .issue_api_key_for_user(guest.id, &guest_key_name)
+            .await
+            .unwrap();
+        assert_ne!(reconnected_guest_key, guest_key);
+        let mut reconnect_owner_events = subscribe_playback_events();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Join")
+                    .header("X-Emby-Token", &reconnected_guest_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let reconnected_group: Value = serde_json::from_slice(&body).unwrap();
+        let reconnected_participants = reconnected_group["Participants"].as_array().unwrap();
+        assert_eq!(reconnected_participants.len(), 2);
+        let reconnected_guest_participants = reconnected_participants
+            .iter()
+            .filter(|participant| participant["UserName"] == "guest")
+            .collect::<Vec<_>>();
+        assert_eq!(reconnected_guest_participants.len(), 1);
+        assert_eq!(
+            reconnected_guest_participants[0]["SessionId"],
+            reconnected_guest_key
+        );
+        assert_eq!(
+            reconnected_guest_participants[0]["DeviceId"],
+            format!("api-key:{guest_key_name}")
+        );
+        tokio::task::yield_now().await;
+        let reconnect_owner_event =
+            next_playback_event_type(&mut reconnect_owner_events, &api_key, "SyncPlayGroupUpdate")
+                .await;
+        assert_eq!(reconnect_owner_event["Data"]["Reason"], "Join");
+        assert_eq!(
+            reconnect_owner_event["Data"]["Group"]["Participants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        guest_key = reconnected_guest_key;
 
         let mut leave_owner_events = subscribe_playback_events();
         let response = app

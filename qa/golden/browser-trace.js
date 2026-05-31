@@ -394,6 +394,7 @@ async function captureTarget(browser, flowDir, target) {
       syncplaySeekFanout: false,
       syncplayUnpause204: false,
       syncplayUnpauseFanout: false,
+      syncplayGuestReconnectDeduped: false,
       syncplayGuestLeft: false,
       syncplayOwnerLeft: false,
       syncplayCleanupConfirmed: false,
@@ -1243,6 +1244,46 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     if (stateAfterCommands.json?.State?.LastCommandName && stateAfterCommands.json.State.LastCommandName !== 'Unpause') {
       throw new Error('SyncPlay final state did not record Unpause');
     }
+
+    const guestReconnectLogin = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/Users/AuthenticateByName',
+      authorization: guestAuthorization,
+      body: {
+        Username: guestName,
+        Pw: syncplayFlowPassword,
+      },
+    });
+    if (guestReconnectLogin.status !== 200 || !guestReconnectLogin.json?.AccessToken) {
+      throw new Error(`syncplay guest reconnect login returned HTTP ${guestReconnectLogin.status}`);
+    }
+    const guestReconnectToken = guestReconnectLogin.json.AccessToken;
+    if (guestReconnectToken === guestToken) {
+      throw new Error('SyncPlay guest reconnect returned the original access token');
+    }
+    const reconnect = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/SyncPlay/Join',
+      token: guestReconnectToken,
+      authorization: guestAuthorization,
+      body: { GroupId: groupId },
+    });
+    if (reconnect.status !== 200) {
+      throw new Error(`SyncPlay reconnect Join returned HTTP ${reconnect.status}`);
+    }
+    const reconnectParticipants = reconnect.json?.Participants || [];
+    const guestParticipants = reconnectParticipants.filter((participant) => participant.UserName === guestName);
+    if (reconnectParticipants.length !== 2 || guestParticipants.length !== 1) {
+      throw new Error(`SyncPlay reconnect duplicated participants: ${JSON.stringify(reconnectParticipants)}`);
+    }
+    if (guestParticipants[0].SessionId !== guestReconnectToken) {
+      throw new Error('SyncPlay reconnect did not replace the guest session id');
+    }
+    if (guestParticipants[0].DeviceId !== `syncplay-guest-${target.name}`) {
+      throw new Error('SyncPlay reconnect did not preserve the guest device id');
+    }
+    guestToken = guestReconnectToken;
+    summary.invariants.syncplayGuestReconnectDeduped = true;
 
     const guestLeave = await browserFetchJson(page, {
       method: 'POST',
@@ -9047,6 +9088,7 @@ function invariantFailures(summary) {
       ['syncplaySeekFanout', 'seek fanout'],
       ['syncplayUnpause204', 'unpause command'],
       ['syncplayUnpauseFanout', 'unpause fanout'],
+      ['syncplayGuestReconnectDeduped', 'guest reconnect dedupe'],
       ['syncplayGuestLeft', 'guest leave'],
       ['syncplayOwnerLeft', 'owner leave'],
       ['syncplayCleanupConfirmed', 'group cleanup'],
