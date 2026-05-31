@@ -77,6 +77,14 @@ async function main() {
     '--',
     '--nocapture',
   ]);
+  const runtimeInstanceTestResult = await runCommand('cargo', [
+    'test',
+    '-p',
+    'jellyrin-db',
+    'plugin_runtime_instance_updates_installed_plugin_health_and_events',
+    '--',
+    '--nocapture',
+  ]);
   const backupRestoreTestResult = await runCommand('cargo', [
     'test',
     '-p',
@@ -116,6 +124,7 @@ async function main() {
     catalogMergeTestResult.code === 0 &&
     taskProgressTestResult.code === 0 &&
     taskFailedProgressTestResult.code === 0 &&
+    runtimeInstanceTestResult.code === 0 &&
     backupRestoreTestResult.code === 0 &&
     filesystemDiscoveryTestResult.code === 0 &&
     runtimeRpcTestResult.code === 0 &&
@@ -123,13 +132,13 @@ async function main() {
   const evidence = {
     gate: 'plugin-dual-runtime',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 92 : 5,
+    percent: passed ? 93 : 5,
     closed: false,
     sourcePhase: passed
-      ? 'E1.P1/E1.P1b/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P2f/E1.P2f2/E1.P2g/E1.P2h/E1.P2i/E1.P2j/E1.P3a/E1.P3b/E1.P3c/E1.P5a/E1.P6a/E1.P6b/E1.P9a'
+      ? 'E1.P1/E1.P1b/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P2f/E1.P2f2/E1.P2g/E1.P2h/E1.P2i/E1.P2j/E1.P3a/E1.P3b/E1.P3c/E1.P5a/E1.P5b/E1.P6a/E1.P6b/E1.P9a'
       : 'E1.P1/P2-attempted',
     evidence: passed
-      ? 'E1/P1 persistent plugin platform model is implemented and verified, including backup/restore of plugin repositories, package catalog cache, package installations, installed plugin rows, manifests, configurations, permissions, runtime instances, host events and audit log metadata without copying plugin binaries; E1/P2a/P2b/P2c/P2d/P2e/P2f/P2f2/P2g/P2h/P2i/P2j/P3a/P3b/P3c/P5a/P6a/P6b/P9a safe package lifecycle, registry discovery, observability and runtime RPC contract are implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, verifies SHA256/SHA1 checksums when provided, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, completes PackageInstall tasks, broadcasts PackageInstall websocket task events for running/completed/failed/cancelled phases, handles update/downgrade by marking previous package_installations as Superseded while switching the active installed_plugins version, refreshes enabled plugin repository manifests into the persisted catalog/task evidence while preserving disabled repositories and previous package state on partial failures, honors IfStale/Force/CacheTtlSeconds repository refresh cache semantics and records cached/refreshed task evidence, broadcasts PackageRepositoriesRefresh websocket task events for running/completed/failed phases, observes PackageInstall cancellation before destructive/DB commit checkpoints and aborts cancelable in-flight package operations while waiting on downloads, file reads and unzip child processes, merges duplicate package catalog entries while preserving dual-runtime versions and optional Runtime/TargetAbi/ServerVersion filters, persists lifecycle progress in task_runs.result_json and exposes GET status endpoints for PackageInstall and PackageRepositoriesRefresh; /Plugins discovers package directories from filesystem, maps .dll artifacts to DotNetJellyfin and .wasm artifacts to RustWasi, ignores unsafe/incomplete package directories, preserves existing status/configuration instead of overwriting persisted state, and includes persisted RuntimeInstances/RecentEvents for plugin observability; discovered or installed plugins remain NotSupported until a runtime host exists; GET /Plugins/{id}/Health and /Plugins/{id}/Logs expose persisted plugin health and host events; jellyrin-plugin-rpc defines the shared versioned JSON-line runtime contract for Handshake, LoadPlugin, configuration, pages, embedded images, capabilities, health and shutdown with typed errors, correlation IDs, stdio JSON-line transport, timeouts and sidecar process kill-on-drop; jellyrin-plugin-host-wasi is a process-isolated RustWasi metadata host with an integration smoke test that launches the compiled sidecar over stdio, handshakes, loads plugin manifests from install paths containing .wasm artifacts, reports capabilities/health and shuts down without executing WASM yet; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
+      ? 'E1/P1 persistent plugin platform model is implemented and verified, including backup/restore of plugin repositories, package catalog cache, package installations, installed plugin rows, manifests, configurations, permissions, runtime instances, host events and audit log metadata without copying plugin binaries; E1/P2a/P2b/P2c/P2d/P2e/P2f/P2f2/P2g/P2h/P2i/P2j/P3a/P3b/P3c/P5a/P5b/P6a/P6b/P9a safe package lifecycle, registry discovery, observability and runtime RPC contract are implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, verifies SHA256/SHA1 checksums when provided, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, completes PackageInstall tasks, broadcasts PackageInstall websocket task events for running/completed/failed/cancelled phases, handles update/downgrade by marking previous package_installations as Superseded while switching the active installed_plugins version, refreshes enabled plugin repository manifests into the persisted catalog/task evidence while preserving disabled repositories and previous package state on partial failures, honors IfStale/Force/CacheTtlSeconds repository refresh cache semantics and records cached/refreshed task evidence, broadcasts PackageRepositoriesRefresh websocket task events for running/completed/failed phases, observes PackageInstall cancellation before destructive/DB commit checkpoints and aborts cancelable in-flight package operations while waiting on downloads, file reads and unzip child processes, merges duplicate package catalog entries while preserving dual-runtime versions and optional Runtime/TargetAbi/ServerVersion filters, persists lifecycle progress in task_runs.result_json and exposes GET status endpoints for PackageInstall and PackageRepositoriesRefresh; /Plugins discovers package directories from filesystem, maps .dll artifacts to DotNetJellyfin and .wasm artifacts to RustWasi, ignores unsafe/incomplete package directories, preserves existing status/configuration instead of overwriting persisted state, and includes persisted RuntimeInstances/RecentEvents for plugin observability; runtime activation state can now persist Active runtime instances, runtime version, health JSON, capabilities and RuntimeStatus host events into installed plugin views and backup snapshots; discovered or installed plugins remain NotSupported until a runtime host exists; GET /Plugins/{id}/Health and /Plugins/{id}/Logs expose persisted plugin health and host events; jellyrin-plugin-rpc defines the shared versioned JSON-line runtime contract for Handshake, LoadPlugin, configuration, pages, embedded images, capabilities, health and shutdown with typed errors, correlation IDs, stdio JSON-line transport, timeouts and sidecar process kill-on-drop; jellyrin-plugin-host-wasi is a process-isolated RustWasi metadata host with an integration smoke test that launches the compiled sidecar over stdio, handshakes, loads plugin manifests from install paths containing .wasm artifacts, reports capabilities/health and shuts down without executing WASM yet; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
       : 'E1/P1/P2 persistent plugin platform or safe lifecycle tests failed; inspect command output before advancing plugin runtime work.',
     updatedAt: new Date().toISOString(),
     completedTargets: passed
@@ -150,6 +159,7 @@ async function main() {
           'plugin-runtime-rpc-contract',
           'plugin-runtime-stdio-transport',
           'rust-wasi-sidecar-metadata-host',
+          'plugin-runtime-instance-activation-state',
           'plugin-state-backup-restore',
           'plugin-filesystem-discovery',
         ]
@@ -164,6 +174,7 @@ async function main() {
       'cargo test -p jellyrin-api package_catalog_merges_duplicates_and_filters_incompatible_versions -- --nocapture',
       'cargo test -p jellyrin-db task_runs_track_current_and_last_result -- --nocapture',
       'cargo test -p jellyrin-db task_runs_can_be_cancelled_and_stale_runs_expire -- --nocapture',
+      'cargo test -p jellyrin-db plugin_runtime_instance_updates_installed_plugin_health_and_events -- --nocapture',
       'cargo test -p jellyrin-api backup_endpoints_list_create_manifest_and_reject_restore -- --nocapture',
       'cargo test -p jellyrin-api plugin_filesystem_discovery -- --nocapture',
       'cargo test -p jellyrin-plugin-rpc -- --nocapture',
@@ -188,6 +199,7 @@ async function main() {
       catalogMergeTestResult,
       taskProgressTestResult,
       taskFailedProgressTestResult,
+      runtimeInstanceTestResult,
       backupRestoreTestResult,
       filesystemDiscoveryTestResult,
       runtimeRpcTestResult,

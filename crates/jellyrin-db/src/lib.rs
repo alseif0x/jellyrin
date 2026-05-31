@@ -377,6 +377,19 @@ pub struct DiscoveredPluginPackage {
     pub install_path: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginRuntimeInstanceUpsert {
+    pub plugin_id: String,
+    pub runtime: String,
+    pub runtime_version: String,
+    pub status: String,
+    pub process_id: Option<i64>,
+    pub endpoint: Option<String>,
+    pub health: Value,
+    pub capabilities: Vec<String>,
+    pub last_error: Option<String>,
+}
+
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let mut options = database_url
@@ -1504,6 +1517,125 @@ impl Database {
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        Ok(true)
+    }
+
+    pub async fn upsert_plugin_runtime_instance(
+        &self,
+        instance: PluginRuntimeInstanceUpsert,
+        actor_user_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
+        let normalized = instance.plugin_id.trim();
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        let plugin_result = sqlx::query(
+            r#"
+            UPDATE installed_plugins
+            SET runtime_version = ?1,
+                status = ?2,
+                capabilities_json = ?3,
+                last_error = ?4,
+                health_json = ?5,
+                updated_at = ?6
+            WHERE plugin_id = ?7 COLLATE NOCASE
+            "#,
+        )
+        .bind(&instance.runtime_version)
+        .bind(&instance.status)
+        .bind(serde_json::to_string(&instance.capabilities)?)
+        .bind(instance.last_error.as_deref())
+        .bind(serde_json::to_string(&instance.health)?)
+        .bind(&now)
+        .bind(normalized)
+        .execute(&mut *tx)
+        .await?;
+        if plugin_result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        let instance_id = plugin_runtime_instance_id(normalized, &instance.runtime);
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_runtime_instances (
+                instance_id, plugin_id, runtime, runtime_version, status, process_id,
+                endpoint, health_json, last_error, started_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+            ON CONFLICT(instance_id) DO UPDATE SET
+                runtime_version = excluded.runtime_version,
+                status = excluded.status,
+                process_id = excluded.process_id,
+                endpoint = excluded.endpoint,
+                health_json = excluded.health_json,
+                last_error = excluded.last_error,
+                started_at = COALESCE(plugin_runtime_instances.started_at, excluded.started_at),
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&instance_id)
+        .bind(normalized)
+        .bind(&instance.runtime)
+        .bind(&instance.runtime_version)
+        .bind(&instance.status)
+        .bind(instance.process_id)
+        .bind(instance.endpoint.as_deref())
+        .bind(serde_json::to_string(&instance.health)?)
+        .bind(instance.last_error.as_deref())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_host_events (id, plugin_id, runtime, event_type, severity, message, payload_json, created_at)
+            VALUES (?1, ?2, ?3, 'RuntimeStatus', ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(normalized)
+        .bind(&instance.runtime)
+        .bind(if instance.status.eq_ignore_ascii_case("Active") {
+            "Information"
+        } else {
+            "Warning"
+        })
+        .bind(format!(
+            "{} runtime status changed to {}.",
+            instance.runtime, instance.status
+        ))
+        .bind(serde_json::to_string(&json!({
+            "InstanceId": instance_id,
+            "RuntimeVersion": instance.runtime_version,
+            "ProcessId": instance.process_id,
+            "Endpoint": instance.endpoint,
+            "Health": instance.health,
+            "LastError": instance.last_error
+        }))?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_audit_log (id, plugin_id, action, actor_user_id, status, payload_json, created_at)
+            VALUES (?1, ?2, 'RuntimeStatus', ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(normalized)
+        .bind(actor_user_id.map(|id| id.to_string()))
+        .bind(&instance.status)
+        .bind(serde_json::to_string(&json!({
+            "Runtime": instance.runtime,
+            "RuntimeVersion": instance.runtime_version,
+            "Capabilities": instance.capabilities
+        }))?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(true)
     }
 
@@ -7630,6 +7762,14 @@ fn plugin_row_to_json(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Value> {
     }))
 }
 
+fn plugin_runtime_instance_id(plugin_id: &str, runtime: &str) -> String {
+    format!(
+        "{}:{}",
+        plugin_id.trim().to_ascii_lowercase(),
+        runtime.trim().to_ascii_lowercase()
+    )
+}
+
 async fn enrich_plugin_runtime_state(pool: &SqlitePool, plugin: &mut Value) -> anyhow::Result<()> {
     let Some(plugin_id) = plugin.get("Id").and_then(Value::as_str).map(str::to_string) else {
         return Ok(());
@@ -7793,10 +7933,10 @@ fn stable_plugin_model_id(kind: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityLogFilter, ActivityLogSortField, Database, SortDirection,
-        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertActiveViewingSession,
-        UpsertPlaybackState, UpsertTranscodeSession, parse_ffprobe_media_info,
-        parse_local_nfo_metadata,
+        ActivityLogFilter, ActivityLogSortField, Database, InstallPluginPackage,
+        PluginRuntimeInstanceUpsert, SortDirection, SystemConfigurationPayloads,
+        UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+        UpsertTranscodeSession, parse_ffprobe_media_info, parse_local_nfo_metadata,
     };
     use serde_json::json;
     use time::Duration;
@@ -9243,5 +9383,76 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert!(users.iter().any(|user| user.name == "admin"));
         assert!(users.iter().any(|user| user.name == "jellyrin-e2e-admin"));
+    }
+
+    #[tokio::test]
+    async fn plugin_runtime_instance_updates_installed_plugin_health_and_events() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Runtime Fixture".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Runtime Fixture",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Runtime Fixture",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi"
+                }),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let recorded = db
+            .upsert_plugin_runtime_instance(
+                PluginRuntimeInstanceUpsert {
+                    plugin_id: plugin_id.to_string(),
+                    runtime: "RustWasi".to_string(),
+                    runtime_version: "0.1.0".to_string(),
+                    status: "Active".to_string(),
+                    process_id: Some(4242),
+                    endpoint: Some("stdio".to_string()),
+                    health: json!({
+                        "Status": "Healthy",
+                        "Message": "RustWasi sidecar loaded metadata."
+                    }),
+                    capabilities: vec!["ScheduledTask".to_string(), "MetadataProvider".to_string()],
+                    last_error: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(recorded);
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert_eq!(plugin["Status"], "Active");
+        assert_eq!(plugin["RuntimeVersion"], "0.1.0");
+        assert_eq!(plugin["Health"]["Status"], "Healthy");
+        assert_eq!(plugin["Capabilities"][0], "ScheduledTask");
+        assert_eq!(plugin["RuntimeInstances"].as_array().unwrap().len(), 1);
+        assert_eq!(plugin["RuntimeInstances"][0]["Status"], "Active");
+        assert_eq!(plugin["RuntimeInstances"][0]["Endpoint"], "stdio");
+        assert_eq!(plugin["RecentEvents"][0]["EventType"], "RuntimeStatus");
+
+        let snapshot = db.plugin_platform_snapshot().await.unwrap();
+        assert_eq!(snapshot["PluginRuntimeInstances"]["Count"], 1);
+        assert!(
+            snapshot["PluginHostEvents"]["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["EventType"] == "RuntimeStatus")
+        );
     }
 }
