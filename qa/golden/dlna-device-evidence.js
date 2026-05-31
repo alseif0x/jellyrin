@@ -130,6 +130,7 @@ async function validateManualDlnaEvidence(evidence) {
     errors.push(`deviceType must be one of: ${allowedDeviceTypes.join(', ')}`);
   }
   requireUrl(errors, evidence, 'jellyrinBaseUrl');
+  requireLanLocation(errors, evidence.jellyrinBaseUrl, 'jellyrinBaseUrl');
 
   if (!evidence.server || typeof evidence.server !== 'object' || Array.isArray(evidence.server)) {
     errors.push('server must be an object');
@@ -165,6 +166,7 @@ async function validateManualDlnaEvidence(evidence) {
     requireUrl(errors, evidence.network, 'network.ssdpLocation', 'ssdpLocation');
     requireLanLocation(errors, evidence.network.ssdpLocation, 'network.ssdpLocation');
     requireLocationHostMatchesIp(errors, evidence.network.ssdpLocation, evidence.network.serverIp, 'network.ssdpLocation', 'network.serverIp');
+    requireLocationHostMatchesIp(errors, evidence.jellyrinBaseUrl, evidence.network.serverIp, 'jellyrinBaseUrl', 'network.serverIp');
     for (const check of requiredNetworkChecks) {
       if (evidence.network[check] !== true) {
         errors.push(`network.${check} must be true`);
@@ -551,6 +553,18 @@ async function selfTest() {
       server: { ...valid.server, commit: '0123456789abcdef0123456789abcdef01234567' },
     };
     await assertInvalid(staleCommit, 'server.commit must match current git HEAD');
+
+    const loopbackBaseUrl = {
+      ...valid,
+      jellyrinBaseUrl: 'http://127.0.0.1:8097',
+    };
+    await assertInvalid(loopbackBaseUrl, 'jellyrinBaseUrl host must be a LAN-reachable IPv4 address');
+
+    const mismatchedBaseUrl = {
+      ...valid,
+      jellyrinBaseUrl: 'http://192.168.1.99:8097',
+    };
+    await assertInvalid(mismatchedBaseUrl, 'jellyrinBaseUrl host must match network.serverIp');
 
     const loopbackServerIp = {
       ...valid,
