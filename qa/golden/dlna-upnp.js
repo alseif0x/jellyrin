@@ -3,6 +3,10 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const {
+  loadManualDlnaEvidence,
+  summarizeManualDlnaEvidence,
+} = require('./dlna-device-evidence');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
@@ -101,9 +105,10 @@ async function main() {
 
   const discoveryEvidence = await readJsonIfExists(discoveryEvidencePath);
   const eventsEvidence = await readJsonIfExists(eventsEvidencePath);
-  const evidence = buildEvidence(result, discoveryEvidence, eventsEvidence);
+  const manualEvidence = await loadManualDlnaEvidence();
+  const evidence = buildEvidence(result, discoveryEvidence, eventsEvidence, manualEvidence);
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
-  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence));
+  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, manualEvidence));
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
   console.log(`wrote ${tracePath}`);
@@ -156,8 +161,9 @@ function runCommand(command) {
   });
 }
 
-function buildEvidence(result, discoveryEvidence, eventsEvidence) {
+function buildEvidence(result, discoveryEvidence, eventsEvidence, manualEvidence) {
   const passed = result.code === 0;
+  const deviceEvidence = summarizeManualDlnaEvidence(manualEvidence);
   const discoveryPassed =
     discoveryEvidence?.status === 'implemented' &&
     discoveryEvidence?.failedTargets?.length === 0 &&
@@ -166,11 +172,13 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
     eventsEvidence?.status === 'implemented' &&
     eventsEvidence?.failedTargets?.length === 0 &&
     eventsEvidence?.completedTargets?.includes('followup-notify');
+  const deviceValidated = passed && discoveryPassed && eventsPassed && deviceEvidence.validCount > 0;
+  const localPercent = passed ? (discoveryPassed && eventsPassed ? 99 : discoveryPassed ? 98 : 97) : 87;
   return {
     gate: 'dlna-upnp',
-    status: 'implemented',
-    percent: passed ? (discoveryPassed && eventsPassed ? 99 : discoveryPassed ? 98 : 97) : 87,
-    closed: false,
+    status: deviceValidated ? 'device-validated' : 'implemented',
+    percent: deviceValidated ? 100 : localPercent,
+    closed: deviceValidated,
     sourcePhase: passed
       ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.2h/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.4f/E3.4g/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
@@ -186,12 +194,16 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
             ? 'The companion dlna-events golden validates real local TCP callback delivery for initial and follow-up GENA NOTIFY messages.'
             : 'The companion dlna-events golden has not been completed in the current generated evidence.',
           'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state, SOAP Browse/Search/GetProtocolInfo/PrepareForConnection/ConnectionComplete, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, SSDP PublishedServerUriBySubnet LOCATION selection, Jellyfin-like local artwork resolution, generated video-frame thumbnails, non-contradictory albumArtURI metadata, DLNA image headers, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
+          deviceValidated
+            ? `${deviceEvidence.validCount} real DLNA renderer/control-point evidence file(s) passed manual validation.`
+            : 'Manual DLNA device evidence intake is ready, but no valid real renderer/control-point evidence has been provided yet.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,
     completedTargets: passed ? ['jellyrin'] : [],
-    skippedTargets: ['upstream', 'renderer-device'],
+    skippedTargets: deviceValidated ? ['upstream'] : ['upstream', 'renderer-device'],
     failedTargets: passed ? [] : ['jellyrin'],
+    deviceEvidence,
     tracePath: path.relative(plansDir, tracePath),
     validatedCommands: [
       ...goldenCommands.map((command) => command.join(' ')),
@@ -203,8 +215,9 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
       'cargo fmt --all -- --check',
       'cargo clippy --all-targets -- -D warnings',
     ],
-    openRisks: [
+    openRisks: deviceValidated ? [] : [
       'Dashboard target remains device-validated; closing E3 still requires real renderer/VLC/TV validation on LAN.',
+      `Add at least one passing DLNA device evidence JSON under ${deviceEvidence.directory}.`,
       'SSDP uses a single IPv4 socket on 0.0.0.0:1900; multi-interface multicast binding, firewall/systemd packaging and real LAN discovery remain pending.',
       'Browse covers root, virtual folders, physical directory hierarchy, direct media items and music album containers; broader metadata-derived grouping for series/artists without folders remains pending.',
       'ContentDirectory Search supports a practical subset of criteria; full UPnP SearchCriteria grammar remains pending.',
@@ -227,7 +240,7 @@ async function readJsonIfExists(filePath) {
   }
 }
 
-function renderMarkdown(evidence) {
+function renderMarkdown(evidence, manualEvidence) {
   const lines = [];
   lines.push('# DLNA/UPnP Gate Evidence');
   lines.push('');
@@ -245,7 +258,29 @@ function renderMarkdown(evidence) {
   lines.push(`- Completed targets: ${evidence.completedTargets.join(', ') || 'none'}`);
   lines.push(`- Skipped targets: ${evidence.skippedTargets.join(', ') || 'none'}`);
   lines.push(`- Failed targets: ${evidence.failedTargets.join(', ') || 'none'}`);
+  if (evidence.deviceEvidence) {
+    lines.push(`- Manual evidence directory: \`${evidence.deviceEvidence.directory}\``);
+    lines.push(`- Manual evidence template: \`${evidence.deviceEvidence.templatePath}\``);
+    lines.push(`- Valid manual evidence files: ${evidence.deviceEvidence.validCount}`);
+    lines.push(`- Invalid manual evidence files: ${evidence.deviceEvidence.invalidCount}`);
+  }
   lines.push('');
+  if (manualEvidence?.valid?.length) {
+    lines.push('## Manual Device Evidence');
+    lines.push('');
+    for (const entry of manualEvidence.valid) {
+      lines.push(`- ${entry.evidence.deviceName} via ${entry.evidence.controlPointName}: \`${entry.relativePath}\``);
+    }
+    lines.push('');
+  }
+  if (manualEvidence?.invalid?.length) {
+    lines.push('## Invalid Manual Evidence');
+    lines.push('');
+    for (const entry of manualEvidence.invalid) {
+      lines.push(`- \`${entry.relativePath}\`: ${entry.errors.join('; ')}`);
+    }
+    lines.push('');
+  }
   lines.push('## Validation');
   lines.push('');
   for (const command of evidence.validatedCommands) {
