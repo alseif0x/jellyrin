@@ -1453,6 +1453,24 @@ impl Database {
         .transpose()
     }
 
+    pub async fn plugin_permissions_json(&self, plugin_id: &str) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query(
+            r#"
+            SELECT permissions_json
+            FROM plugin_permissions
+            WHERE plugin_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            serde_json::from_str(row.get::<&str, _>("permissions_json"))
+                .context("invalid plugin permissions payload")
+        })
+        .transpose()
+    }
+
     pub async fn update_plugin_configuration_json(
         &self,
         plugin_id: &str,
@@ -1476,6 +1494,61 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
+        Ok(true)
+    }
+
+    pub async fn update_plugin_permissions_json(
+        &self,
+        plugin_id: &str,
+        permissions: Value,
+        actor_user_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
+        if self.installed_plugin_manifest(plugin_id).await?.is_none() {
+            return Ok(false);
+        }
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let permissions_json = serde_json::to_string(&permissions)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_permissions (plugin_id, permissions_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(plugin_id) DO UPDATE SET
+                permissions_json = excluded.permissions_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .bind(&permissions_json)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            UPDATE installed_plugins
+            SET permissions_json = ?1, updated_at = ?2
+            WHERE plugin_id = ?3 COLLATE NOCASE
+            "#,
+        )
+        .bind(&permissions_json)
+        .bind(&now)
+        .bind(plugin_id.trim())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_audit_log (id, plugin_id, action, actor_user_id, status, payload_json, created_at)
+            VALUES (?1, ?2, 'UpdatePermissions', ?3, 'Updated', ?4, ?5)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(plugin_id.trim())
+        .bind(actor_user_id.map(|id| id.to_string()))
+        .bind(permissions_json)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(true)
     }
 

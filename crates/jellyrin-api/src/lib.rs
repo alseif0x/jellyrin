@@ -660,6 +660,14 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins/{plugin_id}/health", get(plugin_health))
         .route("/Plugins/{plugin_id}/Logs", get(plugin_logs))
         .route("/plugins/{plugin_id}/logs", get(plugin_logs))
+        .route(
+            "/Plugins/{plugin_id}/Permissions",
+            get(plugin_permissions).post(update_plugin_permissions),
+        )
+        .route(
+            "/plugins/{plugin_id}/permissions",
+            get(plugin_permissions).post(update_plugin_permissions),
+        )
         .route("/Plugins/{plugin_id}/Manifest", get(plugin_manifest))
         .route("/plugins/{plugin_id}/manifest", get(plugin_manifest))
         .route("/Plugins/{plugin_id}/Manifest", post(plugin_manifest_post))
@@ -8166,6 +8174,55 @@ async fn update_plugin_configuration(
     } else {
         Err(ApiError::not_found("Plugin not found"))
     }
+}
+
+async fn plugin_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    state
+        .db
+        .plugin_permissions_json(&plugin_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("Plugin not found"))
+}
+
+async fn update_plugin_permissions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(plugin_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if state
+        .db
+        .update_plugin_permissions_json(
+            &plugin_id,
+            normalize_plugin_permissions_payload(payload),
+            Some(user.id),
+        )
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Plugin not found"))
+    }
+}
+
+fn normalize_plugin_permissions_payload(payload: serde_json::Value) -> serde_json::Value {
+    if payload.is_array() {
+        return payload;
+    }
+    payload
+        .get("Permissions")
+        .cloned()
+        .filter(serde_json::Value::is_array)
+        .unwrap_or_else(|| serde_json::json!([]))
 }
 
 async fn plugin_configuration_from_runtime_host(
@@ -32273,6 +32330,109 @@ mod tests {
         assert_eq!(result.value["Arguments"]["Trigger"], "Manual");
     }
 
+    #[tokio::test]
+    async fn rust_wasi_activation_passes_granted_permissions_to_host() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "aaaaaaaa-0000-0000-0000-000000000001";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("fixture.wasm"), b"\0asm")
+            .await
+            .unwrap();
+        let host_path = fake_rust_wasi_permission_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Permissioned WASI".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Permissioned WASI",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Permissioned WASI",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ScheduledTask"],
+                    "Permissions": [{ "Name": "Network" }]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(plugin["Permissions"].as_array().unwrap().is_empty());
+        assert!(
+            activate_rust_wasi_plugin_with_host_path(&db, &plugin, None, host_path.clone())
+                .await
+                .is_err()
+        );
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Plugins/{plugin_id}/Permissions"))
+                    .header("X-Emby-Token", &api_key)
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        json!({ "Permissions": ["Network"] }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Plugins/{plugin_id}/Permissions"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let permissions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(permissions[0], "Network");
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert_eq!(plugin["Permissions"][0], "Network");
+        assert!(
+            activate_rust_wasi_plugin_with_host_path(&db, &plugin, None, host_path)
+                .await
+                .unwrap()
+        );
+    }
+
     async fn fake_rust_wasi_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-wasi-host.sh");
         tokio::fs::write(
@@ -32295,6 +32455,52 @@ while IFS= read -r line; do
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"55555555-5555-5555-5555-555555555555","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    async fn fake_rust_wasi_permission_host_script(root: &std::path::Path) -> PathBuf {
+        let path = root.join("fake-wasi-permission-host.sh");
+        tokio::fs::write(
+            &path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-wasi-permission-host","ServerVersion":"fake-wasi-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      if [[ "$line" == *'"Permissions":["Network"]'* ]]; then
+        printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"aaaaaaaa-0000-0000-0000-000000000001","Runtime":"RustWasi","RuntimeVersion":"fake-wasi-host-0.1","Status":"Healthy","Manifest":{"Name":"Permissioned WASI"},"Capabilities":["ScheduledTask"]}}\n' "$corr"
+      else
+        printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":false,"Error":{"Code":"PermissionDenied","Message":"Network permission was not granted."}}\n' "$corr"
+      fi
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"aaaaaaaa-0000-0000-0000-000000000001","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
       ;;
     Shutdown)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
