@@ -54,6 +54,7 @@ async function main() {
   const ssdpLocation = requiredString(ssdp.location, 'SSDP LOCATION header');
   const description = await fetchText(new URL(ssdpLocation));
   assertIncludes(description, '<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>', 'root descriptor device type');
+  assertIncludes(description, `<UDN>uuid:${serverId}</UDN>`, 'root descriptor UDN server id');
   assertIncludes(description, '<iconList>', 'root descriptor iconList');
 
   const contentDirectoryUrl = new URL(`/dlna/${serverId}/contentdirectory/control`, baseUrl);
@@ -418,6 +419,11 @@ function selfTest() {
   assertEqual(normalizeBaseUrl(parsed.baseUrl), 'http://192.168.1.46:8097', 'normalizeBaseUrl');
   assertEqual(headerValue('HTTP/1.1 200 OK\r\nLOCATION: http://host/dlna.xml\r\n', 'location'), 'http://host/dlna.xml', 'headerValue');
   assertEqual(requiredString(' http://host/dlna.xml ', 'location'), 'http://host/dlna.xml', 'requiredString trims values');
+  assertIncludes(
+    '<root><device><UDN>uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42</UDN></device></root>',
+    '<UDN>uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42</UDN>',
+    'root descriptor UDN server id',
+  );
   let missingSsdpLocationFailed = false;
   try {
     requiredString(undefined, 'SSDP LOCATION header');
