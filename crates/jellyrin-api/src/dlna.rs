@@ -724,6 +724,13 @@ async fn dlna_thumbnail_response(
     );
     headers.insert("transfermode.dlna.org", "Interactive".parse().unwrap());
     headers.insert("realtimeinfo.dlna.org", "DLNA.ORG_TLAG=*".parse().unwrap());
+    if let Some(profile_name) = dlna_thumbnail_profile_name(content_type) {
+        let content_features = format!("DLNA.ORG_PN={profile_name};{DLNA_PROTOCOL_FLAGS}");
+        headers.insert(
+            "contentfeatures.dlna.org",
+            content_features.parse().unwrap(),
+        );
+    }
     Ok((StatusCode::OK, headers, body).into_response())
 }
 
@@ -971,6 +978,14 @@ fn dlna_image_content_type(path: &FsPath) -> &'static str {
         "gif" => "image/gif",
         "bmp" => "image/bmp",
         _ => "image/png",
+    }
+}
+
+fn dlna_thumbnail_profile_name(content_type: &str) -> Option<&'static str> {
+    match content_type {
+        "image/jpeg" => Some("JPEG_TN"),
+        "image/png" => Some("PNG_TN"),
+        _ => None,
     }
 }
 
@@ -2864,7 +2879,7 @@ fn append_didl_thumbnail(
         server_address.trim_end_matches('/'),
         item.id
     );
-    didl.push_str("<upnp:albumArtURI>");
+    didl.push_str("<upnp:albumArtURI dlna:profileID=\"PNG_TN\">");
     didl.push_str(&escape_xml(&url));
     didl.push_str("</upnp:albumArtURI>");
 }

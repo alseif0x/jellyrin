@@ -32346,13 +32346,12 @@ mod tests {
         assert!(browse_response.contains(&format!("&lt;item id=&quot;item:{}&quot;", item.id)));
         assert!(browse_response.contains("DLNA &amp;amp; Movie"));
         assert!(browse_response.contains("object.item.videoItem.movie"));
-        assert!(!browse_response.contains("PNG_TN"));
         assert!(browse_response.contains(
             "protocolInfo=&quot;http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS="
         ));
         assert!(!browse_response.contains("DLNA.ORG_PN=AVC_MP4"));
         assert!(browse_response.contains(&format!("size=&quot;{}&quot;", primary_bytes.len())));
-        assert!(browse_response.contains("upnp:albumArtURI"));
+        assert!(browse_response.contains("upnp:albumArtURI dlna:profileID=&quot;PNG_TN&quot;"));
         let thumbnail_url = format!(
             "http://media.example.test:8097/dlna/{server_id}/items/{}/thumbnail.png",
             item.id
@@ -32755,6 +32754,15 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("image/jpeg")
         );
+        assert_eq!(
+            response
+                .headers()
+                .get("contentfeatures.dlna.org")
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "DLNA.ORG_PN=JPEG_TN;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+            )
+        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], episode_jpeg);
 
@@ -32796,6 +32804,15 @@ mod tests {
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
             Some("image/png")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("contentfeatures.dlna.org")
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "DLNA.ORG_PN=PNG_TN;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+            )
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], album_png);
