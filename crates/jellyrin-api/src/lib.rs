@@ -8061,6 +8061,9 @@ async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
     for folder in folders {
         scanned += db.scan_virtual_folder_items(folder.id).await?;
     }
+    if scanned > 0 {
+        dlna::notify_dlna_content_directory_changed();
+    }
     Ok(scanned)
 }
 
@@ -14019,6 +14022,7 @@ async fn add_virtual_folder(
         .upsert_virtual_folder(&query.name, query.collection_type.as_deref(), locations)
         .await?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    dlna::notify_dlna_content_directory_changed();
     record_activity(
         &state.db,
         "Library added",
@@ -14066,6 +14070,7 @@ async fn add_virtual_folder_path(
         .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
         .ok_or_else(|| ApiError::bad_request("Virtual folder not found"))?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    dlna::notify_dlna_content_directory_changed();
     record_activity(
         &state.db,
         "Library path added",
@@ -14096,6 +14101,7 @@ async fn delete_virtual_folder(
     )
     .await?;
     if state.db.delete_virtual_folder(&query.name).await? {
+        dlna::notify_dlna_content_directory_changed();
         record_activity(
             &state.db,
             "Library deleted",
@@ -14135,6 +14141,7 @@ async fn delete_virtual_folder_path(
         .remove_virtual_folder_path(&query.name, &query.path)
         .await?
     {
+        dlna::notify_dlna_content_directory_changed();
         record_activity(
             &state.db,
             "Library path deleted",
@@ -14195,6 +14202,7 @@ async fn update_virtual_folder_library_options(
         .upsert_virtual_folder(&existing.name, collection_type, locations)
         .await?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    dlna::notify_dlna_content_directory_changed();
     record_activity(
         &state.db,
         "Library options updated",
@@ -14249,6 +14257,7 @@ async fn rename_virtual_folder(
         .rename_virtual_folder(&query.name, &query.new_name)
         .await?
     {
+        dlna::notify_dlna_content_directory_changed();
         record_activity(
             &state.db,
             "Library renamed",
@@ -14341,6 +14350,7 @@ async fn update_virtual_folder_path(
             .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
             .ok_or_else(|| ApiError::not_found("Virtual folder not found"))?;
         state.db.scan_virtual_folder_items(folder.id).await?;
+        dlna::notify_dlna_content_directory_changed();
         record_activity(
             &state.db,
             "Library path updated",
@@ -28177,6 +28187,7 @@ mod tests {
         subscribe_playback_events, subscribe_system_lifecycle_commands, syncplay_groups,
         transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
     };
+    use crate::dlna;
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode, header},
@@ -28240,6 +28251,64 @@ mod tests {
                 String::from_utf8_lossy(&buffer[..buffer.len().min(header_end + content_length)])
                     .to_string();
             let _ = tx.send(request);
+        });
+        (format!("http://{addr}/events"), rx)
+    }
+
+    async fn spawn_http_request_recorder(
+        expected_requests: usize,
+    ) -> (String, tokio::sync::mpsc::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(expected_requests.max(1));
+        tokio::spawn(async move {
+            for _ in 0..expected_requests {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = Vec::new();
+                let mut scratch = [0_u8; 1024];
+                let header_end = loop {
+                    let Ok(read) = stream.read(&mut scratch).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&scratch[..read]);
+                    if let Some(end) = http_header_end(&buffer) {
+                        break end;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while buffer.len() < header_end + content_length {
+                    let Ok(read) = stream.read(&mut scratch).await else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&scratch[..read]);
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let request = String::from_utf8_lossy(
+                    &buffer[..buffer.len().min(header_end + content_length)],
+                )
+                .to_string();
+                if tx.send(request).await.is_err() {
+                    return;
+                }
+            }
         });
         (format!("http://{addr}/events"), rx)
     }
@@ -32337,7 +32406,8 @@ mod tests {
         assert!(notify_lower.contains(&format!("\r\nsid: {}\r\n", sid).to_ascii_lowercase()));
         assert!(notify_lower.contains("\r\nseq: 0\r\n"));
         assert!(notify.contains("<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"));
-        assert!(notify.contains("<SystemUpdateID>0</SystemUpdateID>"));
+        assert!(notify.contains("<SystemUpdateID>"));
+        assert!(notify.contains("</SystemUpdateID>"));
 
         let (callback_url, callback_rx) = spawn_single_http_request_recorder().await;
         let response = app
@@ -32360,6 +32430,62 @@ mod tests {
             .unwrap();
         assert!(notify.contains("<SourceProtocolInfo>"));
         assert!(notify.contains("<CurrentConnectionIDs>0</CurrentConnectionIDs>"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local TCP bind permission for callback validation"]
+    async fn dlna_content_directory_change_sends_followup_notify() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let (callback_url, mut callback_rx) = spawn_http_request_recorder(2).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("SUBSCRIBE")
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Events"))
+                    .header("CALLBACK", format!("<{callback_url}>"))
+                    .header("NT", "upnp:event")
+                    .header("TIMEOUT", "Second-120")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sid = response
+            .headers()
+            .get("sid")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(initial.to_ascii_lowercase().contains("\r\nseq: 0\r\n"));
+
+        dlna::notify_dlna_content_directory_changed();
+        let followup = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let followup_lower = followup.to_ascii_lowercase();
+        assert!(followup.starts_with("NOTIFY /events HTTP/1.1"));
+        assert!(followup_lower.contains(&format!("\r\nsid: {}\r\n", sid).to_ascii_lowercase()));
+        assert!(followup_lower.contains("\r\nseq: 1\r\n"));
+        assert!(followup.contains("<SystemUpdateID>"));
+        assert!(!followup.contains("<SystemUpdateID>0</SystemUpdateID>"));
     }
 
     #[tokio::test]

@@ -12,7 +12,10 @@ use std::{
     collections::{BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::{Path as FsPath, PathBuf},
-    sync::{LazyLock, Mutex as StdMutex},
+    sync::{
+        LazyLock, Mutex as StdMutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration as StdDuration, Instant},
 };
 use tokio::{net::UdpSocket, task::JoinHandle, time};
@@ -42,6 +45,7 @@ const UPNP_ROOT_DEVICE: &str = "upnp:rootdevice";
 const MEDIA_SERVER_DEVICE: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 static DLNA_EVENT_SUBSCRIPTIONS: LazyLock<StdMutex<HashMap<String, DlnaEventSubscription>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+static DLNA_SYSTEM_UPDATE_ID: AtomicU32 = AtomicU32::new(0);
 const DLNA_PROTOCOL_INFO: &str = concat!(
     "http-get:*:video/mpeg:*,",
     "http-get:*:video/mp4:*,",
@@ -433,10 +437,12 @@ enum DlnaEventService {
     ConnectionManager,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DlnaEventSubscription {
     service: DlnaEventService,
     expires_at: Instant,
+    callback_urls: Vec<String>,
+    next_seq: u32,
 }
 
 fn event_subscription_response(
@@ -497,6 +503,8 @@ fn subscribe_event_response(
         DlnaEventSubscription {
             service,
             expires_at: event_expires_at(timeout),
+            callback_urls: callback_urls.clone(),
+            next_seq: 1,
         },
     );
     spawn_initial_event_notify(service, sid.clone(), callback_urls);
@@ -601,6 +609,72 @@ fn dlna_event_subscriptions()
         .map_err(|_| ApiError::internal("DLNA event subscription lock poisoned"))
 }
 
+pub(crate) fn notify_dlna_content_directory_changed() {
+    let update_id = DLNA_SYSTEM_UPDATE_ID
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    let body =
+        event_property_set_xml_from_properties(vec![("SystemUpdateID", update_id.to_string())]);
+    notify_event_subscribers(DlnaEventService::ContentDirectory, body);
+}
+
+fn notify_event_subscribers(service: DlnaEventService, body: String) {
+    let notifications = match event_notifications_for_service(service) {
+        Ok(notifications) => notifications,
+        Err(error) => {
+            tracing::warn!(?error, "failed to collect DLNA event subscribers");
+            return;
+        }
+    };
+    if notifications.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        for notification in notifications {
+            for callback_url in notification.callback_urls {
+                if let Err(error) = send_event_notify(
+                    &callback_url,
+                    &notification.sid,
+                    notification.seq,
+                    body.clone(),
+                )
+                .await
+                {
+                    tracing::warn!(%error, %callback_url, "DLNA change event notification failed");
+                }
+            }
+        }
+    });
+}
+
+struct DlnaEventNotification {
+    sid: String,
+    callback_urls: Vec<String>,
+    seq: u32,
+}
+
+fn event_notifications_for_service(
+    service: DlnaEventService,
+) -> Result<Vec<DlnaEventNotification>, ApiError> {
+    let now = Instant::now();
+    let mut subscriptions = dlna_event_subscriptions()?;
+    subscriptions.retain(|_, subscription| subscription.expires_at > now);
+    Ok(subscriptions
+        .iter_mut()
+        .filter(|(_, subscription)| subscription.service == service)
+        .map(|(sid, subscription)| {
+            let seq = subscription.next_seq;
+            subscription.next_seq = subscription.next_seq.wrapping_add(1);
+            DlnaEventNotification {
+                sid: sid.clone(),
+                callback_urls: subscription.callback_urls.clone(),
+                seq,
+            }
+        })
+        .collect())
+}
+
 fn spawn_initial_event_notify(service: DlnaEventService, sid: String, callback_urls: Vec<String>) {
     let body = event_property_set_xml(service);
     tokio::spawn(async move {
@@ -637,12 +711,16 @@ async fn send_event_notify(
 }
 
 fn event_property_set_xml(service: DlnaEventService) -> String {
+    event_property_set_xml_from_properties(event_initial_properties(service))
+}
+
+fn event_property_set_xml_from_properties(properties: Vec<(&'static str, String)>) -> String {
     let mut xml = concat!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
         "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
     )
     .to_string();
-    for (name, value) in event_initial_properties(service) {
+    for (name, value) in properties {
         xml.push_str("<e:property><");
         xml.push_str(name);
         xml.push('>');
@@ -657,7 +735,10 @@ fn event_property_set_xml(service: DlnaEventService) -> String {
 
 fn event_initial_properties(service: DlnaEventService) -> Vec<(&'static str, String)> {
     match service {
-        DlnaEventService::ContentDirectory => vec![("SystemUpdateID", "0".to_string())],
+        DlnaEventService::ContentDirectory => vec![(
+            "SystemUpdateID",
+            DLNA_SYSTEM_UPDATE_ID.load(Ordering::Relaxed).to_string(),
+        )],
         DlnaEventService::ConnectionManager => vec![
             ("SourceProtocolInfo", DLNA_PROTOCOL_INFO.to_string()),
             ("SinkProtocolInfo", String::new()),
