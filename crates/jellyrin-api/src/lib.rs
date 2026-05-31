@@ -33362,6 +33362,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dlna_browse_tv_series_metadata_groups_episodes_without_folders() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let media_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            media_root.path().join("Episode One.mp4"),
+            b"episode one unique payload",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            media_root.path().join("Episode Two.mp4"),
+            b"episode two different payload bytes",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            media_root.path().join("Loose Episode.mp4"),
+            b"loose episode standalone payload bytes",
+        )
+        .await
+        .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "TV Metadata",
+                Some("tvshows"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 3);
+        let items = db.media_items().await.unwrap();
+        for (name, index) in [("Episode One", 1), ("Episode Two", 2)] {
+            let item = items
+                .iter()
+                .find(|item| item.path.ends_with(&format!("{name}.mp4")))
+                .unwrap_or_else(|| panic!("missing {name}; items={items:?}"));
+            db.update_media_item_metadata(
+                item.id,
+                json!({
+                    "SeriesName": "Example Metadata Show",
+                    "ParentIndexNumber": 1,
+                    "IndexNumber": index
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let series_id = format!(
+            "series:{}:{}",
+            folder.id,
+            URL_SAFE_NO_PAD.encode("Example Metadata Show".as_bytes())
+        );
+        let season_id = format!(
+            "season:{}:{}:{}",
+            folder.id,
+            URL_SAFE_NO_PAD.encode("Example Metadata Show".as_bytes()),
+            URL_SAFE_NO_PAD.encode("1".as_bytes())
+        );
+
+        let browse_body = |object_id: &str, flag: &str| {
+            format!(
+                r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>{object_id}</ObjectID>
+      <BrowseFlag>{flag}</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria>+dc:title</SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#
+            )
+        };
+        let browse = |app: axum::Router, object_id: String, flag: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                        .header(header::HOST, "media.example.test:8097")
+                        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                        .body(Body::from(browse_body(&object_id, &flag)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+
+        let folder_response = browse(
+            app.clone(),
+            format!("folder:{}", folder.id),
+            "BrowseDirectChildren".to_string(),
+        )
+        .await;
+        assert!(folder_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(folder_response.contains("Example Metadata Show"));
+        assert!(folder_response.contains(&format!("id=&quot;{}&quot;", series_id)));
+        assert!(folder_response.contains("object.container.videoContainer"));
+        assert!(folder_response.contains("Loose Episode"));
+        assert!(!folder_response.contains("Episode One"));
+        assert!(!folder_response.contains("Episode Two"));
+
+        let series_metadata_response =
+            browse(app.clone(), series_id.clone(), "BrowseMetadata".to_string()).await;
+        assert!(series_metadata_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(series_metadata_response.contains("Example Metadata Show"));
+        assert!(series_metadata_response.contains("childCount=&quot;2&quot;"));
+
+        let series_response = browse(
+            app.clone(),
+            series_id.clone(),
+            "BrowseDirectChildren".to_string(),
+        )
+        .await;
+        assert!(series_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(series_response.contains("Season 01"));
+        assert!(series_response.contains(&format!("id=&quot;{}&quot;", season_id)));
+        assert!(!series_response.contains("Episode One"));
+
+        let season_response = browse(
+            app.clone(),
+            season_id.clone(),
+            "BrowseDirectChildren".to_string(),
+        )
+        .await;
+        assert!(season_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(season_response.contains("<TotalMatches>2</TotalMatches>"));
+        assert!(season_response.contains("Episode One"));
+        assert!(season_response.contains("Episode Two"));
+        assert!(!season_response.contains("Loose Episode"));
+        assert!(season_response.contains(&format!("parentID=&quot;{}&quot;", season_id)));
+
+        let search_season = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ContainerID>{season_id}</ContainerID>
+      <SearchCriteria>dc:title contains "Episode"</SearchCriteria>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria>-dc:title</SortCriteria>
+    </u:Search>
+  </s:Body>
+</s:Envelope>"#
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::HOST, "media.example.test:8097")
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(search_season))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let search_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(search_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(
+            search_response.find("Episode Two").unwrap()
+                < search_response.find("Episode One").unwrap()
+        );
+        assert!(!search_response.contains("Loose Episode"));
+        assert!(search_response.contains(&format!("parentID=&quot;{}&quot;", season_id)));
+    }
+
+    #[tokio::test]
     async fn dlna_browse_music_album_metadata_groups_tracks_without_album_folders() {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 

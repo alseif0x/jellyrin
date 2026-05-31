@@ -2061,6 +2061,16 @@ async fn browse_response(
                 &sort_criteria,
                 render_context,
             )?
+        } else if is_tv_folder(&folder) {
+            let metadata = media_item_metadata_map(db).await?;
+            tv_series_browse_payload(
+                &folder,
+                &items,
+                &metadata,
+                (starting_index, requested_count),
+                &sort_criteria,
+                render_context,
+            )?
         } else {
             directory_browse_payload(
                 &folder,
@@ -2129,6 +2139,71 @@ async fn browse_response(
             music_metadata_items_browse_payload(
                 artist_object_id(folder.id, &artist_name),
                 artist_items,
+                (starting_index, requested_count),
+                &sort_criteria,
+                render_context,
+            )
+        }
+    } else if let Some((folder_id, series_title)) = parse_series_object_id(&object_id) {
+        let folder = db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        if !is_tv_folder(&folder) {
+            return Err(ApiError::not_found("DLNA series not found"));
+        }
+        let items = media_items_for_folder(db, folder.id).await?;
+        let metadata = media_item_metadata_map(db).await?;
+        let series_items = tv_series_items(&items, &metadata, &series_title);
+        if series_items.is_empty() {
+            return Err(ApiError::not_found("DLNA series not found"));
+        }
+        if browse_metadata {
+            BrowsePayload::metadata(didl_series_metadata(
+                folder.id,
+                &series_title,
+                series_items.len(),
+            ))
+        } else {
+            tv_series_items_browse_payload(
+                folder.id,
+                &series_title,
+                series_items,
+                &metadata,
+                (starting_index, requested_count),
+                &sort_criteria,
+                render_context,
+            )
+        }
+    } else if let Some((folder_id, series_title, season_key)) = parse_season_object_id(&object_id) {
+        let folder = db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        if !is_tv_folder(&folder) {
+            return Err(ApiError::not_found("DLNA season not found"));
+        }
+        let items = media_items_for_folder(db, folder.id).await?;
+        let metadata = media_item_metadata_map(db).await?;
+        let season_items = tv_season_items(&items, &metadata, &series_title, &season_key);
+        if season_items.is_empty() {
+            return Err(ApiError::not_found("DLNA season not found"));
+        }
+        if browse_metadata {
+            BrowsePayload::metadata(didl_season_metadata(
+                folder.id,
+                &series_title,
+                &season_key,
+                season_items.len(),
+            ))
+        } else {
+            music_metadata_items_browse_payload(
+                season_object_id(folder.id, &series_title, &season_key),
+                season_items,
                 (starting_index, requested_count),
                 &sort_criteria,
                 render_context,
@@ -2219,6 +2294,10 @@ async fn search_response(
     let paged_items = paged_slice(&items, starting_index, requested_count);
     let parent_override = parse_album_object_id(&container_id)
         .or_else(|| parse_artist_object_id(&container_id))
+        .or_else(|| parse_series_object_id(&container_id))
+        .or_else(|| {
+            parse_season_object_id(&container_id).map(|(folder, series, _)| (folder, series))
+        })
         .map(|_| container_id.as_str());
     let didl = didl_search_media_items(paged_items, &folders, parent_override, render_context);
     Ok(format!(
@@ -2284,6 +2363,46 @@ async fn search_container_items(
             return Err(ApiError::not_found("DLNA artist not found"));
         }
         return Ok(artist_items);
+    }
+
+    if let Some((folder_id, series_title)) = parse_series_object_id(container_id) {
+        let folder = folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        if !is_tv_folder(folder) {
+            return Err(ApiError::not_found("DLNA series not found"));
+        }
+        let items = media_items_for_folder(db, folder_id).await?;
+        let metadata = media_item_metadata_map(db).await?;
+        let series_items = items
+            .into_iter()
+            .filter(|item| item_has_series(item, &metadata, &series_title))
+            .collect::<Vec<_>>();
+        if series_items.is_empty() {
+            return Err(ApiError::not_found("DLNA series not found"));
+        }
+        return Ok(series_items);
+    }
+
+    if let Some((folder_id, series_title, season_key)) = parse_season_object_id(container_id) {
+        let folder = folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        if !is_tv_folder(folder) {
+            return Err(ApiError::not_found("DLNA season not found"));
+        }
+        let items = media_items_for_folder(db, folder_id).await?;
+        let metadata = media_item_metadata_map(db).await?;
+        let season_items = items
+            .into_iter()
+            .filter(|item| item_in_series_season(item, &metadata, &series_title, &season_key))
+            .collect::<Vec<_>>();
+        if season_items.is_empty() {
+            return Err(ApiError::not_found("DLNA season not found"));
+        }
+        return Ok(season_items);
     }
 
     if let Some((folder_id, relative_path)) = parse_directory_object_id(container_id) {
@@ -2579,6 +2698,156 @@ fn music_metadata_items_browse_payload(
     )
 }
 
+fn tv_series_browse_payload(
+    folder: &VirtualFolder,
+    items: &[MediaItem],
+    metadata: &HashMap<Uuid, Value>,
+    browse_window: (usize, usize),
+    sort_criteria: &str,
+    render_context: DlnaRenderContext<'_>,
+) -> Result<BrowsePayload, ApiError> {
+    let (starting_index, requested_count) = browse_window;
+    let mut entries = tv_series_browse_entries(folder, items, metadata);
+    sort_browse_entries(&mut entries, sort_criteria);
+    let total_matches = entries.len();
+    let paged_entries = paged_slice(&entries, starting_index, requested_count);
+    Ok(BrowsePayload::children(
+        didl_browse_entries(paged_entries, render_context),
+        paged_entries.len(),
+        total_matches,
+    ))
+}
+
+fn tv_series_browse_entries<'a>(
+    folder: &VirtualFolder,
+    items: &'a [MediaItem],
+    metadata: &HashMap<Uuid, Value>,
+) -> Vec<DlnaBrowseEntry<'a>> {
+    let mut child_dirs = BTreeSet::new();
+    let mut series = BTreeMap::<String, usize>::new();
+    let mut direct_items = Vec::new();
+
+    for item in items {
+        let item_parent = item_parent_relative_path(folder, item).unwrap_or_default();
+        if item_parent.is_empty() {
+            let titles = item_series_titles(item, metadata);
+            if titles.is_empty() {
+                direct_items.push(item);
+            } else {
+                for title in titles {
+                    *series.entry(title).or_default() += 1;
+                }
+            }
+        } else if let Some(child_name) = next_child_directory(&item_parent, "") {
+            child_dirs.insert(child_name);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(child_dirs.len() + series.len() + direct_items.len());
+    for child_name in child_dirs {
+        let child_count = directory_child_count(folder, items, &child_name);
+        entries.push(DlnaBrowseEntry::Container {
+            id: directory_object_id(folder.id, &child_name),
+            parent_id: format!("folder:{}", folder.id),
+            title: child_name,
+            child_count,
+            class: directory_container_class(folder.collection_type.as_deref()),
+        });
+    }
+    for (series_title, child_count) in series {
+        entries.push(DlnaBrowseEntry::Container {
+            id: series_object_id(folder.id, &series_title),
+            parent_id: format!("folder:{}", folder.id),
+            title: series_title,
+            child_count,
+            class: "object.container.videoContainer",
+        });
+    }
+    for item in direct_items {
+        entries.push(DlnaBrowseEntry::Item {
+            item,
+            parent_id: format!("folder:{}", folder.id),
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        left.title()
+            .to_ascii_lowercase()
+            .cmp(&right.title().to_ascii_lowercase())
+            .then_with(|| left.id().cmp(&right.id()))
+    });
+    entries
+}
+
+fn tv_series_items<'a>(
+    items: &'a [MediaItem],
+    metadata: &HashMap<Uuid, Value>,
+    series_title: &str,
+) -> Vec<&'a MediaItem> {
+    items
+        .iter()
+        .filter(|item| item_has_series(item, metadata, series_title))
+        .collect()
+}
+
+fn tv_season_items<'a>(
+    items: &'a [MediaItem],
+    metadata: &HashMap<Uuid, Value>,
+    series_title: &str,
+    season_key: &str,
+) -> Vec<&'a MediaItem> {
+    items
+        .iter()
+        .filter(|item| item_in_series_season(item, metadata, series_title, season_key))
+        .collect()
+}
+
+fn tv_series_items_browse_payload(
+    folder_id: Uuid,
+    series_title: &str,
+    items: Vec<&MediaItem>,
+    metadata: &HashMap<Uuid, Value>,
+    browse_window: (usize, usize),
+    sort_criteria: &str,
+    render_context: DlnaRenderContext<'_>,
+) -> BrowsePayload {
+    let mut seasons = BTreeMap::<String, usize>::new();
+    let mut direct_items = Vec::new();
+    for item in items {
+        if let Some(season_key) = item_season_key(item, metadata) {
+            *seasons.entry(season_key).or_default() += 1;
+        } else {
+            direct_items.push(item);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(seasons.len() + direct_items.len());
+    for (season_key, child_count) in seasons {
+        entries.push(DlnaBrowseEntry::Container {
+            id: season_object_id(folder_id, series_title, &season_key),
+            parent_id: series_object_id(folder_id, series_title),
+            title: season_title(&season_key),
+            child_count,
+            class: "object.container.videoContainer",
+        });
+    }
+    for item in direct_items {
+        entries.push(DlnaBrowseEntry::Item {
+            item,
+            parent_id: series_object_id(folder_id, series_title),
+        });
+    }
+    sort_browse_entries(&mut entries, sort_criteria);
+    let (starting_index, requested_count) = browse_window;
+    let total_matches = entries.len();
+    let paged_entries = paged_slice(&entries, starting_index, requested_count);
+    BrowsePayload::children(
+        didl_browse_entries(paged_entries, render_context),
+        paged_entries.len(),
+        total_matches,
+    )
+}
+
 fn directory_browse_entries<'a>(
     folder: &VirtualFolder,
     items: &'a [MediaItem],
@@ -2746,6 +3015,47 @@ fn didl_artist_metadata(folder_id: Uuid, artist_name: &str, child_count: usize) 
     didl.push_str("\"><dc:title>");
     didl.push_str(&escape_xml(artist_name));
     didl.push_str("</dc:title><upnp:class>object.container.person.musicArtist</upnp:class></container></DIDL-Lite>");
+    didl
+}
+
+fn didl_series_metadata(folder_id: Uuid, series_title: &str, child_count: usize) -> String {
+    let mut didl = didl_prefix();
+    didl.push_str("<container id=\"");
+    didl.push_str(&escape_xml(&series_object_id(folder_id, series_title)));
+    didl.push_str("\" parentID=\"");
+    didl.push_str(&escape_xml(&format!("folder:{folder_id}")));
+    didl.push_str("\" restricted=\"1\" searchable=\"1\" childCount=\"");
+    didl.push_str(&child_count.to_string());
+    didl.push_str("\"><dc:title>");
+    didl.push_str(&escape_xml(series_title));
+    didl.push_str(
+        "</dc:title><upnp:class>object.container.videoContainer</upnp:class></container></DIDL-Lite>",
+    );
+    didl
+}
+
+fn didl_season_metadata(
+    folder_id: Uuid,
+    series_title: &str,
+    season_key: &str,
+    child_count: usize,
+) -> String {
+    let mut didl = didl_prefix();
+    didl.push_str("<container id=\"");
+    didl.push_str(&escape_xml(&season_object_id(
+        folder_id,
+        series_title,
+        season_key,
+    )));
+    didl.push_str("\" parentID=\"");
+    didl.push_str(&escape_xml(&series_object_id(folder_id, series_title)));
+    didl.push_str("\" restricted=\"1\" searchable=\"1\" childCount=\"");
+    didl.push_str(&child_count.to_string());
+    didl.push_str("\"><dc:title>");
+    didl.push_str(&escape_xml(&season_title(season_key)));
+    didl.push_str(
+        "</dc:title><upnp:class>object.container.videoContainer</upnp:class></container></DIDL-Lite>",
+    );
     didl
 }
 
@@ -3267,6 +3577,38 @@ fn parse_artist_object_id(object_id: &str) -> Option<(Uuid, String)> {
     (!artist_name.is_empty()).then(|| (folder_id, artist_name.to_string()))
 }
 
+fn parse_series_object_id(object_id: &str) -> Option<(Uuid, String)> {
+    let value = object_id.trim().strip_prefix("series:")?;
+    let (folder_id, encoded_series) = value.split_once(':')?;
+    let folder_id = Uuid::parse_str(folder_id).ok()?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded_series).ok()?;
+    let series_title = String::from_utf8(decoded).ok()?;
+    let series_title = series_title.trim();
+    (!series_title.is_empty()).then(|| (folder_id, series_title.to_string()))
+}
+
+fn parse_season_object_id(object_id: &str) -> Option<(Uuid, String, String)> {
+    let value = object_id.trim().strip_prefix("season:")?;
+    let mut parts = value.split(':');
+    let folder_id = Uuid::parse_str(parts.next()?).ok()?;
+    let encoded_series = parts.next()?;
+    let encoded_season = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let series_title = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded_series).ok()?).ok()?;
+    let season_key = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded_season).ok()?).ok()?;
+    let series_title = series_title.trim();
+    let season_key = season_key.trim();
+    (!series_title.is_empty() && !season_key.is_empty()).then(|| {
+        (
+            folder_id,
+            series_title.to_string(),
+            normalize_season_key(season_key),
+        )
+    })
+}
+
 fn parse_prefixed_object_uuid(object_id: &str, prefix: &str) -> Option<Uuid> {
     object_id
         .trim()
@@ -3292,6 +3634,21 @@ fn artist_object_id(folder_id: Uuid, artist_name: &str) -> String {
     format!(
         "artist:{folder_id}:{}",
         URL_SAFE_NO_PAD.encode(artist_name.trim().as_bytes())
+    )
+}
+
+fn series_object_id(folder_id: Uuid, series_title: &str) -> String {
+    format!(
+        "series:{folder_id}:{}",
+        URL_SAFE_NO_PAD.encode(series_title.trim().as_bytes())
+    )
+}
+
+fn season_object_id(folder_id: Uuid, series_title: &str, season_key: &str) -> String {
+    format!(
+        "season:{folder_id}:{}:{}",
+        URL_SAFE_NO_PAD.encode(series_title.trim().as_bytes()),
+        URL_SAFE_NO_PAD.encode(normalize_season_key(season_key).as_bytes())
     )
 }
 
@@ -3388,6 +3745,15 @@ fn is_music_folder(folder: &VirtualFolder) -> bool {
         .is_some_and(|collection| collection.eq_ignore_ascii_case("music"))
 }
 
+fn is_tv_folder(folder: &VirtualFolder) -> bool {
+    folder.collection_type.as_deref().is_some_and(|collection| {
+        matches!(
+            collection.to_ascii_lowercase().as_str(),
+            "tvshows" | "tvshow" | "series"
+        )
+    })
+}
+
 fn item_has_album(
     item: &MediaItem,
     metadata: &HashMap<Uuid, Value>,
@@ -3420,6 +3786,80 @@ fn item_artist_names(item: &MediaItem, metadata: &HashMap<Uuid, Value>) -> Vec<S
         .get(&item.id)
         .map(|value| metadata_string_values(value, &["Artists", "AlbumArtists", "ArtistItems"]))
         .unwrap_or_default()
+}
+
+fn item_has_series(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    expected_series_title: &str,
+) -> bool {
+    item_series_titles(item, metadata)
+        .iter()
+        .any(|series| series.eq_ignore_ascii_case(expected_series_title))
+}
+
+fn item_series_titles(item: &MediaItem, metadata: &HashMap<Uuid, Value>) -> Vec<String> {
+    metadata
+        .get(&item.id)
+        .map(|value| metadata_string_values(value, &["SeriesName", "Series", "Show", "ShowTitle"]))
+        .unwrap_or_default()
+}
+
+fn item_in_series_season(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    series_title: &str,
+    season_key: &str,
+) -> bool {
+    item_has_series(item, metadata, series_title)
+        && item_season_key(item, metadata)
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&normalize_season_key(season_key)))
+}
+
+fn item_season_key(item: &MediaItem, metadata: &HashMap<Uuid, Value>) -> Option<String> {
+    let value = metadata.get(&item.id)?;
+    metadata_i64_value(value, &["ParentIndexNumber", "SeasonNumber", "SeasonIndex"])
+        .map(|value| value.to_string())
+        .or_else(|| {
+            metadata_string_values(value, &["SeasonName", "Season"])
+                .into_iter()
+                .next()
+                .map(|value| normalize_season_key(&value))
+        })
+}
+
+fn metadata_i64_value(metadata: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| json_field_case_insensitive(metadata, key).and_then(json_value_as_i64))
+}
+
+fn json_value_as_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+}
+
+fn normalize_season_key(value: &str) -> String {
+    let value = value.trim();
+    if let Ok(number) = value.parse::<i64>() {
+        return number.to_string();
+    }
+    let lower = value.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("season ")
+        && let Ok(number) = rest.trim().parse::<i64>()
+    {
+        return number.to_string();
+    }
+    value.to_string()
+}
+
+fn season_title(season_key: &str) -> String {
+    if let Ok(number) = season_key.parse::<i64>() {
+        return format!("Season {number:02}");
+    }
+    season_key.to_string()
 }
 
 fn metadata_string_values(metadata: &Value, keys: &[&str]) -> Vec<String> {
