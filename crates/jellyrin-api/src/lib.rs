@@ -32037,6 +32037,7 @@ mod tests {
     #[tokio::test]
     async fn dlna_browse_folder_items_and_streams_media_resource() {
         let media_root = tempfile::tempdir().unwrap();
+        let log_root = tempfile::tempdir().unwrap();
         let primary_bytes = b"fake video bytes for dlna range";
         tokio::fs::write(media_root.path().join("DLNA & Movie.mp4"), primary_bytes)
             .await
@@ -32098,7 +32099,7 @@ mod tests {
         let app = router(AppState {
             db,
             web_dir: ".".into(),
-            log_dir: ".".into(),
+            log_dir: log_root.path().join("logs"),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -32405,6 +32406,131 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(b"\x89PNG"));
+    }
+
+    #[tokio::test]
+    async fn dlna_video_thumbnail_generates_real_frame_with_ffmpeg() {
+        let media_root = tempfile::tempdir().unwrap();
+        let log_root = tempfile::tempdir().unwrap();
+        let video_path = media_root.path().join("Thumbnail Source.mp4");
+        let ffmpeg_output = tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=160x90:rate=24")
+            .arg("-t")
+            .arg("2")
+            .arg("-an")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-preset")
+            .arg("ultrafast")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-movflags")
+            .arg("+faststart")
+            .arg(&video_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            ffmpeg_output.status.success(),
+            "ffmpeg failed to generate thumbnail source fixture: {}",
+            String::from_utf8_lossy(&ffmpeg_output.stderr)
+        );
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Thumbnail Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        let item = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "Thumbnail Source")
+            .unwrap();
+        db.update_media_item_media_info(
+            item.id,
+            Some(20_000_000),
+            Some(250_000),
+            Some(160),
+            Some(90),
+            vec![json!({
+                "Type": "Video",
+                "Index": 0,
+                "Codec": "h264",
+                "Width": 160,
+                "Height": 90
+            })],
+        )
+        .await
+        .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: log_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{}/thumbnail.png", item.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/jpeg")
+        );
+        let generated_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(generated_bytes.starts_with(&[0xff, 0xd8]));
+        assert!(
+            generated_bytes.len() > 100,
+            "generated thumbnail should be larger than the placeholder"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{}/thumbnail.png", item.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/jpeg")
+        );
+        let cached_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(cached_bytes, generated_bytes);
     }
 
     #[tokio::test]

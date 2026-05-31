@@ -12,13 +12,14 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::{Path as FsPath, PathBuf},
+    process::Stdio,
     sync::{
         LazyLock, Mutex as StdMutex,
         atomic::{AtomicU32, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
-use tokio::{net::UdpSocket, task::JoinHandle, time};
+use tokio::{net::UdpSocket, process::Command, task::JoinHandle, time};
 use uuid::Uuid;
 
 use crate::{
@@ -538,21 +539,17 @@ async fn find_dlna_item_thumbnail(
     if let Some(path) = find_dlna_stored_item_thumbnail(state, item).await? {
         return Ok(Some(path));
     }
-    find_dlna_local_item_thumbnail(item).await
+    if let Some(path) = find_dlna_local_item_thumbnail(item).await? {
+        return Ok(Some(path));
+    }
+    find_dlna_generated_video_thumbnail(state, item).await
 }
 
 async fn find_dlna_stored_item_thumbnail(
     state: &AppState,
     item: &MediaItem,
 ) -> Result<Option<PathBuf>, ApiError> {
-    let base = state
-        .log_dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(&state.log_dir)
-        .join("metadata")
-        .join("images")
-        .join("items");
+    let base = dlna_item_image_base_dir(state);
     for item_id in [item.id.to_string(), item.id.simple().to_string()] {
         let dir = base.join(sanitize_dlna_image_path_segment(&item_id));
         for extension in DLNA_IMAGE_EXTENSIONS {
@@ -567,6 +564,17 @@ async fn find_dlna_stored_item_thumbnail(
         }
     }
     Ok(None)
+}
+
+fn dlna_item_image_base_dir(state: &AppState) -> PathBuf {
+    state
+        .log_dir
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(&state.log_dir)
+        .join("metadata")
+        .join("images")
+        .join("items")
 }
 
 async fn find_dlna_local_item_thumbnail(item: &MediaItem) -> Result<Option<PathBuf>, ApiError> {
@@ -597,6 +605,85 @@ async fn find_dlna_local_item_thumbnail(item: &MediaItem) -> Result<Option<PathB
         }
     }
     Ok(None)
+}
+
+async fn find_dlna_generated_video_thumbnail(
+    state: &AppState,
+    item: &MediaItem,
+) -> Result<Option<PathBuf>, ApiError> {
+    if !item.media_type.eq_ignore_ascii_case("Video") {
+        return Ok(None);
+    }
+    let dir = dlna_item_image_base_dir(state)
+        .join(sanitize_dlna_image_path_segment(&item.id.to_string()));
+    let path = dir.join("dlna_frame_0.jpg");
+    if tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+    {
+        return Ok(Some(path));
+    }
+
+    tokio::fs::create_dir_all(&dir).await?;
+    let tmp_path = path.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-ss")
+        .arg(dlna_thumbnail_seek_seconds(item))
+        .arg("-i")
+        .arg(&item.path)
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg("scale='min(320,iw)':-2:force_original_aspect_ratio=decrease")
+        .arg("-q:v")
+        .arg("4")
+        .arg("-f")
+        .arg("image2")
+        .arg("-c:v")
+        .arg("mjpeg")
+        .arg(&tmp_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(512)
+            .collect::<String>();
+        tracing::warn!(
+            item_id = %item.id,
+            status = %output.status,
+            stderr = %stderr,
+            "ffmpeg failed to generate DLNA video thumbnail"
+        );
+        return Ok(None);
+    }
+    if tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false)
+    {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Ok(Some(path));
+    }
+    tokio::fs::rename(&tmp_path, &path).await?;
+    Ok(Some(path))
+}
+
+fn dlna_thumbnail_seek_seconds(item: &MediaItem) -> &'static str {
+    match item.runtime_ticks {
+        Some(ticks) if ticks >= 20_000_000 => "1.000",
+        _ => "0.000",
+    }
 }
 
 const DLNA_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
