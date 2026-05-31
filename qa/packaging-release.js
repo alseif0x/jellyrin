@@ -11,6 +11,7 @@ const generatedDir = path.join(plansDir, 'generated');
 async function main() {
   const dockerfile = await read('Dockerfile');
   const compose = await read('docker-compose.yml');
+  const dlnaCompose = await read('docker-compose.dlna.yml');
   const systemd = await read('ops/jellyrin.service');
   const env = await read('ops/jellyrin.env.example');
   const checklist = await read('ops/release-checklist.md');
@@ -27,6 +28,11 @@ async function main() {
     check('compose-persistent-volumes', compose.includes('jellyrin-data') && compose.includes('jellyrin-config') && compose.includes('jellyrin-cache')),
     check('systemd-production-unit', systemd.includes('EnvironmentFile=/etc/jellyrin/jellyrin.env') && systemd.includes('ExecStart=/usr/local/bin/jellyrin-server')),
     check('systemd-hardening', systemd.includes('NoNewPrivileges=true') && systemd.includes('ProtectSystem=strict')),
+    check('systemd-network-online', systemd.includes('After=network-online.target') && systemd.includes('Wants=network-online.target')),
+    check('systemd-restart-and-state-dirs', systemd.includes('Restart=on-failure') && systemd.includes('StateDirectory=jellyrin') && systemd.includes('CacheDirectory=jellyrin') && systemd.includes('LogsDirectory=jellyrin')),
+    check('systemd-dlna-writable-paths', systemd.includes('ReadWritePaths=/var/lib/jellyrin /var/cache/jellyrin /var/log/jellyrin /etc/jellyrin')),
+    check('compose-dlna-host-network', dlnaCompose.includes('network_mode: host') && dlnaCompose.includes('ports: !reset []')),
+    check('compose-dlna-ssdp-guidance', dlnaCompose.includes('multicast UDP 1900') && dlnaCompose.includes('advertised LOCATION')),
     check('config-dirs-env', env.includes('JELLYRIN_DATA_DIR=/var/lib/jellyrin') && env.includes('DATABASE_URL=sqlite:///var/lib/jellyrin/jellyrin.db?mode=rwc')),
     check('server-health-routes', api.includes('route("/healthz", get(health))') && api.includes('route("/readyz", get(ready))')),
     check('startup-migrations', db.includes('MIGRATOR') && db.includes('.run(&pool)')),
