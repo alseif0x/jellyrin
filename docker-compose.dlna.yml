@@ -1,0 +1,7 @@
+services:
+  jellyrin:
+    # DLNA/UPnP SSDP discovery needs multicast UDP 1900 on the host LAN.
+    # Docker bridge port publishing is not enough for many renderers, because
+    # multicast discovery and advertised LOCATION addresses must match the LAN.
+    network_mode: host
+    ports: !reset []

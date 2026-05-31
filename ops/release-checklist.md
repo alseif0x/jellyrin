@@ -17,6 +17,11 @@
 - Mount media read-only under `./media` or adjust the compose media volume.
 - Run `docker compose up -d --build`.
 - Verify `docker compose ps` shows a healthy `jellyrin` service.
+- For DLNA/UPnP device discovery, run with the host-network override:
+  `docker compose -f docker-compose.yml -f docker-compose.dlna.yml up -d --build`.
+- For systemd/bare-metal DLNA/UPnP, allow TCP `8096` and UDP `1900` on the LAN
+  firewall, then verify a control point can fetch `/dlna/{serverId}/description.xml`
+  from the SSDP `LOCATION`.
 
 ## Upgrade
 

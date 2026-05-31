@@ -135,16 +135,30 @@ pub fn spawn_dlna_ssdp_service(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match upnp_enabled(&state.db).await {
-                Ok(true) => match bind_ssdp_socket().await {
-                    Ok(socket) => {
-                        if let Err(error) = run_ssdp_service(state.clone(), socket).await {
-                            tracing::warn!(%error, "DLNA SSDP service stopped");
+                Ok(true) => {
+                    let network = state
+                        .db
+                        .named_configuration("network")
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(
+                                ?error,
+                                "failed to read DLNA SSDP network configuration before bind"
+                            );
+                            None
+                        })
+                        .unwrap_or_else(default_network_configuration);
+                    match bind_ssdp_socket(&network).await {
+                        Ok(socket) => {
+                            if let Err(error) = run_ssdp_service(state.clone(), socket).await {
+                                tracing::warn!(%error, "DLNA SSDP service stopped");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to bind DLNA SSDP socket");
                         }
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to bind DLNA SSDP socket");
-                    }
-                },
+                }
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(?error, "failed to read DLNA SSDP configuration");
@@ -1159,13 +1173,70 @@ pub(crate) async fn upnp_enabled(db: &Database) -> Result<bool, ApiError> {
         .unwrap_or(false))
 }
 
-async fn bind_ssdp_socket() -> anyhow::Result<UdpSocket> {
+async fn bind_ssdp_socket(network: &Value) -> anyhow::Result<UdpSocket> {
     let socket = StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT))?;
     socket.set_nonblocking(true)?;
     socket.set_multicast_loop_v4(true)?;
     socket.set_multicast_ttl_v4(4)?;
-    socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)?;
+    let interfaces = ssdp_multicast_interfaces(network);
+    join_ssdp_multicast_interfaces(&socket, &interfaces)?;
     Ok(UdpSocket::from_std(socket)?)
+}
+
+fn join_ssdp_multicast_interfaces(
+    socket: &StdUdpSocket,
+    interfaces: &[Ipv4Addr],
+) -> anyhow::Result<()> {
+    let mut joined = 0;
+    let mut last_error = None;
+    for interface in interfaces {
+        match socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, interface) {
+            Ok(()) => joined += 1,
+            Err(error) => {
+                tracing::warn!(
+                    %interface,
+                    %error,
+                    "failed to join DLNA SSDP multicast interface"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    if joined > 0 {
+        return Ok(());
+    }
+    if interfaces != [Ipv4Addr::UNSPECIFIED] {
+        socket.join_multicast_v4(&SSDP_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)?;
+        return Ok(());
+    }
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("no DLNA SSDP multicast interfaces configured")))
+}
+
+fn ssdp_multicast_interfaces(network: &Value) -> Vec<Ipv4Addr> {
+    let mut interfaces = network
+        .get("LocalNetworkAddresses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter_map(Value::as_str)
+        .filter_map(|value| value.trim().parse::<IpAddr>().ok())
+        .filter_map(|ip| match ip {
+            IpAddr::V4(ip) if is_usable_ssdp_interface(ip) => Some(ip),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if interfaces.is_empty() {
+        interfaces.push(Ipv4Addr::UNSPECIFIED);
+    }
+    interfaces
+}
+
+fn is_usable_ssdp_interface(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast()
 }
 
 async fn run_ssdp_service(state: AppState, socket: UdpSocket) -> anyhow::Result<()> {
@@ -4242,6 +4313,38 @@ mod tests {
                 &["fd00::/64=https://v6.example.test"]
             ),
             Some("https://v6.example.test".to_string())
+        );
+    }
+
+    #[test]
+    fn ssdp_multicast_interfaces_use_local_network_addresses() {
+        let network = json!({
+            "LocalNetworkAddresses": [
+                "192.168.1.46",
+                "10.0.0.5",
+                "192.168.1.46",
+                "0.0.0.0",
+                "239.255.255.250",
+                "::1",
+                "not-an-ip"
+            ]
+        });
+
+        assert_eq!(
+            ssdp_multicast_interfaces(&network),
+            vec![Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(192, 168, 1, 46)]
+        );
+    }
+
+    #[test]
+    fn ssdp_multicast_interfaces_fall_back_to_unspecified() {
+        assert_eq!(
+            ssdp_multicast_interfaces(&json!({ "LocalNetworkAddresses": [] })),
+            vec![Ipv4Addr::UNSPECIFIED]
+        );
+        assert_eq!(
+            ssdp_multicast_interfaces(&json!({ "LocalNetworkAddresses": ["::1", "not-an-ip"] })),
+            vec![Ipv4Addr::UNSPECIFIED]
         );
     }
 

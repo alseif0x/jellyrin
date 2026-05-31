@@ -31,6 +31,9 @@ Release artifacts live under `ops/` plus the root Docker files:
   volumes and a `/healthz` healthcheck.
 - `docker-compose.yml` runs Jellyrin with persistent data/config/cache/log
   volumes and read-only Jellyfin Web/media mounts.
+- `docker-compose.dlna.yml` is the optional DLNA/UPnP override. Use it with
+  `docker compose -f docker-compose.yml -f docker-compose.dlna.yml up -d --build`
+  when SSDP discovery must work from TVs or VLC on the LAN.
 - `ops/jellyrin.service` is the production systemd unit; copy
   `ops/jellyrin.env.example` to `/etc/jellyrin/jellyrin.env` before enabling it.
 - `ops/release-checklist.md` covers fresh install, upgrade, smoke checks and
