@@ -938,6 +938,7 @@ dependencies = [
  "jellyrin-compat",
  "jellyrin-core",
  "jellyrin-db",
+ "jellyrin-plugin-rpc",
  "jellyrin-transcode",
  "rand_core 0.6.4",
  "reqwest",

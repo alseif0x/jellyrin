@@ -15,6 +15,7 @@ futures-util.workspace = true
 jellyrin-compat = { path = "../jellyrin-compat" }
 jellyrin-core = { path = "../jellyrin-core" }
 jellyrin-db = { path = "../jellyrin-db" }
+jellyrin-plugin-rpc = { path = "../jellyrin-plugin-rpc" }
 jellyrin-transcode = { path = "../jellyrin-transcode" }
 rand_core.workspace = true
 reqwest.workspace = true

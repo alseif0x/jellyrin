@@ -41,10 +41,15 @@ use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
     ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
     DeviceSession, DiscoveredPluginPackage, InstallPluginPackage, MediaItemMetadata, MediaList,
-    MediaListItem, MediaListUserPermission, QuickConnectSession, SortDirection,
-    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    MediaListItem, MediaListUserPermission, PluginRuntimeInstanceUpsert, QuickConnectSession,
+    SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
     UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
     UpsertTranscodeSession,
+};
+use jellyrin_plugin_rpc::{
+    HandshakeRequest, HandshakeResponse, LoadPluginRequest, LoadedPlugin,
+    PLUGIN_RPC_PROTOCOL_VERSION, PluginHealth, PluginHostStdioClient, PluginIdentity,
+    PluginRpcEnvelope, PluginRpcMethod, PluginRuntime,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -8197,6 +8202,171 @@ async fn plugin_logs(
         .ok_or_else(|| ApiError::not_found("Plugin not found"))
 }
 
+async fn try_activate_rust_wasi_plugin(
+    db: &Database,
+    plugin: &serde_json::Value,
+    actor_user_id: Option<Uuid>,
+) -> Result<bool, ApiError> {
+    let Some(host_path) = rust_wasi_host_binary_path() else {
+        return Ok(false);
+    };
+    activate_rust_wasi_plugin_with_host_path(db, plugin, actor_user_id, host_path).await
+}
+
+async fn activate_rust_wasi_plugin_with_host_path(
+    db: &Database,
+    plugin: &serde_json::Value,
+    actor_user_id: Option<Uuid>,
+    host_path: PathBuf,
+) -> Result<bool, ApiError> {
+    let Some(plugin_id) = json_string_field(plugin, "Id") else {
+        return Ok(false);
+    };
+    let version = json_string_field(plugin, "Version").unwrap_or_default();
+    let manifest = plugin
+        .get("Manifest")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(install_path) = plugin_install_path(plugin).or_else(|| plugin_install_path(&manifest))
+    else {
+        return Ok(false);
+    };
+
+    let mut client = PluginHostStdioClient::spawn(&mut Command::new(&host_path))
+        .map_err(|error| ApiError::internal(format!("RustWasi host failed to start: {error}")))?;
+    let handshake = PluginRpcEnvelope::new(
+        format!("{plugin_id}:handshake"),
+        PluginRpcMethod::Handshake,
+        HandshakeRequest {
+            runtime: PluginRuntime::RustWasi,
+            runtime_version: "0.1.0".to_string(),
+            host_id: "jellyrin-api".to_string(),
+            supported_protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION],
+            capabilities: vec!["LoadPlugin".to_string(), "Health".to_string()],
+        },
+    );
+    let handshake_response = client
+        .call::<_, HandshakeResponse>(&handshake, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| ApiError::internal(format!("RustWasi host handshake failed: {error}")))?;
+    let Some(handshake_result) = rpc_result(handshake_response)? else {
+        return Ok(false);
+    };
+
+    let load = PluginRpcEnvelope::new(
+        format!("{plugin_id}:load"),
+        PluginRpcMethod::LoadPlugin,
+        LoadPluginRequest {
+            plugin_id: plugin_id.clone(),
+            name: json_string_field(plugin, "Name").unwrap_or_else(|| plugin_id.clone()),
+            version: version.clone(),
+            runtime: PluginRuntime::RustWasi,
+            target_abi: json_string_field(plugin, "TargetAbi").unwrap_or_default(),
+            install_path,
+            manifest: manifest.clone(),
+            permissions: plugin_string_array(plugin.get("Permissions")),
+        },
+    );
+    let load_response = client
+        .call::<_, LoadedPlugin>(&load, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| ApiError::internal(format!("RustWasi host load failed: {error}")))?;
+    let Some(loaded) = rpc_result(load_response)? else {
+        return Ok(false);
+    };
+
+    let health = PluginRpcEnvelope::new(
+        format!("{plugin_id}:health"),
+        PluginRpcMethod::Health,
+        PluginIdentity {
+            plugin_id: plugin_id.clone(),
+            version,
+        },
+    );
+    let health_response = client
+        .call::<_, PluginHealth>(&health, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| ApiError::internal(format!("RustWasi host health failed: {error}")))?;
+    let Some(health) = rpc_result(health_response)? else {
+        return Ok(false);
+    };
+
+    db.upsert_plugin_runtime_instance(
+        PluginRuntimeInstanceUpsert {
+            plugin_id,
+            runtime: "RustWasi".to_string(),
+            runtime_version: handshake_result.server_version,
+            status: "Active".to_string(),
+            process_id: None,
+            endpoint: Some(host_path.to_string_lossy().to_string()),
+            health: serde_json::to_value(health)?,
+            capabilities: loaded.capabilities,
+            last_error: None,
+        },
+        actor_user_id,
+    )
+    .await?;
+    let _ = client.shutdown().await;
+    Ok(true)
+}
+
+fn rpc_result<T>(
+    response: jellyrin_plugin_rpc::PluginRpcResponse<T>,
+) -> Result<Option<T>, ApiError> {
+    if response.ok {
+        return Ok(response.result);
+    }
+    let message = response
+        .error
+        .map(|error| {
+            format!(
+                "{}: {}",
+                serde_json::to_string(&error.code).unwrap_or_default(),
+                error.message
+            )
+        })
+        .unwrap_or_else(|| "unknown RPC error".to_string());
+    Err(ApiError::internal(message))
+}
+
+fn rust_wasi_host_binary_path() -> Option<PathBuf> {
+    std::env::var_os("JELLYRIN_PLUGIN_HOST_WASI")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(FsPath::to_path_buf))
+                .map(|dir| {
+                    dir.join(format!(
+                        "jellyrin-plugin-host-wasi{}",
+                        std::env::consts::EXE_SUFFIX
+                    ))
+                })
+                .filter(|path| path.is_file())
+        })
+}
+
+fn plugin_install_path(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("Installation")
+        .and_then(|installation| json_string_field(installation, "InstallPath"))
+        .filter(|path| !path.trim().is_empty())
+}
+
+fn plugin_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn enable_plugin(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -8205,6 +8375,12 @@ async fn enable_plugin(
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     require_installed_plugin_version(&state.db, &plugin_id, &version).await?;
+    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await?
+        && json_string_field(&plugin, "Runtime").as_deref() == Some("RustWasi")
+        && try_activate_rust_wasi_plugin(&state.db, &plugin, Some(user.id)).await?
+    {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let last_error = "Runtime host is not implemented yet.";
     if state
         .db
@@ -30501,7 +30677,8 @@ mod tests {
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun,
         PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
-        SystemLifecycleCommand, await_package_install_cancelable, backup_restore_snapshot_json,
+        SystemLifecycleCommand, activate_rust_wasi_plugin_with_host_path,
+        await_package_install_cancelable, backup_restore_snapshot_json,
         cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
@@ -31056,6 +31233,104 @@ mod tests {
             .unwrap();
         assert_eq!(configuration["Preserved"], true);
         assert_eq!(configuration["Quality"], "existing");
+    }
+
+    #[tokio::test]
+    async fn rust_wasi_activation_uses_stdio_host_and_persists_runtime_state() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "55555555-5555-5555-5555-555555555555";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("fixture.wasm"), b"\0asm")
+            .await
+            .unwrap();
+        let host_path = fake_rust_wasi_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Activatable WASI".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Activatable WASI",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Activatable WASI",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ScheduledTask"]
+                }),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_rust_wasi_plugin_with_host_path(&db, &plugin, None, host_path)
+                .await
+                .unwrap()
+        );
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert_eq!(plugin["Status"], "Active");
+        assert_eq!(plugin["RuntimeVersion"], "fake-wasi-host-0.1");
+        assert_eq!(plugin["Health"]["Status"], "Healthy");
+        assert_eq!(plugin["Capabilities"][0], "ScheduledTask");
+        assert_eq!(plugin["RuntimeInstances"][0]["Status"], "Active");
+        assert_eq!(plugin["RecentEvents"][0]["EventType"], "RuntimeStatus");
+    }
+
+    async fn fake_rust_wasi_host_script(root: &std::path::Path) -> PathBuf {
+        let path = root.join("fake-wasi-host.sh");
+        tokio::fs::write(
+            &path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-wasi-host","ServerVersion":"fake-wasi-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"55555555-5555-5555-5555-555555555555","Runtime":"RustWasi","RuntimeVersion":"fake-wasi-host-0.1","Status":"Healthy","Manifest":{"Name":"Activatable WASI"},"Capabilities":["ScheduledTask"]}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"55555555-5555-5555-5555-555555555555","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
     }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)
