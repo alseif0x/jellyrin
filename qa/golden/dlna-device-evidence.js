@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('node:fs/promises');
+const net = require('node:net');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
@@ -159,6 +160,8 @@ async function validateManualDlnaEvidence(evidence) {
     for (const field of ['serverIp', 'deviceIp', 'ssdpLocation']) {
       requireString(errors, evidence.network, `network.${field}`, field);
     }
+    requireLanIpv4(errors, evidence.network.serverIp, 'network.serverIp');
+    requireLanIpv4(errors, evidence.network.deviceIp, 'network.deviceIp');
     requireUrl(errors, evidence.network, 'network.ssdpLocation', 'ssdpLocation');
     for (const check of requiredNetworkChecks) {
       if (evidence.network[check] !== true) {
@@ -332,6 +335,28 @@ function requireUrl(errors, value, label, key = label) {
   }
 }
 
+function requireLanIpv4(errors, value, label) {
+  if (typeof value !== 'string' || value.trim() === '' || looksLikeTemplatePlaceholder(value)) {
+    return;
+  }
+  if (net.isIP(value) !== 4) {
+    errors.push(`${label} must be an IPv4 address`);
+    return;
+  }
+  const octets = value.split('.').map((part) => Number(part));
+  const [first, second, third, fourth] = octets;
+  if (
+    first === 0 ||
+    first === 127 ||
+    first >= 224 ||
+    value === '255.255.255.255' ||
+    (first === 169 && second === 254) ||
+    [first, second, third, fourth].some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+  ) {
+    errors.push(`${label} must be a LAN-reachable IPv4 address, not loopback, link-local, multicast, broadcast or unspecified`);
+  }
+}
+
 function validateTranscodeFallback(errors, transcodeFallback) {
   if (!transcodeFallback || typeof transcodeFallback !== 'object' || Array.isArray(transcodeFallback)) {
     errors.push('transcodeFallback must be an object');
@@ -490,6 +515,18 @@ async function selfTest() {
       server: { ...valid.server, commit: '0123456789abcdef0123456789abcdef01234567' },
     };
     await assertInvalid(staleCommit, 'server.commit must match current git HEAD');
+
+    const loopbackServerIp = {
+      ...valid,
+      network: { ...valid.network, serverIp: '127.0.0.1' },
+    };
+    await assertInvalid(loopbackServerIp, 'network.serverIp must be a LAN-reachable IPv4 address');
+
+    const invalidDeviceIp = {
+      ...valid,
+      network: { ...valid.network, deviceIp: 'not-an-ip' },
+    };
+    await assertInvalid(invalidDeviceIp, 'network.deviceIp must be an IPv4 address');
 
     const outsideArtifact = {
       ...valid,
