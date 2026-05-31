@@ -14,6 +14,7 @@ const traceJsonPath = path.join(traceDir, 'golden-run.json');
 const evidencePath = path.join(generatedDir, 'dlna-upnp.json');
 const evidenceMarkdownPath = path.join(generatedDir, 'dlna-upnp.md');
 const discoveryEvidencePath = path.join(generatedDir, 'dlna-discovery.json');
+const eventsEvidencePath = path.join(generatedDir, 'dlna-events.json');
 
 const goldenCommands = [
   [
@@ -72,7 +73,8 @@ async function main() {
   await fs.writeFile(traceJsonPath, `${JSON.stringify(result, null, 2)}\n`);
 
   const discoveryEvidence = await readJsonIfExists(discoveryEvidencePath);
-  const evidence = buildEvidence(result, discoveryEvidence);
+  const eventsEvidence = await readJsonIfExists(eventsEvidencePath);
+  const evidence = buildEvidence(result, discoveryEvidence, eventsEvidence);
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence));
   console.log(`wrote ${evidencePath}`);
@@ -127,19 +129,23 @@ function runCommand(command) {
   });
 }
 
-function buildEvidence(result, discoveryEvidence) {
+function buildEvidence(result, discoveryEvidence, eventsEvidence) {
   const passed = result.code === 0;
   const discoveryPassed =
     discoveryEvidence?.status === 'implemented' &&
     discoveryEvidence?.failedTargets?.length === 0 &&
     discoveryEvidence?.completedTargets?.includes('local-udp');
+  const eventsPassed =
+    eventsEvidence?.status === 'implemented' &&
+    eventsEvidence?.failedTargets?.length === 0 &&
+    eventsEvidence?.completedTargets?.includes('followup-notify');
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? (discoveryPassed ? 95 : 94) : 87,
+    percent: passed ? (discoveryPassed && eventsPassed ? 96 : discoveryPassed ? 95 : 94) : 87,
     closed: false,
     sourcePhase: passed
-      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
+      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f${eventsPassed ? '/E3.2g' : ''}/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.4e/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
@@ -149,6 +155,9 @@ function buildEvidence(result, discoveryEvidence) {
           discoveryPassed
             ? 'The companion dlna-discovery golden validates a real local UDP M-SEARCH round trip.'
             : 'The companion dlna-discovery golden has not been completed in the current generated evidence.',
+          eventsPassed
+            ? 'The companion dlna-events golden validates real local TCP callback delivery for initial and follow-up GENA NOTIFY messages.'
+            : 'The companion dlna-events golden has not been completed in the current generated evidence.',
           'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
@@ -160,6 +169,7 @@ function buildEvidence(result, discoveryEvidence) {
     validatedCommands: [
       ...goldenCommands.map((command) => command.join(' ')),
       ...(discoveryPassed ? ['npm run golden:dlna-discovery'] : []),
+      ...(eventsPassed ? ['npm run golden:dlna-events'] : []),
       'cargo test -p jellyrin-api dlna_ -- --nocapture',
       'cargo check -p jellyrin-api',
       'cargo check -p jellyrin-server',
