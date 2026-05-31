@@ -51,8 +51,7 @@ async function main() {
   }
 
   const ssdp = await ssdpDiscover(serverId, options.ssdpTimeoutMs || 5000);
-  const descriptionUrl = new URL(`/dlna/${serverId}/description.xml`, baseUrl).toString();
-  const ssdpLocation = ssdp.location || descriptionUrl;
+  const ssdpLocation = requiredString(ssdp.location, 'SSDP LOCATION header');
   const description = await fetchText(new URL(ssdpLocation));
   assertIncludes(description, '<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>', 'root descriptor device type');
   assertIncludes(description, '<iconList>', 'root descriptor iconList');
@@ -328,7 +327,7 @@ async function ssdpDiscover(serverId, timeoutMs) {
       socket.close();
       resolve({
         raw: text,
-        location: headerValue(text, 'location'),
+        location: requiredString(headerValue(text, 'location'), 'SSDP LOCATION header'),
       });
     });
     socket.on('error', (error) => {
@@ -418,6 +417,16 @@ function selfTest() {
   assertEqual(parsed.baseUrl, 'http://192.168.1.46:8097/web/index.html?x=1', 'parse baseUrl');
   assertEqual(normalizeBaseUrl(parsed.baseUrl), 'http://192.168.1.46:8097', 'normalizeBaseUrl');
   assertEqual(headerValue('HTTP/1.1 200 OK\r\nLOCATION: http://host/dlna.xml\r\n', 'location'), 'http://host/dlna.xml', 'headerValue');
+  assertEqual(requiredString(' http://host/dlna.xml ', 'location'), 'http://host/dlna.xml', 'requiredString trims values');
+  let missingSsdpLocationFailed = false;
+  try {
+    requiredString(undefined, 'SSDP LOCATION header');
+  } catch {
+    missingSsdpLocationFailed = true;
+  }
+  if (!missingSsdpLocationFailed) {
+    throw new Error('requiredString should reject a missing SSDP LOCATION header');
+  }
   assertEqual(
     resolvePlaylistUrl('variant/stream.m3u8', new URL('http://host/dlna/item/transcode.m3u8')).toString(),
     'http://host/dlna/item/variant/stream.m3u8',
