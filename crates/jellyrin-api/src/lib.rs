@@ -689,6 +689,16 @@ pub fn router(state: AppState) -> Router {
             delete(cancel_package_installation),
         )
         .route(
+            "/Package/Repositories/Refresh",
+            post(refresh_package_repositories),
+        )
+        .route(
+            "/package/repositories/refresh",
+            post(refresh_package_repositories),
+        )
+        .route("/Repositories/Refresh", post(refresh_package_repositories))
+        .route("/repositories/refresh", post(refresh_package_repositories))
+        .route(
             "/Package/Repositories",
             get(package_repositories).post(update_package_repositories),
         )
@@ -6276,6 +6286,8 @@ fn package_install_task_key(package_id: &str) -> String {
     format!("PackageInstall:{}", package_id.trim().to_ascii_lowercase())
 }
 
+const PACKAGE_REPOSITORIES_REFRESH_TASK_KEY: &str = "PackageRepositoriesRefresh";
+
 fn plugin_package_operation(previous_plugin: Option<&serde_json::Value>, version: &str) -> String {
     let Some(previous_version) =
         previous_plugin.and_then(|plugin| json_string_field(plugin, "Version"))
@@ -6661,6 +6673,188 @@ async fn update_package_repositories(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn refresh_package_repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let run = state
+        .db
+        .start_task_run(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
+        .await
+        .map_err(|error| {
+            if format!("{error:#}").contains("task is already running") {
+                ApiError::conflict("Package repository refresh is already running")
+            } else {
+                error.into()
+            }
+        })?;
+
+    let refresh_result = async {
+        let mut current_payloads = state.db.system_configuration_payloads().await?;
+        let mut repositories =
+            repository_infos_from_config(current_payloads.plugin_repositories.clone());
+        if repositories.is_empty() {
+            repositories = default_plugin_repositories();
+        }
+
+        let refreshed_at = format_time_for_json(OffsetDateTime::now_utc());
+        let mut refreshed_repositories = Vec::with_capacity(repositories.len());
+        let mut refreshed_urls = Vec::<String>::new();
+        let mut failed_repositories = Vec::<serde_json::Value>::new();
+        let mut skipped_repositories = Vec::<String>::new();
+        let mut total_packages = 0_usize;
+
+        for repository in repositories {
+            let name = json_string_field(&repository, "Name").unwrap_or_default();
+            let url = json_string_field(&repository, "Url").unwrap_or_default();
+            if json_bool_field(&repository, "Enabled") == Some(false) {
+                skipped_repositories.push(url.clone());
+                refreshed_repositories.push(repository);
+                continue;
+            }
+
+            match read_plugin_repository_manifest(&url).await {
+                Ok(manifest) => {
+                    let packages = plugin_repository_manifest_packages(&manifest, &url);
+                    total_packages += packages.len();
+                    let mut refreshed_repository = repository;
+                    refreshed_repository["Packages"] = serde_json::Value::Array(packages);
+                    refreshed_repository["LastRefreshStatus"] = serde_json::json!("Succeeded");
+                    refreshed_repository["LastRefreshedAt"] =
+                        serde_json::json!(refreshed_at.clone());
+                    refreshed_repository["LastRefreshError"] = serde_json::Value::Null;
+                    refreshed_repository["LastRefreshPackageCount"] =
+                        serde_json::json!(refreshed_repository["Packages"].as_array().map_or(0, Vec::len));
+                    refreshed_urls.push(url);
+                    refreshed_repositories.push(refreshed_repository);
+                }
+                Err(error) => {
+                    let message = format!("{:#}", error.error);
+                    let mut failed_repository = repository;
+                    failed_repository["LastRefreshStatus"] = serde_json::json!("Failed");
+                    failed_repository["LastRefreshedAt"] = serde_json::json!(refreshed_at.clone());
+                    failed_repository["LastRefreshError"] = serde_json::json!(message.clone());
+                    failed_repositories.push(serde_json::json!({
+                        "Name": name,
+                        "Url": url,
+                        "Error": message,
+                    }));
+                    refreshed_repositories.push(failed_repository);
+                }
+            }
+        }
+
+        current_payloads.plugin_repositories = serde_json::Value::Array(refreshed_repositories);
+        state
+            .db
+            .update_system_configuration_payloads(current_payloads)
+            .await?;
+        Ok::<serde_json::Value, ApiError>(serde_json::json!({
+            "Status": "Completed",
+            "RepositoryCount": refreshed_urls.len() + failed_repositories.len() + skipped_repositories.len(),
+            "RefreshedRepositories": refreshed_urls,
+            "FailedRepositories": failed_repositories,
+            "SkippedRepositories": skipped_repositories,
+            "PackageCount": total_packages,
+        }))
+    }
+    .await;
+
+    let task_result = match refresh_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = state
+                .db
+                .fail_task_run(run.id, &format!("{:#}", error.error))
+                .await;
+            return Err(error);
+        }
+    };
+
+    state.db.complete_task_run(run.id, task_result).await?;
+    record_activity(
+        &state.db,
+        "Plugin repositories refreshed",
+        Some("Plugin repository manifests were refreshed."),
+        "System",
+        Some(user.id),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn read_plugin_repository_manifest(source_url: &str) -> Result<serde_json::Value, ApiError> {
+    let bytes = if let Some(path) = source_url.strip_prefix("file://") {
+        tokio::fs::read(PathBuf::from(path))
+            .await
+            .map_err(|error| {
+                ApiError::bad_request(format!("Plugin repository manifest read failed: {error}"))
+            })?
+    } else if source_url.starts_with("http://") || source_url.starts_with("https://") {
+        let response = HttpClient::builder()
+            .timeout(StdDuration::from_secs(15))
+            .build()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Plugin repository manifest HTTP client setup failed: {error}"
+                ))
+            })?
+            .get(source_url)
+            .send()
+            .await
+            .map_err(|error| {
+                ApiError::bad_request(format!(
+                    "Plugin repository manifest download failed: {error}"
+                ))
+            })?;
+        if !response.status().is_success() {
+            return Err(ApiError::bad_request(format!(
+                "Plugin repository manifest download returned {}",
+                response.status()
+            )));
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| {
+                ApiError::bad_request(format!(
+                    "Plugin repository manifest body read failed: {error}"
+                ))
+            })?
+    } else {
+        tokio::fs::read(PathBuf::from(source_url))
+            .await
+            .map_err(|error| {
+                ApiError::bad_request(format!("Plugin repository manifest read failed: {error}"))
+            })?
+    };
+
+    serde_json::from_slice(&bytes).map_err(|error| {
+        ApiError::bad_request(format!(
+            "Plugin repository manifest JSON is invalid: {error}"
+        ))
+    })
+}
+
+fn plugin_repository_manifest_packages(
+    manifest: &serde_json::Value,
+    repository_url: &str,
+) -> Vec<serde_json::Value> {
+    let packages = manifest.as_array().or_else(|| {
+        json_field_case_insensitive(manifest, "Packages")
+            .or_else(|| json_field_case_insensitive(manifest, "Plugins"))
+            .and_then(serde_json::Value::as_array)
+    });
+    packages
+        .into_iter()
+        .flatten()
+        .filter_map(|package| normalize_package_info(package, Some(repository_url)))
+        .collect()
+}
+
 fn repository_infos_from_config(value: serde_json::Value) -> Vec<serde_json::Value> {
     let serde_json::Value::Array(repositories) = value else {
         return Vec::new();
@@ -6711,6 +6905,18 @@ fn normalize_repository_info(value: serde_json::Value) -> Option<serde_json::Val
                 .filter_map(|package| normalize_package_info(package, Some(url)))
                 .collect(),
         );
+    }
+    for field in [
+        "LastRefreshStatus",
+        "LastRefreshedAt",
+        "LastRefreshPackageCount",
+        "LastRefreshError",
+    ] {
+        if let Some(value) =
+            json_field_case_insensitive(&serde_json::Value::Object(repository.clone()), field)
+        {
+            normalized[field] = value.clone();
+        }
     }
     Some(normalized)
 }
@@ -29147,25 +29353,25 @@ mod tests {
         AUTH_LOCKOUT_FAILURE_LIMIT, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun,
-        SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand, backup_restore_snapshot_json,
-        cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
-        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
-        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
-        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
-        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
-        live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
-        live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
-        materialize_series_timer_timers, media_item_by_id, media_item_streams,
-        package_install_task_key, paged_media_items, parse_authorization_token,
-        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs, plugin_package_operation,
-        reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
-        record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
-        run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
-        subscribe_playback_events, subscribe_system_lifecycle_commands,
-        syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
+        SystemLifecycleCommand, backup_restore_snapshot_json, cascade_delete_series_timer_timers,
+        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
+        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
+        encoding_configuration_json, format_time_for_json, get_valid_filename,
+        hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id, json_string_field,
+        json_value_i64, last_system_lifecycle_command, live_tv_channel_is_remote,
+        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
+        live_tv_recording_name, load_countries, load_cultures, materialize_series_timer_timers,
+        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
+        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
+        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        plugin_package_operation, reconcile_live_tv_recordings_on_startup,
+        reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
+        reserve_live_tv_recording_start, router, run_due_live_tv_timers, series_timer_child_id,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
+        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
         validate_zip_entry_path, verify_plugin_package_checksum,
     };
     use crate::dlna;
@@ -38933,6 +39139,196 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let config: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["PluginRepositories"], repositories);
+    }
+
+    #[tokio::test]
+    async fn package_repository_refresh_downloads_manifest_and_updates_catalog() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let db_for_assertions = db.clone();
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let manifest = json!([
+            {
+                "guid": "22222222-2222-2222-2222-222222222222",
+                "name": "Remote Plugin",
+                "overview": "Remote plugin from refreshed repository manifest",
+                "description": "Remote plugin",
+                "owner": "Jellyfin",
+                "category": "Metadata",
+                "versions": [{
+                    "version": "2.0.0.0",
+                    "targetAbi": "12.0.0.0",
+                    "sourceUrl": "https://repo.example/remote-plugin.zip",
+                    "checksum": "0123456789abcdef0123456789abcdef01234567",
+                    "timestamp": "2026-05-31T00:00:00Z"
+                }]
+            }
+        ]);
+        let manifest_path = tmp.path().join("remote-plugin-manifest.json");
+        tokio::fs::write(&manifest_path, manifest.to_string())
+            .await
+            .unwrap();
+        let manifest_url = format!("file://{}", manifest_path.to_string_lossy());
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir,
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let repository_payload = json!([
+            {
+                "Name": "Stable",
+                "Url": manifest_url,
+                "Enabled": true
+            },
+            {
+                "Name": "Disabled",
+                "Url": "http://127.0.0.1:1/disabled.json",
+                "Enabled": false,
+                "Packages": [{
+                    "Name": "Disabled Plugin",
+                    "Guid": "33333333-3333-3333-3333-333333333333",
+                    "Versions": [{ "Version": "1.0.0.0" }]
+                }]
+            }
+        ]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(repository_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Repositories/Refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Repositories/Refresh")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let repositories: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repositories[0]["LastRefreshStatus"], "Succeeded");
+        assert_eq!(repositories[0]["LastRefreshPackageCount"], 1);
+        assert_eq!(repositories[0]["Packages"][0]["Name"], "Remote Plugin");
+        assert_eq!(repositories[1]["Name"], "Disabled");
+        assert_eq!(repositories[1]["Packages"][0]["Name"], "Disabled Plugin");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Packages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let packages: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(packages.as_array().unwrap().len(), 1);
+        assert_eq!(packages[0]["Name"], "Remote Plugin");
+        assert_eq!(packages[0]["Guid"], "22222222-2222-2222-2222-222222222222");
+        assert_eq!(packages[0]["Versions"][0]["Version"], "2.0.0.0");
+        assert_eq!(
+            packages[0]["Versions"][0]["SourceUrl"],
+            "https://repo.example/remote-plugin.zip"
+        );
+
+        let snapshot = db_for_assertions.plugin_platform_snapshot().await.unwrap();
+        assert_eq!(snapshot["Repositories"]["Count"], 2);
+        assert_eq!(snapshot["PackageCatalogCache"]["Count"], 1);
+        assert_eq!(
+            snapshot["PackageCatalogCache"]["Items"][0]["Name"],
+            "Remote Plugin"
+        );
+        let task = db_for_assertions
+            .last_task_result(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
+            .await
+            .unwrap()
+            .expect("completed repository refresh task");
+        assert_eq!(task.status, "completed");
+        let task_result = task.result_json.unwrap();
+        assert_eq!(task_result["PackageCount"], 1);
+        assert_eq!(
+            task_result["FailedRepositories"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(
+            task_result["SkippedRepositories"].as_array().unwrap()[0],
+            "http://127.0.0.1:1/disabled.json"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/package/repositories/refresh")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let task = db_for_assertions
+            .last_task_result(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
+            .await
+            .unwrap()
+            .expect("completed repository refresh task");
+        assert_eq!(task.status, "completed");
     }
 
     #[test]
