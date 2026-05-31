@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+const crypto = require('node:crypto');
 const dgram = require('node:dgram');
 const fs = require('node:fs/promises');
 const os = require('node:os');
@@ -90,6 +91,7 @@ async function main() {
     baseUrl,
     serverId,
     ssdp,
+    descriptor: summarizeDescriptor(description, serverId),
     browseRootBytes: browseRoot.length,
     searchRootBytes: searchRoot.length,
     browseItemBytes: browseItem.length,
@@ -352,6 +354,20 @@ function headerValue(message, name) {
     .trim();
 }
 
+function summarizeDescriptor(description, serverId) {
+  return {
+    bytes: Buffer.byteLength(description),
+    sha256: sha256(description),
+    mediaServerDevice: description.includes('<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>'),
+    udnMatchesServerId: description.includes(`<UDN>uuid:${serverId}</UDN>`),
+    iconList: description.includes('<iconList>'),
+  };
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
 async function writeArtifact(startedAt, payload) {
   await fs.mkdir(artifactsDir, { recursive: true });
   const artifactPath = path.join(artifactsDir, `device-runner-${stamp(startedAt)}.json`);
@@ -424,6 +440,17 @@ function selfTest() {
     '<UDN>uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42</UDN>',
     'root descriptor UDN server id',
   );
+  assertEqual(
+    sha256('descriptor'),
+    '194b520dc30384b3fc233e123778835e2adc362d91c6e33015ed3db2379d7ea1',
+    'sha256 helper',
+  );
+  const descriptorSummary = summarizeDescriptor(
+    '<root><device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType><UDN>uuid:58deb718-f9ee-4ac5-a1d4-05286d64cf42</UDN><iconList></iconList></device></root>',
+    '58deb718-f9ee-4ac5-a1d4-05286d64cf42',
+  );
+  assertEqual(descriptorSummary.udnMatchesServerId, true, 'descriptor summary UDN');
+  assertEqual(descriptorSummary.iconList, true, 'descriptor summary iconList');
   let missingSsdpLocationFailed = false;
   try {
     requiredString(undefined, 'SSDP LOCATION header');
@@ -484,4 +511,6 @@ module.exports = {
   parseArgs,
   probeHlsFallback,
   resolvePlaylistUrl,
+  sha256,
+  summarizeDescriptor,
 };
