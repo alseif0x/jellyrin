@@ -354,6 +354,17 @@ pub struct SystemConfigurationPayloads {
     pub server_options: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct InstallPluginPackage {
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub runtime: String,
+    pub target_abi: String,
+    pub package: Value,
+    pub manifest: Value,
+}
+
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let mut options = database_url
@@ -629,6 +640,338 @@ impl Database {
                 "Count": table_count(&self.pool, "plugin_audit_log").await?
             }
         }))
+    }
+
+    pub async fn install_plugin_package(
+        &self,
+        package: InstallPluginPackage,
+        actor_user_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let source_url = json_array_case_insensitive(&package.package, "Versions")
+            .and_then(|versions| {
+                versions.iter().find(|version| {
+                    json_string_case_insensitive(version, "Version")
+                        .is_some_and(|version| version.eq_ignore_ascii_case(&package.version))
+                })
+            })
+            .and_then(|version| json_string_case_insensitive(version, "SourceUrl"))
+            .or_else(|| json_string_case_insensitive(&package.package, "SourceUrl"));
+        let install_id = stable_plugin_model_id(
+            "install",
+            &format!("{}:{}", package.plugin_id, package.version),
+        );
+        let runtime_missing = format!("{} runtime host is not implemented yet.", package.runtime);
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO package_installations (
+                id, package_name, package_guid, version, runtime, status, source_url,
+                payload_json, installed_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, 'Installed', ?6, ?7, ?8, ?8)
+            ON CONFLICT(id) DO UPDATE SET
+                package_name = excluded.package_name,
+                package_guid = excluded.package_guid,
+                version = excluded.version,
+                runtime = excluded.runtime,
+                status = excluded.status,
+                source_url = excluded.source_url,
+                payload_json = excluded.payload_json,
+                installed_at = COALESCE(package_installations.installed_at, excluded.installed_at),
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&install_id)
+        .bind(&package.name)
+        .bind(&package.plugin_id)
+        .bind(&package.version)
+        .bind(&package.runtime)
+        .bind(&source_url)
+        .bind(serde_json::to_string(&package.package)?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO installed_plugins (
+                plugin_id, name, version, runtime, target_abi, server_compatibility_json,
+                status, capabilities_json, permissions_json, configuration_state, last_error,
+                health_json, manifest_json, installed_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, '{}', 'NotSupported', '[]', '[]', 'Default', ?6, ?7, ?8, ?9, ?9)
+            ON CONFLICT(plugin_id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                runtime = excluded.runtime,
+                target_abi = excluded.target_abi,
+                status = excluded.status,
+                last_error = excluded.last_error,
+                health_json = excluded.health_json,
+                manifest_json = excluded.manifest_json,
+                installed_at = COALESCE(installed_plugins.installed_at, excluded.installed_at),
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(&package.name)
+        .bind(&package.version)
+        .bind(&package.runtime)
+        .bind(&package.target_abi)
+        .bind(&runtime_missing)
+        .bind(serde_json::to_string(&json!({
+            "Status": "NotSupported",
+            "Message": runtime_missing
+        }))?)
+        .bind(serde_json::to_string(&package.manifest)?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_manifests (plugin_id, manifest_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(plugin_id) DO UPDATE SET
+                manifest_json = excluded.manifest_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(serde_json::to_string(&package.manifest)?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at)
+            VALUES (?1, '{}', ?2)
+            ON CONFLICT(plugin_id) DO NOTHING
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_permissions (plugin_id, permissions_json, updated_at)
+            VALUES (?1, '[]', ?2)
+            ON CONFLICT(plugin_id) DO NOTHING
+            "#,
+        )
+        .bind(&package.plugin_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_audit_log (id, plugin_id, action, actor_user_id, status, payload_json, created_at)
+            VALUES (?1, ?2, 'Install', ?3, 'NotSupported', ?4, ?5)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&package.plugin_id)
+        .bind(actor_user_id.map(|id| id.to_string()))
+        .bind(serde_json::to_string(&json!({
+            "Name": package.name,
+            "Version": package.version,
+            "Runtime": package.runtime,
+            "Reason": runtime_missing
+        }))?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn installed_plugins_json(&self) -> anyhow::Result<Vec<Value>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT plugin_id, name, version, runtime, runtime_version, target_abi,
+                server_compatibility_json, status, capabilities_json, permissions_json,
+                configuration_state, last_error, health_json, manifest_json
+            FROM installed_plugins
+            ORDER BY name COLLATE NOCASE, version COLLATE NOCASE
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| plugin_row_to_json(&row))
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    pub async fn installed_plugin_manifest(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query(
+            r#"
+            SELECT manifest_json
+            FROM plugin_manifests
+            WHERE plugin_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            serde_json::from_str(row.get::<&str, _>("manifest_json"))
+                .context("invalid plugin manifest payload")
+        })
+        .transpose()
+    }
+
+    pub async fn plugin_configuration_json(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query(
+            r#"
+            SELECT configuration_json
+            FROM plugin_configurations
+            WHERE plugin_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            serde_json::from_str(row.get::<&str, _>("configuration_json"))
+                .context("invalid plugin configuration payload")
+        })
+        .transpose()
+    }
+
+    pub async fn update_plugin_configuration_json(
+        &self,
+        plugin_id: &str,
+        configuration: Value,
+    ) -> anyhow::Result<bool> {
+        if self.installed_plugin_manifest(plugin_id).await?.is_none() {
+            return Ok(false);
+        }
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(plugin_id) DO UPDATE SET
+                configuration_json = excluded.configuration_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .bind(serde_json::to_string(&configuration)?)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    pub async fn set_installed_plugin_status(
+        &self,
+        plugin_id: &str,
+        status: &str,
+        last_error: Option<&str>,
+        actor_user_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            UPDATE installed_plugins
+            SET status = ?1, last_error = ?2, updated_at = ?3
+            WHERE plugin_id = ?4 COLLATE NOCASE
+            "#,
+        )
+        .bind(status)
+        .bind(last_error)
+        .bind(&now)
+        .bind(plugin_id.trim())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_audit_log (id, plugin_id, action, actor_user_id, status, payload_json, created_at)
+            VALUES (?1, ?2, 'SetStatus', ?3, ?4, ?5, ?6)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(plugin_id.trim())
+        .bind(actor_user_id.map(|id| id.to_string()))
+        .bind(status)
+        .bind(serde_json::to_string(&json!({ "LastError": last_error }))?)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(true)
+    }
+
+    pub async fn uninstall_plugin_state(
+        &self,
+        plugin_id: &str,
+        actor_user_id: Option<Uuid>,
+    ) -> anyhow::Result<bool> {
+        let normalized = plugin_id.trim();
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            DELETE FROM installed_plugins
+            WHERE plugin_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(normalized)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        for table in [
+            "plugin_manifests",
+            "plugin_configurations",
+            "plugin_permissions",
+            "plugin_runtime_instances",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE plugin_id = ?1 COLLATE NOCASE");
+            sqlx::query(&sql).bind(normalized).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM package_installations
+            WHERE package_guid = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(normalized)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_audit_log (id, plugin_id, action, actor_user_id, status, payload_json, created_at)
+            VALUES (?1, ?2, 'Uninstall', ?3, 'Deleted', '{}', ?4)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(normalized)
+        .bind(actor_user_id.map(|id| id.to_string()))
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn named_configuration(&self, key: &str) -> anyhow::Result<Option<Value>> {
@@ -6420,6 +6763,37 @@ async fn package_catalog_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value
             }))
         })
         .collect()
+}
+
+fn plugin_row_to_json(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Value> {
+    let server_compatibility: Value =
+        serde_json::from_str(row.get::<&str, _>("server_compatibility_json"))
+            .context("invalid plugin server compatibility payload")?;
+    let capabilities: Value = serde_json::from_str(row.get::<&str, _>("capabilities_json"))
+        .context("invalid plugin capabilities payload")?;
+    let permissions: Value = serde_json::from_str(row.get::<&str, _>("permissions_json"))
+        .context("invalid plugin permissions payload")?;
+    let health: Value = serde_json::from_str(row.get::<&str, _>("health_json"))
+        .context("invalid plugin health payload")?;
+    let manifest: Value = serde_json::from_str(row.get::<&str, _>("manifest_json"))
+        .context("invalid plugin manifest payload")?;
+    Ok(json!({
+        "Id": row.get::<String, _>("plugin_id"),
+        "Guid": row.get::<String, _>("plugin_id"),
+        "Name": row.get::<String, _>("name"),
+        "Version": row.get::<String, _>("version"),
+        "Runtime": row.get::<String, _>("runtime"),
+        "RuntimeVersion": row.get::<String, _>("runtime_version"),
+        "TargetAbi": row.get::<String, _>("target_abi"),
+        "ServerCompatibility": server_compatibility,
+        "Status": row.get::<String, _>("status"),
+        "Capabilities": capabilities,
+        "Permissions": permissions,
+        "ConfigurationState": row.get::<String, _>("configuration_state"),
+        "LastError": row.get::<Option<String>, _>("last_error"),
+        "Health": health,
+        "Manifest": manifest
+    }))
 }
 
 async fn table_count(pool: &SqlitePool, table: &str) -> anyhow::Result<i64> {

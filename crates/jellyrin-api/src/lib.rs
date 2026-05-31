@@ -40,10 +40,10 @@ use jellyrin_core::{
 use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
     ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
-    DeviceSession, MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission,
-    QuickConnectSession, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
-    TrickplayInfo, UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
-    UpsertTranscodeSession,
+    DeviceSession, InstallPluginPackage, MediaItemMetadata, MediaList, MediaListItem,
+    MediaListUserPermission, QuickConnectSession, SortDirection, SystemConfigurationPayloads,
+    TaskRun, TranscodeSession, TrickplayInfo, UpsertActivePlaybackSession,
+    UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -6099,7 +6099,7 @@ async fn installed_plugins(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(Vec::new()))
+    Ok(Json(state.db.installed_plugins_json().await?))
 }
 
 async fn available_packages(
@@ -6155,7 +6155,7 @@ async fn install_package(
     Query(query): Query<PackageQuery>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user = require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let package = package_infos_from_repositories(
         &state
             .db
@@ -6166,10 +6166,46 @@ async fn install_package(
     .into_iter()
     .find(|package| package_matches_query(package, &name, &query))
     .ok_or_else(|| ApiError::not_found("Package not found"))?;
+    let selected_version = select_package_version(&package, query.version.as_deref())
+        .ok_or_else(|| ApiError::not_found("Package version not found"))?;
     let package_name = json_string_field(&package, "Name").unwrap_or(name);
-    Err(ApiError::conflict(format!(
-        "Package installation is not supported in Jellyrin yet: {package_name}"
-    )))
+    let plugin_id = json_string_field(&package, "Guid")
+        .unwrap_or_else(|| stable_entity_id("Plugin", &package_name));
+    let version =
+        json_string_field(&selected_version, "Version").unwrap_or_else(|| "0.0.0.0".to_string());
+    let runtime = json_string_field(&selected_version, "Runtime")
+        .or_else(|| json_string_field(&package, "Runtime"))
+        .unwrap_or_else(|| "DotNetJellyfin".to_string());
+    let target_abi = json_string_field(&selected_version, "TargetAbi")
+        .or_else(|| json_string_field(&package, "TargetAbi"))
+        .unwrap_or_default();
+    let manifest = plugin_manifest_from_package(package.clone());
+    state
+        .db
+        .install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.clone(),
+                name: package_name.clone(),
+                version: version.clone(),
+                runtime: runtime.clone(),
+                target_abi,
+                package,
+                manifest,
+            },
+            Some(user.id),
+        )
+        .await?;
+    let details =
+        format!("{package_name} {version} was registered with runtime status NotSupported.");
+    record_activity(
+        &state.db,
+        "Plugin installed",
+        Some(&details),
+        "Plugin",
+        Some(user.id),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn cancel_package_installation(
@@ -6424,25 +6460,52 @@ fn package_versions(package: &serde_json::Value) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+fn select_package_version(
+    package: &serde_json::Value,
+    requested_version: Option<&str>,
+) -> Option<serde_json::Value> {
+    let versions = package_versions(package);
+    if let Some(requested_version) = requested_version {
+        return versions.into_iter().find(|version| {
+            json_string_field(version, "Version")
+                .is_some_and(|version| version.eq_ignore_ascii_case(requested_version.trim()))
+        });
+    }
+    versions.into_iter().next()
+}
+
 async fn plugin_configuration(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_plugin_id): Path<String>,
+    Path(plugin_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Plugin not found"))
+    state
+        .db
+        .plugin_configuration_json(&plugin_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("Plugin not found"))
 }
 
 async fn update_plugin_configuration(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Path(_plugin_id): Path<String>,
-    Json(_payload): Json<serde_json::Value>,
+    Path(plugin_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    Err(ApiError::not_found("Plugin not found"))
+    if state
+        .db
+        .update_plugin_configuration_json(&plugin_id, payload)
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Plugin not found"))
+    }
 }
 
 async fn enable_plugin(
@@ -6451,11 +6514,18 @@ async fn enable_plugin(
     Query(query): Query<AuthQuery>,
     Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    known_catalog_plugin_or_not_found(&state.db, &plugin_id, Some(&version)).await?;
-    Err(ApiError::conflict(format!(
-        "Plugin enable is not implemented in Jellyrin yet: {plugin_id}"
-    )))
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_installed_plugin_version(&state.db, &plugin_id, &version).await?;
+    let last_error = "Runtime host is not implemented yet.";
+    if state
+        .db
+        .set_installed_plugin_status(&plugin_id, "NotSupported", Some(last_error), Some(user.id))
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Plugin not found"))
+    }
 }
 
 async fn disable_plugin(
@@ -6464,11 +6534,17 @@ async fn disable_plugin(
     Query(query): Query<AuthQuery>,
     Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    known_catalog_plugin_or_not_found(&state.db, &plugin_id, Some(&version)).await?;
-    Err(ApiError::conflict(format!(
-        "Plugin disable is not implemented in Jellyrin yet: {plugin_id}"
-    )))
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_installed_plugin_version(&state.db, &plugin_id, &version).await?;
+    if state
+        .db
+        .set_installed_plugin_status(&plugin_id, "Disabled", None, Some(user.id))
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Plugin not found"))
+    }
 }
 
 async fn uninstall_plugin_by_version(
@@ -6477,11 +6553,17 @@ async fn uninstall_plugin_by_version(
     Query(query): Query<AuthQuery>,
     Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    known_catalog_plugin_or_not_found(&state.db, &plugin_id, Some(&version)).await?;
-    Err(ApiError::conflict(format!(
-        "Plugin uninstall is not implemented in Jellyrin yet: {plugin_id}"
-    )))
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_installed_plugin_version(&state.db, &plugin_id, &version).await?;
+    if state
+        .db
+        .uninstall_plugin_state(&plugin_id, Some(user.id))
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Plugin not found"))
+    }
 }
 
 async fn uninstall_plugin(
@@ -6490,34 +6572,33 @@ async fn uninstall_plugin(
     Query(query): Query<AuthQuery>,
     Path(plugin_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    known_catalog_plugin_or_not_found(&state.db, &plugin_id, None).await?;
-    Err(ApiError::conflict(format!(
-        "Plugin uninstall is not implemented in Jellyrin yet: {plugin_id}"
-    )))
+    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if state
+        .db
+        .uninstall_plugin_state(&plugin_id, Some(user.id))
+        .await?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("Plugin not found"))
+    }
 }
 
-async fn known_catalog_plugin_or_not_found(
+async fn require_installed_plugin_version(
     db: &Database,
     plugin_id: &str,
-    version: Option<&str>,
-) -> Result<serde_json::Value, ApiError> {
-    package_infos_from_repositories(
-        &db.system_configuration_payloads()
-            .await?
-            .plugin_repositories,
-    )
-    .into_iter()
-    .find(|package| {
-        package_matches_plugin_id(package, plugin_id)
-            && version.is_none_or(|version| {
-                package_versions(package).iter().any(|candidate| {
-                    json_string_field(candidate, "Version")
-                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(version.trim()))
-                })
-            })
-    })
-    .ok_or_else(|| ApiError::not_found("Plugin not found"))
+    version: &str,
+) -> Result<(), ApiError> {
+    db.installed_plugins_json()
+        .await?
+        .into_iter()
+        .find(|plugin| {
+            json_string_field(plugin, "Id").is_some_and(|id| id.eq_ignore_ascii_case(plugin_id))
+                && json_string_field(plugin, "Version")
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(version.trim()))
+        })
+        .map(|_| ())
+        .ok_or_else(|| ApiError::not_found("Plugin not found"))
 }
 
 async fn plugin_manifest(
@@ -6527,6 +6608,9 @@ async fn plugin_manifest(
     Path(plugin_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(manifest) = state.db.installed_plugin_manifest(&plugin_id).await? {
+        return Ok(Json(manifest));
+    }
     if let Some(package) = package_infos_from_repositories(
         &state
             .db
@@ -37809,24 +37893,84 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let error: Value = serde_json::from_slice(&body).unwrap();
+        let installed_plugins: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(installed_plugins.as_array().unwrap().len(), 1);
+        assert_eq!(
+            installed_plugins[0]["Id"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(installed_plugins[0]["Name"], "Example Plugin");
+        assert_eq!(installed_plugins[0]["Version"], "1.0.0.0");
+        assert_eq!(installed_plugins[0]["Runtime"], "DotNetJellyfin");
+        assert_eq!(installed_plugins[0]["Status"], "NotSupported");
         assert!(
-            error["Message"]
+            installed_plugins[0]["LastError"]
                 .as_str()
                 .unwrap()
-                .contains("Package installation is not supported")
+                .contains("runtime host is not implemented")
         );
 
-        let package_task_key = package_install_task_key("11111111-1111-1111-1111-111111111111");
-        assert!(
-            db_for_assertions
-                .current_task_run(&package_task_key)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let configuration: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(configuration, json!({}));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Enabled": true }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/Configuration")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let configuration: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(configuration["Enabled"], true);
 
         let response = app
             .clone()
@@ -37840,14 +37984,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let package_task_key = package_install_task_key("11111111-1111-1111-1111-111111111111");
         assert!(
-            error["Message"]
-                .as_str()
+            db_for_assertions
+                .current_task_run(&package_task_key)
+                .await
                 .unwrap()
-                .contains("Package installation is not supported")
+                .is_none()
         );
 
         let response = app
@@ -37981,28 +38126,6 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/1.0.0.0/Enable")
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let error: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            error["Message"]
-                .as_str()
-                .unwrap()
-                .contains("Plugin enable is not implemented")
-        );
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
                     .uri("/Plugins/11111111-1111-1111-1111-111111111111/1.0.0.0/Disable")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -38010,14 +38133,59 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let error: Value = serde_json::from_slice(&body).unwrap();
+        let installed_plugins: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(installed_plugins[0]["Status"], "Disabled");
+        assert_eq!(installed_plugins[0]["LastError"], Value::Null);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/1.0.0.0/Enable")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let installed_plugins: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(installed_plugins[0]["Status"], "NotSupported");
         assert!(
-            error["Message"]
+            installed_plugins[0]["LastError"]
                 .as_str()
                 .unwrap()
-                .contains("Plugin disable is not implemented")
+                .contains("Runtime host is not implemented")
         );
 
         let response = app
@@ -38032,15 +38200,37 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let error: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            error["Message"]
-                .as_str()
-                .unwrap()
-                .contains("Plugin uninstall is not implemented")
-        );
+        let installed_plugins: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(installed_plugins.as_array().unwrap().len(), 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Packages/Installed/Example%20Plugin?Version=1.0.0.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
@@ -38054,15 +38244,23 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let error: Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            error["Message"]
-                .as_str()
-                .unwrap()
-                .contains("Plugin uninstall is not implemented")
-        );
+        let installed_plugins: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(installed_plugins.as_array().unwrap().len(), 0);
 
         let response = app
             .oneshot(

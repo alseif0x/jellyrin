@@ -13,7 +13,7 @@ const evidenceMarkdownPath = path.join(generatedDir, 'plugin-dual-runtime.md');
 
 async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
-  const testResult = await runCommand('cargo', [
+  const dbTestResult = await runCommand('cargo', [
     'test',
     '-p',
     'jellyrin-db',
@@ -21,35 +21,44 @@ async function main() {
     '--',
     '--nocapture',
   ]);
-  const passed = testResult.code === 0;
+  const apiTestResult = await runCommand('cargo', [
+    'test',
+    '-p',
+    'jellyrin-api',
+    'package_repositories_round_trip_system_configuration_payload',
+    '--',
+    '--nocapture',
+  ]);
+  const passed = dbTestResult.code === 0 && apiTestResult.code === 0;
   const evidence = {
     gate: 'plugin-dual-runtime',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 12 : 5,
+    percent: passed ? 22 : 5,
     closed: false,
-    sourcePhase: passed ? 'E1.P1' : 'E1.P1-attempted',
+    sourcePhase: passed ? 'E1.P1/E1.P2a/E1.P3a' : 'E1.P1/P2-attempted',
     evidence: passed
-      ? 'E1/P1 persistent plugin platform model is implemented and verified: plugin_repositories, package_catalog_cache, package_installations, installed_plugins, plugin_manifests, plugin_configurations, plugin_permissions, plugin_runtime_instances, plugin_host_events and plugin_audit_log exist; system_configuration_payloads.PluginRepositories migrates into the persistent repository/catalog model; repository and catalog state survive SQLite reopen.'
-      : 'E1/P1 persistent plugin platform model test failed; inspect command output before advancing plugin runtime work.',
+      ? 'E1/P1 persistent plugin platform model is implemented and verified; E1/P2a/P3a safe package lifecycle is implemented and verified: installing from a configured repository records package_installations, installed_plugins, manifest/config/permissions and audit state; /Plugins lists the installed plugin as NotSupported until a runtime host exists; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
+      : 'E1/P1/P2 persistent plugin platform or safe lifecycle tests failed; inspect command output before advancing plugin runtime work.',
     updatedAt: new Date().toISOString(),
-    completedTargets: passed ? ['persistent-plugin-model'] : [],
-    failedTargets: passed ? [] : ['persistent-plugin-model'],
+    completedTargets: passed ? ['persistent-plugin-model', 'safe-plugin-lifecycle'] : [],
+    failedTargets: passed ? [] : ['persistent-plugin-model-or-safe-plugin-lifecycle'],
     validatedCommands: [
       'cargo test -p jellyrin-db plugin_platform_state -- --nocapture',
+      'cargo test -p jellyrin-api package_repositories_round_trip_system_configuration_payload -- --nocapture',
     ],
     openRisks: [
       'DotNetJellyfin sidecar host is not implemented yet.',
       'RustWasi host and SDK are not implemented yet.',
-      'Package installation still rejects lifecycle operations until P2/P3 are implemented.',
+      'Package install records a safe NotSupported state; real host load/execute/unload is still pending.',
       'No real plugin fixture has been loaded or executed yet.',
     ],
   };
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
-  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, testResult));
+  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, [dbTestResult, apiTestResult]));
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
   if (!passed) {
-    process.exitCode = testResult.code || 1;
+    process.exitCode = dbTestResult.code || apiTestResult.code || 1;
   }
 }
 
@@ -76,7 +85,7 @@ function runCommand(command, args) {
   });
 }
 
-function renderMarkdown(evidence, testResult) {
+function renderMarkdown(evidence, testResults) {
   const lines = [];
   lines.push('# Plugin Dual Runtime Evidence');
   lines.push('');
@@ -94,11 +103,13 @@ function renderMarkdown(evidence, testResult) {
   for (const command of evidence.validatedCommands) {
     lines.push(`- \`${command}\``);
   }
-  if (testResult.stderr || testResult.stdout) {
+  if (testResults.some((testResult) => testResult.stderr || testResult.stdout)) {
     lines.push('');
     lines.push('## Command Result');
     lines.push('');
-    lines.push(`- Exit code: ${testResult.code}`);
+    testResults.forEach((testResult, index) => {
+      lines.push(`- Command ${index + 1} exit code: ${testResult.code}`);
+    });
   }
   lines.push('');
   lines.push('## Open Risks');
