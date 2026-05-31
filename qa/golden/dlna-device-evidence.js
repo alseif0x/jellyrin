@@ -16,6 +16,13 @@ const templatePath = path.join(manualEvidenceDir, 'template.json');
 const artifactsDir = path.join(manualEvidenceDir, 'artifacts');
 const allowedDeviceTypes = ['vlc', 'tv', 'console', 'upnp-control-point', 'renderer'];
 const allowedArtifactTypes = ['screenshot', 'client-log', 'server-log', 'packet-capture', 'screen-recording'];
+const artifactExtensionsByType = {
+  screenshot: ['.png', '.jpg', '.jpeg', '.webp'],
+  'client-log': ['.json', '.log', '.txt', '.har'],
+  'server-log': ['.json', '.log', '.txt'],
+  'packet-capture': ['.pcap', '.pcapng'],
+  'screen-recording': ['.mp4', '.mov', '.mkv', '.webm'],
+};
 let currentCommitCache = null;
 
 const requiredFlowChecks = [
@@ -231,7 +238,7 @@ async function validateManualDlnaEvidence(evidence) {
       if (typeof artifact.type === 'string' && !allowedArtifactTypes.includes(artifact.type)) {
         errors.push(`artifacts[${index}].type must be one of: ${allowedArtifactTypes.join(', ')}`);
       }
-      await requireExistingArtifact(errors, artifact.pathOrUrl, index);
+      await requireExistingArtifact(errors, artifact, index);
     }
   }
 
@@ -435,7 +442,8 @@ function validateTranscodeFallback(errors, transcodeFallback) {
   }
 }
 
-async function requireExistingArtifact(errors, pathOrUrl, index) {
+async function requireExistingArtifact(errors, artifact, index) {
+  const pathOrUrl = artifact.pathOrUrl;
   if (typeof pathOrUrl !== 'string' || pathOrUrl.trim() === '' || looksLikeTemplatePlaceholder(pathOrUrl)) {
     return;
   }
@@ -454,6 +462,7 @@ async function requireExistingArtifact(errors, pathOrUrl, index) {
     errors.push(`artifacts[${index}].pathOrUrl must stay under ${artifactsDir}`);
     return;
   }
+  requireArtifactExtension(errors, artifact.type, artifactPath, index);
   try {
     const stat = await fs.stat(artifactPath);
     if (!stat.isFile()) {
@@ -463,6 +472,16 @@ async function requireExistingArtifact(errors, pathOrUrl, index) {
     }
   } catch {
     errors.push(`artifacts[${index}].pathOrUrl file does not exist: ${artifactPath}`);
+  }
+}
+
+function requireArtifactExtension(errors, type, artifactPath, index) {
+  if (typeof type !== 'string' || !artifactExtensionsByType[type]) {
+    return;
+  }
+  const extension = path.extname(artifactPath).toLowerCase();
+  if (!artifactExtensionsByType[type].includes(extension)) {
+    errors.push(`artifacts[${index}].pathOrUrl extension must match ${type}: ${artifactExtensionsByType[type].join(', ')}`);
   }
 }
 
@@ -567,6 +586,12 @@ async function selfTest() {
       artifacts: [{ type: 'other', pathOrUrl: path.relative(plansDir, artifactPath) }],
     };
     await assertInvalid(invalidArtifactType, 'artifacts[0].type must be one of');
+
+    const mismatchedArtifactExtension = {
+      ...valid,
+      artifacts: [{ type: 'screenshot', pathOrUrl: path.relative(plansDir, artifactPath) }],
+    };
+    await assertInvalid(mismatchedArtifactExtension, 'artifacts[0].pathOrUrl extension must match screenshot');
 
     const externalArtifact = {
       ...valid,
