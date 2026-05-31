@@ -15,4 +15,5 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+jellyrin-plugin-sdk = { path = "../jellyrin-plugin-sdk" }
 tempfile.workspace = true

@@ -1014,6 +1014,7 @@ dependencies = [
  "anyhow",
  "base64",
  "jellyrin-plugin-rpc",
+ "jellyrin-plugin-sdk",
  "serde",
  "serde_json",
  "tempfile",

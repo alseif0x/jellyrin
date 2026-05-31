@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 
 pub const TARGET_ABI: &str = "jellyrin-wasi-0.1";
 pub const CAPABILITY_SCHEDULED_TASK: &str = "ScheduledTask";
@@ -31,7 +32,7 @@ impl ScheduledTaskRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ScheduledTaskResult {
     pub task_name: String,
@@ -176,7 +177,7 @@ impl ChannelResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PluginManifest {
     pub guid: String,
@@ -194,6 +195,8 @@ pub struct PluginManifest {
     pub web_pages: Vec<PluginWebPage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embedded_images: Vec<PluginEmbeddedImage>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capability_handlers: BTreeMap<String, CapabilityHandler>,
 }
 
 impl PluginManifest {
@@ -214,6 +217,7 @@ impl PluginManifest {
                 configuration: None,
                 web_pages: Vec::new(),
                 embedded_images: Vec::new(),
+                capability_handlers: BTreeMap::new(),
             },
         }
     }
@@ -254,6 +258,26 @@ impl PluginManifestBuilder {
         self
     }
 
+    pub fn capability_handler(
+        mut self,
+        capability: impl Into<String>,
+        handler: CapabilityHandler,
+    ) -> Self {
+        let capability = capability.into();
+        if !self
+            .manifest
+            .capabilities
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&capability))
+        {
+            self.manifest.capabilities.push(capability.clone());
+        }
+        self.manifest
+            .capability_handlers
+            .insert(capability, handler);
+        self
+    }
+
     pub fn build(self) -> PluginManifest {
         self.manifest
     }
@@ -288,6 +312,8 @@ pub struct PluginWebPage {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enable_in_main_menu: bool,
 }
 
 impl PluginWebPage {
@@ -296,11 +322,17 @@ impl PluginWebPage {
             name: name.into(),
             path: path.into(),
             display_name: None,
+            enable_in_main_menu: false,
         }
     }
 
     pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
         self.display_name = Some(display_name.into());
+        self
+    }
+
+    pub fn enable_in_main_menu(mut self) -> Self {
+        self.enable_in_main_menu = true;
         self
     }
 }
@@ -310,6 +342,8 @@ impl PluginWebPage {
 pub struct PluginEmbeddedImage {
     pub image_type: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 impl PluginEmbeddedImage {
@@ -317,7 +351,35 @@ impl PluginEmbeddedImage {
         Self {
             image_type: image_type.into(),
             path: path.into(),
+            mime_type: None,
         }
+    }
+
+    pub fn mime_type(mut self, mime_type: impl Into<String>) -> Self {
+        self.mime_type = Some(mime_type.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CapabilityHandler {
+    pub result: Value,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub echo_arguments: bool,
+}
+
+impl CapabilityHandler {
+    pub fn new(result: Value) -> Self {
+        Self {
+            result,
+            echo_arguments: false,
+        }
+    }
+
+    pub fn echo_arguments(mut self) -> Self {
+        self.echo_arguments = true;
+        self
     }
 }
 
@@ -404,6 +466,10 @@ fn flatten_result_object(object: &mut Map<String, Value>) {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,8 +484,20 @@ mod tests {
         .capability(CAPABILITY_SCHEDULED_TASK)
         .permission(PluginPermission::new("FileSystem").reason("Read fixture media"))
         .configuration(json!({ "Enabled": true }))
-        .web_page(PluginWebPage::new("fixture-config", "config.html").display_name("Fixture"))
-        .embedded_image(PluginEmbeddedImage::new("Primary", "logo.png"))
+        .web_page(
+            PluginWebPage::new("fixture-config", "config.html")
+                .display_name("Fixture")
+                .enable_in_main_menu(),
+        )
+        .embedded_image(PluginEmbeddedImage::new("Primary", "logo.png").mime_type("image/png"))
+        .capability_handler(
+            CAPABILITY_SCHEDULED_TASK,
+            CapabilityHandler::new(
+                CapabilityResponse::scheduled_task(ScheduledTaskResult::completed("Fixture Task"))
+                    .into_host_value(),
+            )
+            .echo_arguments(),
+        )
         .build()
         .into_json();
 
@@ -429,7 +507,17 @@ mod tests {
         assert_eq!(manifest["Permissions"][0]["Name"], "FileSystem");
         assert_eq!(manifest["Configuration"]["Enabled"], true);
         assert_eq!(manifest["WebPages"][0]["Name"], "fixture-config");
+        assert_eq!(manifest["WebPages"][0]["EnableInMainMenu"], true);
         assert_eq!(manifest["EmbeddedImages"][0]["ImageType"], "Primary");
+        assert_eq!(manifest["EmbeddedImages"][0]["MimeType"], "image/png");
+        assert_eq!(
+            manifest["CapabilityHandlers"]["ScheduledTask"]["Result"]["TaskName"],
+            "Fixture Task"
+        );
+        assert_eq!(
+            manifest["CapabilityHandlers"]["ScheduledTask"]["EchoArguments"],
+            true
+        );
     }
 
     #[test]

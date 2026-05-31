@@ -756,6 +756,11 @@ fn failure(
 mod tests {
     use super::*;
     use jellyrin_plugin_rpc::{PluginRpcJsonLineTransport, UpdateConfigurationRequest};
+    use jellyrin_plugin_sdk::{
+        CAPABILITY_SCHEDULED_TASK, CapabilityHandler, CapabilityResponse as SdkCapabilityResponse,
+        PluginEmbeddedImage as SdkPluginEmbeddedImage, PluginManifest as SdkPluginManifest,
+        PluginWebPage as SdkPluginWebPage, ScheduledTaskResult,
+    };
     use tempfile::tempdir;
     use tokio::io::BufReader;
 
@@ -808,30 +813,28 @@ mod tests {
                 runtime: PluginRuntime::RustWasi,
                 target_abi: "jellyrin-wasi-0.1".to_string(),
                 install_path: plugin_dir.to_string_lossy().to_string(),
-                manifest: json!({
-                    "Name": "WASI Fixture",
-                    "Capabilities": ["ScheduledTask"],
-                    "Configuration": { "IntervalMinutes": 15 },
-                    "WebPages": [{
-                        "Name": "wasi-config",
-                        "DisplayName": "WASI Config",
-                        "Path": "configuration.html",
-                        "EnableInMainMenu": true
-                    }],
-                    "Images": [{
-                        "ImageType": "Primary",
-                        "Path": "logo.png",
-                        "MimeType": "image/png"
-                    }],
-                    "CapabilityHandlers": {
-                        "ScheduledTask": {
-                            "EchoArguments": true,
-                            "Result": {
-                                "TaskName": "WASI Fixture Task"
-                            }
-                        }
-                    }
-                }),
+                manifest: SdkPluginManifest::builder("wasi-fixture", "WASI Fixture", "1.0.0")
+                    .configuration(json!({ "IntervalMinutes": 15 }))
+                    .web_page(
+                        SdkPluginWebPage::new("wasi-config", "configuration.html")
+                            .display_name("WASI Config")
+                            .enable_in_main_menu(),
+                    )
+                    .embedded_image(
+                        SdkPluginEmbeddedImage::new("Primary", "logo.png").mime_type("image/png"),
+                    )
+                    .capability_handler(
+                        CAPABILITY_SCHEDULED_TASK,
+                        CapabilityHandler::new(
+                            SdkCapabilityResponse::scheduled_task(ScheduledTaskResult::completed(
+                                "WASI Fixture Task",
+                            ))
+                            .into_host_value(),
+                        )
+                        .echo_arguments(),
+                    )
+                    .build()
+                    .into_json(),
                 permissions: Vec::new(),
             },
         );
