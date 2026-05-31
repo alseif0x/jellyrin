@@ -4021,6 +4021,10 @@ fn search_criteria_expression_matches(item: &MediaItem, criteria: &str) -> Optio
         return recognized.then_some(true);
     }
 
+    if let Some(negated) = strip_search_not(criteria) {
+        return search_criteria_expression_matches(item, negated).map(|matches| !matches);
+    }
+
     search_criteria_condition_matches(item, criteria)
 }
 
@@ -4037,6 +4041,9 @@ fn search_criteria_condition_matches(item: &MediaItem, criteria: &str) -> Option
     if let Some(value) = search_criteria_value(criteria, "dc:title =") {
         return Some(item.name.eq_ignore_ascii_case(&value));
     }
+    if let Some(matches) = search_relational_criteria(criteria, "dc:title", &item.name) {
+        return Some(matches);
+    }
     if let Some(value) = search_criteria_value(criteria, "upnp:class derivedfrom") {
         let class = didl_item_class(item).to_ascii_lowercase();
         return Some(class.starts_with(&value.to_ascii_lowercase()));
@@ -4051,11 +4058,19 @@ fn search_criteria_condition_matches(item: &MediaItem, criteria: &str) -> Option
         let value = value.to_ascii_lowercase();
         return Some(class == value || class.starts_with(&format!("{value}.")));
     }
+    if let Some(matches) = search_relational_criteria(criteria, "upnp:class", didl_item_class(item))
+    {
+        return Some(matches);
+    }
     if let Some(value) = search_criteria_value(criteria, "@id !=") {
         return Some(!search_item_id_matches(item, &value));
     }
     if let Some(value) = search_criteria_value(criteria, "@id =") {
         return Some(search_item_id_matches(item, &value));
+    }
+    if let Some(matches) = search_relational_criteria(criteria, "@id", &format!("item:{}", item.id))
+    {
+        return Some(matches);
     }
     for property in ["res@protocolinfo", "@protocolinfo", "protocolinfo"] {
         if let Some(value) = search_criteria_value(criteria, &format!("{property} contains")) {
@@ -4069,6 +4084,11 @@ fn search_criteria_condition_matches(item: &MediaItem, criteria: &str) -> Option
         if let Some(value) = search_criteria_value(criteria, &format!("{property} =")) {
             let protocol_info = item_protocol_info_for_search(item)?;
             return Some(protocol_info.eq_ignore_ascii_case(&value));
+        }
+        if let Some(protocol_info) = item_protocol_info_for_search(item)
+            && let Some(matches) = search_relational_criteria(criteria, property, &protocol_info)
+        {
+            return Some(matches);
         }
         if let Some(value) = search_criteria_value(criteria, &format!("{property} exists")) {
             return Some(search_exists_result(
@@ -4087,6 +4107,45 @@ fn search_criteria_condition_matches(item: &MediaItem, criteria: &str) -> Option
     }
 
     None
+}
+
+fn strip_search_not(criteria: &str) -> Option<&str> {
+    let criteria = criteria.trim();
+    let rest = criteria
+        .strip_prefix("not ")
+        .or_else(|| criteria.strip_prefix("NOT "))
+        .or_else(|| criteria.strip_prefix("Not "))?;
+    let rest = rest.trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
+fn search_relational_criteria(criteria: &str, property: &str, actual: &str) -> Option<bool> {
+    for operator in ["<=", ">=", "<", ">"] {
+        if let Some(expected) = search_criteria_value(criteria, &format!("{property} {operator}")) {
+            let ordering = compare_search_values(actual, &expected);
+            return Some(match operator {
+                "<=" => !ordering.is_gt(),
+                ">=" => !ordering.is_lt(),
+                "<" => ordering.is_lt(),
+                ">" => ordering.is_gt(),
+                _ => false,
+            });
+        }
+    }
+    None
+}
+
+fn compare_search_values(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_number = left.trim().parse::<f64>().ok();
+    let right_number = right.trim().parse::<f64>().ok();
+    if let (Some(left), Some(right)) = (left_number, right_number)
+        && let Some(ordering) = left.partial_cmp(&right)
+    {
+        return ordering;
+    }
+    left.to_ascii_lowercase()
+        .cmp(&right.to_ascii_lowercase())
+        .then_with(|| left.cmp(right))
 }
 
 fn search_text_contains(haystack: &str, needle: &str) -> bool {
@@ -5417,6 +5476,34 @@ mod tests {
         assert!(dlna_search_criteria_matches(
             &audio,
             r#"upnp:class != "object.item.videoItem" and res@protocolInfo contains "audio/mpeg""#
+        ));
+    }
+
+    #[test]
+    fn dlna_search_criteria_supports_not_and_relational_operators() {
+        let mut video = test_media_item("/media/Bravo Movie.mp4", "Video");
+        video.name = "Bravo Movie".to_string();
+        video.collection_type = Some("movies".to_string());
+
+        assert!(dlna_search_criteria_matches(
+            &video,
+            r#"not dc:title contains "Other""#
+        ));
+        assert!(!dlna_search_criteria_matches(
+            &video,
+            r#"not (dc:title contains "Bravo" or upnp:class derivedfrom "object.item.videoItem")"#
+        ));
+        assert!(dlna_search_criteria_matches(
+            &video,
+            r#"dc:title >= "Alpha" and dc:title < "Charlie""#
+        ));
+        assert!(dlna_search_criteria_matches(
+            &video,
+            r#"upnp:class >= "object.item.videoItem" and @id > "item:00000000-0000-0000-0000-000000000000""#
+        ));
+        assert!(dlna_search_criteria_matches(
+            &video,
+            r#"res@protocolInfo > "http-get:*:application/""#
         ));
     }
 
