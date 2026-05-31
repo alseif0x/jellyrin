@@ -367,7 +367,15 @@ function requireLanIpv4(errors, value, label) {
     [first, second, third, fourth].some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
   ) {
     errors.push(`${label} must be a LAN-reachable IPv4 address, not loopback, link-local, multicast, broadcast or unspecified`);
+    return;
   }
+  if (!isPrivateLanIpv4(first, second)) {
+    errors.push(`${label} must be a private LAN IPv4 address (10/8, 172.16/12, or 192.168/16)`);
+  }
+}
+
+function isPrivateLanIpv4(first, second) {
+  return first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168);
 }
 
 function requireDistinctIpv4(errors, firstIp, secondIp, firstLabel, secondLabel) {
@@ -679,6 +687,23 @@ async function selfTest() {
       network: { ...valid.network, deviceIp: 'not-an-ip' },
     };
     await assertInvalid(invalidDeviceIp, 'network.deviceIp must be an IPv4 address');
+
+    const publicServerIp = {
+      ...valid,
+      jellyrinBaseUrl: 'http://8.8.8.8:8097',
+      network: {
+        ...valid.network,
+        serverIp: '8.8.8.8',
+        ssdpLocation: 'http://8.8.8.8:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml',
+      },
+    };
+    await assertInvalid(publicServerIp, 'network.serverIp must be a private LAN IPv4 address');
+
+    const publicDeviceIp = {
+      ...valid,
+      network: { ...valid.network, deviceIp: '8.8.8.8' },
+    };
+    await assertInvalid(publicDeviceIp, 'network.deviceIp must be a private LAN IPv4 address');
 
     const sameDeviceAndServerIp = {
       ...valid,
