@@ -335,6 +335,8 @@ pub struct HandshakeResponse {
     pub server_name: String,
     pub server_version: String,
     pub minimum_call_timeout_ms: u64,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -564,6 +566,7 @@ mod tests {
                     server_name: "Jellyrin".to_string(),
                     server_version: "12.0.0".to_string(),
                     minimum_call_timeout_ms: 250,
+                    capabilities: vec!["Health".to_string()],
                 },
             );
             let bytes = encode_json_line(&response, MAX_MESSAGE_BYTES).unwrap();

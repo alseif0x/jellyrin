@@ -994,6 +994,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jellyrin-plugin-host-wasi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jellyrin-plugin-rpc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "jellyrin-plugin-rpc"
 version = "0.1.0"
 dependencies = [
