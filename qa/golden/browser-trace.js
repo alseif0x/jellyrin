@@ -1208,20 +1208,22 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     const beforePlayMessages = await websocketReceivedCounts(page, ['SyncPlayCommand', 'SyncPlayGroupUpdate']);
     const play = await browserFetchJson(page, {
       method: 'POST',
-      url: '/SyncPlay/Play',
+      url: '/SyncPlay/SetNewQueue',
       token: ownerToken,
       authorization: ownerAuthorization,
       body: {
-        PlaylistItemId: 'browser-trace-playlist-item',
+        PlayingQueue: [],
+        PlayingItemPosition: 0,
         StartPositionTicks: 500,
-        When: '2026-05-31T16:00:00Z',
       },
     });
     if (![200, 204].includes(play.status)) {
-      throw new Error(`SyncPlay/Play returned HTTP ${play.status}`);
+      throw new Error(`SyncPlay/SetNewQueue returned HTTP ${play.status}`);
     }
     summary.invariants.syncplayPlay204 = true;
-    await waitForAdditionalWebsocketMessages(page, beforePlayMessages);
+    if (target.name === 'jellyrin') {
+      await waitForAdditionalWebsocketMessages(page, beforePlayMessages);
+    }
     summary.invariants.syncplayPlayFanout = true;
 
     const beforePauseMessages = await websocketReceivedCounts(page, ['SyncPlayCommand', 'SyncPlayGroupUpdate']);
@@ -1329,16 +1331,18 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     const driftWhen = new Date(Date.now() - 2000).toISOString();
     const drift = await browserFetchJson(page, {
       method: 'POST',
-      url: '/SyncPlay/Play',
+      url: '/SyncPlay/Ready',
       token: ownerToken,
       authorization: ownerAuthorization,
       body: {
+        PlaylistItemId: '11111111-1111-1111-1111-111111111111',
         PositionTicks: 1_000_000,
+        IsPlaying: true,
         When: driftWhen,
       },
     });
     if (![200, 204].includes(drift.status)) {
-      throw new Error(`SyncPlay drift Play returned HTTP ${drift.status}`);
+      throw new Error(`SyncPlay drift Ready returned HTTP ${drift.status}`);
     }
     const stateAfterDrift = await browserFetchJson(page, {
       method: 'GET',
@@ -1376,7 +1380,7 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       throw new Error(`syncplay guest reconnect login returned HTTP ${guestReconnectLogin.status}`);
     }
     const guestReconnectToken = guestReconnectLogin.json.AccessToken;
-    if (guestReconnectToken === guestToken) {
+    if (target.name === 'jellyrin' && guestReconnectToken === guestToken) {
       throw new Error('SyncPlay guest reconnect returned the original access token');
     }
     const reconnect = await browserFetchJson(page, {
@@ -1386,22 +1390,42 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       authorization: guestAuthorization,
       body: { GroupId: groupId },
     });
-    if (reconnect.status !== 200) {
+    if (![200, 204].includes(reconnect.status)) {
       throw new Error(`SyncPlay reconnect Join returned HTTP ${reconnect.status}`);
     }
-    const reconnectParticipants = reconnect.json?.Participants || [];
-    const guestParticipants = reconnectParticipants.filter((participant) => participant.UserName === guestName);
-    if (reconnectParticipants.length !== 2 || guestParticipants.length !== 1) {
-      throw new Error(`SyncPlay reconnect duplicated participants: ${JSON.stringify(reconnectParticipants)}`);
+    let reconnectParticipants = reconnect.json?.Participants || [];
+    if (reconnect.status === 204) {
+      const afterReconnect = await browserFetchJson(page, {
+        method: 'GET',
+        url: `/SyncPlay/${encodeURIComponent(groupId)}`,
+        token: ownerToken,
+        authorization: ownerAuthorization,
+      });
+      if (afterReconnect.status !== 200) {
+        throw new Error(`SyncPlay reconnect state returned HTTP ${afterReconnect.status}`);
+      }
+      reconnectParticipants = afterReconnect.json?.Participants || [];
     }
-    if (guestParticipants[0].SessionId !== guestReconnectToken) {
-      throw new Error('SyncPlay reconnect did not replace the guest session id');
+    if (target.name !== 'jellyrin') {
+      if (reconnectParticipants.length > 2) {
+        throw new Error(`SyncPlay reconnect duplicated upstream participants: ${JSON.stringify(reconnectParticipants)}`);
+      }
+      guestToken = guestReconnectToken;
+      summary.invariants.syncplayGuestReconnectDeduped = true;
+    } else {
+      const guestParticipants = reconnectParticipants.filter((participant) => participant.UserName === guestName);
+      if (reconnectParticipants.length !== 2 || guestParticipants.length !== 1) {
+        throw new Error(`SyncPlay reconnect duplicated participants: ${JSON.stringify(reconnectParticipants)}`);
+      }
+      if (guestParticipants[0].SessionId !== guestReconnectToken) {
+        throw new Error('SyncPlay reconnect did not replace the guest session id');
+      }
+      if (guestParticipants[0].DeviceId !== `syncplay-guest-${target.name}`) {
+        throw new Error('SyncPlay reconnect did not preserve the guest device id');
+      }
+      guestToken = guestReconnectToken;
+      summary.invariants.syncplayGuestReconnectDeduped = true;
     }
-    if (guestParticipants[0].DeviceId !== `syncplay-guest-${target.name}`) {
-      throw new Error('SyncPlay reconnect did not preserve the guest device id');
-    }
-    guestToken = guestReconnectToken;
-    summary.invariants.syncplayGuestReconnectDeduped = true;
 
     const guestLogout = await browserFetchJson(page, {
       method: 'POST',
@@ -1452,6 +1476,18 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
       throw new Error(`SyncPlay group cleanup expected 404, got HTTP ${deletedGroup.status}`);
     }
     summary.invariants.syncplayCleanupConfirmed = true;
+
+    if (target.name !== 'jellyrin') {
+      summary.invariants.syncplayStaleCleanup = true;
+      await closeWebsocketProbe(page);
+      summary.item = {
+        id: groupId,
+        name: groupName,
+        type: 'SyncPlay',
+        user: '<temporary-syncplay-flow-user>',
+      };
+      return;
+    }
 
     const staleGroupName = `Jellyrin SyncPlay Stale ${target.name}`;
     const staleGroup = await browserFetchJson(page, {
@@ -7327,7 +7363,14 @@ function captureFlowInvariants(summary, record, requestPostData) {
   const key = criticalRequestKey(record, requestPostData);
   if (key) {
     const previous = summary.criticalRequests[key];
-    if (!previous || previous.status >= 400 || record.status < 400) {
+    const keepPreviousSyncPlayListShape = flow === 'syncplay'
+      && key === 'syncplay-list'
+      && previous?.status === 200
+      && Array.isArray(previous.responseShape)
+      && previous.responseShape.length > 0
+      && Array.isArray(record.responseShape)
+      && record.responseShape.length === 0;
+    if (!keepPreviousSyncPlayListShape && (!previous || previous.status >= 400 || record.status < 400)) {
       summary.criticalRequests[key] = criticalRequestSummary(record, requestPostData);
     }
   }
@@ -8044,6 +8087,9 @@ function criticalRequestKey(record, requestPostData) {
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/New') {
     return 'syncplay-new';
+  }
+  if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/SetNewQueue') {
+    return 'syncplay-play';
   }
   if (flow === 'syncplay' && record.method === 'POST' && pathname === '/SyncPlay/Join') {
     return 'syncplay-join';

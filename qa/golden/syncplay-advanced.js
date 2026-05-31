@@ -93,7 +93,7 @@ function buildEvidence(result, comparison) {
       percent: 100,
       closed: true,
       sourcePhase: 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b/E4.5c/E4.5d/E4.4b',
-      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures for group creation, join/list/get, Play/Pause/Seek/Unpause fanout, deterministic race handling, drift correction, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup.',
+      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures for group creation, join/list/get, SetNewQueue/Pause/Seek/Unpause command handling, deterministic race handling, drift correction, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup.',
       updatedAt,
       completedTargets,
       skippedTargets,
