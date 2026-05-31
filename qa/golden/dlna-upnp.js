@@ -39,6 +39,15 @@ const goldenCommands = [
     'test',
     '-p',
     'jellyrin-api',
+    'dlna_search_filters_by_title_class_and_container',
+    '--',
+    '--nocapture',
+  ],
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
     'ssdp',
     '--',
     '--nocapture',
@@ -118,10 +127,10 @@ function buildEvidence(result, discoveryEvidence) {
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? (discoveryPassed ? 93 : 92) : 87,
+    percent: passed ? (discoveryPassed ? 94 : 93) : 87,
     closed: false,
     sourcePhase: passed
-      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
+      ? `E3.1a/E3.1b${discoveryPassed ? '/E3.1c' : ''}/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.3f/E3.4b/E3.4c/E3.4d/E3.5a/E3.5b/E3.6a/E3.6b/E3.6c/E3.7a`
       : 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b',
     evidence: passed
       ? [
@@ -131,7 +140,7 @@ function buildEvidence(result, discoveryEvidence) {
           discoveryPassed
             ? 'The companion dlna-discovery golden validates a real local UDP M-SEARCH round trip.'
             : 'The companion dlna-discovery golden has not been completed in the current generated evidence.',
-          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
+          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,

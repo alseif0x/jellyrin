@@ -31892,6 +31892,30 @@ mod tests {
         let update_id_response = String::from_utf8(body.to_vec()).unwrap();
         assert!(update_id_response.contains(&format!("<Id>{expected_update_id}</Id>")));
 
+        let get_search_capabilities = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:GetSearchCapabilities xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1" />
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(get_search_capabilities))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let search_caps_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(search_caps_response.contains("<SearchCaps>"));
+        assert!(search_caps_response.contains("res@protocolInfo"));
+
         let browse = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Body>
@@ -32824,7 +32848,7 @@ mod tests {
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
-        let search_body = |container_id: &str, criteria: &str| {
+        let search_body = |container_id: &str, criteria: &str, sort_criteria: &str| {
             format!(
                 r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -32835,13 +32859,16 @@ mod tests {
       <Filter>*</Filter>
       <StartingIndex>0</StartingIndex>
       <RequestedCount>0</RequestedCount>
-      <SortCriteria></SortCriteria>
+      <SortCriteria>{sort_criteria}</SortCriteria>
     </u:Search>
   </s:Body>
 </s:Envelope>"#
             )
         };
-        let search = |app: axum::Router, container_id: String, criteria: String| async move {
+        let search = |app: axum::Router,
+                      container_id: String,
+                      criteria: String,
+                      sort_criteria: String| async move {
             let response = app
                 .oneshot(
                     Request::builder()
@@ -32849,7 +32876,11 @@ mod tests {
                         .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
                         .header(header::HOST, "media.example.test:8097")
                         .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
-                        .body(Body::from(search_body(&container_id, &criteria)))
+                        .body(Body::from(search_body(
+                            &container_id,
+                            &criteria,
+                            &sort_criteria,
+                        )))
                         .unwrap(),
                 )
                 .await
@@ -32864,6 +32895,7 @@ mod tests {
             "0".to_string(),
             r#"upnp:class derivedfrom "object.item.videoItem" and dc:title contains "Match""#
                 .to_string(),
+            "-dc:title".to_string(),
         )
         .await;
         assert!(root_response.contains("<u:SearchResponse"));
@@ -32872,15 +32904,39 @@ mod tests {
         assert!(root_response.contains("<UpdateID>"));
         assert!(root_response.contains("Match Movie"));
         assert!(root_response.contains("Nested Match"));
+        assert!(
+            root_response.find("Nested Match").unwrap()
+                < root_response.find("Match Movie").unwrap()
+        );
         assert!(!root_response.contains("Match Song"));
         assert!(!root_response.contains("Other Movie"));
+
+        let protocol_response = search(
+            app.clone(),
+            "0".to_string(),
+            r#"(dc:title doesNotContain "Other" and res@protocolInfo contains "video/mp4") or @id exists false"#
+                .to_string(),
+            "+dc:title".to_string(),
+        )
+        .await;
+        assert!(protocol_response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(protocol_response.contains("Match Movie"));
+        assert!(protocol_response.contains("Nested Match"));
+        assert!(!protocol_response.contains("Match Song"));
+        assert!(!protocol_response.contains("Other Movie"));
 
         let nested_id = format!(
             "dir:{}:{}",
             folder.id,
             URL_SAFE_NO_PAD.encode("Nested".as_bytes())
         );
-        let nested_response = search(app, nested_id.clone(), "*".to_string()).await;
+        let nested_response = search(
+            app,
+            nested_id.clone(),
+            "*".to_string(),
+            "+dc:title".to_string(),
+        )
+        .await;
         assert!(nested_response.contains("<NumberReturned>1</NumberReturned>"));
         assert!(nested_response.contains("Nested Match"));
         assert!(nested_response.contains(&format!("parentID=&quot;{}&quot;", nested_id)));

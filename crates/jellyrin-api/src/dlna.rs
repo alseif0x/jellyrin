@@ -280,7 +280,9 @@ pub(crate) async fn content_directory_control(
         return Ok(soap_fault_response(401, "Invalid Action"));
     };
     let response_body = match action.as_str() {
-        "getsearchcapabilities" => "<SearchCaps>dc:title,upnp:class,@id</SearchCaps>".to_string(),
+        "getsearchcapabilities" => {
+            "<SearchCaps>dc:title,upnp:class,@id,res@protocolInfo</SearchCaps>".to_string()
+        }
         "getsortcapabilities" => "<SortCaps>dc:title</SortCaps>".to_string(),
         "getsystemupdateid" => format!("<Id>{}</Id>", dlna_system_update_id()),
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
@@ -1468,13 +1470,15 @@ async fn browse_response(
     let object_id = soap_param(request, "ObjectID").unwrap_or_else(|| "0".to_string());
     let browse_flag =
         soap_param(request, "BrowseFlag").unwrap_or_else(|| "BrowseDirectChildren".to_string());
+    let sort_criteria = soap_param(request, "SortCriteria").unwrap_or_default();
     let browse_metadata = browse_flag.eq_ignore_ascii_case("BrowseMetadata");
     let (starting_index, requested_count) = browse_window(request);
     let payload = if is_root_object_id(&object_id) && browse_metadata {
         let child_count = db.virtual_folders().await?.len();
         BrowsePayload::metadata(didl_root_metadata(child_count))
     } else if is_root_object_id(&object_id) {
-        let folders = db.virtual_folders().await?;
+        let mut folders = db.virtual_folders().await?;
+        sort_virtual_folders(&mut folders, &sort_criteria);
         let total_matches = folders.len();
         let paged_folders = paged_slice(&folders, starting_index, requested_count);
         BrowsePayload::children(
@@ -1498,8 +1502,8 @@ async fn browse_response(
                 &folder,
                 &items,
                 "",
-                starting_index,
-                requested_count,
+                (starting_index, requested_count),
+                &sort_criteria,
                 server_id,
                 server_address,
             )?
@@ -1526,8 +1530,8 @@ async fn browse_response(
                 &folder,
                 &items,
                 &relative_path,
-                starting_index,
-                requested_count,
+                (starting_index, requested_count),
+                &sort_criteria,
                 server_id,
                 server_address,
             )?
@@ -1574,10 +1578,12 @@ async fn search_response(
 ) -> Result<String, ApiError> {
     let container_id = soap_param(request, "ContainerID").unwrap_or_else(|| "0".to_string());
     let criteria = soap_param(request, "SearchCriteria").unwrap_or_else(|| "*".to_string());
+    let sort_criteria = soap_param(request, "SortCriteria").unwrap_or_default();
     let (starting_index, requested_count) = browse_window(request);
     let folders = db.virtual_folders().await?;
     let mut items = search_container_items(db, &folders, &container_id).await?;
     items.retain(|item| dlna_search_criteria_matches(item, &criteria));
+    sort_media_items(&mut items, &sort_criteria);
     let total_matches = items.len();
     let paged_items = paged_slice(&items, starting_index, requested_count);
     let didl = didl_search_media_items(paged_items, &folders, server_id, server_address);
@@ -1714,12 +1720,14 @@ fn directory_browse_payload(
     folder: &VirtualFolder,
     items: &[MediaItem],
     relative_path: &str,
-    starting_index: usize,
-    requested_count: usize,
+    browse_window: (usize, usize),
+    sort_criteria: &str,
     server_id: Uuid,
     server_address: &str,
 ) -> Result<BrowsePayload, ApiError> {
-    let entries = directory_browse_entries(folder, items, relative_path);
+    let (starting_index, requested_count) = browse_window;
+    let mut entries = directory_browse_entries(folder, items, relative_path);
+    sort_browse_entries(&mut entries, sort_criteria);
     let total_matches = entries.len();
     let paged_entries = paged_slice(&entries, starting_index, requested_count);
     Ok(BrowsePayload::children(
@@ -2393,55 +2401,303 @@ fn join_relative_path(parent: &str, child: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DlnaSortDirection {
+    Ascending,
+    Descending,
+}
+
+fn dlna_title_sort_direction(sort_criteria: &str) -> Option<DlnaSortDirection> {
+    sort_criteria
+        .split(',')
+        .map(str::trim)
+        .filter(|criterion| !criterion.is_empty())
+        .find_map(|criterion| {
+            let (direction, field) = match criterion.as_bytes().first() {
+                Some(b'-') => (DlnaSortDirection::Descending, &criterion[1..]),
+                Some(b'+') => (DlnaSortDirection::Ascending, &criterion[1..]),
+                _ => (DlnaSortDirection::Ascending, criterion),
+            };
+            field
+                .trim()
+                .eq_ignore_ascii_case("dc:title")
+                .then_some(direction)
+        })
+}
+
+fn sort_virtual_folders(folders: &mut [VirtualFolder], sort_criteria: &str) {
+    if let Some(direction) = dlna_title_sort_direction(sort_criteria) {
+        folders.sort_by(|left, right| compare_dlna_titles(&left.name, &right.name, direction));
+    }
+}
+
+fn sort_media_items(items: &mut [MediaItem], sort_criteria: &str) {
+    if let Some(direction) = dlna_title_sort_direction(sort_criteria) {
+        items.sort_by(|left, right| {
+            compare_dlna_titles(&left.name, &right.name, direction)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+}
+
+fn sort_browse_entries(entries: &mut [DlnaBrowseEntry<'_>], sort_criteria: &str) {
+    if let Some(direction) = dlna_title_sort_direction(sort_criteria) {
+        entries.sort_by(|left, right| {
+            compare_dlna_titles(left.title(), right.title(), direction)
+                .then_with(|| left.id().cmp(&right.id()))
+        });
+    }
+}
+
+fn compare_dlna_titles(
+    left: &str,
+    right: &str,
+    direction: DlnaSortDirection,
+) -> std::cmp::Ordering {
+    let ordering = left
+        .to_ascii_lowercase()
+        .cmp(&right.to_ascii_lowercase())
+        .then_with(|| left.cmp(right));
+    match direction {
+        DlnaSortDirection::Ascending => ordering,
+        DlnaSortDirection::Descending => ordering.reverse(),
+    }
+}
+
 fn dlna_search_criteria_matches(item: &MediaItem, criteria: &str) -> bool {
     let criteria = unescape_xml(criteria.trim());
     if criteria.is_empty() || criteria == "*" {
         return true;
     }
 
-    let mut recognized = false;
-    if let Some(value) = search_criteria_value(&criteria, "dc:title contains") {
-        recognized = true;
-        if !item
-            .name
-            .to_ascii_lowercase()
-            .contains(&value.to_ascii_lowercase())
-        {
-            return false;
-        }
+    search_criteria_expression_matches(item, &criteria).unwrap_or(false)
+}
+
+fn search_criteria_expression_matches(item: &MediaItem, criteria: &str) -> Option<bool> {
+    let criteria = strip_wrapping_search_parentheses(criteria);
+    if criteria.is_empty() || criteria == "*" {
+        return Some(true);
     }
-    if let Some(value) = search_criteria_value(&criteria, "dc:title =") {
-        recognized = true;
-        if !item.name.eq_ignore_ascii_case(&value) {
-            return false;
+
+    let or_terms = split_search_criteria_logical(criteria, "or");
+    if or_terms.len() > 1 {
+        let mut recognized = false;
+        for term in or_terms {
+            if let Some(matches) = search_criteria_expression_matches(item, term) {
+                recognized = true;
+                if matches {
+                    return Some(true);
+                }
+            }
         }
+        return recognized.then_some(false);
     }
-    if let Some(value) = search_criteria_value(&criteria, "upnp:class derivedfrom") {
-        recognized = true;
+
+    let and_terms = split_search_criteria_logical(criteria, "and");
+    if and_terms.len() > 1 {
+        let mut recognized = false;
+        for term in and_terms {
+            if let Some(matches) = search_criteria_expression_matches(item, term) {
+                recognized = true;
+                if !matches {
+                    return Some(false);
+                }
+            } else {
+                return None;
+            }
+        }
+        return recognized.then_some(true);
+    }
+
+    search_criteria_condition_matches(item, criteria)
+}
+
+fn search_criteria_condition_matches(item: &MediaItem, criteria: &str) -> Option<bool> {
+    if let Some(value) = search_criteria_value(criteria, "dc:title doesnotcontain") {
+        return Some(!search_text_contains(&item.name, &value));
+    }
+    if let Some(value) = search_criteria_value(criteria, "dc:title contains") {
+        return Some(search_text_contains(&item.name, &value));
+    }
+    if let Some(value) = search_criteria_value(criteria, "dc:title !=") {
+        return Some(!item.name.eq_ignore_ascii_case(&value));
+    }
+    if let Some(value) = search_criteria_value(criteria, "dc:title =") {
+        return Some(item.name.eq_ignore_ascii_case(&value));
+    }
+    if let Some(value) = search_criteria_value(criteria, "upnp:class derivedfrom") {
         let class = didl_item_class(item).to_ascii_lowercase();
-        if !class.starts_with(&value.to_ascii_lowercase()) {
-            return false;
-        }
+        return Some(class.starts_with(&value.to_ascii_lowercase()));
     }
-    if let Some(value) = search_criteria_value(&criteria, "upnp:class =") {
-        recognized = true;
+    if let Some(value) = search_criteria_value(criteria, "upnp:class !=") {
         let class = didl_item_class(item).to_ascii_lowercase();
         let value = value.to_ascii_lowercase();
-        if class != value && !class.starts_with(&format!("{value}.")) {
-            return false;
+        return Some(class != value && !class.starts_with(&format!("{value}.")));
+    }
+    if let Some(value) = search_criteria_value(criteria, "upnp:class =") {
+        let class = didl_item_class(item).to_ascii_lowercase();
+        let value = value.to_ascii_lowercase();
+        return Some(class == value || class.starts_with(&format!("{value}.")));
+    }
+    if let Some(value) = search_criteria_value(criteria, "@id !=") {
+        return Some(!search_item_id_matches(item, &value));
+    }
+    if let Some(value) = search_criteria_value(criteria, "@id =") {
+        return Some(search_item_id_matches(item, &value));
+    }
+    for property in ["res@protocolinfo", "@protocolinfo", "protocolinfo"] {
+        if let Some(value) = search_criteria_value(criteria, &format!("{property} contains")) {
+            let protocol_info = item_protocol_info_for_search(item)?;
+            return Some(search_text_contains(&protocol_info, &value));
+        }
+        if let Some(value) = search_criteria_value(criteria, &format!("{property} !=")) {
+            let protocol_info = item_protocol_info_for_search(item)?;
+            return Some(!protocol_info.eq_ignore_ascii_case(&value));
+        }
+        if let Some(value) = search_criteria_value(criteria, &format!("{property} =")) {
+            let protocol_info = item_protocol_info_for_search(item)?;
+            return Some(protocol_info.eq_ignore_ascii_case(&value));
+        }
+        if let Some(value) = search_criteria_value(criteria, &format!("{property} exists")) {
+            return Some(search_exists_result(
+                item_protocol_info_for_search(item).is_some(),
+                &value,
+            ));
         }
     }
-    if let Some(value) = search_criteria_value(&criteria, "@id =") {
-        recognized = true;
-        let item_id = format!("item:{}", item.id);
-        if !item_id.eq_ignore_ascii_case(&value)
-            && !item.id.to_string().eq_ignore_ascii_case(&value)
-        {
-            return false;
+    for property in ["dc:title", "upnp:class", "@id"] {
+        if let Some(value) = search_criteria_value(criteria, &format!("{property} exists")) {
+            return Some(search_exists_result(
+                search_property_exists(item, property)?,
+                &value,
+            ));
         }
     }
 
-    recognized
+    None
+}
+
+fn search_text_contains(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+fn search_item_id_matches(item: &MediaItem, value: &str) -> bool {
+    let item_id = format!("item:{}", item.id);
+    item_id.eq_ignore_ascii_case(value) || item.id.to_string().eq_ignore_ascii_case(value)
+}
+
+fn item_protocol_info_for_search(item: &MediaItem) -> Option<String> {
+    let mime_type = dlna_mime_type(item)?;
+    Some(dlna_protocol_info_for_item(item, mime_type))
+}
+
+fn search_property_exists(item: &MediaItem, property: &str) -> Option<bool> {
+    match property {
+        "dc:title" => Some(!item.name.trim().is_empty()),
+        "upnp:class" | "@id" => Some(true),
+        _ => None,
+    }
+}
+
+fn search_exists_result(exists: bool, expected: &str) -> bool {
+    match expected.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => exists,
+        "false" | "0" | "no" => !exists,
+        _ => false,
+    }
+}
+
+fn split_search_criteria_logical<'a>(criteria: &'a str, operator: &str) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut depth = 0_usize;
+
+    for (index, ch) in criteria.char_indices() {
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+
+        if depth == 0 && logical_operator_at(criteria, index, operator) {
+            let part = criteria[start..index].trim();
+            if !part.is_empty() {
+                parts.push(part);
+            }
+            start = index + operator.len();
+        }
+    }
+
+    if parts.is_empty() {
+        return vec![criteria.trim()];
+    }
+    let tail = criteria[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+fn logical_operator_at(criteria: &str, index: usize, operator: &str) -> bool {
+    let Some(candidate) = criteria.get(index..index.saturating_add(operator.len())) else {
+        return false;
+    };
+    if !candidate.eq_ignore_ascii_case(operator) {
+        return false;
+    }
+    let before = criteria[..index].chars().next_back();
+    let after = criteria[index + operator.len()..].chars().next();
+    before.is_some_and(char::is_whitespace) && after.is_some_and(char::is_whitespace)
+}
+
+fn strip_wrapping_search_parentheses(value: &str) -> &str {
+    let mut value = value.trim();
+    loop {
+        if !(value.starts_with('(') && value.ends_with(')')) {
+            return value;
+        }
+        if !outer_search_parentheses_wrap(value) {
+            return value;
+        }
+        value = value[1..value.len() - 1].trim();
+    }
+}
+
+fn outer_search_parentheses_wrap(value: &str) -> bool {
+    let last_index = value.len() - 1;
+    let mut quote = None;
+    let mut depth = 0_usize;
+    for (index, ch) in value.char_indices() {
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index != last_index {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 fn search_criteria_value(criteria: &str, token: &str) -> Option<String> {
@@ -3291,6 +3547,65 @@ mod tests {
         let asf = test_media_item("/media/movie.asf", "Video");
         assert_eq!(dlna_mime_type(&asf), Some("video/x-ms-asf"));
         assert_eq!(dlna_profile_name_for_item(&asf, "video/x-ms-asf"), None);
+    }
+
+    #[test]
+    fn dlna_search_criteria_supports_boolean_protocol_and_exists() {
+        let mut video = test_media_item("/media/Match Movie.mp4", "Video");
+        video.name = "Match Movie".to_string();
+        video.collection_type = Some("movies".to_string());
+
+        assert!(dlna_search_criteria_matches(
+            &video,
+            r#"(upnp:class derivedfrom "object.item.videoItem" and dc:title doesNotContain "Other") and res@protocolInfo contains "video/mp4""#
+        ));
+        assert!(dlna_search_criteria_matches(
+            &video,
+            &format!(r#"@id = "item:{}" and dc:title exists true"#, video.id)
+        ));
+        assert!(dlna_search_criteria_matches(
+            &video,
+            r#"dc:title contains "Song" or dc:title = "Match Movie""#
+        ));
+        assert!(!dlna_search_criteria_matches(
+            &video,
+            r#"upnp:class != "object.item.videoItem""#
+        ));
+        assert!(!dlna_search_criteria_matches(
+            &video,
+            r#"res@protocolInfo exists false"#
+        ));
+
+        let mut audio = test_media_item("/media/Match Song.mp3", "Audio");
+        audio.name = "Match Song".to_string();
+        assert!(dlna_search_criteria_matches(
+            &audio,
+            r#"upnp:class != "object.item.videoItem" and res@protocolInfo contains "audio/mpeg""#
+        ));
+    }
+
+    #[test]
+    fn dlna_sort_criteria_orders_items_by_title_direction() {
+        let mut items = vec![
+            {
+                let mut item = test_media_item("/media/b.mp4", "Video");
+                item.name = "Bravo".to_string();
+                item
+            },
+            {
+                let mut item = test_media_item("/media/a.mp4", "Video");
+                item.name = "Alpha".to_string();
+                item
+            },
+        ];
+
+        sort_media_items(&mut items, "+dc:title");
+        assert_eq!(items[0].name, "Alpha");
+        assert_eq!(items[1].name, "Bravo");
+
+        sort_media_items(&mut items, "-dc:title");
+        assert_eq!(items[0].name, "Bravo");
+        assert_eq!(items[1].name, "Alpha");
     }
 
     fn test_media_item(path: &str, media_type: &str) -> MediaItem {
