@@ -41,8 +41,11 @@ const UPNP_SERVICE_NS: &str = "urn:schemas-upnp-org:service-1-0";
 const SOAP_ENV_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const CONTENT_DIRECTORY_SERVICE: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
 const CONNECTION_MANAGER_SERVICE: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
+const MEDIA_RECEIVER_REGISTRAR_SERVICE: &str =
+    "urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1";
 const CONTENT_DIRECTORY_ID: &str = "urn:upnp-org:serviceId:ContentDirectory";
 const CONNECTION_MANAGER_ID: &str = "urn:upnp-org:serviceId:ConnectionManager";
+const MEDIA_RECEIVER_REGISTRAR_ID: &str = "urn:microsoft.com:serviceId:X_MS_MediaReceiverRegistrar";
 const UPNP_ROOT_DEVICE: &str = "upnp:rootdevice";
 const MEDIA_SERVER_DEVICE: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 static DLNA_EVENT_SUBSCRIPTIONS: LazyLock<StdMutex<HashMap<String, DlnaEventSubscription>>> =
@@ -175,6 +178,14 @@ pub(crate) async fn connection_manager_scpd(
     Ok(xml_response(connection_manager_service_xml()))
 }
 
+pub(crate) async fn media_receiver_registrar_scpd(
+    State(state): State<AppState>,
+    Path(server_id): Path<String>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    Ok(xml_response(media_receiver_registrar_service_xml()))
+}
+
 pub(crate) async fn icon(
     State(state): State<AppState>,
     Path((server_id, file_name)): Path<(String, String)>,
@@ -226,6 +237,30 @@ pub(crate) async fn connection_manager_control(
     };
     Ok(soap_response(
         CONNECTION_MANAGER_SERVICE,
+        action_response_name(&action),
+        body,
+    ))
+}
+
+pub(crate) async fn media_receiver_registrar_control(
+    State(state): State<AppState>,
+    Path(server_id): Path<String>,
+    body: BodyBytes,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let request = String::from_utf8_lossy(&body);
+    let Some(action) = soap_action(&request) else {
+        return Ok(soap_fault_response(401, "Invalid Action"));
+    };
+    let body = match action.as_str() {
+        "isauthorized" | "isvalidated" => "<Result>1</Result>".to_string(),
+        "registerdevice" => "<RegistrationRespMsg></RegistrationRespMsg>".to_string(),
+        _ => {
+            return Ok(soap_fault_response(401, "Invalid Action"));
+        }
+    };
+    Ok(soap_response(
+        MEDIA_RECEIVER_REGISTRAR_SERVICE,
         action_response_name(&action),
         body,
     ))
@@ -295,6 +330,16 @@ pub(crate) async fn connection_manager_events(
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
     event_subscription_response(DlnaEventService::ConnectionManager, &method, &headers)
+}
+
+pub(crate) async fn media_receiver_registrar_events(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    event_subscription_response(DlnaEventService::MediaReceiverRegistrar, &method, &headers)
 }
 
 pub(crate) async fn media_stream(
@@ -587,6 +632,7 @@ fn sanitize_dlna_image_path_segment(value: &str) -> String {
 enum DlnaEventService {
     ContentDirectory,
     ConnectionManager,
+    MediaReceiverRegistrar,
 }
 
 #[derive(Clone, Debug)]
@@ -899,6 +945,10 @@ fn event_initial_properties(service: DlnaEventService) -> Vec<(&'static str, Str
             ("SourceProtocolInfo", dlna_protocol_info().to_string()),
             ("SinkProtocolInfo", String::new()),
             ("CurrentConnectionIDs", "0".to_string()),
+        ],
+        DlnaEventService::MediaReceiverRegistrar => vec![
+            ("AuthorizationDeniedUpdateID", "0".to_string()),
+            ("ValidationRevokedUpdateID", "0".to_string()),
         ],
     }
 }
@@ -1269,7 +1319,7 @@ fn root_device_xml(context: &DlnaContext, server_address: &str) -> String {
          <UDN>uuid:{}</UDN>\
          <iconList><icon><mimetype>image/png</mimetype><width>1</width><height>1</height><depth>24</depth><url>{}/icons/logo.png</url></icon></iconList>\
          <presentationURL>{}/web/index.html</presentationURL>\
-         <serviceList>{}{}</serviceList>\
+         <serviceList>{}{}{}</serviceList>\
          </device>\
         </root>",
         escape_xml(&context.server_name),
@@ -1291,6 +1341,13 @@ fn root_device_xml(context: &DlnaContext, server_address: &str) -> String {
             &format!("{base}/connectionmanager/connectionmanager.xml"),
             &format!("{base}/connectionmanager/control"),
             &format!("{base}/connectionmanager/events"),
+        ),
+        service_description(
+            MEDIA_RECEIVER_REGISTRAR_SERVICE,
+            MEDIA_RECEIVER_REGISTRAR_ID,
+            &format!("{base}/mediareceiverregistrar/mediareceiverregistrar.xml"),
+            &format!("{base}/mediareceiverregistrar/control"),
+            &format!("{base}/mediareceiverregistrar/events"),
         )
     )
 }
@@ -1344,6 +1401,13 @@ fn connection_manager_service_xml() -> String {
     dlna_service_xml(
         CONNECTION_MANAGER_ACTIONS,
         CONNECTION_MANAGER_STATE_VARIABLES,
+    )
+}
+
+fn media_receiver_registrar_service_xml() -> String {
+    dlna_service_xml(
+        MEDIA_RECEIVER_REGISTRAR_ACTIONS,
+        MEDIA_RECEIVER_REGISTRAR_STATE_VARIABLES,
     )
 }
 
@@ -2477,6 +2541,9 @@ fn soap_action(xml: &str) -> Option<String> {
         "X_GetFeatureList",
         "Browse",
         "Search",
+        "IsAuthorized",
+        "IsValidated",
+        "RegisterDevice",
     ]
     .into_iter()
     .find(|action| {
@@ -2550,6 +2617,9 @@ fn action_response_name(action: &str) -> String {
         "x_getfeaturelist" => "X_GetFeatureListResponse",
         "browse" => "BrowseResponse",
         "search" => "SearchResponse",
+        "isauthorized" => "IsAuthorizedResponse",
+        "isvalidated" => "IsValidatedResponse",
+        "registerdevice" => "RegisterDeviceResponse",
         _ => "UnknownResponse",
     }
     .to_string()
@@ -2851,6 +2921,54 @@ const CONNECTION_MANAGER_ACTIONS: &[DlnaAction] = &[
     },
 ];
 
+const MEDIA_RECEIVER_REGISTRAR_ACTIONS: &[DlnaAction] = &[
+    DlnaAction {
+        name: "IsAuthorized",
+        arguments: &[
+            DlnaArgument {
+                name: "DeviceID",
+                direction: "in",
+                related_state_variable: "A_ARG_TYPE_DeviceID",
+            },
+            DlnaArgument {
+                name: "Result",
+                direction: "out",
+                related_state_variable: "A_ARG_TYPE_Result",
+            },
+        ],
+    },
+    DlnaAction {
+        name: "IsValidated",
+        arguments: &[
+            DlnaArgument {
+                name: "DeviceID",
+                direction: "in",
+                related_state_variable: "A_ARG_TYPE_DeviceID",
+            },
+            DlnaArgument {
+                name: "Result",
+                direction: "out",
+                related_state_variable: "A_ARG_TYPE_Result",
+            },
+        ],
+    },
+    DlnaAction {
+        name: "RegisterDevice",
+        arguments: &[
+            DlnaArgument {
+                name: "RegistrationReqMsg",
+                direction: "in",
+                related_state_variable: "A_ARG_TYPE_RegistrationReqMsg",
+            },
+            DlnaArgument {
+                name: "RegistrationRespMsg",
+                direction: "out",
+                related_state_variable: "A_ARG_TYPE_RegistrationRespMsg",
+            },
+        ],
+    },
+];
+
 const CONTENT_DIRECTORY_STATE_VARIABLES: &[DlnaStateVariable] = &[
     DlnaStateVariable {
         name: "SearchCapabilities",
@@ -2996,6 +3114,45 @@ const CONNECTION_MANAGER_STATE_VARIABLES: &[DlnaStateVariable] = &[
     DlnaStateVariable {
         name: "A_ARG_TYPE_RcsID",
         data_type: "ui4",
+        sends_events: false,
+        allowed_values: &[],
+    },
+];
+
+const MEDIA_RECEIVER_REGISTRAR_STATE_VARIABLES: &[DlnaStateVariable] = &[
+    DlnaStateVariable {
+        name: "AuthorizationDeniedUpdateID",
+        data_type: "ui4",
+        sends_events: true,
+        allowed_values: &[],
+    },
+    DlnaStateVariable {
+        name: "ValidationRevokedUpdateID",
+        data_type: "ui4",
+        sends_events: true,
+        allowed_values: &[],
+    },
+    DlnaStateVariable {
+        name: "A_ARG_TYPE_DeviceID",
+        data_type: "string",
+        sends_events: false,
+        allowed_values: &[],
+    },
+    DlnaStateVariable {
+        name: "A_ARG_TYPE_Result",
+        data_type: "int",
+        sends_events: false,
+        allowed_values: &[],
+    },
+    DlnaStateVariable {
+        name: "A_ARG_TYPE_RegistrationReqMsg",
+        data_type: "bin.base64",
+        sends_events: false,
+        allowed_values: &[],
+    },
+    DlnaStateVariable {
+        name: "A_ARG_TYPE_RegistrationRespMsg",
+        data_type: "bin.base64",
         sends_events: false,
         allowed_values: &[],
     },

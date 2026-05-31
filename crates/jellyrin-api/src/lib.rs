@@ -420,6 +420,30 @@ pub fn router(state: AppState) -> Router {
             get(dlna::connection_manager_scpd),
         )
         .route(
+            "/Dlna/{server_id}/MediaReceiverRegistrar",
+            get(dlna::media_receiver_registrar_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/mediareceiverregistrar",
+            get(dlna::media_receiver_registrar_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/MediaReceiverRegistrar/MediaReceiverRegistrar",
+            get(dlna::media_receiver_registrar_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/mediareceiverregistrar/mediareceiverregistrar",
+            get(dlna::media_receiver_registrar_scpd),
+        )
+        .route(
+            "/Dlna/{server_id}/MediaReceiverRegistrar/MediaReceiverRegistrar.xml",
+            get(dlna::media_receiver_registrar_scpd),
+        )
+        .route(
+            "/dlna/{server_id}/mediareceiverregistrar/mediareceiverregistrar.xml",
+            get(dlna::media_receiver_registrar_scpd),
+        )
+        .route(
             "/Dlna/{server_id}/ContentDirectory/Control",
             post(dlna::content_directory_control),
         )
@@ -450,6 +474,22 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/dlna/{server_id}/connectionmanager/events",
             any(dlna::connection_manager_events),
+        )
+        .route(
+            "/Dlna/{server_id}/MediaReceiverRegistrar/Control",
+            post(dlna::media_receiver_registrar_control),
+        )
+        .route(
+            "/dlna/{server_id}/mediareceiverregistrar/control",
+            post(dlna::media_receiver_registrar_control),
+        )
+        .route(
+            "/Dlna/{server_id}/MediaReceiverRegistrar/Events",
+            any(dlna::media_receiver_registrar_events),
+        )
+        .route(
+            "/dlna/{server_id}/mediareceiverregistrar/events",
+            any(dlna::media_receiver_registrar_events),
         )
         .route("/Dlna/{server_id}/icons/{file_name}", get(dlna::icon))
         .route("/dlna/{server_id}/icons/{file_name}", get(dlna::icon))
@@ -28989,6 +29029,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -31730,6 +31771,9 @@ mod tests {
         assert!(
             description.contains("<serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>")
         );
+        assert!(description.contains(
+            "<serviceId>urn:microsoft.com:serviceId:X_MS_MediaReceiverRegistrar</serviceId>"
+        ));
         assert!(description.contains(&format!(
             "http://media.example.test:8097/dlna/{server_id}/contentdirectory/contentdirectory.xml"
         )));
@@ -31738,6 +31782,9 @@ mod tests {
         )));
         assert!(description.contains(&format!(
             "http://media.example.test:8097/dlna/{server_id}/connectionmanager/events"
+        )));
+        assert!(description.contains(&format!(
+            "http://media.example.test:8097/dlna/{server_id}/mediareceiverregistrar/events"
         )));
 
         let response = app
@@ -31778,6 +31825,26 @@ mod tests {
         let connection_manager = String::from_utf8(body.to_vec()).unwrap();
         assert!(connection_manager.contains("<action><name>GetProtocolInfo</name>"));
         assert!(connection_manager.contains("<name>SourceProtocolInfo</name>"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/mediareceiverregistrar/mediareceiverregistrar.xml"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let registrar = String::from_utf8(body.to_vec()).unwrap();
+        assert!(registrar.contains("<action><name>IsAuthorized</name>"));
+        assert!(registrar.contains("<action><name>IsValidated</name>"));
+        assert!(registrar.contains("<action><name>RegisterDevice</name>"));
+        assert!(registrar.contains("<name>AuthorizationDeniedUpdateID</name>"));
 
         let response = app
             .clone()
@@ -31865,6 +31932,7 @@ mod tests {
   </s:Body>
 </s:Envelope>"#;
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -31886,6 +31954,57 @@ mod tests {
         assert!(
             protocol_response.contains("http-get:*:image/png:DLNA.ORG_PN=PNG_LRG;DLNA.ORG_OP=01")
         );
+
+        let is_authorized = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:IsAuthorized xmlns:u="urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1">
+      <DeviceID>uuid:test-renderer</DeviceID>
+    </u:IsAuthorized>
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/MediaReceiverRegistrar/Control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(is_authorized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let authorization_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(authorization_response.contains("<u:IsAuthorizedResponse"));
+        assert!(authorization_response.contains("<Result>1</Result>"));
+
+        let register_device = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:RegisterDevice xmlns:u="urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1">
+      <RegistrationReqMsg></RegistrationReqMsg>
+    </u:RegisterDevice>
+  </s:Body>
+</s:Envelope>"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/dlna/{server_id}/mediareceiverregistrar/control"))
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(register_device))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let register_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(register_response.contains("<u:RegisterDeviceResponse"));
+        assert!(register_response.contains("<RegistrationRespMsg></RegistrationRespMsg>"));
     }
 
     #[tokio::test]
