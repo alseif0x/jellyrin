@@ -17,6 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const HOST_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_ID: &str = "jellyrin-plugin-host-wasi";
+const TARGET_ABI: &str = "jellyrin-wasi-0.1";
 const HOST_CAPABILITIES: &[&str] = &[
     "Handshake",
     "LoadPlugin",
@@ -192,6 +193,34 @@ async fn handle_load_plugin(
             envelope.correlation_id,
             PluginRpcErrorCode::InvalidRequest,
             "WASI host can only load RustWasi plugins.",
+        );
+    }
+    if !request.target_abi.eq_ignore_ascii_case(TARGET_ABI) {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::InvalidRequest,
+            format!(
+                "RustWasi target ABI {} is not supported by this host.",
+                request.target_abi
+            ),
+        );
+    }
+    if let Some(manifest_target_abi) = manifest_target_abi(&request.manifest)
+        && !manifest_target_abi.eq_ignore_ascii_case(TARGET_ABI)
+    {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::InvalidRequest,
+            format!("RustWasi manifest target ABI {manifest_target_abi} is not supported."),
+        );
+    }
+    if let Some(missing_permission) =
+        first_missing_manifest_permission(&request.manifest, &request.permissions)
+    {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PermissionDenied,
+            format!("RustWasi permission {missing_permission} was not granted."),
         );
     }
     let wasm_files = match find_wasm_files(Path::new(&request.install_path)).await {
@@ -561,6 +590,42 @@ fn manifest_capabilities(manifest: &Value) -> Vec<String> {
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn manifest_target_abi(manifest: &Value) -> Option<&str> {
+    manifest.get("TargetAbi").and_then(Value::as_str)
+}
+
+fn first_missing_manifest_permission(manifest: &Value, granted: &[String]) -> Option<String> {
+    manifest_permissions(manifest)
+        .into_iter()
+        .find(|permission| {
+            !granted
+                .iter()
+                .any(|granted| granted.eq_ignore_ascii_case(permission))
+        })
+}
+
+fn manifest_permissions(manifest: &Value) -> Vec<String> {
+    manifest
+        .get("Permissions")
+        .and_then(Value::as_array)
+        .map(|permissions| {
+            permissions
+                .iter()
+                .filter_map(|permission| {
+                    permission.as_str().or_else(|| {
+                        permission
+                            .get("Name")
+                            .or_else(|| permission.get("Permission"))
+                            .and_then(Value::as_str)
+                    })
+                })
+                .filter(|permission| !permission.trim().is_empty())
+                .map(|permission| permission.trim().to_string())
                 .collect()
         })
         .unwrap_or_default()
@@ -1003,5 +1068,90 @@ mod tests {
             response.error.as_ref().unwrap().code,
             PluginRpcErrorCode::PluginNotLoaded
         );
+    }
+
+    #[tokio::test]
+    async fn wasi_host_rejects_incompatible_abi_and_ungranted_permissions() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("fixture.wasm"), b"\0asm")
+            .await
+            .unwrap();
+
+        let mut state = WasiHostState::default();
+        let incompatible_abi = PluginRpcEnvelope::new(
+            "corr-abi",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "abi-mismatch".to_string(),
+                name: "ABI Mismatch".to_string(),
+                version: "1.0.0".to_string(),
+                runtime: PluginRuntime::RustWasi,
+                target_abi: "jellyrin-wasi-99.0".to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "ABI Mismatch",
+                    "TargetAbi": "jellyrin-wasi-99.0"
+                }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, incompatible_abi).await;
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            PluginRpcErrorCode::InvalidRequest
+        );
+
+        let ungranted_permission = PluginRpcEnvelope::new(
+            "corr-permission",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "permission-missing".to_string(),
+                name: "Permission Missing".to_string(),
+                version: "1.0.0".to_string(),
+                runtime: PluginRuntime::RustWasi,
+                target_abi: TARGET_ABI.to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "Permission Missing",
+                    "TargetAbi": TARGET_ABI,
+                    "Permissions": [{ "Name": "Network" }]
+                }),
+                permissions: vec!["FileSystem".to_string()],
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, ungranted_permission).await;
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            PluginRpcErrorCode::PermissionDenied
+        );
+
+        let granted_permission = PluginRpcEnvelope::new(
+            "corr-permission-granted",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "permission-granted".to_string(),
+                name: "Permission Granted".to_string(),
+                version: "1.0.0".to_string(),
+                runtime: PluginRuntime::RustWasi,
+                target_abi: TARGET_ABI.to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "Permission Granted",
+                    "TargetAbi": TARGET_ABI,
+                    "Capabilities": ["ScheduledTask"],
+                    "Permissions": [{ "Name": "Network" }]
+                }),
+                permissions: vec!["Network".to_string()],
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, granted_permission).await;
+        assert!(response.ok);
     }
 }
