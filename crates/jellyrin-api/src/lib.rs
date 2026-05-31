@@ -47,9 +47,9 @@ use jellyrin_db::{
     UpsertTranscodeSession,
 };
 use jellyrin_plugin_rpc::{
-    HandshakeRequest, HandshakeResponse, LoadPluginRequest, LoadedPlugin,
+    EmbeddedImageRequest, HandshakeRequest, HandshakeResponse, LoadPluginRequest, LoadedPlugin,
     PLUGIN_RPC_PROTOCOL_VERSION, PluginHealth, PluginHostStdioClient, PluginIdentity,
-    PluginRpcEnvelope, PluginRpcMethod, PluginRuntime, UpdateConfigurationRequest,
+    PluginRpcEnvelope, PluginRpcMethod, PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -8855,6 +8855,17 @@ async fn plugin_image(
     Path((plugin_id, version)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some((bytes, content_type)) =
+        plugin_image_from_runtime_host(&state.db, &plugin_id, &version).await?
+    {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+        headers.insert(
+            header::CACHE_CONTROL,
+            "public, max-age=3600".parse().unwrap(),
+        );
+        return Ok((headers, bytes).into_response());
+    }
     if let Some(path) = plugin_image_path_from_catalog(
         &state
             .db
@@ -8877,6 +8888,87 @@ async fn plugin_image(
         return stream_path(path, content_type, &headers, true).await;
     }
     Ok(placeholder_png_response())
+}
+
+async fn plugin_image_from_runtime_host(
+    db: &Database,
+    plugin_id: &str,
+    version: &str,
+) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Ok(None);
+    };
+    if !json_string_field(&plugin, "Version")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case(version.trim())
+    {
+        return Ok(None);
+    }
+    let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(&plugin)
+    else {
+        return Ok(None);
+    };
+    plugin_image_from_runtime_host_path(
+        &plugin,
+        version,
+        "Primary",
+        runtime,
+        runtime_name,
+        error_prefix,
+        host_path,
+    )
+    .await
+}
+
+async fn plugin_image_from_runtime_host_path(
+    plugin: &serde_json::Value,
+    version: &str,
+    image_type: &str,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
+    host_path: PathBuf,
+) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let Some(plugin_id) = json_string_field(plugin, "Id") else {
+        return Ok(None);
+    };
+    let Some((mut client, loaded_version)) =
+        load_plugin_runtime_host_with_path(plugin, runtime, runtime_name, error_prefix, host_path)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let image = PluginRpcEnvelope::new(
+        format!("{plugin_id}:embedded-image"),
+        PluginRpcMethod::GetEmbeddedImage,
+        EmbeddedImageRequest {
+            plugin_id,
+            version: if version.trim().is_empty() {
+                loaded_version
+            } else {
+                version.to_string()
+            },
+            image_type: image_type.to_string(),
+        },
+    );
+    let response = client
+        .call::<_, serde_json::Value>(&image, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| ApiError::internal(format!("Plugin host image read failed: {error}")))?;
+    let Some(result) = rpc_result(response)? else {
+        let _ = client.shutdown().await;
+        return Ok(None);
+    };
+    let _ = client.shutdown().await;
+    let Some(encoded) = json_string_field(&result, "Base64Data") else {
+        return Ok(None);
+    };
+    let bytes = general_purpose::STANDARD.decode(encoded).map_err(|error| {
+        ApiError::internal(format!("Plugin host image payload failed: {error}"))
+    })?;
+    let content_type = json_string_field(&result, "MimeType")
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(Some((bytes, content_type)))
 }
 
 fn plugin_image_path_from_catalog(
@@ -9974,6 +10066,7 @@ async fn dashboard_configuration_pages(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let mut pages = discover_dashboard_configuration_pages(&state.web_dir).await?;
+    pages.extend(plugin_configuration_pages_from_runtime_hosts(&state.db).await?);
     if query.enable_in_main_menu == Some(true) {
         pages.retain(|page| {
             page.get("EnableInMainMenu")
@@ -9982,6 +10075,81 @@ async fn dashboard_configuration_pages(
         });
     }
     Ok(Json(pages))
+}
+
+async fn plugin_configuration_pages_from_runtime_hosts(
+    db: &Database,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut pages = Vec::new();
+    for plugin in db.installed_plugins_json().await? {
+        let Some((runtime, runtime_name, error_prefix, host_path)) =
+            plugin_runtime_host_path(&plugin)
+        else {
+            continue;
+        };
+        if let Some(plugin_pages) = plugin_configuration_pages_from_runtime_host_path(
+            &plugin,
+            runtime,
+            runtime_name,
+            error_prefix,
+            host_path,
+        )
+        .await?
+        {
+            pages.extend(plugin_pages);
+        }
+    }
+    Ok(pages)
+}
+
+async fn plugin_configuration_pages_from_runtime_host_path(
+    plugin: &serde_json::Value,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
+    host_path: PathBuf,
+) -> Result<Option<Vec<serde_json::Value>>, ApiError> {
+    let Some(plugin_id) = json_string_field(plugin, "Id") else {
+        return Ok(None);
+    };
+    let Some((mut client, version)) =
+        load_plugin_runtime_host_with_path(plugin, runtime, runtime_name, error_prefix, host_path)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let request = PluginRpcEnvelope::new(
+        format!("{plugin_id}:web-pages"),
+        PluginRpcMethod::ListWebPages,
+        PluginIdentity {
+            plugin_id: plugin_id.clone(),
+            version,
+        },
+    );
+    let response = client
+        .call::<_, Vec<PluginWebPage>>(&request, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| ApiError::internal(format!("Plugin host page list failed: {error}")))?;
+    let pages = rpc_result(response)?.map(|pages| {
+        pages
+            .into_iter()
+            .map(plugin_web_page_json)
+            .collect::<Vec<_>>()
+    });
+    let _ = client.shutdown().await;
+    Ok(pages)
+}
+
+fn plugin_web_page_json(page: PluginWebPage) -> serde_json::Value {
+    serde_json::json!({
+        "Name": page.name,
+        "DisplayName": page.display_name,
+        "PluginId": page.plugin_id,
+        "EnableInMainMenu": page.enable_in_main_menu,
+        "MenuSection": "plugins",
+        "MenuIcon": "extension",
+        "EmbeddedResourcePath": page.path
+    })
 }
 
 async fn dashboard_configuration_page(
@@ -30997,8 +31165,9 @@ mod tests {
         package_infos_from_repositories, package_install_task_key, paged_media_items,
         parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
         parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
-        plugin_configuration_from_runtime_host_path, plugin_package_operation,
-        plugin_packages_root, reconcile_live_tv_recordings_on_startup,
+        plugin_configuration_from_runtime_host_path,
+        plugin_configuration_pages_from_runtime_host_path, plugin_image_from_runtime_host_path,
+        plugin_package_operation, plugin_packages_root, reconcile_live_tv_recordings_on_startup,
         reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
         reserve_live_tv_recording_start, router, run_due_live_tv_timers, series_timer_child_id,
         spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
@@ -31737,6 +31906,76 @@ mod tests {
         assert_eq!(persisted["Enabled"], false);
     }
 
+    #[tokio::test]
+    async fn dotnet_pages_and_images_use_stdio_host() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "88888888-8888-8888-8888-888888888888";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("Jellyfin.Plugin.Visual.dll"), b"dll")
+            .await
+            .unwrap();
+        let host_path = fake_dotnet_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Visual DotNet".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "DotNetJellyfin".to_string(),
+                target_abi: "12.0.0.0".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Visual DotNet",
+                    "Runtime": "DotNetJellyfin"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Visual DotNet",
+                    "Version": "1.0.0.0",
+                    "Runtime": "DotNetJellyfin",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    }
+                }),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        let pages = plugin_configuration_pages_from_runtime_host_path(
+            &plugin,
+            PluginRuntime::DotNetJellyfin,
+            "DotNetJellyfin",
+            "DotNet",
+            host_path.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(pages[0]["Name"], "dotnet-config");
+        assert_eq!(pages[0]["PluginId"], plugin_id);
+        assert_eq!(pages[0]["EmbeddedResourcePath"], "configuration.html");
+
+        let (bytes, content_type) = plugin_image_from_runtime_host_path(
+            &plugin,
+            "1.0.0.0",
+            "Primary",
+            PluginRuntime::DotNetJellyfin,
+            "DotNetJellyfin",
+            "DotNet",
+            host_path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(content_type, "image/png");
+        assert_eq!(bytes, b"dotnet-image");
+    }
+
     async fn fake_rust_wasi_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-wasi-host.sh");
         tokio::fs::write(
@@ -31801,6 +32040,14 @@ while IFS= read -r line; do
       ;;
     UpdateConfiguration)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Enabled":false}}\n' "$corr"
+      ;;
+    ListWebPages)
+      plugin_id="${line#*\"PluginId\":\"}"
+      plugin_id="${plugin_id%%\"*}"
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":[{"PluginId":"%s","Name":"dotnet-config","DisplayName":"DotNet Config","Path":"configuration.html","EnableInMainMenu":true}]}\n' "$corr" "$plugin_id"
+      ;;
+    GetEmbeddedImage)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"66666666-6666-6666-6666-666666666666","ImageType":"Primary","MimeType":"image/png","Base64Data":"ZG90bmV0LWltYWdl"}}\n' "$corr"
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"66666666-6666-6666-6666-666666666666","Runtime":"DotNetJellyfin","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
