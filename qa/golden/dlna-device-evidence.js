@@ -13,8 +13,11 @@ const templatePath = path.join(manualEvidenceDir, 'template.json');
 const requiredFlowChecks = [
   'serverVisibleInControlPoint',
   'rootDescriptorFetched',
+  'iconListFetched',
   'contentDirectoryBrowse',
   'mediaItemVisible',
+  'thumbnailFetched',
+  'subtitleLinkResolved',
   'playbackStarted',
   'playbackStable',
   'streamUrlFetched',
@@ -104,6 +107,9 @@ async function validateManualDlnaEvidence(evidence) {
     return ['evidence must be a JSON object'];
   }
 
+  if (evidence.schema !== manualEvidenceTemplate().schema) {
+    errors.push(`schema must be ${manualEvidenceTemplate().schema}`);
+  }
   for (const field of ['deviceName', 'deviceType', 'controlPointName', 'controlPointVersion', 'testedAt', 'tester', 'jellyrinBaseUrl', 'result']) {
     requireString(errors, evidence, field);
   }
@@ -163,6 +169,17 @@ async function validateManualDlnaEvidence(evidence) {
     if (!Number.isFinite(playbackSeconds) || playbackSeconds < 10) {
       errors.push('media.playbackSeconds must be at least 10');
     }
+    for (const check of ['thumbnailStatusOk', 'subtitleStatusOk']) {
+      if (evidence.media[check] !== true) {
+        errors.push(`media.${check} must be true`);
+      }
+    }
+    if (
+      evidence.media.subtitleMime !== 'text/vtt' &&
+      evidence.media.subtitleMime !== 'text/vtt; charset=utf-8'
+    ) {
+      errors.push('media.subtitleMime must be text/vtt or text/vtt; charset=utf-8');
+    }
   }
 
   if (!evidence.flow || typeof evidence.flow !== 'object' || Array.isArray(evidence.flow)) {
@@ -220,7 +237,7 @@ function summarizeManualDlnaEvidence(report) {
 
 function manualEvidenceTemplate() {
   return {
-    schema: 'jellyrin-dlna-device-evidence-v2',
+    schema: 'jellyrin-dlna-device-evidence-v3',
     deviceName: 'replace-with-tv-vlc-or-renderer-name',
     deviceType: 'vlc|tv|console|upnp-control-point|renderer',
     controlPointName: 'VLC / TV media browser / BubbleUPnP / other',
@@ -249,6 +266,9 @@ function manualEvidenceTemplate() {
       playMethod: 'HLS',
       streamStatus: 200,
       playbackSeconds: 30,
+      thumbnailStatusOk: true,
+      subtitleStatusOk: true,
+      subtitleMime: 'text/vtt; charset=utf-8',
     },
     transcodeFallback: {
       profileRequiresTranscode: true,
