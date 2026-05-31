@@ -45,6 +45,46 @@ async function main() {
   assertIncludes(scpd, '<name>Browse</name>', 'ContentDirectory Browse action');
   assertIncludes(scpd, '<name>Search</name>', 'ContentDirectory Search action');
 
+  const contentDirectoryUrl = new URL(`/dlna/${serverId}/contentdirectory/control`, baseUrl);
+  const browseRoot = await postSoap(
+    contentDirectoryUrl,
+    'urn:schemas-upnp-org:service:ContentDirectory:1',
+    'Browse',
+    [
+      '<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">',
+      '<ObjectID>0</ObjectID>',
+      '<BrowseFlag>BrowseDirectChildren</BrowseFlag>',
+      '<Filter>*</Filter>',
+      '<StartingIndex>0</StartingIndex>',
+      '<RequestedCount>10</RequestedCount>',
+      '<SortCriteria></SortCriteria>',
+      '</u:Browse>',
+    ].join(''),
+  );
+  assertIncludes(browseRoot, '<u:BrowseResponse', 'ContentDirectory Browse response');
+  assertIncludes(browseRoot, '<Result>', 'ContentDirectory Browse DIDL payload');
+  assertIncludes(browseRoot, '<NumberReturned>', 'ContentDirectory Browse NumberReturned');
+  assertIncludes(browseRoot, '<TotalMatches>', 'ContentDirectory Browse TotalMatches');
+  assertIncludes(browseRoot, '<UpdateID>', 'ContentDirectory Browse UpdateID');
+
+  const searchRoot = await postSoap(
+    contentDirectoryUrl,
+    'urn:schemas-upnp-org:service:ContentDirectory:1',
+    'Search',
+    [
+      '<u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">',
+      '<ContainerID>0</ContainerID>',
+      '<SearchCriteria>upnp:class derivedfrom "object.item"</SearchCriteria>',
+      '<Filter>*</Filter>',
+      '<StartingIndex>0</StartingIndex>',
+      '<RequestedCount>10</RequestedCount>',
+      '<SortCriteria>+dc:title</SortCriteria>',
+      '</u:Search>',
+    ].join(''),
+  );
+  assertIncludes(searchRoot, '<u:SearchResponse', 'ContentDirectory Search response');
+  assertIncludes(searchRoot, '<Result>', 'ContentDirectory Search DIDL payload');
+
   const connectionManager = await postSoap(
     new URL(`/dlna/${serverId}/connectionmanager/control`, baseUrl),
     'urn:schemas-upnp-org:service:ConnectionManager:1',
@@ -83,6 +123,7 @@ async function main() {
   assertIncludes(registerDevice, '<u:RegisterDeviceResponse', 'MediaReceiverRegistrar RegisterDevice response');
   assertIncludes(registerDevice, '<RegistrationRespMsg>', 'MediaReceiverRegistrar RegisterDevice payload');
 
+  const mediaProbe = await probeMediaRoutes({ baseUrl, serverId, itemId: options.itemId, subtitleIndex: options.subtitleIndex });
   const draft = buildDraftEvidence({
     baseUrl,
     commit,
@@ -100,13 +141,18 @@ async function main() {
     descriptor: descriptionUrl.toString(),
     iconBytes: icon.length,
     soapChecks: [
+      'ContentDirectory.Browse',
+      'ContentDirectory.Search',
       'ConnectionManager.GetProtocolInfo',
       'MediaReceiverRegistrar.IsAuthorized',
       'MediaReceiverRegistrar.IsValidated',
       'MediaReceiverRegistrar.RegisterDevice',
     ],
+    mediaProbe,
     draftPath: path.relative(plansDir, outputPath),
-    nextStep: 'Replace placeholders in the draft after VLC/TV discovery, playback, thumbnail and subtitle checks.',
+    nextStep: mediaProbe.status === 'skipped'
+      ? 'Re-run preflight with --item-id and optionally --subtitle-index after choosing a media item, then replace placeholders after VLC/TV discovery and playback.'
+      : 'Replace placeholders in the draft after VLC/TV discovery, playback, thumbnail and subtitle checks.',
   }, null, 2));
 }
 
@@ -117,8 +163,14 @@ function parseArgs(args) {
     if (arg === '--base-url') {
       options.baseUrl = args[index + 1];
       index += 1;
+    } else if (arg === '--item-id') {
+      options.itemId = args[index + 1];
+      index += 1;
+    } else if (arg === '--subtitle-index') {
+      options.subtitleIndex = args[index + 1];
+      index += 1;
     } else if (arg === '--help' || arg === '-h') {
-      console.log('Usage: node qa/golden/dlna-device-preflight.js [--base-url http://host:8097]');
+      console.log('Usage: node qa/golden/dlna-device-preflight.js [--base-url http://host:8097] [--item-id <uuid>] [--subtitle-index <n>]');
       process.exit(0);
     } else {
       throw new Error(`unknown argument: ${arg}`);
@@ -160,6 +212,73 @@ async function fetchBytes(url) {
     throw new Error(`GET ${url} failed with HTTP ${response.status}`);
   }
   return Buffer.from(await response.arrayBuffer());
+}
+
+async function probeMediaRoutes({ baseUrl, serverId, itemId, subtitleIndex }) {
+  if (!itemId) {
+    return {
+      status: 'skipped',
+      reason: 'pass --item-id to validate DLNA thumbnail and optional subtitle route readiness before the device run',
+    };
+  }
+
+  const thumbnailUrl = new URL(`/dlna/${serverId}/items/${encodeURIComponent(itemId)}/thumbnail.png`, baseUrl);
+  const thumbnail = await fetchWithHeaders(thumbnailUrl);
+  if (!thumbnail.ok) {
+    throw new Error(`GET ${thumbnailUrl} failed with HTTP ${thumbnail.status}`);
+  }
+  if (!String(thumbnail.headers.get('content-type') || '').toLowerCase().startsWith('image/')) {
+    throw new Error(`DLNA thumbnail route returned unexpected content-type: ${thumbnail.headers.get('content-type')}`);
+  }
+  const thumbnailBytes = Buffer.from(await thumbnail.arrayBuffer());
+  if (thumbnailBytes.length < 8) {
+    throw new Error('DLNA thumbnail route returned an empty body');
+  }
+
+  const probe = {
+    status: 'passed',
+    itemId,
+    thumbnail: {
+      status: thumbnail.status,
+      contentType: thumbnail.headers.get('content-type'),
+      bytes: thumbnailBytes.length,
+    },
+  };
+
+  if (subtitleIndex !== undefined) {
+    const subtitleUrl = new URL(
+      `/dlna/${serverId}/items/${encodeURIComponent(itemId)}/subtitles/${encodeURIComponent(subtitleIndex)}/stream.vtt`,
+      baseUrl,
+    );
+    const subtitle = await fetchWithHeaders(subtitleUrl);
+    if (!subtitle.ok) {
+      throw new Error(`GET ${subtitleUrl} failed with HTTP ${subtitle.status}`);
+    }
+    const subtitleContentType = String(subtitle.headers.get('content-type') || '').toLowerCase();
+    if (!subtitleContentType.startsWith('text/vtt')) {
+      throw new Error(`DLNA subtitle route returned unexpected content-type: ${subtitle.headers.get('content-type')}`);
+    }
+    const text = await subtitle.text();
+    if (!text.includes('WEBVTT')) {
+      throw new Error('DLNA subtitle route did not return a WEBVTT payload');
+    }
+    probe.subtitle = {
+      index: subtitleIndex,
+      status: subtitle.status,
+      contentType: subtitle.headers.get('content-type'),
+      bytes: Buffer.byteLength(text),
+    };
+  }
+
+  return probe;
+}
+
+async function fetchWithHeaders(url) {
+  return fetch(url, {
+    headers: {
+      'user-agent': 'Jellyrin DLNA device preflight',
+    },
+  });
 }
 
 async function postSoap(url, serviceType, action, body) {
