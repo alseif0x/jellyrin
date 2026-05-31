@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{io, time::Duration};
+use tokio::{
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
 
 pub const PLUGIN_RPC_PROTOCOL_VERSION: u16 = 1;
+pub const DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -150,8 +156,24 @@ impl PluginRpcError {
 pub enum PluginRpcCodecError {
     #[error("plugin RPC message is larger than {limit} bytes")]
     MessageTooLarge { limit: usize },
+    #[error("plugin RPC stream ended before a complete message was read")]
+    UnexpectedEof,
     #[error("plugin RPC JSON codec failed: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PluginRpcTransportError {
+    #[error(transparent)]
+    Codec(#[from] PluginRpcCodecError),
+    #[error("plugin RPC I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("plugin RPC call timed out after {timeout_ms}ms")]
+    Timeout { timeout_ms: u64 },
+    #[error("plugin RPC response correlation mismatch: expected {expected}, got {actual}")]
+    CorrelationMismatch { expected: String, actual: String },
+    #[error("plugin host process did not expose {stream} pipe")]
+    MissingPipe { stream: &'static str },
 }
 
 pub fn encode_json_line<T: Serialize>(
@@ -175,6 +197,124 @@ pub fn decode_json_line<T: for<'de> Deserialize<'de>>(
         return Err(PluginRpcCodecError::MessageTooLarge { limit: max_bytes });
     }
     Ok(serde_json::from_slice(line)?)
+}
+
+pub struct PluginRpcJsonLineTransport<R, W> {
+    reader: R,
+    writer: W,
+    max_message_bytes: usize,
+}
+
+impl<R, W> PluginRpcJsonLineTransport<R, W>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn new(reader: R, writer: W) -> Self {
+        Self::with_max_message_bytes(reader, writer, DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES)
+    }
+
+    pub fn with_max_message_bytes(reader: R, writer: W, max_message_bytes: usize) -> Self {
+        Self {
+            reader,
+            writer,
+            max_message_bytes,
+        }
+    }
+
+    pub async fn send<T: Serialize>(
+        &mut self,
+        envelope: &PluginRpcEnvelope<T>,
+    ) -> Result<(), PluginRpcTransportError> {
+        let bytes = encode_json_line(envelope, self.max_message_bytes)?;
+        self.writer.write_all(&bytes).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    pub async fn read_response<T: for<'de> Deserialize<'de>>(
+        &mut self,
+    ) -> Result<PluginRpcResponse<T>, PluginRpcTransportError> {
+        let mut line = Vec::new();
+        let bytes_read = self.reader.read_until(b'\n', &mut line).await?;
+        if bytes_read == 0 {
+            return Err(PluginRpcCodecError::UnexpectedEof.into());
+        }
+        decode_json_line(&line, self.max_message_bytes).map_err(Into::into)
+    }
+
+    pub async fn call<Req, Resp>(
+        &mut self,
+        envelope: &PluginRpcEnvelope<Req>,
+        timeout: Duration,
+    ) -> Result<PluginRpcResponse<Resp>, PluginRpcTransportError>
+    where
+        Req: Serialize,
+        Resp: for<'de> Deserialize<'de>,
+    {
+        let timeout_ms = timeout.as_millis().try_into().unwrap_or(u64::MAX);
+        let response = tokio::time::timeout(timeout, async {
+            self.send(envelope).await?;
+            self.read_response::<Resp>().await
+        })
+        .await
+        .map_err(|_| PluginRpcTransportError::Timeout { timeout_ms })??;
+
+        if response.correlation_id != envelope.correlation_id {
+            return Err(PluginRpcTransportError::CorrelationMismatch {
+                expected: envelope.correlation_id.clone(),
+                actual: response.correlation_id,
+            });
+        }
+        Ok(response)
+    }
+}
+
+pub struct PluginHostStdioClient {
+    child: Child,
+    transport: PluginRpcJsonLineTransport<BufReader<ChildStdout>, ChildStdin>,
+}
+
+impl PluginHostStdioClient {
+    pub fn spawn(command: &mut Command) -> Result<Self, PluginRpcTransportError> {
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(PluginRpcTransportError::MissingPipe { stream: "stdin" })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(PluginRpcTransportError::MissingPipe { stream: "stdout" })?;
+        Ok(Self {
+            child,
+            transport: PluginRpcJsonLineTransport::new(BufReader::new(stdout), stdin),
+        })
+    }
+
+    pub async fn call<Req, Resp>(
+        &mut self,
+        envelope: &PluginRpcEnvelope<Req>,
+        timeout: Duration,
+    ) -> Result<PluginRpcResponse<Resp>, PluginRpcTransportError>
+    where
+        Req: Serialize,
+        Resp: for<'de> Deserialize<'de>,
+    {
+        self.transport.call(envelope, timeout).await
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), PluginRpcTransportError> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill().await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +440,7 @@ pub struct PluginHostLogEvent {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     const MAX_MESSAGE_BYTES: usize = 4096;
 
@@ -402,5 +543,117 @@ mod tests {
             error,
             PluginRpcCodecError::MessageTooLarge { limit: 32 }
         ));
+    }
+
+    #[tokio::test]
+    async fn json_line_transport_calls_host_and_checks_correlation() {
+        let (client_stream, host_stream) = tokio::io::duplex(MAX_MESSAGE_BYTES);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (host_read, mut host_write) = tokio::io::split(host_stream);
+        let host = tokio::spawn(async move {
+            let mut host_reader = BufReader::new(host_read);
+            let mut line = Vec::new();
+            host_reader.read_until(b'\n', &mut line).await.unwrap();
+            let request: PluginRpcEnvelope<HandshakeRequest> =
+                decode_json_line(&line, MAX_MESSAGE_BYTES).unwrap();
+            assert_eq!(request.correlation_id, "corr-transport");
+            let response = PluginRpcResponse::success(
+                request.correlation_id,
+                HandshakeResponse {
+                    accepted_protocol_version: PLUGIN_RPC_PROTOCOL_VERSION,
+                    server_name: "Jellyrin".to_string(),
+                    server_version: "12.0.0".to_string(),
+                    minimum_call_timeout_ms: 250,
+                },
+            );
+            let bytes = encode_json_line(&response, MAX_MESSAGE_BYTES).unwrap();
+            host_write.write_all(&bytes).await.unwrap();
+            host_write.flush().await.unwrap();
+        });
+
+        let mut transport =
+            PluginRpcJsonLineTransport::new(BufReader::new(client_read), client_write);
+        let request = PluginRpcEnvelope::new(
+            "corr-transport",
+            PluginRpcMethod::Handshake,
+            HandshakeRequest {
+                runtime: PluginRuntime::RustWasi,
+                runtime_version: "0.1.0".to_string(),
+                host_id: "host-a".to_string(),
+                supported_protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION],
+                capabilities: Vec::new(),
+            },
+        );
+        let response: PluginRpcResponse<HandshakeResponse> = transport
+            .call(&request, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        host.await.unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            response.result.unwrap().accepted_protocol_version,
+            PLUGIN_RPC_PROTOCOL_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn json_line_transport_rejects_correlation_mismatch() {
+        let (client_stream, host_stream) = tokio::io::duplex(MAX_MESSAGE_BYTES);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (host_read, mut host_write) = tokio::io::split(host_stream);
+        let host = tokio::spawn(async move {
+            let mut host_reader = BufReader::new(host_read);
+            let mut line = Vec::new();
+            host_reader.read_until(b'\n', &mut line).await.unwrap();
+            let response =
+                PluginRpcResponse::success("wrong-correlation", json!({ "Status": "Healthy" }));
+            let bytes = encode_json_line(&response, MAX_MESSAGE_BYTES).unwrap();
+            host_write.write_all(&bytes).await.unwrap();
+            host_write.flush().await.unwrap();
+        });
+
+        let mut transport =
+            PluginRpcJsonLineTransport::new(BufReader::new(client_read), client_write);
+        let request = PluginRpcEnvelope::new(
+            "corr-expected",
+            PluginRpcMethod::Health,
+            PluginIdentity {
+                plugin_id: "plugin".to_string(),
+                version: "1.0.0.0".to_string(),
+            },
+        );
+
+        let error = transport
+            .call::<_, Value>(&request, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        host.await.unwrap();
+        assert!(matches!(
+            error,
+            PluginRpcTransportError::CorrelationMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn json_line_transport_times_out_waiting_for_host() {
+        let (client_stream, _host_stream) = tokio::io::duplex(MAX_MESSAGE_BYTES);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let mut transport =
+            PluginRpcJsonLineTransport::new(BufReader::new(client_read), client_write);
+        let request = PluginRpcEnvelope::new(
+            "corr-timeout",
+            PluginRpcMethod::Health,
+            PluginIdentity {
+                plugin_id: "plugin".to_string(),
+                version: "1.0.0.0".to_string(),
+            },
+        );
+
+        let error = transport
+            .call::<_, Value>(&request, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PluginRpcTransportError::Timeout { .. }));
     }
 }
