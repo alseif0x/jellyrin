@@ -14,14 +14,25 @@ const traceJsonPath = path.join(traceDir, 'golden-run.json');
 const evidencePath = path.join(generatedDir, 'dlna-upnp.json');
 const evidenceMarkdownPath = path.join(generatedDir, 'dlna-upnp.md');
 
-const goldenCommand = [
-  'cargo',
-  'test',
-  '-p',
-  'jellyrin-api',
-  'dlna_control_point_golden_direct_stream_and_real_hls_transcode',
-  '--',
-  '--nocapture',
+const goldenCommands = [
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
+    'dlna_control_point_golden_direct_stream_and_real_hls_transcode',
+    '--',
+    '--nocapture',
+  ],
+  [
+    'cargo',
+    'test',
+    '-p',
+    'jellyrin-api',
+    'ssdp',
+    '--',
+    '--nocapture',
+  ],
 ];
 
 async function main() {
@@ -44,9 +55,25 @@ async function main() {
   }
 }
 
-function runGolden() {
+async function runGolden() {
+  const results = [];
+  for (const command of goldenCommands) {
+    results.push(await runCommand(command));
+  }
+  const failed = results.find((result) => result.code !== 0);
+  return {
+    commands: goldenCommands.map((command) => command.join(' ')),
+    code: failed?.code || 0,
+    signal: failed?.signal || null,
+    output: results.map((result) => result.output).join('\n'),
+    generatedAt: new Date().toISOString(),
+    results,
+  };
+}
+
+function runCommand(command) {
   return new Promise((resolve) => {
-    const child = spawn(goldenCommand[0], goldenCommand.slice(1), {
+    const child = spawn(command[0], command.slice(1), {
       cwd: repoRoot,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -62,11 +89,10 @@ function runGolden() {
     });
     child.on('close', (code, signal) => {
       resolve({
-        command: goldenCommand.join(' '),
+        command: command.join(' '),
         code: code || 0,
         signal,
         output: Buffer.concat(chunks).toString('utf8'),
-        generatedAt: new Date().toISOString(),
       });
     });
   });
@@ -77,7 +103,7 @@ function buildEvidence(result) {
   return {
     gate: 'dlna-upnp',
     status: 'implemented',
-    percent: passed ? 90 : 87,
+    percent: passed ? 91 : 87,
     closed: false,
     sourcePhase: passed
       ? 'E3.1a/E3.2a/E3.2b/E3.2c/E3.2d/E3.2e/E3.2f/E3.3a/E3.3b/E3.3c/E3.3d/E3.3e/E3.4b/E3.4c/E3.4d/E3.5a/E3.6a/E3.6b/E3.6c/E3.7a'
@@ -86,7 +112,8 @@ function buildEvidence(result) {
       ? [
           'Jellyrin DLNA/UPnP local golden completed as a control-point flow.',
           'The trace generates a real MP4 fixture with ffmpeg, enables UPnP, publishes a library, fetches the root device descriptor, browses ContentDirectory, validates a direct DLNA Range stream, requests tokenless transcode.m3u8, waits for the real ffmpeg HLS media playlist, then fetches a rewritten DLNA TS segment with content-type video/mp2t and MPEG-TS sync bytes.',
-          'Existing focused coverage also verifies SSDP packet contracts, descriptors/SCPD, MediaReceiverRegistrar, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, direct stream URLs and HLS fallback route contracts.',
+          'The SSDP contract test verifies M-SEARCH/NOTIFY targets including ContentDirectory, ConnectionManager and X_MS_MediaReceiverRegistrar.',
+          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, SOAP Browse/Search/GetProtocolInfo, UPnP SOAP faults, DIDL root/folders/items/thumbnails/subtitles, profile hints, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,
@@ -95,9 +122,8 @@ function buildEvidence(result) {
     failedTargets: passed ? [] : ['jellyrin'],
     tracePath: path.relative(plansDir, tracePath),
     validatedCommands: [
-      goldenCommand.join(' '),
+      ...goldenCommands.map((command) => command.join(' ')),
       'cargo test -p jellyrin-api dlna_ -- --nocapture',
-      'cargo test -p jellyrin-api ssdp -- --nocapture',
       'cargo check -p jellyrin-api',
       'cargo check -p jellyrin-server',
       'cargo fmt --all -- --check',

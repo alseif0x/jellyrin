@@ -1118,6 +1118,7 @@ fn ssdp_advertised_targets(server_id: Uuid) -> Vec<String> {
         MEDIA_SERVER_DEVICE.to_string(),
         CONTENT_DIRECTORY_SERVICE.to_string(),
         CONNECTION_MANAGER_SERVICE.to_string(),
+        MEDIA_RECEIVER_REGISTRAR_SERVICE.to_string(),
     ]
 }
 
@@ -3190,15 +3191,21 @@ mod tests {
     fn ssdp_matching_targets_cover_root_uuid_device_and_services() {
         let server_id = test_server_id();
         let all = matching_ssdp_targets(server_id, "ssdp:all");
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert!(all.contains(&UPNP_ROOT_DEVICE.to_string()));
         assert!(all.contains(&format!("uuid:{server_id}")));
         assert!(all.contains(&MEDIA_SERVER_DEVICE.to_string()));
         assert!(all.contains(&CONTENT_DIRECTORY_SERVICE.to_string()));
         assert!(all.contains(&CONNECTION_MANAGER_SERVICE.to_string()));
+        assert!(all.contains(&MEDIA_RECEIVER_REGISTRAR_SERVICE.to_string()));
 
         let service = matching_ssdp_targets(server_id, CONTENT_DIRECTORY_SERVICE);
         assert_eq!(service, vec![CONTENT_DIRECTORY_SERVICE.to_string()]);
+        let registrar = matching_ssdp_targets(server_id, MEDIA_RECEIVER_REGISTRAR_SERVICE);
+        assert_eq!(
+            registrar,
+            vec![MEDIA_RECEIVER_REGISTRAR_SERVICE.to_string()]
+        );
         assert!(matching_ssdp_targets(server_id, "urn:example:unknown").is_empty());
     }
 
