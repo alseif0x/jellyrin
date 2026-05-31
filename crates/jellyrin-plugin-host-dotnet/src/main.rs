@@ -1,0 +1,598 @@
+use anyhow::{Context, Result};
+use jellyrin_plugin_rpc::{
+    CapabilityResult, DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES, HandshakeRequest, HandshakeResponse,
+    InvokeCapabilityRequest, LoadPluginRequest, LoadedPlugin, PLUGIN_RPC_PROTOCOL_VERSION,
+    PluginHealth, PluginHealthStatus, PluginIdentity, PluginRpcEnvelope, PluginRpcError,
+    PluginRpcErrorCode, PluginRpcMethod, PluginRpcResponse, PluginRuntime, decode_json_line,
+    encode_json_line,
+};
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, path::Path};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+const HOST_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+const HOST_ID: &str = "jellyrin-plugin-host-dotnet";
+const HOST_CAPABILITIES: &[&str] = &[
+    "Handshake",
+    "LoadPlugin",
+    "UnloadPlugin",
+    "GetManifest",
+    "ListCapabilities",
+    "InvokeCapability",
+    "Health",
+    "Shutdown",
+];
+
+#[derive(Debug, Default)]
+struct DotNetHostState {
+    loaded_plugins: BTreeMap<String, LoadedDotNetPlugin>,
+    shutting_down: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedDotNetPlugin {
+    plugin_id: String,
+    name: String,
+    version: String,
+    install_path: String,
+    manifest: Value,
+    capabilities: Vec<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    serve_json_lines(BufReader::new(stdin), stdout).await
+}
+
+async fn serve_json_lines<R, W>(mut reader: R, mut writer: W) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut state = DotNetHostState::default();
+    loop {
+        let mut line = Vec::new();
+        let bytes_read = reader.read_until(b'\n', &mut line).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        let response = match decode_json_line::<PluginRpcEnvelope<Value>>(
+            &line,
+            DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES,
+        ) {
+            Ok(envelope) => handle_envelope(&mut state, envelope).await,
+            Err(error) => PluginRpcResponse::failure(
+                String::new(),
+                PluginRpcError::new(PluginRpcErrorCode::InvalidRequest, error.to_string()),
+            ),
+        };
+        write_response(&mut writer, &response).await?;
+        if state.shutting_down {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn write_response<T: Serialize, W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &PluginRpcResponse<T>,
+) -> Result<()> {
+    let bytes = encode_json_line(response, DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES)?;
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn handle_envelope(
+    state: &mut DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    if envelope.protocol_version != PLUGIN_RPC_PROTOCOL_VERSION {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::ProtocolVersionMismatch,
+            format!(
+                "Protocol version {} is not supported by {}.",
+                envelope.protocol_version, HOST_ID
+            ),
+        );
+    }
+
+    match envelope.method {
+        PluginRpcMethod::Handshake => handle_handshake(envelope),
+        PluginRpcMethod::LoadPlugin => handle_load_plugin(state, envelope).await,
+        PluginRpcMethod::UnloadPlugin => handle_unload_plugin(state, envelope),
+        PluginRpcMethod::GetManifest => handle_get_manifest(state, envelope),
+        PluginRpcMethod::ListCapabilities => handle_list_capabilities(state, envelope),
+        PluginRpcMethod::InvokeCapability => handle_invoke_capability(state, envelope),
+        PluginRpcMethod::Health => handle_health(state, envelope),
+        PluginRpcMethod::Shutdown => {
+            state.shutting_down = true;
+            success(envelope.correlation_id, json!({ "Status": "Stopped" }))
+        }
+        PluginRpcMethod::GetConfiguration
+        | PluginRpcMethod::UpdateConfiguration
+        | PluginRpcMethod::ListWebPages
+        | PluginRpcMethod::GetEmbeddedImage => failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::UnsupportedMethod,
+            "DotNet host metadata-only milestone does not implement this method yet.",
+        ),
+    }
+}
+
+fn handle_handshake(envelope: PluginRpcEnvelope<Value>) -> PluginRpcResponse<Value> {
+    let request = match serde_json::from_value::<HandshakeRequest>(envelope.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    if request.runtime != PluginRuntime::DotNetJellyfin {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::InvalidRequest,
+            "jellyrin-plugin-host-dotnet only accepts DotNetJellyfin handshakes.",
+        );
+    }
+    if !request
+        .supported_protocol_versions
+        .contains(&PLUGIN_RPC_PROTOCOL_VERSION)
+    {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::ProtocolVersionMismatch,
+            "No compatible plugin RPC protocol version was offered.",
+        );
+    }
+    success(
+        envelope.correlation_id,
+        HandshakeResponse {
+            accepted_protocol_version: PLUGIN_RPC_PROTOCOL_VERSION,
+            server_name: HOST_ID.to_string(),
+            server_version: HOST_RUNTIME_VERSION.to_string(),
+            minimum_call_timeout_ms: 250,
+            capabilities: HOST_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+        },
+    )
+}
+
+async fn handle_load_plugin(
+    state: &mut DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let request = match serde_json::from_value::<LoadPluginRequest>(envelope.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    if request.runtime != PluginRuntime::DotNetJellyfin {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::InvalidRequest,
+            "DotNet host can only load DotNetJellyfin plugins.",
+        );
+    }
+    let dll_files = match find_assembly_files(Path::new(&request.install_path)).await {
+        Ok(files) => files,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::PluginNotFound,
+                error.to_string(),
+            );
+        }
+    };
+    if dll_files.is_empty() {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotFound,
+            "DotNetJellyfin plugin install path does not contain a .dll artifact.",
+        );
+    }
+    let capabilities = manifest_capabilities(&request.manifest);
+    let loaded = LoadedDotNetPlugin {
+        plugin_id: request.plugin_id.clone(),
+        name: request.name.clone(),
+        version: request.version.clone(),
+        install_path: request.install_path.clone(),
+        manifest: request.manifest.clone(),
+        capabilities: capabilities.clone(),
+    };
+    state
+        .loaded_plugins
+        .insert(request.plugin_id.clone(), loaded);
+    success(
+        envelope.correlation_id,
+        LoadedPlugin {
+            plugin_id: request.plugin_id,
+            runtime: PluginRuntime::DotNetJellyfin,
+            runtime_version: HOST_RUNTIME_VERSION.to_string(),
+            status: PluginHealthStatus::Healthy,
+            manifest: request.manifest,
+            capabilities,
+        },
+    )
+}
+
+fn handle_unload_plugin(
+    state: &mut DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let identity = match serde_json::from_value::<PluginIdentity>(envelope.payload) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    if state.loaded_plugins.remove(&identity.plugin_id).is_none() {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    }
+    success(envelope.correlation_id, json!({ "Status": "Unloaded" }))
+}
+
+fn handle_get_manifest(
+    state: &DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let identity = match serde_json::from_value::<PluginIdentity>(envelope.payload) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get(&identity.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    success(envelope.correlation_id, plugin.manifest.clone())
+}
+
+fn handle_list_capabilities(
+    state: &DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let identity = match serde_json::from_value::<PluginIdentity>(envelope.payload) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get(&identity.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    success(envelope.correlation_id, json!(plugin.capabilities))
+}
+
+fn handle_invoke_capability(
+    state: &DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let request = match serde_json::from_value::<InvokeCapabilityRequest>(envelope.payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get(&request.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    if !plugin
+        .capabilities
+        .iter()
+        .any(|capability| capability == &request.capability)
+    {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::CapabilityNotFound,
+            format!("Capability {} is not registered.", request.capability),
+        );
+    }
+    success(
+        envelope.correlation_id,
+        CapabilityResult {
+            value: json!({
+                "Status": "NotExecuted",
+                "Reason": "DotNet assembly execution is not wired in this milestone."
+            }),
+        },
+    )
+}
+
+fn handle_health(
+    state: &DotNetHostState,
+    envelope: PluginRpcEnvelope<Value>,
+) -> PluginRpcResponse<Value> {
+    let identity = match serde_json::from_value::<PluginIdentity>(envelope.payload) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return failure(
+                envelope.correlation_id,
+                PluginRpcErrorCode::InvalidRequest,
+                error.to_string(),
+            );
+        }
+    };
+    let Some(plugin) = state.loaded_plugins.get(&identity.plugin_id) else {
+        return failure(
+            envelope.correlation_id,
+            PluginRpcErrorCode::PluginNotLoaded,
+            "Plugin is not loaded.",
+        );
+    };
+    success(
+        envelope.correlation_id,
+        PluginHealth {
+            plugin_id: plugin.plugin_id.clone(),
+            runtime: PluginRuntime::DotNetJellyfin,
+            status: PluginHealthStatus::Healthy,
+            last_error: None,
+            metrics: json!({
+                "Name": plugin.name,
+                "Version": plugin.version,
+                "InstallPath": plugin.install_path,
+                "CapabilityCount": plugin.capabilities.len()
+            }),
+        },
+    )
+}
+
+async fn find_assembly_files(path: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    find_assembly_files_recursive(path, &mut files)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to inspect DotNetJellyfin plugin path {}",
+                path.display()
+            )
+        })?;
+    Ok(files)
+}
+
+async fn find_assembly_files_recursive(path: &Path, files: &mut Vec<String>) -> Result<()> {
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&path).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+            {
+                files.push(entry.path().to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn manifest_capabilities(manifest: &Value) -> Vec<String> {
+    manifest
+        .get("Capabilities")
+        .and_then(Value::as_array)
+        .map(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn success<T: Serialize>(correlation_id: String, result: T) -> PluginRpcResponse<Value> {
+    match serde_json::to_value(result) {
+        Ok(value) => PluginRpcResponse::success(correlation_id, value),
+        Err(error) => failure(
+            correlation_id,
+            PluginRpcErrorCode::HostFailed,
+            error.to_string(),
+        ),
+    }
+}
+
+fn failure(
+    correlation_id: String,
+    code: PluginRpcErrorCode,
+    message: impl Into<String>,
+) -> PluginRpcResponse<Value> {
+    PluginRpcResponse::failure(correlation_id, PluginRpcError::new(code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jellyrin_plugin_rpc::{PluginRpcJsonLineTransport, UpdateConfigurationRequest};
+    use tempfile::tempdir;
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn dotnet_host_handshake_load_health_and_shutdown() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("Jellyfin.Plugin.Fixture.dll"), b"dll")
+            .await
+            .unwrap();
+
+        let (client_stream, host_stream) = tokio::io::duplex(DEFAULT_PLUGIN_RPC_MAX_MESSAGE_BYTES);
+        let (client_read, client_write) = tokio::io::split(client_stream);
+        let (host_read, host_write) = tokio::io::split(host_stream);
+        let host_task = tokio::spawn(serve_json_lines(BufReader::new(host_read), host_write));
+        let mut client = PluginRpcJsonLineTransport::new(BufReader::new(client_read), client_write);
+
+        let handshake = PluginRpcEnvelope::new(
+            "corr-handshake",
+            PluginRpcMethod::Handshake,
+            HandshakeRequest {
+                runtime: PluginRuntime::DotNetJellyfin,
+                runtime_version: "0.1.0".to_string(),
+                host_id: "test".to_string(),
+                supported_protocol_versions: vec![PLUGIN_RPC_PROTOCOL_VERSION],
+                capabilities: Vec::new(),
+            },
+        );
+        let response = client
+            .call::<_, Value>(&handshake, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            response.result.unwrap()["AcceptedProtocolVersion"],
+            PLUGIN_RPC_PROTOCOL_VERSION
+        );
+
+        let load = PluginRpcEnvelope::new(
+            "corr-load",
+            PluginRpcMethod::LoadPlugin,
+            LoadPluginRequest {
+                plugin_id: "dotnet-fixture".to_string(),
+                name: "DotNet Fixture".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: PluginRuntime::DotNetJellyfin,
+                target_abi: "12.0.0.0".to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "DotNet Fixture",
+                    "Capabilities": ["MetadataProvider"]
+                }),
+                permissions: Vec::new(),
+            },
+        );
+        let response = client
+            .call::<_, Value>(&load, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result.as_ref().unwrap()["Status"], "Healthy");
+        assert_eq!(
+            response.result.as_ref().unwrap()["Capabilities"][0],
+            "MetadataProvider"
+        );
+
+        let health = PluginRpcEnvelope::new(
+            "corr-health",
+            PluginRpcMethod::Health,
+            PluginIdentity {
+                plugin_id: "dotnet-fixture".to_string(),
+                version: "1.0.0.0".to_string(),
+            },
+        );
+        let response = client
+            .call::<_, Value>(&health, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert_eq!(response.result.as_ref().unwrap()["Status"], "Healthy");
+
+        let shutdown =
+            PluginRpcEnvelope::new("corr-shutdown", PluginRpcMethod::Shutdown, json!({}));
+        let response = client
+            .call::<_, Value>(&shutdown, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(response.ok);
+        host_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dotnet_host_rejects_missing_dll_and_unsupported_method() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+
+        let mut state = DotNetHostState::default();
+        let load = PluginRpcEnvelope::new(
+            "corr-missing",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "missing".to_string(),
+                name: "Missing".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: PluginRuntime::DotNetJellyfin,
+                target_abi: "12.0.0.0".to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({ "Name": "Missing" }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, load).await;
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            PluginRpcErrorCode::PluginNotFound
+        );
+
+        let unsupported = PluginRpcEnvelope::new(
+            "corr-config",
+            PluginRpcMethod::UpdateConfiguration,
+            serde_json::to_value(UpdateConfigurationRequest {
+                plugin_id: "missing".to_string(),
+                configuration: json!({}),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, unsupported).await;
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().unwrap().code,
+            PluginRpcErrorCode::UnsupportedMethod
+        );
+    }
+}
