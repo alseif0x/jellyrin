@@ -9,6 +9,8 @@ const plansDir = process.env.JELLYRIN_PLANS_DIR || defaultPlansDir;
 const manualEvidenceDir = process.env.JELLYRIN_DLNA_DEVICE_EVIDENCE_DIR
   || path.join(plansDir, 'manual', 'dlna-upnp');
 const templatePath = path.join(manualEvidenceDir, 'template.json');
+const allowedDeviceTypes = ['vlc', 'tv', 'console', 'upnp-control-point', 'renderer'];
+const allowedArtifactTypes = ['screenshot', 'client-log', 'server-log', 'packet-capture', 'screen-recording'];
 
 const requiredFlowChecks = [
   'serverVisibleInControlPoint',
@@ -119,6 +121,9 @@ async function validateManualDlnaEvidence(evidence) {
   if (evidence.result !== 'pass') {
     errors.push('result must be "pass"');
   }
+  if (typeof evidence.deviceType === 'string' && !allowedDeviceTypes.includes(evidence.deviceType)) {
+    errors.push(`deviceType must be one of: ${allowedDeviceTypes.join(', ')}`);
+  }
   requireUrl(errors, evidence, 'jellyrinBaseUrl');
 
   if (!evidence.server || typeof evidence.server !== 'object' || Array.isArray(evidence.server)) {
@@ -204,6 +209,9 @@ async function validateManualDlnaEvidence(evidence) {
       }
       requireString(errors, artifact, `artifacts[${index}].type`, 'type');
       requireString(errors, artifact, `artifacts[${index}].pathOrUrl`, 'pathOrUrl');
+      if (typeof artifact.type === 'string' && !allowedArtifactTypes.includes(artifact.type)) {
+        errors.push(`artifacts[${index}].type must be one of: ${allowedArtifactTypes.join(', ')}`);
+      }
       await requireExistingArtifact(errors, artifact.pathOrUrl, index);
     }
   }
@@ -342,6 +350,11 @@ async function requireExistingArtifact(errors, pathOrUrl, index) {
     return;
   }
   const artifactPath = path.isAbsolute(pathOrUrl) ? pathOrUrl : path.resolve(plansDir, pathOrUrl);
+  const relativeToManualEvidence = path.relative(manualEvidenceDir, artifactPath);
+  if (relativeToManualEvidence.startsWith('..') || path.isAbsolute(relativeToManualEvidence)) {
+    errors.push(`artifacts[${index}].pathOrUrl must stay under ${manualEvidenceDir}`);
+    return;
+  }
   try {
     const stat = await fs.stat(artifactPath);
     if (!stat.isFile()) {
@@ -357,6 +370,15 @@ function looksLikeTemplatePlaceholder(value) {
 }
 
 async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  if (options.help) {
+    printUsage();
+    return;
+  }
+  if (options.selfTest) {
+    await selfTest();
+    return;
+  }
   const report = await loadManualDlnaEvidence();
   console.log(JSON.stringify({
     directory: report.directory,
@@ -378,6 +400,89 @@ async function main() {
   }
 }
 
+function parseArgs(args) {
+  const options = {};
+  for (const arg of args) {
+    if (arg === '--help' || arg === '-h') {
+      options.help = true;
+    } else if (arg === '--self-test') {
+      options.selfTest = true;
+    } else {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+  }
+  return options;
+}
+
+function printUsage() {
+  console.log('Usage: node qa/golden/dlna-device-evidence.js [--self-test]');
+}
+
+async function selfTest() {
+  const artifactPath = path.join(manualEvidenceDir, 'artifacts', 'self-test-artifact.txt');
+  await fs.mkdir(path.dirname(artifactPath), { recursive: true });
+  await fs.writeFile(artifactPath, 'self-test\n');
+  try {
+    const valid = manualEvidenceTemplate();
+    valid.deviceName = 'VLC laptop';
+    valid.deviceType = 'vlc';
+    valid.controlPointName = 'VLC';
+    valid.controlPointVersion = '3.0.21';
+    valid.tester = 'qa';
+    valid.jellyrinBaseUrl = 'http://192.168.1.46:8097';
+    valid.server.version = 'dev';
+    valid.server.commit = '0123456789abcdef0123456789abcdef01234567';
+    valid.server.serverId = '58deb718-f9ee-4ac5-a1d4-05286d64cf42';
+    valid.network.serverIp = '192.168.1.46';
+    valid.network.deviceIp = '192.168.1.50';
+    valid.network.ssdpLocation = 'http://192.168.1.46:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml';
+    valid.media.itemId = 'fixture-item-id';
+    valid.media.itemName = 'E3 DLNA Manual Fixture';
+    valid.media.container = 'mkv';
+    valid.artifacts = [{
+      type: 'client-log',
+      pathOrUrl: path.relative(plansDir, artifactPath),
+    }];
+
+    const validErrors = await validateManualDlnaEvidence(valid);
+    if (validErrors.length > 0) {
+      throw new Error(`valid fixture evidence failed self-test:\n${validErrors.join('\n')}`);
+    }
+
+    const invalidDeviceType = { ...valid, deviceType: 'replace-with-device' };
+    await assertInvalid(invalidDeviceType, 'deviceType still contains template placeholder text');
+
+    const invalidArtifactType = {
+      ...valid,
+      artifacts: [{ type: 'other', pathOrUrl: path.relative(plansDir, artifactPath) }],
+    };
+    await assertInvalid(invalidArtifactType, 'artifacts[0].type must be one of');
+
+    const externalArtifact = {
+      ...valid,
+      artifacts: [{ type: 'client-log', pathOrUrl: 'https://example.invalid/capture.log' }],
+    };
+    await assertInvalid(externalArtifact, 'artifacts[0].pathOrUrl must be a local evidence file path');
+
+    const outsideArtifact = {
+      ...valid,
+      artifacts: [{ type: 'client-log', pathOrUrl: '/tmp/outside-dlna-evidence.txt' }],
+    };
+    await assertInvalid(outsideArtifact, 'artifacts[0].pathOrUrl must stay under');
+
+    console.log(JSON.stringify({ status: 'self-test-ok' }, null, 2));
+  } finally {
+    await fs.rm(artifactPath, { force: true });
+  }
+}
+
+async function assertInvalid(evidence, expectedErrorSubstring) {
+  const errors = await validateManualDlnaEvidence(evidence);
+  if (!errors.some((error) => error.includes(expectedErrorSubstring))) {
+    throw new Error(`expected validation error containing "${expectedErrorSubstring}", got:\n${errors.join('\n')}`);
+  }
+}
+
 if (require.main === module) {
   main().catch((error) => {
     console.error(error);
@@ -388,6 +493,7 @@ if (require.main === module) {
 module.exports = {
   loadManualDlnaEvidence,
   manualEvidenceTemplate,
+  parseArgs,
   requiredFlowChecks,
   requiredNetworkChecks,
   summarizeManualDlnaEvidence,
