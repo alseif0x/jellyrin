@@ -163,6 +163,7 @@ async function validateManualDlnaEvidence(evidence) {
     requireLanIpv4(errors, evidence.network.serverIp, 'network.serverIp');
     requireLanIpv4(errors, evidence.network.deviceIp, 'network.deviceIp');
     requireUrl(errors, evidence.network, 'network.ssdpLocation', 'ssdpLocation');
+    requireLanLocation(errors, evidence.network.ssdpLocation, 'network.ssdpLocation');
     for (const check of requiredNetworkChecks) {
       if (evidence.network[check] !== true) {
         errors.push(`network.${check} must be true`);
@@ -357,6 +358,21 @@ function requireLanIpv4(errors, value, label) {
   }
 }
 
+function requireLanLocation(errors, value, label) {
+  if (typeof value !== 'string' || value.trim() === '' || looksLikeTemplatePlaceholder(value)) {
+    return;
+  }
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname;
+    if (net.isIP(host) === 4) {
+      requireLanIpv4(errors, host, `${label} host`);
+    }
+  } catch {
+    // requireUrl reports the URL shape error.
+  }
+}
+
 function validateTranscodeFallback(errors, transcodeFallback) {
   if (!transcodeFallback || typeof transcodeFallback !== 'object' || Array.isArray(transcodeFallback)) {
     errors.push('transcodeFallback must be an object');
@@ -527,6 +543,15 @@ async function selfTest() {
       network: { ...valid.network, deviceIp: 'not-an-ip' },
     };
     await assertInvalid(invalidDeviceIp, 'network.deviceIp must be an IPv4 address');
+
+    const loopbackSsdpLocation = {
+      ...valid,
+      network: {
+        ...valid.network,
+        ssdpLocation: 'http://127.0.0.1:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml',
+      },
+    };
+    await assertInvalid(loopbackSsdpLocation, 'network.ssdpLocation host must be a LAN-reachable IPv4 address');
 
     const outsideArtifact = {
       ...valid,
