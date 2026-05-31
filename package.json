@@ -16,6 +16,7 @@
     "golden:dlna:device-evidence": "node qa/golden/dlna-device-evidence.js",
     "golden:dlna:device-fixture": "node qa/golden/dlna-device-fixture.js",
     "golden:dlna:device-preflight": "node qa/golden/dlna-device-preflight.js",
+    "golden:dlna:device-runner": "node qa/golden/dlna-device-runner.js",
     "golden:syncplay": "node qa/golden/syncplay-advanced.js",
     "golden:channels": "node qa/golden/ecosystem-placeholder.js channels-providers",
     "golden:clients": "node qa/golden/non-web-clients.js",
