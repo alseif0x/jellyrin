@@ -6211,8 +6211,11 @@ async fn install_package(
             &version,
             &package,
             &selected_version,
+            &task_key,
+            run.id,
         )
         .await?;
+        ensure_package_install_not_cancelled(&state.db, &task_key, run.id).await?;
         package["Installation"] = artifact;
         state
             .db
@@ -6334,7 +6337,10 @@ async fn prepare_plugin_package_artifact(
     version: &str,
     package: &serde_json::Value,
     selected_version: &serde_json::Value,
+    task_key: &str,
+    run_id: Uuid,
 ) -> Result<serde_json::Value, ApiError> {
+    ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     let Some(source_url) = plugin_package_source_url(package, selected_version) else {
         return Ok(serde_json::json!({
             "Mode": "metadata-only",
@@ -6362,17 +6368,25 @@ async fn prepare_plugin_package_artifact(
     if let Some(parent) = install_dir.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
+    ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     let bytes = read_plugin_package_source(&source_url).await?;
+    ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     let checksum = verify_plugin_package_checksum(package, selected_version, &bytes)?;
     tokio::fs::write(&archive_path, bytes).await?;
 
+    ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     let entries = list_safe_zip_entries(&archive_path).await?;
     if entries.is_empty() {
         let _ = tokio::fs::remove_file(&archive_path).await;
         return Err(ApiError::bad_request("Plugin package archive is empty"));
     }
+    ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     extract_zip_archive(&archive_path, &staging_dir).await?;
 
+    if let Err(error) = ensure_package_install_not_cancelled(&state.db, task_key, run_id).await {
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        return Err(error);
+    }
     if tokio::fs::try_exists(&install_dir).await? {
         if tokio::fs::try_exists(&rollback_dir).await? {
             tokio::fs::remove_dir_all(&rollback_dir).await?;
@@ -6402,6 +6416,19 @@ async fn prepare_plugin_package_artifact(
         "EntryCount": entries.len(),
         "Entries": entries,
     }))
+}
+
+async fn ensure_package_install_not_cancelled(
+    db: &Database,
+    task_key: &str,
+    run_id: Uuid,
+) -> Result<(), ApiError> {
+    let current = db.current_task_run(task_key).await?;
+    if current.as_ref().is_some_and(|run| run.id == run_id) {
+        Ok(())
+    } else {
+        Err(ApiError::conflict("Package installation cancelled."))
+    }
 }
 
 fn plugin_package_source_url(
@@ -29358,20 +29385,21 @@ mod tests {
         cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
         cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
         default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
-        encoding_configuration_json, format_time_for_json, get_valid_filename,
-        hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id, json_string_field,
-        json_value_i64, last_system_lifecycle_command, live_tv_channel_is_remote,
-        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
-        live_tv_recording_name, load_countries, load_cultures, materialize_series_timer_timers,
-        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
-        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
-        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
-        plugin_package_operation, reconcile_live_tv_recordings_on_startup,
-        reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
-        reserve_live_tv_recording_start, router, run_due_live_tv_timers, series_timer_child_id,
-        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
-        subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
-        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        encoding_configuration_json, ensure_package_install_not_cancelled, format_time_for_json,
+        get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id,
+        json_string_field, json_value_i64, last_system_lifecycle_command,
+        live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
+        live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
+        materialize_series_timer_timers, media_item_by_id, media_item_streams,
+        package_install_task_key, paged_media_items, parse_authorization_token,
+        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs, plugin_package_operation,
+        reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
+        record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
+        run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
+        subscribe_playback_events, subscribe_system_lifecycle_commands,
+        syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
         validate_zip_entry_path, verify_plugin_package_checksum,
     };
     use crate::dlna;
@@ -29534,6 +29562,24 @@ mod tests {
             plugin_package_operation(Some(&previous), "1.2.0.0"),
             "Reinstall"
         );
+    }
+
+    #[tokio::test]
+    async fn package_install_cancellation_guard_observes_failed_task_run() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let task_key = package_install_task_key("cancelled-plugin");
+        let run = db.start_task_run(&task_key).await.unwrap();
+        ensure_package_install_not_cancelled(&db, &task_key, run.id)
+            .await
+            .unwrap();
+
+        db.fail_current_task_run(&task_key, "Package installation cancelled.")
+            .await
+            .unwrap();
+        let error = ensure_package_install_not_cancelled(&db, &task_key, run.id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
     }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)

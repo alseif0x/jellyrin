@@ -37,17 +37,29 @@ async function main() {
     '--',
     '--nocapture',
   ]);
-  const passed = dbTestResult.code === 0 && apiTestResult.code === 0 && refreshTestResult.code === 0;
+  const cancellationTestResult = await runCommand('cargo', [
+    'test',
+    '-p',
+    'jellyrin-api',
+    'package_install_cancellation_guard_observes_failed_task_run',
+    '--',
+    '--nocapture',
+  ]);
+  const passed =
+    dbTestResult.code === 0 &&
+    apiTestResult.code === 0 &&
+    refreshTestResult.code === 0 &&
+    cancellationTestResult.code === 0;
   const evidence = {
     gate: 'plugin-dual-runtime',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 52 : 5,
+    percent: passed ? 56 : 5,
     closed: false,
     sourcePhase: passed
-      ? 'E1.P1/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P3a'
+      ? 'E1.P1/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P2f/E1.P3a'
       : 'E1.P1/P2-attempted',
     evidence: passed
-      ? 'E1/P1 persistent plugin platform model is implemented and verified; E1/P2a/P2b/P2c/P2d/P2e/P3a safe package lifecycle is implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, verifies SHA256/SHA1 checksums when provided, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, completes PackageInstall tasks, handles update/downgrade by marking previous package_installations as Superseded while switching the active installed_plugins version, and refreshes enabled plugin repository manifests into the persisted catalog/task evidence while preserving disabled repositories and previous package state on partial failures; /Plugins lists the active plugin as NotSupported until a runtime host exists; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
+      ? 'E1/P1 persistent plugin platform model is implemented and verified; E1/P2a/P2b/P2c/P2d/P2e/P2f/P3a safe package lifecycle is implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, verifies SHA256/SHA1 checksums when provided, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, completes PackageInstall tasks, handles update/downgrade by marking previous package_installations as Superseded while switching the active installed_plugins version, refreshes enabled plugin repository manifests into the persisted catalog/task evidence while preserving disabled repositories and previous package state on partial failures, and observes PackageInstall cancellation before destructive/DB commit checkpoints; /Plugins lists the active plugin as NotSupported until a runtime host exists; configuration, enable, disable and uninstall mutate persisted state without claiming real plugin execution.'
       : 'E1/P1/P2 persistent plugin platform or safe lifecycle tests failed; inspect command output before advancing plugin runtime work.',
     updatedAt: new Date().toISOString(),
     completedTargets: passed
@@ -58,6 +70,7 @@ async function main() {
           'package-checksum-policy',
           'package-update-downgrade',
           'remote-repository-refresh',
+          'cooperative-package-install-cancellation',
         ]
       : [],
     failedTargets: passed ? [] : ['persistent-plugin-model-or-safe-plugin-lifecycle'],
@@ -65,19 +78,25 @@ async function main() {
       'cargo test -p jellyrin-db plugin_platform_state -- --nocapture',
       'cargo test -p jellyrin-api package_repositories_round_trip_system_configuration_payload -- --nocapture',
       'cargo test -p jellyrin-api package_repository_refresh_downloads_manifest_and_updates_catalog -- --nocapture',
+      'cargo test -p jellyrin-api package_install_cancellation_guard_observes_failed_task_run -- --nocapture',
     ],
     openRisks: [
       'DotNetJellyfin sidecar host is not implemented yet.',
       'RustWasi host and SDK are not implemented yet.',
       'Package install extracts package artifacts and records a safe NotSupported state; real host load/execute/unload is still pending.',
-      'Async cancellation still needs full P2 coverage.',
+      'Package install cancellation is cooperative at checkpoints; immediate interruption of in-flight HTTP downloads and unzip subprocesses still needs streaming/process-level cancellation.',
       'No real plugin fixture has been loaded or executed yet.',
     ],
   };
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(
     evidenceMarkdownPath,
-    renderMarkdown(evidence, [dbTestResult, apiTestResult, refreshTestResult]),
+    renderMarkdown(evidence, [
+      dbTestResult,
+      apiTestResult,
+      refreshTestResult,
+      cancellationTestResult,
+    ]),
   );
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
