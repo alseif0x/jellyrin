@@ -2,7 +2,10 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 
+const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(__dirname, '..', '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
 const plansDir = process.env.JELLYRIN_PLANS_DIR || defaultPlansDir;
@@ -11,6 +14,7 @@ const manualEvidenceDir = process.env.JELLYRIN_DLNA_DEVICE_EVIDENCE_DIR
 const templatePath = path.join(manualEvidenceDir, 'template.json');
 const allowedDeviceTypes = ['vlc', 'tv', 'console', 'upnp-control-point', 'renderer'];
 const allowedArtifactTypes = ['screenshot', 'client-log', 'server-log', 'packet-capture', 'screen-recording'];
+let currentCommitCache = null;
 
 const requiredFlowChecks = [
   'serverVisibleInControlPoint',
@@ -134,6 +138,12 @@ async function validateManualDlnaEvidence(evidence) {
     }
     if (typeof evidence.server?.commit === 'string' && !/^[0-9a-f]{7,40}$/i.test(evidence.server.commit)) {
       errors.push('server.commit must be a git commit hash');
+    }
+    if (typeof evidence.server?.commit === 'string' && /^[0-9a-f]{7,40}$/i.test(evidence.server.commit)) {
+      const currentCommit = await gitCommit();
+      if (currentCommit !== evidence.server.commit) {
+        errors.push(`server.commit must match current git HEAD ${currentCommit}`);
+      }
     }
     if (
       typeof evidence.server?.serverId === 'string' &&
@@ -369,6 +379,14 @@ function looksLikeTemplatePlaceholder(value) {
   return /replace-with|\{serverId\}|\|/i.test(value);
 }
 
+async function gitCommit() {
+  if (!currentCommitCache) {
+    const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
+    currentCommitCache = stdout.trim();
+  }
+  return currentCommitCache;
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
@@ -431,7 +449,7 @@ async function selfTest() {
     valid.tester = 'qa';
     valid.jellyrinBaseUrl = 'http://192.168.1.46:8097';
     valid.server.version = 'dev';
-    valid.server.commit = '0123456789abcdef0123456789abcdef01234567';
+    valid.server.commit = await gitCommit();
     valid.server.serverId = '58deb718-f9ee-4ac5-a1d4-05286d64cf42';
     valid.network.serverIp = '192.168.1.46';
     valid.network.deviceIp = '192.168.1.50';
@@ -463,6 +481,12 @@ async function selfTest() {
       artifacts: [{ type: 'client-log', pathOrUrl: 'https://example.invalid/capture.log' }],
     };
     await assertInvalid(externalArtifact, 'artifacts[0].pathOrUrl must be a local evidence file path');
+
+    const staleCommit = {
+      ...valid,
+      server: { ...valid.server, commit: '0123456789abcdef0123456789abcdef01234567' },
+    };
+    await assertInvalid(staleCommit, 'server.commit must match current git HEAD');
 
     const outsideArtifact = {
       ...valid,
