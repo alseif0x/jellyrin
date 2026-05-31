@@ -164,6 +164,7 @@ async function validateManualDlnaEvidence(evidence) {
     requireLanIpv4(errors, evidence.network.deviceIp, 'network.deviceIp');
     requireUrl(errors, evidence.network, 'network.ssdpLocation', 'ssdpLocation');
     requireLanLocation(errors, evidence.network.ssdpLocation, 'network.ssdpLocation');
+    requireLocationHostMatchesIp(errors, evidence.network.ssdpLocation, evidence.network.serverIp, 'network.ssdpLocation', 'network.serverIp');
     for (const check of requiredNetworkChecks) {
       if (evidence.network[check] !== true) {
         errors.push(`network.${check} must be true`);
@@ -373,6 +374,25 @@ function requireLanLocation(errors, value, label) {
   }
 }
 
+function requireLocationHostMatchesIp(errors, location, serverIp, locationLabel, serverIpLabel) {
+  if (
+    typeof location !== 'string' ||
+    typeof serverIp !== 'string' ||
+    looksLikeTemplatePlaceholder(location) ||
+    looksLikeTemplatePlaceholder(serverIp)
+  ) {
+    return;
+  }
+  try {
+    const host = new URL(location).hostname;
+    if (net.isIP(host) === 4 && net.isIP(serverIp) === 4 && host !== serverIp) {
+      errors.push(`${locationLabel} host must match ${serverIpLabel}`);
+    }
+  } catch {
+    // requireUrl reports the URL shape error.
+  }
+}
+
 function validateTranscodeFallback(errors, transcodeFallback) {
   if (!transcodeFallback || typeof transcodeFallback !== 'object' || Array.isArray(transcodeFallback)) {
     errors.push('transcodeFallback must be an object');
@@ -552,6 +572,15 @@ async function selfTest() {
       },
     };
     await assertInvalid(loopbackSsdpLocation, 'network.ssdpLocation host must be a LAN-reachable IPv4 address');
+
+    const mismatchedSsdpLocation = {
+      ...valid,
+      network: {
+        ...valid.network,
+        ssdpLocation: 'http://192.168.1.99:8097/dlna/58deb718-f9ee-4ac5-a1d4-05286d64cf42/description.xml',
+      },
+    };
+    await assertInvalid(mismatchedSsdpLocation, 'network.ssdpLocation host must match network.serverIp');
 
     const outsideArtifact = {
       ...valid,
