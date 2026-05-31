@@ -650,6 +650,10 @@ pub fn router(state: AppState) -> Router {
             "/plugins/{plugin_id}/configuration",
             get(plugin_configuration).post(update_plugin_configuration),
         )
+        .route("/Plugins/{plugin_id}/Health", get(plugin_health))
+        .route("/plugins/{plugin_id}/health", get(plugin_health))
+        .route("/Plugins/{plugin_id}/Logs", get(plugin_logs))
+        .route("/plugins/{plugin_id}/logs", get(plugin_logs))
         .route("/Plugins/{plugin_id}/Manifest", get(plugin_manifest))
         .route("/plugins/{plugin_id}/manifest", get(plugin_manifest))
         .route("/Plugins/{plugin_id}/Manifest", post(plugin_manifest_post))
@@ -8147,6 +8151,50 @@ async fn update_plugin_configuration(
     } else {
         Err(ApiError::not_found("Plugin not found"))
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PluginLogsQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "Limit")]
+    limit: Option<i64>,
+}
+
+async fn plugin_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    state
+        .db
+        .plugin_health_json(&plugin_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("Plugin not found"))
+}
+
+async fn plugin_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PluginLogsQuery>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    state
+        .db
+        .plugin_host_events_json(&plugin_id, query.limit.unwrap_or(50))
+        .await?
+        .map(|items| {
+            Json(serde_json::json!({
+                "Items": items,
+                "TotalRecordCount": items.len(),
+                "StartIndex": 0
+            }))
+        })
+        .ok_or_else(|| ApiError::not_found("Plugin not found"))
 }
 
 async fn enable_plugin(
@@ -40266,6 +40314,69 @@ mod tests {
                 .unwrap()
                 .contains("runtime host is not implemented")
         );
+        assert_eq!(
+            installed_plugins[0]["Health"]["Status"],
+            serde_json::json!("NotSupported")
+        );
+        assert!(
+            installed_plugins[0]["RuntimeInstances"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            installed_plugins[0]["RecentEvents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            installed_plugins[0]["RecentEvents"][0]["EventType"],
+            "RuntimeUnavailable"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/Health")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let health: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["Status"], "NotSupported");
+        assert_eq!(health["Health"]["Status"], "NotSupported");
+        assert!(
+            health["LastError"]
+                .as_str()
+                .unwrap()
+                .contains("runtime host is not implemented")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Plugins/11111111-1111-1111-1111-111111111111/Logs?Limit=5")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let logs: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(logs["TotalRecordCount"], 1);
+        assert_eq!(logs["Items"][0]["Severity"], "Warning");
+        assert_eq!(logs["Items"][0]["EventType"], "RuntimeUnavailable");
+
         let installed_file = log_dir
             .parent()
             .unwrap()

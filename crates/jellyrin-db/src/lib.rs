@@ -1139,6 +1139,26 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_host_events (id, plugin_id, runtime, event_type, severity, message, payload_json, created_at)
+            VALUES (?1, ?2, ?3, 'RuntimeUnavailable', 'Warning', ?4, ?5, ?6)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&package.plugin_id)
+        .bind(&package.runtime)
+        .bind(&runtime_missing)
+        .bind(serde_json::to_string(&json!({
+            "Name": package.name,
+            "Version": package.version,
+            "Runtime": package.runtime,
+            "Status": "NotSupported"
+        }))?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }
@@ -1157,7 +1177,12 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.map(|row| plugin_row_to_json(&row)).transpose()
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut plugin = plugin_row_to_json(&row)?;
+        enrich_plugin_runtime_state(&self.pool, &mut plugin).await?;
+        Ok(Some(plugin))
     }
 
     pub async fn installed_plugins_json(&self) -> anyhow::Result<Vec<Value>> {
@@ -1173,9 +1198,45 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
+        let mut plugins = rows
+            .into_iter()
             .map(|row| plugin_row_to_json(&row))
-            .collect::<anyhow::Result<Vec<_>>>()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for plugin in &mut plugins {
+            enrich_plugin_runtime_state(&self.pool, plugin).await?;
+        }
+        Ok(plugins)
+    }
+
+    pub async fn plugin_health_json(&self, plugin_id: &str) -> anyhow::Result<Option<Value>> {
+        let Some(plugin) = self.installed_plugin_json(plugin_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(json!({
+            "PluginId": plugin["Id"].clone(),
+            "Guid": plugin["Guid"].clone(),
+            "Name": plugin["Name"].clone(),
+            "Version": plugin["Version"].clone(),
+            "Runtime": plugin["Runtime"].clone(),
+            "Status": plugin["Status"].clone(),
+            "LastError": plugin["LastError"].clone(),
+            "Health": plugin["Health"].clone(),
+            "RuntimeInstances": plugin["RuntimeInstances"].clone(),
+            "RecentEvents": plugin["RecentEvents"].clone()
+        })))
+    }
+
+    pub async fn plugin_host_events_json(
+        &self,
+        plugin_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Option<Vec<Value>>> {
+        if self.installed_plugin_json(plugin_id).await?.is_none() {
+            return Ok(None);
+        }
+        plugin_host_events_for_plugin(&self.pool, plugin_id, limit.clamp(1, 250))
+            .await
+            .map(Some)
     }
 
     pub async fn upsert_discovered_plugin_package(
@@ -7567,6 +7628,92 @@ fn plugin_row_to_json(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Value> {
         "Health": health,
         "Manifest": manifest
     }))
+}
+
+async fn enrich_plugin_runtime_state(pool: &SqlitePool, plugin: &mut Value) -> anyhow::Result<()> {
+    let Some(plugin_id) = plugin.get("Id").and_then(Value::as_str).map(str::to_string) else {
+        return Ok(());
+    };
+    plugin["RuntimeInstances"] =
+        Value::Array(plugin_runtime_instances_for_plugin(pool, &plugin_id).await?);
+    plugin["RecentEvents"] =
+        Value::Array(plugin_host_events_for_plugin(pool, &plugin_id, 25).await?);
+    Ok(())
+}
+
+async fn plugin_runtime_instances_for_plugin(
+    pool: &SqlitePool,
+    plugin_id: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT instance_id, plugin_id, runtime, runtime_version, status, process_id,
+            endpoint, health_json, last_error, started_at, updated_at
+        FROM plugin_runtime_instances
+        WHERE plugin_id = ?1 COLLATE NOCASE
+        ORDER BY updated_at DESC
+        "#,
+    )
+    .bind(plugin_id.trim())
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let health: Value = serde_json::from_str(row.get::<&str, _>("health_json"))
+                .context("invalid plugin runtime health payload")?;
+            Ok(json!({
+                "InstanceId": row.get::<String, _>("instance_id"),
+                "PluginId": row.get::<Option<String>, _>("plugin_id"),
+                "Runtime": row.get::<String, _>("runtime"),
+                "RuntimeVersion": row.get::<String, _>("runtime_version"),
+                "Status": row.get::<String, _>("status"),
+                "ProcessId": row.get::<Option<i64>, _>("process_id"),
+                "Endpoint": row.get::<Option<String>, _>("endpoint"),
+                "Health": health,
+                "LastError": row.get::<Option<String>, _>("last_error"),
+                "StartedAt": row.get::<Option<String>, _>("started_at"),
+                "UpdatedAt": row.get::<String, _>("updated_at")
+            }))
+        })
+        .collect()
+}
+
+async fn plugin_host_events_for_plugin(
+    pool: &SqlitePool,
+    plugin_id: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, plugin_id, runtime, event_type, severity, message, payload_json, created_at
+        FROM plugin_host_events
+        WHERE plugin_id = ?1 COLLATE NOCASE
+        ORDER BY created_at DESC
+        LIMIT ?2
+        "#,
+    )
+    .bind(plugin_id.trim())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let payload: Value = serde_json::from_str(row.get::<&str, _>("payload_json"))
+                .context("invalid plugin host event payload")?;
+            Ok(json!({
+                "Id": row.get::<String, _>("id"),
+                "PluginId": row.get::<Option<String>, _>("plugin_id"),
+                "Runtime": row.get::<Option<String>, _>("runtime"),
+                "EventType": row.get::<String, _>("event_type"),
+                "Severity": row.get::<String, _>("severity"),
+                "Message": row.get::<String, _>("message"),
+                "Payload": payload,
+                "CreatedAt": row.get::<String, _>("created_at")
+            }))
+        })
+        .collect()
 }
 
 fn plugin_snapshot_items<'a>(snapshot: &'a Value, section: &str) -> anyhow::Result<&'a Vec<Value>> {
