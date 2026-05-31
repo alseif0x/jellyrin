@@ -13,7 +13,7 @@ use jellyrin_core::{
 };
 use serde_json::{Value, json};
 use sqlx::{
-    QueryBuilder, Sqlite, SqliteConnection, SqlitePool,
+    QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -526,7 +526,109 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
+        self.sync_plugin_platform_from_system_configuration()
+            .await?;
         Ok(())
+    }
+
+    pub async fn sync_plugin_platform_from_system_configuration(&self) -> anyhow::Result<()> {
+        let payloads = self.system_configuration_payloads().await?;
+        let repositories = plugin_repository_models_from_config(&payloads.plugin_repositories);
+        let packages = package_catalog_models_from_repositories(&repositories);
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM package_catalog_cache")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM plugin_repositories")
+            .execute(&mut *tx)
+            .await?;
+
+        for repository in repositories {
+            sqlx::query(
+                r#"
+                INSERT INTO plugin_repositories (id, name, url, enabled, payload_json, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )
+            .bind(&repository.id)
+            .bind(&repository.name)
+            .bind(&repository.url)
+            .bind(repository.enabled)
+            .bind(serde_json::to_string(&repository.payload)?)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for package in packages {
+            sqlx::query(
+                r#"
+                INSERT INTO package_catalog_cache (
+                    id, repository_url, package_guid, package_name, package_version, runtime,
+                    target_abi, payload_json, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )
+            .bind(&package.id)
+            .bind(&package.repository_url)
+            .bind(&package.package_guid)
+            .bind(&package.package_name)
+            .bind(&package.package_version)
+            .bind(&package.runtime)
+            .bind(&package.target_abi)
+            .bind(serde_json::to_string(&package.payload)?)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn plugin_platform_snapshot(&self) -> anyhow::Result<Value> {
+        self.sync_plugin_platform_from_system_configuration()
+            .await?;
+        let repositories = plugin_repositories_snapshot(&self.pool).await?;
+        let package_catalog = package_catalog_snapshot(&self.pool).await?;
+        Ok(json!({
+            "ModelVersion": 1,
+            "Repositories": {
+                "Count": repositories.len(),
+                "Items": repositories
+            },
+            "PackageCatalogCache": {
+                "Count": package_catalog.len(),
+                "Items": package_catalog
+            },
+            "PackageInstallations": {
+                "Count": table_count(&self.pool, "package_installations").await?
+            },
+            "InstalledPlugins": {
+                "Count": table_count(&self.pool, "installed_plugins").await?
+            },
+            "PluginManifests": {
+                "Count": table_count(&self.pool, "plugin_manifests").await?
+            },
+            "PluginConfigurations": {
+                "Count": table_count(&self.pool, "plugin_configurations").await?
+            },
+            "PluginPermissions": {
+                "Count": table_count(&self.pool, "plugin_permissions").await?
+            },
+            "PluginRuntimeInstances": {
+                "Count": table_count(&self.pool, "plugin_runtime_instances").await?
+            },
+            "PluginHostEvents": {
+                "Count": table_count(&self.pool, "plugin_host_events").await?
+            },
+            "PluginAuditLog": {
+                "Count": table_count(&self.pool, "plugin_audit_log").await?
+            }
+        }))
     }
 
     pub async fn named_configuration(&self, key: &str) -> anyhow::Result<Option<Value>> {
@@ -6167,6 +6269,207 @@ fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[derive(Debug, Clone)]
+struct PluginRepositoryModel {
+    id: String,
+    name: String,
+    url: String,
+    enabled: bool,
+    payload: Value,
+}
+
+#[derive(Debug, Clone)]
+struct PackageCatalogModel {
+    id: String,
+    repository_url: String,
+    package_guid: Option<String>,
+    package_name: String,
+    package_version: String,
+    runtime: String,
+    target_abi: String,
+    payload: Value,
+}
+
+fn plugin_repository_models_from_config(value: &Value) -> Vec<PluginRepositoryModel> {
+    let Some(repositories) = value.as_array() else {
+        return Vec::new();
+    };
+    repositories
+        .iter()
+        .filter_map(|value| {
+            let object = value.as_object()?;
+            let name = json_string_case_insensitive(value, "Name")?;
+            let url = json_string_case_insensitive(value, "Url")?;
+            let enabled = object
+                .get("Enabled")
+                .or_else(|| object.get("enabled"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            Some(PluginRepositoryModel {
+                id: stable_plugin_model_id("repository", &url),
+                name,
+                url,
+                enabled,
+                payload: value.clone(),
+            })
+        })
+        .collect()
+}
+
+fn package_catalog_models_from_repositories(
+    repositories: &[PluginRepositoryModel],
+) -> Vec<PackageCatalogModel> {
+    let mut packages = Vec::new();
+    for repository in repositories.iter().filter(|repository| repository.enabled) {
+        let Some(repository_packages) =
+            json_array_case_insensitive(&repository.payload, "Packages")
+        else {
+            continue;
+        };
+        for package in repository_packages {
+            let Some(package_name) = json_string_case_insensitive(package, "Name") else {
+                continue;
+            };
+            let package_guid = json_string_case_insensitive(package, "Guid")
+                .or_else(|| json_string_case_insensitive(package, "Id"))
+                .or_else(|| json_string_case_insensitive(package, "AssemblyGuid"));
+            let package_runtime = json_string_case_insensitive(package, "Runtime")
+                .unwrap_or_else(|| "DotNetJellyfin".to_string());
+            let versions = json_array_case_insensitive(package, "Versions")
+                .map(|versions| versions.to_vec())
+                .unwrap_or_else(|| vec![package.clone()]);
+            for version in versions {
+                let package_version = json_string_case_insensitive(&version, "Version")
+                    .unwrap_or_else(|| "0.0.0.0".to_string());
+                let runtime = json_string_case_insensitive(&version, "Runtime")
+                    .unwrap_or_else(|| package_runtime.clone());
+                let target_abi = json_string_case_insensitive(&version, "TargetAbi")
+                    .or_else(|| json_string_case_insensitive(package, "TargetAbi"))
+                    .unwrap_or_default();
+                let payload = json!({
+                    "RepositoryName": repository.name,
+                    "RepositoryUrl": repository.url,
+                    "Package": package,
+                    "Version": version
+                });
+                packages.push(PackageCatalogModel {
+                    id: stable_plugin_model_id(
+                        "package",
+                        &format!("{}:{}:{}", repository.url, package_name, package_version),
+                    ),
+                    repository_url: repository.url.clone(),
+                    package_guid: package_guid.clone(),
+                    package_name: package_name.clone(),
+                    package_version,
+                    runtime,
+                    target_abi,
+                    payload,
+                });
+            }
+        }
+    }
+    packages
+}
+
+async fn plugin_repositories_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT name, url, enabled, payload_json
+        FROM plugin_repositories
+        ORDER BY name COLLATE NOCASE, url COLLATE NOCASE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let payload: Value = serde_json::from_str(row.get::<&str, _>("payload_json"))
+                .context("invalid plugin repository payload")?;
+            Ok(json!({
+                "Name": row.get::<String, _>("name"),
+                "Url": row.get::<String, _>("url"),
+                "Enabled": row.get::<i64, _>("enabled") != 0,
+                "Payload": payload
+            }))
+        })
+        .collect()
+}
+
+async fn package_catalog_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT repository_url, package_guid, package_name, package_version, runtime, target_abi, payload_json
+        FROM package_catalog_cache
+        ORDER BY package_name COLLATE NOCASE, package_version COLLATE NOCASE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let payload: Value = serde_json::from_str(row.get::<&str, _>("payload_json"))
+                .context("invalid package catalog payload")?;
+            Ok(json!({
+                "RepositoryUrl": row.get::<String, _>("repository_url"),
+                "Guid": row.get::<Option<String>, _>("package_guid"),
+                "Name": row.get::<String, _>("package_name"),
+                "Version": row.get::<String, _>("package_version"),
+                "Runtime": row.get::<String, _>("runtime"),
+                "TargetAbi": row.get::<String, _>("target_abi"),
+                "Payload": payload
+            }))
+        })
+        .collect()
+}
+
+async fn table_count(pool: &SqlitePool, table: &str) -> anyhow::Result<i64> {
+    let sql = match table {
+        "package_installations" => "SELECT COUNT(*) FROM package_installations",
+        "installed_plugins" => "SELECT COUNT(*) FROM installed_plugins",
+        "plugin_manifests" => "SELECT COUNT(*) FROM plugin_manifests",
+        "plugin_configurations" => "SELECT COUNT(*) FROM plugin_configurations",
+        "plugin_permissions" => "SELECT COUNT(*) FROM plugin_permissions",
+        "plugin_runtime_instances" => "SELECT COUNT(*) FROM plugin_runtime_instances",
+        "plugin_host_events" => "SELECT COUNT(*) FROM plugin_host_events",
+        "plugin_audit_log" => "SELECT COUNT(*) FROM plugin_audit_log",
+        _ => anyhow::bail!("unsupported plugin platform table: {table}"),
+    };
+    Ok(sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await?)
+}
+
+fn json_string_case_insensitive(value: &Value, field: &str) -> Option<String> {
+    value
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(field))
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn json_array_case_insensitive<'a>(value: &'a Value, field: &str) -> Option<&'a Vec<Value>> {
+    value
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(field))
+        .and_then(|(_, value)| value.as_array())
+}
+
+fn stable_plugin_model_id(kind: &str, value: &str) -> String {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("{kind}:{normalized}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -6328,6 +6631,108 @@ mod tests {
             .unwrap();
         let updated = db.named_configuration("NETWORK").await.unwrap().unwrap();
         assert_eq!(updated, json!({ "InternalHttpPort": 8098 }));
+    }
+
+    #[tokio::test]
+    async fn plugin_platform_state_migrates_repositories_and_catalog_cache() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_system_configuration_payloads(SystemConfigurationPayloads {
+            plugin_repositories: json!([
+                {
+                    "Name": "Stable",
+                    "Url": "https://repo.example/stable.json",
+                    "Enabled": true,
+                    "Packages": [
+                        {
+                            "Name": "DotNet Fixture",
+                            "Guid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                            "Runtime": "DotNetJellyfin",
+                            "Versions": [
+                                {
+                                    "Version": "1.0.0.0",
+                                    "TargetAbi": "12.0.0.0",
+                                    "SourceUrl": "https://repo.example/dotnet.zip"
+                                }
+                            ]
+                        },
+                        {
+                            "Name": "Rust Fixture",
+                            "Guid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                            "Runtime": "RustWasi",
+                            "Versions": [
+                                {
+                                    "Version": "0.1.0",
+                                    "TargetAbi": "jellyrin-wasi-0.1",
+                                    "SourceUrl": "https://repo.example/rust.wasm"
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "Name": "Disabled",
+                    "Url": "https://repo.example/disabled.json",
+                    "Enabled": false,
+                    "Packages": [
+                        { "Name": "Hidden", "Version": "1.0.0.0" }
+                    ]
+                }
+            ]),
+            ..SystemConfigurationPayloads::default()
+        })
+        .await
+        .unwrap();
+
+        let snapshot = db.plugin_platform_snapshot().await.unwrap();
+        assert_eq!(snapshot["ModelVersion"], 1);
+        assert_eq!(snapshot["Repositories"]["Count"], 2);
+        assert_eq!(snapshot["PackageCatalogCache"]["Count"], 2);
+        assert_eq!(
+            snapshot["PackageCatalogCache"]["Items"][0]["Runtime"],
+            "DotNetJellyfin"
+        );
+        assert_eq!(
+            snapshot["PackageCatalogCache"]["Items"][1]["Runtime"],
+            "RustWasi"
+        );
+        assert_eq!(snapshot["InstalledPlugins"]["Count"], 0);
+        assert_eq!(snapshot["PluginRuntimeInstances"]["Count"], 0);
+    }
+
+    #[tokio::test]
+    async fn plugin_platform_state_survives_sqlite_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("jellyrin-plugin-platform.db");
+        std::fs::File::create(&db_path).unwrap();
+        let database_url = format!("sqlite://{}", db_path.display());
+        {
+            let db = Database::connect(&database_url).await.unwrap();
+            db.update_system_configuration_payloads(SystemConfigurationPayloads {
+                plugin_repositories: json!([{
+                    "Name": "Persistent",
+                    "Url": "https://repo.example/persistent.json",
+                    "Packages": [{
+                        "Name": "Persistent Plugin",
+                        "Guid": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                        "Versions": [{ "Version": "2.0.0.0" }]
+                    }]
+                }]),
+                ..SystemConfigurationPayloads::default()
+            })
+            .await
+            .unwrap();
+            let snapshot = db.plugin_platform_snapshot().await.unwrap();
+            assert_eq!(snapshot["PackageCatalogCache"]["Count"], 1);
+        }
+
+        let reopened = Database::connect(&database_url).await.unwrap();
+        let snapshot = reopened.plugin_platform_snapshot().await.unwrap();
+        assert_eq!(snapshot["Repositories"]["Count"], 1);
+        assert_eq!(snapshot["PackageCatalogCache"]["Count"], 1);
+        assert_eq!(
+            snapshot["PackageCatalogCache"]["Items"][0]["Name"],
+            "Persistent Plugin"
+        );
     }
 
     #[tokio::test]

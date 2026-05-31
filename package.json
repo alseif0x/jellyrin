@@ -8,7 +8,7 @@
     "golden:startup-wizard": "node qa/golden/startup-wizard-runner.js",
     "golden:dto": "node qa/golden/dto-parity.js",
     "golden:ecosystem": "npm run evidence:ecosystem",
-    "golden:plugins": "node qa/golden/ecosystem-placeholder.js plugin-dual-runtime",
+    "golden:plugins": "node qa/golden/plugin-dual-runtime.js",
     "golden:livetv": "node qa/golden/livetv-real.js",
     "golden:dlna": "node qa/golden/dlna-upnp.js",
     "golden:dlna-discovery": "node qa/golden/dlna-discovery.js",
