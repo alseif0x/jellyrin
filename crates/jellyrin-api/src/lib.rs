@@ -28414,17 +28414,17 @@ mod tests {
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun, SystemLifecycleCommand,
         backup_restore_snapshot_json, cascade_delete_series_timer_timers,
-        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
-        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
-        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
-        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
-        live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
-        live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
-        materialize_series_timer_timers, media_item_by_id, media_item_streams,
-        package_install_task_key, paged_media_items, parse_authorization_token,
-        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
+        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
+        encoding_configuration_json, format_time_for_json, get_valid_filename,
+        hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id, json_string_field,
+        json_value_i64, last_system_lifecycle_command, live_tv_channel_is_remote,
+        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
+        live_tv_recording_name, load_countries, load_cultures, materialize_series_timer_timers,
+        media_item_by_id, media_item_streams, package_install_task_key, paged_media_items,
+        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
+        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
         record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
         run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
@@ -32378,6 +32378,261 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(b"\x89PNG"));
+    }
+
+    #[tokio::test]
+    async fn dlna_control_point_golden_direct_stream_and_real_hls_transcode() {
+        let media_root = tempfile::tempdir().unwrap();
+        let video_path = media_root.path().join("Golden DLNA Movie.mp4");
+        let ffmpeg_output = tokio::process::Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("testsrc=size=160x90:rate=24")
+            .arg("-t")
+            .arg("2")
+            .arg("-an")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-preset")
+            .arg("ultrafast")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-movflags")
+            .arg("+faststart")
+            .arg(&video_path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            ffmpeg_output.status.success(),
+            "ffmpeg failed to generate DLNA golden fixture: {}",
+            String::from_utf8_lossy(&ffmpeg_output.stderr)
+        );
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("dlna-golden-user".to_string(), "secret")
+            .await
+            .unwrap();
+        db.issue_api_key_for_user(user.id, "dlna-golden-key")
+            .await
+            .unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Golden DLNA",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 1);
+        let item = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "Golden DLNA Movie")
+            .unwrap();
+        db.update_media_item_media_info(
+            item.id,
+            Some(20_000_000),
+            Some(250_000),
+            Some(160),
+            Some(90),
+            vec![json!({
+                "Type": "Video",
+                "Index": 0,
+                "Codec": "h264",
+                "Width": 160,
+                "Height": 90
+            })],
+        )
+        .await
+        .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/description.xml"))
+                    .header(header::HOST, "127.0.0.1:8097")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let description = String::from_utf8(body.to_vec()).unwrap();
+        assert!(description.contains("urn:schemas-upnp-org:device:MediaServer:1"));
+        assert!(description.contains("ContentDirectory"));
+        assert!(description.contains("ConnectionManager"));
+        assert!(description.contains("X_MS_MediaReceiverRegistrar"));
+
+        let browse_folder = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>folder:{}</ObjectID>
+      <BrowseFlag>BrowseDirectChildren</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria></SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#,
+            folder.id
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/dlna/{server_id}/contentdirectory/control"))
+                    .header(header::HOST, "127.0.0.1:8097")
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(browse_folder))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let browse_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(browse_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(browse_response.contains("Golden DLNA Movie"));
+        assert!(
+            browse_response.contains(&format!("/dlna/{server_id}/items/{}/stream.mp4", item.id))
+        );
+        assert!(browse_response.contains(&format!(
+            "/dlna/{server_id}/items/{}/transcode.m3u8",
+            item.id
+        )));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{}/stream.mp4", item.id))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp4")
+        );
+        let direct_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&direct_bytes[4..8], b"ftyp");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/transcode.m3u8",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let master_playlist = String::from_utf8(body.to_vec()).unwrap();
+        let play_session_id = master_playlist
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("hls/")
+                    .and_then(|value| value.strip_suffix("/main.m3u8"))
+            })
+            .expect("DLNA master playlist must contain media playlist URI")
+            .to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/dlna/{server_id}/items/{}/hls/{play_session_id}/main.m3u8",
+                        item.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let media_playlist = String::from_utf8(body.to_vec()).unwrap();
+        assert!(media_playlist.contains("#EXTINF"));
+        let segment_path = media_playlist
+            .lines()
+            .find(|line| line.starts_with("/dlna/") && line.ends_with(".ts"))
+            .expect("DLNA media playlist must contain rewritten TS segment path");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(segment_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp2t")
+        );
+        let segment_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            segment_bytes.len() >= 188,
+            "DLNA HLS segment should contain at least one TS packet"
+        );
+        assert_eq!(segment_bytes[0], 0x47);
+
+        for _ in 0..50 {
+            let session = test_db
+                .transcode_session_by_play_session_id(&play_session_id)
+                .await
+                .unwrap()
+                .expect("DLNA HLS session should exist");
+            if matches!(session.status.as_str(), "completed" | "failed" | "stopped") {
+                let _ = cleanup_hls_transcode_files(&session.output_path).await;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     #[tokio::test]

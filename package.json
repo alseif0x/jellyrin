@@ -10,7 +10,7 @@
     "golden:ecosystem": "npm run evidence:ecosystem",
     "golden:plugins": "node qa/golden/ecosystem-placeholder.js plugin-dual-runtime",
     "golden:livetv": "node qa/golden/livetv-real.js",
-    "golden:dlna": "node qa/golden/ecosystem-placeholder.js dlna-upnp",
+    "golden:dlna": "node qa/golden/dlna-upnp.js",
     "golden:syncplay": "node qa/golden/syncplay-advanced.js",
     "golden:channels": "node qa/golden/ecosystem-placeholder.js channels-providers",
     "golden:clients": "node qa/golden/non-web-clients.js",
