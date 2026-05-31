@@ -6182,6 +6182,8 @@ async fn install_package(
         .or_else(|| json_string_field(&package, "TargetAbi"))
         .unwrap_or_default();
     let manifest = plugin_manifest_from_package(package.clone());
+    let previous_plugin = state.db.installed_plugin_json(&plugin_id).await?;
+    let operation = plugin_package_operation(previous_plugin.as_ref(), &version);
     let task_key = package_install_task_key(&plugin_id);
     let run = state.db.start_task_run(&task_key).await.map_err(|error| {
         if format!("{error:#}").contains("task is already running") {
@@ -6236,12 +6238,14 @@ async fn install_package(
                 "Name": package_name.clone(),
                 "Version": version.clone(),
                 "Runtime": runtime.clone(),
+                "Operation": operation.clone(),
                 "Status": "Installed"
             }),
         )
         .await?;
-    let details =
-        format!("{package_name} {version} was registered with runtime status NotSupported.");
+    let details = format!(
+        "{package_name} {version} was registered with runtime status NotSupported ({operation})."
+    );
     record_activity(
         &state.db,
         "Plugin installed",
@@ -6270,6 +6274,46 @@ async fn cancel_package_installation(
 
 fn package_install_task_key(package_id: &str) -> String {
     format!("PackageInstall:{}", package_id.trim().to_ascii_lowercase())
+}
+
+fn plugin_package_operation(previous_plugin: Option<&serde_json::Value>, version: &str) -> String {
+    let Some(previous_version) =
+        previous_plugin.and_then(|plugin| json_string_field(plugin, "Version"))
+    else {
+        return "Install".to_string();
+    };
+    match compare_plugin_versions(version, &previous_version) {
+        std::cmp::Ordering::Greater => "Update".to_string(),
+        std::cmp::Ordering::Less => "Downgrade".to_string(),
+        std::cmp::Ordering::Equal => "Reinstall".to_string(),
+    }
+}
+
+fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_parts = parse_plugin_version_parts(left);
+    let right_parts = parse_plugin_version_parts(right);
+    if left_parts.is_empty() || right_parts.is_empty() {
+        return left.trim().cmp(right.trim());
+    }
+    let width = left_parts.len().max(right_parts.len());
+    for index in 0..width {
+        let left = left_parts.get(index).copied().unwrap_or(0);
+        let right = right_parts.get(index).copied().unwrap_or(0);
+        match left.cmp(&right) {
+            std::cmp::Ordering::Equal => continue,
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn parse_plugin_version_parts(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-', '+'])
+        .map(str::trim)
+        .take_while(|part| part.chars().all(|ch| ch.is_ascii_digit()))
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
 }
 
 async fn prepare_plugin_package_artifact(
@@ -29115,7 +29159,7 @@ mod tests {
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
         package_install_task_key, paged_media_items, parse_authorization_token,
         parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs, plugin_package_operation,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
         record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
         run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
@@ -29266,6 +29310,24 @@ mod tests {
             verify_plugin_package_checksum(&json!({}), &json!({ "Checksum": "abc123" }), payload)
                 .unwrap_err();
         assert_eq!(unsupported.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn plugin_package_operation_detects_update_downgrade_and_reinstall() {
+        let previous = json!({ "Version": "1.2.0.0" });
+        assert_eq!(plugin_package_operation(None, "1.0.0.0"), "Install");
+        assert_eq!(
+            plugin_package_operation(Some(&previous), "1.3.0.0"),
+            "Update"
+        );
+        assert_eq!(
+            plugin_package_operation(Some(&previous), "1.1.9.0"),
+            "Downgrade"
+        );
+        assert_eq!(
+            plugin_package_operation(Some(&previous), "1.2.0.0"),
+            "Reinstall"
+        );
     }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)
@@ -38114,6 +38176,24 @@ mod tests {
         .unwrap();
         let plugin_zip_bytes = tokio::fs::read(&plugin_zip).await.unwrap();
         let plugin_zip_checksum = format!("{:x}", Sha256::digest(&plugin_zip_bytes));
+        let plugin_zip_v2 = tmp.path().join("example-plugin-v2.zip");
+        tokio::fs::write(
+            &plugin_zip_v2,
+            stored_zip(&[
+                (
+                    "Jellyfin.Plugin.Example.dll",
+                    b"example dotnet plugin assembly placeholder v2".as_slice(),
+                ),
+                (
+                    "meta.json",
+                    br#"{"name":"Example Plugin","version":"1.1.0.0"}"#.as_slice(),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        let plugin_zip_v2_bytes = tokio::fs::read(&plugin_zip_v2).await.unwrap();
+        let plugin_zip_v2_checksum = format!("{:x}", Sha256::digest(&plugin_zip_v2_bytes));
         let log_dir = tmp.path().join("logs");
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
         let app = router(AppState {
@@ -38134,13 +38214,22 @@ mod tests {
                     "Description": "Example package",
                     "Owner": "Jellyrin",
                     "Category": "General",
-                    "Versions": [{
-                        "Version": "1.0.0.0",
-                        "TargetAbi": "12.0.0.0",
-                        "SourceUrl": format!("file://{}", plugin_zip.to_string_lossy()),
-                        "Checksum": plugin_zip_checksum,
-                        "ImagePath": plugin_image.to_string_lossy()
-                    }]
+                    "Versions": [
+                        {
+                            "Version": "1.0.0.0",
+                            "TargetAbi": "12.0.0.0",
+                            "SourceUrl": format!("file://{}", plugin_zip.to_string_lossy()),
+                            "Checksum": plugin_zip_checksum,
+                            "ImagePath": plugin_image.to_string_lossy()
+                        },
+                        {
+                            "Version": "1.1.0.0",
+                            "TargetAbi": "12.0.0.0",
+                            "SourceUrl": format!("file://{}", plugin_zip_v2.to_string_lossy()),
+                            "Checksum": plugin_zip_v2_checksum,
+                            "ImagePath": plugin_image.to_string_lossy()
+                        }
+                    ]
                 }]
             },
             { "name": "Disabled", "url": "https://disabled.example/manifest.json", "enabled": false },
@@ -38279,9 +38368,14 @@ mod tests {
         assert_eq!(packages[0]["Name"], "Example Plugin");
         assert_eq!(packages[0]["Guid"], "11111111-1111-1111-1111-111111111111");
         assert_eq!(packages[0]["Versions"][0]["Version"], "1.0.0.0");
+        assert_eq!(packages[0]["Versions"][1]["Version"], "1.1.0.0");
         assert_eq!(
             packages[0]["Versions"][0]["SourceUrl"],
             format!("file://{}", plugin_zip.to_string_lossy())
+        );
+        assert_eq!(
+            packages[0]["Versions"][1]["SourceUrl"],
+            format!("file://{}", plugin_zip_v2.to_string_lossy())
         );
 
         let response = app
@@ -38487,7 +38581,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/Package/Packages/Installed/Example%20Plugin?Version=1.0.0.0")
+                    .uri("/Package/Packages/Installed/Example%20Plugin?Version=1.1.0.0")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -38510,7 +38604,53 @@ mod tests {
             .unwrap()
             .expect("completed package install task");
         assert_eq!(package_task.status, "completed");
-        assert_eq!(package_task.result_json.unwrap()["Status"], "Installed");
+        let package_task_result = package_task.result_json.unwrap();
+        assert_eq!(package_task_result["Status"], "Installed");
+        assert_eq!(package_task_result["Operation"], "Update");
+        assert_eq!(package_task_result["Version"], "1.1.0.0");
+        let installed_after_update = db_for_assertions.installed_plugins_json().await.unwrap();
+        assert_eq!(installed_after_update[0]["Version"], "1.1.0.0");
+        let installations = db_for_assertions
+            .package_installations_json("11111111-1111-1111-1111-111111111111")
+            .await
+            .unwrap();
+        assert_eq!(installations.len(), 2);
+        assert_eq!(installations[0]["Version"], "1.0.0.0");
+        assert_eq!(installations[0]["Status"], "Superseded");
+        assert_eq!(installations[1]["Version"], "1.1.0.0");
+        assert_eq!(installations[1]["Status"], "Installed");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Packages/Installed/Example%20Plugin?Version=1.0.0.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let package_task = db_for_assertions
+            .last_task_result(&package_task_key)
+            .await
+            .unwrap()
+            .expect("completed package install task");
+        let package_task_result = package_task.result_json.unwrap();
+        assert_eq!(package_task_result["Operation"], "Downgrade");
+        assert_eq!(package_task_result["Version"], "1.0.0.0");
+        let installed_after_downgrade = db_for_assertions.installed_plugins_json().await.unwrap();
+        assert_eq!(installed_after_downgrade[0]["Version"], "1.0.0.0");
+        let installations = db_for_assertions
+            .package_installations_json("11111111-1111-1111-1111-111111111111")
+            .await
+            .unwrap();
+        assert_eq!(installations[0]["Version"], "1.0.0.0");
+        assert_eq!(installations[0]["Status"], "Installed");
+        assert_eq!(installations[1]["Version"], "1.1.0.0");
+        assert_eq!(installations[1]["Status"], "Superseded");
 
         let response = app
             .clone()

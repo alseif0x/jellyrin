@@ -666,6 +666,21 @@ impl Database {
 
         sqlx::query(
             r#"
+            UPDATE package_installations
+            SET status = 'Superseded', updated_at = ?1
+            WHERE package_guid = ?2 COLLATE NOCASE
+              AND version != ?3 COLLATE NOCASE
+              AND status = 'Installed'
+            "#,
+        )
+        .bind(&now)
+        .bind(&package.plugin_id)
+        .bind(&package.version)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
             INSERT INTO package_installations (
                 id, package_name, package_guid, version, runtime, status, source_url,
                 payload_json, installed_at, updated_at
@@ -792,6 +807,23 @@ impl Database {
         Ok(())
     }
 
+    pub async fn installed_plugin_json(&self, plugin_id: &str) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query(
+            r#"
+            SELECT plugin_id, name, version, runtime, runtime_version, target_abi,
+                server_compatibility_json, status, capabilities_json, permissions_json,
+                configuration_state, last_error, health_json, manifest_json
+            FROM installed_plugins
+            WHERE plugin_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| plugin_row_to_json(&row)).transpose()
+    }
+
     pub async fn installed_plugins_json(&self) -> anyhow::Result<Vec<Value>> {
         let rows = sqlx::query(
             r#"
@@ -807,6 +839,39 @@ impl Database {
 
         rows.into_iter()
             .map(|row| plugin_row_to_json(&row))
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    pub async fn package_installations_json(&self, plugin_id: &str) -> anyhow::Result<Vec<Value>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT package_name, package_guid, version, runtime, status, source_url,
+                payload_json, installed_at, updated_at
+            FROM package_installations
+            WHERE package_guid = ?1 COLLATE NOCASE
+            ORDER BY version COLLATE NOCASE
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload: Value = serde_json::from_str(row.get::<&str, _>("payload_json"))
+                    .context("invalid package installation payload")?;
+                Ok(json!({
+                    "Name": row.get::<String, _>("package_name"),
+                    "Guid": row.get::<Option<String>, _>("package_guid"),
+                    "Version": row.get::<String, _>("version"),
+                    "Runtime": row.get::<String, _>("runtime"),
+                    "Status": row.get::<String, _>("status"),
+                    "SourceUrl": row.get::<Option<String>, _>("source_url"),
+                    "Payload": payload,
+                    "InstalledAt": row.get::<Option<String>, _>("installed_at"),
+                    "UpdatedAt": row.get::<String, _>("updated_at")
+                }))
+            })
             .collect::<anyhow::Result<Vec<_>>>()
     }
 
