@@ -122,6 +122,16 @@ fn dlna_protocol_info() -> &'static str {
     DLNA_SOURCE_PROTOCOL_INFO.as_str()
 }
 
+fn dlna_protocol_info_for_profile(profile: DlnaRendererProfile) -> &'static str {
+    match profile {
+        DlnaRendererProfile::Generic
+        | DlnaRendererProfile::Vlc
+        | DlnaRendererProfile::Samsung
+        | DlnaRendererProfile::Lg
+        | DlnaRendererProfile::Sony => dlna_protocol_info(),
+    }
+}
+
 fn dlna_protocol_info_value(mime_type: &str, profile_name: Option<&str>) -> String {
     match profile_name {
         Some(profile_name) => {
@@ -129,6 +139,64 @@ fn dlna_protocol_info_value(mime_type: &str, profile_name: Option<&str>) -> Stri
         }
         None => format!("http-get:*:{mime_type}:{DLNA_PROTOCOL_FLAGS}"),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DlnaRendererProfile {
+    Generic,
+    Vlc,
+    Samsung,
+    Lg,
+    Sony,
+}
+
+impl DlnaRendererProfile {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let fingerprint = [
+            header_value(headers, header::USER_AGENT.as_str()),
+            header_value(headers, "x-av-client-info"),
+            header_value(headers, "x-av-physical-unit-info"),
+            header_value(headers, "friendlyname.dlna.org"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+        if fingerprint.contains("vlc") {
+            Self::Vlc
+        } else if fingerprint.contains("samsung") || fingerprint.contains("sec_hhp") {
+            Self::Samsung
+        } else if fingerprint.contains("lg") || fingerprint.contains("lge") {
+            Self::Lg
+        } else if fingerprint.contains("sony") || fingerprint.contains("bravia") {
+            Self::Sony
+        } else {
+            Self::Generic
+        }
+    }
+
+    fn prefer_hls_resource(self) -> bool {
+        matches!(self, Self::Vlc)
+    }
+
+    fn emit_caption_info_ex(self) -> bool {
+        matches!(self, Self::Generic | Self::Samsung)
+    }
+
+    fn video_pn_enabled(self) -> bool {
+        matches!(self, Self::Samsung | Self::Lg | Self::Sony)
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub fn spawn_dlna_ssdp_service(state: AppState) -> JoinHandle<()> {
@@ -225,10 +293,12 @@ pub(crate) async fn icon(
 
 pub(crate) async fn connection_manager_control(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     body: BodyBytes,
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
+    let renderer_profile = DlnaRendererProfile::from_headers(&headers);
     let request = String::from_utf8_lossy(&body);
     let Some(action) = soap_action(&request) else {
         return Ok(soap_fault_response(401, "Invalid Action"));
@@ -236,7 +306,7 @@ pub(crate) async fn connection_manager_control(
     let body = match action.as_str() {
         "getprotocolinfo" => format!(
             "<Source>{}</Source><Sink></Sink>",
-            escape_xml(dlna_protocol_info())
+            escape_xml(dlna_protocol_info_for_profile(renderer_profile))
         ),
         "getcurrentconnectionids" => "<ConnectionIDs>0</ConnectionIDs>".to_string(),
         "getcurrentconnectioninfo" => concat!(
@@ -297,6 +367,12 @@ pub(crate) async fn content_directory_control(
 ) -> Result<Response, ApiError> {
     let context = dlna_context(&state, &server_id).await?;
     let server_address = request_server_address(&headers, &state);
+    let renderer_profile = DlnaRendererProfile::from_headers(&headers);
+    let render_context = DlnaRenderContext {
+        server_id: context.server_id,
+        server_address: &server_address,
+        renderer_profile,
+    };
     let request = String::from_utf8_lossy(&body);
     let Some(action) = soap_action(&request) else {
         return Ok(soap_fault_response(401, "Invalid Action"));
@@ -308,24 +384,20 @@ pub(crate) async fn content_directory_control(
         "getsortcapabilities" => "<SortCaps>dc:title</SortCaps>".to_string(),
         "getsystemupdateid" => format!("<Id>{}</Id>", dlna_system_update_id()),
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
-        "browse" => {
-            match browse_response(&state.db, &request, context.server_id, &server_address).await {
-                Ok(response) => response,
-                Err(error) if error.status == StatusCode::NOT_FOUND => {
-                    return Ok(soap_fault_response(701, "No such object"));
-                }
-                Err(error) => return Err(error),
+        "browse" => match browse_response(&state.db, &request, render_context).await {
+            Ok(response) => response,
+            Err(error) if error.status == StatusCode::NOT_FOUND => {
+                return Ok(soap_fault_response(701, "No such object"));
             }
-        }
-        "search" => {
-            match search_response(&state.db, &request, context.server_id, &server_address).await {
-                Ok(response) => response,
-                Err(error) if error.status == StatusCode::NOT_FOUND => {
-                    return Ok(soap_fault_response(701, "No such object"));
-                }
-                Err(error) => return Err(error),
+            Err(error) => return Err(error),
+        },
+        "search" => match search_response(&state.db, &request, render_context).await {
+            Ok(response) => response,
+            Err(error) if error.status == StatusCode::NOT_FOUND => {
+                return Ok(soap_fault_response(701, "No such object"));
             }
-        }
+            Err(error) => return Err(error),
+        },
         _ => {
             return Ok(soap_fault_response(401, "Invalid Action"));
         }
@@ -1828,8 +1900,7 @@ fn dlna_service_xml(actions: &[DlnaAction], state_variables: &[DlnaStateVariable
 async fn browse_response(
     db: &Database,
     request: &str,
-    server_id: Uuid,
-    server_address: &str,
+    render_context: DlnaRenderContext<'_>,
 ) -> Result<String, ApiError> {
     let object_id = soap_param(request, "ObjectID").unwrap_or_else(|| "0".to_string());
     let browse_flag =
@@ -1869,8 +1940,7 @@ async fn browse_response(
                 &metadata,
                 (starting_index, requested_count),
                 &sort_criteria,
-                server_id,
-                server_address,
+                render_context,
             )?
         } else {
             directory_browse_payload(
@@ -1879,8 +1949,7 @@ async fn browse_response(
                 "",
                 (starting_index, requested_count),
                 &sort_criteria,
-                server_id,
-                server_address,
+                render_context,
             )?
         }
     } else if let Some((folder_id, album_title)) = parse_album_object_id(&object_id) {
@@ -1912,8 +1981,7 @@ async fn browse_response(
                 album_items,
                 (starting_index, requested_count),
                 &sort_criteria,
-                server_id,
-                server_address,
+                render_context,
             )
         }
     } else if let Some((folder_id, relative_path)) = parse_directory_object_id(&object_id) {
@@ -1940,8 +2008,7 @@ async fn browse_response(
                 &relative_path,
                 (starting_index, requested_count),
                 &sort_criteria,
-                server_id,
-                server_address,
+                render_context,
             )?
         }
     } else if let Some(item_id) = parse_item_object_id(&object_id) {
@@ -1950,7 +2017,7 @@ async fn browse_response(
             .await
             .map_err(|_| ApiError::not_found("DLNA item not found"))?;
         if browse_metadata {
-            BrowsePayload::metadata(didl_media_items(&[item], server_id, server_address))
+            BrowsePayload::metadata(didl_media_items(&[item], render_context))
         } else {
             BrowsePayload::empty()
         }
@@ -1978,11 +2045,17 @@ async fn media_items_for_folder(
         .collect())
 }
 
+#[derive(Clone, Copy)]
+struct DlnaRenderContext<'a> {
+    server_id: Uuid,
+    server_address: &'a str,
+    renderer_profile: DlnaRendererProfile,
+}
+
 async fn search_response(
     db: &Database,
     request: &str,
-    server_id: Uuid,
-    server_address: &str,
+    render_context: DlnaRenderContext<'_>,
 ) -> Result<String, ApiError> {
     let container_id = soap_param(request, "ContainerID").unwrap_or_else(|| "0".to_string());
     let criteria = soap_param(request, "SearchCriteria").unwrap_or_else(|| "*".to_string());
@@ -1995,13 +2068,7 @@ async fn search_response(
     let total_matches = items.len();
     let paged_items = paged_slice(&items, starting_index, requested_count);
     let parent_override = parse_album_object_id(&container_id).map(|_| container_id.as_str());
-    let didl = didl_search_media_items(
-        paged_items,
-        &folders,
-        server_id,
-        server_address,
-        parent_override,
-    );
+    let didl = didl_search_media_items(paged_items, &folders, parent_override, render_context);
     Ok(format!(
         "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>{}</UpdateID>",
         escape_xml(&didl),
@@ -2157,8 +2224,7 @@ fn directory_browse_payload(
     relative_path: &str,
     browse_window: (usize, usize),
     sort_criteria: &str,
-    server_id: Uuid,
-    server_address: &str,
+    render_context: DlnaRenderContext<'_>,
 ) -> Result<BrowsePayload, ApiError> {
     let (starting_index, requested_count) = browse_window;
     let mut entries = directory_browse_entries(folder, items, relative_path);
@@ -2166,7 +2232,7 @@ fn directory_browse_payload(
     let total_matches = entries.len();
     let paged_entries = paged_slice(&entries, starting_index, requested_count);
     Ok(BrowsePayload::children(
-        didl_browse_entries(paged_entries, server_id, server_address),
+        didl_browse_entries(paged_entries, render_context),
         paged_entries.len(),
         total_matches,
     ))
@@ -2187,8 +2253,7 @@ fn music_album_browse_payload(
     metadata: &HashMap<Uuid, Value>,
     browse_window: (usize, usize),
     sort_criteria: &str,
-    server_id: Uuid,
-    server_address: &str,
+    render_context: DlnaRenderContext<'_>,
 ) -> Result<BrowsePayload, ApiError> {
     let (starting_index, requested_count) = browse_window;
     let mut entries = music_album_browse_entries(folder, items, metadata);
@@ -2196,7 +2261,7 @@ fn music_album_browse_payload(
     let total_matches = entries.len();
     let paged_entries = paged_slice(&entries, starting_index, requested_count);
     Ok(BrowsePayload::children(
-        didl_browse_entries(paged_entries, server_id, server_address),
+        didl_browse_entries(paged_entries, render_context),
         paged_entries.len(),
         total_matches,
     ))
@@ -2280,8 +2345,7 @@ fn music_album_items_browse_payload(
     items: Vec<&MediaItem>,
     browse_window: (usize, usize),
     sort_criteria: &str,
-    server_id: Uuid,
-    server_address: &str,
+    render_context: DlnaRenderContext<'_>,
 ) -> BrowsePayload {
     let (starting_index, requested_count) = browse_window;
     let parent_id = album_object_id(folder_id, album_title);
@@ -2296,7 +2360,7 @@ fn music_album_items_browse_payload(
     let total_matches = entries.len();
     let paged_entries = paged_slice(&entries, starting_index, requested_count);
     BrowsePayload::children(
-        didl_browse_entries(paged_entries, server_id, server_address),
+        didl_browse_entries(paged_entries, render_context),
         paged_entries.len(),
         total_matches,
     )
@@ -2460,8 +2524,7 @@ fn didl_album_metadata(folder_id: Uuid, album_title: &str, child_count: usize) -
 
 fn didl_browse_entries(
     entries: &[DlnaBrowseEntry<'_>],
-    server_id: Uuid,
-    server_address: &str,
+    render_context: DlnaRenderContext<'_>,
 ) -> String {
     let mut didl = didl_prefix();
     for entry in entries {
@@ -2476,7 +2539,7 @@ fn didl_browse_entries(
                 append_didl_container(&mut didl, id, parent_id, title, *child_count, class);
             }
             DlnaBrowseEntry::Item { item, parent_id } => {
-                append_didl_media_item(&mut didl, item, parent_id, server_id, server_address);
+                append_didl_media_item(&mut didl, item, parent_id, render_context);
             }
         }
     }
@@ -2484,15 +2547,14 @@ fn didl_browse_entries(
     didl
 }
 
-fn didl_media_items(items: &[MediaItem], server_id: Uuid, server_address: &str) -> String {
+fn didl_media_items(items: &[MediaItem], render_context: DlnaRenderContext<'_>) -> String {
     let mut didl = didl_prefix();
     for item in items {
         append_didl_media_item(
             &mut didl,
             item,
             &format!("folder:{}", item.virtual_folder_id),
-            server_id,
-            server_address,
+            render_context,
         );
     }
     didl.push_str("</DIDL-Lite>");
@@ -2502,9 +2564,8 @@ fn didl_media_items(items: &[MediaItem], server_id: Uuid, server_address: &str) 
 fn didl_search_media_items(
     items: &[MediaItem],
     folders: &[VirtualFolder],
-    server_id: Uuid,
-    server_address: &str,
     parent_override: Option<&str>,
+    render_context: DlnaRenderContext<'_>,
 ) -> String {
     let mut didl = didl_prefix();
     for item in items {
@@ -2515,7 +2576,7 @@ fn didl_search_media_items(
                 .map(|folder| item_parent_object_id(folder, item))
                 .unwrap_or_else(|| format!("folder:{}", item.virtual_folder_id))
         });
-        append_didl_media_item(&mut didl, item, &parent_id, server_id, server_address);
+        append_didl_media_item(&mut didl, item, &parent_id, render_context);
     }
     didl.push_str("</DIDL-Lite>");
     didl
@@ -2546,8 +2607,7 @@ fn append_didl_media_item(
     didl: &mut String,
     item: &MediaItem,
     parent_id: &str,
-    server_id: Uuid,
-    server_address: &str,
+    render_context: DlnaRenderContext<'_>,
 ) {
     didl.push_str("<item id=\"");
     didl.push_str(&escape_xml(&format!("item:{}", item.id)));
@@ -2558,12 +2618,39 @@ fn append_didl_media_item(
     didl.push_str("</dc:title><upnp:class>");
     didl.push_str(didl_item_class(item));
     didl.push_str("</upnp:class>");
-    append_didl_thumbnail(didl, item, server_id, server_address);
-    if let Some(resource) = didl_resource(item, server_id, server_address) {
-        didl.push_str(&resource);
+    append_didl_thumbnail(
+        didl,
+        item,
+        render_context.server_id,
+        render_context.server_address,
+    );
+    if render_context.renderer_profile.prefer_hls_resource() {
+        append_didl_hls_transcode_resource(
+            didl,
+            item,
+            render_context.server_id,
+            render_context.server_address,
+        );
+        if let Some(resource) = didl_resource(item, render_context) {
+            didl.push_str(&resource);
+        }
+    } else {
+        if let Some(resource) = didl_resource(item, render_context) {
+            didl.push_str(&resource);
+        }
+        append_didl_hls_transcode_resource(
+            didl,
+            item,
+            render_context.server_id,
+            render_context.server_address,
+        );
     }
-    append_didl_hls_transcode_resource(didl, item, server_id, server_address);
-    append_didl_subtitles(didl, item, server_address);
+    append_didl_subtitles(
+        didl,
+        item,
+        render_context.server_address,
+        render_context.renderer_profile,
+    );
     didl.push_str("</item>");
 }
 
@@ -2629,10 +2716,11 @@ fn didl_item_class(item: &MediaItem) -> &'static str {
     }
 }
 
-fn didl_resource(item: &MediaItem, server_id: Uuid, server_address: &str) -> Option<String> {
+fn didl_resource(item: &MediaItem, render_context: DlnaRenderContext<'_>) -> Option<String> {
     let mime_type = dlna_mime_type(item)?;
     let container = dlna_container(item).unwrap_or("bin");
-    let protocol_info = dlna_protocol_info_for_item(item, mime_type);
+    let protocol_info =
+        dlna_protocol_info_for_item(item, mime_type, render_context.renderer_profile);
     let mut attributes = format!("protocolInfo=\"{}\"", escape_xml(&protocol_info));
     if let Some(size) = item.file_size.filter(|size| *size >= 0) {
         attributes.push_str(" size=\"");
@@ -2654,8 +2742,9 @@ fn didl_resource(item: &MediaItem, server_id: Uuid, server_address: &str) -> Opt
     }
     let url = format!(
         "{}/dlna/{server_id}/items/{}/stream.{container}",
-        server_address.trim_end_matches('/'),
-        item.id
+        render_context.server_address.trim_end_matches('/'),
+        item.id,
+        server_id = render_context.server_id
     );
     Some(format!("<res {attributes}>{}</res>", escape_xml(&url)))
 }
@@ -2712,7 +2801,12 @@ fn append_didl_hls_transcode_resource(
     didl.push_str("</res>");
 }
 
-fn append_didl_subtitles(didl: &mut String, item: &MediaItem, server_address: &str) {
+fn append_didl_subtitles(
+    didl: &mut String,
+    item: &MediaItem,
+    server_address: &str,
+    renderer_profile: DlnaRendererProfile,
+) {
     for subtitle in dlna_subtitle_streams(item) {
         let url = format!(
             "{}/Videos/{}/{}/Subtitles/{}/Stream.{}",
@@ -2727,11 +2821,13 @@ fn append_didl_subtitles(didl: &mut String, item: &MediaItem, server_address: &s
         didl.push_str(":*\">");
         didl.push_str(&escape_xml(&url));
         didl.push_str("</res>");
-        didl.push_str("<sec:CaptionInfoEx sec:type=\"");
-        didl.push_str(subtitle.format);
-        didl.push_str("\">");
-        didl.push_str(&escape_xml(&url));
-        didl.push_str("</sec:CaptionInfoEx>");
+        if renderer_profile.emit_caption_info_ex() {
+            didl.push_str("<sec:CaptionInfoEx sec:type=\"");
+            didl.push_str(subtitle.format);
+            didl.push_str("\">");
+            didl.push_str(&escape_xml(&url));
+            didl.push_str("</sec:CaptionInfoEx>");
+        }
     }
 }
 
@@ -2831,18 +2927,59 @@ fn dlna_mime_type(item: &MediaItem) -> Option<&'static str> {
     }
 }
 
-fn dlna_protocol_info_for_item(item: &MediaItem, mime_type: &str) -> String {
-    dlna_protocol_info_value(mime_type, dlna_profile_name_for_item(item, mime_type))
+fn dlna_protocol_info_for_item(
+    item: &MediaItem,
+    mime_type: &str,
+    renderer_profile: DlnaRendererProfile,
+) -> String {
+    dlna_protocol_info_value(
+        mime_type,
+        dlna_profile_name_for_item(item, mime_type, renderer_profile),
+    )
 }
 
-fn dlna_profile_name_for_item(_item: &MediaItem, mime_type: &str) -> Option<&'static str> {
+fn dlna_profile_name_for_item(
+    item: &MediaItem,
+    mime_type: &str,
+    renderer_profile: DlnaRendererProfile,
+) -> Option<&'static str> {
     match mime_type {
         "audio/mpeg" => Some("MP3"),
         "image/jpeg" => Some("JPEG_LRG"),
         "image/png" => Some("PNG_LRG"),
         "image/gif" => Some("GIF_LRG"),
+        "video/mp4" if renderer_profile.video_pn_enabled() => mp4_avc_aac_profile_name(item),
         _ => None,
     }
+}
+
+fn mp4_avc_aac_profile_name(item: &MediaItem) -> Option<&'static str> {
+    if !item_has_codec_stream(item, "Video", &["h264", "avc", "avc1"])
+        || !item_has_codec_stream(item, "Audio", &["aac", "mp4a"])
+    {
+        return None;
+    }
+    match (item.width?, item.height?) {
+        (width, height) if width > 0 && height > 0 && width <= 1280 && height <= 720 => {
+            Some("AVC_MP4_MP_HD_720p_AAC")
+        }
+        (width, height) if width > 0 && height > 0 && width <= 1920 && height <= 1080 => {
+            Some("AVC_MP4_MP_HD_1080i_AAC")
+        }
+        _ => None,
+    }
+}
+
+fn item_has_codec_stream(item: &MediaItem, stream_type: &str, codecs: &[&str]) -> bool {
+    item.media_streams.iter().any(|stream| {
+        json_string_case_insensitive(stream, "Type")
+            .is_some_and(|value| value.eq_ignore_ascii_case(stream_type))
+            && json_string_case_insensitive(stream, "Codec").is_some_and(|codec| {
+                codecs
+                    .iter()
+                    .any(|expected| codec.eq_ignore_ascii_case(expected))
+            })
+    })
 }
 
 fn is_root_object_id(object_id: &str) -> bool {
@@ -3264,7 +3401,11 @@ fn search_item_id_matches(item: &MediaItem, value: &str) -> bool {
 
 fn item_protocol_info_for_search(item: &MediaItem) -> Option<String> {
     let mime_type = dlna_mime_type(item)?;
-    Some(dlna_protocol_info_for_item(item, mime_type))
+    Some(dlna_protocol_info_for_item(
+        item,
+        mime_type,
+        DlnaRendererProfile::Generic,
+    ))
 }
 
 fn search_property_exists(item: &MediaItem, property: &str) -> Option<bool> {
@@ -4364,17 +4505,30 @@ mod tests {
     fn dlna_video_mime_matrix_covers_direct_play_containers_without_false_pn() {
         let mp4 = test_media_item("/media/movie.mp4", "Video");
         assert_eq!(dlna_mime_type(&mp4), Some("video/mp4"));
-        assert_eq!(dlna_profile_name_for_item(&mp4, "video/mp4"), None);
-        assert!(!dlna_protocol_info_for_item(&mp4, "video/mp4").contains("DLNA.ORG_PN="));
+        assert_eq!(
+            dlna_profile_name_for_item(&mp4, "video/mp4", DlnaRendererProfile::Generic),
+            None
+        );
+        assert!(
+            !dlna_protocol_info_for_item(&mp4, "video/mp4", DlnaRendererProfile::Generic)
+                .contains("DLNA.ORG_PN=")
+        );
 
         let mpeg_ps = test_media_item("/media/movie.mpg", "Video");
         assert_eq!(dlna_mime_type(&mpeg_ps), Some("video/mpeg"));
-        assert_eq!(dlna_profile_name_for_item(&mpeg_ps, "video/mpeg"), None);
+        assert_eq!(
+            dlna_profile_name_for_item(&mpeg_ps, "video/mpeg", DlnaRendererProfile::Generic),
+            None
+        );
 
         let mpeg_ts = test_media_item("/media/movie.ts", "Video");
         assert_eq!(dlna_mime_type(&mpeg_ts), Some("video/vnd.dlna.mpeg-tts"));
         assert_eq!(
-            dlna_profile_name_for_item(&mpeg_ts, "video/vnd.dlna.mpeg-tts"),
+            dlna_profile_name_for_item(
+                &mpeg_ts,
+                "video/vnd.dlna.mpeg-tts",
+                DlnaRendererProfile::Generic
+            ),
             None
         );
 
@@ -4383,7 +4537,78 @@ mod tests {
 
         let asf = test_media_item("/media/movie.asf", "Video");
         assert_eq!(dlna_mime_type(&asf), Some("video/x-ms-asf"));
-        assert_eq!(dlna_profile_name_for_item(&asf, "video/x-ms-asf"), None);
+        assert_eq!(
+            dlna_profile_name_for_item(&asf, "video/x-ms-asf", DlnaRendererProfile::Generic),
+            None
+        );
+    }
+
+    #[test]
+    fn dlna_renderer_profile_detects_common_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, "VLC/3.0.20 LibVLC".parse().unwrap());
+        assert_eq!(
+            DlnaRendererProfile::from_headers(&headers),
+            DlnaRendererProfile::Vlc
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-client-info", "ModelName=Samsung TV".parse().unwrap());
+        assert_eq!(
+            DlnaRendererProfile::from_headers(&headers),
+            DlnaRendererProfile::Samsung
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-av-client-info", "LGE WebOS TV".parse().unwrap());
+        assert_eq!(
+            DlnaRendererProfile::from_headers(&headers),
+            DlnaRendererProfile::Lg
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, "BRAVIA KDL".parse().unwrap());
+        assert_eq!(
+            DlnaRendererProfile::from_headers(&headers),
+            DlnaRendererProfile::Sony
+        );
+    }
+
+    #[test]
+    fn renderer_specific_video_pn_is_metadata_gated() {
+        let mut mp4 = test_media_item("/media/movie.mp4", "Video");
+        mp4.width = Some(1280);
+        mp4.height = Some(720);
+        mp4.media_streams = vec![
+            json!({ "Type": "Video", "Codec": "h264" }),
+            json!({ "Type": "Audio", "Codec": "aac" }),
+        ];
+
+        assert_eq!(
+            dlna_profile_name_for_item(&mp4, "video/mp4", DlnaRendererProfile::Generic),
+            None
+        );
+        assert_eq!(
+            dlna_profile_name_for_item(&mp4, "video/mp4", DlnaRendererProfile::Samsung),
+            Some("AVC_MP4_MP_HD_720p_AAC")
+        );
+        assert!(
+            dlna_protocol_info_for_item(&mp4, "video/mp4", DlnaRendererProfile::Lg)
+                .contains("DLNA.ORG_PN=AVC_MP4_MP_HD_720p_AAC")
+        );
+
+        mp4.height = Some(1080);
+        mp4.width = Some(1920);
+        assert_eq!(
+            dlna_profile_name_for_item(&mp4, "video/mp4", DlnaRendererProfile::Sony),
+            Some("AVC_MP4_MP_HD_1080i_AAC")
+        );
+
+        mp4.media_streams = vec![json!({ "Type": "Video", "Codec": "h264" })];
+        assert_eq!(
+            dlna_profile_name_for_item(&mp4, "video/mp4", DlnaRendererProfile::Samsung),
+            None
+        );
     }
 
     #[test]

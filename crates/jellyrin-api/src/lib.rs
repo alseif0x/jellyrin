@@ -32143,6 +32143,11 @@ mod tests {
                     "Height": 1080
                 }),
                 json!({
+                    "Type": "Audio",
+                    "Index": 1,
+                    "Codec": "aac"
+                }),
+                json!({
                     "Type": "Subtitle",
                     "Index": 2,
                     "Codec": "subrip",
@@ -32186,7 +32191,7 @@ mod tests {
                     .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
                     .header(header::HOST, "media.example.test:8097")
                     .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
-                    .body(Body::from(browse_folder))
+                    .body(Body::from(browse_folder.clone()))
                     .unwrap(),
             )
             .await
@@ -32204,6 +32209,7 @@ mod tests {
         assert!(browse_response.contains(
             "protocolInfo=&quot;http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS="
         ));
+        assert!(!browse_response.contains("DLNA.ORG_PN=AVC_MP4"));
         assert!(browse_response.contains(&format!("size=&quot;{}&quot;", primary_bytes.len())));
         assert!(browse_response.contains("upnp:albumArtURI"));
         let thumbnail_url = format!(
@@ -32232,6 +32238,28 @@ mod tests {
             "protocolInfo=&quot;http-get:*:application/vnd.apple.mpegurl:DLNA.ORG_OP=01"
         ));
         assert!(!browse_response.contains("Second Movie"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::HOST, "media.example.test:8097")
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .header(header::USER_AGENT, "Samsung DLNADOC/1.50")
+                    .body(Body::from(browse_folder.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let samsung_browse_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            samsung_browse_response.contains("DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01")
+        );
+        assert!(samsung_browse_response.contains("sec:CaptionInfoEx"));
 
         let browse_item_metadata = format!(
             r#"<?xml version="1.0"?>
