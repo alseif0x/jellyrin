@@ -668,11 +668,11 @@ pub fn router(state: AppState) -> Router {
         .route("/packages/installed/{name}", post(install_package))
         .route(
             "/Packages/Installing/{package_id}",
-            delete(cancel_package_installation),
+            get(package_installation_status).delete(cancel_package_installation),
         )
         .route(
             "/packages/installing/{package_id}",
-            delete(cancel_package_installation),
+            get(package_installation_status).delete(cancel_package_installation),
         )
         .route("/Package/Packages", get(available_packages))
         .route("/package/packages", get(available_packages))
@@ -682,22 +682,28 @@ pub fn router(state: AppState) -> Router {
         .route("/package/packages/installed/{name}", post(install_package))
         .route(
             "/Package/Packages/Installing/{package_id}",
-            delete(cancel_package_installation),
+            get(package_installation_status).delete(cancel_package_installation),
         )
         .route(
             "/package/packages/installing/{package_id}",
-            delete(cancel_package_installation),
+            get(package_installation_status).delete(cancel_package_installation),
         )
         .route(
             "/Package/Repositories/Refresh",
-            post(refresh_package_repositories),
+            get(package_repositories_refresh_status).post(refresh_package_repositories),
         )
         .route(
             "/package/repositories/refresh",
-            post(refresh_package_repositories),
+            get(package_repositories_refresh_status).post(refresh_package_repositories),
         )
-        .route("/Repositories/Refresh", post(refresh_package_repositories))
-        .route("/repositories/refresh", post(refresh_package_repositories))
+        .route(
+            "/Repositories/Refresh",
+            get(package_repositories_refresh_status).post(refresh_package_repositories),
+        )
+        .route(
+            "/repositories/refresh",
+            get(package_repositories_refresh_status).post(refresh_package_repositories),
+        )
         .route(
             "/Package/Repositories",
             get(package_repositories).post(update_package_repositories),
@@ -6217,6 +6223,19 @@ async fn install_package(
             error.into()
         }
     })?;
+    update_package_install_task_progress(
+        &state.db,
+        run.id,
+        PackageInstallTaskProgress {
+            plugin_id: &plugin_id,
+            name: &package_name,
+            version: &version,
+            operation: &operation,
+            phase: "Preparing",
+            progress_percentage: 5.0,
+        },
+    )
+    .await?;
     let install_result = async {
         let artifact = prepare_plugin_package_artifact(
             &state,
@@ -6229,6 +6248,19 @@ async fn install_package(
         )
         .await?;
         ensure_package_install_not_cancelled(&state.db, &task_key, run.id).await?;
+        update_package_install_task_progress(
+            &state.db,
+            run.id,
+            PackageInstallTaskProgress {
+                plugin_id: &plugin_id,
+                name: &package_name,
+                version: &version,
+                operation: &operation,
+                phase: "Registering",
+                progress_percentage: 90.0,
+            },
+        )
+        .await?;
         package["Installation"] = artifact;
         state
             .db
@@ -6265,7 +6297,9 @@ async fn install_package(
                 "Version": version.clone(),
                 "Runtime": runtime.clone(),
                 "Operation": operation.clone(),
-                "Status": "Installed"
+                "Status": "Installed",
+                "Phase": "Completed",
+                "ProgressPercentage": 100.0
             }),
         )
         .await?;
@@ -6298,11 +6332,85 @@ async fn cancel_package_installation(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn package_installation_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(package_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let task_key = package_install_task_key(&package_id);
+    let run = state
+        .db
+        .current_task_run(&task_key)
+        .await?
+        .or(state.db.last_task_result(&task_key).await?)
+        .ok_or_else(|| ApiError::not_found("Package installation task not found"))?;
+    Ok(Json(package_task_run_json(&run)))
+}
+
 fn package_install_task_key(package_id: &str) -> String {
     format!("PackageInstall:{}", package_id.trim().to_ascii_lowercase())
 }
 
+struct PackageInstallTaskProgress<'a> {
+    plugin_id: &'a str,
+    name: &'a str,
+    version: &'a str,
+    operation: &'a str,
+    phase: &'a str,
+    progress_percentage: f64,
+}
+
+async fn update_package_install_task_progress(
+    db: &Database,
+    run_id: Uuid,
+    progress: PackageInstallTaskProgress<'_>,
+) -> Result<(), ApiError> {
+    db.update_task_run_progress(
+        run_id,
+        serde_json::json!({
+            "PluginId": progress.plugin_id,
+            "Name": progress.name,
+            "Version": progress.version,
+            "Operation": progress.operation,
+            "Status": "Running",
+            "Phase": progress.phase,
+            "ProgressPercentage": progress.progress_percentage,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
 const PACKAGE_REPOSITORIES_REFRESH_TASK_KEY: &str = "PackageRepositoriesRefresh";
+
+fn package_task_run_json(run: &TaskRun) -> serde_json::Value {
+    let result = run
+        .result_json
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "Id": run.id.to_string(),
+        "Key": run.task_key.clone(),
+        "Status": task_run_status_name(run),
+        "StartTimeUtc": format_time_for_json(run.started_at),
+        "EndTimeUtc": run.completed_at.map(format_time_for_json),
+        "UpdatedTimeUtc": format_time_for_json(run.updated_at),
+        "ErrorMessage": run.error_message.clone(),
+        "Phase": result.get("Phase").cloned().unwrap_or(serde_json::Value::Null),
+        "ProgressPercentage": result.get("ProgressPercentage").cloned().unwrap_or(serde_json::Value::Null),
+        "Result": result,
+    })
+}
+
+fn task_run_status_name(run: &TaskRun) -> &'static str {
+    match run.status.as_str() {
+        "completed" => "Completed",
+        "failed" => "Failed",
+        _ => "Running",
+    }
+}
 
 fn plugin_package_operation(previous_plugin: Option<&serde_json::Value>, version: &str) -> String {
     let Some(previous_version) =
@@ -6355,6 +6463,20 @@ async fn prepare_plugin_package_artifact(
 ) -> Result<serde_json::Value, ApiError> {
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
     let Some(source_url) = plugin_package_source_url(package, selected_version) else {
+        state
+            .db
+            .update_task_run_progress(
+                run_id,
+                serde_json::json!({
+                    "PluginId": plugin_id,
+                    "Name": json_string_field(package, "Name").unwrap_or_default(),
+                    "Version": version,
+                    "Status": "Running",
+                    "Phase": "MetadataOnly",
+                    "ProgressPercentage": 80.0,
+                }),
+            )
+            .await?;
         return Ok(serde_json::json!({
             "Mode": "metadata-only",
             "Reason": "Package version has no SourceUrl."
@@ -6382,24 +6504,105 @@ async fn prepare_plugin_package_artifact(
         tokio::fs::create_dir_all(parent).await?;
     }
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
+    state
+        .db
+        .update_task_run_progress(
+            run_id,
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Version": version,
+                "Status": "Running",
+                "Phase": "Downloading",
+                "ProgressPercentage": 25.0,
+                "SourceUrl": source_url.clone(),
+            }),
+        )
+        .await?;
     let bytes = read_plugin_package_source(&source_url).await?;
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
+    state
+        .db
+        .update_task_run_progress(
+            run_id,
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Version": version,
+                "Status": "Running",
+                "Phase": "VerifyingChecksum",
+                "ProgressPercentage": 45.0,
+                "BytesDownloaded": bytes.len(),
+            }),
+        )
+        .await?;
     let checksum = verify_plugin_package_checksum(package, selected_version, &bytes)?;
+    state
+        .db
+        .update_task_run_progress(
+            run_id,
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Version": version,
+                "Status": "Running",
+                "Phase": "WritingArchive",
+                "ProgressPercentage": 55.0,
+            }),
+        )
+        .await?;
     tokio::fs::write(&archive_path, bytes).await?;
 
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
+    state
+        .db
+        .update_task_run_progress(
+            run_id,
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Version": version,
+                "Status": "Running",
+                "Phase": "ListingArchive",
+                "ProgressPercentage": 65.0,
+            }),
+        )
+        .await?;
     let entries = list_safe_zip_entries(&archive_path).await?;
     if entries.is_empty() {
         let _ = tokio::fs::remove_file(&archive_path).await;
         return Err(ApiError::bad_request("Plugin package archive is empty"));
     }
     ensure_package_install_not_cancelled(&state.db, task_key, run_id).await?;
+    state
+        .db
+        .update_task_run_progress(
+            run_id,
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Version": version,
+                "Status": "Running",
+                "Phase": "ExtractingArchive",
+                "ProgressPercentage": 75.0,
+                "EntryCount": entries.len(),
+            }),
+        )
+        .await?;
     extract_zip_archive(&archive_path, &staging_dir).await?;
 
     if let Err(error) = ensure_package_install_not_cancelled(&state.db, task_key, run_id).await {
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
         return Err(error);
     }
+    state
+        .db
+        .update_task_run_progress(
+            run_id,
+            serde_json::json!({
+                "PluginId": plugin_id,
+                "Version": version,
+                "Status": "Running",
+                "Phase": "Publishing",
+                "ProgressPercentage": 85.0,
+            }),
+        )
+        .await?;
     if tokio::fs::try_exists(&install_dir).await? {
         if tokio::fs::try_exists(&rollback_dir).await? {
             tokio::fs::remove_dir_all(&rollback_dir).await?;
@@ -6738,6 +6941,18 @@ async fn refresh_package_repositories(
         if repositories.is_empty() {
             repositories = default_plugin_repositories();
         }
+        state
+            .db
+            .update_task_run_progress(
+                run.id,
+                serde_json::json!({
+                    "Status": "Running",
+                    "Phase": "Preparing",
+                    "ProgressPercentage": 5.0,
+                    "RepositoryCount": repositories.len(),
+                }),
+            )
+            .await?;
 
         let refreshed_at = format_time_for_json(OffsetDateTime::now_utc());
         let mut refreshed_repositories = Vec::with_capacity(repositories.len());
@@ -6746,15 +6961,42 @@ async fn refresh_package_repositories(
         let mut skipped_repositories = Vec::<String>::new();
         let mut total_packages = 0_usize;
 
-        for repository in repositories {
+        let repository_count = repositories.len().max(1);
+        for (index, repository) in repositories.into_iter().enumerate() {
             let name = json_string_field(&repository, "Name").unwrap_or_default();
             let url = json_string_field(&repository, "Url").unwrap_or_default();
             if json_bool_field(&repository, "Enabled") == Some(false) {
                 skipped_repositories.push(url.clone());
                 refreshed_repositories.push(repository);
+                update_package_repository_refresh_progress(
+                    &state.db,
+                    run.id,
+                    PackageRepositoryRefreshProgress {
+                        completed_repositories: index + 1,
+                        repository_count,
+                        phase: "SkippingDisabledRepository",
+                        package_count: total_packages,
+                        failed_repository_count: failed_repositories.len(),
+                        skipped_repository_count: skipped_repositories.len(),
+                    },
+                )
+                .await?;
                 continue;
             }
 
+            update_package_repository_refresh_progress(
+                &state.db,
+                run.id,
+                PackageRepositoryRefreshProgress {
+                    completed_repositories: index,
+                    repository_count,
+                    phase: "DownloadingManifest",
+                    package_count: total_packages,
+                    failed_repository_count: failed_repositories.len(),
+                    skipped_repository_count: skipped_repositories.len(),
+                },
+            )
+            .await?;
             match read_plugin_repository_manifest(&url).await {
                 Ok(manifest) => {
                     let packages = plugin_repository_manifest_packages(&manifest, &url);
@@ -6784,8 +7026,36 @@ async fn refresh_package_repositories(
                     refreshed_repositories.push(failed_repository);
                 }
             }
+            update_package_repository_refresh_progress(
+                &state.db,
+                run.id,
+                PackageRepositoryRefreshProgress {
+                    completed_repositories: index + 1,
+                    repository_count,
+                    phase: "RefreshingCatalog",
+                    package_count: total_packages,
+                    failed_repository_count: failed_repositories.len(),
+                    skipped_repository_count: skipped_repositories.len(),
+                },
+            )
+            .await?;
         }
 
+        state
+            .db
+            .update_task_run_progress(
+                run.id,
+                serde_json::json!({
+                    "Status": "Running",
+                    "Phase": "PersistingCatalog",
+                    "ProgressPercentage": 95.0,
+                    "RepositoryCount": refreshed_urls.len() + failed_repositories.len() + skipped_repositories.len(),
+                    "PackageCount": total_packages,
+                    "FailedRepositoryCount": failed_repositories.len(),
+                    "SkippedRepositoryCount": skipped_repositories.len(),
+                }),
+            )
+            .await?;
         current_payloads.plugin_repositories = serde_json::Value::Array(refreshed_repositories);
         state
             .db
@@ -6798,6 +7068,8 @@ async fn refresh_package_repositories(
             "FailedRepositories": failed_repositories,
             "SkippedRepositories": skipped_repositories,
             "PackageCount": total_packages,
+            "Phase": "Completed",
+            "ProgressPercentage": 100.0,
         }))
     }
     .await;
@@ -6823,6 +7095,58 @@ async fn refresh_package_repositories(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn package_repositories_refresh_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let run = state
+        .db
+        .current_task_run(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
+        .await?
+        .or(state
+            .db
+            .last_task_result(PACKAGE_REPOSITORIES_REFRESH_TASK_KEY)
+            .await?)
+        .ok_or_else(|| ApiError::not_found("Package repository refresh task not found"))?;
+    Ok(Json(package_task_run_json(&run)))
+}
+
+struct PackageRepositoryRefreshProgress<'a> {
+    completed_repositories: usize,
+    repository_count: usize,
+    phase: &'a str,
+    package_count: usize,
+    failed_repository_count: usize,
+    skipped_repository_count: usize,
+}
+
+async fn update_package_repository_refresh_progress(
+    db: &Database,
+    run_id: Uuid,
+    progress: PackageRepositoryRefreshProgress<'_>,
+) -> Result<(), ApiError> {
+    let progress_percentage = 10.0
+        + ((progress.completed_repositories as f64 / progress.repository_count.max(1) as f64)
+            * 80.0);
+    db.update_task_run_progress(
+        run_id,
+        serde_json::json!({
+            "Status": "Running",
+            "Phase": progress.phase,
+            "ProgressPercentage": progress_percentage.min(90.0),
+            "CompletedRepositories": progress.completed_repositories,
+            "RepositoryCount": progress.repository_count,
+            "PackageCount": progress.package_count,
+            "FailedRepositoryCount": progress.failed_repository_count,
+            "SkippedRepositoryCount": progress.skipped_repository_count,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn read_plugin_repository_manifest(source_url: &str) -> Result<serde_json::Value, ApiError> {
@@ -39139,6 +39463,26 @@ mod tests {
         assert_eq!(package_task_result["Status"], "Installed");
         assert_eq!(package_task_result["Operation"], "Update");
         assert_eq!(package_task_result["Version"], "1.1.0.0");
+        assert_eq!(package_task_result["Phase"], "Completed");
+        assert_eq!(package_task_result["ProgressPercentage"], 100.0);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Packages/Installing/11111111-1111-1111-1111-111111111111")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let task_status: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(task_status["Status"], "Completed");
+        assert_eq!(task_status["Phase"], "Completed");
+        assert_eq!(task_status["ProgressPercentage"], 100.0);
+        assert_eq!(task_status["Result"]["Operation"], "Update");
         let installed_after_update = db_for_assertions.installed_plugins_json().await.unwrap();
         assert_eq!(installed_after_update[0]["Version"], "1.1.0.0");
         let installations = db_for_assertions
@@ -39627,6 +39971,8 @@ mod tests {
         assert_eq!(task.status, "completed");
         let task_result = task.result_json.unwrap();
         assert_eq!(task_result["PackageCount"], 1);
+        assert_eq!(task_result["Phase"], "Completed");
+        assert_eq!(task_result["ProgressPercentage"], 100.0);
         assert_eq!(
             task_result["FailedRepositories"].as_array().unwrap().len(),
             0
@@ -39635,6 +39981,24 @@ mod tests {
             task_result["SkippedRepositories"].as_array().unwrap()[0],
             "http://127.0.0.1:1/disabled.json"
         );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Package/Repositories/Refresh")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let refresh_status: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refresh_status["Status"], "Completed");
+        assert_eq!(refresh_status["Phase"], "Completed");
+        assert_eq!(refresh_status["ProgressPercentage"], 100.0);
+        assert_eq!(refresh_status["Result"]["PackageCount"], 1);
 
         let response = app
             .oneshot(

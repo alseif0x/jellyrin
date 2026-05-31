@@ -2955,6 +2955,34 @@ impl Database {
         self.task_run_by_id(run_id).await
     }
 
+    pub async fn update_task_run_progress(
+        &self,
+        run_id: Uuid,
+        progress: Value,
+    ) -> anyhow::Result<Option<TaskRun>> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result_json = serde_json::to_string(&progress)?;
+        let result = sqlx::query(
+            r#"
+            UPDATE task_runs
+            SET result_json = ?1,
+                updated_at = ?2
+            WHERE id = ?3 AND status = 'running'
+            "#,
+        )
+        .bind(result_json)
+        .bind(now)
+        .bind(run_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            Ok(None)
+        } else {
+            self.task_run_by_id(run_id).await.map(Some)
+        }
+    }
+
     pub async fn fail_task_run(&self, run_id: Uuid, error: &str) -> anyhow::Result<TaskRun> {
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
@@ -7822,6 +7850,27 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let progressed = db
+            .update_task_run_progress(
+                run.id,
+                json!({
+                    "Phase": "Scanning",
+                    "ProgressPercentage": 25.0
+                }),
+            )
+            .await
+            .unwrap()
+            .expect("running task progress should update");
+        assert_eq!(progressed.result_json.unwrap()["Phase"], "Scanning");
+        assert_eq!(
+            db.current_task_run("RefreshLibrary")
+                .await
+                .unwrap()
+                .unwrap()
+                .result_json
+                .unwrap()["ProgressPercentage"],
+            25.0
+        );
 
         let completed = db
             .complete_task_run(run.id, json!({ "ItemsScanned": 7 }))
@@ -7843,6 +7892,12 @@ mod tests {
             .unwrap();
         assert_eq!(last.id, run.id);
         assert_eq!(last.status, "completed");
+        assert!(
+            db.update_task_run_progress(run.id, json!({ "ProgressPercentage": 50.0 }))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -7850,6 +7905,9 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.unwrap();
 
         let run = db.start_task_run("RefreshLibrary").await.unwrap();
+        db.update_task_run_progress(run.id, json!({ "ProgressPercentage": 10.0 }))
+            .await
+            .unwrap();
         let failed = db
             .fail_current_task_run("RefreshLibrary", "cancelled")
             .await
@@ -7858,6 +7916,7 @@ mod tests {
         assert_eq!(failed.id, run.id);
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.error_message.as_deref(), Some("cancelled"));
+        assert_eq!(failed.result_json.unwrap()["ProgressPercentage"], 10.0);
 
         let stale = db.start_task_run("RefreshLibrary").await.unwrap();
         let expired = db
