@@ -4417,9 +4417,18 @@ fn search_criteria_condition_matches(
     }
     for property in [
         "dc:creator",
+        "dc:description",
+        "dc:publisher",
         "upnp:artist",
+        "upnp:albumArtist",
         "upnp:album",
+        "upnp:author",
+        "upnp:actor",
+        "upnp:director",
+        "upnp:producer",
         "upnp:genre",
+        "upnp:rating",
+        "upnp:description",
         "upnp:seriesTitle",
         "upnp:originalTrackNumber",
         "upnp:episodeSeason",
@@ -4436,7 +4445,7 @@ fn search_criteria_condition_matches(
 }
 
 fn dlna_search_caps() -> &'static str {
-    "dc:title,dc:creator,dc:date,upnp:class,upnp:artist,upnp:album,upnp:genre,upnp:seriesTitle,upnp:originalTrackNumber,upnp:episodeSeason,upnp:episodeNumber,@id,res@protocolInfo"
+    "dc:title,dc:creator,dc:description,dc:publisher,dc:date,upnp:class,upnp:artist,upnp:albumArtist,upnp:album,upnp:author,upnp:actor,upnp:director,upnp:producer,upnp:genre,upnp:rating,upnp:description,upnp:seriesTitle,upnp:originalTrackNumber,upnp:episodeSeason,upnp:episodeNumber,@id,res@protocolInfo"
 }
 
 fn strip_search_not(criteria: &str) -> Option<&str> {
@@ -4507,10 +4516,19 @@ fn search_property_exists(
         "dc:title" => Some(!item.name.trim().is_empty()),
         "upnp:class" | "@id" => Some(true),
         "dc:creator"
+        | "dc:description"
+        | "dc:publisher"
         | "dc:date"
         | "upnp:artist"
+        | "upnp:albumArtist"
         | "upnp:album"
+        | "upnp:author"
+        | "upnp:actor"
+        | "upnp:director"
+        | "upnp:producer"
         | "upnp:genre"
+        | "upnp:rating"
+        | "upnp:description"
         | "upnp:seriesTitle"
         | "upnp:originalTrackNumber"
         | "upnp:episodeSeason"
@@ -4596,8 +4614,53 @@ fn search_metadata_property_values(
                 "Writers",
             ],
         ),
+        "upnp:albumArtist" => {
+            metadata_string_values(value, &["AlbumArtists", "AlbumArtist", "AlbumArtistItems"])
+        }
         "upnp:album" => item_album_titles(item, metadata),
+        "upnp:author" => metadata_string_values(
+            value,
+            &[
+                "Authors",
+                "Author",
+                "Writers",
+                "Writer",
+                "Composers",
+                "Composer",
+            ],
+        ),
+        "upnp:actor" => metadata_string_values(
+            value,
+            &[
+                "Actors",
+                "Actor",
+                "People",
+                "Cast",
+                "ArtistItems",
+                "Artists",
+            ],
+        ),
+        "upnp:director" => metadata_string_values(value, &["Directors", "Director"]),
+        "upnp:producer" => metadata_string_values(value, &["Producers", "Producer"]),
         "upnp:genre" => metadata_string_values(value, &["Genres", "Genre"]),
+        "upnp:rating" => metadata_string_values(
+            value,
+            &[
+                "OfficialRating",
+                "CommunityRating",
+                "CriticRating",
+                "CustomRating",
+                "Rating",
+            ],
+        ),
+        "dc:description" | "upnp:description" => metadata_string_values(
+            value,
+            &["Overview", "Description", "ShortOverview", "Tagline"],
+        ),
+        "dc:publisher" => metadata_string_values(
+            value,
+            &["Studios", "Studio", "Publisher", "ProductionCompany"],
+        ),
         "upnp:seriesTitle" => item_series_titles(item, metadata),
         "upnp:originalTrackNumber" => {
             metadata_i64_value(value, &["IndexNumber", "TrackNumber", "ParentIndexNumber"])
@@ -6002,7 +6065,11 @@ mod tests {
             track.id,
             json!({
                 "Album": "Metadata Album",
+                "AlbumArtists": ["Example Album Artist"],
                 "Artists": ["Example Artist"],
+                "Composers": ["Example Composer"],
+                "Overview": "A live metadata track",
+                "Studios": ["Example Publisher"],
                 "Genres": ["Jazz", "Live"],
                 "IndexNumber": 7,
                 "ProductionYear": 2024
@@ -6015,7 +6082,12 @@ mod tests {
                 "ParentIndexNumber": 1,
                 "IndexNumber": 2,
                 "PremiereDate": "2026-05-31T12:00:00Z",
-                "Genres": ["Drama"]
+                "Genres": ["Drama"],
+                "Actors": ["Example Actor"],
+                "Directors": ["Example Director"],
+                "Producers": ["Example Producer"],
+                "OfficialRating": "TV-14",
+                "Overview": "A metadata episode"
             }),
         );
 
@@ -6034,6 +6106,16 @@ mod tests {
             &metadata,
             r#"dc:creator exists true and dc:date = "2024""#
         ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &track,
+            &metadata,
+            r#"upnp:albumArtist = "Example Album Artist" and upnp:author contains "Composer""#
+        ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &track,
+            &metadata,
+            r#"dc:publisher = "Example Publisher" and dc:description contains "live""#
+        ));
         assert!(!dlna_search_criteria_matches_with_metadata(
             &track,
             &metadata,
@@ -6043,6 +6125,16 @@ mod tests {
             &episode,
             &metadata,
             r#"upnp:seriesTitle contains "Metadata Show" and upnp:episodeSeason = "1" and upnp:episodeNumber = "2""#
+        ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &episode,
+            &metadata,
+            r#"upnp:actor = "Example Actor" and upnp:director = "Example Director" and upnp:producer = "Example Producer""#
+        ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &episode,
+            &metadata,
+            r#"upnp:rating = "TV-14" and upnp:description contains "episode""#
         ));
         assert!(dlna_search_criteria_matches_with_metadata(
             &episode,
