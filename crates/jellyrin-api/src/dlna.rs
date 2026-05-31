@@ -1183,7 +1183,16 @@ async fn run_ssdp_service(state: AppState, socket: UdpSocket) -> anyhow::Result<
                 match result {
                     Ok((len, peer)) => {
                         let server = state.db.server_state().await?;
-                        let base_url = ssdp_base_url_for_peer(&state.local_address, peer);
+                        let network = state
+                            .db
+                            .named_configuration("network")
+                            .await?
+                            .unwrap_or_else(default_network_configuration);
+                        let base_url = ssdp_base_url_for_peer_with_network(
+                            &state.local_address,
+                            peer,
+                            &network,
+                        );
                         respond_to_ssdp_search(
                             &socket,
                             &buffer[..len],
@@ -1229,7 +1238,16 @@ async fn send_ssdp_notify(
     kind: SsdpNotificationKind,
 ) -> anyhow::Result<()> {
     let server = state.db.server_state().await?;
-    let base_url = ssdp_base_url_for_peer(&state.local_address, SocketAddr::V4(multicast));
+    let network = state
+        .db
+        .named_configuration("network")
+        .await?
+        .unwrap_or_else(default_network_configuration);
+    let base_url = ssdp_base_url_for_peer_with_network(
+        &state.local_address,
+        SocketAddr::V4(multicast),
+        &network,
+    );
     let location = ssdp_description_location(&base_url, server.server_id);
     for message in ssdp_notify_messages(server.server_id, &location, kind) {
         socket.send_to(message.as_bytes(), multicast).await?;
@@ -1407,13 +1425,48 @@ fn ssdp_description_location(base_url: &str, server_id: Uuid) -> String {
     )
 }
 
-fn ssdp_base_url_for_peer(configured_base_url: &str, peer: SocketAddr) -> String {
+fn ssdp_base_url_for_peer_with_network(
+    configured_base_url: &str,
+    peer: SocketAddr,
+    network: &Value,
+) -> String {
+    let overrides = network
+        .get("PublishedServerUriBySubnet")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    ssdp_base_url_for_peer_with_published_overrides(configured_base_url, peer, &overrides)
+}
+
+fn ssdp_base_url_for_peer_with_published_overrides(
+    configured_base_url: &str,
+    peer: SocketAddr,
+    overrides: &[&str],
+) -> String {
+    if let Some(published) = published_server_uri_for_peer(peer.ip(), overrides) {
+        return published;
+    }
+
+    ssdp_base_url_for_peer_with_local_ip(configured_base_url, peer, local_ip_for_peer(peer))
+        .or_else(|| {
+            peer.ip().is_loopback().then(|| {
+                ssdp_base_url_for_peer_with_local_ip(configured_base_url, peer, Some(peer.ip()))
+            })?
+        })
+        .unwrap_or_else(|| configured_base_url.trim_end_matches('/').to_string())
+}
+
+fn ssdp_base_url_for_peer_with_local_ip(
+    configured_base_url: &str,
+    peer: SocketAddr,
+    local_ip: Option<IpAddr>,
+) -> Option<String> {
     let configured_base_url = configured_base_url.trim_end_matches('/');
     if !configured_base_url.contains("://0.0.0.0:")
         && !configured_base_url.contains("://[::]:")
         && !configured_base_url.contains("://:::")
     {
-        return configured_base_url.to_string();
+        return Some(configured_base_url.to_string());
     }
 
     let scheme = configured_base_url
@@ -1423,10 +1476,58 @@ fn ssdp_base_url_for_peer(configured_base_url: &str, peer: SocketAddr) -> String
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse::<u16>().ok())
         .unwrap_or(8096);
-    let ip = local_ip_for_peer(peer).unwrap_or_else(|| peer.ip());
+    let ip = local_ip?;
+    if ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() && !peer.ip().is_loopback() {
+        return None;
+    }
     match ip {
-        IpAddr::V4(ip) => format!("{scheme}://{ip}:{port}"),
-        IpAddr::V6(ip) => format!("{scheme}://[{ip}]:{port}"),
+        IpAddr::V4(ip) => Some(format!("{scheme}://{ip}:{port}")),
+        IpAddr::V6(ip) => Some(format!("{scheme}://[{ip}]:{port}")),
+    }
+}
+
+fn published_server_uri_for_peer(peer_ip: IpAddr, overrides: &[&str]) -> Option<String> {
+    for entry in overrides {
+        let Some((selector, uri)) = entry.split_once('=') else {
+            continue;
+        };
+        let selector = selector.trim();
+        let uri = uri.trim().trim_end_matches('/');
+        if uri.is_empty() {
+            continue;
+        }
+        if selector.eq_ignore_ascii_case("all") || cidr_contains_ip(selector, peer_ip) {
+            return Some(uri.to_string());
+        }
+    }
+    None
+}
+
+fn cidr_contains_ip(cidr: &str, ip: IpAddr) -> bool {
+    let Some((network, prefix_len)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix_len) = prefix_len.trim().parse::<u8>() else {
+        return false;
+    };
+    match (network.trim().parse::<IpAddr>(), ip) {
+        (Ok(IpAddr::V4(network)), IpAddr::V4(ip)) if prefix_len <= 32 => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            u32::from(network) & mask == u32::from(ip) & mask
+        }
+        (Ok(IpAddr::V6(network)), IpAddr::V6(ip)) if prefix_len <= 128 => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            u128::from(network) & mask == u128::from(ip) & mask
+        }
+        _ => false,
     }
 }
 
@@ -4056,12 +4157,91 @@ mod tests {
     fn ssdp_base_url_replaces_unspecified_bind_address_for_peer() {
         let peer: SocketAddr = "127.0.0.1:55321".parse().unwrap();
         assert_eq!(
-            ssdp_base_url_for_peer("http://0.0.0.0:8097", peer),
+            ssdp_base_url_for_peer_with_published_overrides("http://0.0.0.0:8097", peer, &[]),
             "http://127.0.0.1:8097"
         );
         assert_eq!(
-            ssdp_base_url_for_peer("http://192.168.1.46:8097", peer),
+            ssdp_base_url_for_peer_with_published_overrides("http://192.168.1.46:8097", peer, &[]),
             "http://192.168.1.46:8097"
+        );
+    }
+
+    #[test]
+    fn ssdp_base_url_uses_injected_local_ip_for_unspecified_hosts() {
+        let peer: SocketAddr = "192.168.1.20:55321".parse().unwrap();
+        assert_eq!(
+            ssdp_base_url_for_peer_with_local_ip(
+                "http://0.0.0.0:8097",
+                peer,
+                Some("192.168.1.10".parse().unwrap())
+            ),
+            Some("http://192.168.1.10:8097".to_string())
+        );
+
+        let peer: SocketAddr = "[fd00::20]:55321".parse().unwrap();
+        assert_eq!(
+            ssdp_base_url_for_peer_with_local_ip(
+                "http://[::]:8097",
+                peer,
+                Some("fd00::10".parse().unwrap())
+            ),
+            Some("http://[fd00::10]:8097".to_string())
+        );
+    }
+
+    #[test]
+    fn ssdp_base_url_does_not_advertise_peer_or_invalid_local_ip() {
+        let peer: SocketAddr = "192.168.1.20:55321".parse().unwrap();
+        assert_eq!(
+            ssdp_base_url_for_peer_with_local_ip("http://0.0.0.0:8097", peer, None),
+            None
+        );
+        assert_eq!(
+            ssdp_base_url_for_peer_with_local_ip(
+                "http://0.0.0.0:8097",
+                peer,
+                Some("239.255.255.250".parse().unwrap())
+            ),
+            None
+        );
+        assert_eq!(
+            ssdp_base_url_for_peer_with_local_ip(
+                "http://0.0.0.0:8097",
+                peer,
+                Some("127.0.0.1".parse().unwrap())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ssdp_base_url_prefers_published_uri_overrides() {
+        let peer: SocketAddr = "192.168.1.20:55321".parse().unwrap();
+        assert_eq!(
+            ssdp_base_url_for_peer_with_published_overrides(
+                "http://0.0.0.0:8097",
+                peer,
+                &[
+                    "10.0.0.0/8=https://wrong.example",
+                    "all=https://media.example.test/"
+                ]
+            ),
+            "https://media.example.test"
+        );
+        assert_eq!(
+            ssdp_base_url_for_peer_with_published_overrides(
+                "http://0.0.0.0:8097",
+                peer,
+                &["192.168.1.0/24=https://lan.example.test"]
+            ),
+            "https://lan.example.test"
+        );
+        assert_eq!(
+            published_server_uri_for_peer(
+                "fd00::20".parse().unwrap(),
+                &["fd00::/64=https://v6.example.test"]
+            ),
+            Some("https://v6.example.test".to_string())
         );
     }
 

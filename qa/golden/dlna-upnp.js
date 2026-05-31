@@ -185,7 +185,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
           eventsPassed
             ? 'The companion dlna-events golden validates real local TCP callback delivery for initial and follow-up GENA NOTIFY messages.'
             : 'The companion dlna-events golden has not been completed in the current generated evidence.',
-          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state, SOAP Browse/Search/GetProtocolInfo/PrepareForConnection/ConnectionComplete, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, Jellyfin-like local artwork resolution, generated video-frame thumbnails, non-contradictory albumArtURI metadata, DLNA image headers, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
+          'Existing focused coverage also verifies descriptors/SCPD, MediaReceiverRegistrar SOAP, GENA subscribe/renew/unsubscribe, initial/follow-up NOTIFY, persisted SystemUpdateID restore/update state, SOAP Browse/Search/GetProtocolInfo/PrepareForConnection/ConnectionComplete, advanced SearchCriteria and SortCriteria handling, UPnP SOAP faults, DIDL root/folders/items/music-album-containers/thumbnails/subtitles, SSDP PublishedServerUriBySubnet LOCATION selection, Jellyfin-like local artwork resolution, generated video-frame thumbnails, non-contradictory albumArtURI metadata, DLNA image headers, profile hints, conservative video MIME mapping without invented video DLNA.ORG_PN values, direct stream URLs and HLS fallback route contracts.',
         ].join(' ')
       : 'DLNA/UPnP golden did not complete; inspect trace log for the failing control-point step.',
     updatedAt: result.generatedAt,
@@ -205,7 +205,7 @@ function buildEvidence(result, discoveryEvidence, eventsEvidence) {
     ],
     openRisks: [
       'Dashboard target remains device-validated; closing E3 still requires real renderer/VLC/TV validation on LAN.',
-      'SSDP uses a single IPv4 socket on 0.0.0.0:1900; multi-interface binding and firewall/systemd packaging remain pending.',
+      'SSDP uses a single IPv4 socket on 0.0.0.0:1900; multi-interface multicast binding, firewall/systemd packaging and real LAN discovery remain pending.',
       'Browse covers root, virtual folders, physical directory hierarchy, direct media items and music album containers; broader metadata-derived grouping for series/artists without folders remains pending.',
       'ContentDirectory Search supports a practical subset of criteria; full UPnP SearchCriteria grammar remains pending.',
       'Thumbnails and text subtitle links are advertised; graphical subtitle support and renderer-specific image sizing/profile negotiation remain pending.',
