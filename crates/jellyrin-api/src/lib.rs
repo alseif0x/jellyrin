@@ -3766,7 +3766,7 @@ async fn backup_restore_snapshot_json(db: &Database) -> Result<serde_json::Value
         "VirtualFolders": backup_virtual_folders_json(db.virtual_folders().await?),
         "MediaMetadata": backup_media_metadata_json(db).await?,
         "Files": backup_files_decision_json(),
-        "Plugins": backup_plugins_decision_json()
+        "Plugins": backup_plugins_snapshot_json(db).await?
     }))
 }
 
@@ -3801,6 +3801,7 @@ async fn restore_backup_data(db: &Database, snapshot: &serde_json::Value) -> Res
     restore_users_from_backup(db, snapshot.get("Users")).await?;
     restore_virtual_folders_from_backup(db, snapshot.get("VirtualFolders")).await?;
     restore_media_metadata_from_backup(db, snapshot.get("MediaMetadata")).await?;
+    restore_plugins_from_backup(db, snapshot.get("Plugins")).await?;
     Ok(())
 }
 
@@ -3921,12 +3922,8 @@ fn backup_files_decision_json() -> serde_json::Value {
     })
 }
 
-fn backup_plugins_decision_json() -> serde_json::Value {
-    serde_json::json!({
-        "Mode": "configuration-only",
-        "Supported": false,
-        "Reason": "Plugin package binaries are not restored; repository configuration is covered by SystemConfigurationPayloads.PluginRepositories."
-    })
+async fn backup_plugins_snapshot_json(db: &Database) -> Result<serde_json::Value, ApiError> {
+    db.plugin_platform_snapshot().await.map_err(ApiError::from)
 }
 
 async fn restore_users_from_backup(
@@ -4097,6 +4094,23 @@ async fn restore_media_metadata_from_backup(
     Ok(())
 }
 
+async fn restore_plugins_from_backup(
+    db: &Database,
+    value: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value
+        .get("Supported")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        db.restore_plugin_platform_snapshot(value).await?;
+    }
+    Ok(())
+}
+
 fn backup_restore_path_is_safe(path: &str) -> bool {
     let path = FsPath::new(path);
     if !path.is_absolute() {
@@ -4179,7 +4193,13 @@ fn backup_snapshot_summary_json(snapshot: Option<&serde_json::Value>) -> serde_j
             .get("Plugins")
             .and_then(|plugins| plugins.get("Mode"))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
+            .unwrap_or("unknown"),
+        "InstalledPlugins": snapshot
+            .get("Plugins")
+            .and_then(|plugins| plugins.get("InstalledPlugins"))
+            .and_then(|installed| installed.get("Count"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
     })
 }
 
@@ -29969,8 +29989,8 @@ mod tests {
     use http_body_util::BodyExt;
     use jellyrin_core::{FfmpegCommandSpec, MediaItem, StartupConfig, TranscodeStreamSelection};
     use jellyrin_db::{
-        BrandingConfig, Database, SystemConfigurationPayloads, UpsertPlaybackState,
-        UpsertTranscodeSession,
+        BrandingConfig, Database, InstallPluginPackage, SystemConfigurationPayloads,
+        UpsertPlaybackState, UpsertTranscodeSession,
     };
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
@@ -31188,6 +31208,43 @@ mod tests {
         )
         .await
         .unwrap();
+        let plugin_id = "22222222-2222-2222-2222-222222222222";
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Snapshot Plugin".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Snapshot Plugin",
+                    "Versions": [{
+                        "Version": "1.0.0.0",
+                        "Runtime": "RustWasi",
+                        "TargetAbi": "jellyrin-wasi-0.1"
+                    }]
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Snapshot Plugin",
+                    "Version": "1.0.0.0",
+                    "Runtime": "RustWasi"
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        db.update_plugin_configuration_json(
+            plugin_id,
+            json!({
+                "EnabledSetting": true,
+                "Quality": "backup"
+            }),
+        )
+        .await
+        .unwrap();
         let db_for_assertions = db.clone();
         let app = router(AppState {
             db,
@@ -31262,10 +31319,8 @@ mod tests {
         assert_eq!(created["SnapshotSummary"]["VirtualFolders"], 1);
         assert_eq!(created["SnapshotSummary"]["MediaMetadata"], 1);
         assert_eq!(created["SnapshotSummary"]["FilesMode"], "metadata-only");
-        assert_eq!(
-            created["SnapshotSummary"]["PluginsMode"],
-            "configuration-only"
-        );
+        assert_eq!(created["SnapshotSummary"]["PluginsMode"], "metadata-only");
+        assert_eq!(created["SnapshotSummary"]["InstalledPlugins"], 1);
 
         let response = app
             .clone()
@@ -31424,6 +31479,20 @@ mod tests {
             .await
             .unwrap();
         db_for_assertions
+            .update_plugin_configuration_json(
+                plugin_id,
+                json!({
+                    "EnabledSetting": false,
+                    "Quality": "changed"
+                }),
+            )
+            .await
+            .unwrap();
+        db_for_assertions
+            .set_installed_plugin_status(plugin_id, "Disabled", None, Some(user.id))
+            .await
+            .unwrap();
+        db_for_assertions
             .upsert_virtual_folder(
                 "Snapshot Movies",
                 Some("tvshows"),
@@ -31534,6 +31603,29 @@ mod tests {
                     && metadata.payload["ProviderIds"]["Imdb"] == "tt0000001"
                     && metadata.payload["Overview"] == "Snapshot overview")
         );
+        let restored_plugins = db_for_assertions.installed_plugins_json().await.unwrap();
+        let restored_plugin = restored_plugins
+            .iter()
+            .find(|plugin| plugin["Id"] == plugin_id)
+            .unwrap();
+        assert_eq!(restored_plugin["Name"], "Snapshot Plugin");
+        assert_eq!(restored_plugin["Version"], "1.0.0.0");
+        assert_eq!(restored_plugin["Runtime"], "RustWasi");
+        assert_eq!(restored_plugin["Status"], "NotSupported");
+        assert_eq!(restored_plugin["Manifest"]["Name"], "Snapshot Plugin");
+        let restored_plugin_config = db_for_assertions
+            .plugin_configuration_json(plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_plugin_config["EnabledSetting"], true);
+        assert_eq!(restored_plugin_config["Quality"], "backup");
+        let restored_installations = db_for_assertions
+            .package_installations_json(plugin_id)
+            .await
+            .unwrap();
+        assert_eq!(restored_installations.len(), 1);
+        assert_eq!(restored_installations[0]["Status"], "Installed");
     }
 
     #[tokio::test]

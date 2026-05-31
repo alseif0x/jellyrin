@@ -606,8 +606,23 @@ impl Database {
             .await?;
         let repositories = plugin_repositories_snapshot(&self.pool).await?;
         let package_catalog = package_catalog_snapshot(&self.pool).await?;
+        let package_installations = package_installations_snapshot(&self.pool).await?;
+        let installed_plugins = installed_plugins_backup_snapshot(&self.pool).await?;
+        let plugin_manifests = plugin_manifests_snapshot(&self.pool).await?;
+        let plugin_configurations = plugin_configurations_snapshot(&self.pool).await?;
+        let plugin_permissions = plugin_permissions_snapshot(&self.pool).await?;
+        let plugin_runtime_instances = plugin_runtime_instances_snapshot(&self.pool).await?;
+        let plugin_host_events = plugin_host_events_snapshot(&self.pool).await?;
+        let plugin_audit_log = plugin_audit_log_snapshot(&self.pool).await?;
         Ok(json!({
             "ModelVersion": 1,
+            "Mode": "metadata-only",
+            "Supported": true,
+            "PackageBinaries": {
+                "Mode": "not-restored",
+                "Supported": false,
+                "Reason": "Backup restores plugin state and metadata; package binary directories are intentionally not copied."
+            },
             "Repositories": {
                 "Count": repositories.len(),
                 "Items": repositories
@@ -617,30 +632,339 @@ impl Database {
                 "Items": package_catalog
             },
             "PackageInstallations": {
-                "Count": table_count(&self.pool, "package_installations").await?
+                "Count": package_installations.len(),
+                "Items": package_installations
             },
             "InstalledPlugins": {
-                "Count": table_count(&self.pool, "installed_plugins").await?
+                "Count": installed_plugins.len(),
+                "Items": installed_plugins
             },
             "PluginManifests": {
-                "Count": table_count(&self.pool, "plugin_manifests").await?
+                "Count": plugin_manifests.len(),
+                "Items": plugin_manifests
             },
             "PluginConfigurations": {
-                "Count": table_count(&self.pool, "plugin_configurations").await?
+                "Count": plugin_configurations.len(),
+                "Items": plugin_configurations
             },
             "PluginPermissions": {
-                "Count": table_count(&self.pool, "plugin_permissions").await?
+                "Count": plugin_permissions.len(),
+                "Items": plugin_permissions
             },
             "PluginRuntimeInstances": {
-                "Count": table_count(&self.pool, "plugin_runtime_instances").await?
+                "Count": plugin_runtime_instances.len(),
+                "Items": plugin_runtime_instances
             },
             "PluginHostEvents": {
-                "Count": table_count(&self.pool, "plugin_host_events").await?
+                "Count": plugin_host_events.len(),
+                "Items": plugin_host_events
             },
             "PluginAuditLog": {
-                "Count": table_count(&self.pool, "plugin_audit_log").await?
+                "Count": plugin_audit_log.len(),
+                "Items": plugin_audit_log
             }
         }))
+    }
+
+    pub async fn restore_plugin_platform_snapshot(&self, snapshot: &Value) -> anyhow::Result<()> {
+        let version = snapshot
+            .get("ModelVersion")
+            .and_then(Value::as_i64)
+            .context("plugin snapshot ModelVersion is missing")?;
+        anyhow::ensure!(
+            version == 1,
+            "unsupported plugin snapshot ModelVersion {version}"
+        );
+
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        for table in [
+            "plugin_audit_log",
+            "plugin_host_events",
+            "plugin_runtime_instances",
+            "plugin_permissions",
+            "plugin_configurations",
+            "plugin_manifests",
+            "installed_plugins",
+            "package_installations",
+            "package_catalog_cache",
+            "plugin_repositories",
+        ] {
+            let sql = format!("DELETE FROM {table}");
+            sqlx::query(&sql).execute(&mut *tx).await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "Repositories")? {
+            let name = plugin_snapshot_string(item, "Name")?;
+            let url = plugin_snapshot_string(item, "Url")?;
+            let payload = plugin_snapshot_value(item, "Payload")
+                .cloned()
+                .unwrap_or_else(|| {
+                    json!({
+                        "Name": name,
+                        "Url": url,
+                        "Enabled": plugin_snapshot_bool(item, "Enabled").unwrap_or(true)
+                    })
+                });
+            sqlx::query(
+                r#"
+                INSERT INTO plugin_repositories (id, name, url, enabled, payload_json, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )
+            .bind(stable_plugin_model_id("repo", &url))
+            .bind(name)
+            .bind(url)
+            .bind(plugin_snapshot_bool(item, "Enabled").unwrap_or(true))
+            .bind(serde_json::to_string(&payload)?)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PackageCatalogCache")? {
+            let repository_url = plugin_snapshot_string(item, "RepositoryUrl")?;
+            let name = plugin_snapshot_string(item, "Name")?;
+            let version = plugin_snapshot_string(item, "Version")?;
+            let runtime = plugin_snapshot_optional_string(item, "Runtime")
+                .unwrap_or_else(|| "Unknown".to_string());
+            let target_abi = plugin_snapshot_optional_string(item, "TargetAbi").unwrap_or_default();
+            let payload = plugin_snapshot_value(item, "Payload")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            sqlx::query(
+                r#"
+                INSERT INTO package_catalog_cache (
+                    id, repository_url, package_guid, package_name, package_version, runtime,
+                    target_abi, payload_json, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+            )
+            .bind(stable_plugin_model_id(
+                "package",
+                &format!("{repository_url}:{name}:{version}"),
+            ))
+            .bind(repository_url)
+            .bind(plugin_snapshot_optional_string(item, "Guid"))
+            .bind(name)
+            .bind(version)
+            .bind(runtime)
+            .bind(target_abi)
+            .bind(serde_json::to_string(&payload)?)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PackageInstallations")? {
+            let name = plugin_snapshot_string(item, "Name")?;
+            let version = plugin_snapshot_string(item, "Version")?;
+            let guid = plugin_snapshot_optional_string(item, "Guid");
+            let runtime = plugin_snapshot_optional_string(item, "Runtime")
+                .unwrap_or_else(|| "Unknown".to_string());
+            let payload = plugin_snapshot_value(item, "Payload")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            sqlx::query(
+                r#"
+                INSERT INTO package_installations (
+                    id, package_name, package_guid, version, runtime, status, source_url,
+                    payload_json, installed_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+            )
+            .bind(stable_plugin_model_id(
+                "install",
+                &format!("{}:{}", guid.as_deref().unwrap_or(&name), version),
+            ))
+            .bind(name)
+            .bind(guid)
+            .bind(version)
+            .bind(runtime)
+            .bind(
+                plugin_snapshot_optional_string(item, "Status")
+                    .unwrap_or_else(|| "Installed".to_string()),
+            )
+            .bind(plugin_snapshot_optional_string(item, "SourceUrl"))
+            .bind(serde_json::to_string(&payload)?)
+            .bind(plugin_snapshot_optional_string(item, "InstalledAt"))
+            .bind(plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "InstalledPlugins")? {
+            let plugin_id = plugin_snapshot_string(item, "Id")
+                .or_else(|_| plugin_snapshot_string(item, "Guid"))?;
+            sqlx::query(
+                r#"
+                INSERT INTO installed_plugins (
+                    plugin_id, name, version, runtime, runtime_version, target_abi,
+                    server_compatibility_json, status, capabilities_json, permissions_json,
+                    configuration_state, last_error, health_json, manifest_json, installed_at,
+                    updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "#,
+            )
+            .bind(plugin_id)
+            .bind(plugin_snapshot_string(item, "Name")?)
+            .bind(plugin_snapshot_string(item, "Version")?)
+            .bind(
+                plugin_snapshot_optional_string(item, "Runtime")
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            )
+            .bind(plugin_snapshot_optional_string(item, "RuntimeVersion").unwrap_or_default())
+            .bind(plugin_snapshot_optional_string(item, "TargetAbi").unwrap_or_default())
+            .bind(plugin_snapshot_json_string(
+                item,
+                "ServerCompatibility",
+                json!({}),
+            )?)
+            .bind(
+                plugin_snapshot_optional_string(item, "Status")
+                    .unwrap_or_else(|| "NotSupported".to_string()),
+            )
+            .bind(plugin_snapshot_json_string(
+                item,
+                "Capabilities",
+                json!([]),
+            )?)
+            .bind(plugin_snapshot_json_string(item, "Permissions", json!([]))?)
+            .bind(
+                plugin_snapshot_optional_string(item, "ConfigurationState")
+                    .unwrap_or_else(|| "Default".to_string()),
+            )
+            .bind(plugin_snapshot_optional_string(item, "LastError"))
+            .bind(plugin_snapshot_json_string(item, "Health", json!({}))?)
+            .bind(plugin_snapshot_json_string(item, "Manifest", json!({}))?)
+            .bind(plugin_snapshot_optional_string(item, "InstalledAt"))
+            .bind(plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PluginManifests")? {
+            sqlx::query(
+                "INSERT INTO plugin_manifests (plugin_id, manifest_json, updated_at) VALUES (?1, ?2, ?3)",
+            )
+            .bind(plugin_snapshot_string(item, "PluginId")?)
+            .bind(plugin_snapshot_json_string(item, "Manifest", json!({}))?)
+            .bind(plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PluginConfigurations")? {
+            sqlx::query(
+                "INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at) VALUES (?1, ?2, ?3)",
+            )
+            .bind(plugin_snapshot_string(item, "PluginId")?)
+            .bind(plugin_snapshot_json_string(item, "Configuration", json!({}))?)
+            .bind(plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PluginPermissions")? {
+            sqlx::query(
+                "INSERT INTO plugin_permissions (plugin_id, permissions_json, updated_at) VALUES (?1, ?2, ?3)",
+            )
+            .bind(plugin_snapshot_string(item, "PluginId")?)
+            .bind(plugin_snapshot_json_string(item, "Permissions", json!([]))?)
+            .bind(plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PluginRuntimeInstances")? {
+            sqlx::query(
+                r#"
+                INSERT INTO plugin_runtime_instances (
+                    instance_id, plugin_id, runtime, runtime_version, status, process_id,
+                    endpoint, health_json, last_error, started_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+            )
+            .bind(plugin_snapshot_string(item, "InstanceId")?)
+            .bind(plugin_snapshot_optional_string(item, "PluginId"))
+            .bind(
+                plugin_snapshot_optional_string(item, "Runtime")
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            )
+            .bind(plugin_snapshot_optional_string(item, "RuntimeVersion").unwrap_or_default())
+            .bind(
+                plugin_snapshot_optional_string(item, "Status")
+                    .unwrap_or_else(|| "Stopped".to_string()),
+            )
+            .bind(plugin_snapshot_value(item, "ProcessId").and_then(Value::as_i64))
+            .bind(plugin_snapshot_optional_string(item, "Endpoint"))
+            .bind(plugin_snapshot_json_string(item, "Health", json!({}))?)
+            .bind(plugin_snapshot_optional_string(item, "LastError"))
+            .bind(plugin_snapshot_optional_string(item, "StartedAt"))
+            .bind(plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PluginHostEvents")? {
+            sqlx::query(
+                r#"
+                INSERT INTO plugin_host_events (
+                    id, plugin_id, runtime, event_type, severity, message, payload_json, created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+            )
+            .bind(
+                plugin_snapshot_optional_string(item, "Id")
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            )
+            .bind(plugin_snapshot_optional_string(item, "PluginId"))
+            .bind(plugin_snapshot_optional_string(item, "Runtime"))
+            .bind(plugin_snapshot_string(item, "EventType")?)
+            .bind(
+                plugin_snapshot_optional_string(item, "Severity")
+                    .unwrap_or_else(|| "Information".to_string()),
+            )
+            .bind(plugin_snapshot_optional_string(item, "Message").unwrap_or_default())
+            .bind(plugin_snapshot_json_string(item, "Payload", json!({}))?)
+            .bind(plugin_snapshot_optional_string(item, "CreatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for item in plugin_snapshot_items(snapshot, "PluginAuditLog")? {
+            sqlx::query(
+                r#"
+                INSERT INTO plugin_audit_log (
+                    id, plugin_id, action, actor_user_id, status, payload_json, created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+            )
+            .bind(
+                plugin_snapshot_optional_string(item, "Id")
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            )
+            .bind(plugin_snapshot_optional_string(item, "PluginId"))
+            .bind(plugin_snapshot_string(item, "Action")?)
+            .bind(plugin_snapshot_optional_string(item, "ActorUserId"))
+            .bind(
+                plugin_snapshot_optional_string(item, "Status")
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            )
+            .bind(plugin_snapshot_json_string(item, "Payload", json!({}))?)
+            .bind(plugin_snapshot_optional_string(item, "CreatedAt").unwrap_or_else(|| now.clone()))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn install_plugin_package(
@@ -6872,6 +7196,211 @@ async fn package_catalog_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value
         .collect()
 }
 
+async fn package_installations_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT package_name, package_guid, version, runtime, status, source_url,
+            payload_json, installed_at, updated_at
+        FROM package_installations
+        ORDER BY package_name COLLATE NOCASE, version COLLATE NOCASE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let payload: Value = serde_json::from_str(row.get::<&str, _>("payload_json"))
+                .context("invalid package installation payload")?;
+            Ok(json!({
+                "Name": row.get::<String, _>("package_name"),
+                "Guid": row.get::<Option<String>, _>("package_guid"),
+                "Version": row.get::<String, _>("version"),
+                "Runtime": row.get::<String, _>("runtime"),
+                "Status": row.get::<String, _>("status"),
+                "SourceUrl": row.get::<Option<String>, _>("source_url"),
+                "Payload": payload,
+                "InstalledAt": row.get::<Option<String>, _>("installed_at"),
+                "UpdatedAt": row.get::<String, _>("updated_at")
+            }))
+        })
+        .collect()
+}
+
+async fn installed_plugins_backup_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT plugin_id, name, version, runtime, runtime_version, target_abi,
+            server_compatibility_json, status, capabilities_json, permissions_json,
+            configuration_state, last_error, health_json, manifest_json, installed_at, updated_at
+        FROM installed_plugins
+        ORDER BY name COLLATE NOCASE, version COLLATE NOCASE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let mut value = plugin_row_to_json(&row)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "InstalledAt".to_string(),
+                    json!(row.get::<Option<String>, _>("installed_at")),
+                );
+                object.insert(
+                    "UpdatedAt".to_string(),
+                    json!(row.get::<String, _>("updated_at")),
+                );
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+async fn plugin_manifests_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT plugin_id, manifest_json, updated_at FROM plugin_manifests ORDER BY plugin_id COLLATE NOCASE",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let manifest: Value = serde_json::from_str(row.get::<&str, _>("manifest_json"))
+                .context("invalid plugin manifest payload")?;
+            Ok(json!({
+                "PluginId": row.get::<String, _>("plugin_id"),
+                "Manifest": manifest,
+                "UpdatedAt": row.get::<String, _>("updated_at")
+            }))
+        })
+        .collect()
+}
+
+async fn plugin_configurations_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT plugin_id, configuration_json, updated_at FROM plugin_configurations ORDER BY plugin_id COLLATE NOCASE",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let configuration: Value =
+                serde_json::from_str(row.get::<&str, _>("configuration_json"))
+                    .context("invalid plugin configuration payload")?;
+            Ok(json!({
+                "PluginId": row.get::<String, _>("plugin_id"),
+                "Configuration": configuration,
+                "UpdatedAt": row.get::<String, _>("updated_at")
+            }))
+        })
+        .collect()
+}
+
+async fn plugin_permissions_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT plugin_id, permissions_json, updated_at FROM plugin_permissions ORDER BY plugin_id COLLATE NOCASE",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let permissions: Value = serde_json::from_str(row.get::<&str, _>("permissions_json"))
+                .context("invalid plugin permissions payload")?;
+            Ok(json!({
+                "PluginId": row.get::<String, _>("plugin_id"),
+                "Permissions": permissions,
+                "UpdatedAt": row.get::<String, _>("updated_at")
+            }))
+        })
+        .collect()
+}
+
+async fn plugin_runtime_instances_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT instance_id, plugin_id, runtime, runtime_version, status, process_id, endpoint,
+            health_json, last_error, started_at, updated_at
+        FROM plugin_runtime_instances
+        ORDER BY plugin_id COLLATE NOCASE, instance_id COLLATE NOCASE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let health: Value = serde_json::from_str(row.get::<&str, _>("health_json"))
+                .context("invalid plugin runtime health payload")?;
+            Ok(json!({
+                "InstanceId": row.get::<String, _>("instance_id"),
+                "PluginId": row.get::<Option<String>, _>("plugin_id"),
+                "Runtime": row.get::<String, _>("runtime"),
+                "RuntimeVersion": row.get::<String, _>("runtime_version"),
+                "Status": row.get::<String, _>("status"),
+                "ProcessId": row.get::<Option<i64>, _>("process_id"),
+                "Endpoint": row.get::<Option<String>, _>("endpoint"),
+                "Health": health,
+                "LastError": row.get::<Option<String>, _>("last_error"),
+                "StartedAt": row.get::<Option<String>, _>("started_at"),
+                "UpdatedAt": row.get::<String, _>("updated_at")
+            }))
+        })
+        .collect()
+}
+
+async fn plugin_host_events_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, plugin_id, runtime, event_type, severity, message, payload_json, created_at
+        FROM plugin_host_events
+        ORDER BY created_at, id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let payload: Value = serde_json::from_str(row.get::<&str, _>("payload_json"))
+                .context("invalid plugin host event payload")?;
+            Ok(json!({
+                "Id": row.get::<String, _>("id"),
+                "PluginId": row.get::<Option<String>, _>("plugin_id"),
+                "Runtime": row.get::<Option<String>, _>("runtime"),
+                "EventType": row.get::<String, _>("event_type"),
+                "Severity": row.get::<String, _>("severity"),
+                "Message": row.get::<String, _>("message"),
+                "Payload": payload,
+                "CreatedAt": row.get::<String, _>("created_at")
+            }))
+        })
+        .collect()
+}
+
+async fn plugin_audit_log_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, plugin_id, action, actor_user_id, status, payload_json, created_at
+        FROM plugin_audit_log
+        ORDER BY created_at, id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let payload: Value = serde_json::from_str(row.get::<&str, _>("payload_json"))
+                .context("invalid plugin audit payload")?;
+            Ok(json!({
+                "Id": row.get::<String, _>("id"),
+                "PluginId": row.get::<Option<String>, _>("plugin_id"),
+                "Action": row.get::<String, _>("action"),
+                "ActorUserId": row.get::<Option<String>, _>("actor_user_id"),
+                "Status": row.get::<String, _>("status"),
+                "Payload": payload,
+                "CreatedAt": row.get::<String, _>("created_at")
+            }))
+        })
+        .collect()
+}
+
 fn plugin_row_to_json(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Value> {
     let server_compatibility: Value =
         serde_json::from_str(row.get::<&str, _>("server_compatibility_json"))
@@ -6903,19 +7432,45 @@ fn plugin_row_to_json(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Value> {
     }))
 }
 
-async fn table_count(pool: &SqlitePool, table: &str) -> anyhow::Result<i64> {
-    let sql = match table {
-        "package_installations" => "SELECT COUNT(*) FROM package_installations",
-        "installed_plugins" => "SELECT COUNT(*) FROM installed_plugins",
-        "plugin_manifests" => "SELECT COUNT(*) FROM plugin_manifests",
-        "plugin_configurations" => "SELECT COUNT(*) FROM plugin_configurations",
-        "plugin_permissions" => "SELECT COUNT(*) FROM plugin_permissions",
-        "plugin_runtime_instances" => "SELECT COUNT(*) FROM plugin_runtime_instances",
-        "plugin_host_events" => "SELECT COUNT(*) FROM plugin_host_events",
-        "plugin_audit_log" => "SELECT COUNT(*) FROM plugin_audit_log",
-        _ => anyhow::bail!("unsupported plugin platform table: {table}"),
-    };
-    Ok(sqlx::query_scalar::<_, i64>(sql).fetch_one(pool).await?)
+fn plugin_snapshot_items<'a>(snapshot: &'a Value, section: &str) -> anyhow::Result<&'a Vec<Value>> {
+    snapshot
+        .get(section)
+        .and_then(|section| section.get("Items"))
+        .and_then(Value::as_array)
+        .with_context(|| format!("plugin snapshot section {section}.Items must be an array"))
+}
+
+fn plugin_snapshot_value<'a>(item: &'a Value, field: &str) -> Option<&'a Value> {
+    item.as_object()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(field))
+        .map(|(_, value)| value)
+}
+
+fn plugin_snapshot_string(item: &Value, field: &str) -> anyhow::Result<String> {
+    plugin_snapshot_optional_string(item, field)
+        .with_context(|| format!("plugin snapshot item is missing {field}"))
+}
+
+fn plugin_snapshot_optional_string(item: &Value, field: &str) -> Option<String> {
+    plugin_snapshot_value(item, field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn plugin_snapshot_bool(item: &Value, field: &str) -> Option<bool> {
+    plugin_snapshot_value(item, field).and_then(Value::as_bool)
+}
+
+fn plugin_snapshot_json_string(
+    item: &Value,
+    field: &str,
+    default: Value,
+) -> anyhow::Result<String> {
+    serde_json::to_string(plugin_snapshot_value(item, field).unwrap_or(&default))
+        .context("plugin snapshot JSON serialization failed")
 }
 
 fn json_string_case_insensitive(value: &Value, field: &str) -> Option<String> {
