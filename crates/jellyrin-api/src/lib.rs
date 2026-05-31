@@ -31649,8 +31649,13 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let protocol_response = String::from_utf8(body.to_vec()).unwrap();
         assert!(protocol_response.contains("<u:GetProtocolInfoResponse"));
-        assert!(protocol_response.contains("http-get:*:video/mp4:*"));
-        assert!(protocol_response.contains("http-get:*:image/png:*"));
+        assert!(
+            protocol_response
+                .contains("http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=")
+        );
+        assert!(
+            protocol_response.contains("http-get:*:image/png:DLNA.ORG_PN=PNG_LRG;DLNA.ORG_OP=01")
+        );
     }
 
     #[tokio::test]
@@ -31758,7 +31763,9 @@ mod tests {
         assert!(browse_response.contains(&format!("&lt;item id=&quot;item:{}&quot;", item.id)));
         assert!(browse_response.contains("DLNA &amp;amp; Movie"));
         assert!(browse_response.contains("object.item.videoItem.movie"));
-        assert!(browse_response.contains("protocolInfo=&quot;http-get:*:video/mp4:*&quot;"));
+        assert!(browse_response.contains(
+            "protocolInfo=&quot;http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS="
+        ));
         assert!(browse_response.contains(&format!("size=&quot;{}&quot;", primary_bytes.len())));
         assert!(browse_response.contains("upnp:albumArtURI"));
         let thumbnail_url = format!(

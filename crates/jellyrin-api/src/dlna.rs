@@ -46,27 +46,34 @@ const MEDIA_SERVER_DEVICE: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 static DLNA_EVENT_SUBSCRIPTIONS: LazyLock<StdMutex<HashMap<String, DlnaEventSubscription>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 static DLNA_SYSTEM_UPDATE_ID: AtomicU32 = AtomicU32::new(0);
-const DLNA_PROTOCOL_INFO: &str = concat!(
-    "http-get:*:video/mpeg:*,",
-    "http-get:*:video/mp4:*,",
-    "http-get:*:video/vnd.dlna.mpeg-tts:*,",
-    "http-get:*:video/avi:*,",
-    "http-get:*:video/x-matroska:*,",
-    "http-get:*:video/x-ms-wmv:*,",
-    "http-get:*:video/wtv:*,",
-    "http-get:*:audio/mpeg:*,",
-    "http-get:*:audio/mp3:*,",
-    "http-get:*:audio/mp4:*,",
-    "http-get:*:audio/x-ms-wma:*,",
-    "http-get:*:audio/wav:*,",
-    "http-get:*:audio/L16:*,",
-    "http-get:*:image/jpeg:*,",
-    "http-get:*:image/png:*,",
-    "http-get:*:image/gif:*,",
-    "http-get:*:image/tiff:*,",
-    "http-get:*:image/webp:*,",
-    "http-get:*:image/bmp:*"
-);
+static DLNA_SOURCE_PROTOCOL_INFO: LazyLock<String> = LazyLock::new(dlna_source_protocol_info);
+const DLNA_PROTOCOL_FLAGS: &str =
+    "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000";
+const DLNA_PROTOCOL_INFO_ENTRIES: &[DlnaProtocolInfoEntry] = &[
+    DlnaProtocolInfoEntry::new("video/mpeg", None),
+    DlnaProtocolInfoEntry::new("video/mp4", None),
+    DlnaProtocolInfoEntry::new("video/vnd.dlna.mpeg-tts", None),
+    DlnaProtocolInfoEntry::new("video/x-msvideo", None),
+    DlnaProtocolInfoEntry::new("video/x-matroska", None),
+    DlnaProtocolInfoEntry::new("video/webm", None),
+    DlnaProtocolInfoEntry::new("video/quicktime", None),
+    DlnaProtocolInfoEntry::new("video/x-ms-wmv", None),
+    DlnaProtocolInfoEntry::new("video/wtv", None),
+    DlnaProtocolInfoEntry::new("audio/mpeg", Some("MP3")),
+    DlnaProtocolInfoEntry::new("audio/mp4", None),
+    DlnaProtocolInfoEntry::new("audio/aac", None),
+    DlnaProtocolInfoEntry::new("audio/flac", None),
+    DlnaProtocolInfoEntry::new("audio/ogg", None),
+    DlnaProtocolInfoEntry::new("audio/x-ms-wma", None),
+    DlnaProtocolInfoEntry::new("audio/wav", None),
+    DlnaProtocolInfoEntry::new("audio/L16", None),
+    DlnaProtocolInfoEntry::new("image/jpeg", Some("JPEG_LRG")),
+    DlnaProtocolInfoEntry::new("image/png", Some("PNG_LRG")),
+    DlnaProtocolInfoEntry::new("image/gif", Some("GIF_LRG")),
+    DlnaProtocolInfoEntry::new("image/tiff", None),
+    DlnaProtocolInfoEntry::new("image/webp", None),
+    DlnaProtocolInfoEntry::new("image/bmp", None),
+];
 const ONE_BY_ONE_PNG: &[u8] = &[
     0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
@@ -74,6 +81,46 @@ const ONE_BY_ONE_PNG: &[u8] = &[
     0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae,
     0x42, 0x60, 0x82,
 ];
+
+#[derive(Clone, Copy)]
+struct DlnaProtocolInfoEntry {
+    mime_type: &'static str,
+    profile_name: Option<&'static str>,
+}
+
+impl DlnaProtocolInfoEntry {
+    const fn new(mime_type: &'static str, profile_name: Option<&'static str>) -> Self {
+        Self {
+            mime_type,
+            profile_name,
+        }
+    }
+
+    fn protocol_info(self) -> String {
+        dlna_protocol_info_value(self.mime_type, self.profile_name)
+    }
+}
+
+fn dlna_source_protocol_info() -> String {
+    DLNA_PROTOCOL_INFO_ENTRIES
+        .iter()
+        .map(|entry| entry.protocol_info())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn dlna_protocol_info() -> &'static str {
+    DLNA_SOURCE_PROTOCOL_INFO.as_str()
+}
+
+fn dlna_protocol_info_value(mime_type: &str, profile_name: Option<&str>) -> String {
+    match profile_name {
+        Some(profile_name) => {
+            format!("http-get:*:{mime_type}:DLNA.ORG_PN={profile_name};{DLNA_PROTOCOL_FLAGS}")
+        }
+        None => format!("http-get:*:{mime_type}:{DLNA_PROTOCOL_FLAGS}"),
+    }
+}
 
 pub fn spawn_dlna_ssdp_service(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -157,7 +204,7 @@ pub(crate) async fn connection_manager_control(
     let body = match action.as_str() {
         "getprotocolinfo" => format!(
             "<Source>{}</Source><Sink></Sink>",
-            escape_xml(DLNA_PROTOCOL_INFO)
+            escape_xml(dlna_protocol_info())
         ),
         "getcurrentconnectionids" => "<ConnectionIDs>0</ConnectionIDs>".to_string(),
         "getcurrentconnectioninfo" => concat!(
@@ -740,7 +787,7 @@ fn event_initial_properties(service: DlnaEventService) -> Vec<(&'static str, Str
             DLNA_SYSTEM_UPDATE_ID.load(Ordering::Relaxed).to_string(),
         )],
         DlnaEventService::ConnectionManager => vec![
-            ("SourceProtocolInfo", DLNA_PROTOCOL_INFO.to_string()),
+            ("SourceProtocolInfo", dlna_protocol_info().to_string()),
             ("SinkProtocolInfo", String::new()),
             ("CurrentConnectionIDs", "0".to_string()),
         ],
@@ -1817,7 +1864,8 @@ fn didl_item_class(item: &MediaItem) -> &'static str {
 fn didl_resource(item: &MediaItem, server_id: Uuid, server_address: &str) -> Option<String> {
     let mime_type = dlna_mime_type(item)?;
     let container = dlna_container(item).unwrap_or("bin");
-    let mut attributes = format!("protocolInfo=\"http-get:*:{mime_type}:*\"");
+    let protocol_info = dlna_protocol_info_for_item(item, mime_type);
+    let mut attributes = format!("protocolInfo=\"{}\"", escape_xml(&protocol_info));
     if let Some(size) = item.file_size.filter(|size| *size >= 0) {
         attributes.push_str(" size=\"");
         attributes.push_str(&size.to_string());
@@ -1958,7 +2006,7 @@ fn dlna_mime_type(item: &MediaItem) -> Option<&'static str> {
         "mkv" => Some("video/x-matroska"),
         "webm" => Some("video/webm"),
         "mov" => Some("video/quicktime"),
-        "avi" => Some("video/avi"),
+        "avi" => Some("video/x-msvideo"),
         "wmv" => Some("video/x-ms-wmv"),
         "ts" | "mpeg" | "mpg" => Some("video/mpeg"),
         "mp3" => Some("audio/mpeg"),
@@ -1973,6 +2021,20 @@ fn dlna_mime_type(item: &MediaItem) -> Option<&'static str> {
         "tif" | "tiff" => Some("image/tiff"),
         "webp" => Some("image/webp"),
         "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn dlna_protocol_info_for_item(item: &MediaItem, mime_type: &str) -> String {
+    dlna_protocol_info_value(mime_type, dlna_profile_name_for_item(item, mime_type))
+}
+
+fn dlna_profile_name_for_item(_item: &MediaItem, mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "audio/mpeg" => Some("MP3"),
+        "image/jpeg" => Some("JPEG_LRG"),
+        "image/png" => Some("PNG_LRG"),
+        "image/gif" => Some("GIF_LRG"),
         _ => None,
     }
 }
@@ -2876,6 +2938,16 @@ mod tests {
             ssdp_base_url_for_peer("http://192.168.1.46:8097", peer),
             "http://192.168.1.46:8097"
         );
+    }
+
+    #[test]
+    fn dlna_protocol_info_adds_profile_hints_and_seek_flags() {
+        let source = dlna_protocol_info();
+        assert!(source.contains("http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01"));
+        assert!(source.contains("http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=01"));
+        assert!(source.contains("http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0"));
+        assert!(source.contains("DLNA.ORG_FLAGS=01500000000000000000000000000000"));
+        assert!(!dlna_protocol_info_value("video/mp4", None).contains("DLNA.ORG_PN="));
     }
 
     #[tokio::test]
