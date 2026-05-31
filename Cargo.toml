@@ -7,6 +7,7 @@ members = [
     "crates/jellyrin-plugin-host-dotnet",
     "crates/jellyrin-plugin-host-wasi",
     "crates/jellyrin-plugin-rpc",
+    "crates/jellyrin-plugin-sdk",
     "crates/jellyrin-server",
     "crates/jellyrin-transcode",
 ]
