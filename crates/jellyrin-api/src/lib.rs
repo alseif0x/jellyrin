@@ -47,9 +47,10 @@ use jellyrin_db::{
     UpsertTranscodeSession,
 };
 use jellyrin_plugin_rpc::{
-    EmbeddedImageRequest, HandshakeRequest, HandshakeResponse, LoadPluginRequest, LoadedPlugin,
-    PLUGIN_RPC_PROTOCOL_VERSION, PluginHealth, PluginHostStdioClient, PluginIdentity,
-    PluginRpcEnvelope, PluginRpcMethod, PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
+    CapabilityResult, EmbeddedImageRequest, HandshakeRequest, HandshakeResponse,
+    InvokeCapabilityRequest, LoadPluginRequest, LoadedPlugin, PLUGIN_RPC_PROTOCOL_VERSION,
+    PluginHealth, PluginHostStdioClient, PluginIdentity, PluginRpcEnvelope, PluginRpcMethod,
+    PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
 };
 use jellyrin_transcode::{
     HLS_MEDIA_PLAYLIST_NAME, HlsTranscodeLayout, HlsVariantInfo, render_hls_master_playlist,
@@ -8300,6 +8301,66 @@ async fn update_plugin_configuration_via_runtime_host_path(
     Ok(result)
 }
 
+async fn invoke_plugin_capability_via_runtime_host(
+    plugin: &serde_json::Value,
+    capability: &str,
+    arguments: serde_json::Value,
+) -> Result<Option<CapabilityResult>, ApiError> {
+    let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(plugin)
+    else {
+        return Ok(None);
+    };
+    invoke_plugin_capability_via_runtime_host_path(
+        plugin,
+        capability,
+        arguments,
+        runtime,
+        runtime_name,
+        error_prefix,
+        host_path,
+    )
+    .await
+}
+
+async fn invoke_plugin_capability_via_runtime_host_path(
+    plugin: &serde_json::Value,
+    capability: &str,
+    arguments: serde_json::Value,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
+    host_path: PathBuf,
+) -> Result<Option<CapabilityResult>, ApiError> {
+    let Some(plugin_id) = json_string_field(plugin, "Id") else {
+        return Ok(None);
+    };
+    let Some((mut client, _version)) =
+        load_plugin_runtime_host_with_path(plugin, runtime, runtime_name, error_prefix, host_path)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let invoke = PluginRpcEnvelope::new(
+        format!("{plugin_id}:capability:{capability}"),
+        PluginRpcMethod::InvokeCapability,
+        InvokeCapabilityRequest {
+            plugin_id,
+            capability: capability.to_string(),
+            arguments,
+            timeout_ms: 5_000,
+        },
+    );
+    let response = client
+        .call::<_, CapabilityResult>(&invoke, StdDuration::from_secs(5))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("Plugin host capability invoke failed: {error}"))
+        })?;
+    let result = rpc_result(response)?;
+    let _ = client.shutdown().await;
+    Ok(result)
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PluginLogsQuery {
     #[serde(flatten)]
@@ -10316,7 +10377,7 @@ async fn scheduled_tasks(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     recover_stale_library_scan_runs(&state.db).await?;
-    Ok(Json(vec![library_scan_task_json(&state.db).await?]))
+    scheduled_task_list_json(&state.db).await.map(Json)
 }
 
 async fn scheduled_task(
@@ -10329,6 +10390,9 @@ async fn scheduled_task(
     recover_stale_library_scan_runs(&state.db).await?;
     if is_library_scan_task(&task_id) {
         return Ok(Json(library_scan_task_json(&state.db).await?));
+    }
+    if let Some(task) = plugin_scheduled_task_json_by_id(&state.db, &task_id).await? {
+        return Ok(Json(task));
     }
 
     Err(ApiError::not_found("Scheduled task not found"))
@@ -10387,6 +10451,48 @@ async fn start_scheduled_task(
         });
         return Ok(StatusCode::NO_CONTENT);
     }
+    if let Some(plugin) = plugin_for_scheduled_task(&state.db, &task_id).await? {
+        let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
+        let task_key = plugin_scheduled_task_key(&plugin_id);
+        let run = match state.db.start_task_run(&task_key).await {
+            Ok(run) => run,
+            Err(error) if format!("{error:#}").contains("task is already running") => {
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(error) if state.db.current_task_run(&task_key).await?.is_some() => {
+                let _ = error;
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let db = state.db.clone();
+        let session_id = token.access_token.clone();
+        broadcast_scheduled_tasks_update(&db, &session_id).await?;
+        tokio::spawn(async move {
+            let result = invoke_plugin_capability_via_runtime_host(
+                &plugin,
+                "ScheduledTask",
+                serde_json::json!({ "Trigger": "Manual" }),
+            )
+            .await;
+            match result {
+                Ok(Some(value)) => {
+                    let _ = db.complete_task_run(run.id, value.value).await;
+                }
+                Ok(None) => {
+                    let _ = db
+                        .fail_task_run(run.id, "Plugin runtime host is unavailable.")
+                        .await;
+                }
+                Err(error) => {
+                    let message = format!("{error:?}");
+                    let _ = db.fail_task_run(run.id, &message).await;
+                }
+            }
+            let _ = broadcast_scheduled_tasks_update(&db, &session_id).await;
+        });
+        return Ok(StatusCode::NO_CONTENT);
+    }
 
     Err(ApiError::not_found("Scheduled task not found"))
 }
@@ -10409,6 +10515,18 @@ async fn stop_scheduled_task(
         broadcast_scheduled_tasks_update(&state.db, &token.access_token).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
+    if let Some(plugin) = plugin_for_scheduled_task(&state.db, &task_id).await? {
+        let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
+        state
+            .db
+            .fail_current_task_run(
+                &plugin_scheduled_task_key(&plugin_id),
+                "Task run cancelled.",
+            )
+            .await?;
+        broadcast_scheduled_tasks_update(&state.db, &token.access_token).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
 
     Err(ApiError::not_found("Scheduled task not found"))
 }
@@ -10422,6 +10540,12 @@ async fn update_scheduled_task_triggers(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     if is_library_scan_task(&task_id) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if plugin_for_scheduled_task(&state.db, &task_id)
+        .await?
+        .is_some()
+    {
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -10438,12 +10562,100 @@ async fn recover_stale_library_scan_runs(db: &Database) -> Result<(), ApiError> 
     Ok(())
 }
 
+async fn scheduled_task_list_json(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut tasks = vec![library_scan_task_json(db).await?];
+    for plugin in plugin_scheduled_task_plugins(db).await? {
+        tasks.push(plugin_scheduled_task_json(db, &plugin).await?);
+    }
+    Ok(tasks)
+}
+
+async fn plugin_scheduled_task_json_by_id(
+    db: &Database,
+    task_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(plugin) = plugin_for_scheduled_task(db, task_id).await? else {
+        return Ok(None);
+    };
+    plugin_scheduled_task_json(db, &plugin).await.map(Some)
+}
+
+async fn plugin_scheduled_task_plugins(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
+    Ok(db
+        .installed_plugins_json()
+        .await?
+        .into_iter()
+        .filter(plugin_is_active_scheduled_task)
+        .collect())
+}
+
+async fn plugin_for_scheduled_task(
+    db: &Database,
+    task_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    Ok(plugin_scheduled_task_plugins(db)
+        .await?
+        .into_iter()
+        .find(|plugin| {
+            json_string_field(plugin, "Id").is_some_and(|plugin_id| {
+                plugin_scheduled_task_id(&plugin_id).eq_ignore_ascii_case(task_id)
+                    || plugin_scheduled_task_key(&plugin_id).eq_ignore_ascii_case(task_id)
+            })
+        }))
+}
+
+fn plugin_is_active_scheduled_task(plugin: &serde_json::Value) -> bool {
+    json_string_field(plugin, "Status").as_deref() == Some("Active")
+        && plugin_string_array(plugin.get("Capabilities"))
+            .iter()
+            .any(|capability| capability.eq_ignore_ascii_case("ScheduledTask"))
+}
+
+async fn plugin_scheduled_task_json(
+    db: &Database,
+    plugin: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let plugin_id = json_string_field(plugin, "Id").unwrap_or_default();
+    let name = json_string_field(plugin, "Name").unwrap_or_else(|| plugin_id.clone());
+    let task_key = plugin_scheduled_task_key(&plugin_id);
+    let current_run = db.current_task_run(&task_key).await?;
+    let last_result = db.last_task_result(&task_key).await?;
+    let state = if current_run.is_some() {
+        "Running"
+    } else {
+        "Idle"
+    };
+    Ok(serde_json::json!({
+        "Name": format!("{name}: Scheduled Task"),
+        "State": state,
+        "Id": plugin_scheduled_task_id(&plugin_id),
+        "LastExecutionResult": last_result
+            .as_ref()
+            .map(task_run_result_json)
+            .unwrap_or_else(|| default_plugin_task_result_json(&task_key, &name)),
+        "Triggers": [],
+        "Description": format!("Runs the ScheduledTask capability for plugin {name}."),
+        "Category": "Plugins",
+        "IsHidden": false,
+        "Key": task_key,
+        "PluginId": plugin_id,
+    }))
+}
+
+fn plugin_scheduled_task_id(plugin_id: &str) -> String {
+    format!("plugin-{plugin_id}-scheduled-task")
+}
+
+fn plugin_scheduled_task_key(plugin_id: &str) -> String {
+    format!("PluginScheduledTask:{plugin_id}")
+}
+
 async fn broadcast_scheduled_tasks_update(db: &Database, session_id: &str) -> Result<(), ApiError> {
     broadcast_session_message(
         session_id,
         serde_json::json!({
             "MessageType": "ScheduledTasksInfo",
-            "Data": [library_scan_task_json(db).await?]
+            "Data": scheduled_task_list_json(db).await?
         }),
     );
     Ok(())
@@ -10654,6 +10866,17 @@ fn default_library_scan_task_result_json() -> serde_json::Value {
     serde_json::json!({
         "Name": "Scan Media Library",
         "Key": LIBRARY_SCAN_TASK_KEY,
+        "Id": "00000000-0000-0000-0000-000000000000",
+        "Status": "Completed",
+        "StartTimeUtc": "1970-01-01T00:00:00Z",
+        "EndTimeUtc": "1970-01-01T00:00:00Z",
+    })
+}
+
+fn default_plugin_task_result_json(task_key: &str, plugin_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "Name": format!("{plugin_name}: Scheduled Task"),
+        "Key": task_key,
         "Id": "00000000-0000-0000-0000-000000000000",
         "Status": "Completed",
         "StartTimeUtc": "1970-01-01T00:00:00Z",
@@ -31167,12 +31390,13 @@ mod tests {
         parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
         plugin_configuration_from_runtime_host_path,
         plugin_configuration_pages_from_runtime_host_path, plugin_image_from_runtime_host_path,
-        plugin_package_operation, plugin_packages_root, reconcile_live_tv_recordings_on_startup,
-        reconcile_transcode_sessions_on_startup, record_channel_to_file, redact_sensitive_log_text,
-        reserve_live_tv_recording_start, router, run_due_live_tv_timers, series_timer_child_id,
-        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
-        subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
-        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        plugin_package_operation, plugin_packages_root, plugin_scheduled_task_id,
+        reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
+        record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
+        run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
+        subscribe_playback_events, subscribe_system_lifecycle_commands,
+        syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
         update_plugin_configuration_via_runtime_host_path, validate_zip_entry_path,
         verify_plugin_package_checksum,
     };
@@ -31976,6 +32200,79 @@ mod tests {
         assert_eq!(bytes, b"dotnet-image");
     }
 
+    #[tokio::test]
+    async fn rust_wasi_scheduled_task_invokes_runtime_host() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "99999999-9999-9999-9999-999999999999";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("task.wasm"), b"\0asm")
+            .await
+            .unwrap();
+        let host_path = fake_rust_wasi_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Task WASI".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Task WASI",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Task WASI",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ScheduledTask"]
+                }),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_rust_wasi_plugin_with_host_path(&db, &plugin, None, host_path.clone())
+                .await
+                .unwrap()
+        );
+
+        let task =
+            super::plugin_scheduled_task_json_by_id(&db, &plugin_scheduled_task_id(plugin_id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(task["Name"], "Task WASI: Scheduled Task");
+        assert_eq!(task["PluginId"], plugin_id);
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        let result = super::invoke_plugin_capability_via_runtime_host_path(
+            &plugin,
+            "ScheduledTask",
+            json!({ "Trigger": "Manual" }),
+            PluginRuntime::RustWasi,
+            "RustWasi",
+            "RustWasi",
+            host_path,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.value["Status"], "Executed");
+        assert_eq!(result.value["Capability"], "ScheduledTask");
+        assert_eq!(result.value["TaskName"], "Fake WASI Task");
+        assert_eq!(result.value["Arguments"]["Trigger"], "Manual");
+    }
+
     async fn fake_rust_wasi_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-wasi-host.sh");
         tokio::fs::write(
@@ -31992,6 +32289,9 @@ while IFS= read -r line; do
       ;;
     LoadPlugin)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"55555555-5555-5555-5555-555555555555","Runtime":"RustWasi","RuntimeVersion":"fake-wasi-host-0.1","Status":"Healthy","Manifest":{"Name":"Activatable WASI"},"Capabilities":["ScheduledTask"]}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"ScheduledTask","TaskName":"Fake WASI Task","Arguments":{"Trigger":"Manual"}}}}\n' "$corr"
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"55555555-5555-5555-5555-555555555555","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
