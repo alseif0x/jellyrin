@@ -91,6 +91,33 @@ const ONE_BY_ONE_PNG: &[u8] = &[
     0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae,
     0x42, 0x60, 0x82,
 ];
+static DLNA_ICON_48_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| solid_png_rgba(48, 48));
+static DLNA_ICON_120_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| solid_png_rgba(120, 120));
+static DLNA_ICON_240_PNG: LazyLock<Vec<u8>> = LazyLock::new(|| solid_png_rgba(240, 240));
+const DLNA_ICON_SPECS: &[DlnaIconSpec] = &[
+    DlnaIconSpec {
+        file_name: "logo-48.png",
+        width: 48,
+        height: 48,
+    },
+    DlnaIconSpec {
+        file_name: "logo-120.png",
+        width: 120,
+        height: 120,
+    },
+    DlnaIconSpec {
+        file_name: "logo-240.png",
+        width: 240,
+        height: 240,
+    },
+];
+
+#[derive(Clone, Copy)]
+struct DlnaIconSpec {
+    file_name: &'static str,
+    width: u32,
+    height: u32,
+}
 
 #[derive(Clone, Copy)]
 struct DlnaProtocolInfoEntry {
@@ -364,16 +391,17 @@ pub(crate) async fn icon(
     Path((server_id, file_name)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
-    if !file_name.eq_ignore_ascii_case("logo.png") {
+    let Some(bytes) = dlna_icon_bytes(&file_name) else {
         return Err(ApiError::not_found("DLNA icon not found"));
-    }
+    };
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "image/png".to_string()),
-            (header::CONTENT_LENGTH, ONE_BY_ONE_PNG.len().to_string()),
+            (header::CONTENT_LENGTH, bytes.len().to_string()),
+            (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
         ],
-        ONE_BY_ONE_PNG,
+        bytes,
     )
         .into_response())
 }
@@ -2005,7 +2033,7 @@ fn root_device_xml(context: &DlnaContext, server_address: &str) -> String {
          <serialNumber>{}</serialNumber>\
          <UPC/>\
          <UDN>uuid:{}</UDN>\
-         <iconList><icon><mimetype>image/png</mimetype><width>1</width><height>1</height><depth>24</depth><url>{}/icons/logo.png</url></icon></iconList>\
+         <iconList>{}</iconList>\
          <presentationURL>{}/web/index.html</presentationURL>\
          <serviceList>{}{}{}</serviceList>\
          </device>\
@@ -2014,7 +2042,7 @@ fn root_device_xml(context: &DlnaContext, server_address: &str) -> String {
         escape_xml(COMPATIBLE_PRODUCT_NAME),
         context.server_id,
         context.server_id,
-        escape_xml(&base),
+        dlna_icon_list_xml(&base),
         escape_xml(server_address.trim_end_matches('/')),
         service_description(
             CONTENT_DIRECTORY_SERVICE,
@@ -2038,6 +2066,114 @@ fn root_device_xml(context: &DlnaContext, server_address: &str) -> String {
             &format!("{base}/mediareceiverregistrar/events"),
         )
     )
+}
+
+fn dlna_icon_list_xml(base: &str) -> String {
+    DLNA_ICON_SPECS
+        .iter()
+        .map(|icon| {
+            format!(
+                "<icon><mimetype>image/png</mimetype><width>{}</width><height>{}</height><depth>32</depth><url>{}/icons/{}</url></icon>",
+                icon.width,
+                icon.height,
+                escape_xml(base),
+                icon.file_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn dlna_icon_bytes(file_name: &str) -> Option<&'static [u8]> {
+    if file_name.eq_ignore_ascii_case("logo.png") || file_name.eq_ignore_ascii_case("logo-120.png")
+    {
+        return Some(DLNA_ICON_120_PNG.as_slice());
+    }
+    if file_name.eq_ignore_ascii_case("logo-48.png") {
+        return Some(DLNA_ICON_48_PNG.as_slice());
+    }
+    if file_name.eq_ignore_ascii_case("logo-240.png") {
+        return Some(DLNA_ICON_240_PNG.as_slice());
+    }
+    None
+}
+
+fn solid_png_rgba(width: u32, height: u32) -> Vec<u8> {
+    let row_len = width as usize * 4 + 1;
+    let mut raw = Vec::with_capacity(row_len * height as usize);
+    for y in 0..height {
+        raw.push(0);
+        for x in 0..width {
+            let border = x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+            if border {
+                raw.extend_from_slice(&[0x2b, 0x9a, 0x9b, 0xff]);
+            } else {
+                raw.extend_from_slice(&[0x18, 0x24, 0x2f, 0xff]);
+            }
+        }
+    }
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    append_png_chunk(&mut png, b"IHDR", &ihdr);
+    append_png_chunk(&mut png, b"IDAT", &zlib_store_blocks(&raw));
+    append_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn zlib_store_blocks(data: &[u8]) -> Vec<u8> {
+    let mut output = vec![0x78, 0x01];
+    let mut offset = 0;
+    while offset < data.len() {
+        let remaining = data.len() - offset;
+        let len = remaining.min(u16::MAX as usize);
+        let final_block = offset + len == data.len();
+        output.push(u8::from(final_block));
+        let len_u16 = len as u16;
+        output.extend_from_slice(&len_u16.to_le_bytes());
+        output.extend_from_slice(&(!len_u16).to_le_bytes());
+        output.extend_from_slice(&data[offset..offset + len]);
+        offset += len;
+    }
+    output.extend_from_slice(&adler32(data).to_be_bytes());
+    output
+}
+
+fn append_png_chunk(png: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    png.extend_from_slice(chunk_type);
+    png.extend_from_slice(data);
+    let mut crc_data = Vec::with_capacity(chunk_type.len() + data.len());
+    crc_data.extend_from_slice(chunk_type);
+    crc_data.extend_from_slice(data);
+    png.extend_from_slice(&crc32(&crc_data).to_be_bytes());
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    const MOD_ADLER: u32 = 65_521;
+    let mut a = 1_u32;
+    let mut b = 0_u32;
+    for byte in data {
+        a = (a + u32::from(*byte)) % MOD_ADLER;
+        b = (b + a) % MOD_ADLER;
+    }
+    (b << 16) | a
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffff_u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 fn service_description(

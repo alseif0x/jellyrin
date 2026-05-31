@@ -31823,6 +31823,17 @@ mod tests {
         assert!(description.contains(&format!(
             "http://media.example.test:8097/dlna/{server_id}/mediareceiverregistrar/events"
         )));
+        for (file_name, width, height) in [
+            ("logo-48.png", 48, 48),
+            ("logo-120.png", 120, 120),
+            ("logo-240.png", 240, 240),
+        ] {
+            assert!(description.contains(&format!("<width>{width}</width>")));
+            assert!(description.contains(&format!("<height>{height}</height>")));
+            assert!(description.contains(&format!(
+                "http://media.example.test:8097/dlna/{server_id}/icons/{file_name}"
+            )));
+        }
 
         let response = app
             .clone()
@@ -31906,6 +31917,31 @@ mod tests {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(b"\x89PNG"));
+        assert_eq!(u32::from_be_bytes(body[16..20].try_into().unwrap()), 120);
+        assert_eq!(u32::from_be_bytes(body[20..24].try_into().unwrap()), 120);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/icons/logo-240.png"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=86400")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"\x89PNG"));
+        assert_eq!(u32::from_be_bytes(body[16..20].try_into().unwrap()), 240);
+        assert_eq!(u32::from_be_bytes(body[20..24].try_into().unwrap()), 240);
 
         dlna::notify_dlna_content_directory_changed(&dlna_db)
             .await
