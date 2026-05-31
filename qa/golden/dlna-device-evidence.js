@@ -166,6 +166,7 @@ async function validateManualDlnaEvidence(evidence) {
     requireUrl(errors, evidence.network, 'network.ssdpLocation', 'ssdpLocation');
     requireLanLocation(errors, evidence.network.ssdpLocation, 'network.ssdpLocation');
     requireLocationHostMatchesIp(errors, evidence.network.ssdpLocation, evidence.network.serverIp, 'network.ssdpLocation', 'network.serverIp');
+    requireLocationContainsServerId(errors, evidence.network.ssdpLocation, evidence.server?.serverId, 'network.ssdpLocation', 'server.serverId');
     requireLocationHostMatchesIp(errors, evidence.jellyrinBaseUrl, evidence.network.serverIp, 'jellyrinBaseUrl', 'network.serverIp');
     for (const check of requiredNetworkChecks) {
       if (evidence.network[check] !== true) {
@@ -395,6 +396,25 @@ function requireLocationHostMatchesIp(errors, location, serverIp, locationLabel,
   }
 }
 
+function requireLocationContainsServerId(errors, location, serverId, locationLabel, serverIdLabel) {
+  if (
+    typeof location !== 'string' ||
+    typeof serverId !== 'string' ||
+    looksLikeTemplatePlaceholder(location) ||
+    looksLikeTemplatePlaceholder(serverId)
+  ) {
+    return;
+  }
+  try {
+    const pathname = new URL(location).pathname.toLowerCase();
+    if (!pathname.includes(serverId.toLowerCase())) {
+      errors.push(`${locationLabel} path must include ${serverIdLabel}`);
+    }
+  } catch {
+    // requireUrl reports the URL shape error.
+  }
+}
+
 function validateTranscodeFallback(errors, transcodeFallback) {
   if (!transcodeFallback || typeof transcodeFallback !== 'object' || Array.isArray(transcodeFallback)) {
     errors.push('transcodeFallback must be an object');
@@ -595,6 +615,15 @@ async function selfTest() {
       },
     };
     await assertInvalid(mismatchedSsdpLocation, 'network.ssdpLocation host must match network.serverIp');
+
+    const mismatchedSsdpServerId = {
+      ...valid,
+      network: {
+        ...valid.network,
+        ssdpLocation: 'http://192.168.1.46:8097/dlna/11111111-2222-3333-8444-555555555555/description.xml',
+      },
+    };
+    await assertInvalid(mismatchedSsdpServerId, 'network.ssdpLocation path must include server.serverId');
 
     const outsideArtifact = {
       ...valid,
