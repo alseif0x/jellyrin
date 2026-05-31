@@ -510,9 +510,7 @@ pub(crate) async fn content_directory_control(
         return Ok(soap_fault_response(401, "Invalid Action"));
     };
     let response_body = match action.as_str() {
-        "getsearchcapabilities" => {
-            "<SearchCaps>dc:title,upnp:class,@id,res@protocolInfo</SearchCaps>".to_string()
-        }
+        "getsearchcapabilities" => format!("<SearchCaps>{}</SearchCaps>", dlna_search_caps()),
         "getsortcapabilities" => "<SortCaps>dc:title</SortCaps>".to_string(),
         "getsystemupdateid" => format!("<Id>{}</Id>", dlna_system_update_id()),
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
@@ -2553,7 +2551,8 @@ async fn search_response(
     let (starting_index, requested_count) = browse_window(request);
     let folders = db.virtual_folders().await?;
     let mut items = search_container_items(db, &folders, &container_id).await?;
-    items.retain(|item| dlna_search_criteria_matches(item, &criteria));
+    let metadata = media_item_metadata_map(db).await?;
+    items.retain(|item| dlna_search_criteria_matches_with_metadata(item, &metadata, &criteria));
     sort_media_items(&mut items, &sort_criteria);
     let total_matches = items.len();
     let paged_items = paged_slice(&items, starting_index, requested_count);
@@ -4145,6 +4144,9 @@ fn collect_metadata_string_values(value: &Value, output: &mut Vec<String>) {
                 output.push(value.to_string());
             }
         }
+        Value::Number(value) => {
+            output.push(value.to_string());
+        }
         Value::Array(values) => {
             for value in values {
                 collect_metadata_string_values(value, output);
@@ -4241,16 +4243,29 @@ fn compare_dlna_titles(
     }
 }
 
+#[cfg(test)]
 fn dlna_search_criteria_matches(item: &MediaItem, criteria: &str) -> bool {
+    dlna_search_criteria_matches_with_metadata(item, &HashMap::new(), criteria)
+}
+
+fn dlna_search_criteria_matches_with_metadata(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    criteria: &str,
+) -> bool {
     let criteria = unescape_xml(criteria.trim());
     if criteria.is_empty() || criteria == "*" {
         return true;
     }
 
-    search_criteria_expression_matches(item, &criteria).unwrap_or(false)
+    search_criteria_expression_matches(item, metadata, &criteria).unwrap_or(false)
 }
 
-fn search_criteria_expression_matches(item: &MediaItem, criteria: &str) -> Option<bool> {
+fn search_criteria_expression_matches(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    criteria: &str,
+) -> Option<bool> {
     let criteria = strip_wrapping_search_parentheses(criteria);
     if criteria.is_empty() || criteria == "*" {
         return Some(true);
@@ -4260,7 +4275,7 @@ fn search_criteria_expression_matches(item: &MediaItem, criteria: &str) -> Optio
     if or_terms.len() > 1 {
         let mut recognized = false;
         for term in or_terms {
-            if let Some(matches) = search_criteria_expression_matches(item, term) {
+            if let Some(matches) = search_criteria_expression_matches(item, metadata, term) {
                 recognized = true;
                 if matches {
                     return Some(true);
@@ -4274,7 +4289,7 @@ fn search_criteria_expression_matches(item: &MediaItem, criteria: &str) -> Optio
     if and_terms.len() > 1 {
         let mut recognized = false;
         for term in and_terms {
-            if let Some(matches) = search_criteria_expression_matches(item, term) {
+            if let Some(matches) = search_criteria_expression_matches(item, metadata, term) {
                 recognized = true;
                 if !matches {
                     return Some(false);
@@ -4287,13 +4302,17 @@ fn search_criteria_expression_matches(item: &MediaItem, criteria: &str) -> Optio
     }
 
     if let Some(negated) = strip_search_not(criteria) {
-        return search_criteria_expression_matches(item, negated).map(|matches| !matches);
+        return search_criteria_expression_matches(item, metadata, negated).map(|matches| !matches);
     }
 
-    search_criteria_condition_matches(item, criteria)
+    search_criteria_condition_matches(item, metadata, criteria)
 }
 
-fn search_criteria_condition_matches(item: &MediaItem, criteria: &str) -> Option<bool> {
+fn search_criteria_condition_matches(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    criteria: &str,
+) -> Option<bool> {
     if let Some(value) = search_criteria_value(criteria, "dc:title doesnotcontain") {
         return Some(!search_text_contains(&item.name, &value));
     }
@@ -4365,13 +4384,33 @@ fn search_criteria_condition_matches(item: &MediaItem, criteria: &str) -> Option
     for property in ["dc:title", "upnp:class", "@id"] {
         if let Some(value) = search_criteria_value(criteria, &format!("{property} exists")) {
             return Some(search_exists_result(
-                search_property_exists(item, property)?,
+                search_property_exists(item, metadata, property)?,
                 &value,
             ));
         }
     }
+    for property in [
+        "dc:creator",
+        "upnp:artist",
+        "upnp:album",
+        "upnp:genre",
+        "upnp:seriesTitle",
+        "upnp:originalTrackNumber",
+        "upnp:episodeSeason",
+        "upnp:episodeNumber",
+        "dc:date",
+    ] {
+        let values = search_metadata_property_values(item, metadata, property);
+        if let Some(matches) = search_multi_value_property_criteria(criteria, property, &values) {
+            return Some(matches);
+        }
+    }
 
     None
+}
+
+fn dlna_search_caps() -> &'static str {
+    "dc:title,dc:creator,dc:date,upnp:class,upnp:artist,upnp:album,upnp:genre,upnp:seriesTitle,upnp:originalTrackNumber,upnp:episodeSeason,upnp:episodeNumber,@id,res@protocolInfo"
 }
 
 fn strip_search_not(criteria: &str) -> Option<&str> {
@@ -4433,11 +4472,140 @@ fn item_protocol_info_for_search(item: &MediaItem) -> Option<String> {
     ))
 }
 
-fn search_property_exists(item: &MediaItem, property: &str) -> Option<bool> {
+fn search_property_exists(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    property: &str,
+) -> Option<bool> {
     match property {
         "dc:title" => Some(!item.name.trim().is_empty()),
         "upnp:class" | "@id" => Some(true),
+        "dc:creator"
+        | "dc:date"
+        | "upnp:artist"
+        | "upnp:album"
+        | "upnp:genre"
+        | "upnp:seriesTitle"
+        | "upnp:originalTrackNumber"
+        | "upnp:episodeSeason"
+        | "upnp:episodeNumber" => {
+            Some(!search_metadata_property_values(item, metadata, property).is_empty())
+        }
         _ => None,
+    }
+}
+
+fn search_multi_value_property_criteria(
+    criteria: &str,
+    property: &str,
+    values: &[String],
+) -> Option<bool> {
+    if let Some(value) = search_criteria_value(criteria, &format!("{property} doesnotcontain")) {
+        return Some(
+            !values
+                .iter()
+                .any(|actual| search_text_contains(actual, &value)),
+        );
+    }
+    if let Some(value) = search_criteria_value(criteria, &format!("{property} contains")) {
+        return Some(
+            values
+                .iter()
+                .any(|actual| search_text_contains(actual, &value)),
+        );
+    }
+    if let Some(value) = search_criteria_value(criteria, &format!("{property} !=")) {
+        return Some(
+            !values
+                .iter()
+                .any(|actual| actual.eq_ignore_ascii_case(&value)),
+        );
+    }
+    if let Some(value) = search_criteria_value(criteria, &format!("{property} =")) {
+        return Some(
+            values
+                .iter()
+                .any(|actual| actual.eq_ignore_ascii_case(&value)),
+        );
+    }
+    if let Some(value) = search_criteria_value(criteria, &format!("{property} exists")) {
+        return Some(search_exists_result(!values.is_empty(), &value));
+    }
+    for operator in ["<=", ">=", "<", ">"] {
+        if let Some(expected) = search_criteria_value(criteria, &format!("{property} {operator}")) {
+            return Some(values.iter().any(|actual| {
+                let ordering = compare_search_values(actual, &expected);
+                match operator {
+                    "<=" => !ordering.is_gt(),
+                    ">=" => !ordering.is_lt(),
+                    "<" => ordering.is_lt(),
+                    ">" => ordering.is_gt(),
+                    _ => false,
+                }
+            }));
+        }
+    }
+    None
+}
+
+fn search_metadata_property_values(
+    item: &MediaItem,
+    metadata: &HashMap<Uuid, Value>,
+    property: &str,
+) -> Vec<String> {
+    let Some(value) = metadata.get(&item.id) else {
+        return Vec::new();
+    };
+    match property {
+        "dc:creator" | "upnp:artist" => metadata_string_values(
+            value,
+            &[
+                "Artists",
+                "AlbumArtists",
+                "ArtistItems",
+                "Artist",
+                "AlbumArtist",
+                "Composers",
+                "Directors",
+                "Writers",
+            ],
+        ),
+        "upnp:album" => item_album_titles(item, metadata),
+        "upnp:genre" => metadata_string_values(value, &["Genres", "Genre"]),
+        "upnp:seriesTitle" => item_series_titles(item, metadata),
+        "upnp:originalTrackNumber" => {
+            metadata_i64_value(value, &["IndexNumber", "TrackNumber", "ParentIndexNumber"])
+                .map(|number| vec![number.to_string()])
+                .unwrap_or_default()
+        }
+        "upnp:episodeSeason" => {
+            metadata_i64_value(value, &["ParentIndexNumber", "SeasonNumber", "SeasonIndex"])
+                .map(|number| vec![number.to_string()])
+                .or_else(|| {
+                    metadata_string_values(value, &["SeasonName", "Season"])
+                        .into_iter()
+                        .next()
+                        .map(|season| vec![normalize_season_key(&season)])
+                })
+                .unwrap_or_default()
+        }
+        "upnp:episodeNumber" => metadata_i64_value(value, &["IndexNumber", "EpisodeNumber"])
+            .map(|number| vec![number.to_string()])
+            .unwrap_or_default(),
+        "dc:date" => metadata_string_values(
+            value,
+            &[
+                "PremiereDate",
+                "DateCreated",
+                "ProductionDate",
+                "Year",
+                "ProductionYear",
+            ],
+        )
+        .into_iter()
+        .map(|date| date.chars().take(10).collect::<String>())
+        .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -5769,6 +5937,74 @@ mod tests {
         assert!(dlna_search_criteria_matches(
             &video,
             r#"res@protocolInfo > "http-get:*:application/""#
+        ));
+    }
+
+    #[test]
+    fn dlna_search_criteria_supports_metadata_vendor_fields() {
+        let mut track = test_media_item("/media/Album/Track One.mp3", "Audio");
+        track.name = "Track One".to_string();
+        track.collection_type = Some("music".to_string());
+        let mut episode = test_media_item("/media/Series/S01E02.mp4", "Video");
+        episode.name = "Episode Two".to_string();
+        episode.collection_type = Some("tvshows".to_string());
+        episode.id = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            track.id,
+            json!({
+                "Album": "Metadata Album",
+                "Artists": ["Example Artist"],
+                "Genres": ["Jazz", "Live"],
+                "IndexNumber": 7,
+                "ProductionYear": 2024
+            }),
+        );
+        metadata.insert(
+            episode.id,
+            json!({
+                "SeriesName": "Example Metadata Show",
+                "ParentIndexNumber": 1,
+                "IndexNumber": 2,
+                "PremiereDate": "2026-05-31T12:00:00Z",
+                "Genres": ["Drama"]
+            }),
+        );
+
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &track,
+            &metadata,
+            r#"upnp:artist = "Example Artist" and upnp:album contains "Metadata""#
+        ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &track,
+            &metadata,
+            r#"upnp:genre contains "jazz" and upnp:originalTrackNumber >= "7""#
+        ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &track,
+            &metadata,
+            r#"dc:creator exists true and dc:date = "2024""#
+        ));
+        assert!(!dlna_search_criteria_matches_with_metadata(
+            &track,
+            &metadata,
+            r#"upnp:artist = "Other Artist" or upnp:genre contains "Classical""#
+        ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &episode,
+            &metadata,
+            r#"upnp:seriesTitle contains "Metadata Show" and upnp:episodeSeason = "1" and upnp:episodeNumber = "2""#
+        ));
+        assert!(dlna_search_criteria_matches_with_metadata(
+            &episode,
+            &metadata,
+            r#"dc:date >= "2026-05-01" and dc:date < "2026-06-01""#
+        ));
+        assert!(!dlna_search_criteria_matches_with_metadata(
+            &episode,
+            &metadata,
+            r#"upnp:episodeSeason exists false"#
         ));
     }
 
