@@ -32434,6 +32434,11 @@ mod tests {
             "protocolInfo=&quot;http-get:*:application/vnd.apple.mpegurl:DLNA.ORG_OP=01"
         ));
         assert!(!browse_response.contains("Second Movie"));
+        assert!(
+            browse_response.find(&resource_url).unwrap()
+                < browse_response.find(&transcode_url).unwrap(),
+            "generic DIDL should expose direct stream before HLS fallback"
+        );
 
         let response = app
             .clone()
@@ -32456,6 +32461,35 @@ mod tests {
             samsung_browse_response.contains("DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01")
         );
         assert!(samsung_browse_response.contains("sec:CaptionInfoEx"));
+        assert!(
+            samsung_browse_response.find(&resource_url).unwrap()
+                < samsung_browse_response.find(&transcode_url).unwrap(),
+            "Samsung DIDL should keep direct-play MP4 before HLS fallback"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::HOST, "media.example.test:8097")
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .header(header::USER_AGENT, "VLC/3.0.20 LibVLC")
+                    .body(Body::from(browse_folder.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let vlc_browse_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            vlc_browse_response.find(&transcode_url).unwrap()
+                < vlc_browse_response.find(&resource_url).unwrap(),
+            "VLC DIDL should prefer HLS resource before direct stream"
+        );
+        assert!(!vlc_browse_response.contains("sec:CaptionInfoEx"));
 
         let browse_item_metadata = format!(
             r#"<?xml version="1.0"?>
