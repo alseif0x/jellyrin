@@ -29,39 +29,53 @@ const baselineEvidence = {
 async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
 
+  const unitResult = await runSyncPlayUnitTests();
   const result = await runBrowserTrace();
   const comparison = await readJsonIfExists(comparisonPath);
-  const evidence = buildEvidence(result, comparison);
+  const evidence = buildEvidence(result, comparison, unitResult);
 
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison));
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
 
-  if (evidence.failedTargets?.length > 0 || evidence.traceExitCode) {
-    process.exitCode = result.code || 1;
+  if (evidence.failedTargets?.length > 0 || evidence.traceExitCode || unitResult.code) {
+    process.exitCode = unitResult.code || result.code || 1;
   }
 }
 
+function runSyncPlayUnitTests() {
+  return runCommand('cargo', [
+    'test',
+    '-p',
+    'jellyrin-api',
+    'syncplay_policy_enforces_create_and_join_access',
+    '--',
+    '--nocapture',
+  ]);
+}
+
 function runBrowserTrace() {
+  return runCommand(process.execPath, [path.join(__dirname, 'browser-trace.js')], {
+    JELLYRIN_BROWSER_FLOW: 'syncplay',
+  });
+}
+
+function runCommand(command, args, extraEnv = {}) {
   return new Promise((resolve) => {
-    const child = spawn(
-      process.execPath,
-      [path.join(__dirname, 'browser-trace.js')],
-      {
-        cwd: repoRoot,
-        env: {
-          ...process.env,
-          JELLYRIN_BROWSER_FLOW: 'syncplay',
-        },
-        stdio: 'inherit',
+    const child = spawn(command, args, {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        ...extraEnv,
       },
-    );
+      stdio: 'inherit',
+    });
     child.on('close', (code, signal) => resolve({ code: code || 0, signal }));
   });
 }
 
-function buildEvidence(result, comparison) {
+function buildEvidence(result, comparison, unitResult) {
   const updatedAt = new Date().toISOString();
   if (!comparison) {
     return {
@@ -86,19 +100,28 @@ function buildEvidence(result, comparison) {
     .sort();
   const failed = Boolean(comparison.comparison?.failed);
 
-  if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream')) {
+  if (
+    unitResult.code === 0 &&
+    !failed &&
+    completedTargets.includes('jellyrin') &&
+    completedTargets.includes('upstream')
+  ) {
     return {
       gate: 'syncplay-advanced',
       status: 'upstream-validated',
       percent: 100,
       closed: true,
-      sourcePhase: 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b/E4.5c/E4.5d/E4.4b',
-      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures for group creation, join/list/get, SetNewQueue/Pause/Seek/Unpause command handling, deterministic race handling, drift correction, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup.',
+      sourcePhase: 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b/E4.5c/E4.5d/E4.4b/E4.6a',
+      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures for group creation, join/list/get, SetNewQueue/Pause/Seek/Unpause command handling, deterministic race handling, drift correction, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup; Rust unit coverage also verifies SyncPlayAccess policy enforcement for CreateAndJoinGroups, JoinGroups and None.',
       updatedAt,
       completedTargets,
       skippedTargets,
       failedTargets,
       tracePath: path.relative(plansDir, comparisonPath),
+      validatedCommands: [
+        'cargo test -p jellyrin-api syncplay_policy_enforces_create_and_join_access -- --nocapture',
+        'node qa/golden/browser-trace.js with JELLYRIN_BROWSER_FLOW=syncplay',
+      ],
       openRisks: [],
     };
   }
@@ -160,6 +183,7 @@ function buildEvidence(result, comparison) {
     failedTargets,
     failedReasons: comparison.comparison?.reasons || [],
     traceExitCode: result.code,
+    unitExitCode: unitResult.code,
     tracePath: path.relative(plansDir, comparisonPath),
   };
 }
@@ -189,6 +213,11 @@ function renderMarkdown(evidence, comparison) {
   lines.push(`- ${evidence.evidence}`);
   if (evidence.tracePath) {
     lines.push(`- Trace: \`${evidence.tracePath}\``);
+  }
+  if (Array.isArray(evidence.validatedCommands)) {
+    for (const command of evidence.validatedCommands) {
+      lines.push(`- Validated: \`${command}\``);
+    }
   }
   if (Array.isArray(evidence.completedTargets)) {
     lines.push(`- Completed targets: ${evidence.completedTargets.join(', ') || 'none'}`);

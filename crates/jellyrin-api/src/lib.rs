@@ -3989,8 +3989,14 @@ async fn restore_users_from_backup(
             existing_by_name.insert(key, created.clone());
             created
         };
-        db.update_user_profile(user.id, &name, is_administrator, is_disabled)
-            .await?;
+        db.update_user_profile(
+            user.id,
+            &name,
+            is_administrator,
+            is_disabled,
+            &user.sync_play_access,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -4447,6 +4453,10 @@ async fn import_jellyfin_users(
         let is_disabled = migration_bool_field(object, &["IsDisabled"])
             .or_else(|| policy.and_then(|policy| migration_bool_field(policy, &["IsDisabled"])))
             .unwrap_or(false);
+        let sync_play_access = policy
+            .and_then(|policy| migration_string_field(policy, &["SyncPlayAccess"]))
+            .and_then(|value| normalize_sync_play_access(&value))
+            .unwrap_or_else(|| "CreateAndJoinGroups".to_string());
         let key = name.to_lowercase();
         let user = if let Some(existing) = existing_by_name.get(&key) {
             existing.clone()
@@ -4455,8 +4465,14 @@ async fn import_jellyfin_users(
             existing_by_name.insert(key, created.clone());
             created
         };
-        db.update_user_profile(user.id, &name, is_administrator, is_disabled)
-            .await?;
+        db.update_user_profile(
+            user.id,
+            &name,
+            is_administrator,
+            is_disabled,
+            &sync_play_access,
+        )
+        .await?;
         imported += 1;
     }
     Ok(imported)
@@ -4967,15 +4983,38 @@ async fn update_user_profile_from_payload(
     let is_administrator =
         bool_value(policy, "IsAdministrator").unwrap_or(current.is_administrator);
     let is_disabled = bool_value(policy, "IsDisabled").unwrap_or(current.is_disabled);
-    db.update_user_profile(user_id, name, is_administrator, is_disabled)
-        .await
-        .map_err(ApiError::from)
+    let sync_play_access = policy
+        .and_then(|policy| {
+            policy
+                .get("SyncPlayAccess")
+                .and_then(serde_json::Value::as_str)
+                .and_then(normalize_sync_play_access)
+        })
+        .unwrap_or(current.sync_play_access);
+    db.update_user_profile(
+        user_id,
+        name,
+        is_administrator,
+        is_disabled,
+        &sync_play_access,
+    )
+    .await
+    .map_err(ApiError::from)
 }
 
 fn bool_value(payload: Option<&serde_json::Value>, key: &str) -> Option<bool> {
     payload
         .and_then(|payload| payload.get(key))
         .and_then(serde_json::Value::as_bool)
+}
+
+fn normalize_sync_play_access(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "createandjoingroups" => Some("CreateAndJoinGroups".to_string()),
+        "joingroups" => Some("JoinGroups".to_string()),
+        "none" => Some("None".to_string()),
+        _ => None,
+    }
 }
 
 async fn authenticate_by_name(
@@ -10663,6 +10702,34 @@ fn syncplay_participant(user: &User, token: &DeviceToken) -> SyncPlayParticipant
     }
 }
 
+fn user_can_create_syncplay_group(user: &User) -> bool {
+    user.sync_play_access
+        .eq_ignore_ascii_case("CreateAndJoinGroups")
+}
+
+fn user_can_join_syncplay_group(user: &User) -> bool {
+    matches!(
+        user.sync_play_access.to_ascii_lowercase().as_str(),
+        "createandjoingroups" | "joingroups"
+    )
+}
+
+fn require_syncplay_create_access(user: &User) -> Result<(), ApiError> {
+    if user_can_create_syncplay_group(user) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("User cannot create SyncPlay groups"))
+    }
+}
+
+fn require_syncplay_join_access(user: &User) -> Result<(), ApiError> {
+    if user_can_join_syncplay_group(user) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("User cannot join SyncPlay groups"))
+    }
+}
+
 fn syncplay_insert_participant(
     participants: &mut BTreeMap<String, SyncPlayParticipant>,
     participant: SyncPlayParticipant,
@@ -10746,6 +10813,7 @@ async fn syncplay_new(
     body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_syncplay_create_access(&user)?;
     syncplay_cleanup_stale_participants("Stale").await;
     let payload = optional_json_body(body).await?;
     let group_id = json_string_any_field(&payload, &["GroupId", "Id"])
@@ -10782,6 +10850,7 @@ async fn syncplay_join(
     body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_syncplay_join_access(&user)?;
     syncplay_cleanup_stale_participants("Stale").await;
     let payload = optional_json_body(body).await?;
     let group_id = json_string_any_field(&payload, &["GroupId", "Id"])
@@ -29519,7 +29588,7 @@ async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<User
             max_active_sessions: 0,
             authentication_provider_id: DEFAULT_AUTHENTICATION_PROVIDER_ID.to_string(),
             password_reset_provider_id: DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_string(),
-            sync_play_access: "CreateAndJoinGroups".to_string(),
+            sync_play_access: user.sync_play_access.clone(),
         },
     })
 }
@@ -31087,7 +31156,7 @@ mod tests {
         .await
         .unwrap();
         let guest = db.create_user("Guest", None).await.unwrap();
-        db.update_user_profile(guest.id, "Guest", false, true)
+        db.update_user_profile(guest.id, "Guest", false, true, "CreateAndJoinGroups")
             .await
             .unwrap();
         let media_root = tempfile::tempdir().unwrap();
@@ -31351,7 +31420,7 @@ mod tests {
             .await
             .unwrap();
         db_for_assertions
-            .update_user_profile(guest.id, "Guest", true, false)
+            .update_user_profile(guest.id, "Guest", true, false, "CreateAndJoinGroups")
             .await
             .unwrap();
         db_for_assertions
@@ -43704,6 +43773,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn syncplay_policy_enforces_create_and_join_access() {
+        let _guard = syncplay_test_lock().await;
+        syncplay_groups().lock().await.clear();
+        let group_id = Uuid::new_v4().to_string();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let owner = db
+            .update_first_user("owner".to_string(), "secret")
+            .await
+            .unwrap();
+        let owner_key = db
+            .issue_api_key_for_user(owner.id, &format!("syncplay-policy-owner-{group_id}"))
+            .await
+            .unwrap();
+        let joiner = db.create_user("joiner", Some("secret")).await.unwrap();
+        let joiner = db
+            .update_user_profile(joiner.id, "joiner", false, false, "JoinGroups")
+            .await
+            .unwrap();
+        let joiner_key = db
+            .issue_api_key_for_user(joiner.id, &format!("syncplay-policy-joiner-{group_id}"))
+            .await
+            .unwrap();
+        let blocked = db.create_user("blocked", Some("secret")).await.unwrap();
+        let blocked = db
+            .update_user_profile(blocked.id, "blocked", false, false, "None")
+            .await
+            .unwrap();
+        let blocked_key = db
+            .issue_api_key_for_user(blocked.id, &format!("syncplay-policy-blocked-{group_id}"))
+            .await
+            .unwrap();
+        db.complete_startup_wizard().await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &owner_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &joiner_key)
+                    .body(Body::from(json!({ "GroupId": Uuid::new_v4() }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Join")
+                    .header("X-Emby-Token", &joiner_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &blocked_key)
+                    .body(Body::from(json!({ "GroupId": Uuid::new_v4() }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Join")
+                    .header("X-Emby-Token", &blocked_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &owner_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let group: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(group["Participants"].as_array().unwrap().len(), 2);
+        assert!(
+            group["Participants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|participant| participant["UserName"] != "blocked")
+        );
     }
 
     #[tokio::test]
@@ -56138,6 +56340,7 @@ mod tests {
                         json!({
                             "IsAdministrator": true,
                             "IsDisabled": false,
+                            "SyncPlayAccess": "JoinGroups",
                             "AuthenticationProviderId": DEFAULT_AUTHENTICATION_PROVIDER_ID,
                             "PasswordResetProviderId": DEFAULT_PASSWORD_RESET_PROVIDER_ID
                         })
@@ -56165,6 +56368,7 @@ mod tests {
         assert_eq!(user["Name"], "managed-renamed");
         assert_eq!(user["Policy"]["IsAdministrator"], true);
         assert_eq!(user["Policy"]["IsDisabled"], false);
+        assert_eq!(user["Policy"]["SyncPlayAccess"], "JoinGroups");
     }
 
     #[tokio::test]

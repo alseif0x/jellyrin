@@ -23,6 +23,7 @@ use uuid::Uuid;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_MAX_CONNECTIONS: u32 = 5;
+const DEFAULT_SYNC_PLAY_ACCESS: &str = "CreateAndJoinGroups";
 
 #[derive(Clone)]
 pub struct Database {
@@ -1402,7 +1403,7 @@ impl Database {
     pub async fn first_user(&self) -> anyhow::Result<User> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
-            SELECT id, name, is_administrator, is_disabled, created_at, updated_at
+            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
             FROM users
             ORDER BY created_at
             LIMIT 1
@@ -1420,7 +1421,7 @@ impl Database {
     pub async fn users(&self) -> anyhow::Result<Vec<User>> {
         let rows = sqlx::query_as::<_, UserRow>(
             r#"
-            SELECT id, name, is_administrator, is_disabled, created_at, updated_at
+            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
             FROM users
             ORDER BY name COLLATE NOCASE
             "#,
@@ -1445,16 +1446,18 @@ impl Database {
 
         sqlx::query(
             r#"
-            INSERT INTO users (id, name, is_administrator, is_disabled, created_at, updated_at)
-            VALUES (?1, ?2, 1, 0, ?3, ?3)
+            INSERT INTO users (id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at)
+            VALUES (?1, ?2, 1, 0, ?3, ?4, ?4)
             ON CONFLICT(name) DO UPDATE SET
                 is_administrator = 1,
                 is_disabled = 0,
+                sync_play_access = excluded.sync_play_access,
                 updated_at = excluded.updated_at
             "#,
         )
         .bind(id.to_string())
         .bind(trimmed_name)
+        .bind(DEFAULT_SYNC_PLAY_ACCESS)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -1522,12 +1525,13 @@ impl Database {
         let user_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO users (id, name, is_administrator, is_disabled, created_at, updated_at)
-            VALUES (?1, ?2, 0, 0, ?3, ?3)
+            INSERT INTO users (id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at)
+            VALUES (?1, ?2, 0, 0, ?3, ?4, ?4)
             "#,
         )
         .bind(user_id.to_string())
         .bind(trimmed_name)
+        .bind(DEFAULT_SYNC_PLAY_ACCESS)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -1605,6 +1609,7 @@ impl Database {
         name: &str,
         is_administrator: bool,
         is_disabled: bool,
+        sync_play_access: &str,
     ) -> anyhow::Result<User> {
         let trimmed_name = name.trim();
         anyhow::ensure!(!trimmed_name.is_empty(), "user name must not be empty");
@@ -1613,13 +1618,14 @@ impl Database {
         sqlx::query(
             r#"
             UPDATE users
-            SET name = ?1, is_administrator = ?2, is_disabled = ?3, updated_at = ?4
-            WHERE id = ?5
+            SET name = ?1, is_administrator = ?2, is_disabled = ?3, sync_play_access = ?4, updated_at = ?5
+            WHERE id = ?6
             "#,
         )
         .bind(trimmed_name)
         .bind(is_administrator)
         .bind(is_disabled)
+        .bind(sync_play_access.trim())
         .bind(format_time(OffsetDateTime::now_utc())?)
         .bind(user_id.to_string())
         .execute(&self.pool)
@@ -3794,6 +3800,7 @@ impl Database {
                    users.name,
                    users.is_administrator,
                    users.is_disabled,
+                   users.sync_play_access,
                    users.created_at,
                    users.updated_at
             FROM media_list_user_permissions
@@ -3824,6 +3831,7 @@ impl Database {
                    users.name,
                    users.is_administrator,
                    users.is_disabled,
+                   users.sync_play_access,
                    users.created_at,
                    users.updated_at
             FROM media_list_user_permissions
@@ -4421,20 +4429,22 @@ impl Database {
             name: "admin".to_string(),
             is_administrator: true,
             is_disabled: false,
+            sync_play_access: DEFAULT_SYNC_PLAY_ACCESS.to_string(),
             created_at: now,
             updated_at: now,
         };
 
         sqlx::query(
             r#"
-            INSERT INTO users (id, name, is_administrator, is_disabled, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO users (id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
         )
         .bind(user.id.to_string())
         .bind(&user.name)
         .bind(user.is_administrator)
         .bind(user.is_disabled)
+        .bind(&user.sync_play_access)
         .bind(format_time(user.created_at)?)
         .bind(format_time(user.updated_at)?)
         .execute(&self.pool)
@@ -4452,7 +4462,7 @@ impl Database {
     async fn optional_user_by_name(&self, username: &str) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
-            SELECT id, name, is_administrator, is_disabled, created_at, updated_at
+            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
             FROM users
             WHERE name = ?1
             "#,
@@ -4467,7 +4477,7 @@ impl Database {
     pub async fn user_by_id(&self, user_id: Uuid) -> anyhow::Result<User> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
-            SELECT id, name, is_administrator, is_disabled, created_at, updated_at
+            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
             FROM users
             WHERE id = ?1
             "#,
@@ -5089,6 +5099,7 @@ struct UserRow {
     name: String,
     is_administrator: bool,
     is_disabled: bool,
+    sync_play_access: String,
     created_at: String,
     updated_at: String,
 }
@@ -5102,6 +5113,7 @@ impl TryFrom<UserRow> for User {
             name: row.name,
             is_administrator: row.is_administrator,
             is_disabled: row.is_disabled,
+            sync_play_access: row.sync_play_access,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         })
@@ -5274,6 +5286,7 @@ struct MediaListUserPermissionRow {
     name: String,
     is_administrator: bool,
     is_disabled: bool,
+    sync_play_access: String,
     created_at: String,
     updated_at: String,
 }
@@ -5609,6 +5622,7 @@ impl TryFrom<MediaListUserPermissionRow> for MediaListUserPermission {
                 name: row.name,
                 is_administrator: row.is_administrator,
                 is_disabled: row.is_disabled,
+                sync_play_access: row.sync_play_access,
                 created_at: parse_time(&row.created_at)?,
                 updated_at: parse_time(&row.updated_at)?,
             },

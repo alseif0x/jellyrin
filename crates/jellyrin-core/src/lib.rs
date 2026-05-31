@@ -31,6 +31,7 @@ pub struct User {
     pub name: String,
     pub is_administrator: bool,
     pub is_disabled: bool,
+    pub sync_play_access: String,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
