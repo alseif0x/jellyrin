@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require('node:fs/promises');
+const net = require('node:net');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
@@ -26,6 +27,7 @@ async function main() {
     return;
   }
   const baseUrl = normalizeBaseUrl(options.baseUrl || process.env.JELLYRIN_BASE_URL || 'http://127.0.0.1:8097');
+  requirePrivateLanBaseUrl(baseUrl);
   const serverInfo = await fetchJson(new URL('/System/Info/Public', baseUrl));
   const serverId = requiredString(serverInfo.Id || serverInfo.ServerId, 'System/Info/Public Id');
   const version = requiredString(serverInfo.Version || serverInfo.LocalAddress || 'unknown', 'System/Info/Public Version');
@@ -211,6 +213,27 @@ function normalizeBaseUrl(value) {
   return url.toString().replace(/\/$/, '');
 }
 
+function requirePrivateLanBaseUrl(baseUrl) {
+  const host = new URL(baseUrl).hostname;
+  if (net.isIP(host) !== 4) {
+    throw new Error('base URL host must be the Jellyrin private LAN IPv4 address used by the renderer, for example http://192.168.1.46:8097');
+  }
+  const [first, second, third, fourth] = host.split('.').map((part) => Number(part));
+  if (
+    first === 0 ||
+    first === 127 ||
+    first >= 224 ||
+    host === '255.255.255.255' ||
+    (first === 169 && second === 254) ||
+    [first, second, third, fourth].some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+  ) {
+    throw new Error('base URL host must be LAN-reachable, not loopback, link-local, multicast, broadcast or unspecified');
+  }
+  if (!(first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168))) {
+    throw new Error('base URL host must be a private LAN IPv4 address (10/8, 172.16/12, or 192.168/16)');
+  }
+}
+
 async function fetchJson(url) {
   const response = await fetch(url);
   if (!response.ok) {
@@ -391,8 +414,20 @@ function selfTest() {
   assertEqual(parsed.itemId, 'item-1', 'parse itemId');
   assertEqual(parsed.subtitleIndex, '2', 'parse subtitleIndex');
   assertEqual(normalizeBaseUrl(parsed.baseUrl), 'http://192.168.1.46:8097', 'normalizeBaseUrl');
+  requirePrivateLanBaseUrl(normalizeBaseUrl(parsed.baseUrl));
   assertEqual(resolveServerUrl('/dlna/server/icons/logo.png', parsed.baseUrl).toString(), 'http://192.168.1.46:8097/dlna/server/icons/logo.png', 'resolveServerUrl');
   assertIncludes(soapEnvelope('<x />'), '<s:Body><x /></s:Body>', 'soapEnvelope body');
+  for (const invalidBaseUrl of ['http://127.0.0.1:8097', 'http://8.8.8.8:8097', 'http://jellyrin.local:8097']) {
+    let failed = false;
+    try {
+      requirePrivateLanBaseUrl(invalidBaseUrl);
+    } catch {
+      failed = true;
+    }
+    if (!failed) {
+      throw new Error(`requirePrivateLanBaseUrl should reject ${invalidBaseUrl}`);
+    }
+  }
   let missingValueFailed = false;
   try {
     parseArgs(['--base-url', '--item-id', 'x']);
@@ -422,6 +457,7 @@ module.exports = {
   buildDraftEvidence,
   normalizeBaseUrl,
   parseArgs,
+  requirePrivateLanBaseUrl,
   resolveServerUrl,
   soapEnvelope,
 };
