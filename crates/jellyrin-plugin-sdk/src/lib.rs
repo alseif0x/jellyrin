@@ -13,6 +13,169 @@ pub const CAPABILITY_METADATA_PROVIDER: &str = "MetadataProvider";
 pub const CAPABILITY_IMAGE_PROVIDER: &str = "ImageProvider";
 pub const CAPABILITY_CHANNEL_PROVIDER: &str = "ChannelProvider";
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ScheduledTaskRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+impl ScheduledTaskRequest {
+    pub fn manual() -> Self {
+        Self {
+            trigger: Some("Manual".to_string()),
+            arguments: json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ScheduledTaskResult {
+    pub task_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_processed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl ScheduledTaskResult {
+    pub fn completed(task_name: impl Into<String>) -> Self {
+        Self {
+            task_name: task_name.into(),
+            items_processed: None,
+            message: None,
+        }
+    }
+
+    pub fn items_processed(mut self, items_processed: u64) -> Self {
+        self.items_processed = Some(items_processed);
+        self
+    }
+
+    pub fn message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MetadataLookupRequest {
+    pub item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub provider_ids: Map<String, Value>,
+}
+
+impl MetadataLookupRequest {
+    pub fn new(item_id: impl Into<String>) -> Self {
+        Self {
+            item_id: item_id.into(),
+            name: None,
+            provider_id: None,
+            provider_ids: Map::new(),
+        }
+    }
+
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MetadataResult {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub provider_ids: Map<String, Value>,
+}
+
+impl MetadataResult {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            overview: None,
+            genres: Vec::new(),
+            provider_ids: Map::new(),
+        }
+    }
+
+    pub fn overview(mut self, overview: impl Into<String>) -> Self {
+        self.overview = Some(overview.into());
+        self
+    }
+
+    pub fn genre(mut self, genre: impl Into<String>) -> Self {
+        self.genres.push(genre.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ChannelItem {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+}
+
+impl ChannelItem {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            media_type: None,
+            path: None,
+            image_url: None,
+        }
+    }
+
+    pub fn media_type(mut self, media_type: impl Into<String>) -> Self {
+        self.media_type = Some(media_type.into());
+        self
+    }
+
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ChannelResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<ChannelItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_record_count: Option<u64>,
+}
+
+impl ChannelResult {
+    pub fn new(items: Vec<ChannelItem>) -> Self {
+        let total_record_count = Some(items.len() as u64);
+        Self {
+            items,
+            total_record_count,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PluginManifest {
@@ -202,6 +365,27 @@ impl CapabilityResponse {
         }
     }
 
+    pub fn scheduled_task(result: ScheduledTaskResult) -> Self {
+        Self::executed(
+            CAPABILITY_SCHEDULED_TASK,
+            serde_json::to_value(result).expect("ScheduledTaskResult must serialize"),
+        )
+    }
+
+    pub fn metadata(result: MetadataResult) -> Self {
+        Self::executed(
+            CAPABILITY_METADATA_PROVIDER,
+            serde_json::to_value(result).expect("MetadataResult must serialize"),
+        )
+    }
+
+    pub fn channel(result: ChannelResult) -> Self {
+        Self::executed(
+            CAPABILITY_CHANNEL_PROVIDER,
+            serde_json::to_value(result).expect("ChannelResult must serialize"),
+        )
+    }
+
     pub fn into_host_value(self) -> Value {
         let mut value = serde_json::to_value(self).expect("CapabilityResponse must serialize");
         if let Value::Object(object) = &mut value {
@@ -277,5 +461,53 @@ mod tests {
         assert_eq!(value["Status"], "NotSupported");
         assert_eq!(value["Capability"], CAPABILITY_CHANNEL_PROVIDER);
         assert_eq!(value["Reason"], "Channel provider ABI is not loaded.");
+    }
+
+    #[test]
+    fn scheduled_task_response_matches_host_capability_shape() {
+        let value = CapabilityResponse::scheduled_task(
+            ScheduledTaskResult::completed("Fixture Task")
+                .items_processed(7)
+                .message("done"),
+        )
+        .into_host_value();
+
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], CAPABILITY_SCHEDULED_TASK);
+        assert_eq!(value["TaskName"], "Fixture Task");
+        assert_eq!(value["ItemsProcessed"], 7);
+        assert_eq!(value["Message"], "done");
+    }
+
+    #[test]
+    fn metadata_response_matches_provider_capability_shape() {
+        let value = CapabilityResponse::metadata(
+            MetadataResult::new("Fixture Movie")
+                .overview("Metadata from Rust/WASI fixture")
+                .genre("Drama"),
+        )
+        .into_host_value();
+
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], CAPABILITY_METADATA_PROVIDER);
+        assert_eq!(value["Name"], "Fixture Movie");
+        assert_eq!(value["Overview"], "Metadata from Rust/WASI fixture");
+        assert_eq!(value["Genres"][0], "Drama");
+    }
+
+    #[test]
+    fn channel_response_matches_provider_capability_shape() {
+        let value = CapabilityResponse::channel(ChannelResult::new(vec![
+            ChannelItem::new("channel-fixture-1", "Fixture Channel")
+                .media_type("Video")
+                .path("https://example.invalid/channel.m3u8"),
+        ]))
+        .into_host_value();
+
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], CAPABILITY_CHANNEL_PROVIDER);
+        assert_eq!(value["Items"][0]["Id"], "channel-fixture-1");
+        assert_eq!(value["Items"][0]["Name"], "Fixture Channel");
+        assert_eq!(value["TotalRecordCount"], 1);
     }
 }
