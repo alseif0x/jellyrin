@@ -394,6 +394,7 @@ async function captureTarget(browser, flowDir, target) {
       syncplaySeekFanout: false,
       syncplayUnpause204: false,
       syncplayUnpauseFanout: false,
+      syncplayRaceSequenced: false,
       syncplayGuestReconnectDeduped: false,
       syncplayStaleCleanup: false,
       syncplayGuestLogoutRemoved: false,
@@ -1279,6 +1280,50 @@ async function runSyncPlayFlow(page, summary, publicInfo, target) {
     if (stateAfterCommands.json?.State?.LastCommandName && stateAfterCommands.json.State.LastCommandName !== 'Unpause') {
       throw new Error('SyncPlay final state did not record Unpause');
     }
+    const beforeRaceSequence = Number(
+      stateAfterCommands.json?.CommandSequence ?? stateAfterCommands.json?.State?.CommandSequence ?? 0,
+    );
+
+    const [racePause, raceSeek] = await Promise.all([
+      browserFetchJson(page, {
+        method: 'POST',
+        url: '/SyncPlay/Pause',
+        token: ownerToken,
+        authorization: ownerAuthorization,
+        body: { PositionTicks: 43_000 },
+      }),
+      browserFetchJson(page, {
+        method: 'POST',
+        url: '/SyncPlay/Seek',
+        token: guestToken,
+        authorization: guestAuthorization,
+        body: { PositionTicks: 44_000 },
+      }),
+    ]);
+    if (![200, 204].includes(racePause.status) || ![200, 204].includes(raceSeek.status)) {
+      throw new Error(`SyncPlay race commands returned HTTP ${racePause.status}/${raceSeek.status}`);
+    }
+    const stateAfterRace = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/SyncPlay/${encodeURIComponent(groupId)}`,
+      token: ownerToken,
+      authorization: ownerAuthorization,
+    });
+    if (stateAfterRace.status !== 200 || stateAfterRace.json?.Participants?.length !== 2) {
+      throw new Error(`SyncPlay race state returned HTTP ${stateAfterRace.status}`);
+    }
+    const afterRaceSequence = Number(
+      stateAfterRace.json?.CommandSequence ?? stateAfterRace.json?.State?.CommandSequence,
+    );
+    if (target.name === 'jellyrin') {
+      if (afterRaceSequence !== beforeRaceSequence + 2) {
+        throw new Error(`SyncPlay race sequence expected ${beforeRaceSequence + 2}, got ${afterRaceSequence}`);
+      }
+      if (Number(stateAfterRace.json?.State?.LastCommandSequence) !== afterRaceSequence) {
+        throw new Error('SyncPlay race state did not preserve the last command sequence');
+      }
+    }
+    summary.invariants.syncplayRaceSequenced = true;
 
     const guestReconnectLogin = await browserFetchJson(page, {
       method: 'POST',
@@ -9195,6 +9240,7 @@ function invariantFailures(summary) {
       ['syncplaySeekFanout', 'seek fanout'],
       ['syncplayUnpause204', 'unpause command'],
       ['syncplayUnpauseFanout', 'unpause fanout'],
+      ['syncplayRaceSequenced', 'race sequencing'],
       ['syncplayGuestReconnectDeduped', 'guest reconnect dedupe'],
       ['syncplayStaleCleanup', 'stale cleanup'],
       ['syncplayGuestLogoutRemoved', 'guest logout cleanup'],

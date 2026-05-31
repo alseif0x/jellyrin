@@ -288,6 +288,7 @@ struct SyncPlayGroup {
     owner_user_id: Uuid,
     participants: BTreeMap<String, SyncPlayParticipant>,
     state: serde_json::Value,
+    command_sequence: u64,
     updated_at: OffsetDateTime,
 }
 
@@ -9511,6 +9512,7 @@ fn syncplay_group_json(group: &SyncPlayGroup) -> serde_json::Value {
         "Name": group.name,
         "Participants": participants,
         "State": group.state,
+        "CommandSequence": group.command_sequence,
         "LastActivityDate": format_time_for_json(group.updated_at)
     })
 }
@@ -9566,8 +9568,10 @@ async fn syncplay_new(
             "PlayState": "Idle",
             "PositionTicks": 0,
             "IsPaused": false,
+            "CommandSequence": 0,
             "Queue": []
         }),
+        command_sequence: 0,
         updated_at: OffsetDateTime::now_utc(),
     };
     let response = syncplay_group_json(&group);
@@ -9733,7 +9737,7 @@ async fn syncplay_group_command(
     let payload = optional_json_body(body).await?;
     let command = syncplay_command_from_uri(&uri);
     let now = OffsetDateTime::now_utc();
-    let (group_id, group_json, participant_session_ids) = {
+    let (group_id, group_json, participant_session_ids, command_sequence) = {
         let mut groups = syncplay_groups().lock().await;
         let group = groups
             .values_mut()
@@ -9743,17 +9747,32 @@ async fn syncplay_group_command(
             participant.last_seen_at = now;
         }
         syncplay_apply_participant_command(group, &token.access_token, &command, &payload, now);
-        syncplay_apply_command_to_state(&mut group.state, &command, &payload, now);
+        group.command_sequence = group.command_sequence.saturating_add(1);
+        let command_sequence = group.command_sequence;
+        syncplay_apply_command_to_state(
+            &mut group.state,
+            &command,
+            &payload,
+            now,
+            command_sequence,
+        );
         group.updated_at = now;
         (
             group.id.clone(),
             syncplay_group_json(group),
             group.participants.keys().cloned().collect::<Vec<_>>(),
+            command_sequence,
         )
     };
     for session_id in participant_session_ids {
-        let command_payload =
-            syncplay_command_message_payload(&group_id, &command, &payload, &group_json, now);
+        let command_payload = syncplay_command_message_payload(
+            &group_id,
+            &command,
+            &payload,
+            &group_json,
+            now,
+            command_sequence,
+        );
         broadcast_session_message(
             &session_id,
             serde_json::json!({
@@ -9772,6 +9791,7 @@ fn syncplay_command_message_payload(
     payload: &serde_json::Value,
     group_json: &serde_json::Value,
     now: OffsetDateTime,
+    command_sequence: u64,
 ) -> serde_json::Value {
     let position_ticks = syncplay_position_ticks_from_payload(payload);
     let emitted_at = format_time_for_json(now);
@@ -9791,6 +9811,7 @@ fn syncplay_command_message_payload(
         "Group": group_json,
         "When": when,
         "EmittedAt": emitted_at,
+        "CommandSequence": command_sequence,
         "PositionTicks": position_ticks,
         "PlaylistItemId": playlist_item_id
     })
@@ -9838,6 +9859,7 @@ fn syncplay_apply_command_to_state(
     command: &str,
     payload: &serde_json::Value,
     now: OffsetDateTime,
+    command_sequence: u64,
 ) {
     if !state.is_object() {
         *state = serde_json::json!({});
@@ -9851,6 +9873,14 @@ fn syncplay_apply_command_to_state(
     object.insert(
         "LastCommandDate".to_string(),
         serde_json::Value::String(format_time_for_json(now)),
+    );
+    object.insert(
+        "CommandSequence".to_string(),
+        serde_json::json!(command_sequence),
+    );
+    object.insert(
+        "LastCommandSequence".to_string(),
+        serde_json::json!(command_sequence),
     );
 
     if let Some(position_ticks) = syncplay_position_ticks_from_payload(payload) {
@@ -41883,6 +41913,119 @@ mod tests {
         }
         syncplay_cleanup_stale_participants("Stale").await;
         assert!(!syncplay_groups().lock().await.contains_key(&group_id));
+    }
+
+    #[tokio::test]
+    async fn syncplay_concurrent_commands_get_deterministic_sequence() {
+        let _guard = syncplay_test_lock().await;
+        syncplay_groups().lock().await.clear();
+        let group_id = Uuid::new_v4().to_string();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let owner = db
+            .update_first_user("owner".to_string(), "secret")
+            .await
+            .unwrap();
+        let owner_key = db
+            .issue_api_key_for_user(owner.id, &format!("syncplay-race-owner-{group_id}"))
+            .await
+            .unwrap();
+        let guest = db.create_user("guest", Some("secret")).await.unwrap();
+        let guest_key = db
+            .issue_api_key_for_user(guest.id, &format!("syncplay-race-guest-{group_id}"))
+            .await
+            .unwrap();
+        db.complete_startup_wizard().await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/New")
+                    .header("X-Emby-Token", &owner_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/SyncPlay/Join")
+                    .header("X-Emby-Token", &guest_key)
+                    .body(Body::from(json!({ "GroupId": group_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut owner_events = subscribe_playback_events();
+        let pause_request = app.clone().oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/SyncPlay/Pause")
+                .header("X-Emby-Token", &owner_key)
+                .body(Body::from(json!({ "PositionTicks": 111 }).to_string()))
+                .unwrap(),
+        );
+        let seek_request = app.clone().oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/SyncPlay/Seek")
+                .header("X-Emby-Token", &guest_key)
+                .body(Body::from(json!({ "PositionTicks": 222 }).to_string()))
+                .unwrap(),
+        );
+        let (pause_response, seek_response) = tokio::join!(pause_request, seek_request);
+        assert_eq!(pause_response.unwrap().status(), StatusCode::NO_CONTENT);
+        assert_eq!(seek_response.unwrap().status(), StatusCode::NO_CONTENT);
+
+        let first_event =
+            next_playback_event_type(&mut owner_events, &owner_key, "SyncPlayCommand").await;
+        let second_event =
+            next_playback_event_type(&mut owner_events, &owner_key, "SyncPlayCommand").await;
+        let mut sequences = [first_event, second_event]
+            .into_iter()
+            .map(|event| {
+                event["Data"]["CommandSequence"]
+                    .as_u64()
+                    .expect("command sequence")
+            })
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![1, 2]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/SyncPlay/{group_id}"))
+                    .header("X-Emby-Token", &owner_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let group: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(group["CommandSequence"], 2);
+        assert_eq!(group["State"]["CommandSequence"], 2);
+        assert_eq!(group["State"]["LastCommandSequence"], 2);
+        assert!(
+            ["Pause", "Seek"].contains(&group["State"]["LastCommandName"].as_str().unwrap()),
+            "last command must be one of the raced commands: {group}"
+        );
     }
 
     #[tokio::test]

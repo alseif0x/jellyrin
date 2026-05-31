@@ -90,17 +90,17 @@ function buildEvidence(result, comparison) {
     return {
       gate: 'syncplay-advanced',
       status: 'implemented',
-      percent: 88,
+      percent: 92,
       closed: false,
-      sourcePhase: 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b/E4.5c',
-      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures for group creation, join/list/get, Play/Pause/Seek/Unpause fanout, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup. E4 stays open until race handling has a dedicated upstream-validated sub-gate.',
+      sourcePhase: 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b/E4.5c/E4.5d',
+      evidence: 'SyncPlay browser golden completed against upstream and Jellyrin with no comparison failures for group creation, join/list/get, Play/Pause/Seek/Unpause fanout, deterministic race handling, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup. E4 stays open until drift correction has a dedicated upstream-validated sub-gate.',
       updatedAt,
       completedTargets,
       skippedTargets,
       failedTargets,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
-        'Simultaneous command race handling still needs deterministic harness coverage.',
+        'Drift correction still needs deterministic harness coverage.',
       ],
     };
   }
@@ -119,10 +119,15 @@ function buildEvidence(result, comparison) {
   const jellyrinStaleCleanup =
     jellyrinLogoutCleanup &&
     jellyrinSummary?.invariants?.syncplayStaleCleanup === true;
+  const jellyrinRaceSequenced =
+    jellyrinStaleCleanup &&
+    jellyrinSummary?.invariants?.syncplayRaceSequenced === true;
   return {
     ...baselineEvidence,
-    percent: jellyrinCompleted ? (jellyrinStaleCleanup ? 72 : jellyrinLogoutCleanup ? 65 : jellyrinReconnect ? 60 : jellyrinPlayFanout ? 50 : 35) : baselineEvidence.percent,
-    sourcePhase: jellyrinStaleCleanup
+    percent: jellyrinCompleted ? (jellyrinRaceSequenced ? 80 : jellyrinStaleCleanup ? 72 : jellyrinLogoutCleanup ? 65 : jellyrinReconnect ? 60 : jellyrinPlayFanout ? 50 : 35) : baselineEvidence.percent,
+    sourcePhase: jellyrinRaceSequenced
+      ? 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b/E4.5c/E4.5d'
+      : jellyrinStaleCleanup
       ? 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b/E4.5c'
       : jellyrinLogoutCleanup
       ? 'E4.2a/E4.3a/E4.4a/E4.5a/E4.5b'
@@ -132,14 +137,16 @@ function buildEvidence(result, comparison) {
         ? 'E4.2a/E4.3a/E4.4a'
         : baselineEvidence.sourcePhase,
     updatedAt,
-    evidence: jellyrinCompleted && jellyrinStaleCleanup
-      ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup. E4 still needs upstream comparable execution plus race sub-gate.'
-      : jellyrinCompleted && jellyrinLogoutCleanup
-        ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout, same-device reconnect dedupe, logout cleanup and final group cleanup. E4 still needs upstream comparable execution plus stale timeout cleanup and race sub-gates.'
-        : jellyrinCompleted && jellyrinReconnect
-          ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout, same-device reconnect dedupe and cleanup. E4 still needs upstream comparable execution plus stale cleanup and race sub-gates.'
-          : jellyrinCompleted && jellyrinPlayFanout
-            ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout and cleanup. E4 still needs upstream comparable execution plus reconnect, stale cleanup and race sub-gates.'
+    evidence: jellyrinCompleted && jellyrinRaceSequenced
+      ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout, deterministic command sequencing under concurrent requests, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup. E4 still needs upstream comparable execution plus drift correction sub-gate.'
+      : jellyrinCompleted && jellyrinStaleCleanup
+        ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout, same-device reconnect dedupe, logout cleanup, stale timeout cleanup and final group cleanup. E4 still needs upstream comparable execution plus race sub-gate.'
+        : jellyrinCompleted && jellyrinLogoutCleanup
+          ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout, same-device reconnect dedupe, logout cleanup and final group cleanup. E4 still needs upstream comparable execution plus stale timeout cleanup and race sub-gates.'
+          : jellyrinCompleted && jellyrinReconnect
+            ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout, same-device reconnect dedupe and cleanup. E4 still needs upstream comparable execution plus stale cleanup and race sub-gates.'
+            : jellyrinCompleted && jellyrinPlayFanout
+              ? 'Jellyrin SyncPlay browser trace completed with Play/Pause/Seek/Unpause websocket fanout and cleanup. E4 still needs upstream comparable execution plus reconnect, stale cleanup and race sub-gates.'
       : jellyrinCompleted
         ? 'Jellyrin SyncPlay browser trace completed, but E4 is not upstream-validated yet.'
       : `${baselineEvidence.evidence} Browser trace did not complete enough targets for E4 closure.`,
