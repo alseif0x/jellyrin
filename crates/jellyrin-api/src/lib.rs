@@ -52,6 +52,8 @@ use jellyrin_transcode::{
 use rand_core::{OsRng, RngCore};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Deserializer, de};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -6305,6 +6307,7 @@ async fn prepare_plugin_package_artifact(
         tokio::fs::create_dir_all(parent).await?;
     }
     let bytes = read_plugin_package_source(&source_url).await?;
+    let checksum = verify_plugin_package_checksum(package, selected_version, &bytes)?;
     tokio::fs::write(&archive_path, bytes).await?;
 
     let entries = list_safe_zip_entries(&archive_path).await?;
@@ -6339,6 +6342,7 @@ async fn prepare_plugin_package_artifact(
         "SourceUrl": source_url,
         "ArchivePath": archive_path.to_string_lossy(),
         "InstallPath": install_dir.to_string_lossy(),
+        "Checksum": checksum,
         "EntryCount": entries.len(),
         "Entries": entries,
     }))
@@ -6353,6 +6357,78 @@ fn plugin_package_source_url(
         .or_else(|| json_string_field(package, "SourceUrl"))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn verify_plugin_package_checksum(
+    package: &serde_json::Value,
+    selected_version: &serde_json::Value,
+    bytes: &[u8],
+) -> Result<serde_json::Value, ApiError> {
+    let Some(expected) = plugin_package_checksum(package, selected_version) else {
+        return Ok(serde_json::json!({
+            "Mode": "not-provided"
+        }));
+    };
+    let expected = expected
+        .trim()
+        .strip_prefix("sha256:")
+        .or_else(|| expected.trim().strip_prefix("SHA256:"))
+        .or_else(|| expected.trim().strip_prefix("sha1:"))
+        .or_else(|| expected.trim().strip_prefix("SHA1:"))
+        .unwrap_or_else(|| expected.trim())
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let algorithm = match expected.len() {
+        64 => "SHA256",
+        40 => "SHA1",
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "Plugin package checksum format is unsupported: expected SHA256 or SHA1 hex, got {} hex characters",
+                expected.len()
+            )));
+        }
+    };
+    let actual = match algorithm {
+        "SHA256" => hex_lower(&Sha256::digest(bytes)),
+        "SHA1" => hex_lower(&Sha1::digest(bytes)),
+        _ => unreachable!(),
+    };
+    if actual != expected {
+        return Err(ApiError::bad_request(format!(
+            "Plugin package checksum mismatch: expected {algorithm} {expected}, got {actual}"
+        )));
+    }
+    Ok(serde_json::json!({
+        "Mode": "verified",
+        "Algorithm": algorithm,
+        "Value": actual
+    }))
+}
+
+fn plugin_package_checksum(
+    package: &serde_json::Value,
+    selected_version: &serde_json::Value,
+) -> Option<String> {
+    json_string_field(selected_version, "Checksum")
+        .or_else(|| json_string_field(selected_version, "checksum"))
+        .or_else(|| json_string_field(selected_version, "Sha256"))
+        .or_else(|| json_string_field(selected_version, "SHA256"))
+        .or_else(|| json_string_field(selected_version, "Sha1"))
+        .or_else(|| json_string_field(selected_version, "SHA1"))
+        .or_else(|| json_string_field(package, "Checksum"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 fn plugin_packages_root(log_dir: &FsPath) -> PathBuf {
@@ -29046,7 +29122,7 @@ mod tests {
         subscribe_playback_events, subscribe_system_lifecycle_commands,
         syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
-        validate_zip_entry_path,
+        validate_zip_entry_path, verify_plugin_package_checksum,
     };
     use crate::dlna;
     use axum::{
@@ -29062,6 +29138,7 @@ mod tests {
         UpsertTranscodeSession,
     };
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -29166,6 +29243,29 @@ mod tests {
                 "{unsafe_entry}"
             );
         }
+    }
+
+    #[test]
+    fn plugin_package_checksum_validation_accepts_sha256_and_rejects_mismatch() {
+        let payload = b"plugin package bytes";
+        let checksum = format!("{:x}", Sha256::digest(payload));
+        let version = json!({ "Checksum": checksum });
+        let ok = verify_plugin_package_checksum(&json!({}), &version, payload).unwrap();
+        assert_eq!(ok["Mode"], "verified");
+        assert_eq!(ok["Algorithm"], "SHA256");
+
+        let mismatch = verify_plugin_package_checksum(
+            &json!({}),
+            &json!({ "Checksum": "0000000000000000000000000000000000000000000000000000000000000000" }),
+            payload,
+        )
+        .unwrap_err();
+        assert_eq!(mismatch.status, StatusCode::BAD_REQUEST);
+
+        let unsupported =
+            verify_plugin_package_checksum(&json!({}), &json!({ "Checksum": "abc123" }), payload)
+                .unwrap_err();
+        assert_eq!(unsupported.status, StatusCode::BAD_REQUEST);
     }
 
     async fn spawn_single_http_request_recorder() -> (String, tokio::sync::oneshot::Receiver<String>)
@@ -38012,6 +38112,8 @@ mod tests {
         )
         .await
         .unwrap();
+        let plugin_zip_bytes = tokio::fs::read(&plugin_zip).await.unwrap();
+        let plugin_zip_checksum = format!("{:x}", Sha256::digest(&plugin_zip_bytes));
         let log_dir = tmp.path().join("logs");
         tokio::fs::create_dir_all(&log_dir).await.unwrap();
         let app = router(AppState {
@@ -38036,7 +38138,7 @@ mod tests {
                         "Version": "1.0.0.0",
                         "TargetAbi": "12.0.0.0",
                         "SourceUrl": format!("file://{}", plugin_zip.to_string_lossy()),
-                        "Checksum": "abc123",
+                        "Checksum": plugin_zip_checksum,
                         "ImagePath": plugin_image.to_string_lossy()
                     }]
                 }]
@@ -38213,7 +38315,7 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let package: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(package["Name"], "Example Plugin");
-        assert_eq!(package["Versions"][0]["Checksum"], "abc123");
+        assert_eq!(package["Versions"][0]["Checksum"], plugin_zip_checksum);
 
         let response = app
             .clone()
@@ -38318,6 +38420,19 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&installed_file).await.unwrap(),
             "example dotnet plugin assembly placeholder"
+        );
+        let installed_plugin_payload = db_for_assertions
+            .installed_plugins_json()
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            installed_plugin_payload["Manifest"]["Versions"][0]["Checksum"],
+            plugin_zip_checksum
+        );
+        assert_eq!(
+            installed_plugin_payload["Manifest"]["Versions"][0]["SourceUrl"],
+            format!("file://{}", plugin_zip.to_string_lossy())
         );
 
         let response = app
@@ -38469,7 +38584,7 @@ mod tests {
         assert_eq!(manifest["Guid"], "11111111-1111-1111-1111-111111111111");
         assert_eq!(manifest["Name"], "Example Plugin");
         assert_eq!(manifest["Versions"][0]["Version"], "1.0.0.0");
-        assert_eq!(manifest["Versions"][0]["Checksum"], "abc123");
+        assert_eq!(manifest["Versions"][0]["Checksum"], plugin_zip_checksum);
 
         let response = app
             .clone()
