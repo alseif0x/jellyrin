@@ -4,12 +4,13 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use jellyrin_core::VirtualFolder;
+use jellyrin_core::{MediaItem, VirtualFolder};
 use jellyrin_db::Database;
 use serde_json::Value;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
+    path::Path as FsPath,
     time::Duration as StdDuration,
 };
 use tokio::{net::UdpSocket, task::JoinHandle, time};
@@ -17,7 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION,
-    default_network_configuration, subscribe_system_lifecycle_commands,
+    default_network_configuration, stream_media_item, subscribe_system_lifecycle_commands,
 };
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
@@ -52,7 +53,9 @@ const DLNA_PROTOCOL_INFO: &str = concat!(
     "http-get:*:image/jpeg:*,",
     "http-get:*:image/png:*,",
     "http-get:*:image/gif:*,",
-    "http-get:*:image/tiff:*"
+    "http-get:*:image/tiff:*,",
+    "http-get:*:image/webp:*,",
+    "http-get:*:image/bmp:*"
 );
 const ONE_BY_ONE_PNG: &[u8] = &[
     0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
@@ -171,10 +174,12 @@ pub(crate) async fn connection_manager_control(
 
 pub(crate) async fn content_directory_control(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(server_id): Path<String>,
     body: BodyBytes,
 ) -> Result<Response, ApiError> {
-    dlna_context(&state, &server_id).await?;
+    let context = dlna_context(&state, &server_id).await?;
+    let server_address = request_server_address(&headers, &state);
     let request = String::from_utf8_lossy(&body);
     let action =
         soap_action(&request).ok_or_else(|| ApiError::bad_request("Invalid SOAP action"))?;
@@ -183,7 +188,9 @@ pub(crate) async fn content_directory_control(
         "getsortcapabilities" => "<SortCaps>dc:title</SortCaps>".to_string(),
         "getsystemupdateid" => "<Id>0</Id>".to_string(),
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
-        "browse" => browse_response(&state.db, &request).await?,
+        "browse" => {
+            browse_response(&state.db, &request, context.server_id, &server_address).await?
+        }
         "search" => empty_browse_like_response(),
         _ => {
             return Err(ApiError::not_found(
@@ -196,6 +203,36 @@ pub(crate) async fn content_directory_control(
         action_response_name(&action),
         response_body,
     ))
+}
+
+pub(crate) async fn media_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id, _container)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    let item = state
+        .db
+        .media_item_by_id(item_id)
+        .await
+        .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
+    stream_media_item(item, &headers, true).await
+}
+
+pub(crate) async fn media_stream_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((server_id, item_id, _container)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    dlna_context(&state, &server_id).await?;
+    let item_id = parse_dlna_uuid(&item_id)?;
+    let item = state
+        .db
+        .media_item_by_id(item_id)
+        .await
+        .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
+    stream_media_item(item, &headers, false).await
 }
 
 pub(crate) async fn upnp_enabled(db: &Database) -> Result<bool, ApiError> {
@@ -688,22 +725,135 @@ fn dlna_service_xml(actions: &[DlnaAction], state_variables: &[DlnaStateVariable
     xml
 }
 
-async fn browse_response(db: &Database, request: &str) -> Result<String, ApiError> {
+async fn browse_response(
+    db: &Database,
+    request: &str,
+    server_id: Uuid,
+    server_address: &str,
+) -> Result<String, ApiError> {
     let object_id = soap_param(request, "ObjectID").unwrap_or_else(|| "0".to_string());
     let browse_flag =
         soap_param(request, "BrowseFlag").unwrap_or_else(|| "BrowseDirectChildren".to_string());
-    let didl = if object_id == "0" && browse_flag.eq_ignore_ascii_case("BrowseMetadata") {
-        didl_root_metadata()
-    } else if object_id == "0" {
-        didl_root_children(db.virtual_folders().await?)
+    let browse_metadata = browse_flag.eq_ignore_ascii_case("BrowseMetadata");
+    let (starting_index, requested_count) = browse_window(request);
+    let payload = if is_root_object_id(&object_id) && browse_metadata {
+        let child_count = db.virtual_folders().await?.len();
+        BrowsePayload::metadata(didl_root_metadata(child_count))
+    } else if is_root_object_id(&object_id) {
+        let folders = db.virtual_folders().await?;
+        let total_matches = folders.len();
+        let paged_folders = paged_slice(&folders, starting_index, requested_count);
+        BrowsePayload::children(
+            didl_root_children(db, paged_folders).await?,
+            paged_folders.len(),
+            total_matches,
+        )
+    } else if let Some(folder_id) = parse_folder_object_id(&object_id) {
+        let folder = db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("DLNA folder not found"))?;
+        let items = media_items_for_folder(db, folder.id).await?;
+        if browse_metadata {
+            BrowsePayload::metadata(didl_folder_metadata(&folder, items.len()))
+        } else {
+            let total_matches = items.len();
+            let paged_items = paged_slice(&items, starting_index, requested_count);
+            BrowsePayload::children(
+                didl_media_items(paged_items, server_id, server_address),
+                paged_items.len(),
+                total_matches,
+            )
+        }
+    } else if let Some(item_id) = parse_item_object_id(&object_id) {
+        let item = db
+            .media_item_by_id(item_id)
+            .await
+            .map_err(|_| ApiError::not_found("DLNA item not found"))?;
+        if browse_metadata {
+            BrowsePayload::metadata(didl_media_items(&[item], server_id, server_address))
+        } else {
+            BrowsePayload::empty()
+        }
     } else {
-        empty_didl()
+        BrowsePayload::empty()
     };
-    let count = didl.matches("<container ").count() + didl.matches("<item ").count();
     Ok(format!(
-        "<Result>{}</Result><NumberReturned>{count}</NumberReturned><TotalMatches>{count}</TotalMatches><UpdateID>0</UpdateID>",
-        escape_xml(&didl)
+        "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>0</UpdateID>",
+        escape_xml(&payload.didl),
+        payload.number_returned,
+        payload.total_matches
     ))
+}
+
+async fn media_items_for_folder(
+    db: &Database,
+    folder_id: Uuid,
+) -> Result<Vec<MediaItem>, ApiError> {
+    Ok(db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| item.virtual_folder_id == folder_id)
+        .collect())
+}
+
+struct BrowsePayload {
+    didl: String,
+    number_returned: usize,
+    total_matches: usize,
+}
+
+impl BrowsePayload {
+    fn metadata(didl: String) -> Self {
+        Self {
+            didl,
+            number_returned: 1,
+            total_matches: 1,
+        }
+    }
+
+    fn children(didl: String, number_returned: usize, total_matches: usize) -> Self {
+        Self {
+            didl,
+            number_returned,
+            total_matches,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            didl: empty_didl(),
+            number_returned: 0,
+            total_matches: 0,
+        }
+    }
+}
+
+fn browse_window(request: &str) -> (usize, usize) {
+    let starting_index = soap_param(request, "StartingIndex")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let requested_count = soap_param(request, "RequestedCount")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    (starting_index, requested_count)
+}
+
+fn paged_slice<T>(items: &[T], starting_index: usize, requested_count: usize) -> &[T] {
+    if starting_index >= items.len() {
+        return &items[items.len()..];
+    }
+    let end = if requested_count == 0 {
+        items.len()
+    } else {
+        starting_index
+            .saturating_add(requested_count)
+            .min(items.len())
+    };
+    &items[starting_index..end]
 }
 
 fn empty_browse_like_response() -> String {
@@ -713,29 +863,65 @@ fn empty_browse_like_response() -> String {
     )
 }
 
-fn didl_root_metadata() -> String {
-    concat!(
-        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ",
-        "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" ",
-        "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">",
-        "<container id=\"0\" parentID=\"-1\" restricted=\"1\" childCount=\"0\">",
-        "<dc:title>Jellyrin</dc:title>",
-        "<upnp:class>object.container</upnp:class>",
-        "</container></DIDL-Lite>"
+fn didl_root_metadata(child_count: usize) -> String {
+    format!(
+        "{}<container id=\"0\" parentID=\"-1\" restricted=\"1\" childCount=\"{}\">\
+         <dc:title>Jellyrin</dc:title>\
+         <upnp:class>object.container</upnp:class>\
+         </container></DIDL-Lite>",
+        didl_prefix(),
+        child_count
     )
-    .to_string()
 }
 
-fn didl_root_children(folders: Vec<VirtualFolder>) -> String {
+async fn didl_root_children(db: &Database, folders: &[VirtualFolder]) -> Result<String, ApiError> {
     let mut didl = didl_prefix();
     for folder in folders {
+        let child_count = media_items_for_folder(db, folder.id).await?.len();
         didl.push_str("<container id=\"");
         didl.push_str(&escape_xml(&format!("folder:{}", folder.id)));
-        didl.push_str("\" parentID=\"0\" restricted=\"1\" childCount=\"0\"><dc:title>");
+        didl.push_str("\" parentID=\"0\" restricted=\"1\" searchable=\"1\" childCount=\"");
+        didl.push_str(&child_count.to_string());
+        didl.push_str("\"><dc:title>");
         didl.push_str(&escape_xml(&folder.name));
         didl.push_str("</dc:title><upnp:class>");
         didl.push_str(didl_container_class(folder.collection_type.as_deref()));
         didl.push_str("</upnp:class></container>");
+    }
+    didl.push_str("</DIDL-Lite>");
+    Ok(didl)
+}
+
+fn didl_folder_metadata(folder: &VirtualFolder, child_count: usize) -> String {
+    let mut didl = didl_prefix();
+    didl.push_str("<container id=\"");
+    didl.push_str(&escape_xml(&format!("folder:{}", folder.id)));
+    didl.push_str("\" parentID=\"0\" restricted=\"1\" searchable=\"1\" childCount=\"");
+    didl.push_str(&child_count.to_string());
+    didl.push_str("\"><dc:title>");
+    didl.push_str(&escape_xml(&folder.name));
+    didl.push_str("</dc:title><upnp:class>");
+    didl.push_str(didl_container_class(folder.collection_type.as_deref()));
+    didl.push_str("</upnp:class></container></DIDL-Lite>");
+    didl
+}
+
+fn didl_media_items(items: &[MediaItem], server_id: Uuid, server_address: &str) -> String {
+    let mut didl = didl_prefix();
+    for item in items {
+        didl.push_str("<item id=\"");
+        didl.push_str(&escape_xml(&format!("item:{}", item.id)));
+        didl.push_str("\" parentID=\"");
+        didl.push_str(&escape_xml(&format!("folder:{}", item.virtual_folder_id)));
+        didl.push_str("\" restricted=\"1\"><dc:title>");
+        didl.push_str(&escape_xml(&item.name));
+        didl.push_str("</dc:title><upnp:class>");
+        didl.push_str(didl_item_class(item));
+        didl.push_str("</upnp:class>");
+        if let Some(resource) = didl_resource(item, server_id, server_address) {
+            didl.push_str(&resource);
+        }
+        didl.push_str("</item>");
     }
     didl.push_str("</DIDL-Lite>");
     didl
@@ -767,6 +953,125 @@ fn didl_container_class(collection_type: Option<&str>) -> &'static str {
         "tvshows" => "object.container.genre.movieGenre",
         _ => "object.container.storageFolder",
     }
+}
+
+fn didl_item_class(item: &MediaItem) -> &'static str {
+    match item.media_type.as_str() {
+        "Video" => {
+            if item
+                .collection_type
+                .as_deref()
+                .is_some_and(|collection| collection.eq_ignore_ascii_case("movies"))
+            {
+                "object.item.videoItem.movie"
+            } else {
+                "object.item.videoItem"
+            }
+        }
+        "Audio" => "object.item.audioItem.musicTrack",
+        "Photo" => "object.item.imageItem.photo",
+        _ => "object.item",
+    }
+}
+
+fn didl_resource(item: &MediaItem, server_id: Uuid, server_address: &str) -> Option<String> {
+    let mime_type = dlna_mime_type(item)?;
+    let container = dlna_container(item).unwrap_or("bin");
+    let mut attributes = format!("protocolInfo=\"http-get:*:{mime_type}:*\"");
+    if let Some(size) = item.file_size.filter(|size| *size >= 0) {
+        attributes.push_str(" size=\"");
+        attributes.push_str(&size.to_string());
+        attributes.push('"');
+    }
+    if let Some(duration) = item.runtime_ticks.and_then(format_dlna_duration) {
+        attributes.push_str(" duration=\"");
+        attributes.push_str(&duration);
+        attributes.push('"');
+    }
+    if let (Some(width), Some(height)) = (item.width, item.height)
+        && width > 0
+        && height > 0
+    {
+        attributes.push_str(" resolution=\"");
+        attributes.push_str(&format!("{width}x{height}"));
+        attributes.push('"');
+    }
+    let url = format!(
+        "{}/dlna/{server_id}/items/{}/stream.{container}",
+        server_address.trim_end_matches('/'),
+        item.id
+    );
+    Some(format!("<res {attributes}>{}</res>", escape_xml(&url)))
+}
+
+fn dlna_container(item: &MediaItem) -> Option<&str> {
+    FsPath::new(&item.path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::trim)
+        .filter(|extension| !extension.is_empty())
+}
+
+fn dlna_mime_type(item: &MediaItem) -> Option<&'static str> {
+    match dlna_container(item)?.to_ascii_lowercase().as_str() {
+        "mp4" | "m4v" => Some("video/mp4"),
+        "mkv" => Some("video/x-matroska"),
+        "webm" => Some("video/webm"),
+        "mov" => Some("video/quicktime"),
+        "avi" => Some("video/avi"),
+        "wmv" => Some("video/x-ms-wmv"),
+        "ts" | "mpeg" | "mpg" => Some("video/mpeg"),
+        "mp3" => Some("audio/mpeg"),
+        "m4a" => Some("audio/mp4"),
+        "aac" => Some("audio/aac"),
+        "flac" => Some("audio/flac"),
+        "ogg" => Some("audio/ogg"),
+        "wav" => Some("audio/wav"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+fn is_root_object_id(object_id: &str) -> bool {
+    matches!(object_id.trim(), "" | "0" | "1")
+}
+
+fn format_dlna_duration(runtime_ticks: i64) -> Option<String> {
+    if runtime_ticks <= 0 {
+        return None;
+    }
+    let total_millis = runtime_ticks / 10_000;
+    let millis = total_millis % 1000;
+    let total_seconds = total_millis / 1000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+    Some(format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}"))
+}
+
+fn parse_folder_object_id(object_id: &str) -> Option<Uuid> {
+    parse_prefixed_object_uuid(object_id, "folder:")
+}
+
+fn parse_item_object_id(object_id: &str) -> Option<Uuid> {
+    parse_prefixed_object_uuid(object_id, "item:")
+}
+
+fn parse_prefixed_object_uuid(object_id: &str, prefix: &str) -> Option<Uuid> {
+    object_id
+        .trim()
+        .strip_prefix(prefix)
+        .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+fn parse_dlna_uuid(value: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(value.trim()).map_err(|_| ApiError::bad_request("Invalid DLNA item id"))
 }
 
 fn soap_response(service_type: &str, action_response: String, body: String) -> Response {

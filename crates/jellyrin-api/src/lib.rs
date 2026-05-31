@@ -437,6 +437,14 @@ pub fn router(state: AppState) -> Router {
         .route("/Dlna/{server_id}/icons/{file_name}", get(dlna::icon))
         .route("/dlna/{server_id}/icons/{file_name}", get(dlna::icon))
         .route(
+            "/Dlna/{server_id}/Items/{item_id}/stream.{container}",
+            get(dlna::media_stream).head(dlna::media_stream_head),
+        )
+        .route(
+            "/dlna/{server_id}/items/{item_id}/stream.{container}",
+            get(dlna::media_stream).head(dlna::media_stream_head),
+        )
+        .route(
             "/System/Configuration/MetadataOptions/Default",
             get(default_metadata_options),
         )
@@ -25638,6 +25646,11 @@ fn media_item_content_type(item: &MediaItem) -> String {
         Some("flac") => "audio/flac",
         Some("ogg") => "audio/ogg",
         Some("wav") => "audio/wav",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
         _ => "application/octet-stream",
     }
     .to_string()
@@ -31481,6 +31494,184 @@ mod tests {
         assert!(protocol_response.contains("<u:GetProtocolInfoResponse"));
         assert!(protocol_response.contains("http-get:*:video/mp4:*"));
         assert!(protocol_response.contains("http-get:*:image/png:*"));
+    }
+
+    #[tokio::test]
+    async fn dlna_browse_folder_items_and_streams_media_resource() {
+        let media_root = tempfile::tempdir().unwrap();
+        let primary_bytes = b"fake video bytes for dlna range";
+        tokio::fs::write(media_root.path().join("DLNA & Movie.mp4"), primary_bytes)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            media_root.path().join("Second Movie.mp4"),
+            b"second video bytes",
+        )
+        .await
+        .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.update_named_configuration("network", json!({ "EnableUPnP": true }))
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "DLNA Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.scan_virtual_folder_items(folder.id).await.unwrap(), 2);
+        let item = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "DLNA & Movie")
+            .unwrap();
+        let server_id = db.server_state().await.unwrap().server_id;
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let browse_folder = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>folder:{}</ObjectID>
+      <BrowseFlag>BrowseDirectChildren</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>1</RequestedCount>
+      <SortCriteria></SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#,
+            folder.id
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Dlna/{server_id}/ContentDirectory/Control"))
+                    .header(header::HOST, "media.example.test:8097")
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(browse_folder))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let browse_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(browse_response.contains("<u:BrowseResponse"));
+        assert!(browse_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(browse_response.contains("<TotalMatches>2</TotalMatches>"));
+        assert!(browse_response.contains(&format!("&lt;item id=&quot;item:{}&quot;", item.id)));
+        assert!(browse_response.contains("DLNA &amp;amp; Movie"));
+        assert!(browse_response.contains("object.item.videoItem.movie"));
+        assert!(browse_response.contains("protocolInfo=&quot;http-get:*:video/mp4:*&quot;"));
+        assert!(browse_response.contains(&format!("size=&quot;{}&quot;", primary_bytes.len())));
+        let resource_url = format!(
+            "http://media.example.test:8097/dlna/{server_id}/items/{}/stream.mp4",
+            item.id
+        );
+        assert!(browse_response.contains(&resource_url));
+        assert!(!browse_response.contains("Second Movie"));
+
+        let browse_item_metadata = format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>item:{}</ObjectID>
+      <BrowseFlag>BrowseMetadata</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>0</RequestedCount>
+      <SortCriteria></SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"#,
+            item.id
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/dlna/{server_id}/contentdirectory/control"))
+                    .header(header::HOST, "media.example.test:8097")
+                    .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+                    .body(Body::from(browse_item_metadata))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let item_metadata_response = String::from_utf8(body.to_vec()).unwrap();
+        assert!(item_metadata_response.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(item_metadata_response.contains("<TotalMatches>1</TotalMatches>"));
+        assert!(item_metadata_response.contains(&resource_url));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/dlna/{server_id}/items/{}/stream.mp4", item.id))
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp4")
+        );
+        let expected_content_range = format!("bytes 0-3/{}", primary_bytes.len());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_content_range.as_str())
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], &primary_bytes[..4]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri(format!("/Dlna/{server_id}/Items/{}/stream.mp4", item.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let expected_content_length = primary_bytes.len().to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_content_length.as_str())
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
