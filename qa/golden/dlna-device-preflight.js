@@ -31,11 +31,11 @@ async function main() {
   assertIncludes(description, '<serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>', 'ConnectionManager service');
   assertIncludes(description, '<serviceType>urn:microsoft.com:service:X_MS_MediaReceiverRegistrar:1</serviceType>', 'MediaReceiverRegistrar service');
 
-  const iconUrl = firstRegexGroup(description, /<url>(\/dlna\/[^<]+\/icons\/logo(?:-\d+)?\.png)<\/url>/);
+  const iconUrl = firstRegexGroup(description, /<url>([^<]*\/dlna\/[^<]+\/icons\/logo(?:-\d+)?\.png)<\/url>/i);
   if (!iconUrl) {
     throw new Error('root descriptor must expose a DLNA PNG icon URL');
   }
-  const icon = await fetchBytes(new URL(iconUrl, baseUrl));
+  const icon = await fetchBytes(resolveServerUrl(iconUrl, baseUrl));
   if (!icon.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47]))) {
     throw new Error(`DLNA icon is not PNG: ${iconUrl}`);
   }
@@ -322,6 +322,10 @@ function firstRegexGroup(value, regex) {
   return match?.[1] || null;
 }
 
+function resolveServerUrl(value, baseUrl) {
+  return new URL(value, baseUrl);
+}
+
 async function gitCommit() {
   const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
   return stdout.trim();
@@ -363,5 +367,6 @@ if (require.main === module) {
 module.exports = {
   buildDraftEvidence,
   normalizeBaseUrl,
+  resolveServerUrl,
   soapEnvelope,
 };
