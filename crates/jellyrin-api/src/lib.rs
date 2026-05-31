@@ -147,6 +147,8 @@ static LIVE_TV_RECORDING_STARTING: OnceLock<StdMutex<HashSet<String>>> = OnceLoc
 // share one logical tuner slot, while distinct channels on the same tuner honor TunerCount.
 static LIVE_TUNER_LEASES: OnceLock<StdMutex<HashMap<LiveTunerLeaseKey, LiveTunerLease>>> =
     OnceLock::new();
+#[cfg(test)]
+static TEST_RUST_WASI_HOST_BINARY_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct LiveTunerLeaseKey {
@@ -8726,7 +8728,22 @@ fn rpc_result<T>(
 }
 
 fn rust_wasi_host_binary_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = test_rust_wasi_host_binary_path()
+        .lock()
+        .expect("test WASI host override lock poisoned")
+        .clone()
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+
     plugin_host_binary_path("JELLYRIN_PLUGIN_HOST_WASI", "jellyrin-plugin-host-wasi")
+}
+
+#[cfg(test)]
+fn test_rust_wasi_host_binary_path() -> &'static StdMutex<Option<PathBuf>> {
+    TEST_RUST_WASI_HOST_BINARY_PATH.get_or_init(|| StdMutex::new(None))
 }
 
 fn dotnet_host_binary_path() -> Option<PathBuf> {
@@ -8792,17 +8809,35 @@ async fn enable_plugin(
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     require_installed_plugin_version(&state.db, &plugin_id, &version).await?;
-    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await?
-        && json_string_field(&plugin, "Runtime").as_deref() == Some("RustWasi")
-        && try_activate_rust_wasi_plugin(&state.db, &plugin, Some(user.id)).await?
-    {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await?
-        && json_string_field(&plugin, "Runtime").as_deref() == Some("DotNetJellyfin")
-        && try_activate_dotnet_plugin(&state.db, &plugin, Some(user.id)).await?
-    {
-        return Ok(StatusCode::NO_CONTENT);
+    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await? {
+        let activation = match json_string_field(&plugin, "Runtime").as_deref() {
+            Some("RustWasi") => {
+                Some(try_activate_rust_wasi_plugin(&state.db, &plugin, Some(user.id)).await)
+            }
+            Some("DotNetJellyfin") => {
+                Some(try_activate_dotnet_plugin(&state.db, &plugin, Some(user.id)).await)
+            }
+            _ => None,
+        };
+        if let Some(activation) = activation {
+            match activation {
+                Ok(true) => return Ok(StatusCode::NO_CONTENT),
+                Ok(false) => {}
+                Err(error) => {
+                    let last_error = format!("{:#}", error.error);
+                    state
+                        .db
+                        .set_installed_plugin_status(
+                            &plugin_id,
+                            "Malfunctioned",
+                            Some(&last_error),
+                            Some(user.id),
+                        )
+                        .await?;
+                    return Ok(StatusCode::NO_CONTENT);
+                }
+            }
+        }
     }
     let last_error = "Runtime host is not implemented yet.";
     if state
@@ -32433,6 +32468,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn enable_plugin_marks_runtime_failure_as_malfunctioned() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "aaaaaaaa-0000-0000-0000-000000000002";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("fixture.wasm"), b"\0asm")
+            .await
+            .unwrap();
+        let host_path = fake_rust_wasi_permission_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Failing WASI".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Failing WASI",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Failing WASI",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ScheduledTask"],
+                    "Permissions": [{ "Name": "Network" }]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let _guard = RustWasiHostPathGuard::set(host_path);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Plugins/{plugin_id}/0.1.0/Enable"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert_eq!(plugin["Status"], "Malfunctioned");
+        assert!(
+            plugin["LastError"]
+                .as_str()
+                .unwrap()
+                .contains("PermissionDenied")
+        );
+    }
+
     async fn fake_rust_wasi_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-wasi-host.sh");
         tokio::fs::write(
@@ -32522,6 +32636,30 @@ done
                 .unwrap();
         }
         path
+    }
+
+    struct RustWasiHostPathGuard {
+        previous: Option<PathBuf>,
+    }
+
+    impl RustWasiHostPathGuard {
+        fn set(path: PathBuf) -> Self {
+            let mut host_path = super::test_rust_wasi_host_binary_path()
+                .lock()
+                .expect("test WASI host override lock poisoned");
+            Self {
+                previous: host_path.replace(path),
+            }
+        }
+    }
+
+    impl Drop for RustWasiHostPathGuard {
+        fn drop(&mut self) {
+            let mut host_path = super::test_rust_wasi_host_binary_path()
+                .lock()
+                .expect("test WASI host override lock poisoned");
+            *host_path = self.previous.take();
+        }
     }
 
     async fn fake_dotnet_host_script(root: &std::path::Path) -> PathBuf {
