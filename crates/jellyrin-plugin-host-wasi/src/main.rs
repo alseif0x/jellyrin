@@ -778,7 +778,7 @@ fn execute_minimal_wasm_i32_export(
         .function_bodies
         .get(defined_index)
         .with_context(|| format!("WASM export {export_name} has no function body"))?;
-    let wasm_return = execute_minimal_wasm_i32_body(&module, body, &wasm_arguments)?;
+    let wasm_return = execute_minimal_wasm_i32_body(&module, body, &wasm_arguments, arguments)?;
     Ok((wasm_return, wasm_arguments))
 }
 
@@ -1051,6 +1051,7 @@ fn execute_minimal_wasm_i32_body(
     module: &MinimalWasmModule,
     bytes: &[u8],
     arguments: &[i32],
+    capability_arguments: &Value,
 ) -> Result<i32> {
     let mut cursor = WasmCursor::new(bytes);
     let local_groups = cursor.read_u32_leb()?;
@@ -1098,7 +1099,12 @@ fn execute_minimal_wasm_i32_body(
             }
             0x10 => {
                 let function_index = cursor.read_u32_leb()?;
-                let value = execute_minimal_wasm_import_call(module, function_index, &mut stack)?;
+                let value = execute_minimal_wasm_import_call(
+                    module,
+                    function_index,
+                    &mut stack,
+                    capability_arguments,
+                )?;
                 stack.push(value);
             }
             opcode => anyhow::bail!("unsupported WASM opcode 0x{opcode:02x}"),
@@ -1110,6 +1116,7 @@ fn execute_minimal_wasm_import_call(
     module: &MinimalWasmModule,
     function_index: u32,
     stack: &mut Vec<i32>,
+    capability_arguments: &Value,
 ) -> Result<i32> {
     let import = module
         .imported_functions
@@ -1145,6 +1152,14 @@ fn execute_minimal_wasm_import_call(
     match (import.module.as_str(), import.name.as_str()) {
         ("jellyrin:sdk", "echo_i32") => Ok(args.first().copied().unwrap_or_default()),
         ("jellyrin:sdk", "capability_argument_count") => Ok(args.len() as i32),
+        ("jellyrin:sdk", "argument_json_len") => {
+            if !args.is_empty() {
+                anyhow::bail!("jellyrin:sdk.argument_json_len does not accept arguments");
+            }
+            let json = serde_json::to_string(capability_arguments)
+                .context("failed to serialize capability arguments for WASM import")?;
+            Ok(json.len() as i32)
+        }
         ("jellyrin:sdk", "utf8_len") => {
             let [ptr, len] = args.as_slice() else {
                 anyhow::bail!("jellyrin:sdk.utf8_len requires pointer and length arguments");
@@ -1980,6 +1995,70 @@ mod tests {
         assert_eq!(value["WasmReturn"], 8);
     }
 
+    #[tokio::test]
+    async fn wasi_host_import_reads_invoke_capability_arguments() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(
+            plugin_dir.join("fixture.wasm"),
+            minimal_argument_json_len_import_wasm("jellyrin_scheduled_task"),
+        )
+        .await
+        .unwrap();
+
+        let mut state = WasiHostState::default();
+        let load = PluginRpcEnvelope::new(
+            "corr-load-argument-json-wasm",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "argument-json-wasm-fixture".to_string(),
+                name: "Argument JSON WASM Fixture".to_string(),
+                version: "1.0.0".to_string(),
+                runtime: PluginRuntime::RustWasi,
+                target_abi: TARGET_ABI.to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "Argument JSON WASM Fixture",
+                    "TargetAbi": TARGET_ABI,
+                    "Capabilities": ["ScheduledTask"],
+                    "WasmExports": {
+                        "ScheduledTask": "jellyrin_scheduled_task"
+                    }
+                }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, load).await;
+        assert!(response.ok);
+
+        let capability_arguments = json!({ "Value": 40 });
+        let invoke = PluginRpcEnvelope::new(
+            "corr-invoke-argument-json-wasm",
+            PluginRpcMethod::InvokeCapability,
+            serde_json::to_value(InvokeCapabilityRequest {
+                plugin_id: "argument-json-wasm-fixture".to_string(),
+                capability: "ScheduledTask".to_string(),
+                arguments: capability_arguments.clone(),
+                timeout_ms: 1000,
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, invoke).await;
+        assert!(response.ok);
+        let value = &response.result.as_ref().unwrap()["Value"];
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], "ScheduledTask");
+        assert_eq!(value["ExecutionMode"], "WasmI32Export");
+        assert_eq!(value["Export"], "jellyrin_scheduled_task");
+        assert_eq!(value["WasmArguments"], json!([]));
+        assert_eq!(
+            value["WasmReturn"],
+            serde_json::to_string(&capability_arguments).unwrap().len()
+        );
+    }
+
     fn minimal_i32_const_wasm(export_name: &str, value: i32) -> Vec<u8> {
         let mut wasm = b"\0asm\x01\0\0\0".to_vec();
         push_section(&mut wasm, 1, &[0x01, 0x60, 0x00, 0x01, 0x7f]);
@@ -2110,6 +2189,36 @@ mod tests {
         push_u32_leb(&mut data, text.len() as u32);
         data.extend_from_slice(text.as_bytes());
         push_section(&mut wasm, 11, &data);
+        wasm
+    }
+
+    fn minimal_argument_json_len_import_wasm(export_name: &str) -> Vec<u8> {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        push_section(&mut wasm, 1, &[0x01, 0x60, 0x00, 0x01, 0x7f]);
+
+        let mut import = Vec::new();
+        push_u32_leb(&mut import, 1);
+        push_name(&mut import, "jellyrin:sdk");
+        push_name(&mut import, "argument_json_len");
+        import.push(0x00);
+        push_u32_leb(&mut import, 0);
+        push_section(&mut wasm, 2, &import);
+
+        push_section(&mut wasm, 3, &[0x01, 0x00]);
+
+        let mut export = Vec::new();
+        push_u32_leb(&mut export, 1);
+        push_name(&mut export, export_name);
+        export.push(0x00);
+        push_u32_leb(&mut export, 1);
+        push_section(&mut wasm, 7, &export);
+
+        let body = vec![0x00, 0x10, 0x00, 0x0b];
+        let mut code = Vec::new();
+        push_u32_leb(&mut code, 1);
+        push_u32_leb(&mut code, body.len() as u32);
+        code.extend_from_slice(&body);
+        push_section(&mut wasm, 10, &code);
         wasm
     }
 
