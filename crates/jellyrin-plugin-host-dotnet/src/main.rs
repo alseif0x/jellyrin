@@ -12,8 +12,11 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration as StdDuration,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 
 const HOST_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOST_ID: &str = "jellyrin-plugin-host-dotnet";
@@ -44,6 +47,7 @@ struct LoadedDotNetPlugin {
     name: String,
     version: String,
     install_path: String,
+    assembly_files: Vec<String>,
     manifest: Value,
     configuration: Value,
     capabilities: Vec<String>,
@@ -121,7 +125,7 @@ async fn handle_envelope(
         PluginRpcMethod::ListWebPages => handle_list_web_pages(state, envelope),
         PluginRpcMethod::GetEmbeddedImage => handle_get_embedded_image(state, envelope).await,
         PluginRpcMethod::ListCapabilities => handle_list_capabilities(state, envelope),
-        PluginRpcMethod::InvokeCapability => handle_invoke_capability(state, envelope),
+        PluginRpcMethod::InvokeCapability => handle_invoke_capability(state, envelope).await,
         PluginRpcMethod::Health => handle_health(state, envelope),
         PluginRpcMethod::Shutdown => {
             state.shutting_down = true;
@@ -217,6 +221,7 @@ async fn handle_load_plugin(
         name: request.name.clone(),
         version: request.version.clone(),
         install_path: request.install_path.clone(),
+        assembly_files: dll_files,
         manifest: request.manifest.clone(),
         configuration: manifest_configuration(&request.manifest),
         capabilities: capabilities.clone(),
@@ -439,7 +444,7 @@ fn handle_list_capabilities(
     success(envelope.correlation_id, json!(plugin.capabilities))
 }
 
-fn handle_invoke_capability(
+async fn handle_invoke_capability(
     state: &DotNetHostState,
     envelope: PluginRpcEnvelope<Value>,
 ) -> PluginRpcResponse<Value> {
@@ -471,14 +476,27 @@ fn handle_invoke_capability(
             format!("Capability {} is not registered.", request.capability),
         );
     }
-    let value = manifest_capability_handler(&plugin.manifest, &request.capability)
-        .map(|handler| execute_manifest_capability_handler(&request, handler))
-        .unwrap_or_else(|| {
-            json!({
-                "Status": "NotExecuted",
-                "Reason": "DotNet assembly execution is not wired for this capability yet."
-            })
-        });
+    let value =
+        if let Some(handler) = manifest_capability_handler(&plugin.manifest, &request.capability) {
+            execute_manifest_capability_handler(&request, handler)
+        } else {
+            match execute_dotnet_capability_handler(plugin, &request).await {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    json!({
+                        "Status": "NotExecuted",
+                        "Reason": "DotNet assembly execution is not wired for this capability yet."
+                    })
+                }
+                Err(error) => {
+                    return failure(
+                        envelope.correlation_id,
+                        PluginRpcErrorCode::HostFailed,
+                        format!("DotNet assembly execution failed: {error:#}"),
+                    );
+                }
+            }
+        };
     success(envelope.correlation_id, CapabilityResult { value })
 }
 
@@ -612,6 +630,171 @@ fn execute_manifest_capability_handler(
         result["Arguments"] = request.arguments.clone();
     }
     result
+}
+
+async fn execute_dotnet_capability_handler(
+    plugin: &LoadedDotNetPlugin,
+    request: &InvokeCapabilityRequest,
+) -> Result<Option<Value>> {
+    let Some(handler) = manifest_dotnet_capability_handler(&plugin.manifest, &request.capability)
+    else {
+        return Ok(None);
+    };
+    let Some(relative_assembly) = handler
+        .assembly
+        .as_deref()
+        .and_then(safe_relative_path)
+        .or_else(|| default_plugin_assembly_path(plugin))
+    else {
+        return Ok(None);
+    };
+    let assembly_path = Path::new(&plugin.install_path).join(relative_assembly);
+    if !assembly_path.is_file() {
+        anyhow::bail!("DotNet assembly {} does not exist", assembly_path.display());
+    }
+    let arguments_json = serde_json::to_string(&request.arguments)?;
+    let mut command = Command::new(dotnet_command());
+    command
+        .arg(&assembly_path)
+        .args(expand_dotnet_handler_arguments(
+            &handler.arguments,
+            request,
+            &arguments_json,
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let timeout = StdDuration::from_millis(request.timeout_ms.clamp(250, 30_000));
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .context("DotNet assembly execution timed out")?
+        .context("failed to spawn dotnet assembly")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "DotNet assembly exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout =
+        String::from_utf8(output.stdout).context("DotNet assembly stdout was not UTF-8")?;
+    let mut value: Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("DotNet assembly stdout was not JSON: {}", stdout.trim()))?;
+    if !value.is_object() {
+        value = json!({ "Value": value });
+    }
+    value["Status"] = value
+        .get("Status")
+        .cloned()
+        .unwrap_or_else(|| json!("Executed"));
+    value["Capability"] = value
+        .get("Capability")
+        .cloned()
+        .unwrap_or_else(|| json!(request.capability));
+    value["ExecutionMode"] = value
+        .get("ExecutionMode")
+        .cloned()
+        .unwrap_or_else(|| json!("DotNetAssembly"));
+    Ok(Some(value))
+}
+
+#[derive(Debug, Default)]
+struct DotNetCapabilityHandler {
+    assembly: Option<String>,
+    arguments: Vec<String>,
+}
+
+fn manifest_dotnet_capability_handler(
+    manifest: &Value,
+    capability: &str,
+) -> Option<DotNetCapabilityHandler> {
+    let handlers = manifest
+        .get("DotNetExports")
+        .or_else(|| manifest.get("DotNetEntryPoints"))
+        .or_else(|| manifest.get("AssemblyHandlers"))?;
+    if let Some(handler) = handlers.get(capability) {
+        return dotnet_capability_handler_from_value(handler);
+    }
+    handlers.as_array()?.iter().find_map(|handler| {
+        let entry_capability = handler
+            .get("Capability")
+            .or_else(|| handler.get("Name"))
+            .and_then(Value::as_str)?;
+        entry_capability
+            .eq_ignore_ascii_case(capability)
+            .then(|| dotnet_capability_handler_from_value(handler))
+            .flatten()
+    })
+}
+
+fn dotnet_capability_handler_from_value(value: &Value) -> Option<DotNetCapabilityHandler> {
+    if let Some(assembly) = value.as_str().filter(|value| !value.trim().is_empty()) {
+        return Some(DotNetCapabilityHandler {
+            assembly: Some(assembly.trim().to_string()),
+            arguments: default_dotnet_handler_arguments(),
+        });
+    }
+    let assembly = value
+        .get("Assembly")
+        .or_else(|| value.get("Path"))
+        .or_else(|| value.get("Dll"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let arguments = value
+        .get("Arguments")
+        .and_then(Value::as_array)
+        .map(|arguments| {
+            arguments
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|arguments| !arguments.is_empty())
+        .unwrap_or_else(default_dotnet_handler_arguments);
+    Some(DotNetCapabilityHandler {
+        assembly,
+        arguments,
+    })
+}
+
+fn default_dotnet_handler_arguments() -> Vec<String> {
+    vec![
+        "--capability".to_string(),
+        "{Capability}".to_string(),
+        "--arguments".to_string(),
+        "{ArgumentsJson}".to_string(),
+    ]
+}
+
+fn expand_dotnet_handler_arguments(
+    arguments: &[String],
+    request: &InvokeCapabilityRequest,
+    arguments_json: &str,
+) -> Vec<String> {
+    arguments
+        .iter()
+        .map(|argument| {
+            argument
+                .replace("{Capability}", &request.capability)
+                .replace("{ArgumentsJson}", arguments_json)
+                .replace("{PluginId}", &request.plugin_id)
+        })
+        .collect()
+}
+
+fn default_plugin_assembly_path(plugin: &LoadedDotNetPlugin) -> Option<PathBuf> {
+    let path = Path::new(plugin.assembly_files.first()?);
+    path.file_name().map(PathBuf::from)
+}
+
+fn dotnet_command() -> String {
+    std::env::var("JELLYRIN_DOTNET_HOST_DOTNET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "dotnet".to_string())
 }
 
 fn manifest_configuration(manifest: &Value) -> Value {
@@ -1004,5 +1187,170 @@ mod tests {
             response.error.as_ref().unwrap().code,
             PluginRpcErrorCode::PluginNotLoaded
         );
+    }
+
+    #[tokio::test]
+    async fn dotnet_host_executes_declared_assembly_for_capability() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        compile_dotnet_fixture(&plugin_dir.join("Jellyfin.Plugin.RealFixture.dll")).await;
+
+        let mut state = DotNetHostState::default();
+        let load = PluginRpcEnvelope::new(
+            "corr-load-real-dotnet",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "real-dotnet-fixture".to_string(),
+                name: "Real DotNet Fixture".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: PluginRuntime::DotNetJellyfin,
+                target_abi: "12.0.0.0".to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "Real DotNet Fixture",
+                    "Capabilities": ["MetadataProvider"],
+                    "DotNetExports": {
+                        "MetadataProvider": {
+                            "Assembly": "Jellyfin.Plugin.RealFixture.dll"
+                        }
+                    }
+                }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, load).await;
+        assert!(response.ok);
+
+        let invoke = PluginRpcEnvelope::new(
+            "corr-invoke-real-dotnet",
+            PluginRpcMethod::InvokeCapability,
+            serde_json::to_value(InvokeCapabilityRequest {
+                plugin_id: "real-dotnet-fixture".to_string(),
+                capability: "MetadataProvider".to_string(),
+                arguments: json!({ "ItemId": "movie-1" }),
+                timeout_ms: 5000,
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, invoke).await;
+        assert!(response.ok, "{:?}", response.error);
+        let value = &response.result.as_ref().unwrap()["Value"];
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], "MetadataProvider");
+        assert_eq!(value["ExecutionMode"], "DotNetAssembly");
+        assert_eq!(value["Provider"], "Compiled DotNet Fixture");
+        assert_eq!(value["SawCapability"], "MetadataProvider");
+        assert_eq!(value["SawArguments"], "{\"ItemId\":\"movie-1\"}");
+    }
+
+    async fn compile_dotnet_fixture(output_path: &Path) {
+        let source_path = output_path.with_extension("cs");
+        tokio::fs::write(
+            &source_path,
+            r#"using System;
+
+public static class Program
+{
+    public static int Main(string[] args)
+    {
+        string capability = "";
+        string arguments = "{}";
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--capability" && i + 1 < args.Length)
+            {
+                capability = args[++i];
+            }
+            else if (args[i] == "--arguments" && i + 1 < args.Length)
+            {
+                arguments = args[++i];
+            }
+        }
+
+        Console.WriteLine("{\"Status\":\"Executed\",\"Provider\":\"Compiled DotNet Fixture\",\"SawCapability\":\"" + Escape(capability) + "\",\"SawArguments\":\"" + Escape(arguments) + "\"}");
+        return 0;
+    }
+
+    private static string Escape(string value)
+    {
+        return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    }
+}
+"#,
+        )
+        .await
+        .unwrap();
+        let csc_path = dotnet_sdk_root().join("Roslyn/bincore/csc.dll");
+        assert!(
+            csc_path.is_file(),
+            "missing csc.dll at {}",
+            csc_path.display()
+        );
+        let ref_dir = dotnet_ref_dir();
+        let mut command = Command::new(dotnet_command());
+        command
+            .arg(csc_path)
+            .arg("-nologo")
+            .arg("-target:exe")
+            .arg(format!("-out:{}", output_path.display()))
+            .arg("-langversion:latest");
+        for reference in std::fs::read_dir(&ref_dir).unwrap() {
+            let path = reference.unwrap().path();
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+            {
+                command.arg(format!("-reference:{}", path.display()));
+            }
+        }
+        command.arg(&source_path);
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "csc failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::fs::write(
+            output_path.with_file_name("Jellyfin.Plugin.RealFixture.runtimeconfig.json"),
+            r#"{"runtimeOptions":{"tfm":"net10.0","framework":{"name":"Microsoft.NETCore.App","version":"10.0.0"}}}"#,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn dotnet_sdk_root() -> PathBuf {
+        let output = std::process::Command::new(dotnet_command())
+            .arg("--info")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "dotnet --info failed");
+        let text = String::from_utf8(output.stdout).unwrap();
+        for line in text.lines() {
+            if let Some(path) = line.trim().strip_prefix("Base Path:") {
+                return PathBuf::from(path.trim());
+            }
+        }
+        panic!("dotnet --info did not include SDK base path");
+    }
+
+    fn dotnet_ref_dir() -> PathBuf {
+        let dotnet_root = std::env::var_os("DOTNET_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/usr/local/share/dotnet"));
+        let pack_root = dotnet_root.join("packs").join("Microsoft.NETCore.App.Ref");
+        let mut versions = std::fs::read_dir(&pack_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.join("ref/net10.0").is_dir())
+            .collect::<Vec<_>>();
+        versions.sort();
+        versions
+            .pop()
+            .expect("missing Microsoft.NETCore.App.Ref net10.0 pack")
+            .join("ref/net10.0")
     }
 }
