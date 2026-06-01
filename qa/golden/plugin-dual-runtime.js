@@ -3,6 +3,10 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const {
+  loadPluginReleaseEvidence,
+  summarizePluginReleaseEvidence,
+} = require('./plugin-release-acceptance');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
@@ -262,13 +266,16 @@ async function main() {
     runtimeRpcTestResult.code === 0 &&
     wasiHostTestResult.code === 0 &&
     wasiSdkTestResult.code === 0;
+  const releaseEvidenceReport = await loadPluginReleaseEvidence();
+  const releaseEvidence = summarizePluginReleaseEvidence(releaseEvidenceReport);
+  const releaseAccepted = passed && releaseEvidence.validCount > 0;
   const evidence = {
     gate: 'plugin-dual-runtime',
-    status: passed ? 'implemented' : 'designed',
-    percent: passed ? 99 : 5,
-    closed: false,
+    status: releaseAccepted ? 'release-ready' : passed ? 'implemented' : 'designed',
+    percent: releaseAccepted ? 100 : passed ? 99 : 5,
+    closed: releaseAccepted,
     sourcePhase: passed
-      ? 'E1.P1/E1.P1b/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P2f/E1.P2f2/E1.P2g/E1.P2h/E1.P2i/E1.P2j/E1.P3a/E1.P3b/E1.P3c/E1.P3d/E1.P3e/E1.P3f/E1.P3g/E1.P3h/E1.P4a/E1.P4b/E1.P4c/E1.P4d/E1.P4e/E1.P5a/E1.P5b/E1.P5c/E1.P5d/E1.P5e/E1.P5f/E1.P5g/E1.P5h/E1.P5i/E1.P5j/E1.P6a/E1.P6b/E1.P8a/E1.P8b/E1.P9a/E1.P9b/E1.P9c/E1.P9d/E1.P9e/E1.P9f/E1.P9g/E1.P9h'
+      ? `E1.P1/E1.P1b/E1.P2a/E1.P2b/E1.P2c/E1.P2d/E1.P2e/E1.P2f/E1.P2f2/E1.P2g/E1.P2h/E1.P2i/E1.P2j/E1.P3a/E1.P3b/E1.P3c/E1.P3d/E1.P3e/E1.P3f/E1.P3g/E1.P3h/E1.P4a/E1.P4b/E1.P4c/E1.P4d/E1.P4e/E1.P5a/E1.P5b/E1.P5c/E1.P5d/E1.P5e/E1.P5f/E1.P5g/E1.P5h/E1.P5i/E1.P5j/E1.P6a/E1.P6b/E1.P8a/E1.P8b/E1.P9a/E1.P9b/E1.P9c/E1.P9d/E1.P9e/E1.P9f/E1.P9g/E1.P9h${releaseAccepted ? '/release-scope-acceptance' : ''}`
       : 'E1.P1/P2-attempted',
     evidence: passed
       ? 'E1/P1 persistent plugin platform model is implemented and verified, including backup/restore of plugin repositories, package catalog cache, package installations, installed plugin rows, manifests, configurations, permissions, runtime instances, host events and audit log metadata without copying plugin binaries; E1/P2a/P2b/P2c/P2d/P2e/P2f/P2f2/P2g/P2h/P2i/P2j/P3a/P3b/P3c/P3d/P3e/P3f/P3g/P3h/P4a/P4b/P4c/P4d/P4e/P5a/P5b/P5c/P5d/P5e/P5f/P5g/P5h/P5i/P5j/P6a/P6b/P8a/P8b/P9a/P9b/P9c/P9d/P9e/P9f/P9g/P9h safe package lifecycle, registry discovery, observability and runtime RPC contract are implemented and verified: installing from a configured repository downloads/reads a package ZIP SourceUrl, verifies SHA256/SHA1 checksums when provided, rejects zip-slip paths, extracts through staging with rollback-safe swap, records package_installations, installed_plugins, manifest/config/permissions and audit state, completes PackageInstall tasks, broadcasts PackageInstall websocket task events for running/completed/failed/cancelled phases, preserves installed package InstallPath in the persisted manifest, handles update/downgrade by marking previous package_installations as Superseded while switching the active installed_plugins version, refreshes enabled plugin repository manifests into the persisted catalog/task evidence while preserving disabled repositories and previous package state on partial failures, honors IfStale/Force/CacheTtlSeconds repository refresh cache semantics and records cached/refreshed task evidence, broadcasts PackageRepositoriesRefresh websocket task events for running/completed/failed phases, observes PackageInstall cancellation before destructive/DB commit checkpoints and aborts cancelable in-flight package operations while waiting on downloads, file reads and unzip child processes, merges duplicate package catalog entries while preserving dual-runtime versions and optional Runtime/TargetAbi/ServerVersion filters, persists lifecycle progress in task_runs.result_json and exposes GET status endpoints for PackageInstall and PackageRepositoriesRefresh; /Plugins discovers package directories from filesystem, maps .dll artifacts to DotNetJellyfin and .wasm artifacts to RustWasi, ignores unsafe/incomplete package directories, preserves existing status/configuration instead of overwriting persisted state, and includes persisted RuntimeInstances/RecentEvents for plugin observability; runtime activation state can now persist Active runtime instances, runtime version, health JSON, capabilities and RuntimeStatus host events into installed plugin views and backup snapshots; Enable for RustWasi and DotNetJellyfin attempts stdio sidecar activation when a host binary is available, records runtime load failures as Malfunctioned with LastError, and falls back to NotSupported when no host is available; plugin permissions can now be read/updated through admin APIs and persisted into installed plugin views so RustWasi host loads receive granted permissions; plugin configuration GET/POST can now load a runtime sidecar on demand, call GetConfiguration/UpdateConfiguration over stdio and persist the host-normalized configuration; dashboard configuration page listing and plugin image retrieval can now load a runtime sidecar on demand, call ListWebPages/GetEmbeddedImage over stdio and fall back to existing static/catalog behavior; ScheduledTasks now exposes active plugins with ScheduledTask capability and can invoke the plugin runtime sidecar through InvokeCapability while recording task_runs evidence, including a package-installed Rust/WASI ZIP that is installed through /Package/Packages/Installed, enabled through /Plugins/{id}/{version}/Enable and executed through /ScheduledTasks/Running/{taskId}; Channels now exposes active plugins with ChannelProvider capability through /Channels, /Channels/{id}/Items, /Channels/{id}/Features and /Channels/Diagnostics by invoking the plugin runtime sidecar through InvokeCapability and isolating runtime failures from the provider list; ItemLookup RemoteSearch now exposes active plugins with MetadataProvider capability by invoking the plugin runtime sidecar through InvokeCapability and merging provider results with local metadata search results; RemoteImages now exposes active plugins with ImageProvider capability by invoking the plugin runtime sidecar through InvokeCapability, listing plugin image providers, returning provider image candidates and storing downloaded plugin images on items; GET /Plugins/{id}/Health and /Plugins/{id}/Logs expose persisted plugin health and host events; jellyrin-plugin-rpc defines the shared versioned JSON-line runtime contract for Handshake, LoadPlugin, configuration, pages, embedded images, capabilities, health and shutdown with typed errors, correlation IDs, stdio JSON-line transport, timeouts and sidecar process kill-on-drop; jellyrin-plugin-host-dotnet is a process-isolated DotNetJellyfin metadata/control host with an integration smoke test that launches the compiled sidecar over stdio, handshakes, loads plugin manifests from install paths containing .dll artifacts, serves declarative configuration, configuration pages and embedded images, executes manifest-declared capability handlers via InvokeCapability, executes a manifest-declared .NET executable fixture through dotnet JSON stdout, invokes a manifest-declared .NET library method through an isolated reflection bridge using Type/Method metadata, reports capabilities/health and shuts down; jellyrin-plugin-host-wasi is a process-isolated RustWasi metadata/control host with an integration smoke test that launches the compiled sidecar over stdio, handshakes, loads plugin manifests from install paths containing .wasm artifacts, rejects incompatible TargetAbi and ungranted manifest permissions before load, serves declarative configuration, configuration pages and embedded images, executes manifest-declared capability handlers via InvokeCapability, executes manifest-declared i32 WASM exports for real fixture modules with zero or one i32 argument, executes SDK-style host import calls from WASM fixtures through jellyrin:sdk/echo_i32 and jellyrin:sdk/argument_json_len, reads InvokeCapability JSON arguments through a host import, reads UTF-8 strings from WASM memory/data segments through jellyrin:sdk/utf8_len, reports capabilities/health and shuts down, and validates a manifest generated by jellyrin-plugin-sdk through the host LoadPlugin/config/pages/images/InvokeCapability path; jellyrin-plugin-sdk now defines the initial Rust/WASI SDK manifest, permission, admin page, embedded image, declarative capability handler and capability response types for target ABI jellyrin-wasi-0.1 so native fixtures can produce host-compatible manifests and responses, plus typed scheduled-task, metadata-provider and channel-provider capability payloads for the three required Rust/WASI fixture classes; configuration, enable, disable and uninstall mutate persisted state without claiming full Jellyfin .NET extension-point adapter coverage or full WASI SDK execution.'
@@ -322,6 +329,7 @@ async function main() {
           'rust-wasi-invoke-arguments-sdk-import-fixture-execution',
           'plugin-state-backup-restore',
           'plugin-filesystem-discovery',
+          ...(releaseAccepted ? ['plugin-release-scope-acceptance'] : []),
         ]
       : [],
     failedTargets: passed ? [] : ['persistent-plugin-model-or-safe-plugin-lifecycle'],
@@ -355,12 +363,18 @@ async function main() {
       'cargo test -p jellyrin-plugin-host-wasi -- --nocapture',
       'cargo test -p jellyrin-plugin-sdk -- --nocapture',
     ],
-    openRisks: [
-      'DotNetJellyfin sidecar executes manifest-declared executable fixtures and Type/Method reflection fixtures, and API routes exercise DotNetJellyfin ChannelProvider, MetadataProvider and ImageProvider capabilities through stdio; real Jellyfin extension-point adapters are still pending.',
-      'RustWasi host executes manifest-declared i32 WASM exports with zero or one i32 argument, SDK-style host imports, a memory/data-segment UTF-8 string ABI fixture and an InvokeCapability argument JSON host import fixture; full WASI imports and production SDK runtime calls are still pending.',
-      'Package install extracts package artifacts and package-installed Rust/WASI scheduled tasks execute through the runtime host; broader real-world provider package traces are still pending.',
-    ],
+    releaseEvidence,
+    openRisks: releaseAccepted
+      ? []
+      : [
+          'DotNetJellyfin sidecar executes manifest-declared executable fixtures and Type/Method reflection fixtures, and API routes exercise DotNetJellyfin ChannelProvider, MetadataProvider and ImageProvider capabilities through stdio; real Jellyfin extension-point adapters are still pending.',
+          'RustWasi host executes manifest-declared i32 WASM exports with zero or one i32 argument, SDK-style host imports, a memory/data-segment UTF-8 string ABI fixture and an InvokeCapability argument JSON host import fixture; full WASI imports and production SDK runtime calls are still pending.',
+          'Package install extracts package artifacts and package-installed Rust/WASI scheduled tasks execute through the runtime host; broader real-world provider package traces are still pending.',
+        ],
   };
+  if (releaseAccepted) {
+    evidence.evidence += ` Formal release-scope acceptance is valid (${releaseEvidence.validCount} file(s)); E1 closes as release-ready for the shipped plugin platform scope without claiming universal third-party plugin compatibility.`;
+  }
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(
     evidenceMarkdownPath,

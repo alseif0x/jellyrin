@@ -9,6 +9,7 @@
     "golden:dto": "node qa/golden/dto-parity.js",
     "golden:ecosystem": "npm run evidence:ecosystem",
     "golden:plugins": "node qa/golden/plugin-dual-runtime.js",
+    "golden:plugins:release-acceptance": "node qa/golden/plugin-release-acceptance.js",
     "golden:livetv": "node qa/golden/livetv-real.js",
     "golden:livetv:device-evidence": "node qa/golden/livetv-device-evidence.js",
     "golden:livetv:simulator-acceptance": "node qa/golden/livetv-simulator-acceptance.js",
