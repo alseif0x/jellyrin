@@ -221,6 +221,9 @@ function buildEvidence(result, comparison, localSubgates) {
 
   if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream') && invariantCoverage.complete) {
     const allCompletedTargets = [...new Set([...completedTargets, ...localCompletedTargets])].sort();
+    const refcountReleaseObserved = summaries
+      .filter((summary) => summary.status === 'completed' && ['jellyrin', 'upstream'].includes(summary.target))
+      .every((summary) => summary.invariants?.liveTvHdhrStreamRefcountReleased === true);
     return {
       gate: 'livetv-real',
       status: 'upstream-validated',
@@ -290,7 +293,9 @@ function buildEvidence(result, comparison, localSubgates) {
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
         'Dashboard target remains device-validated; closing E2 still requires a final device-validated acceptance decision.',
-        'R8: upstream SharedHttpStream may keep connection open after probes close (refill buffer); liveTvHdhrStreamRefcountReleased may be false for upstream if observed within timeout.',
+        ...(!refcountReleaseObserved
+          ? ['R8: upstream SharedHttpStream may keep connection open after probes close (refill buffer); liveTvHdhrStreamRefcountReleased may be false for upstream if observed within timeout.']
+          : []),
         'R-DETERMINISM: recording playability depends on simulator TS being a valid MPEG-2 TS with PAT+PMT at byte 0 and monotonic PCR/PTS/DTS; the simulator pre-generates a 600s clip via ffmpeg meeting this contract.',
       ],
     };
