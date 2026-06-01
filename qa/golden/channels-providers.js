@@ -38,18 +38,39 @@ const jellyrinRequired = [
 async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
 
+  const localSubgates = await runLocalSubgates();
   const result = await runBrowserTrace();
   const comparison = await readJsonIfExists(comparisonPath);
-  const evidence = buildEvidence(result, comparison);
+  const evidence = buildEvidence(result, comparison, localSubgates);
 
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison));
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
 
+  if (localSubgates.some((subgate) => subgate.code !== 0)) {
+    process.exitCode = localSubgates.find((subgate) => subgate.code !== 0)?.code || 1;
+    return;
+  }
   if (evidence.status === 'not-started' || evidence.status === 'designed') {
     process.exitCode = result.code || 1;
   }
+}
+
+async function runLocalSubgates() {
+  const subgates = [
+    {
+      target: 'plugin-channel-provider-media-source',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'rust_wasi_channel_provider_feeds_channels_api', '--', '--nocapture'],
+      evidence: 'Rust/WASI ChannelProvider fixture feeds /Channels and resolves provider item playback through MediaInfo/LiveStreams/Open and Close',
+    },
+  ];
+  const results = [];
+  for (const subgate of subgates) {
+    const result = await runCommand(subgate.command[0], subgate.command.slice(1));
+    results.push({ ...subgate, ...result, command: subgate.command.join(' ') });
+  }
+  return results;
 }
 
 function runBrowserTrace() {
@@ -70,8 +91,20 @@ function runBrowserTrace() {
   });
 }
 
-function buildEvidence(result, comparison) {
+function runCommand(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: 'inherit',
+    });
+    child.on('close', (code, signal) => resolve({ code: code || 0, signal }));
+  });
+}
+
+function buildEvidence(result, comparison, localSubgates) {
   const updatedAt = new Date().toISOString();
+  const localPassed = localSubgates.length > 0 && localSubgates.every((subgate) => subgate.code === 0);
   if (!comparison) {
     return {
       gate: 'channels-providers',
@@ -82,6 +115,7 @@ function buildEvidence(result, comparison) {
       evidence: 'Channels provider browser trace did not produce comparison.json.',
       updatedAt,
       traceExitCode: result.code,
+      localSubgates,
       openRisks: ['No real E5 channels-provider evidence has been generated yet.'],
     };
   }
@@ -104,34 +138,38 @@ function buildEvidence(result, comparison) {
     && !summary.skipped
     && (summary.failedResponses || []).length === 0
     && (summary.pageErrors || []).length === 0);
+  const localCompletedTargets = localPassed ? ['local-channel-provider-subgates'] : [];
+  const allCompletedTargets = [...new Set([...completedTargets, ...localCompletedTargets])].sort();
 
-  if (targetsHealthy && invariantCoverage.complete) {
+  if (targetsHealthy && invariantCoverage.complete && localPassed) {
     return {
       gate: 'channels-providers',
       status: 'implemented',
-      percent: 62,
+      percent: 70,
       closed: false,
-      sourcePhase: 'E5.1/E5.4/E5.5/browser-basic',
+      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source',
       evidence: [
         'Channels browser golden completed against upstream Jellyfin and Jellyrin.',
         'Both targets satisfy the base Channels contract for GET /Channels and GET /Channels/Features.',
         'Jellyrin additionally exposes a real Live TV-backed channel provider fixture through /Channels, /Channels/livetv/Items, /Channels/Items/Latest, /Channels/livetv/Features, /Channels/Diagnostics and MediaInfo live-stream resolution.',
         'The fixture validates provider filtering, media-deletion filtering, item SearchTerm filtering, latest item listing/search, feature capability shape, media-source resolution, direct stream byte delivery and failure isolation for a configured malfunctioning provider.',
-        'This is an implemented E5 baseline, not full upstream-validated external provider parity: plugin-backed providers, refresh/cache persistence, images and non-Live-TV external provider playback remain open.',
+        'The local Rust/WASI ChannelProvider fixture validates plugin-backed provider browse plus non-Live-TV provider item MediaInfo/LiveStreams/Open and Close resolution.',
+        'This is an implemented E5 baseline, not full upstream-validated external provider parity: refresh/cache persistence, images, DotNet provider fixture and broader non-Live-TV provider playback remain open.',
       ].join(' '),
       updatedAt,
-      completedTargets,
+      completedTargets: allCompletedTargets,
       skippedTargets,
       failedTargets,
       upstreamRequired,
       jellyrinRequired,
       invariantCoverage,
+      localSubgates,
       tracePath: path.relative(plansDir, comparisonPath),
       comparisonNotes: comparison.comparison?.reasons || [],
       openRisks: [
         'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
-        'Provider registry/cache, refresh task state, image resolution and media-source playback for non-Live-TV external channel items are still pending.',
-        'Rust/WASI and DotNet plugin channel-provider fixtures are still pending on fuller provider ABI execution.',
+        'Provider registry/cache, refresh task state and image resolution are still pending.',
+        'Rust/WASI plugin channel-provider browse and MediaInfo resolution are covered by local subgate; DotNet channel-provider fixture is still pending.',
         'Provider failure/timeout isolation is covered for declarative malfunctioned providers; runtime plugin provider failures still need direct tests and browser evidence.',
       ],
     };
@@ -150,6 +188,7 @@ function buildEvidence(result, comparison) {
     failedTargets,
     failedReasons: comparison.comparison?.reasons || [],
     invariantCoverage,
+    localSubgates,
     traceExitCode: result.code,
     tracePath: path.relative(plansDir, comparisonPath),
     openRisks: [
@@ -209,6 +248,16 @@ function renderMarkdown(evidence, comparison) {
   }
   if (Array.isArray(evidence.completedTargets)) {
     lines.push(`- Completed targets: ${evidence.completedTargets.join(', ') || 'none'}`);
+  }
+  if (Array.isArray(evidence.localSubgates) && evidence.localSubgates.length > 0) {
+    lines.push('');
+    lines.push('## Local Subgates');
+    lines.push('');
+    lines.push('| Subgate | Exit | Evidence | Command |');
+    lines.push('| --- | ---: | --- | --- |');
+    for (const subgate of evidence.localSubgates) {
+      lines.push(`| ${subgate.target} | ${subgate.code} | ${subgate.evidence} | \`${subgate.command}\` |`);
+    }
   }
   if (Array.isArray(evidence.failedReasons) && evidence.failedReasons.length > 0) {
     lines.push('');

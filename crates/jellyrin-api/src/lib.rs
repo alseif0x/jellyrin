@@ -22585,6 +22585,15 @@ async fn open_live_stream(
             "MediaSourceId": live_stream_id,
         })));
     }
+    if let Some(channel_item) = channel_content_item_by_id(&state.db, &item_id).await? {
+        let media_source = channel_content_item_media_source(&channel_item)?;
+        let live_stream_id = json_string_field(&channel_item, "Id").unwrap_or(item_id);
+        return Ok(Json(serde_json::json!({
+            "MediaSource": media_source,
+            "LiveStreamId": live_stream_id,
+            "MediaSourceId": live_stream_id,
+        })));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_json = media_item_to_json(&item, &server_id);
@@ -22611,6 +22620,9 @@ async fn close_live_stream(
     if let Some(Json(body)) = body
         && let Some(item_id) = body.live_stream_id.or(body.media_source_id)
         && live_tv_channel_by_id(&state.db, &item_id).await.is_err()
+        && channel_content_item_by_id(&state.db, &item_id)
+            .await?
+            .is_none()
     {
         media_item_by_id(&state.db, &item_id).await?;
     }
@@ -27003,6 +27015,79 @@ async fn channel_content_items(
         return Err(ApiError::not_found("Channel not found"));
     }
     Ok(items)
+}
+
+async fn channel_content_item_by_id(
+    db: &Database,
+    item_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    Ok(channel_content_items(db, None)
+        .await?
+        .into_iter()
+        .find(|item| json_string_field(item, "Id").is_some_and(|id| id == item_id)))
+}
+
+fn channel_content_item_media_source(
+    item: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    if let Some(source) = item
+        .get("MediaSources")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|sources| sources.first())
+        .cloned()
+    {
+        return Ok(source);
+    }
+    let item_id = json_string_field(item, "Id")
+        .ok_or_else(|| ApiError::not_found("Channel item not found"))?;
+    let name = json_string_field(item, "Name").unwrap_or_else(|| item_id.clone());
+    let path = json_string_field(item, "Path")
+        .or_else(|| json_string_field(item, "Url"))
+        .or_else(|| json_string_field(item, "DirectStreamUrl"))
+        .ok_or_else(|| ApiError::not_found("Channel media source not found"))?;
+    let direct_stream_url =
+        json_string_field(item, "DirectStreamUrl").unwrap_or_else(|| path.clone());
+    let is_remote = path.starts_with("http://") || path.starts_with("https://");
+    let protocol = if is_remote { "Http" } else { "File" };
+    let container = std::path::Path::new(path.split('?').next().unwrap_or(&path))
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or_else(|| {
+            json_string_field(item, "Container").unwrap_or_else(|| "ts".to_string())
+        });
+    let media_type = json_string_field(item, "MediaType").unwrap_or_else(|| "Video".to_string());
+    Ok(serde_json::json!({
+        "Protocol": protocol,
+        "Id": item_id,
+        "Path": path,
+        "Type": "Default",
+        "Container": container.clone(),
+        "Name": name,
+        "IsRemote": is_remote,
+        "DirectStreamUrl": direct_stream_url,
+        "ETag": null,
+        "RunTimeTicks": item.get("RunTimeTicks").cloned().unwrap_or(serde_json::Value::Null),
+        "ReadAtNativeFramerate": false,
+        "SupportsTranscoding": false,
+        "SupportsDirectStream": true,
+        "SupportsDirectPlay": true,
+        "IsInfiniteStream": false,
+        "RequiresOpening": false,
+        "RequiresClosing": true,
+        "RequiresLooping": false,
+        "SupportsProbing": false,
+        "VideoType": if media_type.eq_ignore_ascii_case("Video") { "VideoFile" } else { "Unknown" },
+        "MediaStreams": item.get("MediaStreams").cloned().unwrap_or_else(|| serde_json::json!([{
+            "Codec": container,
+            "Type": media_type.clone(),
+            "Index": 0,
+            "IsInterlaced": false
+        }])),
+        "Formats": [],
+        "Bitrate": item.get("Bitrate").cloned().unwrap_or(serde_json::Value::Null)
+    }))
 }
 
 fn filter_channel_items_by_search(items: &mut Vec<serde_json::Value>, search_term: Option<&str>) {
@@ -33134,6 +33219,53 @@ mod tests {
             items["Items"][0]["Path"],
             "https://example.invalid/wasi.m3u8"
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/MediaInfo/LiveStreams/Open")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ItemId": "wasi-channel-item" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let live_stream: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(live_stream["LiveStreamId"], "wasi-channel-item");
+        assert_eq!(live_stream["MediaSource"]["Protocol"], "Http");
+        assert_eq!(
+            live_stream["MediaSource"]["Path"],
+            "https://example.invalid/wasi.m3u8"
+        );
+        assert_eq!(
+            live_stream["MediaSource"]["DirectStreamUrl"],
+            "https://example.invalid/wasi.m3u8"
+        );
+        assert_eq!(live_stream["MediaSource"]["SupportsDirectPlay"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/MediaInfo/LiveStreams/Close")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "LiveStreamId": "wasi-channel-item" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
