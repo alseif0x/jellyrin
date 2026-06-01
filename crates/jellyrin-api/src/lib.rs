@@ -34406,6 +34406,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dotnet_metadata_provider_feeds_remote_search() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "bbbbbbbb-0000-0000-0000-000000000006";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(
+            plugin_dir.join("Jellyfin.Plugin.MetadataProvider.dll"),
+            b"dll",
+        )
+        .await
+        .unwrap();
+        let host_path = fake_dotnet_metadata_provider_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Metadata DotNet".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "DotNetJellyfin".to_string(),
+                target_abi: "12.0.0.0".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Metadata DotNet",
+                    "Runtime": "DotNetJellyfin"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Metadata DotNet",
+                    "Version": "1.0.0.0",
+                    "Runtime": "DotNetJellyfin",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["MetadataProvider"]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_dotnet_plugin_with_host_path(&db, &plugin, Some(user.id), host_path.clone())
+                .await
+                .unwrap()
+        );
+        let _guard = DotNetHostPathGuard::set(host_path);
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ItemLookup/Items/RemoteSearch/Movie")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Name": "DotNet Metadata Movie", "Year": 2001 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_results.as_array().unwrap().len(), 1);
+        assert_eq!(remote_results[0]["Name"], "DotNet Metadata Movie");
+        assert_eq!(remote_results[0]["Type"], "Movie");
+        assert_eq!(remote_results[0]["SearchProviderName"], "Metadata DotNet");
+        assert_eq!(remote_results[0]["ProductionYear"], 2001);
+        assert_eq!(
+            remote_results[0]["ProviderIds"]["DotNetProvider"],
+            "dotnet-plugin-movie"
+        );
+        assert_eq!(remote_results[0]["Overview"], "Metadata from DotNet plugin");
+    }
+
+    #[tokio::test]
     async fn rust_wasi_image_provider_feeds_remote_images_and_download() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -34529,6 +34622,168 @@ mod tests {
         let images: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(images["TotalRecordCount"], 1, "{images}");
         assert_eq!(images["Items"][0]["ProviderName"], "Image WASI");
+        assert_eq!(images["Items"][0]["Type"], "Primary");
+        assert_eq!(images["Items"][0]["MimeType"], "image/png");
+        let image_url = images["Items"][0]["Url"].as_str().unwrap();
+        assert!(image_url.starts_with("plugin-image:"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages/Download"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ImageUrl": image_url, "ImageType": "Primary" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_png.as_slice());
+    }
+
+    #[tokio::test]
+    async fn dotnet_image_provider_feeds_remote_images_and_download() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "bbbbbbbb-0000-0000-0000-000000000007";
+        let tmp = tempfile::tempdir().unwrap();
+        let media_dir = tmp.path().join("media");
+        tokio::fs::create_dir_all(&media_dir).await.unwrap();
+        let movie_path = media_dir.join("DotNet Image Movie.mp4");
+        tokio::fs::write(&movie_path, b"fake video").await.unwrap();
+        db.upsert_virtual_folder(
+            "Movies",
+            Some("movies"),
+            vec![media_dir.to_string_lossy().to_string()],
+        )
+        .await
+        .unwrap();
+        scan_all_library_items(&db).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("Jellyfin.Plugin.ImageProvider.dll"), b"dll")
+            .await
+            .unwrap();
+        let expected_png = test_png_bytes();
+        let host_path = fake_dotnet_image_provider_host_script(tmp.path(), &expected_png).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Image DotNet".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "DotNetJellyfin".to_string(),
+                target_abi: "12.0.0.0".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Image DotNet",
+                    "Runtime": "DotNetJellyfin"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Image DotNet",
+                    "Version": "1.0.0.0",
+                    "Runtime": "DotNetJellyfin",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ImageProvider"]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_dotnet_plugin_with_host_path(&db, &plugin, Some(user.id), host_path.clone())
+                .await
+                .unwrap()
+        );
+        let _guard = DotNetHostPathGuard::set(host_path);
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let item_id = item.id.simple().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages/Providers"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let providers: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            providers
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|provider| provider["Name"] == "Image DotNet")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages?ImageType=Primary"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(images["TotalRecordCount"], 1, "{images}");
+        assert_eq!(images["Items"][0]["ProviderName"], "Image DotNet");
         assert_eq!(images["Items"][0]["Type"], "Primary");
         assert_eq!(images["Items"][0]["MimeType"], "image/png");
         let image_url = images["Items"][0]["Url"].as_str().unwrap();
@@ -35171,6 +35426,97 @@ done
         )
         .await
         .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    async fn fake_dotnet_metadata_provider_host_script(root: &std::path::Path) -> PathBuf {
+        let path = root.join("fake-dotnet-metadata-provider-host.sh");
+        tokio::fs::write(
+            &path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-dotnet-metadata-provider-host","ServerVersion":"fake-dotnet-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000006","Runtime":"DotNetJellyfin","RuntimeVersion":"fake-dotnet-host-0.1","Status":"Healthy","Manifest":{"Name":"Metadata DotNet"},"Capabilities":["MetadataProvider"]}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"MetadataProvider","Name":"DotNet Metadata Movie","Type":"Movie","Overview":"Metadata from DotNet plugin","ProductionYear":2001,"ProviderIds":{"DotNetProvider":"dotnet-plugin-movie"}}}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000006","Runtime":"DotNetJellyfin","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    async fn fake_dotnet_image_provider_host_script(
+        root: &std::path::Path,
+        image: &[u8],
+    ) -> PathBuf {
+        let path = root.join("fake-dotnet-image-provider-host.sh");
+        let image_base64 = general_purpose::STANDARD.encode(image);
+        let script = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-dotnet-image-provider-host","ServerVersion":"fake-dotnet-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000007","Runtime":"DotNetJellyfin","RuntimeVersion":"fake-dotnet-host-0.1","Status":"Healthy","Manifest":{"Name":"Image DotNet"},"Capabilities":["ImageProvider"]}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"ImageProvider","Images":[{"Name":"DotNet Primary","ImageType":"Primary","MimeType":"image/png","Base64Data":"__IMAGE_BASE64__","Width":1,"Height":1}]}}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000007","Runtime":"DotNetJellyfin","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#
+        .replace("__IMAGE_BASE64__", &image_base64);
+        tokio::fs::write(&path, script).await.unwrap();
         let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
         #[cfg(unix)]
         {
