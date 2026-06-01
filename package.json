@@ -32,6 +32,7 @@
     "evidence:dashboard": "node qa/golden/evidence-dashboard.js",
     "qa:packaging-release": "node qa/packaging-release.js",
     "qa:release-install-smoke": "node qa/release-install-smoke.js",
+    "qa:systemd-runtime-smoke": "node qa/systemd-runtime-smoke.js",
     "qa:systemd-unit-smoke": "node qa/systemd-unit-smoke.js"
   },
   "devDependencies": {
