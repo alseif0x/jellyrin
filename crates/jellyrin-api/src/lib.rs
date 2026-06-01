@@ -14881,6 +14881,8 @@ async fn live_tv_recording_by_id(
         .find(|recording| {
             json_string_field(recording, "Id")
                 .is_some_and(|id| id.eq_ignore_ascii_case(recording_id.trim()))
+                || json_string_field(recording, "TimerId")
+                    .is_some_and(|id| id.eq_ignore_ascii_case(recording_id.trim()))
         })
         .ok_or_else(|| ApiError::not_found("Live TV recording not found"))
 }
@@ -42224,6 +42226,7 @@ done
             "Recordings": [
                 {
                     "Id": "recording-1",
+                    "TimerId": "timer-recording-1",
                     "Name": "Morning News",
                     "SeriesName": "Morning News",
                     "FolderName": "News",
@@ -43753,6 +43756,21 @@ done
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "video/mp2t"
         );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"recorded transport stream");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/LiveRecordings/timer-recording-1/stream")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"recorded transport stream");
 

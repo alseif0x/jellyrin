@@ -4502,7 +4502,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
   // liveTvHdhrRecordingPlayable: download the recording bytes, run ffprobe, assert >=1 video packet.
   // liveTvHdhrRecordingCleanup (jellyrin-only): /stats currentConcurrent===0 + DELETE 204 + absent.
   {
-    const recordSecs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_SECS || '4', 10);
+    const recordSecs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_SECS || '8', 10);
     const pollTimeoutMs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_POLL_TIMEOUT_MS || '30000', 10);
     const pollIntervalMs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_POLL_INTERVAL_MS || '1000', 10);
 
@@ -4806,7 +4806,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
     let seriesTimerId = null;
     let xmltvFilePath = null;
     try {
-      const seriesRecordSecs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_SECS || '4', 10);
+      const seriesRecordSecs = Number.parseInt(process.env.JELLYRIN_LIVETV_RECORD_SECS || '8', 10);
       // Series timer recording poll timeout is longer than the regular recording poll (90s default)
       // because the child timer recording window includes a ~40s buffer above seriesRecordSecs to
       // survive the RefreshGuide latency on upstream. The recording completes after ~seriesRecordSecs+40s.
