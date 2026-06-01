@@ -28,7 +28,8 @@
     "qa:security-hardening": "node qa/security-hardening.js",
     "evidence:ecosystem": "node qa/golden/ecosystem-parity.js",
     "evidence:dashboard": "node qa/golden/evidence-dashboard.js",
-    "qa:packaging-release": "node qa/packaging-release.js"
+    "qa:packaging-release": "node qa/packaging-release.js",
+    "qa:release-install-smoke": "node qa/release-install-smoke.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2"

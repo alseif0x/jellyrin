@@ -26,6 +26,7 @@ async function main() {
 
   const packaging = await runCommand('node', ['qa/packaging-release.js']);
   const security = await runCommand('node', ['qa/security-hardening.js']);
+  const releaseInstall = await runCommand('node', ['qa/release-install-smoke.js']);
   const backupRestore = await runCommand('cargo', [
     'test',
     '-p',
@@ -48,6 +49,7 @@ async function main() {
   const checks = [
     check('packaging-release-matrix', packaging.code === 0),
     check('security-hardening-matrix', security.code === 0),
+    check('release-install-smoke', releaseInstall.code === 0),
     check('backup-restore-rollback-smoke', backupRestore.code === 0),
     check('runtime-observability-smoke', observability.code === 0),
     ...evidenceChecks,
@@ -58,12 +60,12 @@ async function main() {
   const evidence = {
     gate: 'ecosystem-release',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 55 : 10,
+    percent: passed ? 65 : 10,
     closed: false,
     sourcePhase: passed ? 'E7.1/E7.2/E7.3/E7.4/E7.5/E7.6/release-smoke-baseline' : 'E7.1/E7.2-attempted',
     evidence: passed
       ? [
-          'E7 release baseline is implemented: packaging and security hardening matrices pass, release assets are present, npm exposes the release gate, prerequisite ecosystem evidence files exist for E1-E6, the backup/restore rollback smoke restores users, libraries, metadata, plugins and named configurations used by Live TV, Channels and network/DLNA, and /System/Diagnostics reports plugin runtime, Live TV tuner, DLNA eventing/update-id, SyncPlay and log surfaces.',
+          'E7 release baseline is implemented: packaging and security hardening matrices pass, release assets are present, npm exposes the release gate, prerequisite ecosystem evidence files exist for E1-E6, a repository-local install smoke starts jellyrin-server against release-style temporary data/config/cache/log directories and verifies /healthz, /readyz, /System/Info/Public and SQLite persistence, the backup/restore rollback smoke restores users, libraries, metadata, plugins and named configurations used by Live TV, Channels and network/DLNA, and /System/Diagnostics reports plugin runtime, Live TV tuner, DLNA eventing/update-id, SyncPlay and log surfaces.',
           'This is not final release-ready closure because device/manual gates, real upgrade execution, installed systemd smoke and host-level rollback rehearsal still remain open.',
         ].join(' ')
       : 'E7 release baseline checks failed; inspect failedChecks and commandResults before advancing release work.',
@@ -72,6 +74,7 @@ async function main() {
       ? [
           'packaging-release-matrix',
           'security-hardening-matrix',
+          'release-install-smoke',
           'backup-restore-rollback-smoke',
           'runtime-observability-smoke',
           'release-assets-present',
@@ -83,12 +86,13 @@ async function main() {
     commandResults: {
       packaging: commandSummary(packaging),
       security: commandSummary(security),
+      releaseInstall: commandSummary(releaseInstall),
       backupRestore: commandSummary(backupRestore),
       observability: commandSummary(observability),
     },
     openRisks: [
       'Dashboard target remains release-ready; this baseline does not close E7 until all prior ecosystem gates are closed or explicitly accepted.',
-      'Fresh install, upgrade, installed systemd runtime smoke and host-level rollback rehearsal still need execution evidence outside repository-local checks.',
+      'Upgrade, installed systemd runtime smoke and host-level rollback rehearsal still need execution evidence outside repository-local checks.',
       'Device/manual evidence is still required for E2/E3/E6 before final release closure.',
     ],
   };
