@@ -26832,6 +26832,16 @@ async fn channel_provider_items(db: &Database) -> Result<Vec<serde_json::Value>,
             providers.push(provider_json);
         }
     }
+    for snapshot in plugin_channel_provider_snapshots(db).await? {
+        if snapshot.included {
+            providers.push(channel_provider_json(
+                "",
+                &snapshot.id,
+                &snapshot.name,
+                snapshot.items.len(),
+            ));
+        }
+    }
     Ok(providers)
 }
 
@@ -26839,15 +26849,45 @@ async fn channel_content_items(
     db: &Database,
     channel_id: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
-    let mut items = configured_live_tv_channel_items(db).await?;
-    if items.is_empty() {
-        return Ok(Vec::new());
+    let mut items = Vec::new();
+    let include_live_tv =
+        channel_id.is_none_or(|channel_id| channel_id.eq_ignore_ascii_case("livetv"));
+    if include_live_tv {
+        items.extend(configured_live_tv_channel_items(db).await?);
+        for item in &mut items {
+            item["ChannelId"] = serde_json::json!("livetv");
+        }
     }
-    if channel_id.is_some_and(|channel_id| !channel_id.eq_ignore_ascii_case("livetv")) {
+
+    for provider in configured_channel_provider_descriptors(db).await? {
+        if !channel_provider_is_healthy(&provider) {
+            continue;
+        }
+        let Some(provider_id) =
+            json_string_field(&provider, "Id").or_else(|| json_string_field(&provider, "Name"))
+        else {
+            continue;
+        };
+        if channel_id.is_none_or(|channel_id| channel_id.eq_ignore_ascii_case(&provider_id)) {
+            items.extend(configured_channel_content_items(&provider, &provider_id));
+        }
+    }
+
+    for snapshot in plugin_channel_provider_snapshots(db).await? {
+        if !snapshot.included {
+            continue;
+        }
+        if channel_id.is_none_or(|channel_id| channel_id.eq_ignore_ascii_case(&snapshot.id)) {
+            items.extend(snapshot.items);
+        }
+    }
+
+    if items.is_empty()
+        && channel_id.is_some_and(|channel_id| {
+            !channel_id.eq_ignore_ascii_case("livetv") && !channel_id.trim().is_empty()
+        })
+    {
         return Err(ApiError::not_found("Channel not found"));
-    }
-    for item in &mut items {
-        item["ChannelId"] = serde_json::json!("livetv");
     }
     Ok(items)
 }
@@ -26869,26 +26909,56 @@ async fn channel_feature_items(
     db: &Database,
     channel_id: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
-    if configured_live_tv_channel_items(db).await?.is_empty() {
-        return Ok(Vec::new());
+    let mut features = Vec::new();
+    if !configured_live_tv_channel_items(db).await?.is_empty()
+        && channel_id.is_none_or(|channel_id| channel_id.eq_ignore_ascii_case("livetv"))
+    {
+        features.push(serde_json::json!({
+            "Name": "Live TV",
+            "Id": "livetv",
+            "ChannelId": "livetv",
+            "ContentType": "TvChannel",
+            "MediaTypes": ["Video"],
+            "SupportsLatestItems": true,
+            "SupportsMediaDeletion": false,
+            "SupportsSortOrderToggle": true,
+            "SupportsFavoriteItems": false,
+            "SupportsContentDownloading": false,
+            "AutoRefreshLevels": 0,
+            "DefaultSortFields": ["SortName"],
+        }));
     }
-    if channel_id.is_some_and(|channel_id| !channel_id.eq_ignore_ascii_case("livetv")) {
+    for provider in configured_channel_provider_descriptors(db).await? {
+        if !channel_provider_is_healthy(&provider) {
+            continue;
+        }
+        let Some(provider_id) =
+            json_string_field(&provider, "Id").or_else(|| json_string_field(&provider, "Name"))
+        else {
+            continue;
+        };
+        if channel_id.is_none_or(|channel_id| channel_id.eq_ignore_ascii_case(&provider_id)) {
+            features.push(channel_feature_json(
+                &provider_id,
+                &json_string_field(&provider, "Name").unwrap_or_else(|| provider_id.clone()),
+            ));
+        }
+    }
+    for snapshot in plugin_channel_provider_snapshots(db).await? {
+        if snapshot.included
+            && channel_id.is_none_or(|channel_id| channel_id.eq_ignore_ascii_case(&snapshot.id))
+        {
+            features.push(channel_feature_json(&snapshot.id, &snapshot.name));
+        }
+    }
+    if features.is_empty()
+        && channel_id.is_some_and(|channel_id| {
+            !channel_id.eq_ignore_ascii_case("livetv") && !channel_id.trim().is_empty()
+        })
+    {
         return Err(ApiError::not_found("Channel not found"));
     }
-    Ok(vec![serde_json::json!({
-        "Name": "Live TV",
-        "Id": "livetv",
-        "ChannelId": "livetv",
-        "ContentType": "TvChannel",
-        "MediaTypes": ["Video"],
-        "SupportsLatestItems": true,
-        "SupportsMediaDeletion": false,
-        "SupportsSortOrderToggle": true,
-        "SupportsFavoriteItems": false,
-        "SupportsContentDownloading": false,
-        "AutoRefreshLevels": 0,
-        "DefaultSortFields": ["SortName"],
-    })])
+    Ok(features)
 }
 
 async fn configured_live_tv_channel_items(
@@ -26948,6 +27018,18 @@ async fn channel_provider_diagnostics(db: &Database) -> Result<Vec<serde_json::V
             "Included": healthy
         }));
     }
+    for snapshot in plugin_channel_provider_snapshots(db).await? {
+        providers.push(serde_json::json!({
+            "Id": snapshot.id,
+            "Name": snapshot.name,
+            "Enabled": true,
+            "Runtime": snapshot.runtime,
+            "Status": snapshot.status,
+            "FailureMode": snapshot.failure_mode,
+            "ChildCount": snapshot.items.len(),
+            "Included": snapshot.included
+        }));
+    }
     Ok(providers)
 }
 
@@ -26978,6 +27060,167 @@ fn configured_channel_provider_json(provider: &serde_json::Value) -> Option<serd
         .map(Vec::len)
         .unwrap_or(0);
     Some(channel_provider_json("", &id, &name, child_count))
+}
+
+fn configured_channel_content_items(
+    provider: &serde_json::Value,
+    provider_id: &str,
+) -> Vec<serde_json::Value> {
+    provider
+        .get("Items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, item)| channel_content_item_json(item, provider_id, index))
+        .collect()
+}
+
+#[derive(Debug)]
+struct PluginChannelProviderSnapshot {
+    id: String,
+    name: String,
+    runtime: String,
+    status: String,
+    failure_mode: Option<String>,
+    included: bool,
+    items: Vec<serde_json::Value>,
+}
+
+async fn plugin_channel_provider_snapshots(
+    db: &Database,
+) -> Result<Vec<PluginChannelProviderSnapshot>, ApiError> {
+    let mut snapshots = Vec::new();
+    for plugin in db.installed_plugins_json().await? {
+        if !plugin_is_active_channel_provider(&plugin) {
+            continue;
+        }
+        snapshots.push(plugin_channel_provider_snapshot(&plugin).await);
+    }
+    Ok(snapshots)
+}
+
+async fn plugin_channel_provider_snapshot(
+    plugin: &serde_json::Value,
+) -> PluginChannelProviderSnapshot {
+    let id =
+        json_string_field(plugin, "Id").unwrap_or_else(|| "plugin-channel-provider".to_string());
+    let name = json_string_field(plugin, "Name").unwrap_or_else(|| id.clone());
+    let runtime = json_string_field(plugin, "Runtime").unwrap_or_else(|| "Unknown".to_string());
+    match invoke_plugin_capability_via_runtime_host(
+        plugin,
+        "ChannelProvider",
+        serde_json::json!({ "Operation": "GetItems" }),
+    )
+    .await
+    {
+        Ok(Some(result)) => {
+            let items = result
+                .value
+                .get("Items")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(index, item)| channel_content_item_json(item, &id, index))
+                .collect::<Vec<_>>();
+            PluginChannelProviderSnapshot {
+                id,
+                name,
+                runtime,
+                status: "Healthy".to_string(),
+                failure_mode: None,
+                included: true,
+                items,
+            }
+        }
+        Ok(None) => PluginChannelProviderSnapshot {
+            id,
+            name,
+            runtime,
+            status: "Malfunctioned".to_string(),
+            failure_mode: Some("runtime-unavailable".to_string()),
+            included: false,
+            items: Vec::new(),
+        },
+        Err(error) => PluginChannelProviderSnapshot {
+            id,
+            name,
+            runtime,
+            status: "Malfunctioned".to_string(),
+            failure_mode: Some(format!("{error:?}")),
+            included: false,
+            items: Vec::new(),
+        },
+    }
+}
+
+fn plugin_is_active_channel_provider(plugin: &serde_json::Value) -> bool {
+    json_string_field(plugin, "Status").as_deref() == Some("Active")
+        && plugin_string_array(plugin.get("Capabilities"))
+            .iter()
+            .any(|capability| capability.eq_ignore_ascii_case("ChannelProvider"))
+}
+
+fn channel_content_item_json(
+    item: &serde_json::Value,
+    channel_id: &str,
+    index: usize,
+) -> serde_json::Value {
+    let id = json_string_field(item, "Id").unwrap_or_else(|| format!("{channel_id}-item-{index}"));
+    let name = json_string_field(item, "Name").unwrap_or_else(|| id.clone());
+    let media_type = json_string_field(item, "MediaType").unwrap_or_else(|| "Video".to_string());
+    let item_type =
+        json_string_field(item, "Type").unwrap_or_else(|| "ChannelVideoItem".to_string());
+    let path = json_string_field(item, "Path");
+    let image_url = json_string_field(item, "ImageUrl");
+    serde_json::json!({
+        "Name": name,
+        "ServerId": "",
+        "Id": id,
+        "Etag": null,
+        "DateCreated": null,
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": json_string_field(item, "SortName").unwrap_or_else(|| name.clone()),
+        "ExternalUrls": [],
+        "Path": path,
+        "Overview": json_string_field(item, "Overview").unwrap_or_default(),
+        "ChannelId": channel_id,
+        "ProviderIds": item.get("ProviderIds").cloned().unwrap_or_else(|| serde_json::json!({ "JellyrinChannelProvider": channel_id })),
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": 0,
+            "IsFavorite": false,
+            "Played": false,
+            "Key": id,
+            "ItemId": id
+        },
+        "IsFolder": false,
+        "Type": item_type,
+        "MediaType": media_type,
+        "ImageTags": {},
+        "ImageUrl": image_url,
+        "BackdropImageTags": [],
+        "LocationType": "Virtual"
+    })
+}
+
+fn channel_feature_json(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "Name": name,
+        "Id": id,
+        "ChannelId": id,
+        "ContentType": "ChannelVideoItem",
+        "MediaTypes": ["Video"],
+        "SupportsLatestItems": true,
+        "SupportsMediaDeletion": false,
+        "SupportsSortOrderToggle": true,
+        "SupportsFavoriteItems": false,
+        "SupportsContentDownloading": false,
+        "AutoRefreshLevels": 0,
+        "DefaultSortFields": ["SortName"],
+    })
 }
 
 fn channel_provider_json(
@@ -32506,6 +32749,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rust_wasi_channel_provider_feeds_channels_api() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "bbbbbbbb-0000-0000-0000-000000000001";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("channel.wasm"), b"\0asm")
+            .await
+            .unwrap();
+        let host_path = fake_rust_wasi_channel_provider_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Channel WASI".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Channel WASI",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Channel WASI",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ChannelProvider"]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_rust_wasi_plugin_with_host_path(
+                &db,
+                &plugin,
+                Some(user.id),
+                host_path.clone()
+            )
+            .await
+            .unwrap()
+        );
+        let _guard = RustWasiHostPathGuard::set(host_path);
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels["TotalRecordCount"], 1);
+        assert_eq!(channels["Items"][0]["Id"], plugin_id);
+        assert_eq!(channels["Items"][0]["ChildCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Channels/{plugin_id}/Items"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items["TotalRecordCount"], 1);
+        assert_eq!(items["Items"][0]["Id"], "wasi-channel-item");
+        assert_eq!(items["Items"][0]["ChannelId"], plugin_id);
+        assert_eq!(
+            items["Items"][0]["Path"],
+            "https://example.invalid/wasi.m3u8"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Channels/{plugin_id}/Features"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let features: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(features[0]["Id"], plugin_id);
+        assert_eq!(features[0]["SupportsLatestItems"], true);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels/Diagnostics")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let diagnostics: Value = serde_json::from_slice(&body).unwrap();
+        let provider = diagnostics["Providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["Id"] == plugin_id)
+            .unwrap();
+        assert_eq!(provider["Status"], "Healthy");
+        assert_eq!(provider["Runtime"], "RustWasi");
+        assert_eq!(provider["Included"], true);
+        assert_eq!(provider["ChildCount"], 1);
+    }
+
+    #[tokio::test]
     async fn rust_wasi_activation_passes_granted_permissions_to_host() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -32755,6 +33146,51 @@ while IFS= read -r line; do
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"aaaaaaaa-0000-0000-0000-000000000001","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    async fn fake_rust_wasi_channel_provider_host_script(root: &std::path::Path) -> PathBuf {
+        let path = root.join("fake-wasi-channel-provider-host.sh");
+        tokio::fs::write(
+            &path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-wasi-channel-provider-host","ServerVersion":"fake-wasi-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000001","Runtime":"RustWasi","RuntimeVersion":"fake-wasi-host-0.1","Status":"Healthy","Manifest":{"Name":"Channel WASI"},"Capabilities":["ChannelProvider"]}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"ChannelProvider","Items":[{"Id":"wasi-channel-item","Name":"WASI Channel Item","MediaType":"Video","Path":"https://example.invalid/wasi.m3u8"}],"TotalRecordCount":1}}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000001","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
       ;;
     Shutdown)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
