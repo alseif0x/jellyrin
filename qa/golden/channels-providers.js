@@ -160,9 +160,9 @@ function buildEvidence(result, comparison, localSubgates) {
     return {
       gate: 'channels-providers',
       status: 'implemented',
-      percent: 90,
+      percent: 94,
       closed: false,
-      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation/dotnet-provider',
+      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation/dotnet-provider/remote-http-images',
       evidence: [
         'Channels browser golden completed against upstream Jellyfin and Jellyrin.',
         'Both targets satisfy the base Channels contract for GET /Channels and GET /Channels/Features.',
@@ -170,9 +170,9 @@ function buildEvidence(result, comparison, localSubgates) {
         'The fixture validates provider filtering, media-deletion filtering, item SearchTerm filtering, latest item listing/search, feature capability shape, media-source resolution, direct stream byte delivery and failure isolation for a configured malfunctioning provider.',
         'The local Rust/WASI ChannelProvider fixture validates plugin-backed provider browse, non-Live-TV provider item MediaInfo/LiveStreams/Open and Close resolution, ImageTags and provider item Primary image serving through /Image/Items.',
         'The local DotNetJellyfin ChannelProvider fixture validates stdio-host activation, plugin-backed provider browse, non-Live-TV provider item MediaInfo/LiveStreams/Open resolution and healthy diagnostics.',
-        'RefreshChannels now persists provider cache, item ids, refresh timestamps and refresh history in the channels named configuration.',
+        'RefreshChannels now persists provider cache, item ids, refresh timestamps, remote HTTP provider item image hydration and refresh history in the channels named configuration.',
         'Runtime plugin ChannelProvider failures are isolated from /Channels and /Channels/{id}/Items while diagnostics reports Malfunctioned with failure detail.',
-        'This is an implemented E5 baseline, not full upstream-validated external provider parity: remote HTTP image cache hydration, real external provider traces and broader non-Live-TV provider playback remain open.',
+        'This is an implemented E5 baseline, not full upstream-validated external provider parity: real external provider traces and broader non-Live-TV provider playback remain open.',
       ].join(' '),
       updatedAt,
       completedTargets: allCompletedTargets,
@@ -186,7 +186,7 @@ function buildEvidence(result, comparison, localSubgates) {
       comparisonNotes: comparison.comparison?.reasons || [],
       openRisks: [
         'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
-        'Provider item image resolution is covered for embedded data/plugin payloads; remote HTTP image fetching and cache hydration still need broader provider traces.',
+        'Provider item image resolution is covered for embedded data/plugin payloads and configured-provider remote HTTP hydration; broader external provider traces are still needed.',
         'Rust/WASI and DotNetJellyfin plugin channel-provider browse and MediaInfo resolution are covered by local subgates; real Jellyfin extension-point adapters still need external provider traces.',
         'Provider failure/timeout isolation is covered for declarative and Rust/WASI runtime malfunctioned providers; broader browser evidence with real external providers is still pending.',
       ],

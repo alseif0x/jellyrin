@@ -27477,6 +27477,7 @@ async fn refresh_channel_provider_cache(db: &Database) -> Result<serde_json::Val
         .await?
         .unwrap_or_else(default_channels_configuration);
     let refreshed_at = format_time_for_json(OffsetDateTime::now_utc());
+    let images_cached = hydrate_configured_channel_provider_remote_images(&mut config).await?;
     let mut provider_cache = Vec::new();
     let live_tv_channels = configured_live_tv_channel_items(db).await?;
     if !live_tv_channels.is_empty() {
@@ -27493,7 +27494,12 @@ async fn refresh_channel_provider_cache(db: &Database) -> Result<serde_json::Val
             "RefreshedAtUtc": refreshed_at,
         }));
     }
-    for provider in configured_channel_provider_descriptors(db).await? {
+    let configured_providers = config
+        .get("Providers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for provider in configured_providers {
         let provider_id = json_string_field(&provider, "Id")
             .or_else(|| json_string_field(&provider, "Name"))
             .unwrap_or_else(|| "provider".to_string());
@@ -27508,6 +27514,7 @@ async fn refresh_channel_provider_cache(db: &Database) -> Result<serde_json::Val
             "Status": if healthy { "Healthy" } else { "Malfunctioned" },
             "FailureMode": json_string_field(&provider, "FailureMode"),
             "ItemCount": if healthy { items.len() } else { 0 },
+            "ImageCacheCount": if healthy { channel_items_with_embedded_images(&items) } else { 0 },
             "ItemIds": if healthy {
                 serde_json::Value::Array(items
                     .iter()
@@ -27577,8 +27584,109 @@ async fn refresh_channel_provider_cache(db: &Database) -> Result<serde_json::Val
     Ok(serde_json::json!({
         "ProvidersRefreshed": provider_count,
         "ItemsCached": item_count,
+        "ImagesCached": images_cached,
         "CacheUpdatedAtUtc": cache_updated_at,
     }))
+}
+
+async fn hydrate_configured_channel_provider_remote_images(
+    config: &mut serde_json::Value,
+) -> Result<usize, ApiError> {
+    let refreshed_at = format_time_for_json(OffsetDateTime::now_utc());
+    let Some(providers) = config
+        .get_mut("Providers")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(0);
+    };
+    let mut images_cached = 0;
+    for provider in providers {
+        if !channel_provider_is_healthy(provider) {
+            continue;
+        }
+        let Some(items) = provider
+            .get_mut("Items")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for item in items {
+            if channel_item_primary_image_payload(item)?.is_some() {
+                continue;
+            }
+            let Some(image_url) = json_string_field(item, "ImageUrl") else {
+                continue;
+            };
+            if !image_url.starts_with("http://") && !image_url.starts_with("https://") {
+                continue;
+            }
+            let Some((bytes, mime_type)) = fetch_channel_remote_image_payload(&image_url).await?
+            else {
+                continue;
+            };
+            item["ImageBase64Data"] =
+                serde_json::Value::String(general_purpose::STANDARD.encode(&bytes));
+            item["ImageMimeType"] = serde_json::Value::String(mime_type);
+            item["ImageCacheSourceUrl"] = serde_json::Value::String(image_url);
+            item["ImageCacheUpdatedAtUtc"] = serde_json::Value::String(refreshed_at.clone());
+            images_cached += 1;
+        }
+    }
+    Ok(images_cached)
+}
+
+async fn fetch_channel_remote_image_payload(
+    image_url: &str,
+) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let url = reqwest::Url::parse(image_url)
+        .map_err(|error| ApiError::bad_request(format!("Invalid channel image URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Ok(None);
+    }
+    let response = HttpClient::builder()
+        .timeout(StdDuration::from_secs(5))
+        .build()
+        .map_err(|error| ApiError::internal(format!("Image HTTP client failed: {error}")))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("Channel image fetch failed: {error}")))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let mime_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .filter(|value| value.starts_with("image/"))
+        .map(str::to_string);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| ApiError::internal(format!("Channel image fetch failed: {error}")))?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > IMAGE_UPLOAD_LIMIT_BYTES {
+        return Err(ApiError::bad_request("Channel image file is too large"));
+    }
+    let bytes = bytes.to_vec();
+    let mime_type =
+        mime_type.unwrap_or_else(|| image_format_from_bytes(&bytes).content_type.to_string());
+    Ok(Some((bytes, mime_type)))
+}
+
+fn channel_items_with_embedded_images(items: &[serde_json::Value]) -> usize {
+    items
+        .iter()
+        .filter(|item| {
+            channel_item_primary_image_payload(item)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+        .count()
 }
 
 fn channel_provider_is_healthy(provider: &serde_json::Value) -> bool {
@@ -27752,6 +27860,10 @@ fn channel_content_item_json(
         "MediaType": media_type,
         "ImageTags": image_tags,
         "ImageUrl": image_url,
+        "ImageBase64Data": json_string_any_field(item, &["ImageBase64Data", "ImageData", "Base64Data", "Data"]),
+        "ImageMimeType": json_string_any_field(item, &["ImageMimeType", "MimeType", "ContentType"]),
+        "ImageCacheSourceUrl": json_string_field(item, "ImageCacheSourceUrl"),
+        "ImageCacheUpdatedAtUtc": json_string_field(item, "ImageCacheUpdatedAtUtc"),
         "BackdropImageTags": [],
         "LocationType": "Virtual"
     })
@@ -34904,6 +35016,40 @@ done
         (format!("http://{addr}/events"), rx)
     }
 
+    async fn spawn_single_http_image_response(
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut scratch = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut scratch).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                buffer.extend_from_slice(&scratch[..read]);
+                if let Some(end) = http_header_end(&buffer) {
+                    break end;
+                }
+            };
+            let request = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+            let response_headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                bytes.len()
+            );
+            stream.write_all(response_headers.as_bytes()).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            let _ = tx.send(request);
+        });
+        (format!("http://{addr}/channel-image.png"), rx)
+    }
+
     async fn spawn_http_request_recorder(
         expected_requests: usize,
     ) -> (String, tokio::sync::mpsc::Receiver<String>) {
@@ -36660,6 +36806,8 @@ done
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        let (remote_image_url, remote_image_request) =
+            spawn_single_http_image_response(test_png_bytes(), "image/png").await;
         db.update_named_configuration(
             "channels",
             json!({
@@ -36671,7 +36819,8 @@ done
                             {
                                 "Id": "fixture-item",
                                 "Name": "Fixture Item",
-                                "Path": "https://example.invalid/fixture.m3u8"
+                                "Path": "https://example.invalid/fixture.m3u8",
+                                "ImageUrl": remote_image_url
                             }
                         ]
                     },
@@ -36753,8 +36902,12 @@ done
             2
         );
         assert_eq!(task["LastExecutionResult"]["Result"]["ItemsCached"], 1);
+        assert_eq!(task["LastExecutionResult"]["Result"]["ImagesCached"], 1);
+        let request = remote_image_request.await.unwrap();
+        assert!(request.starts_with("GET /channel-image.png HTTP/1.1"));
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/System/Configuration/channels")
@@ -36777,7 +36930,12 @@ done
             .unwrap();
         assert_eq!(fixture["Status"], "Healthy");
         assert_eq!(fixture["ItemCount"], 1);
+        assert_eq!(fixture["ImageCacheCount"], 1);
         assert_eq!(fixture["ItemIds"], json!(["fixture-item"]));
+        let cached_item = config["Providers"][0]["Items"][0].clone();
+        assert!(cached_item["ImageBase64Data"].as_str().is_some());
+        assert_eq!(cached_item["ImageMimeType"], "image/png");
+        assert!(cached_item["ImageCacheUpdatedAtUtc"].as_str().is_some());
         let broken = config["ProviderCache"]
             .as_array()
             .unwrap()
@@ -36789,6 +36947,24 @@ done
         assert_eq!(config["RefreshHistory"][0]["Status"], "Completed");
         assert_eq!(config["RefreshHistory"][0]["ProviderCount"], 2);
         assert_eq!(config["RefreshHistory"][0]["ItemCount"], 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Image/Items/fixture-item/Images/Primary")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), test_png_bytes().as_slice());
     }
 
     #[tokio::test]
