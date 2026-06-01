@@ -9942,13 +9942,18 @@ fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
 
 fn default_channels_configuration() -> serde_json::Value {
     serde_json::json!({
-        "Providers": []
+        "Providers": [],
+        "ProviderCache": [],
+        "RefreshHistory": []
     })
 }
 
 fn channels_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     let mut config = default_channels_configuration();
     merge_known_network_value(&mut config, &payload, "Providers");
+    merge_known_network_value(&mut config, &payload, "ProviderCache");
+    merge_known_network_value(&mut config, &payload, "RefreshHistory");
+    merge_known_network_value(&mut config, &payload, "LastRefreshUtc");
     config
 }
 
@@ -10486,6 +10491,8 @@ fn web_content_type_for_path(path: &FsPath) -> &'static str {
 
 const LIBRARY_SCAN_TASK_ID: &str = "scan-media-library";
 const LIBRARY_SCAN_TASK_KEY: &str = "RefreshLibrary";
+const CHANNEL_REFRESH_TASK_ID: &str = "refresh-channels";
+const CHANNEL_REFRESH_TASK_KEY: &str = "RefreshChannels";
 const STALE_TASK_HOURS: i64 = 24;
 
 async fn scheduled_tasks(
@@ -10508,6 +10515,9 @@ async fn scheduled_task(
     recover_stale_library_scan_runs(&state.db).await?;
     if is_library_scan_task(&task_id) {
         return Ok(Json(library_scan_task_json(&state.db).await?));
+    }
+    if is_channel_refresh_task(&task_id) {
+        return Ok(Json(channel_refresh_task_json(&state.db).await?));
     }
     if let Some(task) = plugin_scheduled_task_json_by_id(&state.db, &task_id).await? {
         return Ok(Json(task));
@@ -10559,6 +10569,42 @@ async fn start_scheduled_task(
                             }),
                         )
                         .await;
+                }
+                Err(error) => {
+                    let message = format!("{error:?}");
+                    let _ = db.fail_task_run(run.id, &message).await;
+                }
+            }
+            let _ = broadcast_scheduled_tasks_update(&db, &session_id).await;
+        });
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if is_channel_refresh_task(&task_id) {
+        recover_stale_channel_refresh_runs(&state.db).await?;
+        let run = match state.db.start_task_run(CHANNEL_REFRESH_TASK_KEY).await {
+            Ok(run) => run,
+            Err(error) if format!("{error:#}").contains("task is already running") => {
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(error)
+                if state
+                    .db
+                    .current_task_run(CHANNEL_REFRESH_TASK_KEY)
+                    .await?
+                    .is_some() =>
+            {
+                let _ = error;
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let db = state.db.clone();
+        let session_id = token.access_token.clone();
+        broadcast_scheduled_tasks_update(&db, &session_id).await?;
+        tokio::spawn(async move {
+            match refresh_channel_provider_cache(&db).await {
+                Ok(result) => {
+                    let _ = db.complete_task_run(run.id, result).await;
                 }
                 Err(error) => {
                     let message = format!("{error:?}");
@@ -10633,6 +10679,14 @@ async fn stop_scheduled_task(
         broadcast_scheduled_tasks_update(&state.db, &token.access_token).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
+    if is_channel_refresh_task(&task_id) {
+        state
+            .db
+            .fail_current_task_run(CHANNEL_REFRESH_TASK_KEY, "Task run cancelled.")
+            .await?;
+        broadcast_scheduled_tasks_update(&state.db, &token.access_token).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     if let Some(plugin) = plugin_for_scheduled_task(&state.db, &task_id).await? {
         let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
         state
@@ -10660,6 +10714,9 @@ async fn update_scheduled_task_triggers(
     if is_library_scan_task(&task_id) {
         return Ok(StatusCode::NO_CONTENT);
     }
+    if is_channel_refresh_task(&task_id) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     if plugin_for_scheduled_task(&state.db, &task_id)
         .await?
         .is_some()
@@ -10680,8 +10737,21 @@ async fn recover_stale_library_scan_runs(db: &Database) -> Result<(), ApiError> 
     Ok(())
 }
 
+async fn recover_stale_channel_refresh_runs(db: &Database) -> Result<(), ApiError> {
+    db.fail_stale_task_runs(
+        CHANNEL_REFRESH_TASK_KEY,
+        Duration::hours(STALE_TASK_HOURS),
+        "Task run expired before completion.",
+    )
+    .await?;
+    Ok(())
+}
+
 async fn scheduled_task_list_json(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
-    let mut tasks = vec![library_scan_task_json(db).await?];
+    let mut tasks = vec![
+        library_scan_task_json(db).await?,
+        channel_refresh_task_json(db).await?,
+    ];
     for plugin in plugin_scheduled_task_plugins(db).await? {
         tasks.push(plugin_scheduled_task_json(db, &plugin).await?);
     }
@@ -10960,7 +11030,45 @@ fn is_library_scan_task(task_id: &str) -> bool {
     task_id == LIBRARY_SCAN_TASK_ID || task_id == LIBRARY_SCAN_TASK_KEY
 }
 
+async fn channel_refresh_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let current_run = db.current_task_run(CHANNEL_REFRESH_TASK_KEY).await?;
+    let last_result = db.last_task_result(CHANNEL_REFRESH_TASK_KEY).await?;
+    let state = if current_run.is_some() {
+        "Running"
+    } else {
+        "Idle"
+    };
+
+    Ok(serde_json::json!({
+        "Name": "Refresh Channels",
+        "State": state,
+        "Id": CHANNEL_REFRESH_TASK_ID,
+        "LastExecutionResult": last_result
+            .as_ref()
+            .map(|run| named_task_run_result_json(run, "Refresh Channels"))
+            .unwrap_or_else(default_channel_refresh_task_result_json),
+        "Triggers": [
+            {
+                "Type": "IntervalTrigger",
+                "IntervalTicks": 43_200_000_000_i64,
+            }
+        ],
+        "Description": "Refreshes configured channel provider cache and health state.",
+        "Category": "Channels",
+        "IsHidden": false,
+        "Key": CHANNEL_REFRESH_TASK_KEY,
+    }))
+}
+
+fn is_channel_refresh_task(task_id: &str) -> bool {
+    task_id == CHANNEL_REFRESH_TASK_ID || task_id == CHANNEL_REFRESH_TASK_KEY
+}
+
 fn task_run_result_json(run: &TaskRun) -> serde_json::Value {
+    named_task_run_result_json(run, "Scan Media Library")
+}
+
+fn named_task_run_result_json(run: &TaskRun, name: &str) -> serde_json::Value {
     let status = match run.status.as_str() {
         "completed" => "Completed",
         "failed" => "Failed",
@@ -10968,7 +11076,7 @@ fn task_run_result_json(run: &TaskRun) -> serde_json::Value {
     };
 
     serde_json::json!({
-        "Name": "Scan Media Library",
+        "Name": name,
         "Key": run.task_key.clone(),
         "Id": run.id.to_string(),
         "Status": status,
@@ -10984,6 +11092,17 @@ fn default_library_scan_task_result_json() -> serde_json::Value {
     serde_json::json!({
         "Name": "Scan Media Library",
         "Key": LIBRARY_SCAN_TASK_KEY,
+        "Id": "00000000-0000-0000-0000-000000000000",
+        "Status": "Completed",
+        "StartTimeUtc": "1970-01-01T00:00:00Z",
+        "EndTimeUtc": "1970-01-01T00:00:00Z",
+    })
+}
+
+fn default_channel_refresh_task_result_json() -> serde_json::Value {
+    serde_json::json!({
+        "Name": "Refresh Channels",
+        "Key": CHANNEL_REFRESH_TASK_KEY,
         "Id": "00000000-0000-0000-0000-000000000000",
         "Status": "Completed",
         "StartTimeUtc": "1970-01-01T00:00:00Z",
@@ -27231,6 +27350,116 @@ async fn channel_provider_diagnostics(db: &Database) -> Result<Vec<serde_json::V
     Ok(providers)
 }
 
+async fn refresh_channel_provider_cache(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let mut config = db
+        .named_configuration("channels")
+        .await?
+        .unwrap_or_else(default_channels_configuration);
+    let refreshed_at = format_time_for_json(OffsetDateTime::now_utc());
+    let mut provider_cache = Vec::new();
+    let live_tv_channels = configured_live_tv_channel_items(db).await?;
+    if !live_tv_channels.is_empty() {
+        provider_cache.push(serde_json::json!({
+            "Id": "livetv",
+            "Name": "Live TV",
+            "Source": "LiveTv",
+            "Status": "Healthy",
+            "ItemCount": live_tv_channels.len(),
+            "ItemIds": live_tv_channels
+                .iter()
+                .filter_map(|item| json_string_field(item, "Id"))
+                .collect::<Vec<_>>(),
+            "RefreshedAtUtc": refreshed_at,
+        }));
+    }
+    for provider in configured_channel_provider_descriptors(db).await? {
+        let provider_id = json_string_field(&provider, "Id")
+            .or_else(|| json_string_field(&provider, "Name"))
+            .unwrap_or_else(|| "provider".to_string());
+        let provider_name =
+            json_string_field(&provider, "Name").unwrap_or_else(|| provider_id.clone());
+        let items = configured_channel_content_items(&provider, &provider_id);
+        let healthy = channel_provider_is_healthy(&provider);
+        provider_cache.push(serde_json::json!({
+            "Id": provider_id,
+            "Name": provider_name,
+            "Source": "Configured",
+            "Status": if healthy { "Healthy" } else { "Malfunctioned" },
+            "FailureMode": json_string_field(&provider, "FailureMode"),
+            "ItemCount": if healthy { items.len() } else { 0 },
+            "ItemIds": if healthy {
+                serde_json::Value::Array(items
+                    .iter()
+                    .filter_map(|item| json_string_field(item, "Id").map(serde_json::Value::String))
+                    .collect())
+            } else {
+                serde_json::json!([])
+            },
+            "RefreshedAtUtc": refreshed_at,
+        }));
+    }
+    for snapshot in plugin_channel_provider_snapshots(db).await? {
+        provider_cache.push(serde_json::json!({
+            "Id": snapshot.id,
+            "Name": snapshot.name,
+            "Source": "Plugin",
+            "Runtime": snapshot.runtime,
+            "Status": snapshot.status,
+            "FailureMode": snapshot.failure_mode,
+            "ItemCount": if snapshot.included { snapshot.items.len() } else { 0 },
+            "ItemIds": if snapshot.included {
+                serde_json::Value::Array(snapshot.items
+                    .iter()
+                    .filter_map(|item| json_string_field(item, "Id").map(serde_json::Value::String))
+                    .collect())
+            } else {
+                serde_json::json!([])
+            },
+            "RefreshedAtUtc": refreshed_at,
+        }));
+    }
+    let provider_count = provider_cache.len();
+    let item_count: usize = provider_cache
+        .iter()
+        .filter_map(|provider| {
+            provider
+                .get("ItemCount")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .map(|count| count as usize)
+        .sum();
+    let mut refresh_history = config
+        .get("RefreshHistory")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    refresh_history.insert(
+        0,
+        serde_json::json!({
+            "Status": "Completed",
+            "RefreshedAtUtc": refreshed_at,
+            "ProviderCount": provider_count,
+            "ItemCount": item_count,
+        }),
+    );
+    refresh_history.truncate(10);
+    config["ProviderCache"] = serde_json::Value::Array(provider_cache);
+    config["RefreshHistory"] = serde_json::Value::Array(refresh_history);
+    config["LastRefreshUtc"] = serde_json::Value::String(refreshed_at);
+    let normalized = channels_configuration_json(config);
+    let cache_updated_at = normalized
+        .get("LastRefreshUtc")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    db.update_named_configuration("channels", normalized)
+        .await?;
+    Ok(serde_json::json!({
+        "ProvidersRefreshed": provider_count,
+        "ItemsCached": item_count,
+        "CacheUpdatedAtUtc": cache_updated_at,
+    }))
+}
+
 fn channel_provider_is_healthy(provider: &serde_json::Value) -> bool {
     if provider
         .get("Enabled")
@@ -35728,13 +35957,16 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let tasks: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(tasks.as_array().unwrap().len(), 1);
+        assert_eq!(tasks.as_array().unwrap().len(), 2);
         assert_eq!(tasks[0]["Id"], "scan-media-library");
         assert_eq!(tasks[0]["Key"], "RefreshLibrary");
         assert_eq!(tasks[0]["Name"], "Scan Media Library");
         assert_eq!(tasks[0]["State"], "Idle");
         assert_eq!(tasks[0]["IsHidden"], false);
         assert_eq!(tasks[0]["Triggers"].as_array().unwrap().len(), 1);
+        assert_eq!(tasks[1]["Id"], "refresh-channels");
+        assert_eq!(tasks[1]["Key"], "RefreshChannels");
+        assert_eq!(tasks[1]["Name"], "Refresh Channels");
 
         let response = app
             .clone()
@@ -35855,6 +36087,148 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn channels_refresh_task_persists_provider_cache_and_history() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        db.update_named_configuration(
+            "channels",
+            json!({
+                "Providers": [
+                    {
+                        "Id": "fixture-provider",
+                        "Name": "Fixture Provider",
+                        "Items": [
+                            {
+                                "Id": "fixture-item",
+                                "Name": "Fixture Item",
+                                "Path": "https://example.invalid/fixture.m3u8"
+                            }
+                        ]
+                    },
+                    {
+                        "Id": "broken-provider",
+                        "Name": "Broken Provider",
+                        "FailureMode": "timeout",
+                        "Items": [{ "Id": "broken-item" }]
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ScheduledTasks/refresh-channels")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let task: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(task["Key"], "RefreshChannels");
+        assert_eq!(task["Category"], "Channels");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ScheduledTasks/Running/refresh-channels")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let mut task = json!({});
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/ScheduledTasks/refresh-channels")
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            task = serde_json::from_slice(&body).unwrap();
+            if task["State"] == "Idle" && task["LastExecutionResult"]["Status"] == "Completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(task["State"], "Idle");
+        assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
+        assert_eq!(task["LastExecutionResult"]["Key"], "RefreshChannels");
+        assert_eq!(
+            task["LastExecutionResult"]["Result"]["ProvidersRefreshed"],
+            2
+        );
+        assert_eq!(task["LastExecutionResult"]["Result"]["ItemsCached"], 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/channels")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let config: Value = serde_json::from_slice(&body).unwrap();
+        assert!(config["LastRefreshUtc"].as_str().is_some());
+        assert_eq!(config["ProviderCache"].as_array().unwrap().len(), 2);
+        let fixture = config["ProviderCache"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["Id"] == "fixture-provider")
+            .unwrap();
+        assert_eq!(fixture["Status"], "Healthy");
+        assert_eq!(fixture["ItemCount"], 1);
+        assert_eq!(fixture["ItemIds"], json!(["fixture-item"]));
+        let broken = config["ProviderCache"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["Id"] == "broken-provider")
+            .unwrap();
+        assert_eq!(broken["Status"], "Malfunctioned");
+        assert_eq!(broken["ItemCount"], 0);
+        assert_eq!(config["RefreshHistory"][0]["Status"], "Completed");
+        assert_eq!(config["RefreshHistory"][0]["ProviderCount"], 2);
+        assert_eq!(config["RefreshHistory"][0]["ItemCount"], 1);
     }
 
     #[tokio::test]
