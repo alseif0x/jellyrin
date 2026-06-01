@@ -408,7 +408,11 @@ async function captureTarget(browser, flowDir, target) {
       channelsDeletionFilterMatched: false,
       channelsItems200: false,
       channelsItemMatched: false,
+      channelsSearchMatched: false,
+      channelsMediaSourceResolved: false,
+      channelsStreamBytes: false,
       channelsLatest200: false,
+      channelsLatestSearchMatched: false,
       channelsFeatures200: false,
       channelsFeatureMatched: false,
       nonWebClientAuthenticated: false,
@@ -3201,10 +3205,45 @@ async function runChannelsFlow(page, summary, publicInfo, target) {
     throw new Error(`Channels/livetv/Items returned HTTP ${channelItems.status}`);
   }
   summary.invariants.channelsItems200 = true;
-  if (!channelItems.json.Items.some((item) => item.Id === liveTvFlowChannelId && item.ChannelId === 'livetv')) {
+  const fixtureChannelItem = channelItems.json.Items.find((item) => item.Id === liveTvFlowChannelId && item.ChannelId === 'livetv');
+  if (!fixtureChannelItem) {
     throw new Error('Channels/livetv/Items did not expose the M3U channel fixture');
   }
   summary.invariants.channelsItemMatched = true;
+
+  const searchedChannelItems = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Channels/livetv/Items?SearchTerm=${encodeURIComponent('Jellyrin Live')}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (searchedChannelItems.status !== 200 || !searchedChannelItems.json?.Items?.some((item) => item.Id === liveTvFlowChannelId)) {
+    throw new Error(`Channels/livetv/Items SearchTerm did not expose channel fixture, HTTP ${searchedChannelItems.status}`);
+  }
+  summary.invariants.channelsSearchMatched = true;
+
+  const liveStream = await browserFetchJson(page, {
+    method: 'POST',
+    url: '/MediaInfo/LiveStreams/Open',
+    token: auth.AccessToken,
+    body: {
+      ItemId: liveTvFlowChannelId,
+    },
+  });
+  if (liveStream.status !== 200 || !liveStream.json?.MediaSource?.DirectStreamUrl) {
+    throw new Error(`MediaInfo/LiveStreams/Open did not resolve channel media source, HTTP ${liveStream.status}`);
+  }
+  summary.invariants.channelsMediaSourceResolved = true;
+
+  const streamUrl = liveStream.json.MediaSource.DirectStreamUrl || fixtureChannelItem.MediaSources?.[0]?.DirectStreamUrl;
+  const stream = await browserFetchBinary(page, {
+    method: 'GET',
+    url: streamUrl,
+    token: auth.AccessToken,
+  });
+  if (stream.status !== 200 || stream.byteLength < 1) {
+    throw new Error(`Channels provider stream probe returned HTTP ${stream.status} with ${stream.byteLength} bytes`);
+  }
+  summary.invariants.channelsStreamBytes = true;
 
   const latest = await browserFetchJson(page, {
     method: 'GET',
@@ -3215,6 +3254,16 @@ async function runChannelsFlow(page, summary, publicInfo, target) {
     throw new Error(`Channels/Items/Latest did not expose channel fixture, HTTP ${latest.status}`);
   }
   summary.invariants.channelsLatest200 = true;
+
+  const latestSearch = await browserFetchJson(page, {
+    method: 'GET',
+    url: `/Channels/Items/Latest?SearchTerm=${encodeURIComponent('Jellyrin Live')}&Limit=5`,
+    token: auth.AccessToken,
+  });
+  if (latestSearch.status !== 200 || !latestSearch.json?.Items?.some((item) => item.Id === liveTvFlowChannelId)) {
+    throw new Error(`Channels/Items/Latest SearchTerm did not expose channel fixture, HTTP ${latestSearch.status}`);
+  }
+  summary.invariants.channelsLatestSearchMatched = true;
 
   const feature = features.json.find((item) => item.ChannelId === 'livetv');
   if (!feature || feature.SupportsLatestItems !== true || feature.ContentType !== 'TvChannel') {
@@ -9404,7 +9453,11 @@ function invariantFailures(summary) {
         ['channelsDeletionFilterMatched', 'media deletion filter'],
         ['channelsItems200', 'provider items'],
         ['channelsItemMatched', 'fixture channel item'],
+        ['channelsSearchMatched', 'provider item search'],
+        ['channelsMediaSourceResolved', 'provider media source resolution'],
+        ['channelsStreamBytes', 'provider stream bytes'],
         ['channelsLatest200', 'latest channel items'],
+        ['channelsLatestSearchMatched', 'latest channel item search'],
         ['channelsFeatureMatched', 'feature capabilities'],
       ]) {
         if (!summary.invariants[field]) {

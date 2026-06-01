@@ -25,7 +25,11 @@ const jellyrinRequired = [
   'channelsDeletionFilterMatched',
   'channelsItems200',
   'channelsItemMatched',
+  'channelsSearchMatched',
+  'channelsMediaSourceResolved',
+  'channelsStreamBytes',
   'channelsLatest200',
+  'channelsLatestSearchMatched',
   'channelsFeatureMatched',
 ];
 
@@ -103,14 +107,14 @@ function buildEvidence(result, comparison) {
     return {
       gate: 'channels-providers',
       status: 'implemented',
-      percent: 45,
+      percent: 55,
       closed: false,
       sourcePhase: 'E5.1/E5.4/E5.5/browser-basic',
       evidence: [
         'Channels browser golden completed against upstream Jellyfin and Jellyrin.',
         'Both targets satisfy the base Channels contract for GET /Channels and GET /Channels/Features.',
-        'Jellyrin additionally exposes a real Live TV-backed channel provider fixture through /Channels, /Channels/livetv/Items, /Channels/Items/Latest and /Channels/livetv/Features.',
-        'The fixture validates provider filtering, media-deletion filtering, latest item listing and feature capability shape.',
+        'Jellyrin additionally exposes a real Live TV-backed channel provider fixture through /Channels, /Channels/livetv/Items, /Channels/Items/Latest, /Channels/livetv/Features and MediaInfo live-stream resolution.',
+        'The fixture validates provider filtering, media-deletion filtering, item SearchTerm filtering, latest item listing/search, feature capability shape, media-source resolution and direct stream byte delivery.',
         'This is an implemented E5 baseline, not full upstream-validated external provider parity: plugin-backed providers, refresh/cache persistence, search, images and failure isolation remain open.',
       ].join(' '),
       updatedAt,
@@ -124,7 +128,7 @@ function buildEvidence(result, comparison) {
       comparisonNotes: comparison.comparison?.reasons || [],
       openRisks: [
         'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
-        'Provider registry/cache, refresh task state, search, image resolution and media-source playback for external channel items are still pending.',
+        'Provider registry/cache, refresh task state, image resolution and media-source playback for non-Live-TV external channel items are still pending.',
         'Rust/WASI and DotNet plugin channel-provider fixtures are still pending on fuller provider ABI execution.',
         'Provider failure/timeout isolation still needs direct tests and browser evidence.',
       ],

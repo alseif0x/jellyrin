@@ -26662,6 +26662,8 @@ struct ChannelsQuery {
     start_index: Option<usize>,
     #[serde(alias = "limit", alias = "Limit")]
     limit: Option<usize>,
+    #[serde(alias = "searchTerm", alias = "SearchTerm")]
+    search_term: Option<String>,
     #[serde(alias = "supportsLatestItems", alias = "SupportsLatestItems")]
     supports_latest_items: Option<bool>,
     #[serde(alias = "supportsMediaDeletion", alias = "SupportsMediaDeletion")]
@@ -26712,6 +26714,7 @@ async fn channel_latest_items(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let mut items = channel_content_items(&state.db, None).await?;
+    filter_channel_items_by_search(&mut items, query.search_term.as_deref());
     items.sort_by(|left, right| {
         let left_sort = json_string_field(left, "SortName")
             .or_else(|| json_string_field(left, "Name"))
@@ -26741,6 +26744,7 @@ async fn channel_items(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let mut items = channel_content_items(&state.db, Some(&channel_id)).await?;
+    filter_channel_items_by_search(&mut items, query.search_term.as_deref());
     let total = items.len();
     let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(usize::MAX);
@@ -26801,6 +26805,19 @@ async fn channel_content_items(
         item["ChannelId"] = serde_json::json!("livetv");
     }
     Ok(items)
+}
+
+fn filter_channel_items_by_search(items: &mut Vec<serde_json::Value>, search_term: Option<&str>) {
+    let Some(search_term) = search_term.map(str::trim).filter(|term| !term.is_empty()) else {
+        return;
+    };
+    let search_term = search_term.to_ascii_lowercase();
+    items.retain(|item| {
+        ["Name", "SortName", "Id", "Number", "ChannelNumber"]
+            .iter()
+            .filter_map(|field| json_string_field(item, field))
+            .any(|value| value.to_ascii_lowercase().contains(&search_term))
+    });
 }
 
 async fn channel_feature_items(
@@ -39864,6 +39881,24 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/channels/livetv/items?SearchTerm=News")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let searched_channel_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(searched_channel_items["TotalRecordCount"], 1);
+        assert_eq!(searched_channel_items["Items"][0]["Id"], "channel-1");
+        assert_eq!(searched_channel_items["Items"][0]["ChannelId"], "livetv");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Channels/Items/Latest?Limit=1")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -39877,6 +39912,27 @@ done
         assert_eq!(latest_channel_items["TotalRecordCount"], 2);
         assert_eq!(latest_channel_items["Items"].as_array().unwrap().len(), 1);
         assert_eq!(latest_channel_items["Items"][0]["ChannelId"], "livetv");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels/Items/Latest?SearchTerm=Movies")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let latest_searched_channel_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(latest_searched_channel_items["TotalRecordCount"], 1);
+        assert_eq!(latest_searched_channel_items["Items"][0]["Id"], "channel-2");
+        assert_eq!(
+            latest_searched_channel_items["Items"][0]["ChannelId"],
+            "livetv"
+        );
 
         let response = app
             .clone()
