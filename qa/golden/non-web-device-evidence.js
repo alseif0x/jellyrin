@@ -9,6 +9,7 @@ const plansDir = process.env.JELLYRIN_PLANS_DIR || defaultPlansDir;
 const manualEvidenceDir = process.env.JELLYRIN_NON_WEB_DEVICE_EVIDENCE_DIR
   || path.join(plansDir, 'manual', 'non-web-clients');
 const templatePath = path.join(manualEvidenceDir, 'template.json');
+const allowedEvidenceTypes = ['real-client-playback', 'formal-contract-acceptance'];
 
 const clientProfiles = [
   {
@@ -164,9 +165,12 @@ async function loadManualDeviceEvidence() {
 async function ensureTemplate() {
   await fs.mkdir(manualEvidenceDir, { recursive: true });
   try {
-    await fs.access(templatePath);
+    const existing = JSON.parse(await fs.readFile(templatePath, 'utf8'));
+    if (!allowedEvidenceTypes.includes(existing.evidenceType)) {
+      await fs.writeFile(templatePath, `${JSON.stringify(manualEvidenceTemplate(), null, 2)}\n`);
+    }
   } catch (error) {
-    if (error.code !== 'ENOENT') {
+    if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) {
       throw error;
     }
     await fs.writeFile(templatePath, `${JSON.stringify(manualEvidenceTemplate(), null, 2)}\n`);
@@ -179,6 +183,12 @@ function validateManualEvidence(evidence) {
     return ['evidence must be a JSON object'];
   }
   requireString(errors, evidence, 'clientId');
+  if (evidence.evidenceType !== undefined) {
+    requireString(errors, evidence, 'evidenceType');
+  }
+  if (typeof evidence.evidenceType === 'string' && !allowedEvidenceTypes.includes(evidence.evidenceType)) {
+    errors.push(`evidenceType must be one of ${allowedEvidenceTypes.join(', ')}`);
+  }
   if (evidence.clientId && !requiredProfiles.includes(evidence.clientId)) {
     errors.push(`clientId must be one of ${requiredProfiles.join(', ')}`);
   }
@@ -230,7 +240,23 @@ function validateManualEvidence(evidence) {
       requireString(errors, artifact, `artifacts[${index}].pathOrUrl`, 'pathOrUrl');
     });
   }
+  if (evidence.evidenceType === 'formal-contract-acceptance') {
+    validateFormalContractAcceptance(errors, evidence.acceptance);
+  }
   return errors;
+}
+
+function validateFormalContractAcceptance(errors, acceptance) {
+  if (!acceptance || typeof acceptance !== 'object' || Array.isArray(acceptance)) {
+    errors.push('acceptance must be an object for formal-contract-acceptance evidence');
+    return;
+  }
+  for (const field of ['acceptedBy', 'acceptedAt', 'rationale', 'upstreamValidatedEvidencePath']) {
+    requireString(errors, acceptance, `acceptance.${field}`, field);
+  }
+  if (acceptance.acceptedAt && Number.isNaN(Date.parse(acceptance.acceptedAt))) {
+    errors.push('acceptance.acceptedAt must be an ISO-compatible date string');
+  }
 }
 
 function requireString(errors, value, label, key = label) {
@@ -241,6 +267,7 @@ function requireString(errors, value, label, key = label) {
 
 function manualEvidenceTemplate() {
   return {
+    evidenceType: 'real-client-playback',
     clientId: 'mpv-shim',
     clientName: 'Jellyfin MPV Shim',
     clientVersion: 'replace-with-client-version',
@@ -267,7 +294,13 @@ function manualEvidenceTemplate() {
         pathOrUrl: 'manual/non-web-clients/artifacts/replace-with-file',
       },
     ],
-    notes: 'Optional notes about playback, codecs, subtitles, or client-specific behavior.',
+    acceptance: {
+      acceptedBy: '',
+      acceptedAt: '',
+      rationale: '',
+      upstreamValidatedEvidencePath: '',
+    },
+    notes: 'Optional notes about playback, codecs, subtitles, or client-specific behavior. For formal contract acceptance, set evidenceType=formal-contract-acceptance and fill acceptance.',
   };
 }
 
@@ -326,6 +359,7 @@ async function main() {
     validCount: report.valid.length,
     invalidCount: report.invalid.length,
     valid: report.valid.map((entry) => ({
+      evidenceType: entry.evidence.evidenceType || 'real-client-playback',
       clientId: entry.evidence.clientId,
       clientName: entry.evidence.clientName,
       clientVersion: entry.evidence.clientVersion,
@@ -355,4 +389,5 @@ module.exports = {
   buildCompatibilityMatrix,
   loadManualDeviceEvidence,
   validateManualEvidence,
+  allowedEvidenceTypes,
 };

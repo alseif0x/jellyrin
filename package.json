@@ -28,6 +28,8 @@
     "golden:channels:fresh": "node qa/golden/channels-runner.js",
     "golden:clients": "node qa/golden/non-web-clients.js",
     "golden:clients:device-evidence": "node qa/golden/non-web-device-evidence.js",
+    "golden:clients:contract-acceptance": "node qa/golden/non-web-contract-acceptance.js",
+    "golden:clients:fresh": "node qa/golden/non-web-clients-runner.js",
     "golden:ecosystem-release": "node qa/golden/ecosystem-release.js",
     "qa:security-hardening": "node qa/security-hardening.js",
     "evidence:ecosystem": "node qa/golden/ecosystem-parity.js",

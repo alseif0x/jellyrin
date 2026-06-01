@@ -3448,14 +3448,7 @@ async function runNonWebClientFlow(page, summary, publicInfo, target) {
       }
       summary.invariants.nonWebProgress204 = true;
 
-      const resume = await browserFetchJson(page, {
-        method: 'GET',
-        url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video`,
-        token: auth.AccessToken,
-      });
-      if (resume.status !== 200 || !resume.json?.Items?.some((item) => item.Id === movie.Id)) {
-        throw new Error(`non-web ${contract.id} resume query did not include movie, HTTP ${resume.status}`);
-      }
+      await waitForNonWebResume(page, auth, movie.Id, contract.id);
       summary.invariants.nonWebResumeMatched = true;
       passedProfiles.push(contract.id);
     }
@@ -3498,6 +3491,24 @@ async function runNonWebClientFlow(page, summary, publicInfo, target) {
       }).catch(() => {});
     }
   }
+}
+
+async function waitForNonWebResume(page, auth, movieId, contractId) {
+  const deadline = Date.now() + 10_000;
+  let lastStatus = 0;
+  while (Date.now() < deadline) {
+    const resume = await browserFetchJson(page, {
+      method: 'GET',
+      url: `/UserItems/Resume?UserId=${encodeURIComponent(auth.User.Id)}&Limit=12&MediaTypes=Video`,
+      token: auth.AccessToken,
+    });
+    lastStatus = resume.status;
+    if (resume.status === 200 && resume.json?.Items?.some((item) => item.Id === movieId)) {
+      return;
+    }
+    await page.waitForTimeout(500);
+  }
+  throw new Error(`non-web ${contractId} resume query did not include movie, HTTP ${lastStatus}`);
 }
 
 async function loginNonWebClient(page, username, password, authorization) {
@@ -5960,7 +5971,7 @@ async function runDirectPlayFlow(page, summary, publicInfo, target) {
 
 async function firstMovieItem(page, summary, auth) {
   const itemsResponse = await page.request.get(
-    `${summary.baseUrl}/Items?UserId=${encodeURIComponent(auth.User.Id)}&IncludeItemTypes=Movie&Recursive=true&Fields=RunTimeTicks&StartIndex=0&Limit=10`,
+    `${summary.baseUrl}/Items?UserId=${encodeURIComponent(auth.User.Id)}&IncludeItemTypes=Movie&Recursive=true&Fields=RunTimeTicks&SortBy=SortName&StartIndex=0&Limit=50`,
     { headers: { 'X-Emby-Token': auth.AccessToken } },
   );
   if (!itemsResponse.ok()) {

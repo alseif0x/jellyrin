@@ -110,13 +110,17 @@ function buildEvidence(result, comparison, manualEvidence, compatibilityMatrix) 
     && completedTargets.includes('upstream')
     && completedProfiles.length === requiredProfiles.length;
   if (contractsComplete && deviceEvidence.validCount > 0) {
+    const formalCount = deviceEvidence.validClients.filter((client) => client.evidenceType === 'formal-contract-acceptance').length;
+    const realCount = deviceEvidence.validCount - formalCount;
     return {
       gate: 'non-web-clients',
       status: 'device-validated',
       percent: 100,
       closed: true,
       sourcePhase: 'E6.3',
-      evidence: `Non-web client contracts completed against upstream and Jellyrin, and ${deviceEvidence.validCount} real client playback evidence file(s) passed validation.`,
+      evidence: realCount > 0
+        ? `Non-web client contracts completed against upstream and Jellyrin, and ${realCount} real client playback evidence file(s) passed validation.`
+        : `Non-web client contracts completed against upstream and Jellyrin, and ${formalCount} formal contract acceptance evidence file(s) passed validation.`,
       updatedAt,
       completedTargets,
       skippedTargets,
@@ -187,6 +191,7 @@ function summarizeManualEvidence(manualEvidence) {
     validCount: manualEvidence.valid.length,
     invalidCount: manualEvidence.invalid.length,
     validClients: manualEvidence.valid.map((entry) => ({
+      evidenceType: entry.evidence.evidenceType || 'real-client-playback',
       clientId: entry.evidence.clientId,
       clientName: entry.evidence.clientName,
       clientVersion: entry.evidence.clientVersion,
