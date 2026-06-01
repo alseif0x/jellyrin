@@ -220,12 +220,15 @@ function buildEvidence(result, comparison, localSubgates) {
   const localCompletedTargets = localPassed ? ['local-live-tv-subgates'] : [];
 
   if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream') && invariantCoverage.complete) {
+    const allCompletedTargets = [...new Set([...completedTargets, ...localCompletedTargets])].sort();
     return {
       gate: 'livetv-real',
       status: 'upstream-validated',
-      percent: 45,
+      percent: localPassed ? 85 : 45,
       closed: false,
-      sourcePhase: 'E2.1',
+      sourcePhase: localPassed
+        ? 'E2.1/E2.2a/E2.2b/E2.2c/E2.2d/E2.2e/browser-upstream'
+        : 'E2.1',
       evidence: [
         'Live TV HDHomeRun golden completed against both upstream Jellyfin and Jellyrin using the same simulator.',
         'upstream-validated is decided by the 23 HDHomeRun real-sequence invariants (upstreamComparable) executed by BOTH targets against the same simulator.',
@@ -277,15 +280,16 @@ function buildEvidence(result, comparison, localSubgates) {
         'Upstream isolation: the main sim tuner is deleted before the limit test on upstream to prevent fallback to the main tuner (TunerCount=0). Only the offset limit tuner (TunerCount=1) serves channels 7.1/8.1 during the conflict sequence.',
       ].join(' '),
       updatedAt,
-      completedTargets,
+      completedTargets: allCompletedTargets,
       skippedTargets,
       failedTargets,
       upstreamComparableInvariants: upstreamComparable,
       jellyrinOnlyInvariants: jellyrinOnly,
       invariantCoverage,
+      localSubgates,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
-        'Dashboard target remains device-validated; closing E2 requires additional sub-gate evidence.',
+        'Dashboard target remains device-validated; closing E2 still requires a final device-validated acceptance decision.',
         'R8: upstream SharedHttpStream may keep connection open after probes close (refill buffer); liveTvHdhrStreamRefcountReleased may be false for upstream if observed within timeout.',
         'R-DETERMINISM: recording playability depends on simulator TS being a valid MPEG-2 TS with PAT+PMT at byte 0 and monotonic PCR/PTS/DTS; the simulator pre-generates a 600s clip via ffmpeg meeting this contract.',
       ],

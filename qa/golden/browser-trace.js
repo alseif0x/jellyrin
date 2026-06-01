@@ -4529,6 +4529,30 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
           }
           if (completedRecording) break;
         }
+        // Upstream may scan finished DVR files as regular Movie items while
+        // leaving /LiveTv/Recordings empty in this local fixture setup.
+        if (!completedRecording && target.name === 'upstream' && auth.User?.Id) {
+          const itemLookup = await browserFetchJson(page, {
+            method: 'GET',
+            url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Movie&SearchTerm=${encodeURIComponent(timerName)}&Fields=MediaSources,RunTimeTicks,Path&Limit=5`,
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          if (itemLookup.status === 200 && Array.isArray(itemLookup.json?.Items)) {
+            const movieRecording = itemLookup.json.Items.find(
+              (item) => item.Name === timerName
+                && item.RunTimeTicks != null
+                && item.RunTimeTicks > 0,
+            );
+            if (movieRecording?.Id) {
+              completedRecording = {
+                ...movieRecording,
+                Status: 'Completed',
+                _libraryItem: true,
+              };
+              break;
+            }
+          }
+        }
         // Also check timer status (works before library scan on upstream).
         if (timerId && !completedRecording) {
           const timerStatus = await browserFetchJson(page, {
@@ -4951,6 +4975,31 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
             ) || null;
           }
           if (seriesCompletedRecording) break;
+        }
+        // Upstream may expose the completed series recording as a library Movie
+        // item rather than through /LiveTv/Recordings. The item name is unique
+        // for this run, so this is still a strict recording-file match.
+        if (!seriesCompletedRecording && target.name === 'upstream' && auth.User?.Id) {
+          const itemLookup = await browserFetchJson(page, {
+            method: 'GET',
+            url: `/Items?UserId=${encodeURIComponent(auth.User.Id)}&Recursive=true&IncludeItemTypes=Movie&SearchTerm=${encodeURIComponent(seriesName)}&Fields=MediaSources,RunTimeTicks,Path&Limit=5`,
+            token: auth.AccessToken,
+          }).catch(() => ({ status: 0, json: null }));
+          if (itemLookup.status === 200 && Array.isArray(itemLookup.json?.Items)) {
+            const movieRecording = itemLookup.json.Items.find(
+              (item) => item.Name === seriesName
+                && item.RunTimeTicks != null
+                && item.RunTimeTicks > 0,
+            );
+            if (movieRecording?.Id) {
+              seriesCompletedRecording = {
+                ...movieRecording,
+                Status: 'Completed',
+                _libraryItem: true,
+              };
+              break;
+            }
+          }
         }
         // Also check timer status for the child timers.
         if (!seriesCompletedRecording && seriesChildTimers.length > 0) {
