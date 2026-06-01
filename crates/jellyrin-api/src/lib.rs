@@ -149,6 +149,8 @@ static LIVE_TUNER_LEASES: OnceLock<StdMutex<HashMap<LiveTunerLeaseKey, LiveTuner
     OnceLock::new();
 #[cfg(test)]
 static TEST_RUST_WASI_HOST_BINARY_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_DOTNET_HOST_BINARY_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct LiveTunerLeaseKey {
@@ -8749,7 +8751,21 @@ fn test_rust_wasi_host_binary_path() -> &'static StdMutex<Option<PathBuf>> {
 }
 
 fn dotnet_host_binary_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = test_dotnet_host_binary_path()
+        .lock()
+        .expect("test DotNet host override lock poisoned")
+        .clone()
+    {
+        return Some(path);
+    }
+
     plugin_host_binary_path("JELLYRIN_PLUGIN_HOST_DOTNET", "jellyrin-plugin-host-dotnet")
+}
+
+#[cfg(test)]
+fn test_dotnet_host_binary_path() -> &'static StdMutex<Option<PathBuf>> {
+    TEST_DOTNET_HOST_BINARY_PATH.get_or_init(|| StdMutex::new(None))
 }
 
 fn plugin_runtime_host_path(
@@ -33693,6 +33709,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dotnet_channel_provider_feeds_channels_api() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "bbbbbbbb-0000-0000-0000-000000000005";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(
+            plugin_dir.join("Jellyfin.Plugin.ChannelProvider.dll"),
+            b"dll",
+        )
+        .await
+        .unwrap();
+        let host_path = fake_dotnet_channel_provider_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Channel DotNet".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: "DotNetJellyfin".to_string(),
+                target_abi: "12.0.0.0".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Channel DotNet",
+                    "Runtime": "DotNetJellyfin"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Channel DotNet",
+                    "Version": "1.0.0.0",
+                    "Runtime": "DotNetJellyfin",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ChannelProvider"]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_dotnet_plugin_with_host_path(&db, &plugin, Some(user.id), host_path.clone())
+                .await
+                .unwrap()
+        );
+        let _guard = DotNetHostPathGuard::set(host_path);
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels["TotalRecordCount"], 1);
+        assert_eq!(channels["Items"][0]["Id"], plugin_id);
+        assert_eq!(channels["Items"][0]["ChildCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Channels/{plugin_id}/Items"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items["TotalRecordCount"], 1);
+        assert_eq!(items["Items"][0]["Id"], "dotnet-channel-item");
+        assert_eq!(items["Items"][0]["ChannelId"], plugin_id);
+        assert_eq!(
+            items["Items"][0]["Path"],
+            "https://example.invalid/dotnet.m3u8"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/MediaInfo/LiveStreams/Open")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ItemId": "dotnet-channel-item" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let live_stream: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(live_stream["LiveStreamId"], "dotnet-channel-item");
+        assert_eq!(live_stream["MediaSource"]["Protocol"], "Http");
+        assert_eq!(
+            live_stream["MediaSource"]["Path"],
+            "https://example.invalid/dotnet.m3u8"
+        );
+        assert_eq!(live_stream["MediaSource"]["SupportsDirectPlay"], true);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels/Diagnostics")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let diagnostics: Value = serde_json::from_slice(&body).unwrap();
+        let provider = diagnostics["Providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["Id"] == plugin_id)
+            .unwrap();
+        assert_eq!(provider["Status"], "Healthy");
+        assert_eq!(provider["Runtime"], "DotNetJellyfin");
+        assert_eq!(provider["Included"], true);
+        assert_eq!(provider["ChildCount"], 1);
+    }
+
+    #[tokio::test]
     async fn rust_wasi_channel_provider_failure_isolated_from_channels_api() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -34561,6 +34732,30 @@ done
         }
     }
 
+    struct DotNetHostPathGuard {
+        previous: Option<PathBuf>,
+    }
+
+    impl DotNetHostPathGuard {
+        fn set(path: PathBuf) -> Self {
+            let mut host_path = super::test_dotnet_host_binary_path()
+                .lock()
+                .expect("test DotNet host override lock poisoned");
+            Self {
+                previous: host_path.replace(path),
+            }
+        }
+    }
+
+    impl Drop for DotNetHostPathGuard {
+        fn drop(&mut self) {
+            let mut host_path = super::test_dotnet_host_binary_path()
+                .lock()
+                .expect("test DotNet host override lock poisoned");
+            *host_path = self.previous.take();
+        }
+    }
+
     async fn fake_dotnet_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-dotnet-host.sh");
         tokio::fs::write(
@@ -34594,6 +34789,51 @@ while IFS= read -r line; do
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"66666666-6666-6666-6666-666666666666","Runtime":"DotNetJellyfin","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    async fn fake_dotnet_channel_provider_host_script(root: &std::path::Path) -> PathBuf {
+        let path = root.join("fake-dotnet-channel-provider-host.sh");
+        tokio::fs::write(
+            &path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-dotnet-channel-provider-host","ServerVersion":"fake-dotnet-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000005","Runtime":"DotNetJellyfin","RuntimeVersion":"fake-dotnet-host-0.1","Status":"Healthy","Manifest":{"Name":"Channel DotNet"},"Capabilities":["ChannelProvider"]}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"ChannelProvider","Items":[{"Id":"dotnet-channel-item","Name":"DotNet Channel Item","MediaType":"Video","Path":"https://example.invalid/dotnet.m3u8"}],"TotalRecordCount":1}}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000005","Runtime":"DotNetJellyfin","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
       ;;
     Shutdown)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"

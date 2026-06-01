@@ -74,6 +74,11 @@ async function runLocalSubgates() {
       command: ['cargo', 'test', '-p', 'jellyrin-api', 'rust_wasi_channel_provider_failure_isolated_from_channels_api', '--', '--nocapture'],
       evidence: 'Runtime ChannelProvider failures are isolated from /Channels and provider item browse while /Channels/Diagnostics reports Malfunctioned with failure detail',
     },
+    {
+      target: 'dotnet-plugin-channel-provider-media-source',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'dotnet_channel_provider_feeds_channels_api', '--', '--nocapture'],
+      evidence: 'DotNetJellyfin ChannelProvider fixture activates through stdio host, feeds /Channels and /Channels/{id}/Items, resolves provider item playback through MediaInfo/LiveStreams/Open and reports healthy diagnostics',
+    },
   ];
   const results = [];
   for (const subgate of subgates) {
@@ -155,18 +160,19 @@ function buildEvidence(result, comparison, localSubgates) {
     return {
       gate: 'channels-providers',
       status: 'implemented',
-      percent: 86,
+      percent: 90,
       closed: false,
-      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation',
+      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation/dotnet-provider',
       evidence: [
         'Channels browser golden completed against upstream Jellyfin and Jellyrin.',
         'Both targets satisfy the base Channels contract for GET /Channels and GET /Channels/Features.',
         'Jellyrin additionally exposes a real Live TV-backed channel provider fixture through /Channels, /Channels/livetv/Items, /Channels/Items/Latest, /Channels/livetv/Features, /Channels/Diagnostics and MediaInfo live-stream resolution.',
         'The fixture validates provider filtering, media-deletion filtering, item SearchTerm filtering, latest item listing/search, feature capability shape, media-source resolution, direct stream byte delivery and failure isolation for a configured malfunctioning provider.',
         'The local Rust/WASI ChannelProvider fixture validates plugin-backed provider browse, non-Live-TV provider item MediaInfo/LiveStreams/Open and Close resolution, ImageTags and provider item Primary image serving through /Image/Items.',
+        'The local DotNetJellyfin ChannelProvider fixture validates stdio-host activation, plugin-backed provider browse, non-Live-TV provider item MediaInfo/LiveStreams/Open resolution and healthy diagnostics.',
         'RefreshChannels now persists provider cache, item ids, refresh timestamps and refresh history in the channels named configuration.',
         'Runtime plugin ChannelProvider failures are isolated from /Channels and /Channels/{id}/Items while diagnostics reports Malfunctioned with failure detail.',
-        'This is an implemented E5 baseline, not full upstream-validated external provider parity: remote HTTP image cache hydration, DotNet provider fixture and broader non-Live-TV provider playback remain open.',
+        'This is an implemented E5 baseline, not full upstream-validated external provider parity: remote HTTP image cache hydration, real external provider traces and broader non-Live-TV provider playback remain open.',
       ].join(' '),
       updatedAt,
       completedTargets: allCompletedTargets,
@@ -181,7 +187,7 @@ function buildEvidence(result, comparison, localSubgates) {
       openRisks: [
         'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
         'Provider item image resolution is covered for embedded data/plugin payloads; remote HTTP image fetching and cache hydration still need broader provider traces.',
-        'Rust/WASI plugin channel-provider browse and MediaInfo resolution are covered by local subgate; DotNet channel-provider fixture is still pending.',
+        'Rust/WASI and DotNetJellyfin plugin channel-provider browse and MediaInfo resolution are covered by local subgates; real Jellyfin extension-point adapters still need external provider traces.',
         'Provider failure/timeout isolation is covered for declarative and Rust/WASI runtime malfunctioned providers; broader browser evidence with real external providers is still pending.',
       ],
     };
