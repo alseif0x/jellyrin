@@ -294,6 +294,35 @@ function buildEvidence(result, comparison, localSubgates) {
 
   const jellyrinCompleted = completedTargets.includes('jellyrin');
   const localOnlyCompletedTargets = [...new Set([...completedTargets, ...localCompletedTargets])].sort();
+  if (localPassed && jellyrinCompleted) {
+    return {
+      gate: 'livetv-real',
+      status: 'implemented',
+      percent: 75,
+      closed: false,
+      sourcePhase: 'E2.1/E2.2a/E2.2b/E2.2c/E2.2d/E2.2e/browser-jellyrin',
+      updatedAt,
+      evidence: [
+        'Local E2 Live TV subgates completed and Jellyrin browser HDHomeRun trace completed against the simulator.',
+        'Jellyrin satisfies the comparable HDHomeRun invariants plus Jellyrin-only Live TV invariants in the browser trace.',
+        'Upstream browser trace completed with credentials but still has missing comparable invariants, so E2 remains open until the upstream/device validation gap is resolved.',
+      ].join(' '),
+      completedTargets: localOnlyCompletedTargets,
+      skippedTargets,
+      failedTargets,
+      localSubgates,
+      invariantCoverage,
+      failedReasons: comparison.comparison?.reasons || [],
+      traceExitCode: result.code,
+      tracePath: path.relative(plansDir, comparisonPath),
+      openRisks: [
+        'Dashboard target remains device-validated; E2 is not closed until the upstream/device validation gap is resolved.',
+        'Upstream browser trace completed but did not satisfy every comparable HDHomeRun invariant.',
+        'Current upstream gap: series-timer recording playability by ffprobe did not materialize within the bounded golden trace.',
+      ],
+    };
+  }
+
   if (!jellyrinCompleted && localPassed) {
     return {
       gate: 'livetv-real',
