@@ -6297,7 +6297,7 @@ async fn install_package(
     let target_abi = json_string_field(&selected_version, "TargetAbi")
         .or_else(|| json_string_field(&package, "TargetAbi"))
         .unwrap_or_default();
-    let manifest = plugin_manifest_from_package(package.clone());
+    let mut manifest = plugin_manifest_from_package(package.clone());
     let previous_plugin = state.db.installed_plugin_json(&plugin_id).await?;
     let operation = plugin_package_operation(previous_plugin.as_ref(), &version);
     let task_key = package_install_task_key(&plugin_id);
@@ -6351,7 +6351,8 @@ async fn install_package(
             },
         )
         .await?;
-        package["Installation"] = artifact;
+        package["Installation"] = artifact.clone();
+        manifest["Installation"] = artifact;
         state
             .db
             .install_plugin_package(
@@ -45066,6 +45067,199 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let config: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(config["PluginRepositories"], repositories);
+    }
+
+    #[tokio::test]
+    async fn package_installed_rust_wasi_plugin_executes_scheduled_task() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let db_for_assertions = db.clone();
+        let plugin_id = "55555555-5555-5555-5555-555555555555";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_zip = tmp.path().join("scheduled-wasi-plugin.zip");
+        tokio::fs::write(
+            &plugin_zip,
+            stored_zip(&[
+                ("task.wasm", b"\0asm".as_slice()),
+                (
+                    "manifest.json",
+                    br#"{"Name":"Packaged WASI Task","Runtime":"RustWasi","Capabilities":["ScheduledTask"]}"#
+                        .as_slice(),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        let checksum = format!(
+            "{:x}",
+            Sha256::digest(tokio::fs::read(&plugin_zip).await.unwrap())
+        );
+        let host_path = fake_rust_wasi_host_script(tmp.path()).await;
+        let log_dir = tmp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: log_dir.clone(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let repository_payload = json!([
+            {
+                "Name": "Runtime Fixtures",
+                "Url": "file://runtime-fixtures.json",
+                "Enabled": true,
+                "Packages": [{
+                    "Name": "Packaged WASI Task",
+                    "Guid": plugin_id,
+                    "Overview": "Installed runtime execution fixture",
+                    "Description": "Installed runtime execution fixture",
+                    "Runtime": "RustWasi",
+                    "TargetAbi": "jellyrin-wasi-0.1",
+                    "Versions": [{
+                        "Version": "0.1.0",
+                        "Runtime": "RustWasi",
+                        "TargetAbi": "jellyrin-wasi-0.1",
+                        "SourceUrl": format!("file://{}", plugin_zip.to_string_lossy()),
+                        "Checksum": checksum
+                    }]
+                }]
+            }
+        ]);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(repository_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Package/Packages/Installed/Packaged%20WASI%20Task?Version=0.1.0")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let installed = db_for_assertions
+            .installed_plugin_json(plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed["Status"], "NotSupported");
+        assert_eq!(installed["Runtime"], "RustWasi");
+        let installed_wasm = plugin_packages_root(&log_dir)
+            .join(plugin_id)
+            .join("0.1.0")
+            .join("task.wasm");
+        assert_eq!(tokio::fs::read(&installed_wasm).await.unwrap(), b"\0asm");
+
+        let _guard = RustWasiHostPathGuard::set(host_path);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Plugins/{plugin_id}/0.1.0/Enable"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let active = db_for_assertions
+            .installed_plugin_json(plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active["Status"], "Active");
+        assert_eq!(active["RuntimeVersion"], "fake-wasi-host-0.1");
+        assert_eq!(active["Capabilities"], json!(["ScheduledTask"]));
+
+        let task_id = plugin_scheduled_task_id(plugin_id);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ScheduledTasks/{task_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/ScheduledTasks/Running/{task_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let mut task = json!({});
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/ScheduledTasks/{task_id}"))
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            task = serde_json::from_slice(&body).unwrap();
+            if task["State"] == "Idle" && task["LastExecutionResult"]["Status"] == "Completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(task["State"], "Idle");
+        assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
+        assert_eq!(
+            task["LastExecutionResult"]["Result"]["Capability"],
+            "ScheduledTask"
+        );
+        assert_eq!(
+            task["LastExecutionResult"]["Result"]["TaskName"],
+            "Fake WASI Task"
+        );
+        assert_eq!(
+            task["LastExecutionResult"]["Result"]["Arguments"]["Trigger"],
+            "Manual"
+        );
     }
 
     #[tokio::test]
