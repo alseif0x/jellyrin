@@ -816,6 +816,7 @@ struct MinimalWasmModule {
     function_type_indices: Vec<u32>,
     exports: BTreeMap<String, u32>,
     function_bodies: Vec<Vec<u8>>,
+    memory: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -842,6 +843,7 @@ impl MinimalWasmModule {
             function_type_indices: Vec::new(),
             exports: BTreeMap::new(),
             function_bodies: Vec::new(),
+            memory: Vec::new(),
         };
         let mut cursor = WasmCursor::new(&bytes[8..]);
         while !cursor.is_empty() {
@@ -852,8 +854,10 @@ impl MinimalWasmModule {
                 1 => module.types = parse_wasm_type_section(section)?,
                 2 => module.imported_functions = parse_wasm_import_section(section)?,
                 3 => module.function_type_indices = parse_wasm_function_section(section)?,
+                5 => module.memory = parse_wasm_memory_section(section)?,
                 7 => module.exports = parse_wasm_export_section(section)?,
                 10 => module.function_bodies = parse_wasm_code_section(section)?,
+                11 => parse_wasm_data_section(section, &mut module.memory)?,
                 _ => {}
             }
         }
@@ -930,6 +934,24 @@ fn parse_wasm_limits(cursor: &mut WasmCursor<'_>) -> Result<(u32, Option<u32>)> 
     }
 }
 
+fn parse_wasm_memory_section(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut cursor = WasmCursor::new(bytes);
+    let count = cursor.read_u32_leb()?;
+    if count > 1 {
+        anyhow::bail!("minimal WASM executor supports at most one memory");
+    }
+    let mut memory = Vec::new();
+    for _ in 0..count {
+        let (min_pages, _max_pages) = parse_wasm_limits(&mut cursor)?;
+        let byte_len = (min_pages as usize)
+            .checked_mul(65_536)
+            .context("WASM memory size overflow")?;
+        memory.resize(byte_len, 0);
+    }
+    cursor.expect_empty()?;
+    Ok(memory)
+}
+
 fn parse_wasm_function_section(bytes: &[u8]) -> Result<Vec<u32>> {
     let mut cursor = WasmCursor::new(bytes);
     let count = cursor.read_u32_leb()?;
@@ -955,6 +977,62 @@ fn parse_wasm_export_section(bytes: &[u8]) -> Result<BTreeMap<String, u32>> {
     }
     cursor.expect_empty()?;
     Ok(exports)
+}
+
+fn parse_wasm_data_section(bytes: &[u8], memory: &mut Vec<u8>) -> Result<()> {
+    let mut cursor = WasmCursor::new(bytes);
+    let count = cursor.read_u32_leb()?;
+    for _ in 0..count {
+        let flag = cursor.read_u32_leb()?;
+        match flag {
+            0 => {
+                let offset = parse_wasm_i32_const_expr(&mut cursor)? as usize;
+                let len = cursor.read_u32_leb()? as usize;
+                let data = cursor.read_bytes(len)?;
+                let end = offset
+                    .checked_add(data.len())
+                    .context("WASM data segment range overflow")?;
+                if memory.len() < end {
+                    memory.resize(end, 0);
+                }
+                memory[offset..end].copy_from_slice(data);
+            }
+            1 => {
+                let len = cursor.read_u32_leb()? as usize;
+                let _data = cursor.read_bytes(len)?;
+            }
+            2 => {
+                let memory_index = cursor.read_u32_leb()?;
+                if memory_index != 0 {
+                    anyhow::bail!("minimal WASM executor supports only memory index 0");
+                }
+                let offset = parse_wasm_i32_const_expr(&mut cursor)? as usize;
+                let len = cursor.read_u32_leb()? as usize;
+                let data = cursor.read_bytes(len)?;
+                let end = offset
+                    .checked_add(data.len())
+                    .context("WASM data segment range overflow")?;
+                if memory.len() < end {
+                    memory.resize(end, 0);
+                }
+                memory[offset..end].copy_from_slice(data);
+            }
+            _ => anyhow::bail!("unsupported WASM data segment flag {flag}"),
+        }
+    }
+    cursor.expect_empty()?;
+    Ok(())
+}
+
+fn parse_wasm_i32_const_expr(cursor: &mut WasmCursor<'_>) -> Result<i32> {
+    if cursor.read_u8()? != 0x41 {
+        anyhow::bail!("minimal WASM executor only supports i32.const data offsets");
+    }
+    let value = cursor.read_i32_leb()?;
+    if cursor.read_u8()? != 0x0b {
+        anyhow::bail!("WASM const expression did not end with end opcode");
+    }
+    Ok(value)
 }
 
 fn parse_wasm_code_section(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -1067,12 +1145,29 @@ fn execute_minimal_wasm_import_call(
     match (import.module.as_str(), import.name.as_str()) {
         ("jellyrin:sdk", "echo_i32") => Ok(args.first().copied().unwrap_or_default()),
         ("jellyrin:sdk", "capability_argument_count") => Ok(args.len() as i32),
+        ("jellyrin:sdk", "utf8_len") => {
+            let [ptr, len] = args.as_slice() else {
+                anyhow::bail!("jellyrin:sdk.utf8_len requires pointer and length arguments");
+            };
+            let bytes = minimal_wasm_memory_slice(&module.memory, *ptr, *len)?;
+            let value = std::str::from_utf8(bytes).context("WASM utf8_len input is not UTF-8")?;
+            Ok(value.chars().count() as i32)
+        }
         _ => anyhow::bail!(
             "unsupported WASM host import {}.{}",
             import.module,
             import.name
         ),
     }
+}
+
+fn minimal_wasm_memory_slice(memory: &[u8], ptr: i32, len: i32) -> Result<&[u8]> {
+    let ptr = usize::try_from(ptr).context("WASM memory pointer must be non-negative")?;
+    let len = usize::try_from(len).context("WASM memory length must be non-negative")?;
+    let end = ptr.checked_add(len).context("WASM memory range overflow")?;
+    memory
+        .get(ptr..end)
+        .with_context(|| format!("WASM memory range {ptr}..{end} is out of bounds"))
 }
 
 struct WasmCursor<'a> {
@@ -1826,6 +1921,65 @@ mod tests {
         assert_eq!(value["WasmReturn"], 42);
     }
 
+    #[tokio::test]
+    async fn wasi_host_import_reads_utf8_string_from_wasm_memory() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(
+            plugin_dir.join("fixture.wasm"),
+            minimal_utf8_len_import_wasm("jellyrin_metadata_lookup", 32, "jellyrin"),
+        )
+        .await
+        .unwrap();
+
+        let mut state = WasiHostState::default();
+        let load = PluginRpcEnvelope::new(
+            "corr-load-memory-wasm",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "memory-wasm-fixture".to_string(),
+                name: "Memory WASM Fixture".to_string(),
+                version: "1.0.0".to_string(),
+                runtime: PluginRuntime::RustWasi,
+                target_abi: TARGET_ABI.to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "Memory WASM Fixture",
+                    "TargetAbi": TARGET_ABI,
+                    "Capabilities": ["MetadataProvider"],
+                    "WasmExports": {
+                        "MetadataProvider": "jellyrin_metadata_lookup"
+                    }
+                }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, load).await;
+        assert!(response.ok);
+
+        let invoke = PluginRpcEnvelope::new(
+            "corr-invoke-memory-wasm",
+            PluginRpcMethod::InvokeCapability,
+            serde_json::to_value(InvokeCapabilityRequest {
+                plugin_id: "memory-wasm-fixture".to_string(),
+                capability: "MetadataProvider".to_string(),
+                arguments: json!({ "Name": "jellyrin" }),
+                timeout_ms: 1000,
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, invoke).await;
+        assert!(response.ok);
+        let value = &response.result.as_ref().unwrap()["Value"];
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], "MetadataProvider");
+        assert_eq!(value["ExecutionMode"], "WasmI32Export");
+        assert_eq!(value["Export"], "jellyrin_metadata_lookup");
+        assert_eq!(value["WasmReturn"], 8);
+    }
+
     fn minimal_i32_const_wasm(export_name: &str, value: i32) -> Vec<u8> {
         let mut wasm = b"\0asm\x01\0\0\0".to_vec();
         push_section(&mut wasm, 1, &[0x01, 0x60, 0x00, 0x01, 0x7f]);
@@ -1903,6 +2057,59 @@ mod tests {
         push_u32_leb(&mut code, body.len() as u32);
         code.extend_from_slice(&body);
         push_section(&mut wasm, 10, &code);
+        wasm
+    }
+
+    fn minimal_utf8_len_import_wasm(export_name: &str, offset: i32, text: &str) -> Vec<u8> {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        push_section(
+            &mut wasm,
+            1,
+            &[
+                0x02, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x01, 0x7f,
+            ],
+        );
+
+        let mut import = Vec::new();
+        push_u32_leb(&mut import, 1);
+        push_name(&mut import, "jellyrin:sdk");
+        push_name(&mut import, "utf8_len");
+        import.push(0x00);
+        push_u32_leb(&mut import, 0);
+        push_section(&mut wasm, 2, &import);
+
+        push_section(&mut wasm, 3, &[0x01, 0x01]);
+        push_section(&mut wasm, 5, &[0x01, 0x00, 0x01]);
+
+        let mut export = Vec::new();
+        push_u32_leb(&mut export, 1);
+        push_name(&mut export, export_name);
+        export.push(0x00);
+        push_u32_leb(&mut export, 1);
+        push_section(&mut wasm, 7, &export);
+
+        let mut body = vec![0x00, 0x41];
+        push_i32_leb(&mut body, offset);
+        body.push(0x41);
+        push_i32_leb(&mut body, text.len() as i32);
+        body.push(0x10);
+        body.push(0x00);
+        body.push(0x0b);
+        let mut code = Vec::new();
+        push_u32_leb(&mut code, 1);
+        push_u32_leb(&mut code, body.len() as u32);
+        code.extend_from_slice(&body);
+        push_section(&mut wasm, 10, &code);
+
+        let mut data = Vec::new();
+        push_u32_leb(&mut data, 1);
+        push_u32_leb(&mut data, 0);
+        data.push(0x41);
+        push_i32_leb(&mut data, offset);
+        data.push(0x0b);
+        push_u32_leb(&mut data, text.len() as u32);
+        data.extend_from_slice(text.as_bytes());
+        push_section(&mut wasm, 11, &data);
         wasm
     }
 
