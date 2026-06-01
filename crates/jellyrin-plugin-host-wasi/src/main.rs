@@ -45,6 +45,7 @@ struct LoadedWasiPlugin {
     name: String,
     version: String,
     install_path: String,
+    wasm_files: Vec<String>,
     manifest: Value,
     configuration: Value,
     capabilities: Vec<String>,
@@ -122,7 +123,7 @@ async fn handle_envelope(
         PluginRpcMethod::ListWebPages => handle_list_web_pages(state, envelope),
         PluginRpcMethod::GetEmbeddedImage => handle_get_embedded_image(state, envelope).await,
         PluginRpcMethod::ListCapabilities => handle_list_capabilities(state, envelope),
-        PluginRpcMethod::InvokeCapability => handle_invoke_capability(state, envelope),
+        PluginRpcMethod::InvokeCapability => handle_invoke_capability(state, envelope).await,
         PluginRpcMethod::Health => handle_health(state, envelope),
         PluginRpcMethod::Shutdown => {
             state.shutting_down = true;
@@ -246,6 +247,7 @@ async fn handle_load_plugin(
         name: request.name.clone(),
         version: request.version.clone(),
         install_path: request.install_path.clone(),
+        wasm_files,
         manifest: request.manifest.clone(),
         configuration: manifest_configuration(&request.manifest),
         capabilities: capabilities.clone(),
@@ -468,7 +470,7 @@ fn handle_list_capabilities(
     success(envelope.correlation_id, json!(plugin.capabilities))
 }
 
-fn handle_invoke_capability(
+async fn handle_invoke_capability(
     state: &WasiHostState,
     envelope: PluginRpcEnvelope<Value>,
 ) -> PluginRpcResponse<Value> {
@@ -500,14 +502,27 @@ fn handle_invoke_capability(
             format!("Capability {} is not registered.", request.capability),
         );
     }
-    let value = manifest_capability_handler(&plugin.manifest, &request.capability)
-        .map(|handler| execute_manifest_capability_handler(&request, handler))
-        .unwrap_or_else(|| {
-            json!({
-                "Status": "NotExecuted",
-                "Reason": "WASI execution engine is not wired for this capability yet."
-            })
-        });
+    let value =
+        if let Some(handler) = manifest_capability_handler(&plugin.manifest, &request.capability) {
+            execute_manifest_capability_handler(&request, handler)
+        } else {
+            match execute_wasm_capability_handler(plugin, &request).await {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    json!({
+                        "Status": "NotExecuted",
+                        "Reason": "WASI execution engine is not wired for this capability yet."
+                    })
+                }
+                Err(error) => {
+                    return failure(
+                        envelope.correlation_id,
+                        PluginRpcErrorCode::HostFailed,
+                        format!("WASM capability execution failed: {error:#}"),
+                    );
+                }
+            }
+        };
     success(envelope.correlation_id, CapabilityResult { value })
 }
 
@@ -672,6 +687,365 @@ fn execute_manifest_capability_handler(
         result["Arguments"] = request.arguments.clone();
     }
     result
+}
+
+async fn execute_wasm_capability_handler(
+    plugin: &LoadedWasiPlugin,
+    request: &InvokeCapabilityRequest,
+) -> Result<Option<Value>> {
+    let Some(export_name) = manifest_wasm_export(&plugin.manifest, &request.capability) else {
+        return Ok(None);
+    };
+    let Some(wasm_path) = plugin.wasm_files.first() else {
+        return Ok(None);
+    };
+    let bytes = tokio::fs::read(wasm_path)
+        .await
+        .with_context(|| format!("failed to read WASM module {wasm_path}"))?;
+    let wasm_return = execute_minimal_wasm_i32_export(&bytes, &export_name)
+        .with_context(|| format!("failed to execute WASM export {export_name}"))?;
+    Ok(Some(json!({
+        "Status": "Executed",
+        "Capability": request.capability,
+        "ExecutionMode": "WasmI32Export",
+        "Export": export_name,
+        "WasmReturn": wasm_return
+    })))
+}
+
+fn manifest_wasm_export(manifest: &Value, capability: &str) -> Option<String> {
+    let exports = manifest
+        .get("WasmExports")
+        .or_else(|| manifest.get("WasmEntryPoints"))
+        .or_else(|| manifest.get("Exports"))?;
+    if let Some(export_name) = exports
+        .get(capability)
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+    {
+        return Some(export_name.trim().to_string());
+    }
+    exports.as_array()?.iter().find_map(|entry| {
+        let entry_capability = entry
+            .get("Capability")
+            .or_else(|| entry.get("Name"))
+            .and_then(Value::as_str)?;
+        if !entry_capability.eq_ignore_ascii_case(capability) {
+            return None;
+        }
+        entry
+            .get("Export")
+            .or_else(|| entry.get("Function"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| name.trim().to_string())
+    })
+}
+
+fn execute_minimal_wasm_i32_export(bytes: &[u8], export_name: &str) -> Result<i32> {
+    let module = MinimalWasmModule::parse(bytes)?;
+    let function_index = module
+        .exports
+        .get(export_name)
+        .copied()
+        .with_context(|| format!("WASM export {export_name} was not found"))?;
+    if function_index < module.imported_function_count {
+        anyhow::bail!("WASM export {export_name} points to an imported function");
+    }
+    let defined_index = (function_index - module.imported_function_count) as usize;
+    let type_index = module
+        .function_type_indices
+        .get(defined_index)
+        .copied()
+        .with_context(|| format!("WASM export {export_name} has no function type"))?;
+    let function_type = module
+        .types
+        .get(type_index as usize)
+        .with_context(|| format!("WASM export {export_name} type index is invalid"))?;
+    if !function_type.params.is_empty() || function_type.results.as_slice() != [0x7f] {
+        anyhow::bail!("WASM export {export_name} must be a no-arg function returning i32");
+    }
+    let body = module
+        .function_bodies
+        .get(defined_index)
+        .with_context(|| format!("WASM export {export_name} has no function body"))?;
+    execute_minimal_wasm_i32_body(body)
+}
+
+#[derive(Debug)]
+struct MinimalWasmModule {
+    types: Vec<MinimalWasmFunctionType>,
+    imported_function_count: u32,
+    function_type_indices: Vec<u32>,
+    exports: BTreeMap<String, u32>,
+    function_bodies: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct MinimalWasmFunctionType {
+    params: Vec<u8>,
+    results: Vec<u8>,
+}
+
+impl MinimalWasmModule {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 8 || &bytes[..4] != b"\0asm" || bytes[4..8] != [1, 0, 0, 0] {
+            anyhow::bail!("invalid WASM module header");
+        }
+        let mut module = Self {
+            types: Vec::new(),
+            imported_function_count: 0,
+            function_type_indices: Vec::new(),
+            exports: BTreeMap::new(),
+            function_bodies: Vec::new(),
+        };
+        let mut cursor = WasmCursor::new(&bytes[8..]);
+        while !cursor.is_empty() {
+            let section_id = cursor.read_u8()?;
+            let section_size = cursor.read_u32_leb()? as usize;
+            let section = cursor.read_bytes(section_size)?;
+            match section_id {
+                1 => module.types = parse_wasm_type_section(section)?,
+                2 => module.imported_function_count = parse_wasm_import_section(section)?,
+                3 => module.function_type_indices = parse_wasm_function_section(section)?,
+                7 => module.exports = parse_wasm_export_section(section)?,
+                10 => module.function_bodies = parse_wasm_code_section(section)?,
+                _ => {}
+            }
+        }
+        if module.function_bodies.len() != module.function_type_indices.len() {
+            anyhow::bail!("WASM function and code section counts do not match");
+        }
+        Ok(module)
+    }
+}
+
+fn parse_wasm_type_section(bytes: &[u8]) -> Result<Vec<MinimalWasmFunctionType>> {
+    let mut cursor = WasmCursor::new(bytes);
+    let count = cursor.read_u32_leb()?;
+    let mut types = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if cursor.read_u8()? != 0x60 {
+            anyhow::bail!("only WASM function types are supported");
+        }
+        let params = parse_wasm_valtypes(&mut cursor)?;
+        let results = parse_wasm_valtypes(&mut cursor)?;
+        types.push(MinimalWasmFunctionType { params, results });
+    }
+    cursor.expect_empty()?;
+    Ok(types)
+}
+
+fn parse_wasm_valtypes(cursor: &mut WasmCursor<'_>) -> Result<Vec<u8>> {
+    let count = cursor.read_u32_leb()?;
+    let mut values = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        values.push(cursor.read_u8()?);
+    }
+    Ok(values)
+}
+
+fn parse_wasm_import_section(bytes: &[u8]) -> Result<u32> {
+    let mut cursor = WasmCursor::new(bytes);
+    let count = cursor.read_u32_leb()?;
+    let mut functions = 0_u32;
+    for _ in 0..count {
+        let _module = cursor.read_name()?;
+        let _name = cursor.read_name()?;
+        match cursor.read_u8()? {
+            0x00 => {
+                let _type_index = cursor.read_u32_leb()?;
+                functions += 1;
+            }
+            0x01 => {
+                let _limits = parse_wasm_limits(&mut cursor)?;
+            }
+            0x02 => {
+                let _limits = parse_wasm_limits(&mut cursor)?;
+            }
+            0x03 => {
+                let _value_type = cursor.read_u8()?;
+                let _mutable = cursor.read_u8()?;
+            }
+            tag => anyhow::bail!("unsupported WASM import tag {tag}"),
+        }
+    }
+    cursor.expect_empty()?;
+    Ok(functions)
+}
+
+fn parse_wasm_limits(cursor: &mut WasmCursor<'_>) -> Result<(u32, Option<u32>)> {
+    match cursor.read_u8()? {
+        0x00 => Ok((cursor.read_u32_leb()?, None)),
+        0x01 => Ok((cursor.read_u32_leb()?, Some(cursor.read_u32_leb()?))),
+        tag => anyhow::bail!("unsupported WASM limits tag {tag}"),
+    }
+}
+
+fn parse_wasm_function_section(bytes: &[u8]) -> Result<Vec<u32>> {
+    let mut cursor = WasmCursor::new(bytes);
+    let count = cursor.read_u32_leb()?;
+    let mut type_indices = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        type_indices.push(cursor.read_u32_leb()?);
+    }
+    cursor.expect_empty()?;
+    Ok(type_indices)
+}
+
+fn parse_wasm_export_section(bytes: &[u8]) -> Result<BTreeMap<String, u32>> {
+    let mut cursor = WasmCursor::new(bytes);
+    let count = cursor.read_u32_leb()?;
+    let mut exports = BTreeMap::new();
+    for _ in 0..count {
+        let name = cursor.read_name()?;
+        let kind = cursor.read_u8()?;
+        let index = cursor.read_u32_leb()?;
+        if kind == 0x00 {
+            exports.insert(name, index);
+        }
+    }
+    cursor.expect_empty()?;
+    Ok(exports)
+}
+
+fn parse_wasm_code_section(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut cursor = WasmCursor::new(bytes);
+    let count = cursor.read_u32_leb()?;
+    let mut bodies = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let body_size = cursor.read_u32_leb()? as usize;
+        bodies.push(cursor.read_bytes(body_size)?.to_vec());
+    }
+    cursor.expect_empty()?;
+    Ok(bodies)
+}
+
+fn execute_minimal_wasm_i32_body(bytes: &[u8]) -> Result<i32> {
+    let mut cursor = WasmCursor::new(bytes);
+    let local_groups = cursor.read_u32_leb()?;
+    for _ in 0..local_groups {
+        let _count = cursor.read_u32_leb()?;
+        let _value_type = cursor.read_u8()?;
+    }
+    let mut stack = Vec::<i32>::new();
+    loop {
+        match cursor.read_u8()? {
+            0x0b => {
+                cursor.expect_empty()?;
+                return stack
+                    .pop()
+                    .context("WASM function ended without an i32 value");
+            }
+            0x41 => stack.push(cursor.read_i32_leb()?),
+            0x6a => {
+                let rhs = stack.pop().context("WASM i32.add missing rhs")?;
+                let lhs = stack.pop().context("WASM i32.add missing lhs")?;
+                stack.push(lhs.wrapping_add(rhs));
+            }
+            0x6b => {
+                let rhs = stack.pop().context("WASM i32.sub missing rhs")?;
+                let lhs = stack.pop().context("WASM i32.sub missing lhs")?;
+                stack.push(lhs.wrapping_sub(rhs));
+            }
+            0x6c => {
+                let rhs = stack.pop().context("WASM i32.mul missing rhs")?;
+                let lhs = stack.pop().context("WASM i32.mul missing lhs")?;
+                stack.push(lhs.wrapping_mul(rhs));
+            }
+            opcode => anyhow::bail!("unsupported WASM opcode 0x{opcode:02x}"),
+        }
+    }
+}
+
+struct WasmCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> WasmCursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position >= self.bytes.len()
+    }
+
+    fn expect_empty(&self) -> Result<()> {
+        if self.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("WASM section has trailing bytes")
+        }
+    }
+
+    fn read_u8(&mut self) -> Result<u8> {
+        let value = *self
+            .bytes
+            .get(self.position)
+            .context("unexpected end of WASM bytes")?;
+        self.position += 1;
+        Ok(value)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self
+            .position
+            .checked_add(len)
+            .context("WASM byte range overflow")?;
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .context("unexpected end of WASM bytes")?;
+        self.position = end;
+        Ok(value)
+    }
+
+    fn read_name(&mut self) -> Result<String> {
+        let len = self.read_u32_leb()? as usize;
+        let bytes = self.read_bytes(len)?;
+        std::str::from_utf8(bytes)
+            .context("WASM name is not UTF-8")
+            .map(str::to_string)
+    }
+
+    fn read_u32_leb(&mut self) -> Result<u32> {
+        let mut result = 0_u32;
+        let mut shift = 0_u32;
+        loop {
+            let byte = self.read_u8()?;
+            if shift >= 32 && (byte & 0x7f) != 0 {
+                anyhow::bail!("WASM u32 LEB128 value overflowed");
+            }
+            result |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+    }
+
+    fn read_i32_leb(&mut self) -> Result<i32> {
+        let mut result = 0_i32;
+        let mut shift = 0_u32;
+        let mut byte;
+        loop {
+            byte = self.read_u8()?;
+            result |= i32::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            if shift >= 32 {
+                anyhow::bail!("WASM i32 LEB128 value overflowed");
+            }
+        }
+        if shift < 32 && (byte & 0x40) != 0 {
+            result |= !0_i32 << shift;
+        }
+        Ok(result)
+    }
 }
 
 fn manifest_configuration(manifest: &Value) -> Value {
@@ -1153,5 +1527,124 @@ mod tests {
         );
         let response = handle_envelope(&mut state, granted_permission).await;
         assert!(response.ok);
+    }
+
+    #[tokio::test]
+    async fn wasi_host_executes_declared_wasm_export_for_capability() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(
+            plugin_dir.join("fixture.wasm"),
+            minimal_i32_const_wasm("jellyrin_scheduled_task", 42),
+        )
+        .await
+        .unwrap();
+
+        let mut state = WasiHostState::default();
+        let load = PluginRpcEnvelope::new(
+            "corr-load-real-wasm",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "real-wasm-fixture".to_string(),
+                name: "Real WASM Fixture".to_string(),
+                version: "1.0.0".to_string(),
+                runtime: PluginRuntime::RustWasi,
+                target_abi: TARGET_ABI.to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "Real WASM Fixture",
+                    "TargetAbi": TARGET_ABI,
+                    "Capabilities": ["ScheduledTask"],
+                    "WasmExports": {
+                        "ScheduledTask": "jellyrin_scheduled_task"
+                    }
+                }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, load).await;
+        assert!(response.ok);
+
+        let invoke = PluginRpcEnvelope::new(
+            "corr-invoke-real-wasm",
+            PluginRpcMethod::InvokeCapability,
+            serde_json::to_value(InvokeCapabilityRequest {
+                plugin_id: "real-wasm-fixture".to_string(),
+                capability: "ScheduledTask".to_string(),
+                arguments: json!({ "Trigger": "Manual" }),
+                timeout_ms: 1000,
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, invoke).await;
+        assert!(response.ok);
+        let value = &response.result.as_ref().unwrap()["Value"];
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], "ScheduledTask");
+        assert_eq!(value["ExecutionMode"], "WasmI32Export");
+        assert_eq!(value["Export"], "jellyrin_scheduled_task");
+        assert_eq!(value["WasmReturn"], 42);
+    }
+
+    fn minimal_i32_const_wasm(export_name: &str, value: i32) -> Vec<u8> {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        push_section(&mut wasm, 1, &[0x01, 0x60, 0x00, 0x01, 0x7f]);
+        push_section(&mut wasm, 3, &[0x01, 0x00]);
+
+        let mut export = Vec::new();
+        push_u32_leb(&mut export, 1);
+        push_name(&mut export, export_name);
+        export.push(0x00);
+        push_u32_leb(&mut export, 0);
+        push_section(&mut wasm, 7, &export);
+
+        let mut body = vec![0x00, 0x41];
+        push_i32_leb(&mut body, value);
+        body.push(0x0b);
+        let mut code = Vec::new();
+        push_u32_leb(&mut code, 1);
+        push_u32_leb(&mut code, body.len() as u32);
+        code.extend_from_slice(&body);
+        push_section(&mut wasm, 10, &code);
+        wasm
+    }
+
+    fn push_section(wasm: &mut Vec<u8>, id: u8, content: &[u8]) {
+        wasm.push(id);
+        push_u32_leb(wasm, content.len() as u32);
+        wasm.extend_from_slice(content);
+    }
+
+    fn push_name(wasm: &mut Vec<u8>, value: &str) {
+        push_u32_leb(wasm, value.len() as u32);
+        wasm.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_u32_leb(wasm: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            wasm.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn push_i32_leb(wasm: &mut Vec<u8>, mut value: i32) {
+        loop {
+            let byte = (value as u8) & 0x7f;
+            value >>= 7;
+            let done = (value == 0 && (byte & 0x40) == 0) || (value == -1 && (byte & 0x40) != 0);
+            wasm.push(if done { byte } else { byte | 0x80 });
+            if done {
+                break;
+            }
+        }
     }
 }
