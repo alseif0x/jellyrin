@@ -355,6 +355,12 @@ pub struct SystemConfigurationPayloads {
     pub server_options: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedConfigurationPayload {
+    pub key: String,
+    pub payload: Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct InstallPluginPackage {
     pub plugin_id: String,
@@ -1783,6 +1789,29 @@ impl Database {
             serde_json::from_str(&row.payload_json).context("invalid named configuration")
         })
         .transpose()
+    }
+
+    pub async fn named_configurations(&self) -> anyhow::Result<Vec<NamedConfigurationPayload>> {
+        let rows = sqlx::query_as::<_, NamedConfigurationListRow>(
+            r#"
+            SELECT key, payload_json
+            FROM named_configurations
+            ORDER BY key
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let payload = serde_json::from_str(&row.payload_json)
+                    .context("invalid named configuration")?;
+                Ok(NamedConfigurationPayload {
+                    key: row.key,
+                    payload,
+                })
+            })
+            .collect()
     }
 
     pub async fn update_named_configuration(
@@ -5905,6 +5934,12 @@ struct NamedConfigurationRow {
 }
 
 #[derive(sqlx::FromRow)]
+struct NamedConfigurationListRow {
+    key: String,
+    payload_json: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct ApiKeyRow {
     access_token: String,
     user_id: String,
@@ -8164,6 +8199,19 @@ mod tests {
             .unwrap();
         let updated = db.named_configuration("NETWORK").await.unwrap().unwrap();
         assert_eq!(updated, json!({ "InternalHttpPort": 8098 }));
+
+        db.update_named_configuration("livetv", json!({ "Enabled": true }))
+            .await
+            .unwrap();
+        let configurations = db.named_configurations().await.unwrap();
+        assert_eq!(configurations.len(), 2);
+        assert_eq!(configurations[0].key, "livetv");
+        assert_eq!(configurations[0].payload, json!({ "Enabled": true }));
+        assert_eq!(configurations[1].key, "network");
+        assert_eq!(
+            configurations[1].payload,
+            json!({ "InternalHttpPort": 8098 })
+        );
     }
 
     #[tokio::test]

@@ -41,9 +41,9 @@ use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
     ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
     DeviceSession, DiscoveredPluginPackage, InstallPluginPackage, MediaItemMetadata, MediaList,
-    MediaListItem, MediaListUserPermission, PluginRuntimeInstanceUpsert, QuickConnectSession,
-    SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    MediaListItem, MediaListUserPermission, NamedConfigurationPayload, PluginRuntimeInstanceUpsert,
+    QuickConnectSession, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
+    TrickplayInfo, UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
     UpsertTranscodeSession,
 };
 use jellyrin_plugin_rpc::{
@@ -3787,6 +3787,7 @@ async fn backup_restore_snapshot_json(db: &Database) -> Result<serde_json::Value
         "SystemConfigurationPayloads": system_configuration_payloads_backup_json(
             db.system_configuration_payloads().await?
         ),
+        "NamedConfigurations": named_configurations_backup_json(db.named_configurations().await?),
         "BrandingConfiguration": branding_backup_json(db.branding_config().await?),
         "Users": backup_users_json(db.users().await?),
         "VirtualFolders": backup_virtual_folders_json(db.virtual_folders().await?),
@@ -3822,6 +3823,7 @@ async fn restore_backup_data(db: &Database, snapshot: &serde_json::Value) -> Res
         system_payloads,
     )?)
     .await?;
+    restore_named_configurations_from_backup(db, snapshot.get("NamedConfigurations")).await?;
     db.update_branding_config(branding_from_backup(branding)?)
         .await?;
     restore_users_from_backup(db, snapshot.get("Users")).await?;
@@ -3859,6 +3861,50 @@ fn system_configuration_payloads_from_backup(
         plugin_repositories: required_backup_value(value, "PluginRepositories")?,
         server_options: required_backup_value(value, "ServerOptions")?,
     })
+}
+
+fn named_configurations_backup_json(
+    configurations: Vec<NamedConfigurationPayload>,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        configurations
+            .into_iter()
+            .map(|configuration| {
+                serde_json::json!({
+                    "Key": configuration.key,
+                    "Payload": configuration.payload
+                })
+            })
+            .collect(),
+    )
+}
+
+async fn restore_named_configurations_from_backup(
+    db: &Database,
+    value: Option<&serde_json::Value>,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let configurations = value
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request("Backup named configurations must be an array"))?;
+    for configuration in configurations {
+        let key = configuration
+            .get("Key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ApiError::bad_request("Backup named configuration key is missing"))?;
+        if key.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "Backup named configuration key must not be empty",
+            ));
+        }
+        let payload = configuration.get("Payload").cloned().ok_or_else(|| {
+            ApiError::bad_request("Backup named configuration payload is missing")
+        })?;
+        db.update_named_configuration(key, payload).await?;
+    }
+    Ok(())
 }
 
 fn branding_backup_json(config: BrandingConfig) -> serde_json::Value {
@@ -4208,6 +4254,10 @@ fn backup_snapshot_summary_json(snapshot: Option<&serde_json::Value>) -> serde_j
             .map_or(0, Vec::len),
         "MediaMetadata": snapshot
             .get("MediaMetadata")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+        "NamedConfigurations": snapshot
+            .get("NamedConfigurations")
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len),
         "FilesMode": snapshot
@@ -35886,6 +35936,48 @@ done
         })
         .await
         .unwrap();
+        db.update_named_configuration(
+            "livetv",
+            json!({
+                "TunerHosts": [{
+                    "Id": "snapshot-tuner",
+                    "Url": "http://127.0.0.1:8097/live.m3u",
+                    "Type": "M3U"
+                }],
+                "ListingProviders": [{
+                    "Id": "snapshot-guide",
+                    "Type": "XmlTv",
+                    "Path": "/tmp/snapshot-guide.xml"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        db.update_named_configuration(
+            "channels",
+            json!({
+                "Providers": [{
+                    "Id": "snapshot-channel-provider",
+                    "Name": "Snapshot Channels",
+                    "Items": [{
+                        "Id": "snapshot-channel-item",
+                        "Name": "Snapshot Channel Item"
+                    }]
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        db.update_named_configuration(
+            "network",
+            json!({
+                "EnableUPnP": true,
+                "PublicPort": 8097,
+                "PublishedServerUriBySubnet": ["192.0.2.0/24=http://snapshot.local:8097"]
+            }),
+        )
+        .await
+        .unwrap();
         db.update_startup_config(StartupConfig {
             server_name: "Snapshot Server".to_string(),
             ui_culture: "es-ES".to_string(),
@@ -36047,6 +36139,7 @@ done
         assert_eq!(created["SnapshotSummary"]["Users"], 2);
         assert_eq!(created["SnapshotSummary"]["VirtualFolders"], 1);
         assert_eq!(created["SnapshotSummary"]["MediaMetadata"], 1);
+        assert_eq!(created["SnapshotSummary"]["NamedConfigurations"], 3);
         assert_eq!(created["SnapshotSummary"]["FilesMode"], "metadata-only");
         assert_eq!(created["SnapshotSummary"]["PluginsMode"], "metadata-only");
         assert_eq!(created["SnapshotSummary"]["InstalledPlugins"], 1);
@@ -36196,6 +36289,44 @@ done
             .await
             .unwrap();
         db_for_assertions
+            .update_named_configuration(
+                "livetv",
+                json!({
+                    "TunerHosts": [{
+                        "Id": "changed-tuner",
+                        "Url": "http://127.0.0.1:8097/changed.m3u",
+                        "Type": "M3U"
+                    }],
+                    "ListingProviders": []
+                }),
+            )
+            .await
+            .unwrap();
+        db_for_assertions
+            .update_named_configuration(
+                "channels",
+                json!({
+                    "Providers": [{
+                        "Id": "changed-channel-provider",
+                        "Name": "Changed Channels",
+                        "Items": []
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        db_for_assertions
+            .update_named_configuration(
+                "network",
+                json!({
+                    "EnableUPnP": false,
+                    "PublicPort": 8098,
+                    "PublishedServerUriBySubnet": []
+                }),
+            )
+            .await
+            .unwrap();
+        db_for_assertions
             .update_branding_config(BrandingConfig {
                 login_disclaimer: Some("Changed disclaimer".to_string()),
                 custom_css: Some(".changed { color: red; }".to_string()),
@@ -36285,6 +36416,36 @@ done
         assert_eq!(restored_payloads.content_types[0]["Name"], "Movies");
         assert_eq!(restored_payloads.path_substitutions[0]["To"], "/mnt/media");
         assert_eq!(restored_payloads.server_options["EnableMetrics"], true);
+        let restored_livetv = db_for_assertions
+            .named_configuration("livetv")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_livetv["TunerHosts"][0]["Id"], "snapshot-tuner");
+        assert_eq!(
+            restored_livetv["ListingProviders"][0]["Id"],
+            "snapshot-guide"
+        );
+        let restored_channels = db_for_assertions
+            .named_configuration("channels")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored_channels["Providers"][0]["Id"],
+            "snapshot-channel-provider"
+        );
+        assert_eq!(
+            restored_channels["Providers"][0]["Items"][0]["Id"],
+            "snapshot-channel-item"
+        );
+        let restored_network = db_for_assertions
+            .named_configuration("network")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_network["EnableUPnP"], true);
+        assert_eq!(restored_network["PublicPort"], 8097);
         let restored_startup = db_for_assertions.startup_config().await.unwrap();
         assert_eq!(restored_startup.server_name, "Snapshot Server");
         assert_eq!(restored_startup.ui_culture, "es-ES");
