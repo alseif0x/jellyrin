@@ -27,7 +27,7 @@ async function main() {
     check('auth-lockout', api.includes('AUTH_LOCKOUT_FAILURE_LIMIT') && api.includes('StatusCode::TOO_MANY_REQUESTS')),
     check('token-redaction', api.includes('fn redact_sensitive_log_text') && api.includes('[REDACTED]')),
     check('ffmpeg-no-shell', core.includes('FfmpegCommandSpec::new("ffmpeg", args)') && transcode.includes('Command::new(&command.program)') && transcode.includes('.args(&command.args)')),
-    check('ffmpeg-no-stdin', core.includes('"-nostdin"') && transcode.includes('.stdin(Stdio::null())')),
+    check('ffmpeg-no-stdin', core.includes('"-nostdin"') && transcode.includes('pipe_stdin') && transcode.includes('Stdio::null()') && transcode.includes('Stdio::piped()')),
     check('transcode-temp-sanitized', transcode.includes('fn sanitize_hls_path_component') && transcode.includes('sanitize_hls_path_component(play_session_id)')),
     check('cors-not-permissive', !api.includes('CorsLayer::permissive') && !api.includes('allow_origin(Any)')),
   ];

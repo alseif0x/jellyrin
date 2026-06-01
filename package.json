@@ -24,7 +24,8 @@
     "golden:channels:fresh": "node qa/golden/channels-runner.js",
     "golden:clients": "node qa/golden/non-web-clients.js",
     "golden:clients:device-evidence": "node qa/golden/non-web-device-evidence.js",
-    "golden:ecosystem-release": "node qa/golden/ecosystem-placeholder.js ecosystem-release",
+    "golden:ecosystem-release": "node qa/golden/ecosystem-release.js",
+    "qa:security-hardening": "node qa/security-hardening.js",
     "evidence:ecosystem": "node qa/golden/ecosystem-parity.js",
     "evidence:dashboard": "node qa/golden/evidence-dashboard.js",
     "qa:packaging-release": "node qa/packaging-release.js"
