@@ -380,6 +380,8 @@ pub fn router(state: AppState) -> Router {
         .route("/system/logs", get(system_logs))
         .route("/System/Logs/Log", get(system_log_file))
         .route("/system/logs/log", get(system_log_file))
+        .route("/System/Diagnostics", get(system_diagnostics))
+        .route("/system/diagnostics", get(system_diagnostics))
         .route("/System/ActivityLog/Entries", get(activity_log_entries))
         .route("/system/activitylog/entries", get(activity_log_entries))
         .route("/System/Configuration", get(system_configuration))
@@ -5869,6 +5871,166 @@ fn is_server_log_file_name(name: &str) -> bool {
         .and_then(|extension| extension.to_str())
         .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "log" | "txt"))
         .unwrap_or(false)
+}
+
+async fn system_diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(auth_query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "GeneratedAt": format_time_for_json(OffsetDateTime::now_utc()),
+        "Plugins": plugin_observability_summary(&state.db).await?,
+        "LiveTv": live_tv_observability_summary(&state.db).await?,
+        "Dlna": dlna_observability_summary(&state.db).await?,
+        "SyncPlay": syncplay_observability_summary().await,
+        "Logs": {
+            "Directory": state.log_dir.to_string_lossy(),
+            "Endpoints": [
+                "/System/Logs",
+                "/System/Logs/Log"
+            ]
+        }
+    })))
+}
+
+async fn plugin_observability_summary(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let plugins = db.installed_plugins_json().await?;
+    let mut active = 0usize;
+    let mut malfunctioned = 0usize;
+    let mut runtime_instances = 0usize;
+    let mut recent_events = 0usize;
+    let mut runtimes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut statuses: BTreeMap<String, usize> = BTreeMap::new();
+
+    for plugin in &plugins {
+        let runtime = plugin
+            .get("Runtime")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string();
+        *runtimes.entry(runtime).or_default() += 1;
+
+        let status = plugin
+            .get("Status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string();
+        if status.eq_ignore_ascii_case("Active") {
+            active += 1;
+        }
+        if status.eq_ignore_ascii_case("Malfunctioned") {
+            malfunctioned += 1;
+        }
+        *statuses.entry(status).or_default() += 1;
+
+        runtime_instances += plugin
+            .get("RuntimeInstances")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        recent_events += plugin
+            .get("RecentEvents")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+    }
+
+    Ok(serde_json::json!({
+        "Installed": plugins.len(),
+        "Active": active,
+        "Malfunctioned": malfunctioned,
+        "RuntimeInstances": runtime_instances,
+        "RecentEvents": recent_events,
+        "Runtimes": runtimes,
+        "Statuses": statuses
+    }))
+}
+
+async fn live_tv_observability_summary(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let configured_tuners = config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let configured_listing_providers = config
+        .get("ListingProviders")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let active_tuner_leases = live_tuner_lease_observability_summary()?;
+    let active_hls_sessions = if let Some(sessions) = LIVE_HLS_SESSIONS.get() {
+        sessions.lock().await.len()
+    } else {
+        0
+    };
+    let active_recordings = if let Some(recordings) = LIVE_TV_RECORDING_REGISTRY.get() {
+        recordings.lock().await.len()
+    } else {
+        0
+    };
+
+    Ok(serde_json::json!({
+        "ConfiguredTunerHosts": configured_tuners,
+        "ConfiguredListingProviders": configured_listing_providers,
+        "ActiveTunerLeases": active_tuner_leases,
+        "ActiveHlsSessions": active_hls_sessions,
+        "ActiveRecordings": active_recordings
+    }))
+}
+
+fn live_tuner_lease_observability_summary() -> Result<serde_json::Value, ApiError> {
+    let leases = live_tuner_lease_registry().lock().map_err(|_| {
+        tracing::error!("live tuner lease registry lock poisoned while building diagnostics");
+        ApiError::internal("live tuner lease registry lock poisoned")
+    })?;
+    let mut by_tuner_host: BTreeMap<String, usize> = BTreeMap::new();
+    let total_refcount = leases.values().map(|lease| lease.refcount).sum::<usize>();
+    for key in leases.keys() {
+        *by_tuner_host.entry(key.tuner_host_id.clone()).or_default() += 1;
+    }
+    Ok(serde_json::json!({
+        "Count": leases.len(),
+        "TotalRefCount": total_refcount,
+        "ByTunerHost": by_tuner_host
+    }))
+}
+
+async fn dlna_observability_summary(db: &Database) -> Result<serde_json::Value, ApiError> {
+    let mut diagnostics = dlna::dlna_diagnostics_json()?;
+    diagnostics["UPnPEnabled"] = serde_json::Value::Bool(dlna::upnp_enabled(db).await?);
+    Ok(diagnostics)
+}
+
+async fn syncplay_observability_summary() -> serde_json::Value {
+    let groups = syncplay_groups().lock().await;
+    let participant_count = groups
+        .values()
+        .map(|group| group.participants.len())
+        .sum::<usize>();
+    let ready_count = groups
+        .values()
+        .flat_map(|group| group.participants.values())
+        .filter(|participant| participant.is_ready)
+        .count();
+    let buffering_count = groups
+        .values()
+        .flat_map(|group| group.participants.values())
+        .filter(|participant| participant.is_buffering)
+        .count();
+    let command_sequence_max = groups
+        .values()
+        .map(|group| group.command_sequence)
+        .max()
+        .unwrap_or(0);
+    serde_json::json!({
+        "Groups": groups.len(),
+        "Participants": participant_count,
+        "ReadyParticipants": ready_count,
+        "BufferingParticipants": buffering_count,
+        "MaxCommandSequence": command_sequence_max
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -32732,22 +32894,23 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::BTreeMap, fs};
 
     use super::{
         AUTH_LOCKOUT_FAILURE_LIMIT, ApiError, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
-        DirectPlayProfileMatcher, ItemsQuery, LiveTvTimerSchedulerRun,
-        PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
-        SystemLifecycleCommand, activate_dotnet_plugin_with_host_path,
-        activate_rust_wasi_plugin_with_host_path, await_package_install_cancelable,
-        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
-        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
-        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
-        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
-        encoding_configuration_json, ensure_package_install_not_cancelled, filter_package_list,
-        format_time_for_json, get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key,
-        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
+        DirectPlayProfileMatcher, ItemsQuery, LiveTunerLease, LiveTunerLeaseKey,
+        LiveTvTimerSchedulerRun, PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery,
+        SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand,
+        activate_dotnet_plugin_with_host_path, activate_rust_wasi_plugin_with_host_path,
+        await_package_install_cancelable, backup_restore_snapshot_json,
+        cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
+        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
+        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
+        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
+        ensure_package_install_not_cancelled, filter_package_list, format_time_for_json,
+        get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id,
+        json_string_field, json_value_i64, last_system_lifecycle_command,
         live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
         live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
@@ -32764,7 +32927,7 @@ mod tests {
         subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
         transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
         update_plugin_configuration_via_runtime_host_path, validate_zip_entry_path,
-        verify_plugin_package_checksum,
+        verify_plugin_package_checksum, with_live_tuner_leases,
     };
     use crate::dlna;
     use axum::{
@@ -32776,8 +32939,8 @@ mod tests {
     use http_body_util::BodyExt;
     use jellyrin_core::{FfmpegCommandSpec, MediaItem, StartupConfig, TranscodeStreamSelection};
     use jellyrin_db::{
-        BrandingConfig, Database, InstallPluginPackage, SystemConfigurationPayloads,
-        UpsertPlaybackState, UpsertTranscodeSession,
+        BrandingConfig, Database, InstallPluginPackage, PluginRuntimeInstanceUpsert,
+        SystemConfigurationPayloads, UpsertPlaybackState, UpsertTranscodeSession,
     };
     use jellyrin_plugin_rpc::PluginRuntime;
     use serde_json::{Value, json};
@@ -44074,6 +44237,203 @@ done
         assert_eq!(filtered["TotalRecordCount"], 1);
         assert_eq!(filtered["Items"].as_array().unwrap().len(), 1);
         assert_eq!(filtered["Items"][0]["Name"], "Server configuration updated");
+    }
+
+    #[tokio::test]
+    async fn system_diagnostics_requires_admin_and_reports_runtime_surfaces() {
+        let _syncplay_lock = syncplay_test_lock().await;
+        syncplay_groups().lock().await.clear();
+        with_live_tuner_leases(|leases| leases.clear()).unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "diagnostics-key")
+            .await
+            .unwrap();
+        db.update_named_configuration(
+            "livetv",
+            json!({
+                "TunerHosts": [{
+                    "Id": "diag-tuner",
+                    "Url": "http://127.0.0.1:8097/diag.m3u",
+                    "Type": "M3U"
+                }],
+                "ListingProviders": [{
+                    "Id": "diag-guide",
+                    "Type": "XmlTv"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        db.update_named_configuration(
+            "network",
+            json!({
+                "EnableUPnP": true
+            }),
+        )
+        .await
+        .unwrap();
+
+        let plugin_id = "33333333-3333-3333-3333-333333333333";
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Diagnostics Plugin".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Diagnostics Plugin",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Diagnostics Plugin",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi"
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        db.upsert_plugin_runtime_instance(
+            PluginRuntimeInstanceUpsert {
+                plugin_id: plugin_id.to_string(),
+                runtime: "RustWasi".to_string(),
+                runtime_version: "0.1.0".to_string(),
+                status: "Active".to_string(),
+                process_id: Some(4242),
+                endpoint: Some("stdio".to_string()),
+                health: json!({
+                    "Status": "Healthy"
+                }),
+                capabilities: vec!["ScheduledTask".to_string()],
+                last_error: None,
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        dlna::notify_dlna_content_directory_changed(&db)
+            .await
+            .unwrap();
+        with_live_tuner_leases(|leases| {
+            leases.insert(
+                LiveTunerLeaseKey {
+                    tuner_host_id: "diag-tuner".to_string(),
+                    channel_url: "http://127.0.0.1:8097/diag-channel.ts".to_string(),
+                },
+                LiveTunerLease { refcount: 2 },
+            );
+        })
+        .unwrap();
+
+        let group_id = "diag-syncplay".to_string();
+        syncplay_groups().lock().await.insert(
+            group_id.clone(),
+            super::SyncPlayGroup {
+                id: group_id.clone(),
+                name: "Diagnostics SyncPlay".to_string(),
+                owner_user_id: user.id,
+                participants: BTreeMap::from([(
+                    "diag-session".to_string(),
+                    super::SyncPlayParticipant {
+                        user_id: user.id,
+                        user_name: user.name.clone(),
+                        session_id: "diag-session".to_string(),
+                        device_id: "diag-device".to_string(),
+                        is_ready: true,
+                        is_buffering: false,
+                        last_seen_at: OffsetDateTime::now_utc(),
+                    },
+                )]),
+                state: json!({
+                    "LastCommand": "Ready"
+                }),
+                command_sequence: 7,
+                updated_at: OffsetDateTime::now_utc(),
+            },
+        );
+
+        let db_for_assertions = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Diagnostics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Diagnostics")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let diagnostics: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(diagnostics["Plugins"]["Installed"], 1);
+        assert_eq!(diagnostics["Plugins"]["Active"], 1);
+        assert_eq!(diagnostics["Plugins"]["RuntimeInstances"], 1);
+        assert!(diagnostics["Plugins"]["RecentEvents"].as_u64().unwrap() >= 1);
+        assert_eq!(diagnostics["Plugins"]["Runtimes"]["RustWasi"], 1);
+        assert_eq!(diagnostics["LiveTv"]["ConfiguredTunerHosts"], 1);
+        assert_eq!(diagnostics["LiveTv"]["ConfiguredListingProviders"], 1);
+        assert_eq!(diagnostics["LiveTv"]["ActiveTunerLeases"]["Count"], 1);
+        assert_eq!(
+            diagnostics["LiveTv"]["ActiveTunerLeases"]["TotalRefCount"],
+            2
+        );
+        assert_eq!(
+            diagnostics["LiveTv"]["ActiveTunerLeases"]["ByTunerHost"]["diag-tuner"],
+            1
+        );
+        assert_eq!(diagnostics["Dlna"]["UPnPEnabled"], true);
+        assert!(
+            diagnostics["Dlna"]["SystemUpdateID"].as_u64().unwrap() >= 1,
+            "{diagnostics}"
+        );
+        assert_eq!(diagnostics["SyncPlay"]["Groups"], 1);
+        assert_eq!(diagnostics["SyncPlay"]["Participants"], 1);
+        assert_eq!(diagnostics["SyncPlay"]["ReadyParticipants"], 1);
+        assert_eq!(diagnostics["SyncPlay"]["MaxCommandSequence"], 7);
+        assert_eq!(
+            diagnostics["Logs"]["Endpoints"],
+            json!(["/System/Logs", "/System/Logs/Log"])
+        );
+
+        let stored_plugin = db_for_assertions
+            .installed_plugin_json(plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_plugin["Status"], "Active");
+
+        syncplay_groups().lock().await.clear();
+        with_live_tuner_leases(|leases| leases.clear()).unwrap();
     }
 
     #[tokio::test]

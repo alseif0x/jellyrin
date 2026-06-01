@@ -1182,6 +1182,36 @@ struct DlnaEventSubscription {
     next_seq: u32,
 }
 
+pub(crate) fn dlna_diagnostics_json() -> Result<Value, ApiError> {
+    cleanup_expired_event_subscriptions()?;
+    let subscriptions = dlna_event_subscriptions()?;
+    let mut content_directory = 0usize;
+    let mut connection_manager = 0usize;
+    let mut media_receiver_registrar = 0usize;
+    for subscription in subscriptions.values() {
+        match subscription.service {
+            DlnaEventService::ContentDirectory => content_directory += 1,
+            DlnaEventService::ConnectionManager => connection_manager += 1,
+            DlnaEventService::MediaReceiverRegistrar => media_receiver_registrar += 1,
+        }
+    }
+    Ok(json!({
+        "SystemUpdateID": dlna_system_update_id(),
+        "EventSubscriptions": {
+            "Total": subscriptions.len(),
+            "ContentDirectory": content_directory,
+            "ConnectionManager": connection_manager,
+            "MediaReceiverRegistrar": media_receiver_registrar
+        },
+        "Services": [
+            "ContentDirectory",
+            "ConnectionManager",
+            "MediaReceiverRegistrar"
+        ],
+        "SourceProtocolInfoCount": DLNA_PROTOCOL_INFO_ENTRIES.len()
+    }))
+}
+
 fn event_subscription_response(
     service: DlnaEventService,
     method: &Method,

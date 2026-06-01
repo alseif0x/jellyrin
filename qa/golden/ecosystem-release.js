@@ -34,6 +34,14 @@ async function main() {
     '--',
     '--nocapture',
   ]);
+  const observability = await runCommand('cargo', [
+    'test',
+    '-p',
+    'jellyrin-api',
+    'system_diagnostics_requires_admin_and_reports_runtime_surfaces',
+    '--',
+    '--nocapture',
+  ]);
   const evidenceChecks = await prerequisiteEvidenceChecks();
   const assetChecks = await releaseAssetChecks();
 
@@ -41,6 +49,7 @@ async function main() {
     check('packaging-release-matrix', packaging.code === 0),
     check('security-hardening-matrix', security.code === 0),
     check('backup-restore-rollback-smoke', backupRestore.code === 0),
+    check('runtime-observability-smoke', observability.code === 0),
     ...evidenceChecks,
     ...assetChecks,
   ];
@@ -49,12 +58,12 @@ async function main() {
   const evidence = {
     gate: 'ecosystem-release',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 45 : 10,
+    percent: passed ? 55 : 10,
     closed: false,
-    sourcePhase: passed ? 'E7.1/E7.2/E7.5/E7.6/release-smoke-baseline' : 'E7.1/E7.2-attempted',
+    sourcePhase: passed ? 'E7.1/E7.2/E7.3/E7.4/E7.5/E7.6/release-smoke-baseline' : 'E7.1/E7.2-attempted',
     evidence: passed
       ? [
-          'E7 release baseline is implemented: packaging and security hardening matrices pass, release assets are present, npm exposes the release gate, prerequisite ecosystem evidence files exist for E1-E6, and the backup/restore rollback smoke restores users, libraries, metadata, plugins and named configurations used by Live TV, Channels and network/DLNA.',
+          'E7 release baseline is implemented: packaging and security hardening matrices pass, release assets are present, npm exposes the release gate, prerequisite ecosystem evidence files exist for E1-E6, the backup/restore rollback smoke restores users, libraries, metadata, plugins and named configurations used by Live TV, Channels and network/DLNA, and /System/Diagnostics reports plugin runtime, Live TV tuner, DLNA eventing/update-id, SyncPlay and log surfaces.',
           'This is not final release-ready closure because device/manual gates, real upgrade execution, installed systemd smoke and host-level rollback rehearsal still remain open.',
         ].join(' ')
       : 'E7 release baseline checks failed; inspect failedChecks and commandResults before advancing release work.',
@@ -64,6 +73,7 @@ async function main() {
           'packaging-release-matrix',
           'security-hardening-matrix',
           'backup-restore-rollback-smoke',
+          'runtime-observability-smoke',
           'release-assets-present',
           'ecosystem-prerequisite-evidence-present',
         ]
@@ -74,6 +84,7 @@ async function main() {
       packaging: commandSummary(packaging),
       security: commandSummary(security),
       backupRestore: commandSummary(backupRestore),
+      observability: commandSummary(observability),
     },
     openRisks: [
       'Dashboard target remains release-ready; this baseline does not close E7 until all prior ecosystem gates are closed or explicitly accepted.',
