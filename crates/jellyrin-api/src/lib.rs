@@ -30954,7 +30954,7 @@ async fn item_remote_images(
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
     Ok(Json(query_result(
-        remote_image_candidates(&item, query.image_type.as_deref()).await?,
+        remote_image_candidates(&state.db, &item, query.image_type.as_deref()).await?,
     )))
 }
 
@@ -30966,10 +30966,12 @@ async fn item_remote_image_providers(
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     media_item_by_id(&state.db, &item_id).await?;
-    Ok(Json(vec![serde_json::json!({
+    let mut providers = vec![serde_json::json!({
         "Name": "Local cache",
         "SupportedImages": ["Primary", "Backdrop", "Thumb", "Logo"],
-    })]))
+    })];
+    providers.extend(plugin_image_provider_infos(&state.db).await?);
+    Ok(Json(providers))
 }
 
 async fn download_remote_image(
@@ -30995,8 +30997,12 @@ async fn download_remote_image(
         .as_deref()
         .or(body_image_type.as_deref())
         .unwrap_or("Primary");
-    let remote_path = remote_image_path_from_id(image_id).await?;
-    install_remote_image(&state, &item_id, &remote_path, image_type).await?;
+    if let Some((bytes, _mime_type)) = plugin_remote_image_payload_from_id(image_id)? {
+        install_remote_image_bytes(&state, &item_id, bytes, image_type).await?;
+    } else {
+        let remote_path = remote_image_path_from_id(image_id).await?;
+        install_remote_image(&state, &item_id, &remote_path, image_type).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -31029,21 +31035,22 @@ struct RemoteImageDownloadQuery {
 }
 
 async fn remote_image_candidates(
+    db: &Database,
     item: &MediaItem,
     requested_image_type: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut images = plugin_remote_image_candidates(db, item, requested_image_type).await?;
     let Some(item_dir) = media_item_path(item).parent() else {
-        return Ok(Vec::new());
+        return Ok(images);
     };
     let remote_dir = item_dir.join(".jellyrin-remote-images");
     let mut entries = match tokio::fs::read_dir(&remote_dir).await {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(images),
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => return Ok(images),
         Err(error) => return Err(error.into()),
     };
     let requested_image_type = requested_image_type.map(normalize_image_type);
-    let mut images = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
         if !is_supported_remote_image_path(&path) {
@@ -31093,6 +31100,120 @@ async fn remote_image_candidates(
     Ok(images)
 }
 
+async fn plugin_image_provider_infos(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
+    Ok(db
+        .installed_plugins_json()
+        .await?
+        .into_iter()
+        .filter(plugin_is_active_image_provider)
+        .map(|plugin| {
+            serde_json::json!({
+                "Name": json_string_field(&plugin, "Name").unwrap_or_else(|| "Plugin Image Provider".to_string()),
+                "SupportedImages": ["Primary", "Backdrop", "Thumb", "Logo"],
+            })
+        })
+        .collect())
+}
+
+async fn plugin_remote_image_candidates(
+    db: &Database,
+    item: &MediaItem,
+    requested_image_type: Option<&str>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut images = Vec::new();
+    let requested_image_type = requested_image_type.map(canonical_image_type);
+    for plugin in db.installed_plugins_json().await? {
+        if !plugin_is_active_image_provider(&plugin) {
+            continue;
+        }
+        let provider_name = json_string_field(&plugin, "Name").unwrap_or_else(|| {
+            json_string_field(&plugin, "Id").unwrap_or_else(|| "Plugin Image Provider".to_string())
+        });
+        let capability = invoke_plugin_capability_via_runtime_host(
+            &plugin,
+            "ImageProvider",
+            serde_json::json!({
+                "ItemId": item.id.simple().to_string(),
+                "ItemName": item.name,
+                "ItemType": media_item_type(item),
+                "ImageType": requested_image_type.as_deref(),
+            }),
+        )
+        .await?;
+        let Some(capability) = capability else {
+            continue;
+        };
+        images.extend(plugin_remote_image_candidate_values(
+            &provider_name,
+            requested_image_type.as_deref(),
+            &capability.value,
+        )?);
+    }
+    Ok(images)
+}
+
+fn plugin_is_active_image_provider(plugin: &serde_json::Value) -> bool {
+    json_string_field(plugin, "Status").as_deref() == Some("Active")
+        && plugin_string_array(plugin.get("Capabilities"))
+            .iter()
+            .any(|capability| capability.eq_ignore_ascii_case("ImageProvider"))
+}
+
+fn plugin_remote_image_candidate_values(
+    provider_name: &str,
+    requested_image_type: Option<&str>,
+    value: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let values = value
+        .get("Images")
+        .or_else(|| value.get("Items"))
+        .or_else(|| value.get("Results"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| vec![value.clone()]);
+    let mut images = Vec::new();
+    for value in values {
+        let image_type = json_string_any_field(&value, &["ImageType", "Type", "type"])
+            .map(|value| canonical_image_type(&value))
+            .unwrap_or_else(|| "Primary".to_string());
+        if requested_image_type.is_some_and(|requested| requested != image_type.as_str()) {
+            continue;
+        }
+        let Some(base64_data) =
+            json_string_field(&value, "Base64Data").or_else(|| json_string_field(&value, "Data"))
+        else {
+            continue;
+        };
+        let mime_type = json_string_field(&value, "MimeType")
+            .or_else(|| json_string_field(&value, "ContentType"))
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let bytes = general_purpose::STANDARD
+            .decode(base64_data.as_bytes())
+            .map_err(|error| ApiError::internal(format!("Plugin image payload failed: {error}")))?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let size = bytes.len();
+        let url = plugin_remote_image_id(&bytes, &mime_type);
+        images.push(serde_json::json!({
+            "ProviderName": provider_name,
+            "Url": url,
+            "ThumbnailUrl": null,
+            "Name": json_string_field(&value, "Name").unwrap_or_else(|| format!("{provider_name} {image_type}")),
+            "Type": image_type,
+            "Language": null,
+            "RatingType": "Score",
+            "CommunityRating": value.get("CommunityRating").cloned().unwrap_or(serde_json::Value::Null),
+            "VoteCount": value.get("VoteCount").cloned().unwrap_or(serde_json::Value::Null),
+            "Width": value.get("Width").cloned().unwrap_or(serde_json::Value::Null),
+            "Height": value.get("Height").cloned().unwrap_or(serde_json::Value::Null),
+            "Size": size,
+            "MimeType": mime_type,
+        }));
+    }
+    Ok(images)
+}
+
 async fn install_remote_image(
     state: &AppState,
     item_id: &str,
@@ -31106,7 +31227,55 @@ async fn install_remote_image(
     if bytes.len() > IMAGE_UPLOAD_LIMIT_BYTES {
         return Err(ApiError::bad_request("Remote image file is too large"));
     }
+    install_remote_image_bytes(state, item_id, bytes, image_type).await
+}
+
+async fn install_remote_image_bytes(
+    state: &AppState,
+    item_id: &str,
+    bytes: Vec<u8>,
+    image_type: &str,
+) -> Result<(), ApiError> {
+    if bytes.is_empty() {
+        return Err(ApiError::bad_request("Remote image file is empty"));
+    }
+    if bytes.len() > IMAGE_UPLOAD_LIMIT_BYTES {
+        return Err(ApiError::bad_request("Remote image file is too large"));
+    }
     store_image_bytes(state, ImageOwner::Item(item_id), image_type, 0, bytes).await
+}
+
+fn plugin_remote_image_id(bytes: &[u8], mime_type: &str) -> String {
+    let payload = serde_json::json!({
+        "MimeType": mime_type,
+        "Base64Data": general_purpose::STANDARD.encode(bytes),
+    });
+    format!(
+        "plugin-image:{}",
+        general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+    )
+}
+
+fn plugin_remote_image_payload_from_id(
+    image_id: &str,
+) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let Some(encoded) = image_id.strip_prefix("plugin-image:") else {
+        return Ok(None);
+    };
+    let payload = general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError::not_found("Remote image not found"))?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|_| ApiError::not_found("Remote image not found"))?;
+    let Some(base64_data) = json_string_field(&payload, "Base64Data") else {
+        return Err(ApiError::not_found("Remote image not found"));
+    };
+    let bytes = general_purpose::STANDARD
+        .decode(base64_data.as_bytes())
+        .map_err(|_| ApiError::not_found("Remote image not found"))?;
+    let mime_type = json_string_field(&payload, "MimeType")
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(Some((bytes, mime_type)))
 }
 
 fn remote_image_id_for_path(path: &FsPath) -> String {
@@ -31981,10 +32150,10 @@ mod tests {
         plugin_package_operation, plugin_packages_root, plugin_scheduled_task_id,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
         record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
-        run_due_live_tv_timers, series_timer_child_id, spawn_hls_transcode_task, stable_entity_id,
-        subscribe_playback_events, subscribe_system_lifecycle_commands,
-        syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
+        run_due_live_tv_timers, scan_all_library_items, series_timer_child_id,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
+        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
         update_plugin_configuration_via_runtime_host_path, validate_zip_entry_path,
         verify_plugin_package_checksum,
     };
@@ -32920,7 +33089,6 @@ mod tests {
             .unwrap()
         );
         let _guard = RustWasiHostPathGuard::set(host_path);
-
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -33102,6 +33270,173 @@ mod tests {
             "wasi-plugin-movie"
         );
         assert_eq!(remote_results[0]["Overview"], "Metadata from WASI plugin");
+    }
+
+    #[tokio::test]
+    async fn rust_wasi_image_provider_feeds_remote_images_and_download() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "bbbbbbbb-0000-0000-0000-000000000003";
+        let tmp = tempfile::tempdir().unwrap();
+        let media_dir = tmp.path().join("media");
+        tokio::fs::create_dir_all(&media_dir).await.unwrap();
+        let movie_path = media_dir.join("Plugin Image Movie.mp4");
+        tokio::fs::write(&movie_path, b"fake video").await.unwrap();
+        db.upsert_virtual_folder(
+            "Movies",
+            Some("movies"),
+            vec![media_dir.to_string_lossy().to_string()],
+        )
+        .await
+        .unwrap();
+        scan_all_library_items(&db).await.unwrap();
+        let item = db.media_items().await.unwrap().remove(0);
+
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("image.wasm"), b"\0asm")
+            .await
+            .unwrap();
+        let expected_png = test_png_bytes();
+        let host_path = fake_rust_wasi_image_provider_host_script(tmp.path(), &expected_png).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Image WASI".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Image WASI",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Image WASI",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["ImageProvider"]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_rust_wasi_plugin_with_host_path(
+                &db,
+                &plugin,
+                Some(user.id),
+                host_path.clone()
+            )
+            .await
+            .unwrap()
+        );
+        let _guard = RustWasiHostPathGuard::set(host_path);
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let item_id = item.id.simple().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages/Providers"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let providers: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            providers
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|provider| provider["Name"] == "Image WASI")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages?ImageType=Primary"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(images["TotalRecordCount"], 1, "{images}");
+        assert_eq!(images["Items"][0]["ProviderName"], "Image WASI");
+        assert_eq!(images["Items"][0]["Type"], "Primary");
+        assert_eq!(images["Items"][0]["MimeType"], "image/png");
+        let image_url = images["Items"][0]["Url"].as_str().unwrap();
+        assert!(image_url.starts_with("plugin-image:"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages/Download"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "ImageUrl": image_url, "ImageType": "Primary" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Image/Items/{item_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_png.as_slice());
     }
 
     #[tokio::test]
@@ -33465,6 +33800,60 @@ done
                 .unwrap();
         }
         path
+    }
+
+    async fn fake_rust_wasi_image_provider_host_script(
+        root: &std::path::Path,
+        image: &[u8],
+    ) -> PathBuf {
+        let path = root.join("fake-wasi-image-provider-host.sh");
+        let image_base64 = general_purpose::STANDARD.encode(image);
+        let script = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-wasi-image-provider-host","ServerVersion":"fake-wasi-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000003","Runtime":"RustWasi","RuntimeVersion":"fake-wasi-host-0.1","Status":"Healthy","Manifest":{"Name":"Image WASI"},"Capabilities":["ImageProvider"]}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"ImageProvider","Images":[{"Name":"Plugin Primary","ImageType":"Primary","MimeType":"image/png","Base64Data":"__IMAGE_BASE64__","Width":1,"Height":1}]}}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000003","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#
+        .replace("__IMAGE_BASE64__", &image_base64);
+        tokio::fs::write(&path, script).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    fn test_png_bytes() -> Vec<u8> {
+        vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0,
+            5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ]
     }
 
     struct RustWasiHostPathGuard {
