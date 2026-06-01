@@ -10,6 +10,7 @@
     "golden:ecosystem": "npm run evidence:ecosystem",
     "golden:plugins": "node qa/golden/plugin-dual-runtime.js",
     "golden:livetv": "node qa/golden/livetv-real.js",
+    "golden:livetv:device-evidence": "node qa/golden/livetv-device-evidence.js",
     "golden:livetv:fresh": "node qa/golden/livetv-runner.js",
     "golden:dlna": "node qa/golden/dlna-upnp.js",
     "golden:dlna-discovery": "node qa/golden/dlna-discovery.js",

@@ -3,6 +3,10 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const {
+  loadManualLiveTvEvidence,
+  summarizeManualLiveTvEvidence,
+} = require('./livetv-device-evidence');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
@@ -97,9 +101,10 @@ async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
 
   const localSubgates = await runLocalSubgates();
+  const manualEvidence = await loadManualLiveTvEvidence();
   const result = await runBrowserTrace();
   const comparison = await readJsonIfExists(comparisonPath);
-  const evidence = buildEvidence(result, comparison, localSubgates);
+  const evidence = buildEvidence(result, comparison, localSubgates, manualEvidence);
 
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison));
@@ -191,13 +196,16 @@ function runCommand(command, args) {
   });
 }
 
-function buildEvidence(result, comparison, localSubgates) {
+function buildEvidence(result, comparison, localSubgates, manualEvidence) {
   const updatedAt = new Date().toISOString();
   const localPassed = localSubgates.length > 0 && localSubgates.every((subgate) => subgate.code === 0);
+  const deviceEvidence = summarizeManualLiveTvEvidence(manualEvidence);
+  const deviceValidated = deviceEvidence.validCount > 0;
   if (!comparison) {
     return {
       ...baselineEvidence,
       updatedAt,
+      deviceEvidence,
       evidence: `${baselineEvidence.evidence} Browser trace did not produce comparison.json.`,
     };
   }
@@ -226,11 +234,11 @@ function buildEvidence(result, comparison, localSubgates) {
       .every((summary) => summary.invariants?.liveTvHdhrStreamRefcountReleased === true);
     return {
       gate: 'livetv-real',
-      status: 'upstream-validated',
-      percent: localPassed ? 85 : 45,
-      closed: false,
+      status: deviceValidated ? 'device-validated' : 'upstream-validated',
+      percent: deviceValidated ? 100 : localPassed ? 85 : 45,
+      closed: deviceValidated,
       sourcePhase: localPassed
-        ? 'E2.1/E2.2a/E2.2b/E2.2c/E2.2d/E2.2e/browser-upstream'
+        ? `E2.1/E2.2a/E2.2b/E2.2c/E2.2d/E2.2e/browser-upstream${deviceValidated ? '/manual-device' : ''}`
         : 'E2.1',
       evidence: [
         'Live TV HDHomeRun golden completed against both upstream Jellyfin and Jellyrin using the same simulator.',
@@ -281,18 +289,26 @@ function buildEvidence(result, comparison, localSubgates) {
         'liveTvHdhrTunerLimitSharingExempt (jellyrin-only): 2 consumers of channel 7.1 with TunerCount=1 do NOT trigger a conflict; maxConcurrentByChannel[/auto/v7.1]===1 (sharing exempt). Upstream sharing is not directly comparable via the sim metric (upstream uses file-based SharedHttpStream, not broadcast fan-out).',
         'D5 R-LIMIT-SCOPE closed in Jellyrin: TunerCount now uses a shared LIVE_TUNER_LEASES registry across direct TS, live HLS and recordings, and the formal upstream-comparable golden block exercises direct TS, HLS and recording cross-mode conflicts.',
         'Upstream isolation: the main sim tuner is deleted before the limit test on upstream to prevent fallback to the main tuner (TunerCount=0). Only the offset limit tuner (TunerCount=1) serves channels 7.1/8.1 during the conflict sequence.',
+        deviceValidated
+          ? `Manual Live TV acceptance evidence is valid (${deviceEvidence.validCount} file(s)); E2 can close as device-validated.`
+          : `Manual Live TV acceptance evidence is pending; add a passing JSON file under ${deviceEvidence.directory}.`,
       ].join(' '),
       updatedAt,
-      completedTargets: allCompletedTargets,
+      completedTargets: deviceValidated
+        ? [...new Set([...allCompletedTargets, 'manual-live-tv-device-evidence'])].sort()
+        : allCompletedTargets,
       skippedTargets,
       failedTargets,
       upstreamComparableInvariants: upstreamComparable,
       jellyrinOnlyInvariants: jellyrinOnly,
       invariantCoverage,
       localSubgates,
+      deviceEvidence,
       tracePath: path.relative(plansDir, comparisonPath),
       openRisks: [
-        'Dashboard target remains device-validated; closing E2 still requires a final device-validated acceptance decision.',
+        ...(!deviceValidated
+          ? ['Dashboard target remains device-validated; closing E2 still requires a final device-validated acceptance decision.']
+          : []),
         ...(!refcountReleaseObserved
           ? ['R8: upstream SharedHttpStream may keep connection open after probes close (refill buffer); liveTvHdhrStreamRefcountReleased may be false for upstream if observed within timeout.']
           : []),
@@ -320,6 +336,7 @@ function buildEvidence(result, comparison, localSubgates) {
       skippedTargets,
       failedTargets,
       localSubgates,
+      deviceEvidence,
       invariantCoverage,
       failedReasons: comparison.comparison?.reasons || [],
       traceExitCode: result.code,
@@ -349,6 +366,7 @@ function buildEvidence(result, comparison, localSubgates) {
       skippedTargets,
       failedTargets,
       localSubgates,
+      deviceEvidence,
       invariantCoverage,
       failedReasons: comparison.comparison?.reasons || [],
       traceExitCode: result.code,
@@ -376,6 +394,7 @@ function buildEvidence(result, comparison, localSubgates) {
     traceExitCode: result.code,
     tracePath: path.relative(plansDir, comparisonPath),
     localSubgates,
+    deviceEvidence,
     openRisks: jellyrinCompleted
       ? [
           'Upstream Jellyfin does not expose the synthetic M3U/XMLTV fixture through the direct System/Configuration/livetv path used by this harness; a real HDHomeRun/M3U setup path or upstream fixture hook is still needed.',
@@ -458,6 +477,21 @@ function renderMarkdown(evidence, comparison) {
     lines.push('| --- | ---: | --- | --- |');
     for (const subgate of evidence.localSubgates) {
       lines.push(`| ${subgate.target} | ${subgate.code} | ${subgate.evidence} | \`${subgate.command}\` |`);
+    }
+  }
+  if (evidence.deviceEvidence) {
+    lines.push('');
+    lines.push('## Manual Device Evidence');
+    lines.push('');
+    lines.push(`- Directory: \`${evidence.deviceEvidence.directory}\``);
+    lines.push(`- Template: \`${evidence.deviceEvidence.templatePath}\``);
+    lines.push(`- Valid files: ${evidence.deviceEvidence.validCount}`);
+    lines.push(`- Invalid files: ${evidence.deviceEvidence.invalidCount}`);
+    for (const run of evidence.deviceEvidence.validRuns || []) {
+      lines.push(`- Valid run: ${run.evidenceType} / ${run.tunerType} / ${run.clientName} ${run.clientVersion} / ${run.deviceName} (${run.file})`);
+    }
+    for (const invalid of evidence.deviceEvidence.invalidFiles || []) {
+      lines.push(`- Invalid file: ${invalid.file} - ${invalid.errors.join('; ')}`);
     }
   }
   if (Array.isArray(evidence.failedReasons) && evidence.failedReasons.length > 0) {
