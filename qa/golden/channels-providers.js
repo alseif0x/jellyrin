@@ -3,6 +3,10 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const {
+  loadManualChannelsProviderEvidence,
+  summarizeManualChannelsProviderEvidence,
+} = require('./channels-provider-evidence');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
@@ -39,9 +43,10 @@ async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
 
   const localSubgates = await runLocalSubgates();
+  const manualEvidence = await loadManualChannelsProviderEvidence();
   const result = await runBrowserTrace();
   const comparison = await readJsonIfExists(comparisonPath);
-  const evidence = buildEvidence(result, comparison, localSubgates);
+  const evidence = buildEvidence(result, comparison, localSubgates, manualEvidence);
 
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison));
@@ -117,9 +122,11 @@ function runCommand(command, args) {
   });
 }
 
-function buildEvidence(result, comparison, localSubgates) {
+function buildEvidence(result, comparison, localSubgates, manualEvidence) {
   const updatedAt = new Date().toISOString();
   const localPassed = localSubgates.length > 0 && localSubgates.every((subgate) => subgate.code === 0);
+  const providerEvidence = summarizeManualChannelsProviderEvidence(manualEvidence);
+  const externalProviderValidated = providerEvidence.validCount > 0;
   if (!comparison) {
     return {
       gate: 'channels-providers',
@@ -131,6 +138,7 @@ function buildEvidence(result, comparison, localSubgates) {
       updatedAt,
       traceExitCode: result.code,
       localSubgates,
+      providerEvidence,
       openRisks: ['No real E5 channels-provider evidence has been generated yet.'],
     };
   }
@@ -159,10 +167,10 @@ function buildEvidence(result, comparison, localSubgates) {
   if (targetsHealthy && invariantCoverage.complete && localPassed) {
     return {
       gate: 'channels-providers',
-      status: 'implemented',
-      percent: 94,
-      closed: false,
-      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation/dotnet-provider/remote-http-images',
+      status: externalProviderValidated ? 'upstream-validated' : 'implemented',
+      percent: externalProviderValidated ? 100 : 94,
+      closed: externalProviderValidated,
+      sourcePhase: `E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation/dotnet-provider/remote-http-images${externalProviderValidated ? '/external-provider-evidence' : ''}`,
       evidence: [
         'Channels browser golden completed against upstream Jellyfin and Jellyrin.',
         'Both targets satisfy the base Channels contract for GET /Channels and GET /Channels/Features.',
@@ -172,23 +180,32 @@ function buildEvidence(result, comparison, localSubgates) {
         'The local DotNetJellyfin ChannelProvider fixture validates stdio-host activation, plugin-backed provider browse, non-Live-TV provider item MediaInfo/LiveStreams/Open resolution and healthy diagnostics.',
         'RefreshChannels now persists provider cache, item ids, refresh timestamps, remote HTTP provider item image hydration and refresh history in the channels named configuration.',
         'Runtime plugin ChannelProvider failures are isolated from /Channels and /Channels/{id}/Items while diagnostics reports Malfunctioned with failure detail.',
-        'This is an implemented E5 baseline, not full upstream-validated external provider parity: real external provider traces and broader non-Live-TV provider playback remain open.',
+        externalProviderValidated
+          ? `External channels provider evidence is valid (${providerEvidence.validCount} file(s)); E5 can close as upstream-validated.`
+          : `This is an implemented E5 baseline, not full upstream-validated external provider parity: add a passing provider evidence JSON under ${providerEvidence.directory}.`,
       ].join(' '),
       updatedAt,
-      completedTargets: allCompletedTargets,
+      completedTargets: externalProviderValidated
+        ? [...new Set([...allCompletedTargets, 'external-channel-provider-evidence'])].sort()
+        : allCompletedTargets,
       skippedTargets,
       failedTargets,
       upstreamRequired,
       jellyrinRequired,
       invariantCoverage,
       localSubgates,
+      providerEvidence,
       tracePath: path.relative(plansDir, comparisonPath),
       comparisonNotes: comparison.comparison?.reasons || [],
       openRisks: [
-        'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
-        'Provider item image resolution is covered for embedded data/plugin payloads and configured-provider remote HTTP hydration; broader external provider traces are still needed.',
-        'Rust/WASI and DotNetJellyfin plugin channel-provider browse and MediaInfo resolution are covered by local subgates; real Jellyfin extension-point adapters still need external provider traces.',
-        'Provider failure/timeout isolation is covered for declarative and Rust/WASI runtime malfunctioned providers; broader browser evidence with real external providers is still pending.',
+        ...(!externalProviderValidated
+          ? [
+              'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
+              'Provider item image resolution is covered for embedded data/plugin payloads and configured-provider remote HTTP hydration; broader external provider traces are still needed.',
+              'Rust/WASI and DotNetJellyfin plugin channel-provider browse and MediaInfo resolution are covered by local subgates; real Jellyfin extension-point adapters still need external provider traces.',
+              'Provider failure/timeout isolation is covered for declarative and Rust/WASI runtime malfunctioned providers; broader browser evidence with real external providers is still pending.',
+            ]
+          : []),
       ],
     };
   }
@@ -207,6 +224,7 @@ function buildEvidence(result, comparison, localSubgates) {
     failedReasons: comparison.comparison?.reasons || [],
     invariantCoverage,
     localSubgates,
+    providerEvidence,
     traceExitCode: result.code,
     tracePath: path.relative(plansDir, comparisonPath),
     openRisks: [
@@ -275,6 +293,21 @@ function renderMarkdown(evidence, comparison) {
     lines.push('| --- | ---: | --- | --- |');
     for (const subgate of evidence.localSubgates) {
       lines.push(`| ${subgate.target} | ${subgate.code} | ${subgate.evidence} | \`${subgate.command}\` |`);
+    }
+  }
+  if (evidence.providerEvidence) {
+    lines.push('');
+    lines.push('## External Provider Evidence');
+    lines.push('');
+    lines.push(`- Directory: \`${evidence.providerEvidence.directory}\``);
+    lines.push(`- Template: \`${evidence.providerEvidence.templatePath}\``);
+    lines.push(`- Valid files: ${evidence.providerEvidence.validCount}`);
+    lines.push(`- Invalid files: ${evidence.providerEvidence.invalidCount}`);
+    for (const run of evidence.providerEvidence.validRuns || []) {
+      lines.push(`- Valid run: ${run.providerType} / ${run.providerName} / ${run.clientName} ${run.clientVersion} (${run.file})`);
+    }
+    for (const invalid of evidence.providerEvidence.invalidFiles || []) {
+      lines.push(`- Invalid file: ${invalid.file} - ${invalid.errors.join('; ')}`);
     }
   }
   if (Array.isArray(evidence.failedReasons) && evidence.failedReasons.length > 0) {
