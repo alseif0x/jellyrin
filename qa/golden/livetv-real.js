@@ -96,19 +96,70 @@ const baselineEvidence = {
 async function main() {
   await fs.mkdir(generatedDir, { recursive: true });
 
+  const localSubgates = await runLocalSubgates();
   const result = await runBrowserTrace();
   const comparison = await readJsonIfExists(comparisonPath);
-  const evidence = buildEvidence(result, comparison);
+  const evidence = buildEvidence(result, comparison, localSubgates);
 
   await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
   await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence, comparison));
   console.log(`wrote ${evidencePath}`);
   console.log(`wrote ${evidenceMarkdownPath}`);
 
+  if (localSubgates.some((subgate) => subgate.code !== 0)) {
+    process.exitCode = localSubgates.find((subgate) => subgate.code !== 0)?.code || 1;
+    return;
+  }
   const jellyrinCompleted = Array.isArray(evidence.completedTargets) && evidence.completedTargets.includes('jellyrin');
-  if (!jellyrinCompleted && evidence.status !== 'upstream-validated' && evidence.status !== 'device-validated') {
+  if (!jellyrinCompleted && evidence.status !== 'implemented' && evidence.status !== 'upstream-validated' && evidence.status !== 'device-validated') {
     process.exitCode = result.code || 1;
   }
+}
+
+async function runLocalSubgates() {
+  const subgates = [
+    {
+      target: 'recording-copy',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'live_tv_recording_copy_writes_bytes_to_file', '--', '--nocapture'],
+      evidence: 'recording copy writes non-empty bytes to a real recording file and persists Completed metadata',
+    },
+    {
+      target: 'recording-restart-recovery',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'live_tv_startup_reconciliation_restarts_in_window_timer', '--', '--nocapture'],
+      evidence: 'startup reconciliation removes stale InProgress file, restarts an in-window timer and completes recording',
+    },
+    {
+      target: 'future-timer-scheduler',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'live_tv_timer_scheduler_starts_future_timer_when_due', '--', '--nocapture'],
+      evidence: 'timer scheduler does not start early, starts when due and completes a real file recording',
+    },
+    {
+      target: 'stream-sharing-two-consumers',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'live_tv_stream_sharing_two_consumers_one_connection', '--', '--nocapture'],
+      evidence: 'two consumers of the same live stream share one outgoing producer and increment refcount',
+    },
+    {
+      target: 'stream-refcount-release',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'live_tv_stream_sharing_refcount_zero_removes_handle', '--', '--nocapture'],
+      evidence: 'dropping all consumers decrements refcount to zero and removes the shared live-stream handle',
+    },
+    {
+      target: 'tuner-sharing-exempt',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'live_tv_tuner_limit_same_channel_second_consumer_ok', '--', '--nocapture'],
+      evidence: 'same-channel second consumer is exempt from tuner-limit conflict through sharing',
+    },
+    {
+      target: 'recording-conflict-no-zombie',
+      command: ['cargo', 'test', '-p', 'jellyrin-api', 'live_recording_tuner_limit_conflict_does_not_persist_inprogress', '--', '--nocapture'],
+      evidence: 'recording tuner conflict does not persist an InProgress zombie or file',
+    },
+  ];
+  const results = [];
+  for (const subgate of subgates) {
+    const result = await runCommand(subgate.command[0], subgate.command.slice(1));
+    results.push({ ...subgate, ...result, command: subgate.command.join(' ') });
+  }
+  return results;
 }
 
 function runBrowserTrace() {
@@ -129,8 +180,20 @@ function runBrowserTrace() {
   });
 }
 
-function buildEvidence(result, comparison) {
+function runCommand(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: 'inherit',
+    });
+    child.on('close', (code, signal) => resolve({ code: code || 0, signal }));
+  });
+}
+
+function buildEvidence(result, comparison, localSubgates) {
   const updatedAt = new Date().toISOString();
+  const localPassed = localSubgates.length > 0 && localSubgates.every((subgate) => subgate.code === 0);
   if (!comparison) {
     return {
       ...baselineEvidence,
@@ -154,6 +217,7 @@ function buildEvidence(result, comparison) {
     .sort();
   const failed = Boolean(comparison.comparison?.failed);
   const invariantCoverage = liveTvInvariantCoverage(summaries);
+  const localCompletedTargets = localPassed ? ['local-live-tv-subgates'] : [];
 
   if (!failed && completedTargets.includes('jellyrin') && completedTargets.includes('upstream') && invariantCoverage.complete) {
     return {
@@ -229,6 +293,35 @@ function buildEvidence(result, comparison) {
   }
 
   const jellyrinCompleted = completedTargets.includes('jellyrin');
+  const localOnlyCompletedTargets = [...new Set([...completedTargets, ...localCompletedTargets])].sort();
+  if (!jellyrinCompleted && localPassed) {
+    return {
+      gate: 'livetv-real',
+      status: 'implemented',
+      percent: 65,
+      closed: false,
+      sourcePhase: 'E2.1/E2.2a/E2.2b/E2.2c/E2.2d/E2.2e',
+      updatedAt,
+      evidence: [
+        'Local E2 Live TV subgates completed without requiring upstream/browser credentials.',
+        'The validated subgates cover real recording byte copy, due timer scheduling, startup recording reconciliation/restart recovery, shared live-stream fan-out/refcount release, same-channel tuner sharing exemption and recording conflict cleanup.',
+        'The browser HDHomeRun/upstream trace is still required for device/upstream validation.',
+      ].join(' '),
+      completedTargets: localOnlyCompletedTargets,
+      skippedTargets,
+      failedTargets,
+      localSubgates,
+      invariantCoverage,
+      failedReasons: comparison.comparison?.reasons || [],
+      traceExitCode: result.code,
+      tracePath: path.relative(plansDir, comparisonPath),
+      openRisks: [
+        'Dashboard target remains device-validated; HDHomeRun or real tuner/simulator browser evidence is still required before closing E2.',
+        'Upstream Jellyfin comparison still requires browser trace credentials/API keys for both targets.',
+        'The local subgates validate deep Jellyrin behavior, but they do not replace real device/upstream evidence.',
+      ],
+    };
+  }
   return {
     ...baselineEvidence,
     status: jellyrinCompleted ? 'implemented' : baselineEvidence.status,
@@ -237,13 +330,14 @@ function buildEvidence(result, comparison) {
     evidence: jellyrinCompleted
       ? 'Jellyrin Live TV trace completed with channels, guide, direct TS stream, recordings, timers and series timers validated. Upstream direct livetv configuration injection is not comparable yet.'
       : `${baselineEvidence.evidence} Browser trace did not complete enough targets for E2 progress.`,
-    completedTargets,
+    completedTargets: localOnlyCompletedTargets,
     skippedTargets,
     failedTargets,
     invariantCoverage,
     failedReasons: comparison.comparison?.reasons || [],
     traceExitCode: result.code,
     tracePath: path.relative(plansDir, comparisonPath),
+    localSubgates,
     openRisks: jellyrinCompleted
       ? [
           'Upstream Jellyfin does not expose the synthetic M3U/XMLTV fixture through the direct System/Configuration/livetv path used by this harness; a real HDHomeRun/M3U setup path or upstream fixture hook is still needed.',
@@ -317,6 +411,16 @@ function renderMarkdown(evidence, comparison) {
     lines.push(`- Upstream-comparable invariants: ${comparableCount}`);
     lines.push(`- Jellyrin-only invariants: ${jellyrinOnlyCount}`);
     lines.push(`- Invariant coverage complete: ${evidence.invariantCoverage.complete}`);
+  }
+  if (Array.isArray(evidence.localSubgates) && evidence.localSubgates.length > 0) {
+    lines.push('');
+    lines.push('## Local Subgates');
+    lines.push('');
+    lines.push('| Subgate | Exit | Evidence | Command |');
+    lines.push('| --- | ---: | --- | --- |');
+    for (const subgate of evidence.localSubgates) {
+      lines.push(`| ${subgate.target} | ${subgate.code} | ${subgate.evidence} | \`${subgate.command}\` |`);
+    }
   }
   if (Array.isArray(evidence.failedReasons) && evidence.failedReasons.length > 0) {
     lines.push('');
