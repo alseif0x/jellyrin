@@ -755,10 +755,10 @@ fn execute_minimal_wasm_i32_export(
         .get(export_name)
         .copied()
         .with_context(|| format!("WASM export {export_name} was not found"))?;
-    if function_index < module.imported_function_count {
+    if function_index < module.imported_functions.len() as u32 {
         anyhow::bail!("WASM export {export_name} points to an imported function");
     }
-    let defined_index = (function_index - module.imported_function_count) as usize;
+    let defined_index = (function_index - module.imported_functions.len() as u32) as usize;
     let type_index = module
         .function_type_indices
         .get(defined_index)
@@ -778,7 +778,7 @@ fn execute_minimal_wasm_i32_export(
         .function_bodies
         .get(defined_index)
         .with_context(|| format!("WASM export {export_name} has no function body"))?;
-    let wasm_return = execute_minimal_wasm_i32_body(body, &wasm_arguments)?;
+    let wasm_return = execute_minimal_wasm_i32_body(&module, body, &wasm_arguments)?;
     Ok((wasm_return, wasm_arguments))
 }
 
@@ -812,7 +812,7 @@ fn json_number_to_i32(value: &Value) -> Option<i32> {
 #[derive(Debug)]
 struct MinimalWasmModule {
     types: Vec<MinimalWasmFunctionType>,
-    imported_function_count: u32,
+    imported_functions: Vec<MinimalWasmImportFunction>,
     function_type_indices: Vec<u32>,
     exports: BTreeMap<String, u32>,
     function_bodies: Vec<Vec<u8>>,
@@ -824,6 +824,13 @@ struct MinimalWasmFunctionType {
     results: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct MinimalWasmImportFunction {
+    module: String,
+    name: String,
+    type_index: u32,
+}
+
 impl MinimalWasmModule {
     fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 8 || &bytes[..4] != b"\0asm" || bytes[4..8] != [1, 0, 0, 0] {
@@ -831,7 +838,7 @@ impl MinimalWasmModule {
         }
         let mut module = Self {
             types: Vec::new(),
-            imported_function_count: 0,
+            imported_functions: Vec::new(),
             function_type_indices: Vec::new(),
             exports: BTreeMap::new(),
             function_bodies: Vec::new(),
@@ -843,7 +850,7 @@ impl MinimalWasmModule {
             let section = cursor.read_bytes(section_size)?;
             match section_id {
                 1 => module.types = parse_wasm_type_section(section)?,
-                2 => module.imported_function_count = parse_wasm_import_section(section)?,
+                2 => module.imported_functions = parse_wasm_import_section(section)?,
                 3 => module.function_type_indices = parse_wasm_function_section(section)?,
                 7 => module.exports = parse_wasm_export_section(section)?,
                 10 => module.function_bodies = parse_wasm_code_section(section)?,
@@ -882,17 +889,21 @@ fn parse_wasm_valtypes(cursor: &mut WasmCursor<'_>) -> Result<Vec<u8>> {
     Ok(values)
 }
 
-fn parse_wasm_import_section(bytes: &[u8]) -> Result<u32> {
+fn parse_wasm_import_section(bytes: &[u8]) -> Result<Vec<MinimalWasmImportFunction>> {
     let mut cursor = WasmCursor::new(bytes);
     let count = cursor.read_u32_leb()?;
-    let mut functions = 0_u32;
+    let mut functions = Vec::new();
     for _ in 0..count {
-        let _module = cursor.read_name()?;
-        let _name = cursor.read_name()?;
+        let module = cursor.read_name()?;
+        let name = cursor.read_name()?;
         match cursor.read_u8()? {
             0x00 => {
-                let _type_index = cursor.read_u32_leb()?;
-                functions += 1;
+                let type_index = cursor.read_u32_leb()?;
+                functions.push(MinimalWasmImportFunction {
+                    module,
+                    name,
+                    type_index,
+                });
             }
             0x01 => {
                 let _limits = parse_wasm_limits(&mut cursor)?;
@@ -958,7 +969,11 @@ fn parse_wasm_code_section(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(bodies)
 }
 
-fn execute_minimal_wasm_i32_body(bytes: &[u8], arguments: &[i32]) -> Result<i32> {
+fn execute_minimal_wasm_i32_body(
+    module: &MinimalWasmModule,
+    bytes: &[u8],
+    arguments: &[i32],
+) -> Result<i32> {
     let mut cursor = WasmCursor::new(bytes);
     let local_groups = cursor.read_u32_leb()?;
     let mut locals = arguments.to_vec();
@@ -1003,8 +1018,60 @@ fn execute_minimal_wasm_i32_body(bytes: &[u8], arguments: &[i32]) -> Result<i32>
                 let lhs = stack.pop().context("WASM i32.mul missing lhs")?;
                 stack.push(lhs.wrapping_mul(rhs));
             }
+            0x10 => {
+                let function_index = cursor.read_u32_leb()?;
+                let value = execute_minimal_wasm_import_call(module, function_index, &mut stack)?;
+                stack.push(value);
+            }
             opcode => anyhow::bail!("unsupported WASM opcode 0x{opcode:02x}"),
         }
+    }
+}
+
+fn execute_minimal_wasm_import_call(
+    module: &MinimalWasmModule,
+    function_index: u32,
+    stack: &mut Vec<i32>,
+) -> Result<i32> {
+    let import = module
+        .imported_functions
+        .get(function_index as usize)
+        .with_context(|| {
+            format!(
+                "minimal WASM executor can only call imported functions, got function index {function_index}"
+            )
+        })?;
+    let function_type = module
+        .types
+        .get(import.type_index as usize)
+        .with_context(|| {
+            format!(
+                "WASM import {}.{} type index is invalid",
+                import.module, import.name
+            )
+        })?;
+    if function_type.params.iter().any(|param| *param != 0x7f)
+        || function_type.results.as_slice() != [0x7f]
+    {
+        anyhow::bail!(
+            "WASM import {}.{} must use i32 params and return i32",
+            import.module,
+            import.name
+        );
+    }
+    let mut args = Vec::with_capacity(function_type.params.len());
+    for _ in 0..function_type.params.len() {
+        args.push(stack.pop().context("WASM imported call missing argument")?);
+    }
+    args.reverse();
+    match (import.module.as_str(), import.name.as_str()) {
+        ("jellyrin:sdk", "echo_i32") => Ok(args.first().copied().unwrap_or_default()),
+        ("jellyrin:sdk", "capability_argument_count") => Ok(args.len() as i32),
+        _ => anyhow::bail!(
+            "unsupported WASM host import {}.{}",
+            import.module,
+            import.name
+        ),
     }
 }
 
@@ -1699,6 +1766,66 @@ mod tests {
         assert_eq!(value["WasmReturn"], 42);
     }
 
+    #[tokio::test]
+    async fn wasi_host_invokes_declared_wasm_export_with_sdk_host_import() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(
+            plugin_dir.join("fixture.wasm"),
+            minimal_i32_param_sdk_echo_wasm("jellyrin_scheduled_task", 3),
+        )
+        .await
+        .unwrap();
+
+        let mut state = WasiHostState::default();
+        let load = PluginRpcEnvelope::new(
+            "corr-load-sdk-import-wasm",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "sdk-import-wasm-fixture".to_string(),
+                name: "SDK Import WASM Fixture".to_string(),
+                version: "1.0.0".to_string(),
+                runtime: PluginRuntime::RustWasi,
+                target_abi: TARGET_ABI.to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "SDK Import WASM Fixture",
+                    "TargetAbi": TARGET_ABI,
+                    "Capabilities": ["ScheduledTask"],
+                    "WasmExports": {
+                        "ScheduledTask": "jellyrin_scheduled_task"
+                    }
+                }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, load).await;
+        assert!(response.ok);
+
+        let invoke = PluginRpcEnvelope::new(
+            "corr-invoke-sdk-import-wasm",
+            PluginRpcMethod::InvokeCapability,
+            serde_json::to_value(InvokeCapabilityRequest {
+                plugin_id: "sdk-import-wasm-fixture".to_string(),
+                capability: "ScheduledTask".to_string(),
+                arguments: json!({ "Value": 14 }),
+                timeout_ms: 1000,
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, invoke).await;
+        assert!(response.ok);
+        let value = &response.result.as_ref().unwrap()["Value"];
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], "ScheduledTask");
+        assert_eq!(value["ExecutionMode"], "WasmI32Export");
+        assert_eq!(value["Export"], "jellyrin_scheduled_task");
+        assert_eq!(value["WasmArguments"], json!([14]));
+        assert_eq!(value["WasmReturn"], 42);
+    }
+
     fn minimal_i32_const_wasm(export_name: &str, value: i32) -> Vec<u8> {
         let mut wasm = b"\0asm\x01\0\0\0".to_vec();
         push_section(&mut wasm, 1, &[0x01, 0x60, 0x00, 0x01, 0x7f]);
@@ -1737,6 +1864,39 @@ mod tests {
         let mut body = vec![0x00, 0x20, 0x00, 0x41];
         push_i32_leb(&mut body, value);
         body.push(0x6a);
+        body.push(0x0b);
+        let mut code = Vec::new();
+        push_u32_leb(&mut code, 1);
+        push_u32_leb(&mut code, body.len() as u32);
+        code.extend_from_slice(&body);
+        push_section(&mut wasm, 10, &code);
+        wasm
+    }
+
+    fn minimal_i32_param_sdk_echo_wasm(export_name: &str, multiplier: i32) -> Vec<u8> {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        push_section(&mut wasm, 1, &[0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]);
+
+        let mut import = Vec::new();
+        push_u32_leb(&mut import, 1);
+        push_name(&mut import, "jellyrin:sdk");
+        push_name(&mut import, "echo_i32");
+        import.push(0x00);
+        push_u32_leb(&mut import, 0);
+        push_section(&mut wasm, 2, &import);
+
+        push_section(&mut wasm, 3, &[0x01, 0x00]);
+
+        let mut export = Vec::new();
+        push_u32_leb(&mut export, 1);
+        push_name(&mut export, export_name);
+        export.push(0x00);
+        push_u32_leb(&mut export, 1);
+        push_section(&mut wasm, 7, &export);
+
+        let mut body = vec![0x00, 0x20, 0x00, 0x10, 0x00, 0x41];
+        push_i32_leb(&mut body, multiplier);
+        body.push(0x6c);
         body.push(0x0b);
         let mut code = Vec::new();
         push_u32_leb(&mut code, 1);
