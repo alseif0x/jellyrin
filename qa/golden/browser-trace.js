@@ -404,6 +404,8 @@ async function captureTarget(browser, flowDir, target) {
       syncplayCleanupConfirmed: false,
       channelsList200: false,
       channelsProviderMatched: false,
+      channelsFailureIsolated: false,
+      channelsDiagnosticsMatched: false,
       channelsFilterMatched: false,
       channelsDeletionFilterMatched: false,
       channelsItems200: false,
@@ -3142,6 +3144,23 @@ async function runChannelsFlow(page, summary, publicInfo, target) {
     if (![200, 204].includes(configUpdate.status)) {
       throw new Error(`channels Live TV config update returned HTTP ${configUpdate.status}`);
     }
+    const channelsConfigUpdate = await browserFetchJson(page, {
+      method: 'POST',
+      url: '/System/Configuration/channels',
+      token: auth.AccessToken,
+      body: {
+        Providers: [{
+          Id: 'failing-provider',
+          Name: 'Failing Provider',
+          Enabled: true,
+          FailureMode: 'timeout',
+          Items: [{ Id: 'bad-item', Name: 'Bad Item' }],
+        }],
+      },
+    });
+    if (![200, 204].includes(channelsConfigUpdate.status)) {
+      throw new Error(`channels provider config update returned HTTP ${channelsConfigUpdate.status}`);
+    }
   }
 
   const channels = await browserFetchJson(page, {
@@ -3175,6 +3194,21 @@ async function runChannelsFlow(page, summary, publicInfo, target) {
     throw new Error('Channels did not expose the local Live TV provider');
   }
   summary.invariants.channelsProviderMatched = true;
+
+  const diagnostics = await browserFetchJson(page, {
+    method: 'GET',
+    url: '/Channels/Diagnostics',
+    token: auth.AccessToken,
+  });
+  const failingProvider = diagnostics.json?.Providers?.find((provider) => provider.Id === 'failing-provider');
+  if (diagnostics.status !== 200 || failingProvider?.Status !== 'Malfunctioned' || failingProvider?.Included !== false) {
+    throw new Error(`Channels diagnostics did not report isolated failing provider, HTTP ${diagnostics.status}`);
+  }
+  summary.invariants.channelsDiagnosticsMatched = true;
+  if (channels.json.Items.some((item) => item.Id === 'failing-provider')) {
+    throw new Error('Channels included a failing provider in the provider list');
+  }
+  summary.invariants.channelsFailureIsolated = true;
 
   const filtered = await browserFetchJson(page, {
     method: 'GET',
@@ -8108,6 +8142,9 @@ function criticalRequestKey(record, requestPostData) {
   if (flow === 'channels' && record.method === 'GET' && pathname === '/Channels/Features') {
     return 'channels-features';
   }
+  if (flow === 'channels' && record.method === 'GET' && pathname === '/Channels/Diagnostics') {
+    return 'channels-diagnostics';
+  }
   if (flow === 'channels' && record.method === 'GET' && /\/Channels\/[^/]+\/Items$/i.test(pathname)) {
     return 'channels-items';
   }
@@ -9449,6 +9486,8 @@ function invariantFailures(summary) {
     if (summary.target === 'jellyrin') {
       for (const [field, label] of [
         ['channelsProviderMatched', 'local provider'],
+        ['channelsDiagnosticsMatched', 'provider diagnostics'],
+        ['channelsFailureIsolated', 'provider failure isolation'],
         ['channelsFilterMatched', 'supports/favorite filters'],
         ['channelsDeletionFilterMatched', 'media deletion filter'],
         ['channelsItems200', 'provider items'],

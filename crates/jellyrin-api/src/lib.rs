@@ -2992,6 +2992,8 @@ pub fn router(state: AppState) -> Router {
         .route("/years/{year}", get(metadata_year_by_value))
         .route("/Channels", get(channels))
         .route("/channels", get(channels))
+        .route("/Channels/Diagnostics", get(channel_diagnostics))
+        .route("/channels/diagnostics", get(channel_diagnostics))
         .route("/Channels/Items/Latest", get(channel_latest_items))
         .route("/channels/items/latest", get(channel_latest_items))
         .route("/Channels/Features", get(channel_features))
@@ -9692,6 +9694,14 @@ async fn named_configuration(
                 .await?
                 .unwrap_or_else(default_live_tv_configuration)
         }
+        "channels" => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(default_channels_configuration)
+        }
         "metadata" => {
             require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
             state
@@ -9744,6 +9754,10 @@ async fn update_named_configuration(
         "livetv" => (
             live_tv_configuration_json(payload),
             "Live TV configuration updated",
+        ),
+        "channels" => (
+            channels_configuration_json(payload),
+            "Channels configuration updated",
         ),
         "metadata" => (
             metadata_configuration_json(payload),
@@ -9923,6 +9937,18 @@ fn live_tv_configuration_json(payload: serde_json::Value) -> serde_json::Value {
     merge_known_network_value(&mut config, &payload, "SaveRecordingNFO");
     merge_known_network_value(&mut config, &payload, "SaveRecordingImages");
     enrich_live_tv_configuration_local_sources(&mut config);
+    config
+}
+
+fn default_channels_configuration() -> serde_json::Value {
+    serde_json::json!({
+        "Providers": []
+    })
+}
+
+fn channels_configuration_json(payload: serde_json::Value) -> serde_json::Value {
+    let mut config = default_channels_configuration();
+    merge_known_network_value(&mut config, &payload, "Providers");
     config
 }
 
@@ -26776,18 +26802,37 @@ async fn channel_features_by_id(
     ))
 }
 
+async fn channel_diagnostics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "Providers": channel_provider_diagnostics(&state.db).await?
+    })))
+}
+
 async fn channel_provider_items(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
     let live_tv_channels = configured_live_tv_channel_items(db).await?;
-    if live_tv_channels.is_empty() {
-        return Ok(Vec::new());
+    let mut providers = Vec::new();
+    if !live_tv_channels.is_empty() {
+        let server_id = db.server_state().await?.server_id.to_string();
+        providers.push(channel_provider_json(
+            &server_id,
+            "livetv",
+            "Live TV",
+            live_tv_channels.len(),
+        ));
     }
-    let server_id = db.server_state().await?.server_id.to_string();
-    Ok(vec![channel_provider_json(
-        &server_id,
-        "livetv",
-        "Live TV",
-        live_tv_channels.len(),
-    )])
+    for provider in configured_channel_provider_descriptors(db).await? {
+        if channel_provider_is_healthy(&provider)
+            && let Some(provider_json) = configured_channel_provider_json(&provider)
+        {
+            providers.push(provider_json);
+        }
+    }
+    Ok(providers)
 }
 
 async fn channel_content_items(
@@ -26855,6 +26900,84 @@ async fn configured_live_tv_channel_items(
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = db.server_state().await?.server_id.to_string();
     Ok(live_tv_channel_items(&config, &server_id))
+}
+
+async fn configured_channel_provider_descriptors(
+    db: &Database,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    Ok(db
+        .named_configuration("channels")
+        .await?
+        .unwrap_or_else(default_channels_configuration)
+        .get("Providers")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+async fn channel_provider_diagnostics(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
+    let live_tv_channels = configured_live_tv_channel_items(db).await?;
+    let mut providers = Vec::new();
+    providers.push(serde_json::json!({
+        "Id": "livetv",
+        "Name": "Live TV",
+        "Enabled": true,
+        "Status": if live_tv_channels.is_empty() { "Unavailable" } else { "Healthy" },
+        "FailureMode": null,
+        "ChildCount": live_tv_channels.len(),
+        "Included": !live_tv_channels.is_empty()
+    }));
+    for provider in configured_channel_provider_descriptors(db).await? {
+        let id = json_string_field(&provider, "Id")
+            .or_else(|| json_string_field(&provider, "Name"))
+            .unwrap_or_else(|| "provider".to_string());
+        let name = json_string_field(&provider, "Name").unwrap_or_else(|| id.clone());
+        let enabled = provider
+            .get("Enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let failure_mode = json_string_field(&provider, "FailureMode");
+        let healthy = enabled && channel_provider_is_healthy(&provider);
+        providers.push(serde_json::json!({
+            "Id": id,
+            "Name": name,
+            "Enabled": enabled,
+            "Status": if healthy { "Healthy" } else { "Malfunctioned" },
+            "FailureMode": failure_mode,
+            "ChildCount": provider.get("Items").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0),
+            "Included": healthy
+        }));
+    }
+    Ok(providers)
+}
+
+fn channel_provider_is_healthy(provider: &serde_json::Value) -> bool {
+    if provider
+        .get("Enabled")
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|enabled| !enabled)
+    {
+        return false;
+    }
+    if json_string_field(provider, "FailureMode").is_some_and(|mode| !mode.trim().is_empty()) {
+        return false;
+    }
+    !json_string_field(provider, "Status").is_some_and(|status| {
+        status.eq_ignore_ascii_case("failed")
+            || status.eq_ignore_ascii_case("malfunctioned")
+            || status.eq_ignore_ascii_case("timeout")
+    })
+}
+
+fn configured_channel_provider_json(provider: &serde_json::Value) -> Option<serde_json::Value> {
+    let id = json_string_field(provider, "Id").or_else(|| json_string_field(provider, "Name"))?;
+    let name = json_string_field(provider, "Name").unwrap_or_else(|| id.clone());
+    let child_count = provider
+        .get("Items")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Some(channel_provider_json("", &id, &name, child_count))
 }
 
 fn channel_provider_json(
@@ -39822,6 +39945,72 @@ done
         assert_eq!(channels_root["Items"][0]["Type"], "Channel");
         assert_eq!(channels_root["Items"][0]["ChildCount"], 2);
         assert_eq!(channels_root["Items"][0]["UserData"]["IsFavorite"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/System/Configuration/channels")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Providers": [{
+                                "Id": "failing-provider",
+                                "Name": "Failing Provider",
+                                "Enabled": true,
+                                "FailureMode": "timeout",
+                                "Items": [{ "Id": "bad-item" }]
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels/Diagnostics")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let diagnostics: Value = serde_json::from_slice(&body).unwrap();
+        let failing_provider = diagnostics["Providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["Id"] == "failing-provider")
+            .unwrap();
+        assert_eq!(failing_provider["Status"], "Malfunctioned");
+        assert_eq!(failing_provider["Included"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Channels?SupportsLatestItems=true")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels_after_failure: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(channels_after_failure["TotalRecordCount"], 1);
+        assert_eq!(channels_after_failure["Items"][0]["Id"], "livetv");
 
         let response = app
             .clone()
