@@ -13,7 +13,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration as StdDuration,
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -653,6 +653,17 @@ async fn execute_dotnet_capability_handler(
         anyhow::bail!("DotNet assembly {} does not exist", assembly_path.display());
     }
     let arguments_json = serde_json::to_string(&request.arguments)?;
+    if handler.type_name.is_some() || handler.method.is_some() {
+        return execute_dotnet_reflection_handler(
+            plugin,
+            request,
+            &assembly_path,
+            &handler,
+            &arguments_json,
+        )
+        .await
+        .map(Some);
+    }
     let mut command = Command::new(dotnet_command());
     command
         .arg(&assembly_path)
@@ -702,6 +713,8 @@ async fn execute_dotnet_capability_handler(
 #[derive(Debug, Default)]
 struct DotNetCapabilityHandler {
     assembly: Option<String>,
+    type_name: Option<String>,
+    method: Option<String>,
     arguments: Vec<String>,
 }
 
@@ -732,6 +745,8 @@ fn dotnet_capability_handler_from_value(value: &Value) -> Option<DotNetCapabilit
     if let Some(assembly) = value.as_str().filter(|value| !value.trim().is_empty()) {
         return Some(DotNetCapabilityHandler {
             assembly: Some(assembly.trim().to_string()),
+            type_name: None,
+            method: None,
             arguments: default_dotnet_handler_arguments(),
         });
     }
@@ -739,6 +754,19 @@ fn dotnet_capability_handler_from_value(value: &Value) -> Option<DotNetCapabilit
         .get("Assembly")
         .or_else(|| value.get("Path"))
         .or_else(|| value.get("Dll"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let type_name = value
+        .get("Type")
+        .or_else(|| value.get("Class"))
+        .or_else(|| value.get("TypeName"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+    let method = value
+        .get("Method")
+        .or_else(|| value.get("MethodName"))
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_string());
@@ -756,6 +784,8 @@ fn dotnet_capability_handler_from_value(value: &Value) -> Option<DotNetCapabilit
         .unwrap_or_else(default_dotnet_handler_arguments);
     Some(DotNetCapabilityHandler {
         assembly,
+        type_name,
+        method,
         arguments,
     })
 }
@@ -796,6 +826,309 @@ fn dotnet_command() -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "dotnet".to_string())
 }
+
+async fn execute_dotnet_reflection_handler(
+    plugin: &LoadedDotNetPlugin,
+    request: &InvokeCapabilityRequest,
+    assembly_path: &Path,
+    handler: &DotNetCapabilityHandler,
+    arguments_json: &str,
+) -> Result<Value> {
+    let Some(type_name) = handler.type_name.as_deref() else {
+        anyhow::bail!(
+            "DotNet reflection handler for {} is missing Type",
+            request.capability
+        );
+    };
+    let Some(method) = handler.method.as_deref() else {
+        anyhow::bail!(
+            "DotNet reflection handler for {} is missing Method",
+            request.capability
+        );
+    };
+    let bridge_dir = dotnet_reflection_bridge_dir(plugin, request);
+    tokio::fs::create_dir_all(&bridge_dir)
+        .await
+        .with_context(|| format!("failed to create {}", bridge_dir.display()))?;
+    let bridge_path = bridge_dir.join("Jellyrin.DotNetReflectionBridge.dll");
+    compile_dotnet_reflection_bridge(&bridge_path).await?;
+    let mut command = Command::new(dotnet_command());
+    command
+        .arg(&bridge_path)
+        .arg("--assembly")
+        .arg(assembly_path)
+        .arg("--type")
+        .arg(type_name)
+        .arg("--method")
+        .arg(method)
+        .arg("--capability")
+        .arg(&request.capability)
+        .arg("--arguments")
+        .arg(arguments_json)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let timeout = StdDuration::from_millis(request.timeout_ms.clamp(250, 30_000));
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .context("DotNet reflection execution timed out")?
+        .context("failed to spawn DotNet reflection bridge")?;
+    let _ = tokio::fs::remove_dir_all(&bridge_dir).await;
+    if !output.status.success() {
+        anyhow::bail!(
+            "DotNet reflection bridge exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .context("DotNet reflection bridge stdout was not UTF-8")?;
+    let mut value: Value = serde_json::from_str(stdout.trim()).with_context(|| {
+        format!(
+            "DotNet reflection bridge stdout was not JSON: {}",
+            stdout.trim()
+        )
+    })?;
+    if !value.is_object() {
+        value = json!({ "Value": value });
+    }
+    value["Status"] = value
+        .get("Status")
+        .cloned()
+        .unwrap_or_else(|| json!("Executed"));
+    value["Capability"] = value
+        .get("Capability")
+        .cloned()
+        .unwrap_or_else(|| json!(request.capability));
+    value["ExecutionMode"] = value
+        .get("ExecutionMode")
+        .cloned()
+        .unwrap_or_else(|| json!("DotNetReflection"));
+    Ok(value)
+}
+
+fn dotnet_reflection_bridge_dir(
+    plugin: &LoadedDotNetPlugin,
+    request: &InvokeCapabilityRequest,
+) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "jellyrin-dotnet-reflection-{}-{}-{}",
+        std::process::id(),
+        safe_path_component(&plugin.plugin_id),
+        nanos + request.timeout_ms as u128
+    ))
+}
+
+async fn compile_dotnet_reflection_bridge(output_path: &Path) -> Result<()> {
+    let source_path = output_path.with_extension("cs");
+    tokio::fs::write(&source_path, DOTNET_REFLECTION_BRIDGE_SOURCE)
+        .await
+        .with_context(|| format!("failed to write {}", source_path.display()))?;
+    let csc_path = dotnet_sdk_root()
+        .await?
+        .join("Roslyn")
+        .join("bincore")
+        .join("csc.dll");
+    if !csc_path.is_file() {
+        anyhow::bail!("missing csc.dll at {}", csc_path.display());
+    }
+    let ref_dir = dotnet_ref_dir()?;
+    let mut command = Command::new(dotnet_command());
+    command
+        .arg(csc_path)
+        .arg("-nologo")
+        .arg("-target:exe")
+        .arg(format!("-out:{}", output_path.display()))
+        .arg("-langversion:latest");
+    for reference in std::fs::read_dir(&ref_dir)
+        .with_context(|| format!("failed to list {}", ref_dir.display()))?
+    {
+        let path = reference?.path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+        {
+            command.arg(format!("-reference:{}", path.display()));
+        }
+    }
+    command.arg(&source_path);
+    let output = command
+        .output()
+        .await
+        .context("failed to spawn dotnet csc for reflection bridge")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "dotnet csc failed for reflection bridge\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let runtime_version = dotnet_runtime_version()?;
+    tokio::fs::write(
+        output_path.with_file_name("Jellyrin.DotNetReflectionBridge.runtimeconfig.json"),
+        format!(
+            r#"{{"runtimeOptions":{{"tfm":"net{}","framework":{{"name":"Microsoft.NETCore.App","version":"{}"}}}}}}"#,
+            runtime_version
+                .split('.')
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("."),
+            runtime_version
+        ),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to write runtimeconfig for {}",
+            output_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn dotnet_sdk_root() -> Result<PathBuf> {
+    let output = Command::new(dotnet_command())
+        .arg("--info")
+        .output()
+        .await
+        .context("failed to run dotnet --info")?;
+    if !output.status.success() {
+        anyhow::bail!("dotnet --info failed");
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if let Some(path) = line.strip_prefix("Base Path:") {
+            return Ok(PathBuf::from(path.trim()));
+        }
+    }
+    anyhow::bail!("dotnet --info did not include SDK Base Path")
+}
+
+fn dotnet_ref_dir() -> Result<PathBuf> {
+    let dotnet_root = std::env::var_os("DOTNET_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/share/dotnet"));
+    let pack_root = dotnet_root.join("packs").join("Microsoft.NETCore.App.Ref");
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(&pack_root)
+        .with_context(|| format!("failed to list {}", pack_root.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    versions.sort();
+    let Some(version) = versions.pop() else {
+        anyhow::bail!(
+            "no Microsoft.NETCore.App.Ref pack found under {}",
+            pack_root.display()
+        );
+    };
+    let ref_root = version.join("ref");
+    let mut refs: Vec<PathBuf> = std::fs::read_dir(&ref_root)
+        .with_context(|| format!("failed to list {}", ref_root.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    refs.sort();
+    refs.pop().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no target framework refs found under {}",
+            ref_root.display()
+        )
+    })
+}
+
+fn dotnet_runtime_version() -> Result<String> {
+    let dotnet_root = std::env::var_os("DOTNET_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/share/dotnet"));
+    let runtime_root = dotnet_root.join("shared").join("Microsoft.NETCore.App");
+    let mut versions: Vec<String> = std::fs::read_dir(&runtime_root)
+        .with_context(|| format!("failed to list {}", runtime_root.display()))?
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+        })
+        .collect();
+    versions.sort();
+    versions.pop().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no Microsoft.NETCore.App runtime found under {}",
+            runtime_root.display()
+        )
+    })
+}
+
+fn safe_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+const DOTNET_REFLECTION_BRIDGE_SOURCE: &str = r#"using System;
+using System.Reflection;
+using System.Text.Json;
+
+public static class JellyrinDotNetReflectionBridge
+{
+    public static int Main(string[] args)
+    {
+        string assemblyPath = "";
+        string typeName = "";
+        string methodName = "";
+        string capability = "";
+        string argumentsJson = "{}";
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--assembly" && i + 1 < args.Length) assemblyPath = args[++i];
+            else if (args[i] == "--type" && i + 1 < args.Length) typeName = args[++i];
+            else if (args[i] == "--method" && i + 1 < args.Length) methodName = args[++i];
+            else if (args[i] == "--capability" && i + 1 < args.Length) capability = args[++i];
+            else if (args[i] == "--arguments" && i + 1 < args.Length) argumentsJson = args[++i];
+        }
+        Assembly assembly = Assembly.LoadFrom(assemblyPath);
+        Type? type = assembly.GetType(typeName, throwOnError: false, ignoreCase: false);
+        if (type == null) throw new InvalidOperationException("Type not found: " + typeName);
+        MethodInfo? method = type.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
+        if (method == null) throw new InvalidOperationException("Method not found: " + methodName);
+        object? instance = method.IsStatic ? null : Activator.CreateInstance(type);
+        ParameterInfo[] parameters = method.GetParameters();
+        object?[] invokeArgs = parameters.Length switch
+        {
+            0 => Array.Empty<object?>(),
+            1 => new object?[] { argumentsJson },
+            2 => new object?[] { capability, argumentsJson },
+            _ => throw new InvalidOperationException("Unsupported method signature: " + parameters.Length)
+        };
+        object? result = method.Invoke(instance, invokeArgs);
+        if (result == null)
+        {
+            Console.WriteLine("{}");
+        }
+        else if (result is string text)
+        {
+            Console.WriteLine(text);
+        }
+        else
+        {
+            Console.WriteLine(JsonSerializer.Serialize(result));
+        }
+        return 0;
+    }
+}
+"#;
 
 fn manifest_configuration(manifest: &Value) -> Value {
     manifest
@@ -1245,6 +1578,67 @@ mod tests {
         assert_eq!(value["SawArguments"], "{\"ItemId\":\"movie-1\"}");
     }
 
+    #[tokio::test]
+    async fn dotnet_host_invokes_declared_reflection_method_for_capability() {
+        let temp = tempdir().unwrap();
+        let plugin_dir = temp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        compile_dotnet_reflection_fixture(
+            &plugin_dir.join("Jellyfin.Plugin.ReflectionFixture.dll"),
+        )
+        .await;
+
+        let mut state = DotNetHostState::default();
+        let load = PluginRpcEnvelope::new(
+            "corr-load-reflection-dotnet",
+            PluginRpcMethod::LoadPlugin,
+            serde_json::to_value(LoadPluginRequest {
+                plugin_id: "reflection-dotnet-fixture".to_string(),
+                name: "Reflection DotNet Fixture".to_string(),
+                version: "1.0.0.0".to_string(),
+                runtime: PluginRuntime::DotNetJellyfin,
+                target_abi: "12.0.0.0".to_string(),
+                install_path: plugin_dir.to_string_lossy().to_string(),
+                manifest: json!({
+                    "Name": "Reflection DotNet Fixture",
+                    "Capabilities": ["MetadataProvider"],
+                    "DotNetExports": {
+                        "MetadataProvider": {
+                            "Assembly": "Jellyfin.Plugin.ReflectionFixture.dll",
+                            "Type": "Jellyfin.Plugin.ReflectionFixture.PluginEntry",
+                            "Method": "Invoke"
+                        }
+                    }
+                }),
+                permissions: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, load).await;
+        assert!(response.ok, "{:?}", response.error);
+
+        let invoke = PluginRpcEnvelope::new(
+            "corr-invoke-reflection-dotnet",
+            PluginRpcMethod::InvokeCapability,
+            serde_json::to_value(InvokeCapabilityRequest {
+                plugin_id: "reflection-dotnet-fixture".to_string(),
+                capability: "MetadataProvider".to_string(),
+                arguments: json!({ "ItemId": "movie-2" }),
+                timeout_ms: 10_000,
+            })
+            .unwrap(),
+        );
+        let response = handle_envelope(&mut state, invoke).await;
+        assert!(response.ok, "{:?}", response.error);
+        let value = &response.result.as_ref().unwrap()["Value"];
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], "MetadataProvider");
+        assert_eq!(value["ExecutionMode"], "DotNetReflection");
+        assert_eq!(value["Provider"], "Reflection DotNet Fixture");
+        assert_eq!(value["SawCapability"], "MetadataProvider");
+        assert_eq!(value["SawArguments"], "{\"ItemId\":\"movie-2\"}");
+    }
+
     async fn compile_dotnet_fixture(output_path: &Path) {
         let source_path = output_path.with_extension("cs");
         tokio::fs::write(
@@ -1320,6 +1714,62 @@ public static class Program
         )
         .await
         .unwrap();
+    }
+
+    async fn compile_dotnet_reflection_fixture(output_path: &Path) {
+        let source_path = output_path.with_extension("cs");
+        tokio::fs::write(
+            &source_path,
+            r#"namespace Jellyfin.Plugin.ReflectionFixture;
+
+public sealed class PluginEntry
+{
+    public string Invoke(string capability, string arguments)
+    {
+        return "{\"Status\":\"Executed\",\"Provider\":\"Reflection DotNet Fixture\",\"SawCapability\":\"" + Escape(capability) + "\",\"SawArguments\":\"" + Escape(arguments) + "\"}";
+    }
+
+    private static string Escape(string value)
+    {
+        return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    }
+}
+"#,
+        )
+        .await
+        .unwrap();
+        let csc_path = dotnet_sdk_root().join("Roslyn/bincore/csc.dll");
+        assert!(
+            csc_path.is_file(),
+            "missing csc.dll at {}",
+            csc_path.display()
+        );
+        let ref_dir = dotnet_ref_dir();
+        let mut command = Command::new(dotnet_command());
+        command
+            .arg(csc_path)
+            .arg("-nologo")
+            .arg("-target:library")
+            .arg(format!("-out:{}", output_path.display()))
+            .arg("-langversion:latest");
+        for reference in std::fs::read_dir(&ref_dir).unwrap() {
+            let path = reference.unwrap().path();
+            if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+            {
+                command.arg(format!("-reference:{}", path.display()));
+            }
+        }
+        command.arg(&source_path);
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "csc failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn dotnet_sdk_root() -> PathBuf {
