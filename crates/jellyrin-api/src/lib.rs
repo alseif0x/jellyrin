@@ -19976,7 +19976,120 @@ async fn remote_search_local_results(
         _ => {}
     }
 
+    for result in plugin_metadata_provider_remote_search_results(db, item_type, &request).await? {
+        let name = result
+            .get("Name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        results.insert(
+            remote_search_result_key(
+                item_type,
+                &format!(
+                    "{}:{}",
+                    result
+                        .get("SearchProviderName")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Plugin"),
+                    name
+                ),
+            ),
+            result,
+        );
+    }
+
     Ok(results.into_values().collect())
+}
+
+async fn plugin_metadata_provider_remote_search_results(
+    db: &Database,
+    item_type: &str,
+    request: &RemoteSearchRequest,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut results = Vec::new();
+    for plugin in db.installed_plugins_json().await? {
+        if !plugin_is_active_metadata_provider(&plugin) {
+            continue;
+        }
+        let provider_name = json_string_field(&plugin, "Name").unwrap_or_else(|| {
+            json_string_field(&plugin, "Id").unwrap_or_else(|| "Plugin Metadata".to_string())
+        });
+        let capability = invoke_plugin_capability_via_runtime_host(
+            &plugin,
+            "MetadataProvider",
+            serde_json::json!({
+                "ItemType": item_type,
+                "SearchInfo": {
+                    "Name": request.name,
+                    "Year": request.year
+                }
+            }),
+        )
+        .await?;
+        let Some(capability) = capability else {
+            continue;
+        };
+        results.extend(plugin_metadata_provider_result_values(
+            item_type,
+            &provider_name,
+            &capability.value,
+        ));
+    }
+    Ok(results)
+}
+
+fn plugin_is_active_metadata_provider(plugin: &serde_json::Value) -> bool {
+    json_string_field(plugin, "Status").as_deref() == Some("Active")
+        && plugin_string_array(plugin.get("Capabilities"))
+            .iter()
+            .any(|capability| capability.eq_ignore_ascii_case("MetadataProvider"))
+}
+
+fn plugin_metadata_provider_result_values(
+    item_type: &str,
+    provider_name: &str,
+    value: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let values = value
+        .get("Items")
+        .or_else(|| value.get("Results"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| vec![value.clone()]);
+    values
+        .iter()
+        .filter_map(|value| plugin_metadata_provider_result_value(item_type, provider_name, value))
+        .collect()
+}
+
+fn plugin_metadata_provider_result_value(
+    item_type: &str,
+    provider_name: &str,
+    value: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let name = json_string_field(value, "Name")?;
+    let provider_ids = value
+        .get("ProviderIds")
+        .cloned()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                provider_name: stable_entity_id(item_type, &name)
+            })
+        });
+    Some(serde_json::json!({
+        "Name": name,
+        "ProviderIds": provider_ids,
+        "ProductionYear": json_i64_field(value, "ProductionYear").or_else(|| json_i64_field(value, "Year")),
+        "IndexNumber": value.get("IndexNumber").cloned().unwrap_or(serde_json::Value::Null),
+        "IndexNumberEnd": value.get("IndexNumberEnd").cloned().unwrap_or(serde_json::Value::Null),
+        "ParentIndexNumber": value.get("ParentIndexNumber").cloned().unwrap_or(serde_json::Value::Null),
+        "PremiereDate": value.get("PremiereDate").cloned().unwrap_or(serde_json::Value::Null),
+        "ImageUrl": value.get("ImageUrl").cloned().unwrap_or(serde_json::Value::Null),
+        "SearchProviderName": provider_name,
+        "Overview": json_string_field(value, "Overview").unwrap_or_default(),
+        "Type": json_string_field(value, "Type").unwrap_or_else(|| item_type.to_string())
+    }))
 }
 
 #[derive(Default)]
@@ -32897,6 +33010,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rust_wasi_metadata_provider_feeds_remote_search() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "bbbbbbbb-0000-0000-0000-000000000002";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
+        tokio::fs::write(plugin_dir.join("metadata.wasm"), b"\0asm")
+            .await
+            .unwrap();
+        let host_path = fake_rust_wasi_metadata_provider_host_script(tmp.path()).await;
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "Metadata WASI".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "RustWasi".to_string(),
+                target_abi: "jellyrin-wasi-0.1".to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "Metadata WASI",
+                    "Runtime": "RustWasi"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "Metadata WASI",
+                    "Version": "0.1.0",
+                    "Runtime": "RustWasi",
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    },
+                    "Capabilities": ["MetadataProvider"]
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            activate_rust_wasi_plugin_with_host_path(
+                &db,
+                &plugin,
+                Some(user.id),
+                host_path.clone()
+            )
+            .await
+            .unwrap()
+        );
+        let _guard = RustWasiHostPathGuard::set(host_path);
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ItemLookup/Items/RemoteSearch/Movie")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "Name": "Plugin Metadata Movie", "Year": 1999 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_results.as_array().unwrap().len(), 1);
+        assert_eq!(remote_results[0]["Name"], "Plugin Metadata Movie");
+        assert_eq!(remote_results[0]["Type"], "Movie");
+        assert_eq!(remote_results[0]["SearchProviderName"], "Metadata WASI");
+        assert_eq!(remote_results[0]["ProductionYear"], 1999);
+        assert_eq!(
+            remote_results[0]["ProviderIds"]["WasiProvider"],
+            "wasi-plugin-movie"
+        );
+        assert_eq!(remote_results[0]["Overview"], "Metadata from WASI plugin");
+    }
+
+    #[tokio::test]
     async fn rust_wasi_activation_passes_granted_permissions_to_host() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -33191,6 +33399,51 @@ while IFS= read -r line; do
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000001","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
+      ;;
+    Shutdown)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .await
+        .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .unwrap();
+        }
+        path
+    }
+
+    async fn fake_rust_wasi_metadata_provider_host_script(root: &std::path::Path) -> PathBuf {
+        let path = root.join("fake-wasi-metadata-provider-host.sh");
+        tokio::fs::write(
+            &path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-wasi-metadata-provider-host","ServerVersion":"fake-wasi-host-0.1","MinimumCallTimeoutMs":250,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000002","Runtime":"RustWasi","RuntimeVersion":"fake-wasi-host-0.1","Status":"Healthy","Manifest":{"Name":"Metadata WASI"},"Capabilities":["MetadataProvider"]}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"MetadataProvider","Name":"Plugin Metadata Movie","Type":"Movie","Overview":"Metadata from WASI plugin","ProductionYear":1999,"ProviderIds":{"WasiProvider":"wasi-plugin-movie"}}}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000002","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
       ;;
     Shutdown)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
