@@ -26,6 +26,7 @@ async function main() {
 
   const packaging = await runCommand('node', ['qa/packaging-release.js']);
   const security = await runCommand('node', ['qa/security-hardening.js']);
+  const systemd = await runCommand('node', ['qa/systemd-unit-smoke.js']);
   const releaseInstall = await runCommand('node', ['qa/release-install-smoke.js']);
   const backupRestore = await runCommand('cargo', [
     'test',
@@ -49,6 +50,7 @@ async function main() {
   const checks = [
     check('packaging-release-matrix', packaging.code === 0),
     check('security-hardening-matrix', security.code === 0),
+    check('systemd-unit-smoke', systemd.code === 0),
     check('release-install-smoke', releaseInstall.code === 0),
     check('backup-restore-rollback-smoke', backupRestore.code === 0),
     check('runtime-observability-smoke', observability.code === 0),
@@ -60,12 +62,12 @@ async function main() {
   const evidence = {
     gate: 'ecosystem-release',
     status: passed ? 'implemented' : 'designed',
-    percent: passed ? 75 : 10,
+    percent: passed ? 82 : 10,
     closed: false,
     sourcePhase: passed ? 'E7.1/E7.2/E7.3/E7.4/E7.5/E7.6/release-smoke-baseline' : 'E7.1/E7.2-attempted',
     evidence: passed
       ? [
-          'E7 release baseline is implemented: packaging and security hardening matrices pass, release assets are present, npm exposes the release gate, prerequisite ecosystem evidence files exist for E1-E6, a repository-local release smoke starts jellyrin-server against release-style temporary data/config/cache/log directories, verifies /healthz, /readyz, /System/Info/Public and SQLite persistence, restarts against the same database as an upgrade rehearsal, mutates startup state, restores SQLite DB/WAL/SHM plus config from rollback backup, and verifies the restored server identity/config on a third start.',
+          'E7 release baseline is implemented: packaging, security hardening and systemd unit verification matrices pass, release assets are present, npm exposes the release gate, prerequisite ecosystem evidence files exist for E1-E6, a repository-local release smoke starts jellyrin-server against release-style temporary data/config/cache/log directories, verifies /healthz, /readyz, /System/Info/Public and SQLite persistence, restarts against the same database as an upgrade rehearsal, mutates startup state, restores SQLite DB/WAL/SHM plus config from rollback backup, and verifies the restored server identity/config on a third start.',
           'The backup/restore rollback smoke restores users, libraries, metadata, plugins and named configurations used by Live TV, Channels and network/DLNA, and /System/Diagnostics reports plugin runtime, Live TV tuner, DLNA eventing/update-id, SyncPlay and log surfaces.',
           'This is not final release-ready closure because device/manual gates, installed systemd smoke and host-level rollback rehearsal still remain open.',
         ].join(' ')
@@ -75,6 +77,7 @@ async function main() {
       ? [
           'packaging-release-matrix',
           'security-hardening-matrix',
+          'systemd-unit-smoke',
           'release-install-smoke',
           'backup-restore-rollback-smoke',
           'runtime-observability-smoke',
@@ -87,6 +90,7 @@ async function main() {
     commandResults: {
       packaging: commandSummary(packaging),
       security: commandSummary(security),
+      systemd: commandSummary(systemd),
       releaseInstall: commandSummary(releaseInstall),
       backupRestore: commandSummary(backupRestore),
       observability: commandSummary(observability),

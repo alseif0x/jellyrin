@@ -29,7 +29,8 @@
     "evidence:ecosystem": "node qa/golden/ecosystem-parity.js",
     "evidence:dashboard": "node qa/golden/evidence-dashboard.js",
     "qa:packaging-release": "node qa/packaging-release.js",
-    "qa:release-install-smoke": "node qa/release-install-smoke.js"
+    "qa:release-install-smoke": "node qa/release-install-smoke.js",
+    "qa:systemd-unit-smoke": "node qa/systemd-unit-smoke.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2"
