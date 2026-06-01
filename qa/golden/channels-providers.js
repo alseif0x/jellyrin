@@ -62,7 +62,7 @@ async function runLocalSubgates() {
     {
       target: 'plugin-channel-provider-media-source',
       command: ['cargo', 'test', '-p', 'jellyrin-api', 'rust_wasi_channel_provider_feeds_channels_api', '--', '--nocapture'],
-      evidence: 'Rust/WASI ChannelProvider fixture feeds /Channels and resolves provider item playback through MediaInfo/LiveStreams/Open and Close',
+      evidence: 'Rust/WASI ChannelProvider fixture feeds /Channels, resolves provider item playback through MediaInfo/LiveStreams/Open and Close, and serves provider item Primary images through Image/Items',
     },
     {
       target: 'provider-refresh-cache-history',
@@ -150,17 +150,17 @@ function buildEvidence(result, comparison, localSubgates) {
     return {
       gate: 'channels-providers',
       status: 'implemented',
-      percent: 76,
+      percent: 82,
       closed: false,
-      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/refresh-cache-history',
+      sourcePhase: 'E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history',
       evidence: [
         'Channels browser golden completed against upstream Jellyfin and Jellyrin.',
         'Both targets satisfy the base Channels contract for GET /Channels and GET /Channels/Features.',
         'Jellyrin additionally exposes a real Live TV-backed channel provider fixture through /Channels, /Channels/livetv/Items, /Channels/Items/Latest, /Channels/livetv/Features, /Channels/Diagnostics and MediaInfo live-stream resolution.',
         'The fixture validates provider filtering, media-deletion filtering, item SearchTerm filtering, latest item listing/search, feature capability shape, media-source resolution, direct stream byte delivery and failure isolation for a configured malfunctioning provider.',
-        'The local Rust/WASI ChannelProvider fixture validates plugin-backed provider browse plus non-Live-TV provider item MediaInfo/LiveStreams/Open and Close resolution.',
+        'The local Rust/WASI ChannelProvider fixture validates plugin-backed provider browse, non-Live-TV provider item MediaInfo/LiveStreams/Open and Close resolution, ImageTags and provider item Primary image serving through /Image/Items.',
         'RefreshChannels now persists provider cache, item ids, refresh timestamps and refresh history in the channels named configuration.',
-        'This is an implemented E5 baseline, not full upstream-validated external provider parity: images, DotNet provider fixture and broader non-Live-TV provider playback remain open.',
+        'This is an implemented E5 baseline, not full upstream-validated external provider parity: remote HTTP image cache hydration, DotNet provider fixture and broader non-Live-TV provider playback remain open.',
       ].join(' '),
       updatedAt,
       completedTargets: allCompletedTargets,
@@ -174,7 +174,7 @@ function buildEvidence(result, comparison, localSubgates) {
       comparisonNotes: comparison.comparison?.reasons || [],
       openRisks: [
         'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
-        'Provider image resolution is still pending.',
+        'Provider item image resolution is covered for embedded data/plugin payloads; remote HTTP image fetching and cache hydration still need broader provider traces.',
         'Rust/WASI plugin channel-provider browse and MediaInfo resolution are covered by local subgate; DotNet channel-provider fixture is still pending.',
         'Provider failure/timeout isolation is covered for declarative malfunctioned providers; runtime plugin provider failures still need direct tests and browser evidence.',
       ],

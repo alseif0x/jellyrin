@@ -27209,6 +27209,111 @@ fn channel_content_item_media_source(
     }))
 }
 
+fn channel_item_image_infos(item: &serde_json::Value) -> Result<Vec<serde_json::Value>, ApiError> {
+    let Some((bytes, mime_type)) = channel_item_primary_image_payload(item)? else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![serde_json::json!({
+        "ImageType": "Primary",
+        "ImageIndex": 0,
+        "ImageTag": channel_item_image_tag(&bytes),
+        "Size": bytes.len(),
+        "MimeType": mime_type,
+    })])
+}
+
+fn channel_item_image_response(
+    item: &serde_json::Value,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<axum::response::Response>, ApiError> {
+    if !image_type.eq_ignore_ascii_case("Primary") || image_index != 0 {
+        return Ok(None);
+    }
+    let Some((bytes, mime_type)) = channel_item_primary_image_payload(item)? else {
+        return Ok(None);
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, mime_type.parse().unwrap());
+    headers.insert(
+        header::CACHE_CONTROL,
+        "public, max-age=3600".parse().unwrap(),
+    );
+    headers.insert(
+        header::ETAG,
+        channel_item_image_tag(&bytes).parse().unwrap(),
+    );
+    Ok(Some((headers, bytes).into_response()))
+}
+
+fn channel_item_primary_image_payload(
+    item: &serde_json::Value,
+) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    if let Some(image_url) = json_string_field(item, "ImageUrl") {
+        if let Some(payload) = data_uri_image_payload(&image_url)? {
+            return Ok(Some(payload));
+        }
+        if let Some((bytes, mime_type)) = plugin_remote_image_payload_from_id(&image_url)? {
+            return Ok(Some((bytes, mime_type)));
+        }
+    }
+    let Some(base64_data) = json_string_any_field(
+        item,
+        &["ImageBase64Data", "ImageData", "Base64Data", "Data"],
+    ) else {
+        return Ok(None);
+    };
+    let bytes = general_purpose::STANDARD
+        .decode(base64_data.as_bytes())
+        .map_err(|error| {
+            ApiError::bad_request(format!("Invalid channel image payload: {error}"))
+        })?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mime_type = json_string_any_field(item, &["ImageMimeType", "MimeType", "ContentType"])
+        .unwrap_or_else(|| image_format_from_bytes(&bytes).content_type.to_string());
+    Ok(Some((bytes, mime_type)))
+}
+
+fn data_uri_image_payload(value: &str) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let Some(rest) = value.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let Some((metadata, data)) = rest.split_once(',') else {
+        return Ok(None);
+    };
+    let mut metadata_parts = metadata.split(';');
+    let mime_type = metadata_parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    if !metadata_parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return Ok(None);
+    }
+    let bytes = general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|error| {
+            ApiError::bad_request(format!("Invalid channel image data URI: {error}"))
+        })?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((bytes, mime_type)))
+}
+
+fn channel_item_primary_image_tag(item: &serde_json::Value) -> Option<String> {
+    channel_item_primary_image_payload(item)
+        .ok()
+        .flatten()
+        .map(|(bytes, _)| channel_item_image_tag(&bytes))
+}
+
+fn channel_item_image_tag(bytes: &[u8]) -> String {
+    format!("{:x}-{:x}", bytes.len(), fnv1a64(bytes, 0x4f958f3c72a1d12b))
+}
+
 fn filter_channel_items_by_search(items: &mut Vec<serde_json::Value>, search_term: Option<&str>) {
     let Some(search_term) = search_term.map(str::trim).filter(|term| !term.is_empty()) else {
         return;
@@ -27601,6 +27706,9 @@ fn channel_content_item_json(
         json_string_field(item, "Type").unwrap_or_else(|| "ChannelVideoItem".to_string());
     let path = json_string_field(item, "Path");
     let image_url = json_string_field(item, "ImageUrl");
+    let image_tags = channel_item_primary_image_tag(item)
+        .map(|tag| serde_json::json!({ "Primary": tag }))
+        .unwrap_or_else(|| serde_json::json!({}));
     serde_json::json!({
         "Name": name,
         "ServerId": "",
@@ -27626,7 +27734,7 @@ fn channel_content_item_json(
         "IsFolder": false,
         "Type": item_type,
         "MediaType": media_type,
-        "ImageTags": {},
+        "ImageTags": image_tags,
         "ImageUrl": image_url,
         "BackdropImageTags": [],
         "LocationType": "Virtual"
@@ -30491,6 +30599,11 @@ async fn item_image_or_placeholder(
     image_type: &str,
     image_index: usize,
 ) -> Result<axum::response::Response, ApiError> {
+    if let Some(channel_item) = channel_content_item_by_id(&state.db, item_id).await?
+        && let Some(response) = channel_item_image_response(&channel_item, image_type, image_index)?
+    {
+        return Ok(response);
+    }
     let item = match media_item_by_id(&state.db, item_id).await {
         Ok(item) => Some(item),
         Err(error) if error.status == StatusCode::NOT_FOUND => {
@@ -31253,6 +31366,9 @@ async fn item_image_infos(
     Path(item_id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(channel_item) = channel_content_item_by_id(&state.db, &item_id).await? {
+        return Ok(Json(channel_item_image_infos(&channel_item)?));
+    }
     media_item_or_folder_by_id(&state.db, &item_id).await?;
     Ok(Json(
         stored_image_infos(&state, ImageOwner::Item(&item_id)).await?,
@@ -33444,6 +33560,7 @@ mod tests {
         assert_eq!(items["TotalRecordCount"], 1);
         assert_eq!(items["Items"][0]["Id"], "wasi-channel-item");
         assert_eq!(items["Items"][0]["ChannelId"], plugin_id);
+        assert!(items["Items"][0]["ImageTags"]["Primary"].as_str().is_some());
         assert_eq!(
             items["Items"][0]["Path"],
             "https://example.invalid/wasi.m3u8"
@@ -33495,6 +33612,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Image/Items/wasi-channel-item/Images")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let image_infos: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(image_infos.as_array().unwrap().len(), 1);
+        assert_eq!(image_infos[0]["ImageType"], "Primary");
+        assert_eq!(image_infos[0]["MimeType"], "image/png");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Image/Items/wasi-channel-item/Images/Primary")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), test_png_bytes().as_slice());
 
         let response = app
             .clone()
@@ -34075,9 +34229,8 @@ done
 
     async fn fake_rust_wasi_channel_provider_host_script(root: &std::path::Path) -> PathBuf {
         let path = root.join("fake-wasi-channel-provider-host.sh");
-        tokio::fs::write(
-            &path,
-            r#"#!/usr/bin/env bash
+        let image_base64 = general_purpose::STANDARD.encode(test_png_bytes());
+        let script = r#"#!/usr/bin/env bash
 while IFS= read -r line; do
   corr="${line#*\"CorrelationId\":\"}"
   corr="${corr%%\"*}"
@@ -34091,7 +34244,7 @@ while IFS= read -r line; do
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000001","Runtime":"RustWasi","RuntimeVersion":"fake-wasi-host-0.1","Status":"Healthy","Manifest":{"Name":"Channel WASI"},"Capabilities":["ChannelProvider"]}}\n' "$corr"
       ;;
     InvokeCapability)
-      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"ChannelProvider","Items":[{"Id":"wasi-channel-item","Name":"WASI Channel Item","MediaType":"Video","Path":"https://example.invalid/wasi.m3u8"}],"TotalRecordCount":1}}}\n' "$corr"
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Capability":"ChannelProvider","Items":[{"Id":"wasi-channel-item","Name":"WASI Channel Item","MediaType":"Video","Path":"https://example.invalid/wasi.m3u8","ImageUrl":"data:image/png;base64,__IMAGE_BASE64__"}],"TotalRecordCount":1}}}\n' "$corr"
       ;;
     Health)
       printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"bbbbbbbb-0000-0000-0000-000000000001","Runtime":"RustWasi","Status":"Healthy","Metrics":{"CapabilityCount":1}}}\n' "$corr"
@@ -34102,10 +34255,9 @@ while IFS= read -r line; do
       ;;
   esac
 done
-"#,
-        )
-        .await
-        .unwrap();
+"#
+        .replace("__IMAGE_BASE64__", &image_base64);
+        tokio::fs::write(&path, script).await.unwrap();
         let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
         #[cfg(unix)]
         {
