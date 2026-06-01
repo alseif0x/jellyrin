@@ -126,7 +126,7 @@ function buildEvidence(result, comparison, localSubgates, manualEvidence) {
   const updatedAt = new Date().toISOString();
   const localPassed = localSubgates.length > 0 && localSubgates.every((subgate) => subgate.code === 0);
   const providerEvidence = summarizeManualChannelsProviderEvidence(manualEvidence);
-  const externalProviderValidated = providerEvidence.validCount > 0;
+  const providerTraceValidated = providerEvidence.validCount > 0;
   if (!comparison) {
     return {
       gate: 'channels-providers',
@@ -167,10 +167,10 @@ function buildEvidence(result, comparison, localSubgates, manualEvidence) {
   if (targetsHealthy && invariantCoverage.complete && localPassed) {
     return {
       gate: 'channels-providers',
-      status: externalProviderValidated ? 'upstream-validated' : 'implemented',
-      percent: externalProviderValidated ? 100 : 94,
-      closed: externalProviderValidated,
-      sourcePhase: `E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation/dotnet-provider/remote-http-images${externalProviderValidated ? '/external-provider-evidence' : ''}`,
+      status: providerTraceValidated ? 'upstream-validated' : 'implemented',
+      percent: providerTraceValidated ? 100 : 94,
+      closed: providerTraceValidated,
+      sourcePhase: `E5.1/E5.2/E5.3/E5.4/E5.5/browser-basic/plugin-provider-media-source/provider-images/refresh-cache-history/runtime-plugin-failure-isolation/dotnet-provider/remote-http-images${providerTraceValidated ? '/provider-trace-evidence' : ''}`,
       evidence: [
         'Channels browser golden completed against upstream Jellyfin and Jellyrin.',
         'Both targets satisfy the base Channels contract for GET /Channels and GET /Channels/Features.',
@@ -180,13 +180,13 @@ function buildEvidence(result, comparison, localSubgates, manualEvidence) {
         'The local DotNetJellyfin ChannelProvider fixture validates stdio-host activation, plugin-backed provider browse, non-Live-TV provider item MediaInfo/LiveStreams/Open resolution and healthy diagnostics.',
         'RefreshChannels now persists provider cache, item ids, refresh timestamps, remote HTTP provider item image hydration and refresh history in the channels named configuration.',
         'Runtime plugin ChannelProvider failures are isolated from /Channels and /Channels/{id}/Items while diagnostics reports Malfunctioned with failure detail.',
-        externalProviderValidated
-          ? `External channels provider evidence is valid (${providerEvidence.validCount} file(s)); E5 can close as upstream-validated.`
-          : `This is an implemented E5 baseline, not full upstream-validated external provider parity: add a passing provider evidence JSON under ${providerEvidence.directory}.`,
+        providerTraceValidated
+          ? `Channels provider trace evidence is valid (${providerEvidence.validCount} file(s)); E5 can close as upstream-validated.`
+          : `This is an implemented E5 baseline, not full upstream-validated provider parity: add a passing provider evidence JSON under ${providerEvidence.directory}.`,
       ].join(' '),
       updatedAt,
-      completedTargets: externalProviderValidated
-        ? [...new Set([...allCompletedTargets, 'external-channel-provider-evidence'])].sort()
+      completedTargets: providerTraceValidated
+        ? [...new Set([...allCompletedTargets, 'channel-provider-trace-evidence'])].sort()
         : allCompletedTargets,
       skippedTargets,
       failedTargets,
@@ -198,7 +198,7 @@ function buildEvidence(result, comparison, localSubgates, manualEvidence) {
       tracePath: path.relative(plansDir, comparisonPath),
       comparisonNotes: comparison.comparison?.reasons || [],
       openRisks: [
-        ...(!externalProviderValidated
+        ...(!providerTraceValidated
           ? [
               'E5 target remains upstream-validated; current evidence covers base Channels API plus a Jellyrin Live TV-backed provider fixture, not multiple external providers.',
               'Provider item image resolution is covered for embedded data/plugin payloads and configured-provider remote HTTP hydration; broader external provider traces are still needed.',
@@ -297,7 +297,7 @@ function renderMarkdown(evidence, comparison) {
   }
   if (evidence.providerEvidence) {
     lines.push('');
-    lines.push('## External Provider Evidence');
+    lines.push('## Provider Evidence');
     lines.push('');
     lines.push(`- Directory: \`${evidence.providerEvidence.directory}\``);
     lines.push(`- Template: \`${evidence.providerEvidence.templatePath}\``);
