@@ -104,11 +104,16 @@ pub struct HlsTranscodeRequest {
     pub selection: TranscodeStreamSelection,
     pub include_video: bool,
     pub start_position_ticks: i64,
+    pub duration_ticks: Option<i64>,
+    pub hls_start_number: Option<u32>,
+    pub output_ts_offset_ticks: Option<i64>,
+    pub event_playlist: bool,
     pub max_video_width: Option<u32>,
     pub max_video_height: Option<u32>,
     pub video_bitrate: Option<u32>,
     pub audio_bitrate: Option<u32>,
     pub segment_time_seconds: u32,
+    pub burn_in_subtitle: bool,
 }
 
 impl HlsTranscodeRequest {
@@ -125,11 +130,16 @@ impl HlsTranscodeRequest {
             selection,
             include_video: true,
             start_position_ticks: 0,
+            duration_ticks: None,
+            hls_start_number: None,
+            output_ts_offset_ticks: None,
+            event_playlist: false,
             max_video_width: None,
             max_video_height: None,
             video_bitrate: None,
             audio_bitrate: None,
             segment_time_seconds: DEFAULT_HLS_SEGMENT_TIME_SECONDS,
+            burn_in_subtitle: false,
         }
     }
 }
@@ -192,13 +202,38 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     args.push("-i".to_string());
     args.push(request.input_path.clone());
 
-    if request.include_video {
+    if let Some(duration_ticks) = request.duration_ticks
+        && duration_ticks > 0
+    {
+        args.push("-t".to_string());
+        args.push(format_ticks_as_seconds(duration_ticks));
+    }
+
+    let should_burn_subtitle = request.include_video
+        && request.burn_in_subtitle
+        && request
+            .selection
+            .subtitle_stream_index
+            .is_some_and(|index| index >= 0);
+
+    if should_burn_subtitle {
+        args.push("-filter_complex".to_string());
+        args.push(format!(
+            "{}{}overlay=eof_action=pass:repeatlast=0[v]",
+            ffmpeg_stream_filter_input("v", request.selection.video_stream_index),
+            ffmpeg_stream_filter_input("s", request.selection.subtitle_stream_index),
+        ));
+        args.push("-map".to_string());
+        args.push("[v]".to_string());
+    } else if request.include_video {
         push_selected_stream_map(&mut args, "v", request.selection.video_stream_index, true);
     } else {
         args.push("-vn".to_string());
     }
     push_selected_stream_map(&mut args, "a", request.selection.audio_stream_index, true);
-    if request
+    if should_burn_subtitle {
+        args.push("-sn".to_string());
+    } else if request
         .selection
         .subtitle_stream_index
         .is_some_and(|index| index >= 0)
@@ -245,9 +280,18 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
 
     args.push("-c:a".to_string());
     args.push("aac".to_string());
+    args.push("-ac".to_string());
+    args.push("2".to_string());
     if let Some(audio_bitrate) = request.audio_bitrate {
         args.push("-b:a".to_string());
         args.push(audio_bitrate.to_string());
+    }
+
+    if let Some(output_ts_offset_ticks) = request.output_ts_offset_ticks
+        && output_ts_offset_ticks > 0
+    {
+        args.push("-output_ts_offset".to_string());
+        args.push(format_ticks_as_seconds(output_ts_offset_ticks));
     }
 
     args.push("-f".to_string());
@@ -255,7 +299,17 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     args.push("-hls_time".to_string());
     args.push(request.segment_time_seconds.max(1).to_string());
     args.push("-hls_playlist_type".to_string());
-    args.push("event".to_string());
+    args.push(if request.event_playlist {
+        "event".to_string()
+    } else {
+        "vod".to_string()
+    });
+    args.push("-hls_list_size".to_string());
+    args.push("0".to_string());
+    if let Some(start_number) = request.hls_start_number {
+        args.push("-start_number".to_string());
+        args.push(start_number.to_string());
+    }
     args.push("-hls_segment_filename".to_string());
     args.push(request.segment_pattern_path.clone());
     args.push("-progress".to_string());
@@ -317,6 +371,13 @@ fn push_selected_stream_map(
     match stream_index {
         Some(index) if index >= 0 => args.push(format!("0:{index}{optional_suffix}")),
         _ => args.push(format!("0:{stream_type}:0{optional_suffix}")),
+    }
+}
+
+fn ffmpeg_stream_filter_input(stream_type: &str, stream_index: Option<i64>) -> String {
+    match stream_index {
+        Some(index) if index >= 0 => format!("[0:{index}]"),
+        _ => format!("[0:{stream_type}:0]"),
     }
 }
 
@@ -400,6 +461,8 @@ mod tests {
                 "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
                 "-c:a",
                 "aac",
+                "-ac",
+                "2",
                 "-b:a",
                 "192000",
                 "-f",
@@ -407,7 +470,9 @@ mod tests {
                 "-hls_time",
                 "3",
                 "-hls_playlist_type",
-                "event",
+                "vod",
+                "-hls_list_size",
+                "0",
                 "-hls_segment_filename",
                 "/tmp/jellyrin/transcodes/play-1/segment_%05d.ts",
                 "-progress",
@@ -454,6 +519,40 @@ mod tests {
     }
 
     #[test]
+    fn hls_ffmpeg_command_burns_image_subtitles_into_video() {
+        let mut request = HlsTranscodeRequest::new(
+            "/media/Movie.mkv",
+            "/tmp/main.m3u8",
+            "/tmp/segment_%05d.ts",
+            TranscodeStreamSelection {
+                video_stream_index: Some(0),
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(3),
+            },
+        );
+        request.burn_in_subtitle = true;
+
+        let command = build_hls_ffmpeg_command(&request);
+
+        assert!(command.args.windows(2).any(|pair| {
+            pair == [
+                "-filter_complex",
+                "[0:0][0:3]overlay=eof_action=pass:repeatlast=0[v]",
+            ]
+        }));
+        assert!(command.args.windows(2).any(|pair| pair == ["-map", "[v]"]));
+        assert!(command.args.windows(2).any(|pair| pair == ["-map", "0:1?"]));
+        assert!(command.args.iter().any(|arg| arg == "-sn"));
+        assert!(!command.args.windows(2).any(|pair| pair == ["-map", "0:3"]));
+        assert!(
+            !command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-c:s", "webvtt"])
+        );
+    }
+
+    #[test]
     fn hls_ffmpeg_command_can_transcode_audio_only() {
         let mut request = HlsTranscodeRequest::new(
             "/media/Song.flac",
@@ -479,6 +578,46 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|pair| pair == ["-b:a", "128000"])
+        );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_can_start_at_specific_segment_number() {
+        let mut request = HlsTranscodeRequest::new(
+            "/media/Movie.mkv",
+            "/tmp/seek/segment_00042.m3u8",
+            "/tmp/seek/segment_%05d.ts",
+            TranscodeStreamSelection {
+                video_stream_index: Some(0),
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(-1),
+            },
+        );
+        request.start_position_ticks = 120_000_000;
+        request.duration_ticks = Some(30_000_000);
+        request.hls_start_number = Some(42);
+        request.output_ts_offset_ticks = Some(1_260_000_000);
+
+        let command = build_hls_ffmpeg_command(&request);
+
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-ss", "12.000"])
+        );
+        assert!(command.args.windows(2).any(|pair| pair == ["-t", "3.000"]));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-start_number", "42"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-output_ts_offset", "126.000"])
         );
     }
 

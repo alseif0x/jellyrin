@@ -33,8 +33,8 @@ use jellyrin_compat::{
     StartupRemoteAccessDto, StartupUserDto, UserDto, UserPolicyDto,
 };
 use jellyrin_core::{
-    DeviceToken, HlsTranscodeRequest, MediaItem, PlaybackState, StartupConfig,
-    TranscodeStreamSelection, User, VirtualFolder, build_hls_ffmpeg_command,
+    DEFAULT_HLS_SEGMENT_TIME_SECONDS, DeviceToken, HlsTranscodeRequest, MediaItem, PlaybackState,
+    StartupConfig, TranscodeStreamSelection, User, VirtualFolder, build_hls_ffmpeg_command,
     build_hls_ffmpeg_command_from_stdin,
 };
 use jellyrin_db::{
@@ -84,6 +84,9 @@ const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
+const HLS_SEGMENT_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const HLS_SEGMENT_WAIT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
+const HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS: i64 = 8;
 const DLNA_TRANSCODE_DEVICE_ID: &str = "dlna-upnp";
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
 const HDHOMERUN_DISCOVERY_PORT: u16 = 65001;
@@ -354,6 +357,10 @@ pub fn router(state: AppState) -> Router {
         .route("/System/Info", get(system_info))
         .route("/TimeSync/GetUtcTime", get(time_sync_utc_time))
         .route("/timesync/getutctime", get(time_sync_utc_time))
+        .route("/GetUtcTime", get(time_sync_utc_time))
+        .route("/getutctime", get(time_sync_utc_time))
+        .route("/Tmdb/ClientConfiguration", get(tmdb_client_configuration))
+        .route("/tmdb/clientconfiguration", get(tmdb_client_configuration))
         .route("/System/Ping", get(ping))
         .route("/System/Ping", post(ping))
         .route("/system/ping", get(ping))
@@ -1081,6 +1088,8 @@ pub fn router(state: AppState) -> Router {
             "/playstate/sessions/playing/ping",
             post(ping_playback_session),
         )
+        .route("/Sessions/Playing/Ping", post(ping_playback_session))
+        .route("/sessions/playing/ping", post(ping_playback_session))
         .route("/Sessions/Capabilities", post(update_session_capabilities))
         .route(
             "/Session/Sessions/Capabilities",
@@ -1528,8 +1537,12 @@ pub fn router(state: AppState) -> Router {
         .route("/mediainfo/playback/bitratetest", get(bitrate_test))
         .route("/MediaInfo/LiveStreams/Open", post(open_live_stream))
         .route("/mediainfo/livestreams/open", post(open_live_stream))
+        .route("/LiveStreams/Open", post(open_live_stream))
+        .route("/livestreams/open", post(open_live_stream))
         .route("/MediaInfo/LiveStreams/Close", post(close_live_stream))
         .route("/mediainfo/livestreams/close", post(close_live_stream))
+        .route("/LiveStreams/Close", post(close_live_stream))
+        .route("/livestreams/close", post(close_live_stream))
         .route("/Videos/ActiveEncodings", get(active_encodings))
         .route("/videos/activeencodings", get(active_encodings))
         .route("/Videos/ActiveEncodings", delete(stop_active_encoding))
@@ -1622,6 +1635,10 @@ pub fn router(state: AppState) -> Router {
             "/dynamichls/videos/{item_id}/live.m3u8",
             get(hls_media_playlist),
         )
+        .route("/Videos/{item_id}/live.m3u8", get(hls_media_playlist))
+        .route("/videos/{item_id}/live.m3u8", get(hls_media_playlist))
+        .route("/Videos/{item_id}/live.m3u8", head(hls_media_playlist_head))
+        .route("/videos/{item_id}/live.m3u8", head(hls_media_playlist_head))
         .route(
             "/DynamicHls/Videos/{item_id}/hls1/{playlist_id}/{segment_file}",
             get(hls_segment),
@@ -1740,6 +1757,8 @@ pub fn router(state: AppState) -> Router {
             "/Subtitle/FallbackFont/Fonts",
             get(subtitle_fallback_fonts),
         )
+        .route("/FallbackFont/Fonts", get(subtitle_fallback_fonts))
+        .route("/fallbackfont/fonts", get(subtitle_fallback_fonts))
         .route(
             "/subtitle/fallbackfont/fonts",
             get(subtitle_fallback_fonts),
@@ -1748,6 +1767,8 @@ pub fn router(state: AppState) -> Router {
             "/Subtitle/FallbackFont/Fonts/{name}",
             get(subtitle_fallback_font),
         )
+        .route("/FallbackFont/Fonts/{name}", get(subtitle_fallback_font))
+        .route("/fallbackfont/fonts/{name}", get(subtitle_fallback_font))
         .route(
             "/subtitle/fallbackfont/fonts/{name}",
             get(subtitle_fallback_font),
@@ -1757,7 +1778,15 @@ pub fn router(state: AppState) -> Router {
             get(search_remote_subtitles),
         )
         .route(
+            "/Items/{item_id}/RemoteSearch/Subtitles/{language}",
+            get(search_remote_subtitles),
+        )
+        .route(
             "/subtitle/items/{item_id}/remotesearch/subtitles/{language}",
+            get(search_remote_subtitles),
+        )
+        .route(
+            "/items/{item_id}/remotesearch/subtitles/{language}",
             get(search_remote_subtitles),
         )
         .route(
@@ -1765,11 +1794,27 @@ pub fn router(state: AppState) -> Router {
             post(download_remote_subtitle),
         )
         .route(
+            "/Items/{item_id}/RemoteSearch/Subtitles/{language}",
+            post(download_remote_subtitle),
+        )
+        .route(
             "/subtitle/items/{item_id}/remotesearch/subtitles/{language}",
             post(download_remote_subtitle),
         )
         .route(
+            "/items/{item_id}/remotesearch/subtitles/{language}",
+            post(download_remote_subtitle),
+        )
+        .route(
             "/Subtitle/Providers/Subtitles/Subtitles/{subtitle_id}",
+            get(get_remote_subtitle),
+        )
+        .route(
+            "/Providers/Subtitles/Subtitles/{subtitle_id}",
+            get(get_remote_subtitle),
+        )
+        .route(
+            "/providers/subtitles/subtitles/{subtitle_id}",
             get(get_remote_subtitle),
         )
         .route(
@@ -1781,7 +1826,15 @@ pub fn router(state: AppState) -> Router {
             get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
         )
         .route(
+            "/Audio/{item_id}/Lyrics",
+            get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
+        )
+        .route(
             "/lyrics/audio/{item_id}/lyrics",
+            get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
+        )
+        .route(
+            "/audio/{item_id}/lyrics",
             get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
         )
         .route(
@@ -1789,7 +1842,15 @@ pub fn router(state: AppState) -> Router {
             get(search_remote_lyrics),
         )
         .route(
+            "/Audio/{item_id}/RemoteSearch/Lyrics",
+            get(search_remote_lyrics),
+        )
+        .route(
             "/lyrics/audio/{item_id}/remotesearch/lyrics",
+            get(search_remote_lyrics),
+        )
+        .route(
+            "/audio/{item_id}/remotesearch/lyrics",
             get(search_remote_lyrics),
         )
         .route(
@@ -1797,13 +1858,23 @@ pub fn router(state: AppState) -> Router {
             post(download_remote_lyrics),
         )
         .route(
+            "/Audio/{item_id}/RemoteSearch/Lyrics/{lyric_id}",
+            post(download_remote_lyrics),
+        )
+        .route(
             "/lyrics/audio/{item_id}/remotesearch/lyrics/{lyric_id}",
+            post(download_remote_lyrics),
+        )
+        .route(
+            "/audio/{item_id}/remotesearch/lyrics/{lyric_id}",
             post(download_remote_lyrics),
         )
         .route(
             "/Lyrics/Providers/Lyrics/{lyric_id}",
             get(get_remote_lyrics),
         )
+        .route("/Providers/Lyrics/{lyric_id}", get(get_remote_lyrics))
+        .route("/providers/lyrics/{lyric_id}", get(get_remote_lyrics))
         .route(
             "/lyrics/providers/lyrics/{lyric_id}",
             get(get_remote_lyrics),
@@ -1902,6 +1973,10 @@ pub fn router(state: AppState) -> Router {
             get(trickplay_tile),
         )
         .route(
+            "/videos/{item_id}/trickplay/{width}/{tile_file}",
+            get(trickplay_tile),
+        )
+        .route(
             "/trickplay/videos/{item_id}/trickplay/{width}/{tile_file}",
             get(trickplay_tile),
         )
@@ -1926,7 +2001,15 @@ pub fn router(state: AppState) -> Router {
             get(user_grouping_options_legacy),
         )
         .route(
+            "/Users/{user_id}/GroupingOptions",
+            get(user_grouping_options_legacy),
+        )
+        .route(
             "/userviews/users/{user_id}/groupingoptions",
+            get(user_grouping_options_legacy),
+        )
+        .route(
+            "/users/{user_id}/groupingoptions",
             get(user_grouping_options_legacy),
         )
         .route("/Items/Counts", get(item_counts))
@@ -1971,7 +2054,15 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_similar_album_items),
         )
         .route(
+            "/Albums/{item_id}/Similar",
+            get(authenticated_similar_album_items),
+        )
+        .route(
             "/library/albums/{item_id}/similar",
+            get(authenticated_similar_album_items),
+        )
+        .route(
+            "/albums/{item_id}/similar",
             get(authenticated_similar_album_items),
         )
         .route(
@@ -1979,7 +2070,15 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_similar_artist_items),
         )
         .route(
+            "/Artists/{item_id}/Similar",
+            get(authenticated_similar_artist_items),
+        )
+        .route(
             "/library/artists/{item_id}/similar",
+            get(authenticated_similar_artist_items),
+        )
+        .route(
+            "/artists/{item_id}/similar",
             get(authenticated_similar_artist_items),
         )
         .route(
@@ -1987,7 +2086,15 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_similar_items),
         )
         .route(
+            "/Movies/{item_id}/Similar",
+            get(authenticated_similar_items),
+        )
+        .route(
             "/library/movies/{item_id}/similar",
+            get(authenticated_similar_items),
+        )
+        .route(
+            "/movies/{item_id}/similar",
             get(authenticated_similar_items),
         )
         .route(
@@ -2011,7 +2118,15 @@ pub fn router(state: AppState) -> Router {
             get(authenticated_similar_trailer_items),
         )
         .route(
+            "/Trailers/{item_id}/Similar",
+            get(authenticated_similar_trailer_items),
+        )
+        .route(
             "/library/trailers/{item_id}/similar",
+            get(authenticated_similar_trailer_items),
+        )
+        .route(
+            "/trailers/{item_id}/similar",
             get(authenticated_similar_trailer_items),
         )
         .route(
@@ -2021,6 +2136,24 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/users/{user_id}/items/{item_id}/intros",
             get(user_item_intros),
+        )
+        .route("/Items/{item_id}/Intros", get(authenticated_item_intros))
+        .route("/items/{item_id}/intros", get(authenticated_item_intros))
+        .route(
+            "/Items/{item_id}/LocalTrailers",
+            get(authenticated_item_local_trailers_list),
+        )
+        .route(
+            "/items/{item_id}/localtrailers",
+            get(authenticated_item_local_trailers_list),
+        )
+        .route(
+            "/Items/{item_id}/SpecialFeatures",
+            get(authenticated_item_special_features_list),
+        )
+        .route(
+            "/items/{item_id}/specialfeatures",
+            get(authenticated_item_special_features_list),
         )
         .route(
             "/Items/{item_id}/Images",
@@ -2047,12 +2180,28 @@ pub fn router(state: AppState) -> Router {
             get(item_remote_images),
         )
         .route(
+            "/RemoteImage/Items/{item_id}/RemoteImages/Preview",
+            get(remote_image_preview),
+        )
+        .route(
+            "/Items/{item_id}/RemoteImages/Preview",
+            get(remote_image_preview),
+        )
+        .route(
             "/remoteimage/items/{item_id}/remoteimages",
             get(item_remote_images),
         )
         .route(
             "/items/{item_id}/remoteimages",
             get(item_remote_images),
+        )
+        .route(
+            "/remoteimage/items/{item_id}/remoteimages/preview",
+            get(remote_image_preview),
+        )
+        .route(
+            "/items/{item_id}/remoteimages/preview",
+            get(remote_image_preview),
         )
         .route(
             "/RemoteImage/Items/{item_id}/RemoteImages/Providers",
@@ -2209,7 +2358,15 @@ pub fn router(state: AppState) -> Router {
             get(instant_mix_from_album),
         )
         .route(
+            "/Albums/{item_id}/InstantMix",
+            get(instant_mix_from_album),
+        )
+        .route(
             "/instantmix/albums/{item_id}/instantmix",
+            get(instant_mix_from_album),
+        )
+        .route(
+            "/albums/{item_id}/instantmix",
             get(instant_mix_from_album),
         )
         .route(
@@ -2217,7 +2374,15 @@ pub fn router(state: AppState) -> Router {
             get(instant_mix_from_artist),
         )
         .route(
+            "/Artists/{item_id}/InstantMix",
+            get(instant_mix_from_artist),
+        )
+        .route(
             "/instantmix/artists/{item_id}/instantmix",
+            get(instant_mix_from_artist),
+        )
+        .route(
+            "/artists/{item_id}/instantmix",
             get(instant_mix_from_artist),
         )
         .route(
@@ -2225,7 +2390,15 @@ pub fn router(state: AppState) -> Router {
             get(instant_mix_from_playlist),
         )
         .route(
+            "/Playlists/{item_id}/InstantMix",
+            get(instant_mix_from_playlist),
+        )
+        .route(
             "/instantmix/playlists/{item_id}/instantmix",
+            get(instant_mix_from_playlist),
+        )
+        .route(
+            "/playlists/{item_id}/instantmix",
             get(instant_mix_from_playlist),
         )
         .route(
@@ -2241,7 +2414,15 @@ pub fn router(state: AppState) -> Router {
             get(instant_mix_from_music_genre_by_id),
         )
         .route(
+            "/MusicGenres/InstantMix",
+            get(instant_mix_from_music_genre_by_id),
+        )
+        .route(
             "/instantmix/musicgenres/instantmix",
+            get(instant_mix_from_music_genre_by_id),
+        )
+        .route(
+            "/musicgenres/instantmix",
             get(instant_mix_from_music_genre_by_id),
         )
         .route(
@@ -2249,7 +2430,15 @@ pub fn router(state: AppState) -> Router {
             get(instant_mix_from_music_genre),
         )
         .route(
+            "/MusicGenres/{name}/InstantMix",
+            get(instant_mix_from_music_genre),
+        )
+        .route(
             "/instantmix/musicgenres/{name}/instantmix",
+            get(instant_mix_from_music_genre),
+        )
+        .route(
+            "/musicgenres/{name}/instantmix",
             get(instant_mix_from_music_genre),
         )
         .route("/MediaSegments/{item_id}", get(media_segments))
@@ -2386,18 +2575,42 @@ pub fn router(state: AppState) -> Router {
             "/audio/{item_id}/stream.{container}",
             head(direct_stream_audio_by_container_head),
         )
-        .route("/Items/{item_id}", get(item_detail).post(update_item_metadata))
-        .route("/items/{item_id}", get(item_detail).post(update_item_metadata))
+        .route(
+            "/Items/{item_id}",
+            get(item_detail)
+                .post(update_item_metadata)
+                .put(update_item_metadata),
+        )
+        .route(
+            "/items/{item_id}",
+            get(item_detail)
+                .post(update_item_metadata)
+                .put(update_item_metadata),
+        )
         .route("/Items/{item_id}/Refresh", post(refresh_item))
         .route("/items/{item_id}/refresh", post(refresh_item))
-        .route("/ItemUpdate/Items/{item_id}", post(update_item_metadata))
-        .route("/itemupdate/items/{item_id}", post(update_item_metadata))
+        .route(
+            "/ItemUpdate/Items/{item_id}",
+            post(update_item_metadata).put(update_item_metadata),
+        )
+        .route(
+            "/itemupdate/items/{item_id}",
+            post(update_item_metadata).put(update_item_metadata),
+        )
         .route(
             "/ItemUpdate/Items/{item_id}/ContentType",
             post(update_item_content_type),
         )
         .route(
+            "/Items/{item_id}/ContentType",
+            post(update_item_content_type),
+        )
+        .route(
             "/itemupdate/items/{item_id}/contenttype",
+            post(update_item_content_type),
+        )
+        .route(
+            "/items/{item_id}/contenttype",
             post(update_item_content_type),
         )
         .route(
@@ -2437,19 +2650,33 @@ pub fn router(state: AppState) -> Router {
             post(apply_remote_item_search),
         )
         .route(
+            "/Items/RemoteSearch/Apply/{item_id}",
+            post(apply_remote_item_search),
+        )
+        .route(
             "/itemlookup/items/remotesearch/apply/{item_id}",
+            post(apply_remote_item_search),
+        )
+        .route(
+            "/items/remotesearch/apply/{item_id}",
             post(apply_remote_item_search),
         )
         .route(
             "/ItemLookup/Items/RemoteSearch/Book",
             post(remote_search_book),
         )
+        .route("/Items/RemoteSearch/Book", post(remote_search_book))
         .route(
             "/itemlookup/items/remotesearch/book",
             post(remote_search_book),
         )
+        .route("/items/remotesearch/book", post(remote_search_book))
         .route(
             "/ItemLookup/Items/RemoteSearch/BoxSet",
+            post(remote_search_box_set),
+        )
+        .route(
+            "/Items/RemoteSearch/BoxSet",
             post(remote_search_box_set),
         )
         .route(
@@ -2457,15 +2684,25 @@ pub fn router(state: AppState) -> Router {
             post(remote_search_box_set),
         )
         .route(
+            "/items/remotesearch/boxset",
+            post(remote_search_box_set),
+        )
+        .route(
             "/ItemLookup/Items/RemoteSearch/Movie",
             post(remote_search_movie),
         )
+        .route("/Items/RemoteSearch/Movie", post(remote_search_movie))
         .route(
             "/itemlookup/items/remotesearch/movie",
             post(remote_search_movie),
         )
+        .route("/items/remotesearch/movie", post(remote_search_movie))
         .route(
             "/ItemLookup/Items/RemoteSearch/MusicAlbum",
+            post(remote_search_music_album),
+        )
+        .route(
+            "/Items/RemoteSearch/MusicAlbum",
             post(remote_search_music_album),
         )
         .route(
@@ -2473,7 +2710,15 @@ pub fn router(state: AppState) -> Router {
             post(remote_search_music_album),
         )
         .route(
+            "/items/remotesearch/musicalbum",
+            post(remote_search_music_album),
+        )
+        .route(
             "/ItemLookup/Items/RemoteSearch/MusicArtist",
+            post(remote_search_music_artist),
+        )
+        .route(
+            "/Items/RemoteSearch/MusicArtist",
             post(remote_search_music_artist),
         )
         .route(
@@ -2481,7 +2726,15 @@ pub fn router(state: AppState) -> Router {
             post(remote_search_music_artist),
         )
         .route(
+            "/items/remotesearch/musicartist",
+            post(remote_search_music_artist),
+        )
+        .route(
             "/ItemLookup/Items/RemoteSearch/MusicVideo",
+            post(remote_search_music_video),
+        )
+        .route(
+            "/Items/RemoteSearch/MusicVideo",
             post(remote_search_music_video),
         )
         .route(
@@ -2489,33 +2742,55 @@ pub fn router(state: AppState) -> Router {
             post(remote_search_music_video),
         )
         .route(
+            "/items/remotesearch/musicvideo",
+            post(remote_search_music_video),
+        )
+        .route(
             "/ItemLookup/Items/RemoteSearch/Person",
             post(remote_search_person),
         )
+        .route("/Items/RemoteSearch/Person", post(remote_search_person))
         .route(
             "/itemlookup/items/remotesearch/person",
             post(remote_search_person),
         )
+        .route("/items/remotesearch/person", post(remote_search_person))
         .route(
             "/ItemLookup/Items/RemoteSearch/Series",
             post(remote_search_series),
         )
+        .route("/Items/RemoteSearch/Series", post(remote_search_series))
         .route(
             "/itemlookup/items/remotesearch/series",
             post(remote_search_series),
         )
+        .route("/items/remotesearch/series", post(remote_search_series))
         .route(
             "/ItemLookup/Items/RemoteSearch/Trailer",
+            post(remote_search_trailer),
+        )
+        .route(
+            "/Items/RemoteSearch/Trailer",
             post(remote_search_trailer),
         )
         .route(
             "/itemlookup/items/remotesearch/trailer",
             post(remote_search_trailer),
         )
+        .route(
+            "/items/remotesearch/trailer",
+            post(remote_search_trailer),
+        )
         .route("/UserLibrary/Items/Root", get(root_folder))
         .route("/userlibrary/items/root", get(root_folder))
+        .route("/Items/Root", get(root_folder))
+        .route("/items/root", get(root_folder))
         .route("/UserLibrary/Items/{item_id}", get(current_user_item_detail))
         .route("/userlibrary/items/{item_id}", get(current_user_item_detail))
+        .route("/Items/{item_id}/Download", get(download_item_file))
+        .route("/items/{item_id}/download", get(download_item_file))
+        .route("/Items/{item_id}/File", get(library_item_file))
+        .route("/items/{item_id}/file", get(library_item_file))
         .route("/Library/Items/{item_id}/Download", get(download_item_file))
         .route("/library/items/{item_id}/download", get(download_item_file))
         .route("/Library/Items/{item_id}/File", get(library_item_file))
@@ -2530,6 +2805,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/items/useritems/{item_id}/userdata",
+            get(authenticated_item_user_data).post(update_authenticated_item_user_data),
+        )
+        .route(
+            "/UserItems/{item_id}/UserData",
+            get(authenticated_item_user_data).post(update_authenticated_item_user_data),
+        )
+        .route(
+            "/useritems/{item_id}/userdata",
             get(authenticated_item_user_data).post(update_authenticated_item_user_data),
         )
         .route(
@@ -2611,6 +2894,14 @@ pub fn router(state: AppState) -> Router {
             post(mark_authenticated_item_favorite).delete(unmark_authenticated_item_favorite),
         )
         .route(
+            "/UserFavoriteItems/{item_id}",
+            post(mark_authenticated_item_favorite).delete(unmark_authenticated_item_favorite),
+        )
+        .route(
+            "/userfavoriteitems/{item_id}",
+            post(mark_authenticated_item_favorite).delete(unmark_authenticated_item_favorite),
+        )
+        .route(
             "/UserLibrary/Users/{user_id}/FavoriteItems/{item_id}",
             post(mark_user_item_favorite).delete(unmark_user_item_favorite),
         )
@@ -2624,6 +2915,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/userlibrary/useritems/{item_id}/rating",
+            post(update_authenticated_item_rating).delete(delete_authenticated_item_rating),
+        )
+        .route(
+            "/UserItems/{item_id}/Rating",
+            post(update_authenticated_item_rating).delete(delete_authenticated_item_rating),
+        )
+        .route(
+            "/useritems/{item_id}/rating",
             post(update_authenticated_item_rating).delete(delete_authenticated_item_rating),
         )
         .route(
@@ -2651,6 +2950,14 @@ pub fn router(state: AppState) -> Router {
             post(mark_authenticated_item_played),
         )
         .route(
+            "/UserPlayedItems/{item_id}",
+            post(mark_authenticated_item_played),
+        )
+        .route(
+            "/userplayeditems/{item_id}",
+            post(mark_authenticated_item_played),
+        )
+        .route(
             "/Playstate/Users/{user_id}/PlayedItems/{item_id}",
             post(mark_item_played),
         )
@@ -2675,6 +2982,14 @@ pub fn router(state: AppState) -> Router {
             delete(mark_authenticated_item_unplayed),
         )
         .route(
+            "/UserPlayedItems/{item_id}",
+            delete(mark_authenticated_item_unplayed),
+        )
+        .route(
+            "/userplayeditems/{item_id}",
+            delete(mark_authenticated_item_unplayed),
+        )
+        .route(
             "/Playstate/Users/{user_id}/PlayedItems/{item_id}",
             delete(mark_item_unplayed),
         )
@@ -2688,6 +3003,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/playstate/playingitems/{item_id}",
+            post(report_path_playback_start),
+        )
+        .route(
+            "/PlayingItems/{item_id}",
+            post(report_path_playback_start),
+        )
+        .route(
+            "/playingitems/{item_id}",
             post(report_path_playback_start),
         )
         .route(
@@ -2707,6 +3030,14 @@ pub fn router(state: AppState) -> Router {
             post(report_path_playback_progress),
         )
         .route(
+            "/PlayingItems/{item_id}/Progress",
+            post(report_path_playback_progress),
+        )
+        .route(
+            "/playingitems/{item_id}/progress",
+            post(report_path_playback_progress),
+        )
+        .route(
             "/Playstate/Users/{user_id}/PlayingItems/{item_id}/Progress",
             post(report_path_playback_progress_legacy),
         )
@@ -2720,6 +3051,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/playstate/playingitems/{item_id}",
+            delete(report_path_playback_stopped),
+        )
+        .route(
+            "/PlayingItems/{item_id}",
+            delete(report_path_playback_stopped),
+        )
+        .route(
+            "/playingitems/{item_id}",
             delete(report_path_playback_stopped),
         )
         .route(
@@ -2791,7 +3130,15 @@ pub fn router(state: AppState) -> Router {
             post(update_item_image_index),
         )
         .route(
+            "/Items/{item_id}/Images/{image_type}/{image_index}/Index",
+            post(update_item_image_index),
+        )
+        .route(
             "/image/items/{item_id}/images/{image_type}/{image_index}/index",
+            post(update_item_image_index),
+        )
+        .route(
+            "/items/{item_id}/images/{image_type}/{image_index}/index",
             post(update_item_image_index),
         )
         .route(
@@ -2826,7 +3173,21 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_current_user_image),
         )
         .route(
+            "/UserImage",
+            get(current_user_placeholder_image)
+                .head(current_user_placeholder_image)
+                .post(update_current_user_image)
+                .delete(delete_current_user_image),
+        )
+        .route(
             "/image/userimage",
+            get(current_user_placeholder_image)
+                .head(current_user_placeholder_image)
+                .post(update_current_user_image)
+                .delete(delete_current_user_image),
+        )
+        .route(
+            "/userimage",
             get(current_user_placeholder_image)
                 .head(current_user_placeholder_image)
                 .post(update_current_user_image)
@@ -2865,7 +3226,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
+            "/Genres/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
             "/image/genres/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/genres/{name}/images/{image_type}",
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
@@ -2873,7 +3242,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
+            "/Genres/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
             "/image/genres/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/genres/{name}/images/{image_type}/{image_index}",
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
@@ -2881,7 +3258,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
+            "/MusicGenres/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
             "/image/musicgenres/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/musicgenres/{name}/images/{image_type}",
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
@@ -2889,7 +3274,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
+            "/MusicGenres/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
             "/image/musicgenres/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/musicgenres/{name}/images/{image_type}/{image_index}",
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
@@ -2897,7 +3290,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
+            "/Persons/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
             "/image/persons/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/persons/{name}/images/{image_type}",
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
@@ -2905,7 +3306,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
+            "/Persons/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
             "/image/persons/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/persons/{name}/images/{image_type}/{image_index}",
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
@@ -2913,7 +3322,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
+            "/Studios/{name}/Images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
             "/image/studios/{name}/images/{image_type}",
+            get(named_placeholder_image).head(named_placeholder_image),
+        )
+        .route(
+            "/studios/{name}/images/{image_type}",
             get(named_placeholder_image).head(named_placeholder_image),
         )
         .route(
@@ -2921,7 +3338,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
+            "/Studios/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
             "/image/studios/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/studios/{name}/images/{image_type}/{image_index}",
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
@@ -2929,7 +3354,15 @@ pub fn router(state: AppState) -> Router {
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route(
+            "/Artists/{name}/Images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
             "/image/artists/{name}/images/{image_type}/{image_index}",
+            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+        )
+        .route(
+            "/artists/{name}/images/{image_type}/{image_index}",
             get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
         )
         .route("/Shows/NextUp", get(shows_next_up))
@@ -2946,10 +3379,12 @@ pub fn router(state: AppState) -> Router {
             "/Suggestions/Items/Suggestions",
             get(item_suggestions),
         )
+        .route("/Items/Suggestions", get(item_suggestions))
         .route(
             "/suggestions/items/suggestions",
             get(item_suggestions),
         )
+        .route("/items/suggestions", get(item_suggestions))
         .route(
             "/Suggestions/Users/{user_id}/Suggestions",
             get(user_suggestions),
@@ -3033,6 +3468,7 @@ pub fn router(state: AppState) -> Router {
         .route("/Localization/parentalratings", get(parental_ratings))
         .route("/localization/parentalratings", get(parental_ratings))
         .route("/socket", get(websocket))
+        .route("/web/serviceworker.js", get(service_worker_stub))
         .nest_service(
             "/web",
             ServeDir::new(web_dir).append_index_html_on_directories(true),
@@ -3448,12 +3884,7 @@ async fn system_info(
         "CachePath": data_root,
         "CanLaunchWebBrowser": false,
         "CanSelfRestart": false,
-        "CastReceiverApplications": [
-            {
-                "Id": "F007D354-F27D-4D8B-A3DD-2A3DE3CFC6DA",
-                "Name": "Stable"
-            }
-        ],
+        "CastReceiverApplications": [],
         "CompletedInstallations": [],
         "EncoderLocation": "System",
         "HasPendingRestart": false,
@@ -3477,6 +3908,23 @@ async fn time_sync_utc_time() -> Json<serde_json::Value> {
         "RequestReceptionTime": now,
         "ResponseTransmissionTime": now
     }))
+}
+
+async fn tmdb_client_configuration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "BaseUrl": "http://image.tmdb.org/t/p/",
+        "SecureBaseUrl": "https://image.tmdb.org/t/p/",
+        "BackdropSizes": ["w300", "w780", "w1280", "original"],
+        "LogoSizes": ["w45", "w92", "w154", "w185", "w300", "w500", "original"],
+        "PosterSizes": ["w92", "w154", "w185", "w342", "w500", "w780", "original"],
+        "ProfileSizes": ["w45", "w185", "h632", "original"],
+        "StillSizes": ["w92", "w185", "w300", "original"]
+    })))
 }
 
 async fn get_startup_configuration(
@@ -4291,12 +4739,14 @@ struct JellyfinMigrationReport {
     user_data: usize,
     playlists: usize,
     collections: usize,
+    task_history: usize,
     scanned_items: usize,
     imported_users: usize,
     imported_libraries: usize,
     imported_media_metadata: usize,
     imported_user_data: usize,
     imported_lists: usize,
+    imported_task_history: usize,
     unsupported: BTreeMap<&'static str, String>,
     warnings: Vec<String>,
 }
@@ -4325,6 +4775,7 @@ impl JellyfinMigrationReport {
                 "UserData": self.user_data,
                 "Playlists": self.playlists,
                 "Collections": self.collections,
+                "TaskHistory": self.task_history,
                 "ScannedItems": self.scanned_items
             },
             "Imported": {
@@ -4332,7 +4783,8 @@ impl JellyfinMigrationReport {
                 "Libraries": self.imported_libraries,
                 "MediaMetadata": self.imported_media_metadata,
                 "UserData": self.imported_user_data,
-                "Lists": self.imported_lists
+                "Lists": self.imported_lists,
+                "TaskHistory": self.imported_task_history
             },
             "Families": {
                 "MediaHierarchy": "libraries-and-scanned-paths",
@@ -4345,7 +4797,7 @@ impl JellyfinMigrationReport {
                 "Playlists": "imported-by-name-and-item-path",
                 "Collections": "imported-by-name-and-item-path",
                 "UserData": "imported-by-user-and-item-path",
-                "TaskHistory": "unsupported-decided",
+                "TaskHistory": "imported-as-terminal-task-runs",
                 "Transcodes": "unsupported-runtime-state",
                 "PackageState": "unsupported-decided"
             },
@@ -4375,6 +4827,7 @@ async fn analyze_jellyfin_migration(
         user_data: migration_array(data, "UserData").len(),
         playlists: migration_array(data, "Playlists").len(),
         collections: migration_array(data, "Collections").len(),
+        task_history: migration_array(data, "TaskHistory").len(),
         ..Default::default()
     };
     report.unsupported = jellyfin_migration_unsupported_map(data);
@@ -4396,6 +4849,7 @@ async fn apply_jellyfin_migration(
     report.imported_media_metadata = import_jellyfin_media_metadata(db, data).await?;
     report.imported_user_data = import_jellyfin_user_data(db, data).await?;
     report.imported_lists = import_jellyfin_lists(db, data).await?;
+    report.imported_task_history = import_jellyfin_task_history(db, data).await?;
     Ok(report)
 }
 
@@ -4506,10 +4960,6 @@ fn jellyfin_migration_unsupported_map(
         (
             "Trickplay",
             "Trickplay/keyframe tiles are regenerated, not migrated.",
-        ),
-        (
-            "TaskHistory",
-            "Task history is runtime/audit data and is not replayed.",
         ),
         (
             "Transcodes",
@@ -4773,6 +5223,100 @@ async fn import_jellyfin_list_family(
         imported += 1;
     }
     Ok(imported)
+}
+
+async fn import_jellyfin_task_history(
+    db: &Database,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> Result<usize, ApiError> {
+    let mut imported = 0usize;
+    for entry in migration_array(data, "TaskHistory") {
+        let object = entry.as_object().ok_or_else(|| {
+            ApiError::bad_request("Jellyfin migration TaskHistory entry must be an object")
+        })?;
+        let Some(task_key) = migration_string_field(object, &["Key", "TaskKey", "Name", "Id"])
+        else {
+            continue;
+        };
+        let status = migration_task_history_status(object);
+        let started_at = migration_time_field(
+            object,
+            &["StartTimeUtc", "StartDate", "DateStarted", "StartedAt"],
+        )
+        .unwrap_or_else(OffsetDateTime::now_utc);
+        let completed_at = migration_time_field(
+            object,
+            &["EndTimeUtc", "EndDate", "DateCompleted", "CompletedAt"],
+        )
+        .unwrap_or(started_at);
+        let id = migration_string_field(object, &["RunId", "HistoryId"])
+            .or_else(|| migration_string_field(object, &["Id"]).filter(|value| value.contains('-')))
+            .and_then(|value| Uuid::parse_str(&value).ok())
+            .unwrap_or_else(|| {
+                migration_task_history_id(&task_key, status, started_at, completed_at)
+            });
+        let result = object
+            .get("Result")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "ImportedFrom": "Jellyfin" }));
+        let error_message = migration_string_field(
+            object,
+            &["ErrorMessage", "Error", "Exception", "CancellationMessage"],
+        );
+        db.import_task_run_history(
+            Some(id),
+            &task_key,
+            status,
+            started_at,
+            completed_at,
+            result,
+            error_message.as_deref(),
+        )
+        .await?;
+        imported += 1;
+    }
+    Ok(imported)
+}
+
+fn migration_task_history_status(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> &'static str {
+    match migration_string_field(object, &["Status", "State"])
+        .unwrap_or_else(|| "Completed".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "failed" | "cancelled" | "canceled" | "aborted" => "failed",
+        _ => "completed",
+    }
+}
+
+fn migration_time_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+) -> Option<OffsetDateTime> {
+    migration_string_field(object, fields)
+        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+}
+
+fn migration_task_history_id(
+    task_key: &str,
+    status: &str,
+    started_at: OffsetDateTime,
+    completed_at: OffsetDateTime,
+) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(task_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(status.as_bytes());
+    hasher.update([0]);
+    hasher.update(format_time_for_json(started_at).as_bytes());
+    hasher.update([0]);
+    hasher.update(format_time_for_json(completed_at).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 fn migration_string_field(
@@ -5565,8 +6109,7 @@ fn default_user_configuration() -> serde_json::Value {
         "HidePlayedInLatest": true,
         "RememberAudioSelections": true,
         "RememberSubtitleSelections": true,
-        "EnableNextEpisodeAutoPlay": true,
-        "CastReceiverId": "F007D354-F27D-4D8B-A3DD-2A3DE3CFC6DA"
+        "EnableNextEpisodeAutoPlay": true
     })
 }
 
@@ -6078,6 +6621,16 @@ async fn system_log_file(
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         contents,
     ))
+}
+
+async fn service_worker_stub() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        "self.addEventListener('install', event => self.skipWaiting());\n",
+    )
 }
 
 fn safe_log_file_path(log_dir: &FsPath, name: &str) -> Option<PathBuf> {
@@ -7501,11 +8054,12 @@ async fn package_repositories(
             .await?
             .plugin_repositories,
     );
-    Ok(Json(if repositories.is_empty() {
+    let repositories = if repositories.is_empty() {
         default_plugin_repositories()
     } else {
         repositories
-    }))
+    };
+    Ok(Json(repositories))
 }
 
 async fn update_package_repositories(
@@ -9876,7 +10430,7 @@ fn system_configuration_json(
         "SkipDeserializationForPrograms": false,
         "SaveMetadataHidden": false,
         "ContentTypes": payloads.content_types,
-        "MetadataOptions": payloads.metadata_options,
+        "MetadataOptions": metadata_options_or_default(payloads.metadata_options),
         "PathSubstitutions": payloads.path_substitutions,
         "PluginRepositories": payloads.plugin_repositories,
         "CachePath": server_options["CachePath"],
@@ -9896,6 +10450,48 @@ fn system_configuration_json(
         "SlowResponseThresholdMs": server_options["SlowResponseThresholdMs"],
         "RunAtStartup": false
     })
+}
+
+fn metadata_options_or_default(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) if !items.is_empty() => serde_json::Value::Array(items),
+        _ => default_system_metadata_options(),
+    }
+}
+
+fn default_system_metadata_options() -> serde_json::Value {
+    serde_json::Value::Array(
+        [
+            "Book",
+            "Movie",
+            "MusicVideo",
+            "Series",
+            "MusicAlbum",
+            "MusicArtist",
+            "BoxSet",
+            "Season",
+            "Episode",
+        ]
+        .into_iter()
+        .map(default_metadata_option_for_item_type)
+        .collect(),
+    )
+}
+
+fn default_metadata_option_for_item_type(item_type: &str) -> serde_json::Value {
+    let mut option = default_metadata_options_payload();
+    option["ItemType"] = serde_json::json!(item_type);
+    match item_type {
+        "MusicVideo" => {
+            option["DisabledMetadataFetchers"] = serde_json::json!(["The Open Movie Database"]);
+            option["DisabledImageFetchers"] = serde_json::json!(["The Open Movie Database"]);
+        }
+        "MusicAlbum" | "MusicArtist" => {
+            option["DisabledMetadataFetchers"] = serde_json::json!(["TheAudioDB"]);
+        }
+        _ => {}
+    }
+    option
 }
 
 async fn named_configuration(
@@ -9955,7 +10551,14 @@ async fn named_configuration(
                 .await?
                 .unwrap_or_else(default_encoding_configuration)
         }
-        _ => serde_json::json!({}),
+        _ => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(|| serde_json::json!({}))
+        }
     };
     Ok(Json(value))
 }
@@ -10000,7 +10603,10 @@ async fn update_named_configuration(
             encoding_configuration_json(payload),
             "Encoding configuration updated",
         ),
-        _ => return Ok(StatusCode::NOT_IMPLEMENTED),
+        _ => (
+            generic_named_configuration_json(payload),
+            "Configuration updated",
+        ),
     };
     state
         .db
@@ -10015,6 +10621,13 @@ async fn update_named_configuration(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn generic_named_configuration_json(payload: serde_json::Value) -> serde_json::Value {
+    match payload {
+        serde_json::Value::Object(_) => payload,
+        _ => serde_json::json!({ "Value": payload }),
+    }
 }
 
 fn default_network_configuration() -> serde_json::Value {
@@ -10443,17 +11056,18 @@ fn public_branding_configuration_json(config: BrandingConfig) -> serde_json::Val
 }
 
 async fn default_metadata_options() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "ItemType": null,
+    Json(default_metadata_options_payload())
+}
+
+fn default_metadata_options_payload() -> serde_json::Value {
+    serde_json::json!({
         "DisabledMetadataSavers": [],
         "LocalMetadataReaderOrder": [],
         "DisabledMetadataFetchers": [],
         "MetadataFetcherOrder": [],
         "DisabledImageFetchers": [],
-        "ImageFetcherOrder": [],
-        "DisabledSubtitleFetchers": [],
-        "SubtitleFetcherOrder": []
-    }))
+        "ImageFetcherOrder": []
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -10722,6 +11336,7 @@ const LIBRARY_SCAN_TASK_ID: &str = "scan-media-library";
 const LIBRARY_SCAN_TASK_KEY: &str = "RefreshLibrary";
 const CHANNEL_REFRESH_TASK_ID: &str = "refresh-channels";
 const CHANNEL_REFRESH_TASK_KEY: &str = "RefreshChannels";
+const SCHEDULED_TASK_TRIGGER_CONFIG_PREFIX: &str = "scheduled-task-triggers:";
 const STALE_TASK_HOURS: i64 = 24;
 
 async fn scheduled_tasks(
@@ -10937,23 +11552,75 @@ async fn update_scheduled_task_triggers(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Path(task_id): Path<String>,
-    Json(_triggers): Json<serde_json::Value>,
+    Json(triggers): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     if is_library_scan_task(&task_id) {
+        update_scheduled_task_trigger_config(&state.db, LIBRARY_SCAN_TASK_KEY, triggers).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
     if is_channel_refresh_task(&task_id) {
+        update_scheduled_task_trigger_config(&state.db, CHANNEL_REFRESH_TASK_KEY, triggers).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
-    if plugin_for_scheduled_task(&state.db, &task_id)
-        .await?
-        .is_some()
-    {
+    if let Some(plugin) = plugin_for_scheduled_task(&state.db, &task_id).await? {
+        let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
+        update_scheduled_task_trigger_config(
+            &state.db,
+            &plugin_scheduled_task_key(&plugin_id),
+            triggers,
+        )
+        .await?;
         return Ok(StatusCode::NO_CONTENT);
     }
 
     Err(ApiError::not_found("Scheduled task not found"))
+}
+
+async fn update_scheduled_task_trigger_config(
+    db: &Database,
+    task_key: &str,
+    triggers: serde_json::Value,
+) -> Result<(), ApiError> {
+    if !triggers.is_array() {
+        return Err(ApiError::bad_request(
+            "Scheduled task triggers must be an array",
+        ));
+    }
+    db.update_named_configuration(
+        &scheduled_task_trigger_config_key(task_key),
+        serde_json::json!({
+            "Triggers": triggers,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn scheduled_task_triggers_json(
+    db: &Database,
+    task_key: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let key = scheduled_task_trigger_config_key(task_key);
+    if let Some(config) = db.named_configuration(&key).await? {
+        if let Some(triggers) = config.get("Triggers").filter(|value| value.is_array()) {
+            return Ok(triggers.clone());
+        }
+    }
+    Ok(default_scheduled_task_triggers_json())
+}
+
+fn scheduled_task_trigger_config_key(task_key: &str) -> String {
+    format!("{SCHEDULED_TASK_TRIGGER_CONFIG_PREFIX}{task_key}")
+}
+
+fn default_scheduled_task_triggers_json() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "Type": "IntervalTrigger",
+            "IntervalTicks": 43_200_000_000_i64,
+        }
+    ])
 }
 
 async fn recover_stale_library_scan_runs(db: &Database) -> Result<(), ApiError> {
@@ -11037,6 +11704,7 @@ async fn plugin_scheduled_task_json(
     let task_key = plugin_scheduled_task_key(&plugin_id);
     let current_run = db.current_task_run(&task_key).await?;
     let last_result = db.last_task_result(&task_key).await?;
+    let triggers = scheduled_task_triggers_json(db, &task_key).await?;
     let state = if current_run.is_some() {
         "Running"
     } else {
@@ -11050,7 +11718,7 @@ async fn plugin_scheduled_task_json(
             .as_ref()
             .map(task_run_result_json)
             .unwrap_or_else(|| default_plugin_task_result_json(&task_key, &name)),
-        "Triggers": [],
+        "Triggers": triggers,
         "Description": format!("Runs the ScheduledTask capability for plugin {name}."),
         "Category": "Plugins",
         "IsHidden": false,
@@ -11228,6 +11896,7 @@ async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
 async fn library_scan_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
     let current_run = db.current_task_run(LIBRARY_SCAN_TASK_KEY).await?;
     let last_result = db.last_task_result(LIBRARY_SCAN_TASK_KEY).await?;
+    let triggers = scheduled_task_triggers_json(db, LIBRARY_SCAN_TASK_KEY).await?;
     let state = if current_run.is_some() {
         "Running"
     } else {
@@ -11242,12 +11911,7 @@ async fn library_scan_task_json(db: &Database) -> Result<serde_json::Value, ApiE
             .as_ref()
             .map(task_run_result_json)
             .unwrap_or_else(default_library_scan_task_result_json),
-        "Triggers": [
-            {
-                "Type": "IntervalTrigger",
-                "IntervalTicks": 43_200_000_000_i64,
-            }
-        ],
+        "Triggers": triggers,
         "Description": "Scans configured Jellyrin media libraries.",
         "Category": "Library",
         "IsHidden": false,
@@ -11262,6 +11926,7 @@ fn is_library_scan_task(task_id: &str) -> bool {
 async fn channel_refresh_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
     let current_run = db.current_task_run(CHANNEL_REFRESH_TASK_KEY).await?;
     let last_result = db.last_task_result(CHANNEL_REFRESH_TASK_KEY).await?;
+    let triggers = scheduled_task_triggers_json(db, CHANNEL_REFRESH_TASK_KEY).await?;
     let state = if current_run.is_some() {
         "Running"
     } else {
@@ -11276,12 +11941,7 @@ async fn channel_refresh_task_json(db: &Database) -> Result<serde_json::Value, A
             .as_ref()
             .map(|run| named_task_run_result_json(run, "Refresh Channels"))
             .unwrap_or_else(default_channel_refresh_task_result_json),
-        "Triggers": [
-            {
-                "Type": "IntervalTrigger",
-                "IntervalTicks": 43_200_000_000_i64,
-            }
-        ],
+        "Triggers": triggers,
         "Description": "Refreshes configured channel provider cache and health state.",
         "Category": "Channels",
         "IsHidden": false,
@@ -11304,7 +11964,7 @@ fn named_task_run_result_json(run: &TaskRun, name: &str) -> serde_json::Value {
         _ => "Running",
     };
 
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "Name": name,
         "Key": run.task_key.clone(),
         "Id": run.id.to_string(),
@@ -11312,9 +11972,16 @@ fn named_task_run_result_json(run: &TaskRun, name: &str) -> serde_json::Value {
         "StartTimeUtc": format_time_for_json(run.started_at),
         "EndTimeUtc": run.completed_at.map(format_time_for_json)
             .unwrap_or_else(|| format_time_for_json(run.updated_at)),
-        "ErrorMessage": run.error_message.clone(),
-        "Result": run.result_json.clone().unwrap_or_else(|| serde_json::json!({})),
-    })
+    });
+    if let Some(error_message) = &run.error_message
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert(
+            "ErrorMessage".to_string(),
+            serde_json::Value::String(error_message.clone()),
+        );
+    }
+    result
 }
 
 fn default_library_scan_task_result_json() -> serde_json::Value {
@@ -11363,9 +12030,9 @@ struct PlaybackReportBody {
     #[serde(alias = "MediaSourceId")]
     media_source_id: Option<String>,
     #[serde(alias = "PlaySessionId")]
-    _play_session_id: Option<String>,
+    play_session_id: Option<String>,
     #[serde(alias = "PlayMethod")]
-    _play_method: Option<String>,
+    play_method: Option<String>,
     #[serde(alias = "CanSeek")]
     _can_seek: Option<bool>,
     #[serde(alias = "AudioStreamIndex")]
@@ -11382,6 +12049,12 @@ struct PlaybackReportBody {
     _is_muted: Option<bool>,
     #[serde(alias = "PositionTicks")]
     position_ticks: Option<i64>,
+    #[serde(alias = "PlaybackPositionTicks")]
+    playback_position_ticks: Option<i64>,
+    #[serde(alias = "StartPositionTicks")]
+    start_position_ticks: Option<i64>,
+    #[serde(alias = "StartTimeTicks")]
+    start_time_ticks: Option<i64>,
     #[serde(alias = "IsPaused")]
     is_paused: Option<bool>,
 }
@@ -11462,8 +12135,8 @@ impl PathPlaybackReportQuery {
         PlaybackReportBody {
             item_id,
             media_source_id: self.media_source_id.clone(),
-            _play_session_id: None,
-            _play_method: None,
+            play_session_id: None,
+            play_method: None,
             _can_seek: None,
             audio_stream_index: self.audio_stream_index,
             subtitle_stream_index: self.subtitle_stream_index,
@@ -11472,6 +12145,9 @@ impl PathPlaybackReportQuery {
             _volume_level: None,
             _is_muted: None,
             position_ticks: self.position_ticks.or(self.start_position_ticks),
+            playback_position_ticks: None,
+            start_position_ticks: None,
+            start_time_ticks: None,
             is_paused: self.is_paused,
         }
     }
@@ -11555,7 +12231,19 @@ async fn report_playback(
 ) -> Result<StatusCode, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &payload.item_id).await?;
-    let position_ticks = payload.position_ticks.unwrap_or_default();
+    let reported_position_ticks = payload
+        .position_ticks
+        .or(payload.playback_position_ticks)
+        .or(payload.start_position_ticks)
+        .or(payload.start_time_ticks)
+        .unwrap_or_default();
+    let position_ticks = normalize_playback_report_position_ticks(
+        &state.db,
+        payload.play_method.as_deref(),
+        payload.play_session_id.as_deref(),
+        reported_position_ticks,
+    )
+    .await?;
     let is_paused = payload.is_paused.unwrap_or(false);
     state
         .db
@@ -11592,6 +12280,35 @@ async fn report_playback(
     }
     broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn normalize_playback_report_position_ticks(
+    db: &Database,
+    play_method: Option<&str>,
+    play_session_id: Option<&str>,
+    position_ticks: i64,
+) -> Result<i64, ApiError> {
+    let Some(play_session_id) = play_session_id
+        .map(str::trim)
+        .filter(|play_session_id| !play_session_id.is_empty())
+    else {
+        return Ok(position_ticks.max(0));
+    };
+    let Some(play_method) = play_method else {
+        return Ok(position_ticks.max(0));
+    };
+    if !play_method.eq_ignore_ascii_case("Transcode") {
+        return Ok(position_ticks.max(0));
+    }
+    let Some(session) = db
+        .transcode_session_by_play_session_id(play_session_id)
+        .await?
+    else {
+        return Ok(position_ticks.max(0));
+    };
+    Ok(session
+        .start_position_ticks
+        .saturating_add(position_ticks.max(0)))
 }
 
 #[derive(Debug, Default)]
@@ -17501,6 +18218,7 @@ async fn add_virtual_folder(
         .upsert_virtual_folder(&query.name, query.collection_type.as_deref(), locations)
         .await?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    refresh_tv_metadata_for_folder(&state, folder.id).await?;
     dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
         &state.db,
@@ -17549,6 +18267,7 @@ async fn add_virtual_folder_path(
         .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
         .ok_or_else(|| ApiError::bad_request("Virtual folder not found"))?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    refresh_tv_metadata_for_folder(&state, folder.id).await?;
     dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
         &state.db,
@@ -17681,6 +18400,7 @@ async fn update_virtual_folder_library_options(
         .upsert_virtual_folder(&existing.name, collection_type, locations)
         .await?;
     state.db.scan_virtual_folder_items(folder.id).await?;
+    refresh_tv_metadata_for_folder(&state, folder.id).await?;
     dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
         &state.db,
@@ -17829,6 +18549,7 @@ async fn update_virtual_folder_path(
             .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
             .ok_or_else(|| ApiError::not_found("Virtual folder not found"))?;
         state.db.scan_virtual_folder_items(folder.id).await?;
+        refresh_tv_metadata_for_folder(&state, folder.id).await?;
         dlna::notify_dlna_content_directory_changed(&state.db).await?;
         record_activity(
             &state.db,
@@ -18396,10 +19117,17 @@ fn media_list_to_json(list: &MediaList, server_id: &str, child_count: usize) -> 
     } else {
         "Playlist"
     };
+    let list_id = list.id.simple().to_string();
+    let primary_image_tag = first_metadata_value_from_json(&list.metadata, &["PrimaryImageTag"])
+        .unwrap_or_else(|| default_primary_image_tag(&list_id));
+    let provider_ids = json_field_case_insensitive(&list.metadata, "ProviderIds")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     serde_json::json!({
         "Name": list.name,
         "ServerId": server_id,
-        "Id": list.id.simple().to_string(),
+        "Id": list_id,
         "Etag": null,
         "DateCreated": format_time_for_json(list.created_at),
         "DateLastMediaAdded": format_time_for_json(list.updated_at),
@@ -18412,17 +19140,20 @@ fn media_list_to_json(list: &MediaList, server_id: &str, child_count: usize) -> 
         "ChannelId": null,
         "Taglines": [],
         "Genres": [],
+        "Overview": first_metadata_value_from_json(&list.metadata, &["Overview"]).unwrap_or_default(),
         "PlayAccess": "Full",
         "RemoteTrailers": [],
-        "ProviderIds": {},
+        "ProviderIds": provider_ids,
         "IsFolder": true,
         "ParentId": null,
         "Type": item_type,
         "MediaType": null,
         "CollectionType": list.collection_type,
         "ChildCount": child_count,
+        "RecursiveItemCount": child_count,
         "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
-        "ImageTags": {},
+        "ImageTags": { "Primary": primary_image_tag },
+        "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "Virtual",
         "OwnerUserId": list.owner_user_id.map(|id| id.simple().to_string())
@@ -18708,7 +19439,7 @@ fn user_views_for_query(
     query: &UserViewsQuery,
 ) -> Vec<serde_json::Value> {
     let preset_views = csv_values_lowercase(&query.preset_views);
-    folders
+    let mut items = folders
         .iter()
         .filter(|folder| {
             preset_views.as_ref().is_none_or(|presets| {
@@ -18723,7 +19454,19 @@ fn user_views_for_query(
             })
         })
         .map(|folder| user_view_to_json(folder, server_id))
-        .collect()
+        .collect::<Vec<_>>();
+    items.extend(special_user_views(server_id).into_iter().filter(|view| {
+        preset_views.as_ref().is_none_or(|presets| {
+            view.get("CollectionType")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|collection_type| {
+                    presets
+                        .iter()
+                        .any(|preset| preset.eq_ignore_ascii_case(collection_type))
+                })
+        })
+    }));
+    items
 }
 
 fn grouping_options_for_folders(folders: &[VirtualFolder]) -> Vec<serde_json::Value> {
@@ -18732,6 +19475,16 @@ fn grouping_options_for_folders(folders: &[VirtualFolder]) -> Vec<serde_json::Va
         let Some(collection_type) = folder.collection_type.as_deref() else {
             continue;
         };
+        options
+            .entry(collection_type.to_ascii_lowercase())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "Name": special_view_option_name(collection_type),
+                    "Id": collection_type
+                })
+            });
+    }
+    for (_, collection_type) in SPECIAL_USER_VIEWS {
         options
             .entry(collection_type.to_ascii_lowercase())
             .or_insert_with(|| {
@@ -18755,6 +19508,67 @@ fn special_view_option_name(collection_type: &str) -> String {
         "boxsets" => "Collections".to_string(),
         value => canonical_image_type(value),
     }
+}
+
+const SPECIAL_USER_VIEWS: &[(&str, &str)] = &[
+    ("Collections", "boxsets"),
+    ("Live TV", "livetv"),
+    ("Playlists", "playlists"),
+];
+
+fn special_user_views(server_id: &str) -> Vec<serde_json::Value> {
+    SPECIAL_USER_VIEWS
+        .iter()
+        .map(|(name, collection_type)| special_user_view_to_json(name, collection_type, server_id))
+        .collect()
+}
+
+fn special_user_view_to_json(
+    name: &str,
+    collection_type: &str,
+    server_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "Name": name,
+        "ServerId": server_id,
+        "Id": special_user_view_id(collection_type),
+        "Etag": null,
+        "DateCreated": null,
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": name,
+        "ExternalUrls": [],
+        "Path": null,
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": {},
+        "IsFolder": true,
+        "ParentId": null,
+        "Type": "CollectionFolder",
+        "CollectionType": collection_type,
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": { "Primary": "placeholder" },
+        "PrimaryImageAspectRatio": 1.0,
+        "BackdropImageTags": [],
+        "LocationType": "Virtual",
+        "MediaType": null,
+    })
+}
+
+fn special_user_view_id(collection_type: &str) -> String {
+    stable_entity_id("UserView", collection_type)
+}
+
+fn special_user_view_collection_type_for_parent(parent_id: Option<&str>) -> Option<&'static str> {
+    let parent_id = parent_id?;
+    SPECIAL_USER_VIEWS.iter().find_map(|(_, collection_type)| {
+        (special_user_view_id(collection_type).eq_ignore_ascii_case(parent_id))
+            .then_some(*collection_type)
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -18788,12 +19602,161 @@ struct ItemsQuery {
         alias = "mediaTypes"
     )]
     media_types: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "Containers",
+        alias = "containers"
+    )]
+    containers: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "VideoTypes",
+        alias = "videoTypes",
+        alias = "VideoType",
+        alias = "videoType"
+    )]
+    video_types: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "AudioLanguages",
+        alias = "audioLanguages",
+        alias = "AudioLanguage",
+        alias = "audioLanguage"
+    )]
+    audio_languages: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "SubtitleLanguages",
+        alias = "subtitleLanguages",
+        alias = "SubtitleLanguage",
+        alias = "subtitleLanguage"
+    )]
+    subtitle_languages: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "PersonIds",
+        alias = "personIds"
+    )]
+    person_ids: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "GenreIds",
+        alias = "genreIds",
+        alias = "GenreId",
+        alias = "genreId"
+    )]
+    genre_ids: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "StudioIds",
+        alias = "studioIds",
+        alias = "StudioId",
+        alias = "studioId"
+    )]
+    studio_ids: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "OfficialRatings",
+        alias = "officialRatings",
+        alias = "OfficialRating",
+        alias = "officialRating"
+    )]
+    official_ratings: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "Tags",
+        alias = "tags"
+    )]
+    tags: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "SeriesStatus",
+        alias = "seriesStatus",
+        alias = "SeriesStatuses",
+        alias = "seriesStatuses"
+    )]
+    series_status: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "Years",
+        alias = "years",
+        alias = "Year",
+        alias = "year",
+        alias = "ProductionYear",
+        alias = "productionYear"
+    )]
+    years: Vec<String>,
     #[serde(alias = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
     #[serde(alias = "IsPlayed", alias = "isPlayed")]
     is_played: Option<bool>,
+    #[serde(alias = "IsFavorite", alias = "isFavorite")]
+    is_favorite: Option<bool>,
     #[serde(alias = "IsFolder", alias = "isFolder")]
     is_folder: Option<bool>,
+    #[serde(alias = "HasSubtitles", alias = "hasSubtitles")]
+    has_subtitles: Option<bool>,
+    #[serde(alias = "HasTrailer", alias = "hasTrailer")]
+    has_trailer: Option<bool>,
+    #[serde(alias = "HasOverview", alias = "hasOverview")]
+    has_overview: Option<bool>,
+    #[serde(alias = "HasImdbId", alias = "hasImdbId")]
+    has_imdb_id: Option<bool>,
+    #[serde(alias = "HasTmdbId", alias = "hasTmdbId")]
+    has_tmdb_id: Option<bool>,
+    #[serde(alias = "HasTvdbId", alias = "hasTvdbId")]
+    has_tvdb_id: Option<bool>,
+    #[serde(alias = "IsHD", alias = "isHD", alias = "isHd")]
+    is_hd: Option<bool>,
+    #[serde(alias = "Is4K", alias = "is4K")]
+    is_4k: Option<bool>,
+    #[serde(alias = "MinWidth", alias = "minWidth")]
+    min_width: Option<i64>,
+    #[serde(alias = "MaxWidth", alias = "maxWidth")]
+    max_width: Option<i64>,
+    #[serde(alias = "MinHeight", alias = "minHeight")]
+    min_height: Option<i64>,
+    #[serde(alias = "MaxHeight", alias = "maxHeight")]
+    max_height: Option<i64>,
+    #[serde(alias = "IsMissing", alias = "isMissing")]
+    is_missing: Option<bool>,
+    #[serde(alias = "IsUnaired", alias = "isUnaired")]
+    is_unaired: Option<bool>,
+    #[serde(alias = "HasOfficialRating", alias = "hasOfficialRating")]
+    has_official_rating: Option<bool>,
+    #[serde(alias = "IsLocked", alias = "isLocked")]
+    is_locked: Option<bool>,
+    #[serde(alias = "MinCommunityRating", alias = "minCommunityRating")]
+    min_community_rating: Option<f64>,
+    #[serde(alias = "MaxCommunityRating", alias = "maxCommunityRating")]
+    max_community_rating: Option<f64>,
+    #[serde(alias = "MinCriticRating", alias = "minCriticRating")]
+    min_critic_rating: Option<f64>,
+    #[serde(alias = "MaxCriticRating", alias = "maxCriticRating")]
+    max_critic_rating: Option<f64>,
+    #[serde(alias = "MinPremiereDate", alias = "minPremiereDate")]
+    min_premiere_date: Option<String>,
+    #[serde(alias = "MaxPremiereDate", alias = "maxPremiereDate")]
+    max_premiere_date: Option<String>,
+    #[serde(alias = "MinDateCreated", alias = "minDateCreated")]
+    min_date_created: Option<String>,
+    #[serde(alias = "MaxDateCreated", alias = "maxDateCreated")]
+    max_date_created: Option<String>,
+    #[serde(alias = "MinDateLastSaved", alias = "minDateLastSaved")]
+    min_date_last_saved: Option<String>,
+    #[serde(alias = "MaxDateLastSaved", alias = "maxDateLastSaved")]
+    max_date_last_saved: Option<String>,
     #[serde(
         default,
         deserialize_with = "deserialize_csv_values",
@@ -18833,8 +19796,24 @@ struct ItemsQuery {
     _enable_image_types: Option<String>,
     #[serde(alias = "EnableTotalRecordCount", alias = "enableTotalRecordCount")]
     _enable_total_record_count: Option<String>,
-    #[serde(alias = "ExcludeLocationTypes", alias = "excludeLocationTypes")]
-    _exclude_location_types: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "LocationTypes",
+        alias = "locationTypes",
+        alias = "LocationType",
+        alias = "locationType"
+    )]
+    location_types: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "ExcludeLocationTypes",
+        alias = "excludeLocationTypes",
+        alias = "ExcludeLocationType",
+        alias = "excludeLocationType"
+    )]
+    exclude_location_types: Vec<String>,
 }
 
 fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
@@ -18855,9 +19834,59 @@ fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
             "includeitemtypes" => query.include_item_types.push(value),
             "excludeitemtypes" => query.exclude_item_types.push(value),
             "mediatypes" => query.media_types.push(value),
+            "containers" => query.containers.push(value),
+            "container" => query.containers.push(value),
+            "videotypes" => query.video_types.push(value),
+            "videotype" => query.video_types.push(value),
+            "audiolanguages" => query.audio_languages.push(value),
+            "audiolanguage" => query.audio_languages.push(value),
+            "subtitlelanguages" => query.subtitle_languages.push(value),
+            "subtitlelanguage" => query.subtitle_languages.push(value),
+            "personids" => query.person_ids.push(value),
+            "personid" => query.person_ids.push(value),
+            "genreids" => query.genre_ids.push(value),
+            "genreid" => query.genre_ids.push(value),
+            "studioids" => query.studio_ids.push(value),
+            "studioid" => query.studio_ids.push(value),
+            "officialratings" => query.official_ratings.push(value),
+            "officialrating" => query.official_ratings.push(value),
+            "tags" => query.tags.push(value),
+            "tag" => query.tags.push(value),
+            "seriesstatus" => query.series_status.push(value),
+            "seriesstatuses" => query.series_status.push(value),
+            "years" => query.years.push(value),
+            "year" => query.years.push(value),
+            "productionyear" => query.years.push(value),
             "searchterm" => query.search_term = Some(value),
             "isplayed" => query.is_played = parse_query_bool(&value),
+            "isfavorite" => query.is_favorite = parse_query_bool(&value),
             "isfolder" => query.is_folder = parse_query_bool(&value),
+            "hassubtitles" => query.has_subtitles = parse_query_bool(&value),
+            "hastrailer" => query.has_trailer = parse_query_bool(&value),
+            "hasoverview" => query.has_overview = parse_query_bool(&value),
+            "hasimdbid" => query.has_imdb_id = parse_query_bool(&value),
+            "hastmdbid" => query.has_tmdb_id = parse_query_bool(&value),
+            "hastvdbid" => query.has_tvdb_id = parse_query_bool(&value),
+            "ishd" => query.is_hd = parse_query_bool(&value),
+            "is4k" => query.is_4k = parse_query_bool(&value),
+            "minwidth" => query.min_width = value.parse().ok(),
+            "maxwidth" => query.max_width = value.parse().ok(),
+            "minheight" => query.min_height = value.parse().ok(),
+            "maxheight" => query.max_height = value.parse().ok(),
+            "ismissing" => query.is_missing = parse_query_bool(&value),
+            "isunaired" => query.is_unaired = parse_query_bool(&value),
+            "hasofficialrating" => query.has_official_rating = parse_query_bool(&value),
+            "islocked" => query.is_locked = parse_query_bool(&value),
+            "mincommunityrating" => query.min_community_rating = value.parse().ok(),
+            "maxcommunityrating" => query.max_community_rating = value.parse().ok(),
+            "mincriticrating" => query.min_critic_rating = value.parse().ok(),
+            "maxcriticrating" => query.max_critic_rating = value.parse().ok(),
+            "minpremieredate" => query.min_premiere_date = Some(value),
+            "maxpremieredate" => query.max_premiere_date = Some(value),
+            "mindatecreated" => query.min_date_created = Some(value),
+            "maxdatecreated" => query.max_date_created = Some(value),
+            "mindatelastsaved" => query.min_date_last_saved = Some(value),
+            "maxdatelastsaved" => query.max_date_last_saved = Some(value),
             "filters" => query.filters.push(value),
             "namestartswith" => query.name_starts_with = Some(value),
             "namestartswithorgreater" => query.name_starts_with_or_greater = Some(value),
@@ -18867,6 +19896,10 @@ fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
             "sortby" => set_query_scalar(&mut query.sort_by, value),
             "sortorder" => set_query_scalar(&mut query.sort_order, value),
             "fields" => set_query_scalar(&mut query.fields, value),
+            "locationtypes" => query.location_types.push(value),
+            "locationtype" => query.location_types.push(value),
+            "excludelocationtypes" => query.exclude_location_types.push(value),
+            "excludelocationtype" => query.exclude_location_types.push(value),
             _ => {}
         }
     }
@@ -18944,6 +19977,22 @@ async fn items_result(
         ensure_user_access(&auth_user, requested_user_id)?;
     }
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(collection_type) =
+        special_user_view_collection_type_for_parent(query.parent_id.as_deref())
+    {
+        return special_user_view_items_result(
+            &state.db,
+            &query,
+            &auth_user,
+            requested_user_id,
+            &server_id,
+            collection_type,
+        )
+        .await;
+    }
+    if query_requests_only_item_type(&query, "Series") {
+        return tv_series_items_result(&state.db, &query, requested_user_id, &server_id).await;
+    }
     let filtered_items = filtered_media_items(
         state.db.media_items().await?,
         &query,
@@ -18951,6 +20000,35 @@ async fn items_result(
         &state.db,
     )
     .await?;
+    if should_include_parent_virtual_items(&query) {
+        let mut items = items_to_json(
+            &state.db,
+            filtered_items,
+            &server_id,
+            requested_user_id,
+            should_use_compact_items_result(&query),
+        )
+        .await?;
+        items.extend(
+            parent_virtual_items(
+                &state.db,
+                &query,
+                requested_user_id,
+                &server_id,
+                items.len(),
+            )
+            .await?,
+        );
+        sort_json_items(&mut items, &query);
+        let total_record_count = items.len();
+        let start_index = query.start_index.unwrap_or(0);
+        let limit = query.limit.unwrap_or(usize::MAX);
+        return Ok(Json(query_result_with_total(
+            items.into_iter().skip(start_index).take(limit).collect(),
+            total_record_count,
+            start_index,
+        )));
+    }
     let total_record_count = filtered_items.len();
     let items = items_to_json(
         &state.db,
@@ -18980,6 +20058,23 @@ async fn user_items_result(
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(collection_type) =
+        special_user_view_collection_type_for_parent(query.parent_id.as_deref())
+    {
+        return special_user_view_items_result(
+            &state.db,
+            &query,
+            &auth_user,
+            Some(requested_user_id),
+            &server_id,
+            collection_type,
+        )
+        .await;
+    }
+    if query_requests_only_item_type(&query, "Series") {
+        return tv_series_items_result(&state.db, &query, Some(requested_user_id), &server_id)
+            .await;
+    }
     let filtered_items = filtered_media_items(
         state.db.media_items().await?,
         &query,
@@ -18987,6 +20082,35 @@ async fn user_items_result(
         &state.db,
     )
     .await?;
+    if should_include_parent_virtual_items(&query) {
+        let mut items = items_to_json(
+            &state.db,
+            filtered_items,
+            &server_id,
+            Some(requested_user_id),
+            should_use_compact_items_result(&query),
+        )
+        .await?;
+        items.extend(
+            parent_virtual_items(
+                &state.db,
+                &query,
+                Some(requested_user_id),
+                &server_id,
+                items.len(),
+            )
+            .await?,
+        );
+        sort_json_items(&mut items, &query);
+        let total_record_count = items.len();
+        let start_index = query.start_index.unwrap_or(0);
+        let limit = query.limit.unwrap_or(usize::MAX);
+        return Ok(Json(query_result_with_total(
+            items.into_iter().skip(start_index).take(limit).collect(),
+            total_record_count,
+            start_index,
+        )));
+    }
     let total_record_count = filtered_items.len();
     let items = items_to_json(
         &state.db,
@@ -19001,6 +20125,329 @@ async fn user_items_result(
         total_record_count,
         query.start_index.unwrap_or(0),
     )))
+}
+
+async fn special_user_view_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    auth_user: &User,
+    requested_user_id: Option<Uuid>,
+    server_id: &str,
+    collection_type: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut items = match collection_type {
+        "boxsets" => special_collection_items(db, server_id).await?,
+        "playlists" => special_playlist_items(db, auth_user, server_id).await?,
+        "livetv" => channel_provider_items(db).await?,
+        _ => Vec::new(),
+    };
+    let include_types = csv_values_lowercase(&query.include_item_types);
+    let search_term = query
+        .search_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    items.retain(|item| {
+        include_types.as_ref().is_none_or(|types| {
+            json_string_field(item, "Type")
+                .map(|item_type| item_type.to_ascii_lowercase())
+                .is_some_and(|item_type| types.iter().any(|allowed| allowed == &item_type))
+        }) && search_term.as_ref().is_none_or(|term| {
+            json_string_field(item, "Name")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains(term)
+        })
+    });
+    if let Some(is_favorite) = query.is_favorite {
+        items.retain(|item| {
+            item.get("UserData")
+                .and_then(|value| json_bool_field(value, "IsFavorite"))
+                .unwrap_or(false)
+                == is_favorite
+        });
+    }
+    if let Some(user_id) = requested_user_id
+        && let Some(is_played) = query.is_played
+    {
+        let mut filtered = Vec::new();
+        for item in items {
+            let played = if let Some(id) =
+                json_string_field(&item, "Id").and_then(|id| parse_jellyfin_uuid(&id).ok())
+            {
+                db.playback_state_for_item(user_id, id)
+                    .await?
+                    .is_some_and(|state| state.played)
+            } else {
+                false
+            };
+            if played == is_played {
+                filtered.push(item);
+            }
+        }
+        items = filtered;
+    }
+    sort_json_items(&mut items, query);
+    let total_record_count = items.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    Ok(Json(query_result_with_total(
+        items.into_iter().skip(start_index).take(limit).collect(),
+        total_record_count,
+        start_index,
+    )))
+}
+
+async fn special_collection_items(
+    db: &Database,
+    server_id: &str,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut values = Vec::new();
+    for list in db.media_lists("collection").await? {
+        let child_count = db.media_list_items(list.id).await?.len();
+        values.push(media_list_to_json(&list, server_id, child_count));
+    }
+    Ok(values)
+}
+
+async fn special_playlist_items(
+    db: &Database,
+    auth_user: &User,
+    server_id: &str,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut values = Vec::new();
+    for list in db.media_lists("playlist").await? {
+        if ensure_media_list_read_access(db, auth_user, &list)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let child_count = db.media_list_items(list.id).await?.len();
+        values.push(media_list_to_json(&list, server_id, child_count));
+    }
+    Ok(values)
+}
+
+fn should_include_parent_virtual_items(query: &ItemsQuery) -> bool {
+    query.parent_id.is_some()
+        && query.ids.is_none()
+        && query.include_item_types.is_empty()
+        && query.exclude_item_types.is_empty()
+        && query.media_types.is_empty()
+        && query.person_ids.is_empty()
+        && query.genre_ids.is_empty()
+        && query.studio_ids.is_empty()
+        && query.filters.is_empty()
+        && query.search_term.is_none()
+        && query.is_folder.is_none()
+        && query.is_played.is_none()
+        && query.is_favorite.is_none()
+}
+
+async fn parent_virtual_items(
+    db: &Database,
+    query: &ItemsQuery,
+    user_id: Option<Uuid>,
+    server_id: &str,
+    direct_child_count: usize,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let Some(parent_id) = query.parent_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let parent_id = parse_jellyfin_uuid(parent_id)?;
+    let folders = db.virtual_folders().await?;
+    let Some(folder) = folders.iter().find(|folder| folder.id == parent_id) else {
+        return Ok(Vec::new());
+    };
+    let mut values = vec![physical_folder_item_to_json(
+        folder,
+        server_id,
+        direct_child_count,
+    )];
+    let all_items = db.media_items().await?;
+    let child_folders = child_virtual_folders(folder, &folders);
+    let folder_ids = std::iter::once(folder.id)
+        .chain(child_folders.iter().map(|child| child.id))
+        .collect::<HashSet<_>>();
+    for child_folder in &child_folders {
+        let child_count = all_items
+            .iter()
+            .filter(|item| item.virtual_folder_id == child_folder.id)
+            .count();
+        values.push(physical_folder_item_to_json(
+            child_folder,
+            server_id,
+            child_count,
+        ));
+    }
+    if folder.collection_type.as_deref() != Some("tvshows") {
+        return Ok(values);
+    }
+
+    let episodes = all_items
+        .into_iter()
+        .filter(|item| folder_ids.contains(&item.virtual_folder_id))
+        .collect::<Vec<_>>();
+    let metadata_by_item =
+        media_metadata_by_item_id(db, episodes.iter().map(|episode| episode.id).collect()).await?;
+
+    let mut series_by_name = BTreeMap::<String, TvSeriesSummary>::new();
+    let mut seasons_by_series = BTreeMap::<String, BTreeMap<Option<i32>, TvSeasonSummary>>::new();
+    for episode in &episodes {
+        let Some(info) = tv_episode_info(episode) else {
+            continue;
+        };
+        let metadata = metadata_by_item.get(&episode.id);
+        let playback = if let Some(user_id) = user_id {
+            db.playback_state_for_item(user_id, episode.id).await?
+        } else {
+            None
+        };
+        let series = series_by_name
+            .entry(info.series_name.clone())
+            .or_insert_with(|| TvSeriesSummary::new(info.series_name.clone()));
+        series.add_episode(episode, &info, metadata, playback.as_ref());
+
+        let season = seasons_by_series
+            .entry(info.series_name.clone())
+            .or_default()
+            .entry(info.season_number)
+            .or_insert_with(|| TvSeasonSummary::new(info.season_number));
+        season.episode_count += 1;
+        if playback.as_ref().is_none_or(|state| !state.played) {
+            season.unplayed_count += 1;
+        }
+        if let Some(metadata) = metadata {
+            season.merge_episode_metadata(metadata);
+        }
+    }
+
+    for summary in series_by_name.into_values() {
+        let series_id = summary.id();
+        let series_name = summary.source_name.clone();
+        values.push(tv_series_json(server_id, summary));
+        if let Some(seasons) = seasons_by_series.remove(&series_name) {
+            for season in seasons.into_values() {
+                values.push(tv_season_json(server_id, &series_name, &series_id, season));
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn child_virtual_folders<'a>(
+    parent: &VirtualFolder,
+    folders: &'a [VirtualFolder],
+) -> Vec<&'a VirtualFolder> {
+    let parent_locations = parent
+        .locations
+        .iter()
+        .map(|location| normalized_folder_path(location))
+        .filter(|location| !location.is_empty())
+        .collect::<HashSet<_>>();
+    if parent_locations.is_empty() {
+        return Vec::new();
+    }
+    let mut children = folders
+        .iter()
+        .filter(|folder| folder.id != parent.id)
+        .filter(|folder| {
+            folder
+                .locations
+                .iter()
+                .map(|location| normalized_folder_path(location))
+                .any(|location| parent_locations.contains(&location))
+        })
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    children
+}
+
+fn normalized_folder_path(path: &str) -> String {
+    path.trim().trim_end_matches('/').to_string()
+}
+
+async fn virtual_folder_detail_json(
+    db: &Database,
+    folder: &VirtualFolder,
+    server_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let folders = db.virtual_folders().await?;
+    let child_folders = child_virtual_folders(folder, &folders);
+    let folder_ids = std::iter::once(folder.id)
+        .chain(child_folders.iter().map(|child| child.id))
+        .collect::<HashSet<_>>();
+    let child_count = db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| folder_ids.contains(&item.virtual_folder_id))
+        .count();
+    Ok(physical_folder_item_to_json(folder, server_id, child_count))
+}
+
+fn physical_folder_item_to_json(
+    folder: &VirtualFolder,
+    server_id: &str,
+    child_count: usize,
+) -> serde_json::Value {
+    let id = folder.id.simple().to_string();
+    let name = folder.name.clone();
+    serde_json::json!({
+        "Name": name,
+        "ServerId": server_id,
+        "Id": id,
+        "Etag": null,
+        "DateCreated": format_time_for_json(folder.created_at),
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": folder.name,
+        "ExternalUrls": [],
+        "Path": folder.locations.first().cloned(),
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": {},
+        "IsFolder": true,
+        "ParentId": null,
+        "Type": "Folder",
+        "MediaType": null,
+        "CollectionType": folder.collection_type,
+        "ChildCount": child_count,
+        "RecursiveItemCount": child_count,
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "ImageTags": { "Primary": default_primary_image_tag(&id) },
+        "PrimaryImageAspectRatio": 0.6666667,
+        "BackdropImageTags": [],
+        "LocationType": "FileSystem",
+    })
+}
+
+fn sort_json_items(items: &mut [serde_json::Value], query: &ItemsQuery) {
+    let descending = query
+        .sort_order
+        .as_deref()
+        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"));
+    items.sort_by(|left, right| {
+        let left_key = json_string_field(left, "SortName")
+            .or_else(|| json_string_field(left, "Name"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let right_key = json_string_field(right, "SortName")
+            .or_else(|| json_string_field(right, "Name"))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if descending {
+            right_key.cmp(&left_key)
+        } else {
+            left_key.cmp(&right_key)
+        }
+    });
 }
 
 async fn item_counts(
@@ -19947,12 +21394,30 @@ async fn item_detail(
         .into_iter()
         .find(|folder| folder.id == requested_id)
     {
-        return Ok(Json(user_view_to_json(&folder, &server_id)));
+        return Ok(Json(
+            virtual_folder_detail_json(&state.db, &folder, &server_id).await?,
+        ));
     }
     if let Ok(list) = state.db.media_list_by_id(requested_id).await {
         ensure_media_list_read_access(&state.db, &user, &list).await?;
         let child_count = state.db.media_list_items(list.id).await?.len();
         return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
+    }
+    if let Some(summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
+        return Ok(Json(tv_series_json(&server_id, summary)));
+    }
+    if let Some((series_name, series_id, summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, None).await?
+    {
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
+    if let Some(entity) = metadata_entity_by_stable_id(&state.db, &item_id).await? {
+        return Ok(Json(metadata_entity_match_json(&server_id, &entity)));
     }
 
     let item = state
@@ -19997,12 +21462,32 @@ async fn current_user_item_detail(
         .into_iter()
         .find(|folder| folder.id == requested_id)
     {
-        return Ok(Json(user_view_to_json(&folder, &server_id)));
+        return Ok(Json(
+            virtual_folder_detail_json(&state.db, &folder, &server_id).await?,
+        ));
     }
     if let Ok(list) = state.db.media_list_by_id(requested_id).await {
         ensure_media_list_read_access(&state.db, &auth_user, &list).await?;
         let child_count = state.db.media_list_items(list.id).await?.len();
         return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
+    }
+    if let Some(summary) =
+        tv_series_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
+    {
+        return Ok(Json(tv_series_json(&server_id, summary)));
+    }
+    if let Some((series_name, series_id, summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
+    {
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
+    if let Some(entity) = metadata_entity_by_stable_id(&state.db, &item_id).await? {
+        return Ok(Json(metadata_entity_match_json(&server_id, &entity)));
     }
 
     let item = media_item_by_id(&state.db, &item_id).await?;
@@ -20030,10 +21515,37 @@ async fn user_item_detail(
     ensure_user_access(&auth_user, user_id)?;
     let requested_id = parse_jellyfin_uuid(&item_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(folder) = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == requested_id)
+    {
+        return Ok(Json(
+            virtual_folder_detail_json(&state.db, &folder, &server_id).await?,
+        ));
+    }
     if let Ok(list) = state.db.media_list_by_id(requested_id).await {
         ensure_media_list_read_access(&state.db, &auth_user, &list).await?;
         let child_count = state.db.media_list_items(list.id).await?.len();
         return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
+    }
+    if let Some(summary) = tv_series_summary_by_id(&state.db, &item_id, Some(user_id)).await? {
+        return Ok(Json(tv_series_json(&server_id, summary)));
+    }
+    if let Some((series_name, series_id, summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, Some(user_id)).await?
+    {
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
+    if let Some(entity) = metadata_entity_by_stable_id(&state.db, &item_id).await? {
+        return Ok(Json(metadata_entity_match_json(&server_id, &entity)));
     }
     let item = media_item_by_id(&state.db, &item_id).await?;
     let playback = state.db.playback_state_for_item(user_id, item.id).await?;
@@ -20053,11 +21565,30 @@ async fn refresh_item(
     Path(item_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(series_name) =
+        series_name_for_id(state.db.media_items().await?, &state.db, &item_id).await?
+    {
+        refresh_tv_metadata_for_series(&state, &series_name).await?;
+        state
+            .db
+            .add_activity_log_entry_with_item(
+                "Item refreshed",
+                Some(&format!("Series {series_name} metadata was refreshed.")),
+                Some(&format!("Series {series_name} metadata was refreshed.")),
+                "Library",
+                Some(user.id),
+                None,
+            )
+            .await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
     let item = media_item_by_id(&state.db, &item_id).await?;
     let scanned = state
         .db
         .scan_virtual_folder_items(item.virtual_folder_id)
         .await?;
+    refresh_tv_metadata_for_folder(&state, item.virtual_folder_id).await?;
     state
         .db
         .add_activity_log_entry_with_item(
@@ -20083,6 +21614,27 @@ async fn update_item_metadata(
     body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(series_name) =
+        series_name_for_id(state.db.media_items().await?, &state.db, &item_id).await?
+    {
+        if let Some(Json(payload)) = body {
+            apply_manual_series_metadata_update(&state, &series_name, payload).await?;
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    if let Some(folder) = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == requested_id)
+    {
+        if let Some(Json(payload)) = body {
+            update_virtual_folder_metadata(&state.db, folder, payload).await?;
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
     if let Some(Json(payload)) = body {
@@ -20093,6 +21645,29 @@ async fn update_item_metadata(
         .update_media_item_metadata(item.id, metadata)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn update_virtual_folder_metadata(
+    db: &Database,
+    folder: VirtualFolder,
+    payload: serde_json::Value,
+) -> Result<(), ApiError> {
+    let requested_name = json_string_any_field(&payload, &["Name", "Title"])
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    let final_name = requested_name.unwrap_or_else(|| folder.name.clone());
+    if final_name != folder.name {
+        db.rename_virtual_folder(&folder.name, &final_name).await?;
+    }
+
+    let content_type = json_string_any_field(
+        &payload,
+        &["ContentType", "CollectionType", "collectionType", "Type"],
+    )
+    .or(folder.collection_type);
+    db.upsert_virtual_folder(&final_name, content_type.as_deref(), folder.locations)
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -20110,12 +21685,41 @@ async fn update_item_content_type(
     body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
     let content_type = query.content_type.or_else(|| {
         body.as_ref()
             .and_then(|Json(body)| json_string_field(body, "ContentType"))
     });
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    if let Some(folder) = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == requested_id)
+    {
+        if let Some(content_type) = content_type.as_deref() {
+            state
+                .db
+                .upsert_virtual_folder(&folder.name, Some(content_type), folder.locations)
+                .await?;
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if let Some(series_name) =
+        series_name_for_id(state.db.media_items().await?, &state.db, &item_id).await?
+    {
+        if let Some(content_type) = content_type {
+            apply_manual_series_metadata_update(
+                &state,
+                &series_name,
+                serde_json::json!({ "ContentType": content_type }),
+            )
+            .await?;
+        }
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
     if let Some(content_type) = content_type {
         metadata["ContentType"] = serde_json::Value::String(content_type);
     }
@@ -20133,16 +21737,239 @@ async fn item_metadata_editor(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(folder) = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == requested_id)
+    {
+        return Ok(Json(serde_json::json!({
+            "Item": user_view_to_json(&folder, &server_id),
+            "Metadata": {
+                "Name": folder.name,
+                "Path": folder.locations.first().cloned().unwrap_or_default(),
+                "ContentType": folder.collection_type
+            },
+            "ExternalIdInfos": [],
+            "ParentalRatingOptions": metadata_editor_parental_rating_options(),
+            "ContentType": folder.collection_type,
+            "ContentTypeOptions": metadata_editor_content_type_options(),
+            "Cultures": load_cultures(),
+            "Countries": load_countries()
+        })));
+    }
+    if let Ok(list) = state.db.media_list_by_id(requested_id).await {
+        let child_count = state.db.media_list_items(list.id).await?.len();
+        let item = media_list_to_json(&list, &server_id, child_count);
+        let content_type = list
+            .collection_type
+            .clone()
+            .unwrap_or_else(|| list.kind.clone());
+        return Ok(Json(serde_json::json!({
+            "Item": item,
+            "Metadata": {
+                "Name": list.name,
+                "ContentType": content_type
+            },
+            "ExternalIdInfos": external_id_infos_for_item_type(if list.kind == "collection" { "BoxSet" } else { "Playlist" }),
+            "ParentalRatingOptions": metadata_editor_parental_rating_options(),
+            "ContentType": content_type,
+            "ContentTypeOptions": metadata_editor_content_type_options(),
+            "Cultures": load_cultures(),
+            "Countries": load_countries()
+        })));
+    }
+    if let Some(summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
+        let item = tv_series_json(&server_id, summary);
+        let content_type =
+            json_string_field(&item, "ContentType").unwrap_or_else(|| "tvshows".to_string());
+        return Ok(Json(serde_json::json!({
+            "Item": item,
+            "Metadata": item,
+            "ExternalIdInfos": external_id_infos_for_item_type("Series"),
+            "ParentalRatingOptions": metadata_editor_parental_rating_options(),
+            "ContentType": content_type,
+            "ContentTypeOptions": metadata_editor_content_type_options(),
+            "Cultures": load_cultures(),
+            "Countries": load_countries()
+        })));
+    }
+    if let Some((series_name, series_id, summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, None).await?
+    {
+        let item = tv_season_json(&server_id, &series_name, &series_id, summary);
+        return Ok(Json(serde_json::json!({
+            "Item": item,
+            "Metadata": item,
+            "ExternalIdInfos": external_id_infos_for_item_type("Season"),
+            "ParentalRatingOptions": metadata_editor_parental_rating_options(),
+            "ContentType": "tvshows",
+            "ContentTypeOptions": metadata_editor_content_type_options(),
+            "Cultures": load_cultures(),
+            "Countries": load_countries()
+        })));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     let metadata = metadata_payload_for_item(&state.db, item.id).await?;
-    let server_id = state.db.server_state().await?.server_id.to_string();
     Ok(Json(serde_json::json!({
         "Item": media_item_to_json_with_playback_and_metadata(&item, &server_id, None, Some(&metadata)),
         "Metadata": metadata,
         "ExternalIdInfos": external_id_infos_for_item_type(media_item_type(&item)),
+        "ParentalRatingOptions": metadata_editor_parental_rating_options(),
+        "ContentType": item.collection_type,
+        "ContentTypeOptions": metadata_editor_content_type_options(),
         "Cultures": load_cultures(),
         "Countries": load_countries()
     })))
+}
+
+async fn apply_manual_series_metadata_update(
+    state: &AppState,
+    series_name: &str,
+    payload: serde_json::Value,
+) -> Result<(), ApiError> {
+    let series_metadata = series_metadata_from_item_update_payload(&payload);
+    let episodes = state
+        .db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| tv_episode_info(item).is_some_and(|info| info.series_name == series_name))
+        .collect::<Vec<_>>();
+    for episode in episodes {
+        let mut metadata = metadata_payload_for_item(&state.db, episode.id).await?;
+        merge_tvmaze_series_metadata(&mut metadata, &series_metadata);
+        state
+            .db
+            .update_media_item_metadata(episode.id, metadata)
+            .await?;
+    }
+    Ok(())
+}
+
+fn series_metadata_from_item_update_payload(payload: &serde_json::Value) -> serde_json::Value {
+    let provider_ids = json_field_case_insensitive(payload, "ProviderIds")
+        .filter(|value| value.is_object())
+        .cloned();
+    serde_json::json!({
+        "SeriesName": json_string_field(payload, "Name"),
+        "SeriesOverview": json_string_field(payload, "Overview"),
+        "SeriesOriginalTitle": json_string_field(payload, "OriginalTitle"),
+        "SeriesOfficialRating": json_string_field(payload, "OfficialRating"),
+        "SeriesStatus": json_string_field(payload, "Status"),
+        "SeriesGenres": json_field_case_insensitive(payload, "Genres").cloned(),
+        "SeriesStudios": json_field_case_insensitive(payload, "Studios").cloned(),
+        "SeriesTags": json_field_case_insensitive(payload, "Tags").cloned(),
+        "SeriesTaglines": json_field_case_insensitive(payload, "Taglines").cloned(),
+        "SeriesAirDays": json_field_case_insensitive(payload, "AirDays").cloned(),
+        "SeriesPeople": json_field_case_insensitive(payload, "People").cloned(),
+        "SeriesProviderIds": provider_ids,
+        "SeriesContentType": json_string_field(payload, "ContentType"),
+        "SeriesProductionYear": json_i64_field(payload, "ProductionYear"),
+        "SeriesPremiereDate": json_string_field(payload, "PremiereDate"),
+        "EndDate": json_string_field(payload, "EndDate"),
+        "SeriesCommunityRating": json_f64_field(payload, "CommunityRating"),
+        "SeriesCriticRating": json_f64_field(payload, "CriticRating"),
+        "PreferredMetadataLanguage": json_string_field(payload, "PreferredMetadataLanguage"),
+        "PreferredMetadataCountryCode": json_string_field(payload, "PreferredMetadataCountryCode"),
+        "LockData": json_field_case_insensitive(payload, "LockData").cloned(),
+        "LockedFields": json_field_case_insensitive(payload, "LockedFields").cloned(),
+    })
+}
+
+fn metadata_editor_content_type_options() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({ "Name": "", "Value": "" }),
+        serde_json::json!({ "Name": "Movies", "Value": "movies" }),
+        serde_json::json!({ "Name": "TV Shows", "Value": "tvshows" }),
+        serde_json::json!({ "Name": "Music", "Value": "music" }),
+        serde_json::json!({ "Name": "Music Videos", "Value": "musicvideos" }),
+        serde_json::json!({ "Name": "Books", "Value": "books" }),
+        serde_json::json!({ "Name": "Photos", "Value": "photos" }),
+    ]
+}
+
+fn metadata_editor_parental_rating_options() -> Vec<serde_json::Value> {
+    [
+        ("Unrated", None, None),
+        ("Approved", Some(0), Some(0)),
+        ("G", Some(0), Some(0)),
+        ("TV-G", Some(0), Some(0)),
+        ("TV-Y", Some(0), Some(0)),
+        ("TV-Y7", Some(7), Some(0)),
+        ("TV-Y7-FV", Some(7), Some(1)),
+        ("PG", Some(10), Some(0)),
+        ("TV-PG", Some(10), Some(0)),
+        ("TV-PG-D", Some(10), Some(1)),
+        ("TV-PG-L", Some(10), Some(1)),
+        ("TV-PG-S", Some(10), Some(1)),
+        ("TV-PG-V", Some(10), Some(1)),
+        ("TV-PG-DL", Some(10), Some(1)),
+        ("TV-PG-DS", Some(10), Some(1)),
+        ("TV-PG-DV", Some(10), Some(1)),
+        ("TV-PG-LS", Some(10), Some(1)),
+        ("TV-PG-LV", Some(10), Some(1)),
+        ("TV-PG-SV", Some(10), Some(1)),
+        ("TV-PG-DLS", Some(10), Some(1)),
+        ("TV-PG-DLV", Some(10), Some(1)),
+        ("TV-PG-DSV", Some(10), Some(1)),
+        ("TV-PG-LSV", Some(10), Some(1)),
+        ("TV-PG-DLSV", Some(10), Some(1)),
+        ("PG-13", Some(13), Some(0)),
+        ("TV-14", Some(14), Some(0)),
+        ("TV-14-D", Some(14), Some(1)),
+        ("TV-14-L", Some(14), Some(1)),
+        ("TV-14-S", Some(14), Some(1)),
+        ("TV-14-V", Some(14), Some(1)),
+        ("TV-14-DL", Some(14), Some(1)),
+        ("TV-14-DS", Some(14), Some(1)),
+        ("TV-14-DV", Some(14), Some(1)),
+        ("TV-14-LS", Some(14), Some(1)),
+        ("TV-14-LV", Some(14), Some(1)),
+        ("TV-14-SV", Some(14), Some(1)),
+        ("TV-14-DLS", Some(14), Some(1)),
+        ("TV-14-DLV", Some(14), Some(1)),
+        ("TV-14-DSV", Some(14), Some(1)),
+        ("TV-14-LSV", Some(14), Some(1)),
+        ("TV-14-DLSV", Some(14), Some(1)),
+        ("R", Some(17), Some(0)),
+        ("NC-17", Some(17), Some(1)),
+        ("TV-MA", Some(17), Some(1)),
+        ("TV-MA-L", Some(17), Some(1)),
+        ("TV-MA-S", Some(17), Some(1)),
+        ("TV-MA-V", Some(17), Some(1)),
+        ("TV-MA-LS", Some(17), Some(1)),
+        ("TV-MA-LV", Some(17), Some(1)),
+        ("TV-MA-SV", Some(17), Some(1)),
+        ("TV-MA-LSV", Some(17), Some(1)),
+        ("TV-X", Some(18), Some(0)),
+        ("TV-AO", Some(18), Some(0)),
+        ("21", Some(21), None),
+        ("XXX", Some(1000), None),
+        ("Banned", Some(1001), None),
+    ]
+    .into_iter()
+    .map(|(name, value, sub_score)| {
+        let mut option = serde_json::Map::new();
+        option.insert("Name".to_string(), serde_json::json!(name));
+        if let Some(value) = value {
+            option.insert("Value".to_string(), serde_json::json!(value));
+            let mut rating_score = serde_json::Map::new();
+            rating_score.insert("score".to_string(), serde_json::json!(value));
+            if let Some(sub_score) = sub_score {
+                rating_score.insert("subScore".to_string(), serde_json::json!(sub_score));
+            }
+            option.insert(
+                "RatingScore".to_string(),
+                serde_json::Value::Object(rating_score),
+            );
+        }
+        serde_json::Value::Object(option)
+    })
+    .collect()
 }
 
 async fn item_external_id_infos(
@@ -20152,6 +21979,37 @@ async fn item_external_id_infos(
     Path(item_id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    if series_name_for_id(state.db.media_items().await?, &state.db, &item_id)
+        .await?
+        .is_some()
+    {
+        return Ok(Json(external_id_infos_for_item_type("Series")));
+    }
+    if tv_season_summary_by_id(&state.db, &item_id, None)
+        .await?
+        .is_some()
+    {
+        return Ok(Json(external_id_infos_for_item_type("Season")));
+    }
+    let requested_id = parse_jellyfin_uuid(&item_id)?;
+    if let Ok(list) = state.db.media_list_by_id(requested_id).await {
+        return Ok(Json(external_id_infos_for_item_type(
+            if list.kind == "collection" {
+                "BoxSet"
+            } else {
+                "Playlist"
+            },
+        )));
+    }
+    if state
+        .db
+        .virtual_folders()
+        .await?
+        .iter()
+        .any(|folder| folder.id == requested_id)
+    {
+        return Ok(Json(external_id_infos_for_item_type("Folder")));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     Ok(Json(external_id_infos_for_item_type(media_item_type(
         &item,
@@ -20166,10 +22024,17 @@ async fn apply_remote_item_search(
     body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
     let Some(Json(payload)) = body else {
         return Err(ApiError::not_found("Remote search result not found"));
     };
+    if let Some(series_name) =
+        series_name_for_id(state.db.media_items().await?, &state.db, &item_id).await?
+    {
+        apply_remote_series_search_result(&state, &series_name, payload).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    let item = media_item_by_id(&state.db, &item_id).await?;
     let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
     merge_remote_search_result_metadata(&mut metadata, payload)?;
     state
@@ -20177,6 +22042,78 @@ async fn apply_remote_item_search(
         .update_media_item_metadata(item.id, metadata)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn apply_remote_series_search_result(
+    state: &AppState,
+    series_name: &str,
+    payload: serde_json::Value,
+) -> Result<(), ApiError> {
+    let candidate = remote_search_candidate_payload(payload);
+    let series_metadata = series_metadata_from_remote_search_result(&candidate);
+    let episodes = state
+        .db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| tv_episode_info(item).is_some_and(|info| info.series_name == series_name))
+        .collect::<Vec<_>>();
+    for episode in episodes {
+        let mut metadata = metadata_payload_for_item(&state.db, episode.id).await?;
+        merge_tvmaze_series_metadata(&mut metadata, &series_metadata);
+        state
+            .db
+            .update_media_item_metadata(episode.id, metadata)
+            .await?;
+    }
+    if let Some(image_url) = json_string_field(&candidate, "ImageUrl")
+        && let Ok(bytes) = fetch_remote_image_bytes(&image_url).await
+    {
+        store_image_bytes(
+            state,
+            ImageOwner::Item(&tv_series_id(series_name)),
+            "Primary",
+            0,
+            bytes,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn series_metadata_from_remote_search_result(candidate: &serde_json::Value) -> serde_json::Value {
+    let provider_ids = json_field_case_insensitive(candidate, "ProviderIds")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let primary_tag = provider_ids
+        .get("TvMaze")
+        .and_then(serde_json::Value::as_str)
+        .map(|id| format!("tvmaze-primary-{id}"))
+        .or_else(|| {
+            json_string_field(candidate, "ImageUrl")
+                .map(|url| format!("remote-primary-{}", stable_entity_id("RemoteImage", &url)))
+        });
+    serde_json::json!({
+        "SeriesName": json_string_field(candidate, "Name"),
+        "SeriesOverview": json_string_field(candidate, "Overview"),
+        "SeriesOriginalTitle": json_string_field(candidate, "OriginalTitle"),
+        "SeriesOfficialRating": json_string_field(candidate, "OfficialRating"),
+        "SeriesStatus": json_string_field(candidate, "Status"),
+        "SeriesGenres": json_field_case_insensitive(candidate, "Genres").cloned(),
+        "SeriesStudios": json_field_case_insensitive(candidate, "Studios").cloned(),
+        "SeriesTags": json_field_case_insensitive(candidate, "Tags").cloned(),
+        "SeriesTaglines": json_field_case_insensitive(candidate, "Taglines").cloned(),
+        "SeriesPeople": json_field_case_insensitive(candidate, "People").cloned(),
+        "SeriesProviderIds": provider_ids,
+        "SeriesProductionYear": json_i64_field(candidate, "ProductionYear"),
+        "SeriesPremiereDate": json_string_field(candidate, "PremiereDate"),
+        "EndDate": json_string_field(candidate, "EndDate"),
+        "SeriesCommunityRating": json_f64_field(candidate, "CommunityRating"),
+        "SeriesCriticRating": json_f64_field(candidate, "CriticRating"),
+        "SeriesPrimaryImageTag": primary_tag,
+        "MetadataSource": json_string_field(candidate, "SearchProviderName").unwrap_or_else(|| "RemoteSearch".to_string())
+    })
 }
 
 macro_rules! remote_search_handler {
@@ -20251,6 +22188,26 @@ async fn remote_search_local_results(
                     .or_insert_with(|| {
                         remote_search_result_from_name(&server_id, &series, item_type, None)
                     });
+            }
+            if let Ok(tvmaze_results) = tvmaze_remote_search_series_results(&request).await {
+                for result in tvmaze_results {
+                    let name = result
+                        .get("Name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let provider_id = result
+                        .get("ProviderIds")
+                        .and_then(|ids| ids.get("TvMaze"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    results.insert(
+                        remote_search_result_key(
+                            item_type,
+                            &format!("TVMaze:{provider_id}:{name}"),
+                        ),
+                        result,
+                    );
+                }
             }
         }
         "MusicAlbum" => {
@@ -20642,29 +22599,113 @@ fn merge_remote_search_result_metadata(
     metadata: &mut serde_json::Value,
     payload: serde_json::Value,
 ) -> Result<(), ApiError> {
-    let candidate = json_field_case_insensitive(&payload, "SearchResult")
+    let mut candidate = remote_search_candidate_payload(payload);
+    if !candidate.is_object() {
+        return Err(ApiError::bad_request(
+            "Remote search result must be an object",
+        ));
+    }
+
+    for (target, keys) in [
+        (
+            "PrimaryImageUrl",
+            &["PrimaryImageUrl", "ImageUrl", "PosterUrl", "PosterImageUrl"][..],
+        ),
+        (
+            "BackdropImageUrl",
+            &["BackdropImageUrl", "BackgroundImageUrl", "BackdropUrl"][..],
+        ),
+        (
+            "ThumbImageUrl",
+            &["ThumbImageUrl", "ThumbnailUrl", "BannerImageUrl"][..],
+        ),
+        ("LogoImageUrl", &["LogoImageUrl", "LogoUrl"][..]),
+    ] {
+        if json_field_case_insensitive(&candidate, target).is_none()
+            && let Some(value) = keys
+                .iter()
+                .find_map(|key| json_field_case_insensitive(&candidate, key))
+                .cloned()
+            && value.as_str().is_some_and(remote_image_url_is_fetchable)
+        {
+            candidate[target] = value;
+        }
+    }
+
+    if json_field_case_insensitive(&candidate, "MetadataSource").is_none()
+        && let Some(provider) = json_string_field(&candidate, "SearchProviderName")
+    {
+        candidate["MetadataSource"] = serde_json::Value::String(provider);
+    }
+
+    merge_item_metadata_update(metadata, candidate)
+}
+
+fn remote_search_candidate_payload(payload: serde_json::Value) -> serde_json::Value {
+    json_field_case_insensitive(&payload, "SearchResult")
         .or_else(|| json_field_case_insensitive(&payload, "Result"))
         .or_else(|| json_field_case_insensitive(&payload, "Item"))
         .cloned()
-        .unwrap_or(payload);
-    merge_item_metadata_update(metadata, candidate)
+        .unwrap_or(payload)
 }
 
 fn external_id_infos_for_item_type(item_type: &str) -> Vec<serde_json::Value> {
     let mut infos = vec![serde_json::json!({
         "Name": "IMDb",
         "Key": "Imdb",
-        "Type": "String",
         "UrlFormatString": "https://www.imdb.com/title/{0}",
         "SupportsMultiple": false
     })];
     match item_type {
-        "Movie" | "Series" | "Episode" => {
+        "Movie" => {
             infos.push(serde_json::json!({
                 "Name": "TheMovieDb",
                 "Key": "Tmdb",
-                "Type": "String",
                 "UrlFormatString": "https://www.themoviedb.org/{0}",
+                "SupportsMultiple": false
+            }));
+            infos.push(serde_json::json!({
+                "Name": "TheTVDB",
+                "Key": "Tvdb",
+                "UrlFormatString": "https://thetvdb.com/dereferrer/{0}",
+                "SupportsMultiple": false
+            }));
+        }
+        "Series" => {
+            infos.push(serde_json::json!({
+                "Name": "TheMovieDb",
+                "Key": "Tmdb",
+                "Type": "Series",
+                "UrlFormatString": "https://www.themoviedb.org/tv/{0}",
+                "SupportsMultiple": false
+            }));
+            infos.push(serde_json::json!({
+                "Name": "TheTVDB",
+                "Key": "Tvdb",
+                "Type": "Series",
+                "UrlFormatString": "https://thetvdb.com/dereferrer/series/{0}",
+                "SupportsMultiple": false
+            }));
+            infos.push(serde_json::json!({
+                "Name": "Zap2It",
+                "Key": "Zap2It",
+                "UrlFormatString": "",
+                "SupportsMultiple": false
+            }));
+        }
+        "Episode" | "Season" => {
+            infos.push(serde_json::json!({
+                "Name": "TheMovieDb",
+                "Key": "Tmdb",
+                "Type": item_type,
+                "UrlFormatString": "https://www.themoviedb.org/tv/{0}",
+                "SupportsMultiple": false
+            }));
+            infos.push(serde_json::json!({
+                "Name": "TheTVDB",
+                "Key": "Tvdb",
+                "Type": item_type,
+                "UrlFormatString": "https://thetvdb.com/dereferrer/{0}",
                 "SupportsMultiple": false
             }));
         }
@@ -20672,7 +22713,6 @@ fn external_id_infos_for_item_type(item_type: &str) -> Vec<serde_json::Value> {
             infos.push(serde_json::json!({
                 "Name": "MusicBrainz",
                 "Key": "MusicBrainz",
-                "Type": "String",
                 "UrlFormatString": "",
                 "SupportsMultiple": false
             }));
@@ -21093,6 +23133,67 @@ async fn item_ancestors(
 
     if folders.iter().any(|folder| folder.id == requested_id) {
         return Ok(Json(vec![root]));
+    }
+
+    if let Some((series_name, series_id, _summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, None).await?
+    {
+        let folder_id = state
+            .db
+            .media_items()
+            .await?
+            .into_iter()
+            .find(|item| tv_episode_info(item).is_some_and(|info| info.series_name == series_name))
+            .map(|item| item.virtual_folder_id)
+            .ok_or_else(|| ApiError::not_found("Parent folder not found"))?;
+        let folder = folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("Parent folder not found"))?;
+        let mut folder_json = user_view_to_json(folder, &server_id);
+        if let Some(object) = folder_json.as_object_mut() {
+            object.insert("ParentId".to_string(), serde_json::json!(root_id));
+        }
+        let series_summary = tv_series_summary_by_id(&state.db, &series_id, None)
+            .await?
+            .ok_or_else(|| ApiError::not_found("Parent series not found"))?;
+        let mut series_json = tv_series_json(&server_id, series_summary);
+        if let Some(object) = series_json.as_object_mut() {
+            object.insert(
+                "ParentId".to_string(),
+                serde_json::json!(folder.id.simple().to_string()),
+            );
+        }
+        return Ok(Json(vec![series_json, folder_json, root]));
+    }
+
+    if let Some(series_name) =
+        series_name_for_id(state.db.media_items().await?, &state.db, &item_id).await?
+    {
+        let folder_id = state
+            .db
+            .media_items()
+            .await?
+            .into_iter()
+            .find(|item| tv_episode_info(item).is_some_and(|info| info.series_name == series_name))
+            .map(|item| item.virtual_folder_id)
+            .ok_or_else(|| ApiError::not_found("Parent folder not found"))?;
+        let folder = folders
+            .iter()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| ApiError::not_found("Parent folder not found"))?;
+        let mut folder_json = user_view_to_json(folder, &server_id);
+        if let Some(object) = folder_json.as_object_mut() {
+            object.insert("ParentId".to_string(), serde_json::json!(root_id));
+        }
+        return Ok(Json(vec![folder_json, root]));
+    }
+
+    if metadata_entity_by_stable_id(&state.db, &item_id)
+        .await?
+        .is_some()
+    {
+        return Ok(Json(Vec::new()));
     }
 
     let item = state
@@ -21560,7 +23661,9 @@ struct PlaybackInfoOptions {
     media_source_id: Option<String>,
     audio_stream_index: Option<i64>,
     subtitle_stream_index: Option<i64>,
+    burn_in_subtitle: bool,
     start_position_ticks: i64,
+    start_position_ticks_provided: bool,
     direct_play_profiles: Option<Vec<DirectPlayProfileMatcher>>,
 }
 
@@ -21581,7 +23684,9 @@ impl Default for PlaybackInfoOptions {
             media_source_id: None,
             audio_stream_index: None,
             subtitle_stream_index: None,
+            burn_in_subtitle: false,
             start_position_ticks: 0,
+            start_position_ticks_provided: false,
             direct_play_profiles: None,
         }
     }
@@ -21636,6 +23741,7 @@ fn parse_playback_info_options(
             "starttimeticks" | "startpositionticks" => {
                 if let Ok(value) = value.parse::<i64>() {
                     options.start_position_ticks = value.max(0);
+                    options.start_position_ticks_provided = true;
                 }
             }
             _ => {}
@@ -21659,10 +23765,12 @@ fn playback_info_options_from_body(body: &serde_json::Value) -> PlaybackInfoOpti
     options.media_source_id = json_string_field(body, "MediaSourceId");
     options.audio_stream_index = json_i64_field(body, "AudioStreamIndex");
     options.subtitle_stream_index = json_i64_field(body, "SubtitleStreamIndex");
-    options.start_position_ticks = json_i64_field(body, "StartTimeTicks")
+    if let Some(value) = json_i64_field(body, "StartTimeTicks")
         .or_else(|| json_i64_field(body, "StartPositionTicks"))
-        .unwrap_or_default()
-        .max(0);
+    {
+        options.start_position_ticks = value.max(0);
+        options.start_position_ticks_provided = true;
+    }
     options.direct_play_profiles = parse_direct_play_profiles(body);
     options
 }
@@ -21701,6 +23809,14 @@ fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
 
 fn json_i64_field(value: &serde_json::Value, field: &str) -> Option<i64> {
     json_field_case_insensitive(value, field).and_then(json_value_i64)
+}
+
+fn json_f64_field(value: &serde_json::Value, field: &str) -> Option<f64> {
+    json_field_case_insensitive(value, field).and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+    })
 }
 
 fn parse_direct_play_profiles(body: &serde_json::Value) -> Option<Vec<DirectPlayProfileMatcher>> {
@@ -21744,7 +23860,7 @@ async fn playback_info_response(
     user: &User,
     token: &DeviceToken,
     item_id: &str,
-    options: PlaybackInfoOptions,
+    mut options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let requested_item = media_item_by_id(&state.db, item_id).await?;
     let play_session_id = Uuid::new_v4().simple().to_string();
@@ -21762,9 +23878,16 @@ async fn playback_info_response(
         })));
     };
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let item_json = media_item_to_json(&item, &server_id);
-    let direct_play_supported = playback_direct_play_supported(&item, &options);
-    let direct_stream_supported = options.enable_direct_stream || direct_play_supported;
+    let playback = state.db.playback_state_for_item(user.id, item.id).await?;
+    let active_playback =
+        active_playback_session_for_user_item(&state.db, user.id, item.id).await?;
+    apply_playback_info_state_defaults(&mut options, playback.as_ref(), active_playback.as_ref());
+    let item_json = media_item_to_json_with_playback(&item, &server_id, playback.as_ref());
+    let selected_audio_needs_transcode = selected_audio_stream_needs_transcode(&item, &options);
+    let direct_play_supported =
+        playback_direct_play_supported(&item, &options) && !selected_audio_needs_transcode;
+    let direct_stream_supported =
+        (options.enable_direct_stream || direct_play_supported) && !selected_audio_needs_transcode;
     if !playback_selection_supported(&item, &options) {
         return Ok(Json(serde_json::json!({
             "MediaSources": [],
@@ -21809,6 +23932,58 @@ async fn playback_info_response(
     })))
 }
 
+async fn active_playback_session_for_user_item(
+    db: &Database,
+    user_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<ActivePlaybackSession>, ApiError> {
+    Ok(db
+        .active_playback_sessions()
+        .await?
+        .into_iter()
+        .find(|session| session.user_id == user_id && session.item.id == item_id))
+}
+
+fn apply_playback_info_state_defaults(
+    options: &mut PlaybackInfoOptions,
+    playback: Option<&PlaybackState>,
+    active_playback: Option<&ActivePlaybackSession>,
+) {
+    let explicit_stream_selection =
+        options.audio_stream_index.is_some() || options.subtitle_stream_index.is_some();
+
+    if options.audio_stream_index.is_none() {
+        options.audio_stream_index = active_playback
+            .and_then(|session| session.audio_stream_index)
+            .or_else(|| playback.and_then(|state| state.audio_stream_index));
+    }
+    if options.subtitle_stream_index.is_none() {
+        options.subtitle_stream_index = active_playback
+            .and_then(|session| session.subtitle_stream_index)
+            .or_else(|| playback.and_then(|state| state.subtitle_stream_index));
+    }
+
+    if options.start_position_ticks_provided {
+        return;
+    }
+
+    if let Some(position_ticks) = active_playback
+        .map(|session| session.position_ticks)
+        .filter(|position_ticks| *position_ticks > 0)
+    {
+        options.start_position_ticks = position_ticks;
+        return;
+    }
+
+    if explicit_stream_selection
+        && let Some(position_ticks) = playback
+            .map(|state| state.position_ticks)
+            .filter(|position_ticks| *position_ticks > 0)
+    {
+        options.start_position_ticks = position_ticks;
+    }
+}
+
 async fn playback_transcode_info_response(
     state: &AppState,
     user: &User,
@@ -21817,11 +23992,18 @@ async fn playback_transcode_info_response(
     item_json: serde_json::Value,
     options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut options = options;
     let play_session_id = Uuid::new_v4().simple().to_string();
     let item_id = item.id.simple().to_string();
 
     let streams = media_item_streams(item);
     let include_video = item.media_type == "Video";
+    options.burn_in_subtitle =
+        include_video && selected_subtitle_stream_is_image(&streams, options.subtitle_stream_index);
+    if include_video {
+        options.start_position_ticks =
+            hls_effective_start_position_ticks(options.start_position_ticks, item.runtime_ticks);
+    }
     let selection = TranscodeStreamSelection {
         video_stream_index: include_video
             .then(|| first_stream_index(&streams, "Video"))
@@ -21857,6 +24039,7 @@ async fn playback_transcode_info_response(
     );
     request.start_position_ticks = options.start_position_ticks;
     request.include_video = include_video;
+    request.burn_in_subtitle = options.burn_in_subtitle;
     let command = build_hls_ffmpeg_command(&request);
 
     let (session, claimed_new_session) = state
@@ -21878,6 +24061,7 @@ async fn playback_transcode_info_response(
                 status: "starting".to_string(),
                 progress_percent: None,
                 position_ticks: request.start_position_ticks,
+                start_position_ticks: request.start_position_ticks,
             },
         )
         .await?;
@@ -21932,12 +24116,112 @@ fn playback_transcode_session_info_response(
         );
         media_source.remove("DirectStreamUrl");
         apply_playback_stream_selection(media_source, options);
+        apply_hls_transcode_stream_contract(media_source, media_type, options);
     }
 
     Ok(Json(serde_json::json!({
         "MediaSources": media_sources,
         "PlaySessionId": play_session_id,
     })))
+}
+
+fn apply_hls_transcode_stream_contract(
+    media_source: &mut serde_json::Map<String, serde_json::Value>,
+    media_type: &str,
+    options: &PlaybackInfoOptions,
+) {
+    let selected_audio_stream_index = media_source
+        .get("DefaultAudioStreamIndex")
+        .and_then(json_value_i64);
+    let selected_subtitle_stream_index = options
+        .subtitle_stream_index
+        .and_then(|index| (index >= 0).then_some(index));
+
+    if let Some(streams) = media_source
+        .get_mut("MediaStreams")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for stream in streams {
+            let Some(stream) = stream.as_object_mut() else {
+                continue;
+            };
+            let stream_type = stream
+                .get("Type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match stream_type.as_str() {
+                "video" if media_type == "Video" => {
+                    stream.insert("Codec".to_string(), serde_json::json!("h264"));
+                    stream.insert("Profile".to_string(), serde_json::json!("main"));
+                    stream.insert("PixelFormat".to_string(), serde_json::json!("yuv420p"));
+                    stream.insert("BitDepth".to_string(), serde_json::json!(8));
+                    stream.insert("VideoRange".to_string(), serde_json::json!("SDR"));
+                    stream.insert("VideoRangeType".to_string(), serde_json::json!("SDR"));
+                    stream.insert(
+                        "DisplayTitle".to_string(),
+                        serde_json::json!("1080p H264 SDR"),
+                    );
+                }
+                "audio" => {
+                    let index = stream.get("Index").and_then(json_value_i64);
+                    let selected =
+                        selected_audio_stream_index.is_none_or(|selected| index == Some(selected));
+                    if selected {
+                        stream.insert("Codec".to_string(), serde_json::json!("aac"));
+                        stream.insert("Channels".to_string(), serde_json::json!(2));
+                        stream.insert("ChannelLayout".to_string(), serde_json::json!("stereo"));
+                        stream.insert("BitRate".to_string(), serde_json::json!(192000));
+                        stream.insert(
+                            "DisplayTitle".to_string(),
+                            serde_json::json!("AAC - stereo"),
+                        );
+                    }
+                }
+                "subtitle" => {
+                    let index = stream.get("Index").and_then(json_value_i64);
+                    let selected = selected_subtitle_stream_index
+                        .is_some_and(|selected| index == Some(selected));
+                    if selected && !options.burn_in_subtitle {
+                        stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
+                        stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
+                        stream.insert("DisplayTitle".to_string(), serde_json::json!("WebVTT"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn selected_subtitle_stream_is_image(
+    streams: &[serde_json::Value],
+    subtitle_stream_index: Option<i64>,
+) -> bool {
+    let Some(selected_index) =
+        subtitle_stream_index.and_then(|index| (index >= 0).then_some(index))
+    else {
+        return false;
+    };
+
+    streams.iter().any(|stream| {
+        let Some(stream) = stream.as_object() else {
+            return false;
+        };
+        let is_selected_subtitle = stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+            && stream.get("Index").and_then(json_value_i64) == Some(selected_index);
+        if !is_selected_subtitle {
+            return false;
+        }
+
+        stream
+            .get("Codec")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|codec| !is_text_subtitle_codec(codec))
+    })
 }
 
 fn hls_transcode_dedupe_key(
@@ -22053,6 +24337,7 @@ async fn spawn_hls_transcode_task(
                         status: "running".to_string(),
                         progress_percent: session.progress_percent,
                         position_ticks: session.position_ticks,
+                        start_position_ticks: session.start_position_ticks,
                     })
                     .await;
             }
@@ -22196,6 +24481,7 @@ fn live_hls_entry_to_transcode_session(entry: &LiveHlsSessionEntry) -> Transcode
         status: entry.status.clone(),
         progress_percent: None,
         position_ticks: 0,
+        start_position_ticks: 0,
         created_at: entry.created_at,
         updated_at: entry.updated_at,
     }
@@ -22474,6 +24760,14 @@ fn apply_playback_stream_selection(
         );
     }
 
+    if options.burn_in_subtitle {
+        media_source.insert(
+            "DefaultSubtitleStreamIndex".to_string(),
+            serde_json::Value::Null,
+        );
+        return;
+    }
+
     if let Some(subtitle_stream_index) = options.subtitle_stream_index {
         let value = if subtitle_stream_index < 0 {
             serde_json::Value::Null
@@ -22515,6 +24809,26 @@ fn playback_direct_play_supported(item: &MediaItem, options: &PlaybackInfoOption
     profiles
         .iter()
         .any(|profile| direct_play_profile_matches(item, profile))
+}
+
+fn selected_audio_stream_needs_transcode(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
+    if item.media_type != "Video" || !options.enable_transcoding {
+        return false;
+    }
+    let streams = media_item_streams(item);
+    let selected_index = options
+        .audio_stream_index
+        .or_else(|| default_audio_stream_index(&streams));
+    let Some(codec) = selected_index
+        .and_then(|index| media_item_stream_codec_by_index(item, "Audio", index))
+        .map(|codec| codec.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    matches!(
+        codec.as_str(),
+        "ac3" | "eac3" | "dts" | "truehd" | "mlp" | "flac"
+    )
 }
 
 fn direct_play_profile_matches(item: &MediaItem, profile: &DirectPlayProfileMatcher) -> bool {
@@ -22567,6 +24881,28 @@ fn media_item_stream_codec(item: &MediaItem, stream_type: &str) -> Option<String
         let stream = stream.as_object()?;
         let type_matches = stream.get("Type").and_then(serde_json::Value::as_str)?;
         if !type_matches.eq_ignore_ascii_case(stream_type) {
+            return None;
+        }
+        stream
+            .get("Codec")
+            .and_then(serde_json::Value::as_str)
+            .filter(|codec| !codec.trim().is_empty())
+            .map(|codec| codec.trim().to_string())
+    })
+}
+
+fn media_item_stream_codec_by_index(
+    item: &MediaItem,
+    stream_type: &str,
+    index: i64,
+) -> Option<String> {
+    item.media_streams.iter().find_map(|stream| {
+        let stream = stream.as_object()?;
+        let type_matches = stream.get("Type").and_then(serde_json::Value::as_str)?;
+        if !type_matches.eq_ignore_ascii_case(stream_type) {
+            return None;
+        }
+        if stream.get("Index").and_then(json_value_i64) != Some(index) {
             return None;
         }
         stream
@@ -23332,7 +25668,7 @@ async fn hls_master_playlist_response_for(
                     .height
                     .and_then(|value| positive_u32(i64::from(value))),
             ),
-        codecs: hls_codecs(&session.item),
+        codecs: transcoded_hls_codecs(media_type),
     });
     playlist_response(playlist, include_body)
 }
@@ -23378,9 +25714,21 @@ async fn hls_media_playlist_response_for(
     let session =
         active_hls_transcode_session_for(state, headers, item_id, &query, route.media_type).await?;
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
+    if route.media_type == "Video"
+        && !is_live_tv_channel_id(item_id)
+        && let Some(playlist) =
+            render_seekable_hls_media_playlist(&session, item_id, raw_query, route.route_media_type)
+    {
+        return playlist_response(playlist, include_body);
+    }
+
     // Live TV HLS sessions use a longer readiness timeout because the HTTP live source
     // (HDHomeRun stream) may require extra buffering before ffmpeg writes the first segment.
-    let readiness_timeout = if is_live_tv_channel_id(item_id) {
+    let burns_image_subtitle = selected_subtitle_stream_is_image(
+        &media_item_streams(&session.item),
+        session.subtitle_stream_index,
+    );
+    let readiness_timeout = if is_live_tv_channel_id(item_id) || burns_image_subtitle {
         std::time::Duration::from_secs(LIVE_HLS_READINESS_TIMEOUT_SECS)
     } else {
         std::time::Duration::from_secs(5)
@@ -23455,13 +25803,142 @@ async fn hls_segment_response_for(
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
     let segment_id = u32::try_from(segment.segment_id)
         .map_err(|_| ApiError::not_found("HLS segment not found"))?;
+    let segment_path = layout.segment_path(segment_id);
+    let mut generated_on_demand = false;
+    if !segment_path.exists() && media_type == "Video" && !is_live_tv_channel_id(item_id) {
+        if should_generate_hls_segment_on_demand(&session, segment_id) {
+            generate_missing_hls_segment(&session, &layout, segment_id).await?;
+            generated_on_demand = true;
+        } else if !wait_for_hls_segment_ready(
+            &segment_path,
+            &layout.segment_path(segment_id.saturating_add(1)),
+            HLS_SEGMENT_WAIT_TIMEOUT,
+        )
+        .await?
+        {
+            if should_generate_hls_segment_on_demand(&session, segment_id) {
+                generate_missing_hls_segment(&session, &layout, segment_id).await?;
+                generated_on_demand = true;
+            }
+        }
+    }
+    if media_type == "Video"
+        && !is_live_tv_channel_id(item_id)
+        && !generated_on_demand
+        && !should_generate_hls_segment_on_demand(&session, segment_id)
+    {
+        wait_for_hls_segment_ready(
+            &segment_path,
+            &layout.segment_path(segment_id.saturating_add(1)),
+            HLS_SEGMENT_WAIT_TIMEOUT,
+        )
+        .await?;
+    }
     stream_path(
-        layout.segment_path(segment_id),
+        segment_path,
         "video/mp2t".to_string(),
         headers,
         include_body,
     )
     .await
+}
+
+async fn generate_missing_hls_segment(
+    session: &TranscodeSession,
+    layout: &HlsTranscodeLayout,
+    segment_id: u32,
+) -> Result<(), ApiError> {
+    let segment_path = layout.segment_path(segment_id);
+    if segment_path.exists() {
+        return Ok(());
+    }
+
+    let runtime_ticks = session.item.runtime_ticks.unwrap_or(0).max(0);
+    let start_position_ticks = hls_effective_start_position_ticks(
+        session.start_position_ticks,
+        session.item.runtime_ticks,
+    );
+    let segment_start_ticks = start_position_ticks + i64::from(segment_id) * hls_segment_ticks();
+    if runtime_ticks > 0 && segment_start_ticks >= runtime_ticks {
+        return Err(ApiError::not_found("HLS segment not found"));
+    }
+
+    tokio::fs::create_dir_all(&layout.session_dir).await?;
+    let segment_duration_ticks = if runtime_ticks > 0 {
+        (runtime_ticks - segment_start_ticks).min(hls_segment_ticks())
+    } else {
+        hls_segment_ticks()
+    }
+    .max(1);
+
+    let streams = media_item_streams(&session.item);
+    let mut request = HlsTranscodeRequest::new(
+        session.item.path.clone(),
+        layout
+            .session_dir
+            .join(format!("segment_{segment_id:05}.m3u8"))
+            .to_string_lossy()
+            .to_string(),
+        layout.segment_pattern_string(),
+        TranscodeStreamSelection {
+            video_stream_index: session.video_stream_index,
+            audio_stream_index: session.audio_stream_index,
+            subtitle_stream_index: session.subtitle_stream_index,
+        },
+    );
+    request.start_position_ticks = segment_start_ticks;
+    request.duration_ticks = Some(segment_duration_ticks);
+    request.hls_start_number = Some(segment_id);
+    request.output_ts_offset_ticks = Some(i64::from(segment_id) * hls_segment_ticks());
+    request.include_video = true;
+    request.burn_in_subtitle =
+        selected_subtitle_stream_is_image(&streams, session.subtitle_stream_index);
+
+    let command = build_hls_ffmpeg_command(&request);
+    let status = Command::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("failed to generate HLS seek segment: {error}"))
+        })?;
+    if !status.success() || !segment_path.exists() {
+        return Err(ApiError::not_found("HLS segment not found"));
+    }
+
+    Ok(())
+}
+
+fn should_generate_hls_segment_on_demand(session: &TranscodeSession, segment_id: u32) -> bool {
+    if !matches!(session.status.as_str(), "starting" | "running") {
+        return true;
+    }
+
+    let segment_ticks = hls_segment_ticks();
+    let requested_segment_start_ticks = i64::from(segment_id).saturating_mul(segment_ticks);
+    let continuous_transcode_ticks = session.position_ticks.max(0);
+    let seek_ahead_ticks = HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS.saturating_mul(segment_ticks);
+    requested_segment_start_ticks > continuous_transcode_ticks.saturating_add(seek_ahead_ticks)
+}
+
+async fn wait_for_hls_segment_ready(
+    path: &FsPath,
+    next_path: &FsPath,
+    timeout: StdDuration,
+) -> Result<bool, ApiError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() && next_path.exists() {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(path.exists());
+        }
+        tokio::time::sleep(HLS_SEGMENT_WAIT_POLL_INTERVAL).await;
+    }
 }
 
 pub(crate) async fn dlna_hls_master_playlist_response(
@@ -23481,7 +25958,7 @@ pub(crate) async fn dlna_hls_master_playlist_response(
             .width
             .and_then(|value| positive_u32(i64::from(value)))
             .zip(item.height.and_then(|value| positive_u32(i64::from(value)))),
-        codecs: hls_codecs(&item),
+        codecs: transcoded_hls_codecs("Video"),
     });
     playlist_response(playlist, include_body)
 }
@@ -23587,6 +26064,7 @@ async fn ensure_dlna_hls_transcode_session(
                 status: "starting".to_string(),
                 progress_percent: None,
                 position_ticks: 0,
+                start_position_ticks: 0,
             },
         )
         .await?;
@@ -25813,7 +28291,7 @@ async fn active_hls_transcode_session_for_live_tv(
     let layout = HlsTranscodeLayout::new(transcode_temp_root(), &new_play_session_id);
     tokio::fs::create_dir_all(&layout.session_dir).await?;
 
-    let request = HlsTranscodeRequest::new(
+    let mut request = HlsTranscodeRequest::new(
         input_path,
         layout.media_playlist_path.to_string_lossy().to_string(),
         layout.segment_pattern_string(),
@@ -25823,6 +28301,7 @@ async fn active_hls_transcode_session_for_live_tv(
             subtitle_stream_index: None,
         },
     );
+    request.event_playlist = true;
     let command = if is_legacy_hdhomerun {
         build_hls_ffmpeg_command_from_stdin(&request)
     } else {
@@ -26183,28 +28662,45 @@ async fn series_episodes(
         query.include_item_types.push("Episode".to_string());
     }
 
-    let mut episodes = filtered_media_items(
+    let candidate_episodes = filtered_media_items(
         state.db.media_items().await?,
         &query,
         Some(requested_user_id),
         &state.db,
     )
-    .await?
-    .into_iter()
-    .filter(|item| tv_episode_matches_series(item, &series_id))
-    .filter(|item| {
-        query
-            .season_id
-            .as_deref()
-            .is_none_or(|season_id| tv_episode_matches_season(item, season_id))
-    })
-    .collect::<Vec<_>>();
+    .await?;
+    let metadata_by_item = media_metadata_by_item_id(
+        &state.db,
+        candidate_episodes
+            .iter()
+            .map(|episode| episode.id)
+            .collect(),
+    )
+    .await?;
+    let mut episodes = candidate_episodes
+        .into_iter()
+        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &series_id))
+        .filter(|item| {
+            query.season_id.as_deref().is_none_or(|season_id| {
+                tv_episode_matches_season(item, metadata_by_item.get(&item.id), season_id)
+            })
+        })
+        .collect::<Vec<_>>();
     if episodes.is_empty()
-        && series_name_for_id(state.db.media_items().await?, &series_id).is_none()
+        && series_name_for_id(state.db.media_items().await?, &state.db, &series_id)
+            .await?
+            .is_none()
     {
         return Err(ApiError::not_found("Series not found"));
     }
-    episodes.sort_by(compare_tv_episodes);
+    episodes.sort_by(|left, right| {
+        compare_tv_episodes_with_metadata(
+            left,
+            metadata_by_item.get(&left.id),
+            right,
+            metadata_by_item.get(&right.id),
+        )
+    });
 
     let total_record_count = episodes.len();
     let server_id = state.db.server_state().await?.server_id.to_string();
@@ -26241,27 +28737,59 @@ async fn series_seasons(
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
 
-    let episodes = state
+    let candidate_episodes = state
         .db
         .media_items()
         .await?
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, &series_id))
+        .collect::<Vec<_>>();
+    let metadata_by_item = media_metadata_by_item_id(
+        &state.db,
+        candidate_episodes
+            .iter()
+            .map(|episode| episode.id)
+            .collect(),
+    )
+    .await?;
+    let episodes = candidate_episodes
+        .into_iter()
+        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &series_id))
         .collect::<Vec<_>>();
     let series_name = episodes
         .iter()
         .find_map(|item| tv_episode_info(item).map(|info| info.series_name))
         .ok_or_else(|| ApiError::not_found("Series not found"))?;
-    let mut seasons = BTreeMap::<Option<i32>, usize>::new();
+    let series_id = episodes
+        .iter()
+        .find_map(|episode| {
+            metadata_by_item
+                .get(&episode.id)
+                .and_then(|metadata| canonical_metadata_uuid_from_json(metadata, &["SeriesId"]))
+        })
+        .unwrap_or_else(|| tv_series_id(&series_name));
+    let mut seasons = BTreeMap::<Option<i32>, TvSeasonSummary>::new();
     for episode in &episodes {
         let season_number = tv_episode_info(episode).and_then(|info| info.season_number);
-        *seasons.entry(season_number).or_insert(0) += 1;
+        let playback = state
+            .db
+            .playback_state_for_item(requested_user_id, episode.id)
+            .await?;
+        let entry = seasons
+            .entry(season_number)
+            .or_insert_with(|| TvSeasonSummary::new(season_number));
+        entry.episode_count += 1;
+        if playback.is_none_or(|state| !state.played) {
+            entry.unplayed_count += 1;
+        }
+        if let Some(metadata) = metadata_by_item.get(&episode.id) {
+            entry.merge_episode_metadata(metadata);
+        }
     }
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut season_items = seasons
         .into_iter()
-        .map(|(season_number, episode_count)| {
-            tv_season_json(&server_id, &series_name, season_number, episode_count)
+        .map(|(_season_number, summary)| {
+            tv_season_json(&server_id, &series_name, &series_id, summary)
         })
         .collect::<Vec<_>>();
     season_items.sort_by(|left, right| {
@@ -26464,7 +28992,15 @@ async fn metadata_genres(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_collection(state, headers, auth_query, raw_query, "Genres", "Genre").await
+    metadata_collection_keys(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        &["Genres", "SeriesGenres"],
+        "Genre",
+    )
+    .await
 }
 
 async fn metadata_music_genres(
@@ -26541,7 +29077,15 @@ async fn metadata_persons(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_collection(state, headers, auth_query, raw_query, "People", "Person").await
+    metadata_collection_keys(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        &["People", "SeriesPeople", "Cast"],
+        "Person",
+    )
+    .await
 }
 
 async fn metadata_studios(
@@ -26550,7 +29094,15 @@ async fn metadata_studios(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    metadata_collection(state, headers, auth_query, raw_query, "Studios", "Studio").await
+    metadata_collection_keys(
+        state,
+        headers,
+        auth_query,
+        raw_query,
+        &["Studios", "SeriesStudios"],
+        "Studio",
+    )
+    .await
 }
 
 async fn metadata_years(
@@ -26652,7 +29204,7 @@ async fn metadata_genre_by_name(
         name,
         MetadataEntitySpec {
             item_type: "Genre",
-            metadata_keys: &["Genres"],
+            metadata_keys: &["Genres", "SeriesGenres"],
             production_year: None,
         },
     )
@@ -26718,7 +29270,7 @@ async fn metadata_person_by_name(
         name,
         MetadataEntitySpec {
             item_type: "Person",
-            metadata_keys: &["People"],
+            metadata_keys: &["People", "SeriesPeople", "Cast"],
             production_year: None,
         },
     )
@@ -26740,7 +29292,7 @@ async fn metadata_studio_by_name(
         name,
         MetadataEntitySpec {
             item_type: "Studio",
-            metadata_keys: &["Studios"],
+            metadata_keys: &["Studios", "SeriesStudios"],
             production_year: None,
         },
     )
@@ -26895,6 +29447,29 @@ fn metadata_remote_trailers(
         }
     }
     trailers
+}
+
+fn metadata_has_remote_trailer(metadata: &serde_json::Value) -> bool {
+    ["RemoteTrailers", "Trailers"].iter().any(|key| {
+        json_field_case_insensitive(metadata, key).is_some_and(|value| match value {
+            serde_json::Value::Array(values) => values.iter().any(remote_trailer_value_has_url),
+            value => remote_trailer_value_has_url(value),
+        })
+    })
+}
+
+fn remote_trailer_value_has_url(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Object(object) => object
+            .get("Url")
+            .or_else(|| object.get("url"))
+            .or_else(|| object.get("Path"))
+            .or_else(|| object.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty()),
+        _ => false,
+    }
 }
 
 fn collect_remote_trailer_values(
@@ -27101,6 +29676,11 @@ fn metadata_entity_json(
     production_year: Option<i32>,
 ) -> serde_json::Value {
     let id = stable_entity_id(item_type, name);
+    let image_tags = if item_type.eq_ignore_ascii_case("Person") {
+        serde_json::json!({ "Primary": default_primary_image_tag(&id) })
+    } else {
+        serde_json::json!({})
+    };
     serde_json::json!({
         "Name": name,
         "OriginalTitle": null,
@@ -27128,10 +29708,225 @@ fn metadata_entity_json(
         "MediaType": null,
         "ProductionYear": production_year,
         "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
-        "ImageTags": {},
+        "ImageTags": image_tags,
         "BackdropImageTags": [],
         "LocationType": "Virtual"
     })
+}
+
+struct MetadataEntityMatch {
+    name: String,
+    item_type: &'static str,
+    production_year: Option<i32>,
+    metadata: Option<serde_json::Value>,
+}
+
+fn metadata_entity_match_json(server_id: &str, entity: &MetadataEntityMatch) -> serde_json::Value {
+    let mut value = metadata_entity_json(
+        server_id,
+        &entity.name,
+        entity.item_type,
+        entity.production_year,
+    );
+    if let Some(metadata) = entity.metadata.as_ref() {
+        apply_metadata_entity_details(&mut value, metadata, entity.item_type);
+    }
+    value
+}
+
+fn apply_metadata_entity_details(
+    value: &mut serde_json::Value,
+    metadata: &serde_json::Value,
+    item_type: &str,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(id) = first_metadata_value_from_json(metadata, &["Id"]) {
+        object.insert("Id".to_string(), serde_json::Value::String(id));
+    }
+    for key in [
+        "Overview",
+        "PrimaryImageAspectRatio",
+        "SeriesCount",
+        "EpisodeCount",
+        "MovieCount",
+        "AlbumCount",
+        "ArtistCount",
+        "SongCount",
+        "MusicVideoCount",
+        "TrailerCount",
+        "ProgramCount",
+        "SpecialFeatureCount",
+        "LocalTrailerCount",
+        "ChildCount",
+    ] {
+        if let Some(field_value) = json_field_case_insensitive(metadata, key)
+            && !field_value.is_null()
+        {
+            object.insert(key.to_string(), field_value.clone());
+        }
+    }
+    if let Some(provider_ids) = metadata_entity_provider_ids(metadata) {
+        object.insert("ProviderIds".to_string(), provider_ids.clone());
+        object.insert(
+            "ExternalUrls".to_string(),
+            serde_json::json!(external_urls_from_metadata_entity_provider_ids(
+                &provider_ids,
+                item_type
+            )),
+        );
+    }
+    if let Some(primary_tag) = first_metadata_value_from_json(metadata, &["PrimaryImageTag"]) {
+        object.insert(
+            "ImageTags".to_string(),
+            serde_json::json!({ "Primary": primary_tag }),
+        );
+    }
+    for key in ["People", "Tags", "Studios", "GenreItems"] {
+        object
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::json!([]));
+    }
+}
+
+async fn metadata_entity_by_stable_id(
+    db: &Database,
+    entity_id: &str,
+) -> Result<Option<MetadataEntityMatch>, ApiError> {
+    let entity_id = parse_jellyfin_uuid(entity_id)?.simple().to_string();
+    let specs = [
+        ("Genre", &["Genres", "SeriesGenres"][..]),
+        ("MusicGenre", &["MusicGenres"][..]),
+        ("MusicArtist", &["Artists", "AlbumArtists"][..]),
+        ("Person", &["People", "SeriesPeople", "Cast"][..]),
+        ("Studio", &["Studios", "SeriesStudios"][..]),
+        ("Year", &["ProductionYear"][..]),
+    ];
+    for metadata in db.media_item_metadata().await? {
+        for (item_type, keys) in specs {
+            for key in keys {
+                let Some(value) = json_field_case_insensitive(&metadata.payload, key) else {
+                    continue;
+                };
+                if item_type == "Person"
+                    && let Some(entity) = metadata_person_entity_match(value, &entity_id)
+                {
+                    return Ok(Some(entity));
+                }
+                let mut values = BTreeMap::<String, String>::new();
+                collect_metadata_value(value, &mut values);
+                for name in values.into_values() {
+                    if stable_entity_id(item_type, &name).eq_ignore_ascii_case(&entity_id) {
+                        let production_year = if item_type == "Year" {
+                            name.parse::<i32>().ok()
+                        } else {
+                            None
+                        };
+                        return Ok(Some(MetadataEntityMatch {
+                            name,
+                            item_type,
+                            production_year,
+                            metadata: None,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn metadata_entity_provider_ids(metadata: &serde_json::Value) -> Option<serde_json::Value> {
+    let value = json_field_case_insensitive(metadata, "ProviderIds")?;
+    if value.is_object() {
+        return Some(value.clone());
+    }
+    let parsed = value
+        .as_str()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())?;
+    if parsed.is_object() {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+fn metadata_person_entity_match(
+    value: &serde_json::Value,
+    entity_id: &str,
+) -> Option<MetadataEntityMatch> {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| metadata_person_entity_match(value, entity_id)),
+        serde_json::Value::Object(object) => {
+            let name = object.get("Name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let imported_id = object
+                .get("Id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| id.trim());
+            let matches_imported_id =
+                imported_id.is_some_and(|id| !id.is_empty() && id.eq_ignore_ascii_case(entity_id));
+            if !matches_imported_id
+                && !stable_entity_id("Person", name).eq_ignore_ascii_case(entity_id)
+            {
+                return None;
+            }
+            Some(MetadataEntityMatch {
+                name: name.to_string(),
+                item_type: "Person",
+                production_year: None,
+                metadata: Some(serde_json::Value::Object(object.clone())),
+            })
+        }
+        serde_json::Value::String(name) => {
+            let name = name.trim();
+            if name.is_empty() || !stable_entity_id("Person", name).eq_ignore_ascii_case(entity_id)
+            {
+                return None;
+            }
+            Some(MetadataEntityMatch {
+                name: name.to_string(),
+                item_type: "Person",
+                production_year: None,
+                metadata: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn external_urls_from_metadata_entity_provider_ids(
+    provider_ids: &serde_json::Value,
+    item_type: &str,
+) -> Vec<serde_json::Value> {
+    let Some(provider_ids) = provider_ids.as_object() else {
+        return Vec::new();
+    };
+    provider_ids
+        .iter()
+        .filter_map(|(name, value)| {
+            let id = value.as_str()?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let url = match (
+                item_type.to_ascii_lowercase().as_str(),
+                name.to_ascii_lowercase().as_str(),
+            ) {
+                ("person", "tmdb") => format!("https://www.themoviedb.org/person/{id}"),
+                (_, "imdb") => format!("https://www.imdb.com/title/{id}"),
+                (_, "tmdb") => format!("https://www.themoviedb.org/tv/{id}"),
+                (_, "tvdb") => format!("https://thetvdb.com/dereferrer/series/{id}"),
+                _ => return None,
+            };
+            Some(serde_json::json!({ "Name": name, "Url": url }))
+        })
+        .collect()
 }
 
 fn stable_entity_id(item_type: &str, name: &str) -> String {
@@ -27244,6 +30039,12 @@ async fn channel_items(
     Path(channel_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    if matches!(
+        channel_provider_availability(&state.db, &channel_id).await?,
+        ChannelProviderAvailability::KnownUnavailable
+    ) {
+        return Err(ApiError::not_found("Channel not found"));
+    }
     let mut items = channel_content_items(&state.db, Some(&channel_id)).await?;
     filter_channel_items_by_search(&mut items, query.search_term.as_deref());
     let total = items.len();
@@ -27254,6 +30055,46 @@ async fn channel_items(
         total,
         start_index,
     )))
+}
+
+enum ChannelProviderAvailability {
+    Available,
+    KnownUnavailable,
+    Unknown,
+}
+
+async fn channel_provider_availability(
+    db: &Database,
+    channel_id: &str,
+) -> Result<ChannelProviderAvailability, ApiError> {
+    if channel_id.eq_ignore_ascii_case("livetv") {
+        return Ok(if configured_live_tv_channel_items(db).await?.is_empty() {
+            ChannelProviderAvailability::Unknown
+        } else {
+            ChannelProviderAvailability::Available
+        });
+    }
+    for provider in configured_channel_provider_descriptors(db).await? {
+        let provider_id =
+            json_string_field(&provider, "Id").or_else(|| json_string_field(&provider, "Name"));
+        if provider_id.is_some_and(|provider_id| provider_id.eq_ignore_ascii_case(channel_id)) {
+            return Ok(if channel_provider_is_healthy(&provider) {
+                ChannelProviderAvailability::Available
+            } else {
+                ChannelProviderAvailability::KnownUnavailable
+            });
+        }
+    }
+    for snapshot in plugin_channel_provider_snapshots(db).await? {
+        if snapshot.id.eq_ignore_ascii_case(channel_id) {
+            return Ok(if snapshot.included {
+                ChannelProviderAvailability::Available
+            } else {
+                ChannelProviderAvailability::KnownUnavailable
+            });
+        }
+    }
+    Ok(ChannelProviderAvailability::Unknown)
 }
 
 async fn channel_features(
@@ -27357,13 +30198,6 @@ async fn channel_content_items(
         }
     }
 
-    if items.is_empty()
-        && channel_id.is_some_and(|channel_id| {
-            !channel_id.eq_ignore_ascii_case("livetv") && !channel_id.trim().is_empty()
-        })
-    {
-        return Err(ApiError::not_found("Channel not found"));
-    }
     Ok(items)
 }
 
@@ -27608,8 +30442,9 @@ async fn channel_feature_items(
         && channel_id.is_some_and(|channel_id| {
             !channel_id.eq_ignore_ascii_case("livetv") && !channel_id.trim().is_empty()
         })
+        && let Some(channel_id) = channel_id
     {
-        return Err(ApiError::not_found("Channel not found"));
+        features.push(channel_feature_json(channel_id, channel_id));
     }
     Ok(features)
 }
@@ -28174,6 +31009,25 @@ async fn authenticated_item_special_features(
     authenticated_item_sidecars(state, headers, query, item_id, SidecarKind::SpecialFeature).await
 }
 
+async fn authenticated_item_local_trailers_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    authenticated_item_sidecar_list(state, headers, query, item_id, SidecarKind::LocalTrailer).await
+}
+
+async fn authenticated_item_special_features_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(item_id): Path<String>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    authenticated_item_sidecar_list(state, headers, query, item_id, SidecarKind::SpecialFeature)
+        .await
+}
+
 async fn user_item_intros(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -28229,6 +31083,18 @@ async fn authenticated_item_sidecars(
     local_sidecar_result(&state.db, &item, user.id, kind).await
 }
 
+async fn authenticated_item_sidecar_list(
+    state: AppState,
+    headers: HeaderMap,
+    query: AuthQuery,
+    item_id: String,
+    kind: SidecarKind,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let item = media_item_by_id(&state.db, &item_id).await?;
+    local_sidecar_list(&state.db, &item, user.id, kind).await
+}
+
 async fn user_item_sidecars(
     state: AppState,
     headers: HeaderMap,
@@ -28242,6 +31108,19 @@ async fn user_item_sidecars(
     ensure_user_access(&auth_user, user_id)?;
     let item = media_item_by_id(&state.db, &item_id).await?;
     local_sidecar_result(&state.db, &item, user_id, kind).await
+}
+
+async fn local_sidecar_list(
+    db: &Database,
+    source: &MediaItem,
+    user_id: Uuid,
+    kind: SidecarKind,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let server_id = db.server_state().await?.server_id.to_string();
+    let items = local_sidecar_items(db, source, kind).await?;
+    Ok(Json(
+        items_to_json(db, items, &server_id, Some(user_id), false).await?,
+    ))
 }
 
 async fn local_sidecar_result(
@@ -28534,16 +31413,35 @@ async fn authenticated_item_theme_media(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
-    let source = media_item_by_id(&state.db, &item_id).await?;
+    let source = match media_item_by_id(&state.db, &item_id).await {
+        Ok(source) => source,
+        Err(error)
+            if error.status == StatusCode::NOT_FOUND
+                && virtual_tv_item_exists(&state.db, &item_id).await? =>
+        {
+            return Ok(Json(empty_theme_media_result()));
+        }
+        Err(error) => return Err(error),
+    };
     let theme_videos =
         theme_items_result(&state.db, &source, requested_user_id, "Video", &query).await?;
     let theme_songs =
         theme_items_result(&state.db, &source, requested_user_id, "Audio", &query).await?;
+    let soundtrack_songs =
+        soundtrack_items_result(&state.db, &source, requested_user_id, &query).await?;
     Ok(Json(serde_json::json!({
         "ThemeVideosResult": theme_videos,
         "ThemeSongsResult": theme_songs,
-        "SoundtrackSongsResult": query_result(Vec::new())
+        "SoundtrackSongsResult": soundtrack_songs
     })))
+}
+
+fn empty_theme_media_result() -> serde_json::Value {
+    serde_json::json!({
+        "ThemeVideosResult": query_result(Vec::new()),
+        "ThemeSongsResult": query_result(Vec::new()),
+        "SoundtrackSongsResult": query_result(Vec::new())
+    })
 }
 
 async fn authenticated_item_theme_songs(
@@ -28620,6 +31518,72 @@ async fn theme_items_result(
     ))
 }
 
+async fn soundtrack_items_result(
+    db: &Database,
+    source: &MediaItem,
+    user_id: Uuid,
+    query: &ItemsQuery,
+) -> Result<serde_json::Value, ApiError> {
+    let all_items = db.media_items().await?;
+    let metadata_by_item =
+        media_metadata_by_item_id(db, all_items.iter().map(|item| item.id).collect()).await?;
+    let source_terms = soundtrack_match_terms(metadata_by_item.get(&source.id));
+    if source_terms.is_empty() {
+        return Ok(query_result(Vec::new()));
+    }
+
+    let mut scored = all_items
+        .into_iter()
+        .filter(|item| item.id != source.id && item.media_type == "Audio")
+        .filter_map(|item| {
+            let terms = soundtrack_match_terms(metadata_by_item.get(&item.id));
+            let score = terms.intersection(&source_terms).count();
+            (score > 0).then_some((score, item))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left_score, left_item), (right_score, right_item)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| compare_media_items(left_item, right_item, &[SortField::SortName]))
+    });
+
+    let total_record_count = scored.len();
+    let items = scored
+        .into_iter()
+        .map(|(_, item)| item)
+        .skip(query.start_index.unwrap_or(0))
+        .take(query.limit.unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
+    let server_id = db.server_state().await?.server_id.to_string();
+    Ok(query_result_with_total(
+        items_to_json(db, items, &server_id, Some(user_id), false).await?,
+        total_record_count,
+        query.start_index.unwrap_or(0),
+    ))
+}
+
+fn soundtrack_match_terms(metadata: Option<&serde_json::Value>) -> BTreeSet<String> {
+    let Some(metadata) = metadata else {
+        return BTreeSet::new();
+    };
+    let mut values = BTreeMap::<String, String>::new();
+    for key in [
+        "Album",
+        "AlbumName",
+        "Albums",
+        "Artists",
+        "AlbumArtists",
+        "Genres",
+        "MusicGenres",
+        "Tags",
+    ] {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
+            collect_metadata_value(value, &mut values);
+        }
+    }
+    values.into_keys().collect()
+}
+
 fn is_theme_item_for_source(source: &MediaItem, item: &MediaItem, media_type: &str) -> bool {
     if item.id == source.id || item.media_type != media_type {
         return false;
@@ -28653,7 +31617,16 @@ async fn authenticated_similar_items(
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
 
-    similar_items_for_media_source(&state, &query, requested_user_id, &item_id).await
+    match similar_items_for_media_source(&state, &query, requested_user_id, &item_id).await {
+        Ok(response) => Ok(response),
+        Err(error)
+            if error.status == StatusCode::NOT_FOUND
+                && virtual_tv_item_exists(&state.db, &item_id).await? =>
+        {
+            Ok(Json(query_result(Vec::new())))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn authenticated_similar_album_items(
@@ -28732,16 +31705,25 @@ async fn authenticated_similar_show_items(
     items_query.sort_by = None;
     items_query.sort_order = None;
 
-    let mut episodes = filtered_media_items(
+    let candidate_episodes = filtered_media_items(
         state.db.media_items().await?,
         &items_query,
         Some(requested_user_id),
         &state.db,
     )
-    .await?
-    .into_iter()
-    .filter(|item| tv_episode_matches_series(item, &item_id))
-    .collect::<Vec<_>>();
+    .await?;
+    let metadata_by_item = media_metadata_by_item_id(
+        &state.db,
+        candidate_episodes
+            .iter()
+            .map(|episode| episode.id)
+            .collect(),
+    )
+    .await?;
+    let mut episodes = candidate_episodes
+        .into_iter()
+        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &item_id))
+        .collect::<Vec<_>>();
     if episodes.is_empty() {
         return Err(ApiError::not_found("Similar source not found"));
     }
@@ -29035,8 +32017,18 @@ async fn item_filters(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let query = parse_items_query(raw_query.as_deref());
-    let items =
-        filtered_items_for_query(&state, &headers, auth_query.api_key.as_deref(), &query).await?;
+    let mut filter_query = query.clone();
+    if query_requests_only_item_type(&filter_query, "Series") {
+        filter_query.include_item_types = vec!["Episode".to_string()];
+        filter_query.ids = None;
+    }
+    let items = filtered_items_for_query(
+        &state,
+        &headers,
+        auth_query.api_key.as_deref(),
+        &filter_query,
+    )
+    .await?;
     let media_types = items
         .iter()
         .map(|item| item.media_type.clone())
@@ -29049,6 +32041,13 @@ async fn item_filters(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let video_types = items
+        .iter()
+        .filter(|item| item.media_type.eq_ignore_ascii_case("Video"))
+        .map(|_| "VideoFile".to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let metadata_values = item_filter_metadata_values(&state.db, &items).await?;
 
     Ok(Json(serde_json::json!({
@@ -29058,14 +32057,14 @@ async fn item_filters(
         "Years": metadata_values.years.into_values().collect::<Vec<_>>(),
         "Containers": containers,
         "MediaTypes": media_types,
-        "VideoTypes": [],
-        "SeriesStatuses": [],
-        "Staff": [],
+        "VideoTypes": video_types,
+        "SeriesStatuses": metadata_values.series_statuses.into_values().collect::<Vec<_>>(),
+        "Staff": metadata_values.staff.into_values().collect::<Vec<_>>(),
         "Artists": metadata_values.artists.into_values().collect::<Vec<_>>(),
         "Albums": metadata_values.albums.into_values().collect::<Vec<_>>(),
         "Studios": metadata_values.studios.into_values().collect::<Vec<_>>(),
-        "Trailers": [],
-        "Features": []
+        "Trailers": metadata_values.trailers.into_values().collect::<Vec<_>>(),
+        "Features": metadata_values.features.into_values().collect::<Vec<_>>()
     })))
 }
 
@@ -29082,19 +32081,25 @@ async fn query_filters(
     Ok(Json(serde_json::json!({
         "Genres": metadata_values.genres.into_values().collect::<Vec<_>>(),
         "Tags": metadata_values.tags.into_values().collect::<Vec<_>>(),
-        "AudioLanguages": [],
-        "SubtitleLanguages": []
+        "AudioLanguages": metadata_values.audio_languages.into_values().collect::<Vec<_>>(),
+        "SubtitleLanguages": metadata_values.subtitle_languages.into_values().collect::<Vec<_>>()
     })))
 }
 
 #[derive(Default)]
 struct ItemFilterMetadataValues {
     albums: BTreeMap<String, String>,
+    audio_languages: BTreeMap<String, String>,
     artists: BTreeMap<String, String>,
+    features: BTreeMap<String, String>,
     genres: BTreeMap<String, String>,
     official_ratings: BTreeMap<String, String>,
+    series_statuses: BTreeMap<String, String>,
+    staff: BTreeMap<String, serde_json::Value>,
     studios: BTreeMap<String, String>,
+    subtitle_languages: BTreeMap<String, String>,
     tags: BTreeMap<String, String>,
+    trailers: BTreeMap<String, String>,
     years: BTreeMap<String, String>,
 }
 
@@ -29107,6 +32112,16 @@ async fn item_filter_metadata_values(
     }
     let item_ids = items.iter().map(|item| item.id).collect::<HashSet<_>>();
     let mut values = ItemFilterMetadataValues::default();
+    for item in items {
+        collect_media_item_stream_languages(item, "Audio", &mut values.audio_languages);
+        collect_media_item_stream_languages(item, "Subtitle", &mut values.subtitle_languages);
+        if media_item_has_stream_type(item, "Subtitle") {
+            values
+                .features
+                .entry("hassubtitles".to_string())
+                .or_insert_with(|| "HasSubtitles".to_string());
+        }
+    }
     for metadata in db.media_item_metadata().await? {
         if item_ids.contains(&metadata.item_id) {
             collect_item_count_metadata_value(&metadata, "Album", &mut values.albums);
@@ -29125,6 +32140,23 @@ async fn item_filter_metadata_values(
                 &mut values.official_ratings,
             );
             collect_item_count_metadata_value(&metadata, "Studios", &mut values.studios);
+            collect_item_count_metadata_value(
+                &metadata,
+                "SeriesStatus",
+                &mut values.series_statuses,
+            );
+            collect_item_filter_staff_value(&metadata, "People", &mut values.staff);
+            collect_item_filter_staff_value(&metadata, "SeriesPeople", &mut values.staff);
+            if metadata_has_remote_trailer(&metadata.payload) {
+                values
+                    .features
+                    .entry("hastrailer".to_string())
+                    .or_insert_with(|| "HasTrailer".to_string());
+                values
+                    .trailers
+                    .entry("trailer".to_string())
+                    .or_insert_with(|| "Trailer".to_string());
+            }
             collect_item_count_metadata_value(&metadata, "Tags", &mut values.tags);
             collect_item_count_metadata_value(&metadata, "ProductionYear", &mut values.years);
             collect_item_count_metadata_value(&metadata, "Years", &mut values.years);
@@ -29185,14 +32217,51 @@ async fn filtered_media_items(
     let include_types = csv_values_lowercase(&query.include_item_types);
     let exclude_types = csv_values_lowercase(&query.exclude_item_types);
     let media_types = csv_values_lowercase(&query.media_types);
+    let containers = csv_values_lowercase(&query.containers);
+    let video_types = csv_values_lowercase(&query.video_types);
+    let audio_languages = csv_values_lowercase(&query.audio_languages);
+    let subtitle_languages = csv_values_lowercase(&query.subtitle_languages);
+    let person_ids = csv_values_lowercase(&query.person_ids);
+    let genre_ids = csv_values_lowercase(&query.genre_ids);
+    let studio_ids = csv_values_lowercase(&query.studio_ids);
+    let official_ratings = csv_values_lowercase(&query.official_ratings);
+    let tags = csv_values_lowercase(&query.tags);
+    let series_status = csv_values_lowercase(&query.series_status);
+    let years = csv_values_lowercase(&query.years);
     let filters = csv_values_lowercase(&query.filters);
+    let location_types = csv_values_lowercase(&query.location_types);
+    let exclude_location_types = csv_values_lowercase(&query.exclude_location_types);
     let search_term = query
         .search_term
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
-    let metadata_search_by_item = if search_term.is_some() {
+    let metadata_by_item = if search_term.is_some()
+        || person_ids.is_some()
+        || genre_ids.is_some()
+        || studio_ids.is_some()
+        || official_ratings.is_some()
+        || tags.is_some()
+        || series_status.is_some()
+        || query.has_trailer.is_some()
+        || query.has_overview.is_some()
+        || query.has_imdb_id.is_some()
+        || query.has_tmdb_id.is_some()
+        || query.has_tvdb_id.is_some()
+        || query.has_official_rating.is_some()
+        || query.is_locked.is_some()
+        || filters
+            .as_deref()
+            .is_some_and(|filters| filters.iter().any(|filter| filter == "hastrailer"))
+        || years.is_some()
+        || query.min_community_rating.is_some()
+        || query.max_community_rating.is_some()
+        || query.min_critic_rating.is_some()
+        || query.max_critic_rating.is_some()
+        || query.min_premiere_date.is_some()
+        || query.max_premiere_date.is_some()
+    {
         Some(media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?)
     } else {
         None
@@ -29207,11 +32276,65 @@ async fn filtered_media_items(
     let is_played_filter = query
         .is_played
         .or_else(|| filters.as_deref().and_then(played_filter_value));
+    let has_subtitles_filter = query.has_subtitles.or_else(|| {
+        filters
+            .as_deref()
+            .is_some_and(|filters| filters.iter().any(|filter| filter == "hassubtitles"))
+            .then_some(true)
+    });
+    let has_trailer_filter = query.has_trailer.or_else(|| {
+        filters
+            .as_deref()
+            .is_some_and(|filters| filters.iter().any(|filter| filter == "hastrailer"))
+            .then_some(true)
+    });
+    let min_premiere_date = query
+        .min_premiere_date
+        .as_deref()
+        .and_then(parse_item_query_date);
+    let max_premiere_date = query
+        .max_premiere_date
+        .as_deref()
+        .and_then(parse_item_query_date);
+    let min_date_created = query
+        .min_date_created
+        .as_deref()
+        .and_then(parse_item_query_date);
+    let max_date_created = query
+        .max_date_created
+        .as_deref()
+        .and_then(parse_item_query_date);
+    let min_date_last_saved = query
+        .min_date_last_saved
+        .as_deref()
+        .and_then(parse_item_query_date);
+    let max_date_last_saved = query
+        .max_date_last_saved
+        .as_deref()
+        .and_then(parse_item_query_date);
+    let parent_folder_ids = if let Some(parent_id) = parent_id {
+        let folders = db.virtual_folders().await?;
+        let mut ids = HashSet::from([parent_id]);
+        if let Some(parent) = folders.iter().find(|folder| folder.id == parent_id) {
+            for child in child_virtual_folders(parent, &folders) {
+                ids.insert(child.id);
+            }
+        }
+        Some(ids)
+    } else {
+        None
+    };
 
     let mut items = items
         .into_iter()
         .filter(|item| ids.as_ref().is_none_or(|ids| ids.contains(&item.id)))
-        .filter(|item| parent_id.is_none_or(|parent_id| item.virtual_folder_id == parent_id))
+        .filter(|item| {
+            parent_folder_ids
+                .as_ref()
+                .is_some_and(|parent_ids| parent_ids.contains(&item.virtual_folder_id))
+                || (parent_folder_ids.is_none()
+                    && parent_id.is_none_or(|parent_id| item.virtual_folder_id == parent_id))
+        })
         .filter(|item| {
             include_types.as_ref().is_none_or(|types| {
                 let item_type = media_item_type(item).to_ascii_lowercase();
@@ -29230,15 +32353,204 @@ async fn filtered_media_items(
                 types.iter().any(|allowed| allowed == &media_type)
             })
         })
+        .filter(|item| {
+            location_types.as_ref().is_none_or(|types| {
+                let location_type = media_item_location_type(item).to_ascii_lowercase();
+                types.iter().any(|allowed| allowed == &location_type)
+            })
+        })
+        .filter(|item| {
+            exclude_location_types.as_ref().is_none_or(|types| {
+                let location_type = media_item_location_type(item).to_ascii_lowercase();
+                !types.iter().any(|excluded| excluded == &location_type)
+            })
+        })
+        .filter(|item| {
+            containers.as_ref().is_none_or(|containers| {
+                media_item_container(item)
+                    .map(|container| container.to_ascii_lowercase())
+                    .is_some_and(|container| containers.iter().any(|allowed| allowed == &container))
+            })
+        })
+        .filter(|item| {
+            video_types.as_ref().is_none_or(|video_types| {
+                let video_type = if item.media_type.eq_ignore_ascii_case("Video") {
+                    "videofile"
+                } else {
+                    "unknown"
+                };
+                video_types.iter().any(|allowed| allowed == video_type)
+            })
+        })
+        .filter(|item| {
+            audio_languages
+                .as_ref()
+                .is_none_or(|languages| media_item_has_stream_language(item, "Audio", languages))
+        })
+        .filter(|item| {
+            subtitle_languages
+                .as_ref()
+                .is_none_or(|languages| media_item_has_stream_language(item, "Subtitle", languages))
+        })
+        .filter(|item| {
+            has_subtitles_filter
+                .is_none_or(|expected| media_item_has_stream_type(item, "Subtitle") == expected)
+        })
+        .filter(|item| {
+            has_trailer_filter.is_none_or(|expected| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(metadata_has_remote_trailer)
+                    == expected
+            })
+        })
+        .filter(|item| {
+            query.has_overview.is_none_or(|expected| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(metadata_has_overview)
+                    == expected
+            })
+        })
+        .filter(|item| provider_filter_matches(item, metadata_by_item.as_ref(), query))
+        .filter(|item| media_item_dimension_filters_match(item, query))
+        .filter(|_| query.is_missing.is_none_or(|expected| !expected))
+        .filter(|_| query.is_unaired.is_none_or(|expected| !expected))
+        .filter(|item| {
+            metadata_flag_filters_match(
+                item,
+                metadata_by_item.as_ref(),
+                query.has_official_rating,
+                query.is_locked,
+            )
+        })
+        .filter(|item| {
+            min_date_created.is_none_or(|min| item.created_at >= min)
+                && max_date_created.is_none_or(|max| item.created_at <= max)
+                && min_date_last_saved.is_none_or(|min| item.updated_at >= min)
+                && max_date_last_saved.is_none_or(|max| item.updated_at <= max)
+        })
         .filter(|_| is_folder_filter.is_none_or(|is_folder| !is_folder))
         .filter(|item| {
             search_term.as_ref().is_none_or(|term| {
                 item.name.to_ascii_lowercase().contains(term)
-                    || metadata_search_by_item
+                    || metadata_by_item
                         .as_ref()
                         .and_then(|metadata| metadata.get(&item.id))
                         .is_some_and(|metadata| metadata_value_matches_search(metadata, term))
             })
+        })
+        .filter(|item| {
+            person_ids.as_ref().is_none_or(|person_ids| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(|metadata| {
+                        metadata_matches_entity_ids(
+                            metadata,
+                            "Person",
+                            &["People", "Cast", "SeriesPeople"],
+                            person_ids,
+                        )
+                    })
+            })
+        })
+        .filter(|item| {
+            genre_ids.as_ref().is_none_or(|genre_ids| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(|metadata| {
+                        metadata_matches_entity_ids(
+                            metadata,
+                            "Genre",
+                            &["Genres", "SeriesGenres"],
+                            genre_ids,
+                        )
+                    })
+            })
+        })
+        .filter(|item| {
+            studio_ids.as_ref().is_none_or(|studio_ids| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(|metadata| {
+                        metadata_matches_entity_ids(
+                            metadata,
+                            "Studio",
+                            &["Studios", "SeriesStudios"],
+                            studio_ids,
+                        )
+                    })
+            })
+        })
+        .filter(|item| {
+            official_ratings.as_ref().is_none_or(|official_ratings| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(|metadata| {
+                        metadata_matches_values(
+                            metadata,
+                            &["OfficialRating", "OfficialRatings", "SeriesOfficialRating"],
+                            official_ratings,
+                        )
+                    })
+            })
+        })
+        .filter(|item| {
+            tags.as_ref().is_none_or(|tags| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(|metadata| metadata_matches_values(metadata, &["Tags"], tags))
+            })
+        })
+        .filter(|item| {
+            series_status.as_ref().is_none_or(|series_status| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(|metadata| {
+                        metadata_matches_values(
+                            metadata,
+                            &["SeriesStatus", "Status"],
+                            series_status,
+                        )
+                    })
+            })
+        })
+        .filter(|item| {
+            years.as_ref().is_none_or(|years| {
+                metadata_by_item
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&item.id))
+                    .is_some_and(|metadata| {
+                        metadata_matches_values(metadata, &["ProductionYear", "Years"], years)
+                    })
+            })
+        })
+        .filter(|item| {
+            metadata_by_item
+                .as_ref()
+                .and_then(|metadata| metadata.get(&item.id))
+                .is_none_or(|metadata| metadata_matches_range_filters(metadata, query))
+        })
+        .filter(|item| {
+            if min_premiere_date.is_none() && max_premiere_date.is_none() {
+                return true;
+            }
+            metadata_by_item
+                .as_ref()
+                .and_then(|metadata| metadata.get(&item.id))
+                .and_then(metadata_item_filter_premiere_date)
+                .is_some_and(|premiere_date| {
+                    min_premiere_date.is_none_or(|min| premiere_date >= min)
+                        && max_premiere_date.is_none_or(|max| premiere_date <= max)
+                })
         })
         .filter(|item| {
             name_starts_with
@@ -29275,18 +32587,61 @@ async fn filtered_media_items(
         items = filtered;
     }
 
-    let sort_fields = sort_fields(query.sort_by.as_deref());
-    if query
-        .sort_order
-        .as_deref()
-        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"))
-    {
-        items.sort_by(|left, right| compare_media_items(right, left, &sort_fields));
+    if let Some(is_favorite) = query.is_favorite {
+        let Some(user_id) = user_id else {
+            items.clear();
+            return Ok(items);
+        };
+        let mut filtered = Vec::new();
+        for item in items {
+            let favorite = db
+                .playback_state_for_item(user_id, item.id)
+                .await?
+                .is_some_and(|state| state.is_favorite);
+            if favorite == is_favorite {
+                filtered.push(item);
+            }
+        }
+        items = filtered;
+    }
+
+    if query_should_sort_episode_person_results_by_index(query, include_types.as_deref()) {
+        let empty_metadata = HashMap::new();
+        let metadata = metadata_by_item.as_ref().unwrap_or(&empty_metadata);
+        items.sort_by(|left, right| {
+            compare_tv_episodes_with_metadata(
+                left,
+                metadata.get(&left.id),
+                right,
+                metadata.get(&right.id),
+            )
+        });
     } else {
-        items.sort_by(|left, right| compare_media_items(left, right, &sort_fields));
+        let sort_fields = sort_fields(query.sort_by.as_deref());
+        if query
+            .sort_order
+            .as_deref()
+            .is_some_and(|order| order.eq_ignore_ascii_case("Descending"))
+        {
+            items.sort_by(|left, right| compare_media_items(right, left, &sort_fields));
+        } else {
+            items.sort_by(|left, right| compare_media_items(left, right, &sort_fields));
+        }
     }
 
     Ok(items)
+}
+
+fn query_should_sort_episode_person_results_by_index(
+    query: &ItemsQuery,
+    include_types: Option<&[String]>,
+) -> bool {
+    let Some(types) = include_types else {
+        return false;
+    };
+    !query.person_ids.is_empty()
+        && !types.is_empty()
+        && types.iter().all(|item_type| item_type == "episode")
 }
 
 fn metadata_value_matches_search(value: &serde_json::Value, term: &str) -> bool {
@@ -29301,6 +32656,258 @@ fn metadata_value_matches_search(value: &serde_json::Value, term: &str) -> bool 
             .any(|value| metadata_value_matches_search(value, term)),
         serde_json::Value::Bool(_) | serde_json::Value::Null => false,
     }
+}
+
+fn metadata_has_overview(metadata: &serde_json::Value) -> bool {
+    first_metadata_value_from_json(metadata, &["Overview", "SeriesOverview"])
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn provider_filter_matches(
+    item: &MediaItem,
+    metadata_by_item: Option<&HashMap<Uuid, serde_json::Value>>,
+    query: &ItemsQuery,
+) -> bool {
+    for (expected, provider_key) in [
+        (query.has_imdb_id, "Imdb"),
+        (query.has_tmdb_id, "Tmdb"),
+        (query.has_tvdb_id, "Tvdb"),
+    ] {
+        let Some(expected) = expected else {
+            continue;
+        };
+        let has_provider = metadata_by_item
+            .and_then(|metadata| metadata.get(&item.id))
+            .is_some_and(|metadata| metadata_has_provider_id(metadata, provider_key));
+        if has_provider != expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn metadata_flag_filters_match(
+    item: &MediaItem,
+    metadata_by_item: Option<&HashMap<Uuid, serde_json::Value>>,
+    has_official_rating: Option<bool>,
+    is_locked: Option<bool>,
+) -> bool {
+    let metadata = metadata_by_item.and_then(|metadata| metadata.get(&item.id));
+    if let Some(expected) = has_official_rating {
+        let actual = metadata.is_some_and(metadata_has_official_rating);
+        if actual != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = is_locked {
+        let actual = metadata.is_some_and(metadata_is_locked);
+        if actual != expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn metadata_has_official_rating(metadata: &serde_json::Value) -> bool {
+    first_metadata_value_from_json(
+        metadata,
+        &["OfficialRating", "OfficialRatings", "SeriesOfficialRating"],
+    )
+    .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn metadata_is_locked(metadata: &serde_json::Value) -> bool {
+    json_field_case_insensitive(metadata, "LockData")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn metadata_has_provider_id(metadata: &serde_json::Value, provider_key: &str) -> bool {
+    ["ProviderIds", "SeriesProviderIds"].iter().any(|key| {
+        json_field_case_insensitive(metadata, key)
+            .and_then(|provider_ids| json_field_case_insensitive(provider_ids, provider_key))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn media_item_dimension_filters_match(item: &MediaItem, query: &ItemsQuery) -> bool {
+    let width = item.width.map(i64::from);
+    let height = item.height.map(i64::from);
+    if let Some(is_hd) = query.is_hd {
+        let item_is_hd = height.is_some_and(|height| height >= 720);
+        if item_is_hd != is_hd {
+            return false;
+        }
+    }
+    if let Some(is_4k) = query.is_4k {
+        let item_is_4k =
+            width.is_some_and(|width| width >= 3840) || height.is_some_and(|height| height >= 2160);
+        if item_is_4k != is_4k {
+            return false;
+        }
+    }
+    if query
+        .min_width
+        .is_some_and(|min_width| !width.is_some_and(|width| width >= min_width))
+        || query
+            .max_width
+            .is_some_and(|max_width| !width.is_some_and(|width| width <= max_width))
+        || query
+            .min_height
+            .is_some_and(|min_height| !height.is_some_and(|height| height >= min_height))
+        || query
+            .max_height
+            .is_some_and(|max_height| !height.is_some_and(|height| height <= max_height))
+    {
+        return false;
+    }
+    true
+}
+
+fn metadata_matches_entity_ids(
+    metadata: &serde_json::Value,
+    item_type: &str,
+    metadata_keys: &[&str],
+    entity_ids: &[String],
+) -> bool {
+    if entity_ids.is_empty() {
+        return true;
+    }
+    let mut names = BTreeMap::<String, String>::new();
+    let mut ids = HashSet::<String>::new();
+    let effective_keys: Vec<&str> = if item_type.eq_ignore_ascii_case("Person")
+        && metadata_keys
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case("SeriesPeople"))
+        && (json_field_case_insensitive(metadata, "People").is_some_and(metadata_value_has_items)
+            || json_field_case_insensitive(metadata, "Cast").is_some_and(metadata_value_has_items))
+    {
+        metadata_keys
+            .iter()
+            .copied()
+            .filter(|key| !key.eq_ignore_ascii_case("SeriesPeople"))
+            .collect()
+    } else {
+        metadata_keys.to_vec()
+    };
+    for key in effective_keys {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
+            collect_metadata_value(value, &mut names);
+            collect_metadata_entity_ids(value, item_type, &mut ids);
+        }
+    }
+    ids.extend(
+        names
+            .into_values()
+            .map(|name| stable_entity_id(item_type, &name).to_ascii_lowercase()),
+    );
+    ids.into_iter()
+        .any(|id| entity_ids.iter().any(|entity_id| entity_id == &id))
+}
+
+fn metadata_value_has_items(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => !values.is_empty(),
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Object(object) => !object.is_empty(),
+        _ => false,
+    }
+}
+
+fn collect_metadata_entity_ids(
+    value: &serde_json::Value,
+    item_type: &str,
+    ids: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_metadata_entity_ids(value, item_type, ids);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(id) = object
+                .get("Id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                ids.insert(id.to_ascii_lowercase());
+            }
+            if let Some(name) = object
+                .get("Name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                ids.insert(stable_entity_id(item_type, name).to_ascii_lowercase());
+            }
+        }
+        serde_json::Value::String(name) => {
+            let name = name.trim();
+            if !name.is_empty() {
+                ids.insert(stable_entity_id(item_type, name).to_ascii_lowercase());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn metadata_matches_values(
+    metadata: &serde_json::Value,
+    metadata_keys: &[&str],
+    expected_values: &[String],
+) -> bool {
+    if expected_values.is_empty() {
+        return true;
+    }
+    let mut values = BTreeMap::<String, String>::new();
+    for key in metadata_keys {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
+            collect_metadata_value(value, &mut values);
+        }
+    }
+    values
+        .into_values()
+        .map(|value| value.to_ascii_lowercase())
+        .any(|value| expected_values.iter().any(|expected| expected == &value))
+}
+
+fn metadata_matches_range_filters(metadata: &serde_json::Value, query: &ItemsQuery) -> bool {
+    let community_rating =
+        first_metadata_number_from_json(metadata, &["CommunityRating", "Rating"]);
+    let critic_rating = first_metadata_number_from_json(metadata, &["CriticRating"]);
+    query
+        .min_community_rating
+        .is_none_or(|min| community_rating.is_some_and(|rating| rating >= min))
+        && query
+            .max_community_rating
+            .is_none_or(|max| community_rating.is_some_and(|rating| rating <= max))
+        && query
+            .min_critic_rating
+            .is_none_or(|min| critic_rating.is_some_and(|rating| rating >= min))
+        && query
+            .max_critic_rating
+            .is_none_or(|max| critic_rating.is_some_and(|rating| rating <= max))
+}
+
+fn metadata_item_filter_premiere_date(metadata: &serde_json::Value) -> Option<OffsetDateTime> {
+    first_metadata_value_from_json(metadata, &["PremiereDate", "AirDate", "DateCreated"])
+        .as_deref()
+        .and_then(parse_item_query_date)
+}
+
+fn parse_item_query_date(value: &str) -> Option<OffsetDateTime> {
+    let value = value.trim();
+    OffsetDateTime::parse(value, &Rfc3339).ok().or_else(|| {
+        let date = time::Date::parse(
+            value.split('T').next().unwrap_or(value),
+            &time::macros::format_description!("[year]-[month]-[day]"),
+        )
+        .ok()?;
+        Some(date.midnight().assume_utc())
+    })
 }
 
 fn paged_media_items(items: Vec<MediaItem>, query: &ItemsQuery) -> Vec<MediaItem> {
@@ -29363,6 +32970,7 @@ fn compact_media_item_to_json(
     playback: Option<&PlaybackState>,
 ) -> serde_json::Value {
     let item_id = item.id.simple().to_string();
+    let image_tag = default_primary_image_tag(&item_id);
     let playback_position_ticks = playback.map_or(0, |state| state.position_ticks);
     let played = playback.is_some_and(|state| state.played);
     serde_json::json!({
@@ -29383,10 +32991,18 @@ fn compact_media_item_to_json(
             "Key": item_id,
             "ItemId": item_id,
         },
-        "ImageTags": {},
-        "ImageBlurHashes": {},
+        "ImageTags": { "Primary": image_tag },
+        "ImageBlurHashes": {
+            "Primary": {
+                image_tag: default_primary_blur_hash()
+            }
+        },
         "BackdropImageTags": [],
     })
+}
+
+fn default_primary_blur_hash() -> &'static str {
+    "LKO2?U%2Tw=w]~RBVZRi};RPxuwH"
 }
 
 async fn media_metadata_by_item_id(
@@ -29477,6 +33093,1338 @@ fn query_filters_played_value(filters: &[String]) -> Option<bool> {
     played_filter_value(&filters)
 }
 
+fn query_requests_only_item_type(query: &ItemsQuery, item_type: &str) -> bool {
+    let Some(include_types) = csv_values_lowercase(&query.include_item_types) else {
+        return false;
+    };
+    include_types.len() == 1 && include_types[0].eq_ignore_ascii_case(item_type)
+}
+
+async fn tv_series_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    user_id: Option<Uuid>,
+    server_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut episode_query = query.clone();
+    episode_query.include_item_types = vec!["Episode".to_string()];
+    episode_query.is_folder = None;
+    episode_query.filters.retain(|filter| {
+        !filter
+            .split(',')
+            .any(|value| value.trim().eq_ignore_ascii_case("IsFolder"))
+    });
+    episode_query.ids = None;
+    episode_query.search_term = None;
+    episode_query.name_starts_with = None;
+    episode_query.name_starts_with_or_greater = None;
+    episode_query.name_less_than = None;
+    episode_query.start_index = None;
+    episode_query.limit = None;
+    episode_query.sort_by = Some("SortName".to_string());
+    episode_query.sort_order = None;
+
+    let episodes =
+        filtered_media_items(db.media_items().await?, &episode_query, user_id, db).await?;
+    let mut grouped = BTreeMap::<String, TvSeriesSummary>::new();
+    let metadata_by_item =
+        media_metadata_by_item_id(db, episodes.iter().map(|item| item.id).collect()).await?;
+    for episode in episodes {
+        let Some(info) = tv_episode_info(&episode) else {
+            continue;
+        };
+        let playback = if let Some(user_id) = user_id {
+            db.playback_state_for_item(user_id, episode.id).await?
+        } else {
+            None
+        };
+        let summary = grouped
+            .entry(info.series_name.clone())
+            .or_insert_with(|| TvSeriesSummary::new(info.series_name.clone()));
+        summary.add_episode(
+            &episode,
+            &info,
+            metadata_by_item.get(&episode.id),
+            playback.as_ref(),
+        );
+    }
+
+    let requested_ids = query.ids.as_deref().map(parse_uuid_list).transpose()?;
+    let search_term = query
+        .search_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let name_starts_with = normalized_prefix(query.name_starts_with.as_deref());
+    let name_starts_with_or_greater =
+        normalized_prefix(query.name_starts_with_or_greater.as_deref());
+    let name_less_than = normalized_prefix(query.name_less_than.as_deref());
+
+    let mut series = grouped
+        .into_values()
+        .filter(|summary| {
+            requested_ids.as_ref().is_none_or(|ids| {
+                parse_jellyfin_uuid(&summary.id()).is_ok_and(|series_id| ids.contains(&series_id))
+            })
+        })
+        .filter(|summary| {
+            search_term
+                .as_ref()
+                .is_none_or(|term| summary.name.to_ascii_lowercase().contains(term.as_str()))
+        })
+        .filter(|summary| {
+            name_starts_with
+                .as_ref()
+                .is_none_or(|prefix| summary.name.to_ascii_lowercase().starts_with(prefix))
+        })
+        .filter(|summary| {
+            name_starts_with_or_greater
+                .as_ref()
+                .is_none_or(|prefix| summary.name.to_ascii_lowercase().as_str() >= prefix.as_str())
+        })
+        .filter(|summary| {
+            name_less_than
+                .as_ref()
+                .is_none_or(|prefix| summary.name.to_ascii_lowercase().as_str() < prefix.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    if query
+        .sort_order
+        .as_deref()
+        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"))
+    {
+        series.sort_by(|left, right| right.sort_name.cmp(&left.sort_name));
+    } else {
+        series.sort_by(|left, right| left.sort_name.cmp(&right.sort_name));
+    }
+
+    let total_record_count = series.len();
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    let items = series
+        .into_iter()
+        .skip(start_index)
+        .take(limit)
+        .map(|summary| tv_series_json(server_id, summary))
+        .collect::<Vec<_>>();
+    Ok(Json(query_result_with_total(
+        items,
+        total_record_count,
+        start_index,
+    )))
+}
+
+#[derive(Debug)]
+struct TvSeriesSummary {
+    source_name: String,
+    id: Option<String>,
+    name: String,
+    sort_name: String,
+    seasons: BTreeSet<i32>,
+    episode_count: usize,
+    unplayed_count: usize,
+    path: Option<String>,
+    date_created: Option<time::OffsetDateTime>,
+    date_last_media_added: Option<time::OffsetDateTime>,
+    runtime_ticks: i64,
+    production_year: Option<i32>,
+    premiere_date: Option<String>,
+    end_date: Option<String>,
+    metadata: serde_json::Value,
+}
+
+impl TvSeriesSummary {
+    fn new(source_name: String) -> Self {
+        let (name, production_year) = clean_tv_series_name_and_year(&source_name);
+        let sort_name = name.to_ascii_lowercase();
+        Self {
+            source_name,
+            id: None,
+            name,
+            sort_name,
+            seasons: BTreeSet::new(),
+            episode_count: 0,
+            unplayed_count: 0,
+            path: None,
+            date_created: None,
+            date_last_media_added: None,
+            runtime_ticks: 0,
+            production_year,
+            premiere_date: None,
+            end_date: None,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    fn add_episode(
+        &mut self,
+        item: &MediaItem,
+        info: &TvEpisodeInfo,
+        metadata: Option<&serde_json::Value>,
+        playback: Option<&PlaybackState>,
+    ) {
+        self.episode_count += 1;
+        if playback.is_none_or(|state| !state.played) {
+            self.unplayed_count += 1;
+        }
+        if let Some(season_number) = info.season_number {
+            self.seasons.insert(season_number);
+        }
+        if let Some(path) = tv_series_path_for_episode(item, info) {
+            self.path.get_or_insert(path);
+        }
+        self.date_created = Some(
+            self.date_created
+                .map_or(item.created_at, |current| current.min(item.created_at)),
+        );
+        self.date_last_media_added = Some(
+            self.date_last_media_added
+                .map_or(item.updated_at, |current| current.max(item.updated_at)),
+        );
+        if let Some(runtime_ticks) = item.runtime_ticks {
+            self.runtime_ticks += runtime_ticks;
+        }
+        if let Some(metadata) = metadata {
+            self.merge_episode_metadata(metadata);
+        }
+    }
+
+    fn merge_episode_metadata(&mut self, metadata: &serde_json::Value) {
+        if self.id.is_none() {
+            self.id = canonical_metadata_uuid_from_json(metadata, &["SeriesId"]);
+        }
+        if let Some(series_name) = first_metadata_value_from_json(metadata, &["SeriesName"])
+            && !series_name.trim().is_empty()
+        {
+            self.name = series_name.trim().to_string();
+            self.sort_name = self.name.to_ascii_lowercase();
+        }
+        if self.premiere_date.is_none()
+            && let Some(value) =
+                first_metadata_value_from_json(metadata, &["SeriesPremiereDate", "PremiereDate"])
+        {
+            self.premiere_date = Some(normalize_metadata_date_for_json(&value));
+        }
+        if let Some(value) = first_metadata_value_from_json(metadata, &["EndDate"]) {
+            self.end_date = Some(normalize_metadata_date_for_json(&value));
+        }
+        if self.production_year.is_none() {
+            self.production_year = first_metadata_i32_from_json(
+                metadata,
+                &["SeriesProductionYear", "ProductionYear", "Year"],
+            );
+        }
+
+        for (target, keys) in [
+            ("Overview", &["SeriesOverview"][..]),
+            ("OriginalTitle", &["SeriesOriginalTitle"][..]),
+            ("OfficialRating", &["SeriesOfficialRating"][..]),
+            ("Status", &["SeriesStatus", "Status"][..]),
+            ("ContentType", &["SeriesContentType"][..]),
+            ("OriginalLanguage", &["OriginalLanguage", "Language"][..]),
+            ("SeriesPrimaryImageTag", &["SeriesPrimaryImageTag"][..]),
+            ("SeriesBackdropImageTag", &["SeriesBackdropImageTag"][..]),
+            ("SeriesThumbImageTag", &["SeriesThumbImageTag"][..]),
+            ("SeriesLogoImageTag", &["SeriesLogoImageTag"][..]),
+            ("SeriesPrimaryImageUrl", &["SeriesPrimaryImageUrl"][..]),
+            ("SeriesBackdropImageUrl", &["SeriesBackdropImageUrl"][..]),
+            ("SeriesThumbImageUrl", &["SeriesThumbImageUrl"][..]),
+            ("SeriesLogoImageUrl", &["SeriesLogoImageUrl"][..]),
+            ("SeriesPrimaryImagePath", &["SeriesPrimaryImagePath"][..]),
+            ("SeriesBackdropImagePath", &["SeriesBackdropImagePath"][..]),
+            ("SeriesThumbImagePath", &["SeriesThumbImagePath"][..]),
+            ("SeriesLogoImagePath", &["SeriesLogoImagePath"][..]),
+            ("MetadataSource", &["MetadataSource"][..]),
+        ] {
+            if self.metadata.get(target).is_none()
+                && let Some(value) = first_metadata_value_from_json(metadata, keys)
+            {
+                self.metadata[target] = serde_json::Value::String(value);
+            }
+        }
+
+        for (target, keys) in [
+            ("CommunityRating", &["SeriesCommunityRating"][..]),
+            ("CriticRating", &["SeriesCriticRating"][..]),
+        ] {
+            if self.metadata.get(target).is_none()
+                && let Some(value) = first_metadata_number_from_json(metadata, keys)
+            {
+                self.metadata[target] = serde_json::json!(value);
+            }
+        }
+
+        if self.metadata.get("People").is_none()
+            && let Some(people) = json_field_case_insensitive(metadata, "SeriesPeople")
+                .or_else(|| json_field_case_insensitive(metadata, "People"))
+            && people.is_array()
+        {
+            self.metadata["People"] = people.clone();
+        }
+
+        for (target, keys) in [
+            ("Genres", &["SeriesGenres"][..]),
+            ("Studios", &["SeriesStudios"][..]),
+            ("Tags", &["SeriesTags"][..]),
+            ("Taglines", &["SeriesTaglines"][..]),
+            ("AirDays", &["SeriesAirDays", "AirDays"][..]),
+        ] {
+            let mut values = metadata_values_from_json(&self.metadata, &[target]);
+            values.extend(metadata_values_from_json(metadata, keys));
+            values.sort();
+            values.dedup();
+            if !values.is_empty() {
+                self.metadata[target] = serde_json::json!(values);
+            }
+        }
+
+        if let Some(air_day) = episode_air_day_from_metadata(metadata) {
+            let mut values = metadata_values_from_json(&self.metadata, &["AirDays"]);
+            values.push(air_day);
+            values.sort();
+            values.dedup();
+            self.metadata["AirDays"] = serde_json::json!(values);
+        }
+
+        if self.metadata.get("ProviderIds").is_none()
+            && let Some(provider_ids) = json_field_case_insensitive(metadata, "SeriesProviderIds")
+            && provider_ids.is_object()
+        {
+            self.metadata["ProviderIds"] = provider_ids.clone();
+        }
+        if self.metadata.get("RemoteTrailers").is_none()
+            && let Some(trailers) = json_field_case_insensitive(metadata, "SeriesRemoteTrailers")
+                .or_else(|| json_field_case_insensitive(metadata, "RemoteTrailers"))
+            && trailers.is_array()
+        {
+            self.metadata["RemoteTrailers"] = trailers.clone();
+        }
+    }
+
+    fn id(&self) -> String {
+        self.id
+            .clone()
+            .unwrap_or_else(|| tv_series_id(&self.source_name))
+    }
+}
+
+fn episode_air_day_from_metadata(metadata: &serde_json::Value) -> Option<String> {
+    first_metadata_value_from_json(metadata, &["PremiereDate", "AirDate"])
+        .as_deref()
+        .and_then(parse_item_query_date)
+        .map(|date| weekday_display_name(date.date().weekday()).to_string())
+}
+
+fn weekday_display_name(weekday: time::Weekday) -> &'static str {
+    match weekday {
+        time::Weekday::Monday => "Monday",
+        time::Weekday::Tuesday => "Tuesday",
+        time::Weekday::Wednesday => "Wednesday",
+        time::Weekday::Thursday => "Thursday",
+        time::Weekday::Friday => "Friday",
+        time::Weekday::Saturday => "Saturday",
+        time::Weekday::Sunday => "Sunday",
+    }
+}
+
+fn tv_series_json(server_id: &str, summary: TvSeriesSummary) -> serde_json::Value {
+    let series_id = summary.id();
+    let season_count = summary.seasons.len();
+    let image_tag = default_primary_image_tag(&series_id);
+    let played = summary.episode_count > 0 && summary.unplayed_count == 0;
+    let mut value = serde_json::json!({
+        "Name": summary.name,
+        "OriginalTitle": null,
+        "ServerId": server_id,
+        "Id": series_id,
+        "Etag": null,
+        "DateCreated": summary.date_created.map(format_time_for_json),
+        "DateLastMediaAdded": summary.date_last_media_added.map(format_time_for_json),
+        "CanDelete": false,
+        "CanDownload": false,
+        "SortName": summary.sort_name,
+        "ForcedSortName": null,
+        "ExternalUrls": [],
+        "Path": summary.path,
+        "PremiereDate": summary.premiere_date,
+        "EndDate": summary.end_date,
+        "ProductionYear": summary.production_year,
+        "OfficialRating": null,
+        "CommunityRating": null,
+        "CriticRating": null,
+        "Overview": "",
+        "EnableMediaSourceDisplay": true,
+        "ChannelId": null,
+        "Taglines": [],
+        "Genres": [],
+        "GenreItems": [],
+        "Studios": [],
+        "People": [],
+        "Tags": [],
+        "TagItems": [],
+        "PlayAccess": "Full",
+        "RemoteTrailers": [],
+        "ProviderIds": {},
+        "ContentType": "tvshows",
+        "IsFolder": true,
+        "ParentId": null,
+        "Type": "Series",
+        "MediaType": null,
+        "ChildCount": season_count,
+        "RecursiveItemCount": summary.episode_count,
+        "CumulativeRunTimeTicks": (summary.runtime_ticks > 0).then_some(summary.runtime_ticks),
+        "RunTimeTicks": (summary.runtime_ticks > 0 && summary.episode_count > 0)
+            .then_some(summary.runtime_ticks / summary.episode_count as i64),
+        "SpecialFeatureCount": 0,
+        "DisplayPreferencesId": stable_entity_id("DisplayPreferences", &series_id),
+        "Status": null,
+        "AirDays": [],
+        "Chapters": [],
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": i32::from(played),
+            "IsFavorite": false,
+            "Played": played,
+            "PlayedPercentage": if played { 100.0 } else { 0.0 },
+            "UnplayedItemCount": summary.unplayed_count,
+            "Key": series_id,
+            "ItemId": series_id
+        },
+        "ImageTags": { "Primary": image_tag },
+        "PrimaryImageAspectRatio": 0.6666667,
+        "BackdropImageTags": [],
+        "LocationType": "Virtual"
+    });
+    apply_tv_series_metadata(&mut value, &summary.metadata);
+    value
+}
+
+fn apply_tv_series_metadata(value: &mut serde_json::Value, metadata: &serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    for key in [
+        "Overview",
+        "OriginalTitle",
+        "OfficialRating",
+        "CommunityRating",
+        "CriticRating",
+        "Status",
+        "ContentType",
+        "OriginalLanguage",
+    ] {
+        if let Some(field_value) = metadata.get(key)
+            && !field_value.is_null()
+            && !(field_value.as_str() == Some(""))
+        {
+            object.insert(key.to_string(), field_value.clone());
+        }
+    }
+
+    for (target, item_type) in [
+        ("Genres", "Genre"),
+        ("Tags", "Tag"),
+        ("Studios", "Studio"),
+        ("Taglines", "Tagline"),
+    ] {
+        let values = metadata_values_from_json(metadata, &[target]);
+        if values.is_empty() {
+            continue;
+        }
+        object.insert(target.to_string(), serde_json::json!(values));
+        match target {
+            "Genres" => {
+                object.insert(
+                    "GenreItems".to_string(),
+                    serde_json::json!(metadata_name_id_items(item_type, &values)),
+                );
+            }
+            "Studios" => {
+                object.insert(
+                    "Studios".to_string(),
+                    serde_json::json!(metadata_name_id_items(item_type, &values)),
+                );
+            }
+            "Tags" => {
+                object.insert(
+                    "TagItems".to_string(),
+                    serde_json::json!(metadata_name_id_items(item_type, &values)),
+                );
+            }
+            _ => {}
+        }
+    }
+    let air_days = metadata_values_from_json(metadata, &["AirDays", "SeriesAirDays"]);
+    if !air_days.is_empty() {
+        object.insert("AirDays".to_string(), serde_json::json!(air_days));
+    }
+
+    let people = metadata_people_items_from_json(metadata, &["People", "SeriesPeople"]);
+    if !people.is_empty() {
+        object.insert("People".to_string(), serde_json::json!(people));
+    }
+    if let Some(provider_ids) = metadata.get("ProviderIds")
+        && provider_ids.is_object()
+    {
+        object.insert("ProviderIds".to_string(), provider_ids.clone());
+        object.insert(
+            "ExternalUrls".to_string(),
+            serde_json::json!(external_urls_from_provider_ids(provider_ids)),
+        );
+    }
+    if let Some(trailers) = json_field_case_insensitive(metadata, "RemoteTrailers")
+        && trailers.is_array()
+    {
+        object.insert("RemoteTrailers".to_string(), trailers.clone());
+    }
+    let primary_tag = first_metadata_value_from_json(metadata, &["SeriesPrimaryImageTag"]);
+    let thumb_tag = first_metadata_value_from_json(metadata, &["SeriesThumbImageTag"]);
+    let logo_tag = first_metadata_value_from_json(metadata, &["SeriesLogoImageTag"]);
+    if primary_tag.is_some() || thumb_tag.is_some() || logo_tag.is_some() {
+        let mut image_tags = serde_json::Map::new();
+        if let Some(primary_tag) = primary_tag {
+            image_tags.insert(
+                "Primary".to_string(),
+                serde_json::Value::String(primary_tag),
+            );
+        }
+        if let Some(thumb_tag) = thumb_tag {
+            image_tags.insert("Thumb".to_string(), serde_json::Value::String(thumb_tag));
+        }
+        if let Some(logo_tag) = logo_tag {
+            image_tags.insert("Logo".to_string(), serde_json::Value::String(logo_tag));
+        }
+        object.insert(
+            "ImageTags".to_string(),
+            serde_json::Value::Object(image_tags),
+        );
+    }
+    if let Some(backdrop_tag) =
+        first_metadata_value_from_json(metadata, &["SeriesBackdropImageTag", "BackdropImageTag"])
+    {
+        object.insert(
+            "BackdropImageTags".to_string(),
+            serde_json::json!([backdrop_tag]),
+        );
+    }
+}
+
+fn metadata_people_items_from_json(
+    metadata: &serde_json::Value,
+    keys: &[&str],
+) -> Vec<serde_json::Value> {
+    let mut people = Vec::<serde_json::Value>::new();
+    let mut seen = HashSet::<String>::new();
+    for key in keys {
+        let Some(value) = json_field_case_insensitive(metadata, key) else {
+            continue;
+        };
+        collect_metadata_people(value, &mut people, &mut seen);
+    }
+    people
+}
+
+fn collect_metadata_people(
+    value: &serde_json::Value,
+    people: &mut Vec<serde_json::Value>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_metadata_people(item, people, seen);
+            }
+        }
+        serde_json::Value::String(name) => {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(name)
+                && (parsed.is_array() || parsed.is_object())
+            {
+                collect_metadata_people(&parsed, people, seen);
+                return;
+            }
+            let name = name.trim();
+            if !name.is_empty() && seen.insert(name.to_ascii_lowercase()) {
+                people.push(metadata_people_items(&[name.to_string()]).remove(0));
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let Some(name) = object.get("Name").and_then(serde_json::Value::as_str) else {
+                return;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return;
+            }
+            if seen.insert(name.to_ascii_lowercase()) {
+                people.push(serde_json::json!({
+                    "Name": name,
+                    "Id": stable_entity_id("Person", name),
+                    "Role": object.get("Role").cloned().unwrap_or(serde_json::Value::Null),
+                    "Type": object.get("Type").cloned().unwrap_or_else(|| serde_json::json!("Person")),
+                    "PrimaryImageTag": object
+                        .get("PrimaryImageTag")
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!(default_primary_image_tag(&stable_entity_id("Person", name))))
+                }));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn external_urls_from_provider_ids(provider_ids: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(provider_ids) = provider_ids.as_object() else {
+        return Vec::new();
+    };
+    provider_ids
+        .iter()
+        .filter_map(|(name, value)| {
+            let id = value.as_str()?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let url = match name.to_ascii_lowercase().as_str() {
+                "imdb" => format!("https://www.imdb.com/title/{id}"),
+                "tmdb" => format!("https://www.themoviedb.org/tv/{id}"),
+                "tvdb" => format!("https://thetvdb.com/dereferrer/series/{id}"),
+                _ => return None,
+            };
+            Some(serde_json::json!({ "Name": name, "Url": url }))
+        })
+        .collect()
+}
+
+fn clean_tv_series_name_and_year(source_name: &str) -> (String, Option<i32>) {
+    let source_name = source_name.trim();
+    if let Some((prefix, suffix)) = source_name.split_once(" (") {
+        if suffix.len() >= 5 {
+            let year = &suffix[..4];
+            if year.chars().all(|character| character.is_ascii_digit())
+                && suffix.as_bytes().get(4) == Some(&b')')
+            {
+                return (prefix.trim().to_string(), year.parse::<i32>().ok());
+            }
+        }
+    }
+    (source_name.to_string(), None)
+}
+
+fn tv_series_path_for_episode(item: &MediaItem, info: &TvEpisodeInfo) -> Option<String> {
+    let episode_path = media_item_path(item);
+    let parent = episode_path.parent()?;
+    if info.season_number.is_some() {
+        parent
+            .parent()
+            .or(Some(parent))
+            .map(|path| path.to_string_lossy().to_string())
+    } else {
+        Some(parent.to_string_lossy().to_string())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeSearchResult {
+    show: TvMazeShow,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeShow {
+    id: i64,
+    name: String,
+    summary: Option<String>,
+    genres: Vec<String>,
+    status: Option<String>,
+    schedule: Option<TvMazeSchedule>,
+    premiered: Option<String>,
+    ended: Option<String>,
+    rating: Option<TvMazeRating>,
+    network: Option<TvMazeNetwork>,
+    #[serde(rename = "webChannel")]
+    web_channel: Option<TvMazeNetwork>,
+    externals: Option<TvMazeExternals>,
+    image: Option<TvMazeImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeRating {
+    average: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeSchedule {
+    #[serde(default)]
+    days: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeNetwork {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeExternals {
+    tvrage: Option<i64>,
+    thetvdb: Option<i64>,
+    imdb: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeImage {
+    medium: Option<String>,
+    original: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeCastCredit {
+    person: TvMazeCastPerson,
+    character: TvMazeCastCharacter,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeCastPerson {
+    name: String,
+    image: Option<TvMazeImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeCastCharacter {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeShowImage {
+    #[serde(rename = "type")]
+    image_type: Option<String>,
+    main: Option<bool>,
+    resolutions: Option<TvMazeImageResolutions>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeEpisode {
+    id: i64,
+    name: String,
+    season: i32,
+    number: Option<i32>,
+    airdate: Option<String>,
+    summary: Option<String>,
+    rating: Option<TvMazeRating>,
+    image: Option<TvMazeImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeSeason {
+    id: i64,
+    number: i32,
+    #[serde(rename = "episodeOrder")]
+    episode_order: Option<i32>,
+    #[serde(rename = "premiereDate")]
+    premiere_date: Option<String>,
+    #[serde(rename = "endDate")]
+    end_date: Option<String>,
+    summary: Option<String>,
+    image: Option<TvMazeImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeImageResolutions {
+    original: Option<TvMazeImageResolution>,
+    medium: Option<TvMazeImageResolution>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TvMazeImageResolution {
+    url: Option<String>,
+}
+
+async fn refresh_tv_metadata_for_folder(state: &AppState, folder_id: Uuid) -> Result<(), ApiError> {
+    let folder = state
+        .db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == folder_id);
+    if !folder
+        .as_ref()
+        .and_then(|folder| folder.collection_type.as_deref())
+        .is_some_and(|collection_type| {
+            matches!(
+                collection_type.to_ascii_lowercase().as_str(),
+                "tvshows" | "tvshow" | "series"
+            )
+        })
+    {
+        return Ok(());
+    }
+
+    let series_names = state
+        .db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| item.virtual_folder_id == folder_id)
+        .filter_map(|item| tv_episode_info(&item).map(|info| info.series_name))
+        .collect::<BTreeSet<_>>();
+    for series_name in series_names {
+        if let Err(error) = refresh_tv_metadata_for_series(state, &series_name).await {
+            tracing::warn!(
+                series = %series_name,
+                %error.error,
+                "failed to refresh TV metadata"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_tv_metadata_for_series(
+    state: &AppState,
+    series_name: &str,
+) -> Result<(), ApiError> {
+    let episodes = state
+        .db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| tv_episode_info(item).is_some_and(|info| info.series_name == series_name))
+        .collect::<Vec<_>>();
+    if episodes.is_empty() {
+        return Ok(());
+    }
+
+    let (clean_name, year) = clean_tv_series_name_and_year(series_name);
+    let Some(show) = tvmaze_search_show(&clean_name, year).await? else {
+        return Ok(());
+    };
+    let cast = tvmaze_show_cast(show.id).await.unwrap_or_default();
+    let images = tvmaze_show_images(show.id).await.unwrap_or_default();
+    let tvmaze_seasons = tvmaze_show_seasons(show.id).await.unwrap_or_default();
+    let tvmaze_seasons_by_number = tvmaze_seasons
+        .iter()
+        .map(|season| (season.number, season))
+        .collect::<HashMap<_, _>>();
+    let tvmaze_episodes = tvmaze_show_episodes(show.id).await.unwrap_or_default();
+    let tvmaze_episodes_by_number = tvmaze_episodes
+        .iter()
+        .filter_map(|episode| Some(((episode.season, episode.number?), episode)))
+        .collect::<HashMap<_, _>>();
+    let metadata = tvmaze_series_metadata(&show, &cast, &images);
+    for episode in episodes {
+        let episode_info = tv_episode_info(&episode);
+        let tvmaze_season = episode_info
+            .as_ref()
+            .and_then(|info| tvmaze_seasons_by_number.get(&info.season_number?));
+        let tvmaze_episode = episode_info.as_ref().and_then(|info| {
+            Some(tvmaze_episodes_by_number.get(&(info.season_number?, info.episode_number?))?)
+        });
+        let mut merged = metadata_payload_for_item(&state.db, episode.id).await?;
+        merge_tvmaze_series_metadata(&mut merged, &metadata);
+        if let Some(tvmaze_season) = tvmaze_season {
+            let season_metadata = tvmaze_season_metadata(tvmaze_season);
+            merge_tvmaze_series_metadata(&mut merged, &season_metadata);
+        }
+        if let Some(tvmaze_episode) = tvmaze_episode {
+            let episode_metadata = tvmaze_episode_metadata(tvmaze_episode);
+            merge_tvmaze_series_metadata(&mut merged, &episode_metadata);
+            if let Some(url) = tvmaze_episode_image_url(tvmaze_episode)
+                && let Ok(bytes) = fetch_remote_image_bytes(&url).await
+            {
+                store_image_bytes(
+                    state,
+                    ImageOwner::Item(&episode.id.simple().to_string()),
+                    "Primary",
+                    0,
+                    bytes,
+                )
+                .await?;
+            }
+        }
+        state
+            .db
+            .update_media_item_metadata(episode.id, merged)
+            .await?;
+    }
+
+    let series_id = tv_series_id(series_name);
+    for credit in &cast {
+        if let Some(url) = tvmaze_person_image_url(credit)
+            && let Ok(bytes) = fetch_remote_image_bytes(&url).await
+        {
+            let person_id = stable_entity_id("Person", &credit.person.name);
+            store_image_bytes(state, ImageOwner::Item(&person_id), "Primary", 0, bytes).await?;
+        }
+    }
+    if let Some(url) = tvmaze_primary_image_url(&show, &images)
+        && let Ok(bytes) = fetch_remote_image_bytes(&url).await
+    {
+        store_image_bytes(state, ImageOwner::Item(&series_id), "Primary", 0, bytes).await?;
+    }
+    if let Some(url) = tvmaze_background_image_url(&images)
+        && let Ok(bytes) = fetch_remote_image_bytes(&url).await
+    {
+        store_image_bytes(state, ImageOwner::Item(&series_id), "Backdrop", 0, bytes).await?;
+    }
+    if let Some(url) = tvmaze_thumb_image_url(&images)
+        && let Ok(bytes) = fetch_remote_image_bytes(&url).await
+    {
+        store_image_bytes(state, ImageOwner::Item(&series_id), "Thumb", 0, bytes).await?;
+    }
+    for season in tvmaze_seasons {
+        let season_id = tv_season_id(series_name, Some(season.number));
+        if let Some(url) = tvmaze_season_image_url(&season)
+            && let Ok(bytes) = fetch_remote_image_bytes(&url).await
+        {
+            store_image_bytes(state, ImageOwner::Item(&season_id), "Primary", 0, bytes).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn tvmaze_search_show(name: &str, year: Option<i32>) -> Result<Option<TvMazeShow>, ApiError> {
+    Ok(tvmaze_search_shows(name)
+        .await?
+        .into_iter()
+        .find(|show| tvmaze_show_matches(show, name, year)))
+}
+
+async fn tvmaze_search_shows(name: &str) -> Result<Vec<TvMazeShow>, ApiError> {
+    let mut url = reqwest::Url::parse("http://api.tvmaze.com/search/shows")?;
+    url.query_pairs_mut().append_pair("q", name);
+    let client = HttpClient::builder().user_agent("Jellyrin/0.1").build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Ok(Vec::new());
+    }
+    let results = response.json::<Vec<TvMazeSearchResult>>().await?;
+    Ok(results.into_iter().map(|result| result.show).collect())
+}
+
+async fn tvmaze_remote_search_series_results(
+    request: &RemoteSearchRequest,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let Some(name) = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(tvmaze_search_shows(name)
+        .await?
+        .into_iter()
+        .filter(|show| {
+            request
+                .year
+                .is_none_or(|year| tvmaze_show_year(show) == Some(year))
+        })
+        .take(10)
+        .map(tvmaze_remote_search_series_result)
+        .collect())
+}
+
+fn tvmaze_remote_search_series_result(show: TvMazeShow) -> serde_json::Value {
+    let provider_ids = tvmaze_show_provider_ids(&show);
+    serde_json::json!({
+        "Name": show.name,
+        "ProviderIds": provider_ids,
+        "ProductionYear": tvmaze_show_year(&show),
+        "IndexNumber": null,
+        "IndexNumberEnd": null,
+        "ParentIndexNumber": null,
+        "PremiereDate": show.premiered.as_deref().map(date_to_utc_midnight),
+        "ImageUrl": show.image.as_ref().and_then(|image| image.original.as_ref().or(image.medium.as_ref())).cloned(),
+        "SearchProviderName": "TVMaze",
+        "Overview": show.summary.as_deref().map(strip_html_summary).unwrap_or_default(),
+        "Type": "Series"
+    })
+}
+
+fn tvmaze_show_provider_ids(show: &TvMazeShow) -> serde_json::Value {
+    let mut provider_ids = serde_json::Map::new();
+    provider_ids.insert("TvMaze".to_string(), serde_json::json!(show.id.to_string()));
+    if let Some(externals) = &show.externals {
+        if let Some(id) = externals.thetvdb {
+            provider_ids.insert("Tvdb".to_string(), serde_json::json!(id.to_string()));
+        }
+        if let Some(id) = externals.tvrage {
+            provider_ids.insert("TvRage".to_string(), serde_json::json!(id.to_string()));
+        }
+        if let Some(id) = externals.imdb.as_deref().filter(|id| !id.trim().is_empty()) {
+            provider_ids.insert("Imdb".to_string(), serde_json::json!(id));
+        }
+    }
+    serde_json::Value::Object(provider_ids)
+}
+
+fn tvmaze_show_year(show: &TvMazeShow) -> Option<i32> {
+    show.premiered
+        .as_deref()
+        .and_then(|date| date.get(0..4))
+        .and_then(|year| year.parse::<i32>().ok())
+}
+
+fn tvmaze_show_matches(show: &TvMazeShow, name: &str, year: Option<i32>) -> bool {
+    if !show.name.eq_ignore_ascii_case(name) {
+        return false;
+    }
+    year.is_none_or(|year| tvmaze_show_year(show).is_none_or(|show_year| show_year == year))
+}
+
+async fn tvmaze_show_cast(show_id: i64) -> Result<Vec<TvMazeCastCredit>, ApiError> {
+    let url = format!("http://api.tvmaze.com/shows/{show_id}/cast");
+    let client = HttpClient::builder().user_agent("Jellyrin/0.1").build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Ok(Vec::new());
+    }
+    Ok(response.json::<Vec<TvMazeCastCredit>>().await?)
+}
+
+async fn tvmaze_show_images(show_id: i64) -> Result<Vec<TvMazeShowImage>, ApiError> {
+    let url = format!("http://api.tvmaze.com/shows/{show_id}/images");
+    let client = HttpClient::builder().user_agent("Jellyrin/0.1").build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Ok(Vec::new());
+    }
+    Ok(response.json::<Vec<TvMazeShowImage>>().await?)
+}
+
+async fn tvmaze_show_seasons(show_id: i64) -> Result<Vec<TvMazeSeason>, ApiError> {
+    let url = format!("http://api.tvmaze.com/shows/{show_id}/seasons");
+    let client = HttpClient::builder().user_agent("Jellyrin/0.1").build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Ok(Vec::new());
+    }
+    Ok(response.json::<Vec<TvMazeSeason>>().await?)
+}
+
+async fn tvmaze_show_episodes(show_id: i64) -> Result<Vec<TvMazeEpisode>, ApiError> {
+    let url = format!("http://api.tvmaze.com/shows/{show_id}/episodes?specials=1");
+    let client = HttpClient::builder().user_agent("Jellyrin/0.1").build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Ok(Vec::new());
+    }
+    Ok(response.json::<Vec<TvMazeEpisode>>().await?)
+}
+
+fn tvmaze_series_metadata(
+    show: &TvMazeShow,
+    cast: &[TvMazeCastCredit],
+    images: &[TvMazeShowImage],
+) -> serde_json::Value {
+    let studio = show
+        .network
+        .as_ref()
+        .or(show.web_channel.as_ref())
+        .and_then(|network| network.name.clone());
+    let provider_ids = serde_json::json!({
+        "TvMaze": show.id.to_string(),
+        "Tvdb": show.externals.as_ref().and_then(|external| external.thetvdb).map(|id| id.to_string()).unwrap_or_default(),
+        "TvRage": show.externals.as_ref().and_then(|external| external.tvrage).map(|id| id.to_string()).unwrap_or_default(),
+        "Imdb": show.externals.as_ref().and_then(|external| external.imdb.clone()).unwrap_or_default(),
+    });
+    let people = cast
+        .iter()
+        .take(20)
+        .map(|credit| {
+            serde_json::json!({
+                "Name": credit.person.name,
+                "Role": credit.character.name,
+                "Type": "Actor",
+                "PrimaryImageTag": null,
+                "ImageUrl": credit.person.image.as_ref().and_then(|image| image.original.as_ref().or(image.medium.as_ref())).cloned()
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "SeriesName": show.name,
+        "SeriesOverview": show.summary.as_deref().map(strip_html_summary).unwrap_or_default(),
+        "SeriesGenres": show.genres,
+        "SeriesStudios": studio.into_iter().collect::<Vec<_>>(),
+        "SeriesStatus": jellyfin_series_status(show.status.as_deref()),
+        "SeriesAirDays": show.schedule.as_ref().map(|schedule| schedule.days.clone()).unwrap_or_default(),
+        "SeriesPremiereDate": show.premiered.as_deref().map(date_to_utc_midnight),
+        "EndDate": show.ended.as_deref().map(date_to_utc_midnight),
+        "SeriesCommunityRating": show.rating.as_ref().and_then(|rating| rating.average),
+        "SeriesProviderIds": provider_ids,
+        "SeriesPeople": people,
+        "SeriesPrimaryImageTag": format!("tvmaze-primary-{}", show.id),
+        "SeriesBackdropImageTag": format!("tvmaze-backdrop-{}", show.id),
+        "SeriesThumbImageTag": tvmaze_thumb_image_url(images).map(|_| format!("tvmaze-thumb-{}", show.id)),
+        "SeriesPrimaryImageUrl": tvmaze_primary_image_url(show, images),
+        "SeriesBackdropImageUrl": tvmaze_background_image_url(images),
+        "SeriesThumbImageUrl": tvmaze_thumb_image_url(images),
+        "MetadataSource": "TVMaze"
+    })
+}
+
+fn merge_tvmaze_series_metadata(
+    metadata: &mut serde_json::Value,
+    tvmaze_metadata: &serde_json::Value,
+) {
+    let Some(target) = metadata.as_object_mut() else {
+        *metadata = serde_json::json!({});
+        return merge_tvmaze_series_metadata(metadata, tvmaze_metadata);
+    };
+    if let Some(source) = tvmaze_metadata.as_object() {
+        for (key, value) in source {
+            if !value.is_null() && !(value.as_str() == Some("")) {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn tvmaze_episode_metadata(episode: &TvMazeEpisode) -> serde_json::Value {
+    serde_json::json!({
+        "Name": episode.name,
+        "Overview": episode.summary.as_deref().map(strip_html_summary).unwrap_or_default(),
+        "PremiereDate": episode.airdate.as_deref().map(date_to_utc_midnight),
+        "ProductionYear": episode.airdate.as_deref().and_then(|date| date.get(0..4)).and_then(|year| year.parse::<i32>().ok()),
+        "CommunityRating": episode.rating.as_ref().and_then(|rating| rating.average),
+        "ProviderIds": { "TvMaze": episode.id.to_string() },
+        "PrimaryImageTag": format!("tvmaze-episode-{}", episode.id),
+        "PrimaryImageUrl": tvmaze_episode_image_url(episode),
+        "IndexNumber": episode.number,
+        "ParentIndexNumber": episode.season,
+        "MetadataSource": "TVMaze"
+    })
+}
+
+fn tvmaze_season_metadata(season: &TvMazeSeason) -> serde_json::Value {
+    serde_json::json!({
+        "SeasonOverview": season.summary.as_deref().map(strip_html_summary).unwrap_or_default(),
+        "SeasonPremiereDate": season.premiere_date.as_deref().map(date_to_utc_midnight),
+        "SeasonEndDate": season.end_date.as_deref().map(date_to_utc_midnight),
+        "SeasonProviderIds": { "TvMaze": season.id.to_string() },
+        "SeasonPrimaryImageTag": format!("tvmaze-season-{}", season.id),
+        "SeasonPrimaryImageUrl": tvmaze_season_image_url(season),
+        "SeasonEpisodeOrder": season.episode_order,
+    })
+}
+
+fn tvmaze_episode_image_url(episode: &TvMazeEpisode) -> Option<String> {
+    episode
+        .image
+        .as_ref()
+        .and_then(|image| image.original.as_ref().or(image.medium.as_ref()))
+        .cloned()
+}
+
+fn tvmaze_season_image_url(season: &TvMazeSeason) -> Option<String> {
+    season
+        .image
+        .as_ref()
+        .and_then(|image| image.original.as_ref().or(image.medium.as_ref()))
+        .cloned()
+}
+
+fn tvmaze_person_image_url(credit: &TvMazeCastCredit) -> Option<String> {
+    credit
+        .person
+        .image
+        .as_ref()
+        .and_then(|image| image.original.as_ref().or(image.medium.as_ref()))
+        .cloned()
+}
+
+fn tvmaze_primary_image_url(show: &TvMazeShow, images: &[TvMazeShowImage]) -> Option<String> {
+    show.image
+        .as_ref()
+        .and_then(|image| image.original.as_ref().or(image.medium.as_ref()))
+        .cloned()
+        .or_else(|| {
+            tvmaze_image_url_for_type(images, "poster")
+                .or_else(|| tvmaze_image_url_for_type(images, "banner"))
+        })
+}
+
+fn tvmaze_background_image_url(images: &[TvMazeShowImage]) -> Option<String> {
+    tvmaze_image_url_for_type(images, "background")
+}
+
+fn tvmaze_thumb_image_url(images: &[TvMazeShowImage]) -> Option<String> {
+    tvmaze_image_url_for_type(images, "banner")
+}
+
+fn tvmaze_image_url_for_type(images: &[TvMazeShowImage], image_type: &str) -> Option<String> {
+    images
+        .iter()
+        .filter(|image| {
+            image
+                .image_type
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(image_type))
+        })
+        .max_by_key(|image| image.main.unwrap_or(false))
+        .and_then(|image| image.resolutions.as_ref())
+        .and_then(|resolutions| {
+            resolutions
+                .original
+                .as_ref()
+                .and_then(|resolution| resolution.url.clone())
+                .or_else(|| {
+                    resolutions
+                        .medium
+                        .as_ref()
+                        .and_then(|resolution| resolution.url.clone())
+                })
+        })
+}
+
+async fn fetch_remote_image_bytes(url: &str) -> Result<Vec<u8>, ApiError> {
+    Ok(fetch_remote_image_payload(url).await?.0)
+}
+
+async fn fetch_remote_image_payload(url: &str) -> Result<(Vec<u8>, Option<String>), ApiError> {
+    let url = url.replacen("https://", "http://", 1);
+    let client = HttpClient::builder().user_agent("Jellyrin/0.1").build()?;
+    let response = client.get(url).send().await?;
+    if !response.status().is_success() {
+        return Err(ApiError::not_found("Remote image not found"));
+    }
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    Ok((response.bytes().await?.to_vec(), content_type))
+}
+
+fn strip_html_summary(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for character in value.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    output
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&rsquo;", "'")
+        .replace("&lsquo;", "'")
+        .trim()
+        .to_string()
+}
+
+fn date_to_utc_midnight(value: &str) -> String {
+    format!("{value}T00:00:00.0000000Z")
+}
+
+fn jellyfin_series_status(value: Option<&str>) -> Option<String> {
+    value.map(|value| match value.to_ascii_lowercase().as_str() {
+        "ended" => "Ended".to_string(),
+        "running" => "Continuing".to_string(),
+        other => other.to_string(),
+    })
+}
+
+async fn tv_series_summary_by_id(
+    db: &Database,
+    series_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Option<TvSeriesSummary>, ApiError> {
+    let mut grouped = BTreeMap::<String, TvSeriesSummary>::new();
+    let items = db.media_items().await?;
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    for item in items {
+        let Some(info) = tv_episode_info(&item) else {
+            continue;
+        };
+        let metadata = metadata_by_item.get(&item.id);
+        if !tv_episode_matches_series(&item, metadata, series_id) {
+            continue;
+        }
+        let playback = if let Some(user_id) = user_id {
+            db.playback_state_for_item(user_id, item.id).await?
+        } else {
+            None
+        };
+        let summary = grouped
+            .entry(info.series_name.clone())
+            .or_insert_with(|| TvSeriesSummary::new(info.series_name.clone()));
+        summary.add_episode(
+            &item,
+            &info,
+            metadata_by_item.get(&item.id),
+            playback.as_ref(),
+        );
+    }
+    Ok(grouped.into_values().next())
+}
+
+async fn tv_season_summary_by_id(
+    db: &Database,
+    season_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Option<(String, String, TvSeasonSummary)>, ApiError> {
+    let items = db.media_items().await?;
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    let mut series_name = None::<String>;
+    let mut series_id = None::<String>;
+    let mut summary = None::<TvSeasonSummary>;
+
+    for item in items {
+        let Some(info) = tv_episode_info(&item) else {
+            continue;
+        };
+        let metadata = metadata_by_item.get(&item.id);
+        if !tv_episode_matches_season(&item, metadata, season_id) {
+            continue;
+        }
+        series_name.get_or_insert_with(|| info.series_name.clone());
+        series_id.get_or_insert_with(|| tv_series_id_for_episode(&info, metadata));
+        let playback = if let Some(user_id) = user_id {
+            db.playback_state_for_item(user_id, item.id).await?
+        } else {
+            None
+        };
+        let entry = summary.get_or_insert_with(|| TvSeasonSummary::new(info.season_number));
+        entry.episode_count += 1;
+        if playback.is_none_or(|state| !state.played) {
+            entry.unplayed_count += 1;
+        }
+        if let Some(metadata) = metadata {
+            entry.merge_episode_metadata(metadata);
+        }
+    }
+
+    Ok(match (series_name, series_id, summary) {
+        (Some(series_name), Some(series_id), Some(summary)) => {
+            Some((series_name, series_id, summary))
+        }
+        _ => None,
+    })
+}
+
+async fn virtual_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, ApiError> {
+    let items = db.media_items().await?;
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    Ok(items.into_iter().any(|item| {
+        tv_episode_info(&item).is_some_and(|info| {
+            let metadata = metadata_by_item.get(&item.id);
+            tv_series_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
+                || tv_season_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
+                || tv_season_id(&info.series_name, info.season_number).eq_ignore_ascii_case(item_id)
+        })
+    }))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SortField {
     SortName,
@@ -29546,6 +34494,10 @@ fn hyphenate_uuid(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn default_primary_image_tag(item_id: &str) -> String {
+    format!("generated-{item_id}")
 }
 
 fn user_view_to_json(folder: &VirtualFolder, server_id: &str) -> serde_json::Value {
@@ -29632,6 +34584,7 @@ fn media_item_to_json_with_playback_and_metadata(
 ) -> serde_json::Value {
     let item_type = media_item_type(item);
     let item_id = item.id.simple().to_string();
+    let image_tag = default_primary_image_tag(&item_id);
     let container = media_item_container(item);
     let file_name = media_item_file_name(item);
     let file_size = media_item_file_size(item);
@@ -29688,27 +34641,40 @@ fn media_item_to_json_with_playback_and_metadata(
         "Size": file_size,
         "Name": item.name,
         "IsRemote": false,
-        "ETag": null,
+        "ETag": stable_entity_id("MediaSourceETag", &item_id),
         "RunTimeTicks": item.runtime_ticks,
         "ReadAtNativeFramerate": false,
         "IgnoreDts": false,
         "IgnoreIndex": false,
         "GenPtsInput": false,
-        "SupportsTranscoding": false,
+        "SupportsTranscoding": item.media_type == "Video" || item.media_type == "Audio",
         "SupportsDirectStream": true,
         "SupportsDirectPlay": true,
         "IsInfiniteStream": false,
+        "UseMostCompatibleTranscodingProfile": false,
         "RequiresOpening": false,
         "RequiresClosing": false,
         "RequiresLooping": false,
         "SupportsProbing": true,
         "VideoType": video_type,
         "DefaultAudioStreamIndex": selected_audio_stream_index,
-        "DefaultSubtitleStreamIndex": selected_subtitle_stream_index,
         "MediaStreams": media_streams.clone(),
+        "MediaAttachments": [],
         "Formats": [],
+        "RequiredHttpHeaders": {},
+        "TranscodingSubProtocol": "http",
+        "HasSegments": false,
         "Bitrate": item.bitrate,
     });
+    let mut media_source = media_source;
+    if !selected_subtitle_stream_index.is_null()
+        && let Some(object) = media_source.as_object_mut()
+    {
+        object.insert(
+            "DefaultSubtitleStreamIndex".to_string(),
+            selected_subtitle_stream_index.clone(),
+        );
+    }
 
     let mut value = serde_json::json!({
         "Name": item.name,
@@ -29752,13 +34718,17 @@ fn media_item_to_json_with_playback_and_metadata(
         "PlayAccess": "Full",
         "RemoteTrailers": [],
         "ProviderIds": {},
+        "LockData": false,
+        "LockedFields": [],
+        "SpecialFeatureCount": 0,
+        "DisplayPreferencesId": stable_entity_id("DisplayPreferences", &item_id),
         "IsFolder": false,
         "ParentId": item.virtual_folder_id.simple().to_string(),
         "Type": item_type,
         "MediaType": item.media_type,
         "RunTimeTicks": item.runtime_ticks,
         "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": is_favorite, "Likes": likes, "Played": played, "Key": item_id, "ItemId": item_id, "PlayedPercentage": null, "LastPlayedDate": null, "Rating": rating },
-        "ImageTags": { "Primary": "placeholder" },
+        "ImageTags": { "Primary": image_tag },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
@@ -29815,13 +34785,114 @@ fn apply_media_item_metadata(
             serde_json::Value::String(normalize_metadata_date_for_json(&premiere_date)),
         );
     }
+    if let Some(index_number) = first_metadata_i32_from_json(metadata, &["IndexNumber"]) {
+        object.insert("IndexNumber".to_string(), serde_json::json!(index_number));
+    }
+    if let Some(parent_index_number) =
+        first_metadata_i32_from_json(metadata, &["ParentIndexNumber"])
+    {
+        object.insert(
+            "ParentIndexNumber".to_string(),
+            serde_json::json!(parent_index_number),
+        );
+    }
+    if media_item_type(item) == "Episode"
+        && let Some(series_name) = first_metadata_value_from_json(metadata, &["SeriesName"])
+    {
+        object.insert(
+            "SeriesName".to_string(),
+            serde_json::Value::String(series_name),
+        );
+    }
+    if media_item_type(item) == "Episode"
+        && let Some(series_id) = canonical_metadata_uuid_from_json(metadata, &["SeriesId"])
+    {
+        object.insert(
+            "SeriesId".to_string(),
+            serde_json::Value::String(series_id.clone()),
+        );
+        if object.get("ParentBackdropItemId").is_some() {
+            object.insert(
+                "ParentBackdropItemId".to_string(),
+                serde_json::Value::String(series_id.clone()),
+            );
+        }
+        if object.get("ParentThumbItemId").is_some() {
+            object.insert(
+                "ParentThumbItemId".to_string(),
+                serde_json::Value::String(series_id),
+            );
+        }
+    }
+    if media_item_type(item) == "Episode"
+        && let Some(season_id) = canonical_metadata_uuid_from_json(metadata, &["SeasonId"])
+    {
+        object.insert(
+            "SeasonId".to_string(),
+            serde_json::Value::String(season_id.clone()),
+        );
+        object.insert("ParentId".to_string(), serde_json::Value::String(season_id));
+    }
+    if let Some(primary_tag) =
+        first_metadata_value_from_json(metadata, &["PrimaryImageTag", "ImageTag"])
+    {
+        object.insert(
+            "ImageTags".to_string(),
+            serde_json::json!({ "Primary": primary_tag }),
+        );
+    }
+    if let Some(series_primary_tag) =
+        first_metadata_value_from_json(metadata, &["SeriesPrimaryImageTag"])
+    {
+        object.insert(
+            "SeriesPrimaryImageTag".to_string(),
+            serde_json::Value::String(series_primary_tag),
+        );
+    }
+    if let Some(series_backdrop_tag) =
+        first_metadata_value_from_json(metadata, &["SeriesBackdropImageTag"])
+    {
+        object.insert(
+            "ParentBackdropImageTags".to_string(),
+            serde_json::json!([series_backdrop_tag]),
+        );
+        if let Some(series_id) = object.get("SeriesId").cloned() {
+            object.insert("ParentBackdropItemId".to_string(), series_id);
+        }
+    }
+    if let Some(backdrop_tag) = first_metadata_value_from_json(metadata, &["BackdropImageTag"]) {
+        object.insert(
+            "BackdropImageTags".to_string(),
+            serde_json::json!([backdrop_tag]),
+        );
+    }
+    if let Some(series_thumb_tag) =
+        first_metadata_value_from_json(metadata, &["SeriesThumbImageTag"])
+    {
+        object.insert(
+            "ParentThumbImageTag".to_string(),
+            serde_json::Value::String(series_thumb_tag),
+        );
+        if let Some(series_id) = object.get("SeriesId").cloned() {
+            object.insert("ParentThumbItemId".to_string(), series_id);
+        }
+    }
 
     let taglines = metadata_values_from_json(metadata, &["Taglines"]);
     if !taglines.is_empty() {
         object.insert("Taglines".to_string(), serde_json::json!(taglines));
     }
 
-    let genres = metadata_values_from_json(metadata, &["Genres", "MusicGenres"]);
+    for (target, keys) in [
+        ("LockData", &["LockData"][..]),
+        ("LockedFields", &["LockedFields"][..]),
+    ] {
+        if let Some(field_value) = first_metadata_json_from_case_insensitive(metadata, keys) {
+            object.insert(target.to_string(), field_value);
+        }
+    }
+
+    let genres = metadata_values_from_json(metadata, &["Genres", "SeriesGenres", "MusicGenres"]);
     if !genres.is_empty() {
         object.insert("Genres".to_string(), serde_json::json!(genres));
         object.insert(
@@ -29830,17 +34901,17 @@ fn apply_media_item_metadata(
         );
     }
 
-    let studios = metadata_values_from_json(metadata, &["Studios"]);
+    let studios = metadata_values_from_json(metadata, &["Studios", "SeriesStudios"]);
     if !studios.is_empty() {
-        object.insert("Studios".to_string(), serde_json::json!(studios));
+        object.insert(
+            "Studios".to_string(),
+            serde_json::json!(metadata_name_id_items("Studio", &studios)),
+        );
     }
 
-    let people = metadata_values_from_json(metadata, &["People", "Cast"]);
+    let people = metadata_people_items_from_json(metadata, &["People", "Cast", "SeriesPeople"]);
     if !people.is_empty() {
-        object.insert(
-            "People".to_string(),
-            serde_json::json!(metadata_people_items(&people)),
-        );
+        object.insert("People".to_string(), serde_json::json!(people));
     }
 
     let tags = metadata_values_from_json(metadata, &["Tags"]);
@@ -29857,16 +34928,57 @@ fn apply_media_item_metadata(
         object.insert("Artists".to_string(), serde_json::json!(artists));
     }
 
-    if let Some(provider_ids) = json_field_case_insensitive(metadata, "ProviderIds")
-        .or_else(|| json_field_case_insensitive(metadata, "ProviderId"))
-        && provider_ids.is_object()
-    {
+    let provider_ids = merged_provider_ids_from_metadata(metadata);
+    if !provider_ids.is_empty() {
+        let provider_ids = serde_json::Value::Object(provider_ids);
         object.insert("ProviderIds".to_string(), provider_ids.clone());
+        object.insert(
+            "ExternalUrls".to_string(),
+            serde_json::json!(external_urls_from_provider_ids(&provider_ids)),
+        );
     }
 
     if !trailers.is_empty() {
         object.insert("RemoteTrailers".to_string(), serde_json::json!(trailers));
     }
+    if let Some(chapters) = json_field_case_insensitive(metadata, "Chapters")
+        && chapters.is_array()
+    {
+        object.insert("Chapters".to_string(), chapters.clone());
+    }
+}
+
+fn first_metadata_json_from_case_insensitive(
+    metadata: &serde_json::Value,
+    keys: &[&str],
+) -> Option<serde_json::Value> {
+    for key in keys {
+        if let Some(value) = json_field_case_insensitive(metadata, key) {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+fn merged_provider_ids_from_metadata(
+    metadata: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut merged = serde_json::Map::new();
+    for key in ["SeriesProviderIds", "ProviderIds", "ProviderId"] {
+        let Some(value) = json_field_case_insensitive(metadata, key) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        for (provider, id) in object {
+            if id.is_null() || id.as_str().is_some_and(|id| id.trim().is_empty()) {
+                continue;
+            }
+            merged.insert(provider.clone(), id.clone());
+        }
+    }
+    merged
 }
 
 fn metadata_values_from_json(metadata: &serde_json::Value, keys: &[&str]) -> Vec<String> {
@@ -29883,9 +34995,31 @@ fn first_metadata_value_from_json(metadata: &serde_json::Value, keys: &[&str]) -
     metadata_values_from_json(metadata, keys).into_iter().next()
 }
 
+fn canonical_metadata_uuid_from_json(
+    metadata: &serde_json::Value,
+    keys: &[&str],
+) -> Option<String> {
+    first_metadata_value_from_json(metadata, keys).and_then(|value| {
+        parse_jellyfin_uuid(&value)
+            .ok()
+            .map(|uuid| uuid.simple().to_string())
+    })
+}
+
 fn normalize_metadata_date_for_json(value: &str) -> String {
     if OffsetDateTime::parse(value, &Rfc3339).is_ok() {
         return value.to_string();
+    }
+    if let Some((date, time)) = value.split_once(' ')
+        && date.len() == 10
+        && time.len() >= 8
+        && date.chars().all(|ch| ch.is_ascii_digit() || ch == '-')
+        && time
+            .chars()
+            .take(8)
+            .all(|ch| ch.is_ascii_digit() || ch == ':')
+    {
+        return format!("{date}T{}Z", &time[..8]);
     }
     if let Some(value) = value.strip_suffix(" +00:00:00")
         && let Some((date, time)) = value.split_once(' ')
@@ -30187,6 +35321,27 @@ fn collect_item_count_metadata_value(
     }
 }
 
+fn collect_item_filter_staff_value(
+    metadata: &MediaItemMetadata,
+    key: &str,
+    values: &mut BTreeMap<String, serde_json::Value>,
+) {
+    let Some(value) = metadata.payload.get(key) else {
+        return;
+    };
+    let mut names = BTreeMap::<String, String>::new();
+    collect_metadata_value(value, &mut names);
+    for name in names.into_values() {
+        let id = stable_entity_id("Person", &name);
+        values.entry(name.to_ascii_lowercase()).or_insert_with(|| {
+            serde_json::json!({
+                "Name": name,
+                "Id": id
+            })
+        });
+    }
+}
+
 fn media_item_path(item: &MediaItem) -> &FsPath {
     FsPath::new(&item.path)
 }
@@ -30196,6 +35351,61 @@ fn media_item_container(item: &MediaItem) -> Option<String> {
         .extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase())
+}
+
+fn media_item_location_type(_item: &MediaItem) -> &'static str {
+    "FileSystem"
+}
+
+fn collect_media_item_stream_languages(
+    item: &MediaItem,
+    stream_type: &str,
+    values: &mut BTreeMap<String, String>,
+) {
+    for language in media_item_stream_languages(item, stream_type) {
+        values
+            .entry(language.to_ascii_lowercase())
+            .or_insert(language);
+    }
+}
+
+fn media_item_has_stream_language(
+    item: &MediaItem,
+    stream_type: &str,
+    languages: &[String],
+) -> bool {
+    media_item_stream_languages(item, stream_type)
+        .into_iter()
+        .map(|language| language.to_ascii_lowercase())
+        .any(|language| languages.iter().any(|allowed| allowed == &language))
+}
+
+fn media_item_has_stream_type(item: &MediaItem, stream_type: &str) -> bool {
+    media_item_streams(item).into_iter().any(|stream| {
+        stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(stream_type))
+    })
+}
+
+fn media_item_stream_languages(item: &MediaItem, stream_type: &str) -> Vec<String> {
+    media_item_streams(item)
+        .into_iter()
+        .filter(|stream| {
+            stream
+                .get("Type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(stream_type))
+        })
+        .filter_map(|stream| {
+            stream
+                .get("Language")
+                .and_then(serde_json::Value::as_str)
+                .and_then(normalize_language_code)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
 }
 
 fn media_item_file_name(item: &MediaItem) -> Option<String> {
@@ -30245,6 +35455,14 @@ fn hls_codecs(item: &MediaItem) -> Option<String> {
     (!codecs.is_empty()).then(|| codecs.join(","))
 }
 
+fn transcoded_hls_codecs(media_type: &str) -> Option<String> {
+    match media_type {
+        "Video" => Some("avc1.4d401f,mp4a.40.2".to_string()),
+        "Audio" => Some("mp4a.40.2".to_string()),
+        _ => None,
+    }
+}
+
 fn rewrite_hls_media_playlist(
     playlist: &str,
     item_id: &str,
@@ -30266,6 +35484,94 @@ fn rewrite_hls_media_playlist(
         rewritten.push('\n');
     }
     rewritten
+}
+
+fn render_seekable_hls_media_playlist(
+    session: &TranscodeSession,
+    item_id: &str,
+    raw_query: Option<&str>,
+    route_media_type: &str,
+) -> Option<String> {
+    let runtime_ticks = session.item.runtime_ticks?.max(0);
+    if runtime_ticks <= 0 {
+        return None;
+    }
+
+    let start_position_ticks =
+        hls_effective_start_position_ticks(session.start_position_ticks, Some(runtime_ticks));
+    let remaining_ticks = runtime_ticks.saturating_sub(start_position_ticks);
+    if remaining_ticks <= 0 {
+        return None;
+    }
+
+    let segment_ticks = hls_segment_ticks();
+    let segment_count = ((remaining_ticks + segment_ticks - 1) / segment_ticks).max(1);
+    let mut playlist = String::new();
+    playlist.push_str("#EXTM3U\n");
+    playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    playlist.push_str("#EXT-X-VERSION:3\n");
+    playlist.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)
+    ));
+    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+
+    for segment_id in 0..segment_count {
+        let segment_start_ticks = start_position_ticks + segment_id * segment_ticks;
+        let segment_length_ticks = (runtime_ticks - segment_start_ticks)
+            .min(segment_ticks)
+            .max(0);
+        if segment_length_ticks <= 0 {
+            continue;
+        }
+        let segment_duration_seconds = segment_length_ticks as f64 / 10_000_000.0;
+        playlist.push_str(&format!("#EXTINF:{segment_duration_seconds:.6}, nodesc\n"));
+        let path = format!("/{route_media_type}/{item_id}/hls1/main/{segment_id}.ts");
+        let query =
+            append_hls_segment_timing_query(raw_query, segment_start_ticks, segment_length_ticks);
+        playlist.push_str(&append_query(&path, query.as_deref()));
+        playlist.push('\n');
+    }
+
+    playlist.push_str("#EXT-X-ENDLIST\n");
+    Some(playlist)
+}
+
+fn append_hls_segment_timing_query(
+    raw_query: Option<&str>,
+    runtime_ticks: i64,
+    actual_segment_length_ticks: i64,
+) -> Option<String> {
+    let timing = format!(
+        "runtimeTicks={}&actualSegmentLengthTicks={}",
+        runtime_ticks.max(0),
+        actual_segment_length_ticks.max(0)
+    );
+    Some(
+        raw_query
+            .filter(|query| !query.trim().is_empty())
+            .map_or(timing.clone(), |query| format!("{query}&{timing}")),
+    )
+}
+
+fn hls_segment_ticks() -> i64 {
+    i64::from(DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)) * 10_000_000
+}
+
+fn hls_effective_start_position_ticks(
+    start_position_ticks: i64,
+    runtime_ticks: Option<i64>,
+) -> i64 {
+    let start_position_ticks = start_position_ticks.max(0);
+    let Some(runtime_ticks) = runtime_ticks.map(|ticks| ticks.max(0)) else {
+        return start_position_ticks;
+    };
+    if runtime_ticks <= 0 {
+        return start_position_ticks;
+    }
+
+    let max_start = runtime_ticks.saturating_sub(hls_segment_ticks()).max(0);
+    start_position_ticks.min(max_start)
 }
 
 fn hls_segment_id_from_uri(uri: &str) -> Option<u32> {
@@ -30297,7 +35603,14 @@ fn positive_u32(value: i64) -> Option<u32> {
 
 fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
     if !item.media_streams.is_empty() {
-        return item.media_streams.clone();
+        let mut streams = item
+            .media_streams
+            .iter()
+            .cloned()
+            .map(normalize_media_stream)
+            .collect::<Vec<_>>();
+        enrich_media_streams_with_context(&mut streams);
+        return streams;
     }
 
     if item.media_type == "Audio" {
@@ -30358,6 +35671,447 @@ fn media_item_streams(item: &MediaItem) -> Vec<serde_json::Value> {
     Vec::new()
 }
 
+fn normalize_media_stream(mut stream: serde_json::Value) -> serde_json::Value {
+    let Some(object) = stream.as_object_mut() else {
+        return stream;
+    };
+    let stream_type = object
+        .get("Type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let raw_codec = object
+        .get("Codec")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let api_codec = media_stream_api_codec(&stream_type, &raw_codec);
+    if api_codec != raw_codec {
+        object.insert("Codec".to_string(), serde_json::json!(api_codec));
+    }
+    let language = object
+        .get("Language")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_language_code)
+        .map(ToOwned::to_owned);
+    if let Some(language) = language.as_deref() {
+        object.insert("Language".to_string(), serde_json::json!(language));
+    }
+    let title = object
+        .get("Title")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let channels = object.get("Channels").and_then(json_value_i64);
+    let channel_layout = object
+        .get("ChannelLayout")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let is_default = object
+        .get("IsDefault")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let is_forced = object
+        .get("IsForced")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let width = object.get("Width").and_then(json_value_i64);
+    let height = object.get("Height").and_then(json_value_i64);
+    let pixel_format = object
+        .get("PixelFormat")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let bit_depth = object
+        .get("BitDepth")
+        .and_then(json_value_i64)
+        .or_else(|| video_bit_depth_from_pixel_format(pixel_format.as_deref()));
+
+    insert_if_missing_or_null(object, "TimeBase", serde_json::json!("1/1000"));
+    insert_if_missing_or_null(object, "VideoRange", serde_json::json!("Unknown"));
+    insert_if_missing_or_null(object, "VideoRangeType", serde_json::json!("Unknown"));
+    insert_if_missing_or_null(object, "AudioSpatialFormat", serde_json::json!("None"));
+    insert_if_missing_or_null(object, "IsHearingImpaired", serde_json::json!(false));
+    insert_if_missing_or_null(object, "IsOriginal", serde_json::json!(false));
+
+    if let Some(localized_language) = language_display_name(language.as_deref()) {
+        object.insert(
+            "LocalizedLanguage".to_string(),
+            serde_json::json!(localized_language),
+        );
+    }
+    object.insert("LocalizedDefault".to_string(), serde_json::json!("Default"));
+    object.insert(
+        "LocalizedExternal".to_string(),
+        serde_json::json!("External"),
+    );
+
+    if stream_type == "Subtitle" {
+        object.insert(
+            "IsTextSubtitleStream".to_string(),
+            serde_json::json!(is_text_subtitle_codec(&api_codec)),
+        );
+        object.insert(
+            "SupportsExternalStream".to_string(),
+            serde_json::json!(subtitle_supports_external_stream(&api_codec)),
+        );
+        object.insert(
+            "LocalizedUndefined".to_string(),
+            serde_json::json!("Undefined"),
+        );
+        object.insert("LocalizedForced".to_string(), serde_json::json!("Forced"));
+        object.insert(
+            "LocalizedHearingImpaired".to_string(),
+            serde_json::json!("Hearing Impaired"),
+        );
+    }
+    if stream_type == "Audio" {
+        object.insert("IsTextSubtitleStream".to_string(), serde_json::json!(false));
+        object.insert(
+            "SupportsExternalStream".to_string(),
+            serde_json::json!(false),
+        );
+        object.insert(
+            "LocalizedOriginal".to_string(),
+            serde_json::json!("Original"),
+        );
+        if let Some(channels) = audio_channel_display(channels, channel_layout.as_deref()) {
+            object.insert("ChannelLayout".to_string(), serde_json::json!(channels));
+        }
+    }
+    if stream_type == "Video" {
+        if let Some(bit_depth) = bit_depth {
+            object.insert("BitDepth".to_string(), serde_json::json!(bit_depth));
+        }
+        for key in [
+            "ChannelLayout",
+            "Channels",
+            "CodecTag",
+            "LocalizedDefault",
+            "LocalizedExternal",
+            "Path",
+            "SampleRate",
+            "Title",
+        ] {
+            object.remove(key);
+        }
+        let is_h264 = api_codec.eq_ignore_ascii_case("h264");
+        insert_if_missing_or_null(object, "IsAVC", serde_json::json!(is_h264));
+        insert_if_missing_or_null(object, "IsAnamorphic", serde_json::json!(false));
+        insert_if_missing_or_null(object, "IsInterlaced", serde_json::json!(false));
+        insert_if_missing_or_null(object, "SupportsExternalStream", serde_json::json!(false));
+        if let Some(aspect_ratio) = video_aspect_ratio(width, height) {
+            insert_if_missing_or_null(object, "AspectRatio", serde_json::json!(aspect_ratio));
+        }
+        if is_h264 {
+            insert_if_missing_or_null(object, "NalLengthSize", serde_json::json!("4"));
+            insert_if_missing_or_null(object, "Level", serde_json::json!(30));
+            insert_if_missing_or_null(object, "RefFrames", serde_json::json!(1));
+        }
+        if let Some(frame_rate) = object
+            .get("RealFrameRate")
+            .cloned()
+            .or_else(|| object.get("AverageFrameRate").cloned())
+            .filter(|value| !value.is_null())
+        {
+            insert_if_missing_or_null(object, "ReferenceFrameRate", frame_rate);
+        }
+        let video_range = video_stream_range(object);
+        object.insert("VideoRange".to_string(), serde_json::json!(video_range));
+        object.insert("VideoRangeType".to_string(), serde_json::json!(video_range));
+    }
+    object.insert(
+        "DisplayTitle".to_string(),
+        serde_json::json!(if stream_type == "Video" {
+            video_stream_display_title(
+                &api_codec,
+                width,
+                height,
+                object.get("VideoRange").and_then(serde_json::Value::as_str),
+            )
+        } else {
+            media_stream_display_title(
+                &stream_type,
+                &api_codec,
+                language.as_deref(),
+                title.as_deref(),
+                channels,
+                channel_layout.as_deref(),
+                is_default,
+                is_forced,
+            )
+        }),
+    );
+    stream
+}
+
+fn enrich_media_streams_with_context(streams: &mut [serde_json::Value]) {
+    let video_dimensions = streams.iter().find_map(|stream| {
+        let object = stream.as_object()?;
+        let stream_type = object.get("Type").and_then(serde_json::Value::as_str)?;
+        if !stream_type.eq_ignore_ascii_case("Video") {
+            return None;
+        }
+        Some((
+            object
+                .get("Width")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            object
+                .get("Height")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ))
+    });
+
+    let Some((video_width, video_height)) = video_dimensions else {
+        return;
+    };
+    if video_width.is_null() && video_height.is_null() {
+        return;
+    }
+
+    for stream in streams {
+        let Some(object) = stream.as_object_mut() else {
+            continue;
+        };
+        let stream_type = object
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !stream_type.eq_ignore_ascii_case("Subtitle") {
+            continue;
+        }
+        insert_if_missing_or_null(object, "Width", video_width.clone());
+        insert_if_missing_or_null(object, "Height", video_height.clone());
+    }
+}
+
+fn insert_if_missing_or_null(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    if object.get(key).is_none_or(serde_json::Value::is_null) {
+        object.insert(key.to_string(), value);
+    }
+}
+
+fn media_stream_display_title(
+    stream_type: &str,
+    codec: &str,
+    language: Option<&str>,
+    title: Option<&str>,
+    channels: Option<i64>,
+    channel_layout: Option<&str>,
+    is_default: bool,
+    is_forced: bool,
+) -> String {
+    let mut parts = Vec::<String>::new();
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        parts.push(title.to_string());
+    }
+    if let Some(language) = language_display_name(language) {
+        parts.push(language);
+    }
+    match stream_type {
+        "Audio" => {
+            parts.push(codec_display_name(codec));
+            if let Some(channels) = audio_channel_display(channels, channel_layout) {
+                parts.push(channels);
+            }
+        }
+        "Subtitle" => {
+            parts.push(codec_display_name(codec));
+        }
+        _ => parts.push(codec_display_name(codec)),
+    }
+    if is_default {
+        parts.push("Default".to_string());
+    }
+    if is_forced {
+        parts.push("Forced".to_string());
+    }
+    if parts.is_empty() {
+        stream_type.to_string()
+    } else {
+        parts.join(" - ")
+    }
+}
+
+fn video_stream_display_title(
+    codec: &str,
+    width: Option<i64>,
+    height: Option<i64>,
+    video_range: Option<&str>,
+) -> String {
+    let mut parts = Vec::<String>::new();
+    if let Some(resolution) = video_resolution_display(width, height) {
+        parts.push(resolution);
+    }
+    parts.push(codec_display_name(codec));
+    if let Some(video_range) = video_range
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("Unknown"))
+    {
+        parts.push(video_range.to_ascii_uppercase());
+    }
+    parts.join(" ")
+}
+
+fn video_resolution_display(width: Option<i64>, height: Option<i64>) -> Option<String> {
+    let height = height.filter(|height| *height > 0)?;
+    let label = match height {
+        1..=479 => format!("{height}p"),
+        480..=719 => "480p".to_string(),
+        720..=1079 => "720p".to_string(),
+        1080..=1439 => "1080p".to_string(),
+        1440..=2159 => "1440p".to_string(),
+        2160..=4319 => "4K".to_string(),
+        _ => format!("{height}p"),
+    };
+    if width.is_some_and(|width| width >= 3800) && height >= 2000 {
+        Some("4K".to_string())
+    } else {
+        Some(label)
+    }
+}
+
+fn video_aspect_ratio(width: Option<i64>, height: Option<i64>) -> Option<String> {
+    let width = width.filter(|value| *value > 0)?;
+    let height = height.filter(|value| *value > 0)?;
+    let divisor = gcd_i64(width, height);
+    Some(format!("{}:{}", width / divisor, height / divisor))
+}
+
+fn gcd_i64(mut left: i64, mut right: i64) -> i64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.abs().max(1)
+}
+
+fn video_stream_range(object: &serde_json::Map<String, serde_json::Value>) -> &'static str {
+    let existing = object
+        .get("VideoRange")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if existing.eq_ignore_ascii_case("HDR")
+        || existing.eq_ignore_ascii_case("HDR10")
+        || existing.eq_ignore_ascii_case("HLG")
+        || existing.eq_ignore_ascii_case("DolbyVision")
+    {
+        return "HDR";
+    }
+    let transfer = object
+        .get("ColorTransfer")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(transfer.as_str(), "smpte2084" | "arib-std-b67") {
+        "HDR"
+    } else {
+        "SDR"
+    }
+}
+
+fn video_bit_depth_from_pixel_format(pixel_format: Option<&str>) -> Option<i64> {
+    let pixel_format = pixel_format?.to_ascii_lowercase();
+    if pixel_format.contains("12") {
+        Some(12)
+    } else if pixel_format.contains("10") {
+        Some(10)
+    } else {
+        None
+    }
+}
+
+fn media_stream_api_codec(stream_type: &str, codec: &str) -> String {
+    match (stream_type, codec.to_ascii_lowercase().as_str()) {
+        ("Subtitle", "hdmv_pgs_subtitle") => "PGSSUB".to_string(),
+        _ => codec.to_string(),
+    }
+}
+
+fn codec_display_name(codec: &str) -> String {
+    match codec.to_ascii_lowercase().as_str() {
+        "ac3" => "Dolby Digital".to_string(),
+        "eac3" => "Dolby Digital+".to_string(),
+        "aac" => "AAC".to_string(),
+        "dts" => "DTS".to_string(),
+        "truehd" => "TrueHD".to_string(),
+        "flac" => "FLAC".to_string(),
+        "hevc" | "h265" => "HEVC".to_string(),
+        "h264" => "H264".to_string(),
+        "hdmv_pgs_subtitle" | "pgssub" => "PGSSUB".to_string(),
+        "subrip" => "SRT".to_string(),
+        "ass" | "ssa" => codec.to_ascii_uppercase(),
+        _ => codec.to_string(),
+    }
+}
+
+fn language_display_name(language: Option<&str>) -> Option<String> {
+    let language = language?.trim();
+    if language.is_empty() || language.eq_ignore_ascii_case("und") {
+        return None;
+    }
+    Some(
+        match language.to_ascii_lowercase().as_str() {
+            "eng" | "en" => "English",
+            "spa" | "es" => "Spanish; Castilian",
+            "fre" | "fra" | "fr" => "French",
+            "ger" | "deu" | "de" => "German",
+            "dan" | "da" => "Danish",
+            "fin" | "fi" => "Finnish",
+            "nob" => "Norwegian (Bokmal)",
+            "nor" | "no" => "Norwegian",
+            "swe" | "sv" => "Swedish",
+            _ => language,
+        }
+        .to_string(),
+    )
+}
+
+fn normalize_language_code(language: &str) -> Option<&str> {
+    let language = language.trim();
+    if language.is_empty() || language.eq_ignore_ascii_case("und") {
+        return None;
+    }
+    Some(match language.to_ascii_lowercase().as_str() {
+        "fre" => "fra",
+        "ger" => "deu",
+        _ => language,
+    })
+}
+
+fn audio_channel_display(channels: Option<i64>, channel_layout: Option<&str>) -> Option<String> {
+    if let Some(layout) = channel_layout {
+        let normalized = layout.trim().trim_end_matches("(side)").trim();
+        if !normalized.is_empty() && normalized != "0" {
+            return Some(normalized.to_string());
+        }
+    }
+    match channels {
+        Some(1) => Some("Mono".to_string()),
+        Some(2) => Some("Stereo".to_string()),
+        Some(6) => Some("5.1".to_string()),
+        Some(8) => Some("7.1".to_string()),
+        Some(value) if value > 0 => Some(format!("{value} ch")),
+        _ => None,
+    }
+}
+
+fn is_text_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "subrip" | "srt" | "ass" | "ssa" | "webvtt" | "vtt" | "mov_text"
+    )
+}
+
+fn subtitle_supports_external_stream(codec: &str) -> bool {
+    !is_text_subtitle_codec(codec)
+}
+
 fn parse_range_header(headers: &HeaderMap, total_len: u64) -> Result<Option<(u64, u64)>, ()> {
     let Some(range) = headers.get(header::RANGE) else {
         return Ok(None);
@@ -30393,6 +36147,7 @@ fn media_item_type(item: &MediaItem) -> &'static str {
     match (item.media_type.as_str(), item.collection_type.as_deref()) {
         ("Video", Some("movies")) => "Movie",
         ("Video", Some("musicvideos" | "musicvideo")) => "MusicVideo",
+        ("Video", Some("tvshows" | "tvshow" | "series")) if is_tv_extra_item(item) => "Video",
         ("Video", Some("tvshows" | "tvshow" | "series")) => "Episode",
         ("Video", _) => "Video",
         ("Audio", _) => "Audio",
@@ -30400,6 +36155,32 @@ fn media_item_type(item: &MediaItem) -> &'static str {
         ("Book", _) => "Book",
         _ => "BaseItem",
     }
+}
+
+fn is_tv_extra_item(item: &MediaItem) -> bool {
+    media_item_path(item)
+        .parent()
+        .map(|parent| {
+            parent.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .map(|value| {
+                        matches!(
+                            value.trim().to_ascii_lowercase().as_str(),
+                            "extras"
+                                | "featurettes"
+                                | "special features"
+                                | "behind the scenes"
+                                | "deleted scenes"
+                                | "interviews"
+                                | "trailers"
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -30467,40 +36248,137 @@ fn tv_season_id(series_name: &str, season_number: Option<i32>) -> String {
     stable_entity_id("Season", &format!("{series_name}:{season_key}"))
 }
 
-fn tv_episode_matches_series(item: &MediaItem, series_id: &str) -> bool {
+fn tv_series_id_for_episode(info: &TvEpisodeInfo, metadata: Option<&serde_json::Value>) -> String {
+    metadata
+        .and_then(|metadata| canonical_metadata_uuid_from_json(metadata, &["SeriesId"]))
+        .unwrap_or_else(|| tv_series_id(&info.series_name))
+}
+
+fn tv_season_id_for_episode(info: &TvEpisodeInfo, metadata: Option<&serde_json::Value>) -> String {
+    metadata
+        .and_then(|metadata| canonical_metadata_uuid_from_json(metadata, &["SeasonId"]))
+        .unwrap_or_else(|| tv_season_id(&info.series_name, info.season_number))
+}
+
+fn tv_episode_matches_series(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+    series_id: &str,
+) -> bool {
     tv_episode_info(item)
-        .map(|info| tv_series_id(&info.series_name).eq_ignore_ascii_case(series_id))
+        .map(|info| tv_series_id_for_episode(&info, metadata).eq_ignore_ascii_case(series_id))
         .unwrap_or(false)
 }
 
-fn tv_episode_matches_season(item: &MediaItem, season_id: &str) -> bool {
+fn tv_episode_matches_season(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+    season_id: &str,
+) -> bool {
     tv_episode_info(item)
         .map(|info| {
-            tv_season_id(&info.series_name, info.season_number).eq_ignore_ascii_case(season_id)
+            tv_season_id_for_episode(&info, metadata).eq_ignore_ascii_case(season_id)
+                || tv_season_id(&info.series_name, info.season_number)
+                    .eq_ignore_ascii_case(season_id)
         })
         .unwrap_or(false)
 }
 
-fn series_name_for_id(items: Vec<MediaItem>, series_id: &str) -> Option<String> {
-    items
-        .into_iter()
-        .filter_map(|item| tv_episode_info(&item))
-        .find(|info| tv_series_id(&info.series_name).eq_ignore_ascii_case(series_id))
-        .map(|info| info.series_name)
+async fn series_name_for_id(
+    items: Vec<MediaItem>,
+    db: &Database,
+    series_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    Ok(items.into_iter().find_map(|item| {
+        let info = tv_episode_info(&item)?;
+        tv_series_id_for_episode(&info, metadata_by_item.get(&item.id))
+            .eq_ignore_ascii_case(series_id)
+            .then_some(info.series_name)
+    }))
+}
+
+#[derive(Debug)]
+struct TvSeasonSummary {
+    id: Option<String>,
+    season_number: Option<i32>,
+    episode_count: usize,
+    unplayed_count: usize,
+    metadata: serde_json::Value,
+}
+
+impl TvSeasonSummary {
+    fn new(season_number: Option<i32>) -> Self {
+        Self {
+            id: None,
+            season_number,
+            episode_count: 0,
+            unplayed_count: 0,
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    fn merge_episode_metadata(&mut self, metadata: &serde_json::Value) {
+        if self.id.is_none() {
+            self.id = canonical_metadata_uuid_from_json(metadata, &["SeasonId"]);
+        }
+        for (target, keys) in [
+            ("Overview", &["SeasonOverview"][..]),
+            ("PremiereDate", &["SeasonPremiereDate"][..]),
+            ("EndDate", &["SeasonEndDate"][..]),
+            ("CommunityRating", &["SeasonCommunityRating"][..]),
+            ("ProductionYear", &["SeasonProductionYear"][..]),
+            ("PrimaryImageTag", &["SeasonPrimaryImageTag"][..]),
+            ("PrimaryImagePath", &["SeasonPrimaryImagePath"][..]),
+        ] {
+            if self.metadata.get(target).is_none()
+                && let Some(value) = first_metadata_value_from_json(metadata, keys)
+            {
+                self.metadata[target] = serde_json::Value::String(value);
+            }
+        }
+        if self.metadata.get("ProviderIds").is_none()
+            && let Some(provider_ids) = json_field_case_insensitive(metadata, "SeasonProviderIds")
+            && provider_ids.is_object()
+        {
+            self.metadata["ProviderIds"] = provider_ids.clone();
+        }
+        for (target, key) in [
+            ("People", "SeasonPeople"),
+            ("ExternalUrls", "SeasonExternalUrls"),
+        ] {
+            if self.metadata.get(target).is_none()
+                && let Some(value) = json_field_case_insensitive(metadata, key)
+                && value.is_array()
+            {
+                self.metadata[target] = value.clone();
+            }
+        }
+    }
 }
 
 fn tv_season_json(
     server_id: &str,
     series_name: &str,
-    season_number: Option<i32>,
-    episode_count: usize,
+    series_id: &str,
+    summary: TvSeasonSummary,
 ) -> serde_json::Value {
+    let season_number = summary.season_number;
     let season_name = season_number
         .map(|season| format!("Season {season}"))
         .unwrap_or_else(|| "Season Unknown".to_string());
-    let series_id = tv_series_id(series_name);
-    let season_id = tv_season_id(series_name, season_number);
-    serde_json::json!({
+    let season_id = summary
+        .id
+        .clone()
+        .unwrap_or_else(|| tv_season_id(series_name, season_number));
+    let image_tag = default_primary_image_tag(&season_id);
+    let series_image_tag = default_primary_image_tag(&series_id);
+    let (display_series_name, _) = clean_tv_series_name_and_year(series_name);
+    let episode_count = summary.episode_count;
+    let unplayed_count = summary.unplayed_count;
+    let played = episode_count > 0 && unplayed_count == 0;
+    let mut value = serde_json::json!({
         "Name": season_name,
         "OriginalTitle": null,
         "ServerId": server_id,
@@ -30525,16 +36403,79 @@ fn tv_season_json(
         "ParentId": series_id,
         "Type": "Season",
         "MediaType": null,
-        "SeriesName": series_name,
+        "SeriesName": display_series_name,
         "SeriesId": series_id,
+        "ParentLogoItemId": series_id,
+        "ParentBackdropItemId": series_id,
+        "ParentBackdropImageTags": [],
+        "ParentThumbItemId": series_id,
+        "ParentThumbImageTag": series_image_tag,
+        "SeriesPrimaryImageTag": series_image_tag,
         "IndexNumber": season_number,
         "ChildCount": episode_count,
         "RecursiveItemCount": episode_count,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
-        "ImageTags": { "Primary": "placeholder" },
+        "UserData": {
+            "PlaybackPositionTicks": 0,
+            "PlayCount": i32::from(played),
+            "IsFavorite": false,
+            "Played": played,
+            "PlayedPercentage": if played { 100.0 } else { 0.0 },
+            "UnplayedItemCount": unplayed_count,
+            "Key": season_id,
+            "ItemId": season_id
+        },
+        "ImageTags": { "Primary": image_tag },
+        "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "Virtual"
-    })
+    });
+    apply_tv_season_metadata(&mut value, &summary.metadata);
+    value
+}
+
+fn apply_tv_season_metadata(value: &mut serde_json::Value, metadata: &serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in ["Overview", "CommunityRating"] {
+        if let Some(field_value) = metadata.get(key)
+            && !field_value.is_null()
+            && !(field_value.as_str() == Some(""))
+        {
+            object.insert(key.to_string(), field_value.clone());
+        }
+    }
+    for key in ["PremiereDate", "EndDate"] {
+        if let Some(field_value) = first_metadata_value_from_json(metadata, &[key]) {
+            object.insert(
+                key.to_string(),
+                serde_json::Value::String(normalize_metadata_date_for_json(&field_value)),
+            );
+        }
+    }
+    if let Some(year) = first_metadata_i32_from_json(metadata, &["ProductionYear"]) {
+        object.insert("ProductionYear".to_string(), serde_json::json!(year));
+    }
+    if let Some(primary_tag) = first_metadata_value_from_json(metadata, &["PrimaryImageTag"]) {
+        object.insert(
+            "ImageTags".to_string(),
+            serde_json::json!({ "Primary": primary_tag }),
+        );
+    }
+    if let Some(provider_ids) = json_field_case_insensitive(metadata, "ProviderIds")
+        && provider_ids.is_object()
+    {
+        object.insert("ProviderIds".to_string(), provider_ids.clone());
+    }
+    if let Some(external_urls) = json_field_case_insensitive(metadata, "ExternalUrls")
+        && external_urls.is_array()
+    {
+        object.insert("ExternalUrls".to_string(), external_urls.clone());
+    }
+    let people = metadata_people_items_from_json(metadata, &["People"]);
+    if !people.is_empty() {
+        object.insert("People".to_string(), serde_json::json!(people));
+    }
 }
 
 fn compare_tv_episodes(left: &MediaItem, right: &MediaItem) -> Ordering {
@@ -30573,6 +36514,66 @@ fn compare_tv_episodes(left: &MediaItem, right: &MediaItem) -> Ordering {
                         .and_then(|info| info.episode_number)
                         .unwrap_or(i32::MAX),
                 )
+        })
+        .then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn compare_tv_episodes_with_metadata(
+    left: &MediaItem,
+    left_metadata: Option<&serde_json::Value>,
+    right: &MediaItem,
+    right_metadata: Option<&serde_json::Value>,
+) -> Ordering {
+    let left_info = tv_episode_info(left);
+    let right_info = tv_episode_info(right);
+    let left_series = left_metadata
+        .and_then(|metadata| first_metadata_value_from_json(metadata, &["SeriesName"]))
+        .or_else(|| left_info.as_ref().map(|info| info.series_name.clone()))
+        .unwrap_or_else(|| left.name.clone())
+        .to_ascii_lowercase();
+    let right_series = right_metadata
+        .and_then(|metadata| first_metadata_value_from_json(metadata, &["SeriesName"]))
+        .or_else(|| right_info.as_ref().map(|info| info.series_name.clone()))
+        .unwrap_or_else(|| right.name.clone())
+        .to_ascii_lowercase();
+    left_series
+        .cmp(&right_series)
+        .then_with(|| {
+            first_metadata_i32_from_json(
+                left_metadata.unwrap_or(&serde_json::Value::Null),
+                &["ParentIndexNumber"],
+            )
+            .or_else(|| left_info.as_ref().and_then(|info| info.season_number))
+            .unwrap_or(i32::MAX)
+            .cmp(
+                &first_metadata_i32_from_json(
+                    right_metadata.unwrap_or(&serde_json::Value::Null),
+                    &["ParentIndexNumber"],
+                )
+                .or_else(|| right_info.as_ref().and_then(|info| info.season_number))
+                .unwrap_or(i32::MAX),
+            )
+        })
+        .then_with(|| {
+            first_metadata_i32_from_json(
+                left_metadata.unwrap_or(&serde_json::Value::Null),
+                &["IndexNumber"],
+            )
+            .or_else(|| left_info.as_ref().and_then(|info| info.episode_number))
+            .unwrap_or(i32::MAX)
+            .cmp(
+                &first_metadata_i32_from_json(
+                    right_metadata.unwrap_or(&serde_json::Value::Null),
+                    &["IndexNumber"],
+                )
+                .or_else(|| right_info.as_ref().and_then(|info| info.episode_number))
+                .unwrap_or(i32::MAX),
+            )
         })
         .then_with(|| {
             left.name
@@ -30950,7 +36951,13 @@ async fn item_image_or_placeholder(
     let item = match media_item_by_id(&state.db, item_id).await {
         Ok(item) => Some(item),
         Err(error) if error.status == StatusCode::NOT_FOUND => {
-            media_item_or_folder_by_id(&state.db, item_id).await?;
+            if !virtual_tv_item_exists(&state.db, item_id).await?
+                && metadata_entity_by_stable_id(&state.db, item_id)
+                    .await?
+                    .is_none()
+            {
+                return Ok(placeholder_png_response());
+            }
             None
         }
         Err(error) => return Err(error),
@@ -30964,6 +36971,40 @@ async fn item_image_or_placeholder(
         && let Some(local_image) = find_local_item_image(item, image_type, image_index).await?
     {
         return stored_image_response(local_image).await;
+    }
+    if let Some(item) = item.as_ref()
+        && let Some(generated_image) =
+            find_generated_video_item_image(state, item, item_id, image_type, image_index).await?
+    {
+        return stored_image_response(generated_image).await;
+    }
+    if item.is_none()
+        && let Some(path) =
+            virtual_tv_metadata_image_path(&state.db, item_id, image_type, image_index).await?
+    {
+        return stored_image_response(path).await;
+    }
+    if item.is_none()
+        && let Some(source_item) = virtual_tv_image_source_item(&state.db, item_id).await?
+        && let Some(generated_image) =
+            find_generated_video_item_image(state, &source_item, item_id, image_type, image_index)
+                .await?
+    {
+        return stored_image_response(generated_image).await;
+    }
+    if item.is_none()
+        && let Some(entity) = metadata_entity_by_stable_id(&state.db, item_id).await?
+        && let Some(path) = metadata_entity_image_path(&entity, image_type, image_index).await?
+    {
+        return stored_image_response(path).await;
+    }
+    if item.is_none()
+        && let Some(entity) = metadata_entity_by_stable_id(&state.db, item_id).await?
+        && let Some(path) =
+            find_named_entity_representative_image(state, &entity.name, image_type, image_index)
+                .await?
+    {
+        return stored_image_response(path).await;
     }
     Ok(placeholder_png_response())
 }
@@ -31032,6 +37073,247 @@ fn local_item_image_stems(image_type: &str, image_index: usize) -> Vec<String> {
     }
 }
 
+async fn find_generated_video_item_image(
+    state: &AppState,
+    item: &MediaItem,
+    cache_item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    if !item.media_type.eq_ignore_ascii_case("Video")
+        || image_index != 0
+        || !matches!(
+            normalize_image_type(image_type).as_str(),
+            "primary" | "thumb"
+        )
+    {
+        return Ok(None);
+    }
+
+    let dir = stored_image_owner_dir(state, ImageOwner::Item(cache_item_id));
+    let path = dir.join("generated_video_primary.jpg");
+    if generated_video_image_is_usable(&path).await {
+        return Ok(Some(path));
+    }
+
+    let image_lock = trickplay_tile_lock(&path).await;
+    let _guard = image_lock.lock().await;
+    if generated_video_image_is_usable(&path).await {
+        return Ok(Some(path));
+    }
+
+    tokio::fs::create_dir_all(&dir).await?;
+    let _ = tokio::fs::remove_file(&path).await;
+    let mut best_candidate: Option<(PathBuf, u64)> = None;
+    for (index, seek_seconds) in generated_video_image_seek_seconds(item)
+        .into_iter()
+        .enumerate()
+    {
+        let tmp_path =
+            path.with_extension(format!("jpg.tmp.{}.{}", index, Uuid::new_v4().simple()));
+        let output = Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-ss")
+            .arg(&seek_seconds)
+            .arg("-i")
+            .arg(media_item_path(item))
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-vf")
+            .arg("scale='min(480,iw)':-2:force_original_aspect_ratio=decrease")
+            .arg("-q:v")
+            .arg("4")
+            .arg("-f")
+            .arg("image2")
+            .arg("-c:v")
+            .arg("mjpeg")
+            .arg(&tmp_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        let Ok(output) = output else {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            continue;
+        };
+        if !output.status.success() {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(512)
+                .collect::<String>();
+            tracing::warn!(
+                item_id = %item.id,
+                cache_item_id,
+                status = %output.status,
+                seek_seconds,
+                stderr = %stderr,
+                "ffmpeg failed to generate video item image candidate"
+            );
+            continue;
+        }
+        let bytes = tokio::fs::metadata(&tmp_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if bytes == 0 {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            continue;
+        }
+        if best_candidate
+            .as_ref()
+            .is_some_and(|(_, best_bytes)| *best_bytes >= bytes)
+        {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        } else {
+            if let Some((old_path, _)) = best_candidate.replace((tmp_path, bytes)) {
+                let _ = tokio::fs::remove_file(old_path).await;
+            }
+        }
+    }
+    let Some((tmp_path, _)) = best_candidate else {
+        return Ok(None);
+    };
+    if tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Ok(Some(path));
+    }
+    tokio::fs::rename(&tmp_path, &path).await?;
+    Ok(Some(path))
+}
+
+async fn generated_video_image_is_usable(path: &std::path::Path) -> bool {
+    const MIN_GENERATED_IMAGE_BYTES: u64 = 4 * 1024;
+
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.is_file() && metadata.len() >= MIN_GENERATED_IMAGE_BYTES)
+        .unwrap_or(false)
+}
+
+fn generated_video_image_seek_seconds(item: &MediaItem) -> Vec<String> {
+    match item.runtime_ticks {
+        Some(ticks) if ticks >= 20_000_000 => {
+            let duration_seconds = (ticks as f64 / 10_000_000.0).max(2.0);
+            [0.10, 0.25, 0.50, 0.75]
+                .into_iter()
+                .map(|ratio| format!("{:.3}", (duration_seconds * ratio).max(1.0)))
+                .collect()
+        }
+        _ => vec!["0.000".to_string()],
+    }
+}
+
+async fn virtual_tv_image_source_item(
+    db: &Database,
+    item_id: &str,
+) -> Result<Option<MediaItem>, ApiError> {
+    let items = db.media_items().await?;
+    let metadata_by_item =
+        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    let mut items = db
+        .media_items()
+        .await?
+        .into_iter()
+        .filter(|item| {
+            tv_episode_info(item).is_some_and(|info| {
+                let metadata = metadata_by_item.get(&item.id);
+                tv_series_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
+                    || tv_season_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
+                    || tv_series_id(&info.series_name).eq_ignore_ascii_case(item_id)
+                    || tv_season_id(&info.series_name, info.season_number)
+                        .eq_ignore_ascii_case(item_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(compare_tv_episodes);
+    Ok(items.into_iter().next())
+}
+
+async fn virtual_tv_metadata_image_path(
+    db: &Database,
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    let metadata = if let Some(summary) = tv_series_summary_by_id(db, item_id, None).await? {
+        Some(summary.metadata)
+    } else if let Some((_series_name, _series_id, summary)) =
+        tv_season_summary_by_id(db, item_id, None).await?
+    {
+        Some(summary.metadata)
+    } else {
+        None
+    };
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let Some(path) = metadata_image_path_from_json(&metadata, image_type, image_index) else {
+        return Ok(None);
+    };
+    let canonical = match tokio::fs::canonicalize(&path).await {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if tokio::fs::metadata(&canonical)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        Ok(Some(canonical))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn metadata_entity_image_path(
+    entity: &MetadataEntityMatch,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    let Some(metadata) = entity.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(path) = metadata_image_path_from_json(metadata, image_type, image_index) else {
+        return Ok(None);
+    };
+    let canonical = match tokio::fs::canonicalize(&path).await {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if tokio::fs::metadata(&canonical)
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        Ok(Some(canonical))
+    } else {
+        Ok(None)
+    }
+}
+
+fn metadata_image_path_from_json(
+    metadata: &serde_json::Value,
+    image_type: &str,
+    image_index: usize,
+) -> Option<PathBuf> {
+    let keys: &[&str] = match normalize_image_type(image_type).as_str() {
+        "primary" if image_index == 0 => &["PrimaryImagePath", "SeriesPrimaryImagePath"],
+        "backdrop" => &["BackdropImagePath", "SeriesBackdropImagePath"],
+        "thumb" if image_index == 0 => &["ThumbImagePath", "SeriesThumbImagePath"],
+        "logo" if image_index == 0 => &["LogoImagePath", "SeriesLogoImagePath"],
+        _ => return None,
+    };
+    first_metadata_value_from_json(metadata, keys).map(PathBuf::from)
+}
+
 async fn named_entity_image_or_placeholder(
     state: &AppState,
     name: &str,
@@ -31055,6 +37337,12 @@ async fn find_named_entity_representative_image(
     let needle = name.trim();
     if needle.is_empty() {
         return Ok(None);
+    }
+    let person_id = stable_entity_id("Person", needle);
+    if let Some(path) =
+        find_stored_image(state, ImageOwner::Item(&person_id), image_type, image_index).await?
+    {
+        return Ok(Some(path));
     }
     for metadata in state.db.media_item_metadata().await? {
         if !metadata_payload_contains_entity_name(&metadata.payload, needle) {
@@ -31300,6 +37588,62 @@ async fn stored_image_infos(
     Ok(infos)
 }
 
+fn image_infos_include(infos: &[serde_json::Value], image_type: &str, image_index: usize) -> bool {
+    infos.iter().any(|info| {
+        info.get("ImageType")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(image_type))
+            && info
+                .get("ImageIndex")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value == image_index as u64)
+    })
+}
+
+async fn representative_item_primary_image_info(
+    state: &AppState,
+    item_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let item = match media_item_by_id(&state.db, item_id).await {
+        Ok(item) => Some(item),
+        Err(_) => virtual_tv_image_source_item(&state.db, item_id).await?,
+    };
+    let Some(item) = item else {
+        return Ok(None);
+    };
+    if let Some(path) = find_local_item_image(&item, "Primary", 0).await? {
+        return item_image_info_from_path("Primary", 0, path)
+            .await
+            .map(Some);
+    }
+    if let Some(path) = find_generated_video_item_image(state, &item, item_id, "Primary", 0).await?
+    {
+        return item_image_info_from_path("Primary", 0, path)
+            .await
+            .map(Some);
+    }
+    Ok(None)
+}
+
+async fn item_image_info_from_path(
+    image_type: &str,
+    image_index: usize,
+    path: PathBuf,
+) -> Result<serde_json::Value, ApiError> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("bin");
+    Ok(serde_json::json!({
+        "ImageType": canonical_image_type(image_type),
+        "ImageIndex": image_index,
+        "ImageTag": stored_image_tag(&path).await?,
+        "Path": path.to_string_lossy(),
+        "Size": tokio::fs::metadata(&path).await?.len(),
+        "MimeType": image_format_from_extension(extension).content_type,
+    }))
+}
+
 async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response, ApiError> {
     let extension = path
         .extension()
@@ -31509,7 +37853,7 @@ async fn update_item_image(
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
     store_uploaded_image(&state, ImageOwner::Item(&item_id), &image_type, 0, body).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -31517,13 +37861,27 @@ async fn update_item_image(
 async fn delete_item_image(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<DeleteImageQuery>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
-    delete_stored_image(&state, ImageOwner::Item(&item_id), &image_type, 0).await?;
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
+    let image_index = query
+        .image_index
+        .as_deref()
+        .map(parse_image_index)
+        .transpose()?
+        .unwrap_or(0);
+    delete_stored_image(&state, ImageOwner::Item(&item_id), &image_type, image_index).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DeleteImageQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "ImageIndex", alias = "imageIndex", alias = "image_index")]
+    image_index: Option<String>,
 }
 
 async fn update_item_image_by_index(
@@ -31534,7 +37892,7 @@ async fn update_item_image_by_index(
     body: Body,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
     let image_index = parse_image_index(&image_index)?;
     store_uploaded_image(
         &state,
@@ -31554,7 +37912,7 @@ async fn delete_item_image_by_index(
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
     let image_index = parse_image_index(&image_index)?;
     delete_stored_image(&state, ImageOwner::Item(&item_id), &image_type, image_index).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -31575,7 +37933,7 @@ async fn update_item_image_index(
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
     let image_index = parse_image_index(&image_index)?;
     let Some(new_index) = query.new_index.as_deref() else {
         return Ok(StatusCode::NO_CONTENT);
@@ -31712,10 +38070,50 @@ async fn item_image_infos(
     if let Some(channel_item) = channel_content_item_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel_item_image_infos(&channel_item)?));
     }
-    media_item_or_folder_by_id(&state.db, &item_id).await?;
-    Ok(Json(
-        stored_image_infos(&state, ImageOwner::Item(&item_id)).await?,
-    ))
+    let metadata_entity = ensure_image_item_owner_exists(&state.db, &item_id).await?;
+    let mut infos = stored_image_infos(&state, ImageOwner::Item(&item_id)).await?;
+    if !image_infos_include(&infos, "Primary", 0)
+        && let Some(info) = representative_item_primary_image_info(&state, &item_id).await?
+    {
+        infos.push(info);
+    }
+    if !image_infos_include(&infos, "Primary", 0)
+        && let Some(entity) = metadata_entity.as_ref()
+        && let Some(path) = metadata_entity_image_path(&entity, "Primary", 0).await?
+    {
+        infos.push(item_image_info_from_path("Primary", 0, path).await?);
+    }
+    if !image_infos_include(&infos, "Primary", 0)
+        && let Some(entity) = metadata_entity.as_ref()
+        && let Some(path) =
+            find_named_entity_representative_image(&state, &entity.name, "Primary", 0).await?
+    {
+        infos.push(item_image_info_from_path("Primary", 0, path).await?);
+    }
+    if infos.is_empty()
+        && let Ok(requested_id) = parse_jellyfin_uuid(&item_id)
+        && let Ok(list) = state.db.media_list_by_id(requested_id).await
+    {
+        if let Some(path) = metadata_image_path_from_json(&list.metadata, "Primary", 0)
+            && let Ok(info) = item_image_info_from_path("Primary", 0, path).await
+        {
+            infos.push(info);
+        }
+        if infos.is_empty() {
+            infos.push(virtual_primary_image_info(&item_id));
+        }
+    }
+    Ok(Json(infos))
+}
+
+fn virtual_primary_image_info(item_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ImageType": "Primary",
+        "ImageIndex": 0,
+        "ImageTag": default_primary_image_tag(item_id),
+        "Size": 0,
+        "MimeType": "image/png",
+    })
 }
 
 async fn item_remote_images(
@@ -31725,10 +38123,80 @@ async fn item_remote_images(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    Ok(Json(query_result(
-        remote_image_candidates(&state.db, &item, query.image_type.as_deref()).await?,
-    )))
+    let images = match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => {
+            let mut images =
+                remote_image_candidates(&state.db, &item, query.image_type.as_deref()).await?;
+            images.extend(
+                stored_remote_image_candidates(&state, &item_id, query.image_type.as_deref())
+                    .await?,
+            );
+            dedupe_remote_images(images)
+        }
+        Err(error) if error.status == StatusCode::NOT_FOUND => {
+            ensure_image_item_owner_exists(&state.db, &item_id).await?;
+            let mut images =
+                if let Some(summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
+                    metadata_remote_image_candidates(
+                        &item_id,
+                        &summary.metadata,
+                        query.image_type.as_deref(),
+                    )
+                } else {
+                    Vec::new()
+                };
+            images.extend(
+                stored_remote_image_candidates(&state, &item_id, query.image_type.as_deref())
+                    .await?,
+            );
+            dedupe_remote_images(images)
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(Json(remote_image_query_result(images)))
+}
+
+fn remote_image_query_result(images: Vec<serde_json::Value>) -> serde_json::Value {
+    let providers = remote_image_provider_names(&images);
+    let total_record_count = images.len();
+    serde_json::json!({
+        "TotalRecordCount": total_record_count,
+        "StartIndex": 0,
+        "Items": images,
+        "Images": images,
+        "Providers": providers,
+    })
+}
+
+fn dedupe_remote_images(images: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::HashSet::new();
+    images
+        .into_iter()
+        .filter(|image| {
+            let key = image
+                .get("ImageUrl")
+                .or_else(|| image.get("Url"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            seen.insert(key)
+        })
+        .collect()
+}
+
+fn remote_image_provider_names(images: &[serde_json::Value]) -> Vec<String> {
+    let mut providers = images
+        .iter()
+        .filter_map(|image| {
+            image
+                .get("ProviderName")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    providers
 }
 
 async fn item_remote_image_providers(
@@ -31738,13 +38206,48 @@ async fn item_remote_image_providers(
     Path(item_id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
     let mut providers = vec![serde_json::json!({
         "Name": "Local cache",
         "SupportedImages": ["Primary", "Backdrop", "Thumb", "Logo"],
     })];
+    if let Some(provider_name) =
+        metadata_remote_image_provider_for_item(&state.db, &item_id).await?
+        && !providers.iter().any(|provider| {
+            provider
+                .get("Name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name == provider_name)
+        })
+    {
+        providers.push(serde_json::json!({
+            "Name": provider_name,
+            "SupportedImages": ["Primary", "Backdrop", "Thumb", "Logo"],
+        }));
+    }
     providers.extend(plugin_image_provider_infos(&state.db).await?);
     Ok(Json(providers))
+}
+
+async fn metadata_remote_image_provider_for_item(
+    db: &Database,
+    item_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let metadata = match media_item_by_id(db, item_id).await {
+        Ok(item) => metadata_payload_for_item(db, item.id).await?,
+        Err(error) if error.status == StatusCode::NOT_FOUND => {
+            let Some(summary) = tv_series_summary_by_id(db, item_id, None).await? else {
+                return Ok(None);
+            };
+            summary.metadata
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata_remote_image_candidates(item_id, &metadata, None).is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(remote_image_provider_name(&metadata)))
+    }
 }
 
 async fn download_remote_image(
@@ -31755,7 +38258,7 @@ async fn download_remote_image(
     body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    media_item_by_id(&state.db, &item_id).await?;
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
     let payload = body.as_ref().map(|body| &body.0);
     let empty_payload = serde_json::Value::Null;
     let payload = payload.unwrap_or(&empty_payload);
@@ -31763,6 +38266,7 @@ async fn download_remote_image(
     let Some(image_id) = query.image_url.as_deref().or(body_image_url.as_deref()) else {
         return Ok(StatusCode::NO_CONTENT);
     };
+    let image_id = remote_image_download_id_from_url(image_id);
     let body_image_type =
         json_string_any_field(payload, &["ImageType", "imageType", "Type", "type"]);
     let image_type = query
@@ -31770,13 +38274,55 @@ async fn download_remote_image(
         .as_deref()
         .or(body_image_type.as_deref())
         .unwrap_or("Primary");
-    if let Some((bytes, _mime_type)) = plugin_remote_image_payload_from_id(image_id)? {
+    if remote_image_url_is_existing_item_image(&image_id) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if let Some((bytes, _mime_type)) = plugin_remote_image_payload_from_id(&image_id)? {
+        install_remote_image_bytes(&state, &item_id, bytes, image_type).await?;
+    } else if let Some((url, _mime_type)) = remote_url_image_payload_from_id(&image_id)? {
+        let bytes = fetch_remote_image_bytes(&url).await?;
         install_remote_image_bytes(&state, &item_id, bytes, image_type).await?;
     } else {
-        let remote_path = remote_image_path_from_id(image_id).await?;
+        let remote_path = remote_image_path_from_id(&image_id).await?;
         install_remote_image(&state, &item_id, &remote_path, image_type).await?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remote_image_preview(
+    State(state): State<AppState>,
+    Query(query): Query<RemoteImagePreviewQuery>,
+    Path(item_id): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    ensure_image_item_owner_exists(&state.db, &item_id).await?;
+    let image_id = remote_image_download_id_from_url(&query.image_url);
+    if let Some((bytes, mime_type)) = plugin_remote_image_payload_from_id(&image_id)? {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, mime_type.parse().unwrap());
+        headers.insert(
+            header::CACHE_CONTROL,
+            "public, max-age=3600".parse().unwrap(),
+        );
+        return Ok((headers, bytes).into_response());
+    }
+    if let Some((url, fallback_mime_type)) = remote_url_image_payload_from_id(&image_id)? {
+        let (bytes, mime_type) = fetch_remote_image_payload(&url).await?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            mime_type
+                .unwrap_or(fallback_mime_type)
+                .parse()
+                .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+        );
+        headers.insert(
+            header::CACHE_CONTROL,
+            "public, max-age=3600".parse().unwrap(),
+        );
+        return Ok((headers, bytes).into_response());
+    }
+    let remote_path = remote_image_path_from_id(&image_id).await?;
+    stored_image_response(remote_path).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -31807,12 +38353,24 @@ struct RemoteImageDownloadQuery {
     image_type: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RemoteImagePreviewQuery {
+    #[serde(alias = "ImageUrl", alias = "imageUrl", alias = "Url", alias = "url")]
+    image_url: String,
+}
+
 async fn remote_image_candidates(
     db: &Database,
     item: &MediaItem,
     requested_image_type: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let mut images = plugin_remote_image_candidates(db, item, requested_image_type).await?;
+    let metadata = metadata_payload_for_item(db, item.id).await?;
+    images.extend(metadata_remote_image_candidates(
+        &item.id.simple().to_string(),
+        &metadata,
+        requested_image_type,
+    ));
     let Some(item_dir) = media_item_path(item).parent() else {
         return Ok(images);
     };
@@ -31847,10 +38405,14 @@ async fn remote_image_candidates(
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_default();
+        let item_id = item.id.simple().to_string();
+        let image_id = remote_image_id_for_path(&canonical_path);
+        let preview_url = remote_image_preview_url(&item_id, &image_id);
         images.push(serde_json::json!({
             "ProviderName": "Local cache",
-            "Url": remote_image_id_for_path(&canonical_path),
-            "ThumbnailUrl": null,
+            "ImageUrl": image_id,
+            "Url": preview_url,
+            "ThumbnailUrl": preview_url,
             "Name": name,
             "Type": canonical_image_type(&image_type),
             "Language": null,
@@ -31870,6 +38432,130 @@ async fn remote_image_candidates(
             .unwrap_or_default()
             .to_ascii_lowercase()
     });
+    Ok(images)
+}
+
+fn metadata_remote_image_candidates(
+    item_id: &str,
+    metadata: &serde_json::Value,
+    requested_image_type: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let requested_image_type = requested_image_type.map(canonical_image_type);
+    let mut images = Vec::new();
+    for (image_type, keys) in [
+        (
+            "Primary",
+            &[
+                "PrimaryImageUrl",
+                "SeriesPrimaryImageUrl",
+                "ImageUrl",
+                "SeriesImageUrl",
+            ][..],
+        ),
+        (
+            "Backdrop",
+            &[
+                "BackdropImageUrl",
+                "SeriesBackdropImageUrl",
+                "BackgroundImageUrl",
+                "SeriesBackgroundImageUrl",
+            ][..],
+        ),
+        (
+            "Thumb",
+            &["ThumbImageUrl", "SeriesThumbImageUrl", "BannerImageUrl"][..],
+        ),
+        ("Logo", &["LogoImageUrl", "SeriesLogoImageUrl"][..]),
+    ] {
+        if requested_image_type
+            .as_deref()
+            .is_some_and(|requested| requested != image_type)
+        {
+            continue;
+        }
+        for url in metadata_values_from_json(metadata, keys) {
+            if !remote_image_url_is_fetchable(&url) {
+                continue;
+            }
+            let image_id = remote_url_image_id(&url, None);
+            let preview_url = remote_image_preview_url(item_id, &image_id);
+            images.push(serde_json::json!({
+                "ProviderName": remote_image_provider_name(metadata),
+                "ImageUrl": image_id,
+                "Url": preview_url,
+                "ThumbnailUrl": preview_url,
+                "Name": format!("{} {}", remote_image_provider_name(metadata), image_type),
+                "Type": image_type,
+                "Language": null,
+                "RatingType": "Score",
+                "CommunityRating": null,
+                "VoteCount": null,
+                "Width": null,
+                "Height": null,
+                "Size": null,
+                "MimeType": null,
+            }));
+        }
+    }
+    images
+}
+
+fn remote_image_provider_name(metadata: &serde_json::Value) -> String {
+    json_string_field(metadata, "MetadataSource")
+        .or_else(|| json_string_field(metadata, "SearchProviderName"))
+        .unwrap_or_else(|| "Remote metadata".to_string())
+}
+
+async fn stored_remote_image_candidates(
+    state: &AppState,
+    item_id: &str,
+    requested_image_type: Option<&str>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let requested_image_type = requested_image_type.map(canonical_image_type);
+    let infos = stored_image_infos(state, ImageOwner::Item(item_id)).await?;
+    let mut images = Vec::new();
+    for info in infos {
+        let image_type = info
+            .get("ImageType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Primary")
+            .to_string();
+        if requested_image_type
+            .as_deref()
+            .is_some_and(|requested| requested != image_type)
+        {
+            continue;
+        }
+        let Some(path) = info.get("Path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let bytes = tokio::fs::read(path).await?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let mime_type = info
+            .get("MimeType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let preview_url = item_image_url(item_id, &image_type);
+        images.push(serde_json::json!({
+            "ProviderName": "Local cache",
+            "ImageUrl": preview_url,
+            "Url": preview_url,
+            "ThumbnailUrl": preview_url,
+            "Name": format!("Cached {image_type}"),
+            "Type": image_type,
+            "Language": null,
+            "RatingType": "Score",
+            "CommunityRating": null,
+            "VoteCount": null,
+            "Width": null,
+            "Height": null,
+            "Size": bytes.len(),
+            "MimeType": mime_type,
+        }));
+    }
     Ok(images)
 }
 
@@ -31917,6 +38603,7 @@ async fn plugin_remote_image_candidates(
             continue;
         };
         images.extend(plugin_remote_image_candidate_values(
+            &item.id.simple().to_string(),
             &provider_name,
             requested_image_type.as_deref(),
             &capability.value,
@@ -31933,6 +38620,7 @@ fn plugin_is_active_image_provider(plugin: &serde_json::Value) -> bool {
 }
 
 fn plugin_remote_image_candidate_values(
+    item_id: &str,
     provider_name: &str,
     requested_image_type: Option<&str>,
     value: &serde_json::Value,
@@ -31967,11 +38655,13 @@ fn plugin_remote_image_candidate_values(
             continue;
         }
         let size = bytes.len();
-        let url = plugin_remote_image_id(&bytes, &mime_type);
+        let image_id = plugin_remote_image_id(&bytes, &mime_type);
+        let preview_url = remote_image_preview_url(item_id, &image_id);
         images.push(serde_json::json!({
             "ProviderName": provider_name,
-            "Url": url,
-            "ThumbnailUrl": null,
+            "ImageUrl": image_id,
+            "Url": preview_url,
+            "ThumbnailUrl": preview_url,
             "Name": json_string_field(&value, "Name").unwrap_or_else(|| format!("{provider_name} {image_type}")),
             "Type": image_type,
             "Language": null,
@@ -32051,11 +38741,119 @@ fn plugin_remote_image_payload_from_id(
     Ok(Some((bytes, mime_type)))
 }
 
+fn remote_url_image_id(url: &str, mime_type: Option<&str>) -> String {
+    let payload = serde_json::json!({
+        "Url": url,
+        "MimeType": mime_type.unwrap_or("application/octet-stream"),
+    });
+    format!(
+        "remote-url-image:{}",
+        general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+    )
+}
+
+fn remote_url_image_payload_from_id(image_id: &str) -> Result<Option<(String, String)>, ApiError> {
+    let Some(encoded) = image_id.strip_prefix("remote-url-image:") else {
+        return Ok(None);
+    };
+    let payload = general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ApiError::not_found("Remote image not found"))?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload)
+        .map_err(|_| ApiError::not_found("Remote image not found"))?;
+    let Some(url) = json_string_field(&payload, "Url") else {
+        return Err(ApiError::not_found("Remote image not found"));
+    };
+    if !remote_image_url_is_fetchable(&url) {
+        return Err(ApiError::not_found("Remote image not found"));
+    }
+    let mime_type = json_string_field(&payload, "MimeType")
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok(Some((url, mime_type)))
+}
+
 fn remote_image_id_for_path(path: &FsPath) -> String {
     format!(
         "local-image:{}",
         general_purpose::URL_SAFE_NO_PAD.encode(path.to_string_lossy().as_bytes())
     )
+}
+
+fn remote_image_preview_url(item_id: &str, image_id: &str) -> String {
+    format!(
+        "/Items/{item_id}/RemoteImages/Preview?ImageUrl={}",
+        query_percent_encode(image_id)
+    )
+}
+
+fn item_image_url(item_id: &str, image_type: &str) -> String {
+    format!(
+        "/Items/{item_id}/Images/{}",
+        query_path_segment_encode(image_type)
+    )
+}
+
+fn remote_image_download_id_from_url(image_url: &str) -> String {
+    if image_url.starts_with("plugin-image:")
+        || image_url.starts_with("local-image:")
+        || image_url.starts_with("remote-url-image:")
+    {
+        return image_url.to_string();
+    }
+    let parsed_url = if image_url.starts_with('/') {
+        reqwest::Url::parse(&format!("http://127.0.0.1{image_url}")).ok()
+    } else {
+        reqwest::Url::parse(image_url).ok()
+    };
+    parsed_url
+        .and_then(|url| {
+            let path = url.path().to_ascii_lowercase();
+            if !path.ends_with("/remoteimages/preview") {
+                return None;
+            }
+            url.query_pairs().find_map(|(key, value)| {
+                matches!(key.as_ref(), "ImageUrl" | "imageUrl" | "Url" | "url")
+                    .then(|| value.into_owned())
+            })
+        })
+        .unwrap_or_else(|| image_url.to_string())
+}
+
+fn remote_image_url_is_existing_item_image(image_url: &str) -> bool {
+    let parsed_url = if image_url.starts_with('/') {
+        reqwest::Url::parse(&format!("http://127.0.0.1{image_url}")).ok()
+    } else {
+        reqwest::Url::parse(image_url).ok()
+    };
+    parsed_url
+        .map(|url| {
+            let path = url.path().to_ascii_lowercase();
+            path.contains("/items/") && path.contains("/images/")
+        })
+        .unwrap_or(false)
+}
+
+fn remote_image_url_is_fetchable(image_url: &str) -> bool {
+    reqwest::Url::parse(image_url)
+        .map(|url| matches!(url.scheme(), "http" | "https"))
+        .unwrap_or(false)
+}
+
+fn query_percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn query_path_segment_encode(value: &str) -> String {
+    query_percent_encode(value).replace("%2F", "%252F")
 }
 
 async fn remote_image_path_from_id(image_id: &str) -> Result<PathBuf, ApiError> {
@@ -32143,7 +38941,30 @@ async fn media_item_or_folder_by_id(db: &Database, item_id: &str) -> Result<(), 
     {
         return Ok(());
     }
+    if db.media_list_by_id(requested_id).await.is_ok() {
+        return Ok(());
+    }
+    if virtual_tv_item_exists(db, item_id).await? {
+        return Ok(());
+    }
     Err(ApiError::not_found("Item not found"))
+}
+
+async fn ensure_image_item_owner_exists(
+    db: &Database,
+    item_id: &str,
+) -> Result<Option<MetadataEntityMatch>, ApiError> {
+    match media_item_or_folder_by_id(db, item_id).await {
+        Ok(()) => Ok(None),
+        Err(error) if error.status == StatusCode::NOT_FOUND => {
+            if let Some(entity) = metadata_entity_by_stable_id(db, item_id).await? {
+                Ok(Some(entity))
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn playback_event_sender() -> &'static broadcast::Sender<PlaybackEvent> {
@@ -32903,23 +39724,26 @@ mod tests {
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
         DirectPlayProfileMatcher, ItemsQuery, LiveTunerLease, LiveTunerLeaseKey,
         LiveTvTimerSchedulerRun, PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery,
-        SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand,
+        SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand, TvMazeExternals, TvMazeImage,
+        TvMazeNetwork, TvMazeRating, TvMazeSchedule, TvMazeShow,
         activate_dotnet_plugin_with_host_path, activate_rust_wasi_plugin_with_host_path,
         await_package_install_cancelable, backup_restore_snapshot_json,
         cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
         default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
-        ensure_package_install_not_cancelled, filter_package_list, format_time_for_json,
-        get_valid_filename, hdhomerun_bool_field, hls_transcode_dedupe_key, is_live_tv_channel_id,
-        json_string_field, json_value_i64, last_system_lifecycle_command,
-        live_tv_channel_is_remote, live_tv_channel_media_source, live_tv_channel_stable_uuid,
-        live_tv_configuration_json, live_tv_recording_name, load_countries, load_cultures,
-        materialize_series_timer_timers, media_item_by_id, media_item_streams,
-        package_infos_from_repositories, package_install_task_key, paged_media_items,
-        parse_authorization_token, parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels,
-        parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs, parse_media_browser_pairs,
-        plugin_configuration_from_runtime_host_path,
+        enrich_media_streams_with_context, ensure_package_install_not_cancelled,
+        external_id_infos_for_item_type, filter_package_list, format_time_for_json,
+        get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
+        hls_segment_ticks, hls_transcode_dedupe_key, is_live_tv_channel_id, json_string_field,
+        json_value_i64, last_system_lifecycle_command, live_tv_channel_is_remote,
+        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
+        live_tv_recording_name, load_countries, load_cultures, materialize_series_timer_timers,
+        media_item_by_id, media_item_streams, metadata_editor_parental_rating_options,
+        normalize_media_stream, package_infos_from_repositories, package_install_task_key,
+        paged_media_items, parse_authorization_token, parse_jellyfin_uuid,
+        parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs,
+        parse_media_browser_pairs, plugin_configuration_from_runtime_host_path,
         plugin_configuration_pages_from_runtime_host_path, plugin_image_from_runtime_host_path,
         plugin_package_operation, plugin_packages_root, plugin_scheduled_task_id,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
@@ -32928,8 +39752,8 @@ mod tests {
         spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
         subscribe_system_lifecycle_commands, syncplay_cleanup_stale_participants, syncplay_groups,
         transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
-        update_plugin_configuration_via_runtime_host_path, validate_zip_entry_path,
-        verify_plugin_package_checksum, with_live_tuner_leases,
+        tvmaze_remote_search_series_result, update_plugin_configuration_via_runtime_host_path,
+        validate_zip_entry_path, verify_plugin_package_checksum, with_live_tuner_leases,
     };
     use crate::dlna;
     use axum::{
@@ -32942,7 +39766,8 @@ mod tests {
     use jellyrin_core::{FfmpegCommandSpec, MediaItem, StartupConfig, TranscodeStreamSelection};
     use jellyrin_db::{
         BrandingConfig, Database, InstallPluginPackage, PluginRuntimeInstanceUpsert,
-        SystemConfigurationPayloads, UpsertPlaybackState, UpsertTranscodeSession,
+        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertPlaybackState,
+        UpsertTranscodeSession,
     };
     use jellyrin_plugin_rpc::PluginRuntime;
     use serde_json::{Value, json};
@@ -33957,6 +40782,26 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+        for endpoint in [
+            "/Playstate/Sessions/Playing/Ping?playSessionId=test-session",
+            "/Sessions/Playing/Ping?playSessionId=test-session",
+            "/sessions/playing/ping?playSessionId=test-session",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+        }
+
         let response = app
             .clone()
             .oneshot(
@@ -33987,10 +40832,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
-        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), test_png_bytes().as_slice());
 
@@ -34627,7 +41468,24 @@ mod tests {
         assert_eq!(images["Items"][0]["Type"], "Primary");
         assert_eq!(images["Items"][0]["MimeType"], "image/png");
         let image_url = images["Items"][0]["Url"].as_str().unwrap();
-        assert!(image_url.starts_with("plugin-image:"));
+        let original_image_url = images["Items"][0]["ImageUrl"].as_str().unwrap();
+        assert!(image_url.starts_with(&format!("/Items/{item_id}/RemoteImages/Preview?ImageUrl=")));
+        assert!(original_image_url.starts_with("plugin-image:"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(image_url)
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_png.as_slice());
 
         let response = app
             .clone()
@@ -34659,10 +41517,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
-        );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), expected_png.as_slice());
     }
@@ -34789,7 +41643,28 @@ mod tests {
         assert_eq!(images["Items"][0]["Type"], "Primary");
         assert_eq!(images["Items"][0]["MimeType"], "image/png");
         let image_url = images["Items"][0]["Url"].as_str().unwrap();
-        assert!(image_url.starts_with("plugin-image:"));
+        let original_image_url = images["Items"][0]["ImageUrl"].as_str().unwrap();
+        assert!(image_url.starts_with(&format!("/Items/{item_id}/RemoteImages/Preview?ImageUrl=")));
+        assert!(original_image_url.starts_with("plugin-image:"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(image_url)
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), expected_png.as_slice());
 
         let response = app
             .clone()
@@ -35582,32 +42457,53 @@ done
         bytes: Vec<u8>,
         content_type: &str,
     ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let (url, mut rx) = spawn_http_image_response(bytes, content_type, 1).await;
+        let (tx, single_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Some(request) = rx.recv().await {
+                let _ = tx.send(request);
+            }
+        });
+        (url, single_rx)
+    }
+
+    async fn spawn_http_image_response(
+        bytes: Vec<u8>,
+        content_type: &str,
+        expected_requests: usize,
+    ) -> (String, tokio::sync::mpsc::Receiver<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let content_type = content_type.to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(expected_requests.max(1));
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = Vec::new();
-            let mut scratch = [0_u8; 1024];
-            let header_end = loop {
-                let read = stream.read(&mut scratch).await.unwrap();
-                if read == 0 {
+            for _ in 0..expected_requests {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = Vec::new();
+                let mut scratch = [0_u8; 1024];
+                let header_end = loop {
+                    let read = stream.read(&mut scratch).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&scratch[..read]);
+                    if let Some(end) = http_header_end(&buffer) {
+                        break end;
+                    }
+                };
+                let request = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let response_headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                    bytes.len()
+                );
+                stream.write_all(response_headers.as_bytes()).await.unwrap();
+                stream.write_all(&bytes).await.unwrap();
+                if tx.send(request).await.is_err() {
                     return;
                 }
-                buffer.extend_from_slice(&scratch[..read]);
-                if let Some(end) = http_header_end(&buffer) {
-                    break end;
-                }
-            };
-            let request = String::from_utf8_lossy(&buffer[..header_end]).to_string();
-            let response_headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
-                bytes.len()
-            );
-            stream.write_all(response_headers.as_bytes()).await.unwrap();
-            stream.write_all(&bytes).await.unwrap();
-            let _ = tx.send(request);
+            }
         });
         (format!("http://{addr}/channel-image.png"), rx)
     }
@@ -35691,6 +42587,9 @@ done
         assert_eq!(media_source["TranscodingSubProtocol"], "hls");
         assert_eq!(media_source["TranscodingContainer"], "ts");
         assert_eq!(media_source["Container"], "ts");
+        assert_eq!(media_source["MediaStreams"][0]["Codec"], "h264");
+        assert_eq!(media_source["MediaStreams"][1]["Codec"], "aac");
+        assert_eq!(media_source["MediaStreams"][1]["Channels"], 2);
         assert!(
             !media_source
                 .as_object()
@@ -35869,6 +42768,85 @@ done
         );
     }
 
+    #[test]
+    fn tvmaze_series_search_result_maps_to_jellyfin_identify_contract() {
+        let result = tvmaze_remote_search_series_result(TvMazeShow {
+            id: 143,
+            name: "Silicon Valley".to_string(),
+            summary: Some("<p>Startup satire.</p>".to_string()),
+            genres: vec!["Comedy".to_string()],
+            status: Some("Ended".to_string()),
+            schedule: Some(TvMazeSchedule {
+                days: vec!["Sunday".to_string()],
+            }),
+            premiered: Some("2014-04-06".to_string()),
+            ended: Some("2019-12-08".to_string()),
+            rating: Some(TvMazeRating { average: Some(8.4) }),
+            network: Some(TvMazeNetwork {
+                name: Some("HBO".to_string()),
+            }),
+            web_channel: None,
+            externals: Some(TvMazeExternals {
+                tvrage: Some(33759),
+                thetvdb: Some(277165),
+                imdb: Some("tt2575988".to_string()),
+            }),
+            image: Some(TvMazeImage {
+                medium: Some("http://static.tvmaze.example/medium.jpg".to_string()),
+                original: Some("http://static.tvmaze.example/original.jpg".to_string()),
+            }),
+        });
+
+        assert_eq!(result["Name"], "Silicon Valley");
+        assert_eq!(result["Type"], "Series");
+        assert_eq!(result["SearchProviderName"], "TVMaze");
+        assert_eq!(result["ProductionYear"], 2014);
+        assert_eq!(result["PremiereDate"], "2014-04-06T00:00:00.0000000Z");
+        assert_eq!(
+            result["ImageUrl"],
+            "http://static.tvmaze.example/original.jpg"
+        );
+        assert_eq!(result["Overview"], "Startup satire.");
+        assert_eq!(result["ProviderIds"]["TvMaze"], "143");
+        assert_eq!(result["ProviderIds"]["Tvdb"], "277165");
+        assert_eq!(result["ProviderIds"]["TvRage"], "33759");
+        assert_eq!(result["ProviderIds"]["Imdb"], "tt2575988");
+    }
+
+    #[test]
+    fn tv_extra_directories_are_not_classified_as_episodes() {
+        let make_item = |path: &str| MediaItem {
+            id: uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            virtual_folder_id: uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+                .unwrap(),
+            name: "Sample".to_string(),
+            path: path.to_string(),
+            media_type: "Video".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+
+        assert_eq!(
+            super::media_item_type(&make_item(
+                "/media/Silicon Valley/Featurettes/Making Silicon Valley.mkv"
+            )),
+            "Video"
+        );
+        assert_eq!(
+            super::media_item_type(&make_item(
+                "/media/Silicon Valley/Season 01/Silicon Valley S01E01.mkv"
+            )),
+            "Episode"
+        );
+    }
+
     #[tokio::test]
     async fn health_and_readiness_routes_report_service_status() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -35905,6 +42883,21 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let readiness: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(readiness["Status"], "Ready");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/web/serviceworker.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
     }
 
     #[tokio::test]
@@ -35948,7 +42941,10 @@ done
             assert_eq!(response.status(), StatusCode::OK);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let views: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(views["TotalRecordCount"], 0);
+            assert_eq!(views["TotalRecordCount"], 3);
+            assert!(views["Items"].as_array().unwrap().iter().any(|item| {
+                item["Name"] == "Collections" && item["CollectionType"] == "boxsets"
+            }));
         }
 
         let response = app
@@ -37090,7 +44086,13 @@ done
                     "Name": "Imported Collection",
                     "ItemPaths": [movie_path]
                 }],
-                "TaskHistory": [{ "Name": "RefreshLibrary" }],
+                "TaskHistory": [{
+                    "Name": "RefreshLibrary",
+                    "Status": "Completed",
+                    "StartTimeUtc": "2024-01-02T03:04:05Z",
+                    "EndTimeUtc": "2024-01-02T03:05:05Z",
+                    "Result": { "ItemsScanned": 12 }
+                }],
                 "Transcodes": [{ "PlaySessionId": "runtime-only" }],
                 "PackageState": [{ "Name": "Plugin" }]
             }
@@ -37121,7 +44123,8 @@ done
         assert_eq!(dry_run["Counts"]["UserData"], 1);
         assert_eq!(dry_run["Counts"]["Playlists"], 1);
         assert_eq!(dry_run["Counts"]["Collections"], 1);
-        assert!(dry_run["Unsupported"]["TaskHistory"].as_str().is_some());
+        assert_eq!(dry_run["Counts"]["TaskHistory"], 1);
+        assert!(dry_run["Unsupported"]["TaskHistory"].is_null());
         assert_eq!(db_for_assertions.virtual_folders().await.unwrap().len(), 0);
         assert_eq!(db_for_assertions.backup_manifests().await.unwrap().len(), 0);
 
@@ -37149,6 +44152,7 @@ done
         assert_eq!(imported["Imported"]["MediaMetadata"], 1);
         assert_eq!(imported["Imported"]["UserData"], 1);
         assert_eq!(imported["Imported"]["Lists"], 2);
+        assert_eq!(imported["Imported"]["TaskHistory"], 1);
 
         let backups = db_for_assertions.backup_manifests().await.unwrap();
         assert_eq!(backups.len(), 1);
@@ -37198,6 +44202,13 @@ done
         assert!(playback.played);
         assert!(playback.is_favorite);
         assert_eq!(playback.position_ticks, 123456);
+        let imported_task_run = db_for_assertions
+            .last_task_result("RefreshLibrary")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported_task_run.status, "completed");
+        assert_eq!(imported_task_run.result_json.unwrap()["ItemsScanned"], 12);
         let playlist = db_for_assertions
             .media_lists("playlist")
             .await
@@ -37294,7 +44305,7 @@ done
     }
 
     #[tokio::test]
-    async fn scheduled_tasks_endpoints_expose_library_scan_stub() {
+    async fn scheduled_tasks_endpoints_expose_library_scan_contract() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("admin".to_string(), "secret")
@@ -37411,8 +44422,8 @@ done
         assert_eq!(task["State"], "Idle");
         assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
         assert_eq!(task["LastExecutionResult"]["Key"], "RefreshLibrary");
-        assert_eq!(task["LastExecutionResult"]["ErrorMessage"], Value::Null);
-        assert_eq!(task["LastExecutionResult"]["Result"]["ItemsScanned"], 0);
+        assert!(task["LastExecutionResult"].get("ErrorMessage").is_none());
+        assert!(task["LastExecutionResult"].get("Result").is_none());
         let completed_event =
             next_playback_event_type(&mut task_events, &api_key, "ScheduledTasksInfo").await;
         assert_eq!(
@@ -37446,12 +44457,53 @@ done
                     .uri("/ScheduledTasks/scan-media-library/Triggers")
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!([]).to_string()))
+                    .body(Body::from(
+                        json!([
+                            {
+                                "Type": "DailyTrigger",
+                                "TimeOfDayTicks": 7_200_000_000_i64
+                            }
+                        ])
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ScheduledTasks/RefreshLibrary")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let task: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(task["Triggers"].as_array().unwrap().len(), 1);
+        assert_eq!(task["Triggers"][0]["Type"], "DailyTrigger");
+        assert_eq!(task["Triggers"][0]["TimeOfDayTicks"], 7_200_000_000_i64);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ScheduledTasks/scan-media-library/Triggers")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "Type": "DailyTrigger" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .oneshot(
@@ -37570,12 +44622,7 @@ done
         assert_eq!(task["State"], "Idle");
         assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
         assert_eq!(task["LastExecutionResult"]["Key"], "RefreshChannels");
-        assert_eq!(
-            task["LastExecutionResult"]["Result"]["ProvidersRefreshed"],
-            2
-        );
-        assert_eq!(task["LastExecutionResult"]["Result"]["ItemsCached"], 1);
-        assert_eq!(task["LastExecutionResult"]["Result"]["ImagesCached"], 1);
+        assert!(task["LastExecutionResult"].get("Result").is_none());
         let request = remote_image_request.await.unwrap();
         assert!(request.starts_with("GET /channel-image.png HTTP/1.1"));
 
@@ -37751,6 +44798,28 @@ done
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/MetadataOptions/Default")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metadata_defaults: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metadata_defaults["DisabledMetadataSavers"], json!([]));
+        assert_eq!(metadata_defaults["LocalMetadataReaderOrder"], json!([]));
+        assert_eq!(metadata_defaults["DisabledMetadataFetchers"], json!([]));
+        assert_eq!(metadata_defaults["MetadataFetcherOrder"], json!([]));
+        assert_eq!(metadata_defaults["DisabledImageFetchers"], json!([]));
+        assert_eq!(metadata_defaults["ImageFetcherOrder"], json!([]));
+        assert!(metadata_defaults.get("ItemType").is_none());
+        assert!(metadata_defaults.get("SubtitleFetcherOrder").is_none());
 
         let response = app
             .clone()
@@ -38525,14 +45594,28 @@ done
                         .uri(endpoint)
                         .header("X-Emby-Token", &api_key)
                         .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            json!({ "Sentinel": "not-persisted" }).to_string(),
-                        ))
+                        .body(Body::from(json!({ "Sentinel": "persisted" }).to_string()))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{endpoint}");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let config: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(config["Sentinel"], "persisted", "{endpoint}");
         }
 
         let response = app
@@ -38624,6 +45707,33 @@ done
         assert_eq!(
             default_config["TrickplayOptions"]["WidthResolutions"],
             json!([320])
+        );
+        assert_eq!(
+            default_config["MetadataOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|option| option["ItemType"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Book",
+                "Movie",
+                "MusicVideo",
+                "Series",
+                "MusicAlbum",
+                "MusicArtist",
+                "BoxSet",
+                "Season",
+                "Episode"
+            ]
+        );
+        assert_eq!(
+            default_config["MetadataOptions"][2]["DisabledMetadataFetchers"],
+            json!(["The Open Movie Database"])
+        );
+        assert_eq!(
+            default_config["MetadataOptions"][4]["DisabledMetadataFetchers"],
+            json!(["TheAudioDB"])
         );
 
         let response = app
@@ -40133,6 +47243,7 @@ done
                 status: "running".to_string(),
                 progress_percent: None,
                 position_ticks: 0,
+                start_position_ticks: 0,
             })
             .await
             .unwrap();
@@ -44033,20 +51144,34 @@ done
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
                     .uri("/System/Configuration/unsupported")
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({ "Sentinel": "not-persisted" }).to_string(),
-                    ))
+                    .body(Body::from(json!({ "Sentinel": "persisted" }).to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Configuration/unsupported")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let unsupported_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unsupported_config["Sentinel"], "persisted");
     }
 
     #[tokio::test]
@@ -46133,18 +53258,7 @@ done
         }
         assert_eq!(task["State"], "Idle");
         assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
-        assert_eq!(
-            task["LastExecutionResult"]["Result"]["Capability"],
-            "ScheduledTask"
-        );
-        assert_eq!(
-            task["LastExecutionResult"]["Result"]["TaskName"],
-            "Fake WASI Task"
-        );
-        assert_eq!(
-            task["LastExecutionResult"]["Result"]["Arguments"]["Trigger"],
-            "Manual"
-        );
+        assert!(task["LastExecutionResult"].get("Result").is_none());
     }
 
     #[tokio::test]
@@ -47056,7 +54170,7 @@ done
         use jellyrin_core::{
             HlsTranscodeRequest, TranscodeStreamSelection, build_hls_ffmpeg_command,
         };
-        let request = HlsTranscodeRequest::new(
+        let mut request = HlsTranscodeRequest::new(
             "http://192.168.1.100:5004/auto/v4.1",
             "/tmp/jellyrin/transcodes/live-session/main.m3u8",
             "/tmp/jellyrin/transcodes/live-session/segment_%05d.ts",
@@ -47066,6 +54180,7 @@ done
                 subtitle_stream_index: None,
             },
         );
+        request.event_playlist = true;
         let command = build_hls_ffmpeg_command(&request);
         assert_eq!(command.program, "ffmpeg");
         // -i must point to the HTTP URL directly (no file path wrapping).
@@ -49323,7 +56438,7 @@ done
         receiver: &mut tokio::sync::broadcast::Receiver<super::PlaybackEvent>,
         session_id: &str,
     ) -> Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 break;
@@ -49607,7 +56722,11 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
     }
 
     #[tokio::test]
@@ -51036,7 +58155,7 @@ done
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/Image/Items/{item_id}/Images/Backdrop/2/Index?newIndex=0"
+                        "/Items/{item_id}/Images/Backdrop/2/Index?newIndex=0"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -51067,6 +58186,7 @@ done
         }
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/Image/Items/{item_id}/Images"))
@@ -51087,6 +58207,43 @@ done
             .map(|image| image["ImageIndex"].as_u64().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(indexes, vec![0, 1, 2]);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/Items/{item_id}/Images/Backdrop?imageIndex=1"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/Images"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let image_infos: Value = serde_json::from_slice(&body).unwrap();
+        let indexes = image_infos
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == "Backdrop")
+            .map(|image| image["ImageIndex"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(indexes, vec![0, 2]);
     }
 
     #[tokio::test]
@@ -51200,6 +58357,22 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/Items/Root")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_root: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_root, root);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/UserLibrary/Users/{admin_id}/Items/Root"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -51262,6 +58435,7 @@ done
                 "Feature Movie - main - featurette",
             ),
             (format!("/Users/{admin_id}/Items/{item_id}/Intros"), "intro"),
+            (format!("/Items/{item_id}/Intros"), "intro"),
         ] {
             let response = app
                 .clone()
@@ -51282,6 +58456,35 @@ done
             assert_eq!(result["Items"].as_array().unwrap().len(), 1);
             assert_eq!(result["Items"][0]["Name"], expected_name);
             assert_eq!(result["Items"][0]["MediaType"], "Video");
+        }
+
+        for (endpoint, expected_name) in [
+            (
+                format!("/Items/{item_id}/LocalTrailers"),
+                "Feature Movie - main - trailer",
+            ),
+            (
+                format!("/Items/{item_id}/SpecialFeatures"),
+                "Feature Movie - main - featurette",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result.as_array().unwrap().len(), 1);
+            assert_eq!(result[0]["Name"], expected_name);
+            assert_eq!(result[0]["MediaType"], "Video");
         }
 
         let response = app
@@ -51430,11 +58633,14 @@ done
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let media_folders: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(media_folders["TotalRecordCount"], 1, "{endpoint}");
-            assert_eq!(media_folders["Items"][0]["Name"], "Movies", "{endpoint}");
-            assert_eq!(
-                media_folders["Items"][0]["CollectionType"], "movies",
-                "{endpoint}"
+            assert_eq!(media_folders["TotalRecordCount"], 4, "{endpoint}");
+            assert!(
+                media_folders["Items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| { item["Name"] == "Movies" && item["CollectionType"] == "movies" }),
+                "{endpoint}: expected Movies media folder in {media_folders}"
             );
         }
 
@@ -51585,6 +58791,9 @@ done
         tokio::fs::write(tmp.path().join("theme.mp4"), b"fake theme video")
             .await
             .unwrap();
+        tokio::fs::write(tmp.path().join("soundtrack.mp3"), b"fake soundtrack song")
+            .await
+            .unwrap();
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -51595,6 +58804,7 @@ done
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        let test_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -51635,6 +58845,34 @@ done
         let items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(items["TotalRecordCount"], 1);
         let item_id = items["Items"][0]["Id"].as_str().unwrap();
+        let scanned_items = test_db.media_items().await.unwrap();
+        let soundtrack_id = scanned_items
+            .iter()
+            .find(|item| item.name == "soundtrack")
+            .map(|item| item.id)
+            .unwrap();
+        test_db
+            .update_media_item_metadata(
+                parse_jellyfin_uuid(item_id).unwrap(),
+                json!({
+                    "Album": "Feature Soundtrack",
+                    "Genres": ["Score"],
+                    "Artists": ["Feature Composer"]
+                }),
+            )
+            .await
+            .unwrap();
+        test_db
+            .update_media_item_metadata(
+                soundtrack_id,
+                json!({
+                    "Album": "Feature Soundtrack",
+                    "Genres": ["Score"],
+                    "Artists": ["Feature Composer"]
+                }),
+            )
+            .await
+            .unwrap();
 
         let response = app
             .clone()
@@ -51677,6 +58915,15 @@ done
             theme_media["ThemeVideosResult"]["Items"][0]["MediaType"],
             "Video"
         );
+        assert_eq!(theme_media["SoundtrackSongsResult"]["TotalRecordCount"], 1);
+        assert_eq!(
+            theme_media["SoundtrackSongsResult"]["Items"][0]["Name"],
+            "soundtrack"
+        );
+        assert_eq!(
+            theme_media["SoundtrackSongsResult"]["Items"][0]["MediaType"],
+            "Audio"
+        );
 
         let response = app
             .clone()
@@ -51708,6 +58955,18 @@ done
         assert_eq!(paged_theme_media["ThemeVideosResult"]["StartIndex"], 1);
         assert_eq!(
             paged_theme_media["ThemeVideosResult"]["Items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            paged_theme_media["SoundtrackSongsResult"]["TotalRecordCount"],
+            1
+        );
+        assert_eq!(paged_theme_media["SoundtrackSongsResult"]["StartIndex"], 1);
+        assert_eq!(
+            paged_theme_media["SoundtrackSongsResult"]["Items"]
                 .as_array()
                 .unwrap()
                 .len(),
@@ -51867,6 +59126,107 @@ done
         assert_eq!(filtered_counts["ItemCount"], 1);
     }
 
+    #[test]
+    fn media_stream_normalization_matches_jellyfin_audio_and_pgs_shape() {
+        let mut streams = vec![
+            normalize_media_stream(json!({
+                "Type": "Video",
+                "Index": 0,
+                "Codec": "hevc",
+                "Width": 1920,
+                "Height": 1080,
+                "PixelFormat": "yuv420p10le",
+                "IsDefault": true
+            })),
+            normalize_media_stream(json!({
+                "Type": "Audio",
+                "Index": 1,
+                "Codec": "eac3",
+                "Language": "eng",
+                "Channels": 6,
+                "ChannelLayout": "5.1(side)",
+                "IsDefault": true
+            })),
+            normalize_media_stream(json!({
+                "Type": "Audio",
+                "Index": 2,
+                "Codec": "ac3",
+                "Language": "eng",
+                "Title": "Commentary",
+                "Channels": 6,
+                "ChannelLayout": "5.1(side)"
+            })),
+            normalize_media_stream(json!({
+                "Type": "Subtitle",
+                "Index": 3,
+                "Codec": "hdmv_pgs_subtitle",
+                "Language": "fre"
+            })),
+            normalize_media_stream(json!({
+                "Type": "Subtitle",
+                "Index": 4,
+                "Codec": "hdmv_pgs_subtitle",
+                "Language": "spa",
+                "Title": "SDH"
+            })),
+        ];
+        enrich_media_streams_with_context(&mut streams);
+
+        assert_eq!(streams[0]["DisplayTitle"], "1080p HEVC SDR");
+        assert_eq!(streams[0]["BitDepth"], 10);
+        assert_eq!(streams[0]["VideoRange"], "SDR");
+        assert_eq!(
+            streams[1]["DisplayTitle"],
+            "English - Dolby Digital+ - 5.1 - Default"
+        );
+        assert_eq!(streams[1]["ChannelLayout"], "5.1");
+        assert_eq!(streams[1]["LocalizedLanguage"], "English");
+        assert_eq!(streams[1]["SupportsExternalStream"], false);
+        assert_eq!(
+            streams[2]["DisplayTitle"],
+            "Commentary - English - Dolby Digital - 5.1"
+        );
+        assert_eq!(streams[3]["Codec"], "PGSSUB");
+        assert_eq!(streams[3]["Language"], "fra");
+        assert_eq!(streams[3]["DisplayTitle"], "French - PGSSUB");
+        assert_eq!(streams[3]["SupportsExternalStream"], true);
+        assert_eq!(streams[3]["IsTextSubtitleStream"], false);
+        assert_eq!(streams[3]["Width"], 1920);
+        assert_eq!(streams[3]["Height"], 1080);
+        assert_eq!(
+            streams[4]["DisplayTitle"],
+            "SDH - Spanish; Castilian - PGSSUB"
+        );
+        assert_eq!(streams[4]["LocalizedForced"], "Forced");
+        assert_eq!(streams[4]["LocalizedHearingImpaired"], "Hearing Impaired");
+    }
+
+    #[test]
+    fn metadata_editor_external_ids_match_jellyfin_item_types() {
+        let episode_infos = external_id_infos_for_item_type("Episode");
+        assert_eq!(episode_infos.len(), 3);
+        assert_eq!(episode_infos[0]["Key"], "Imdb");
+        assert_eq!(episode_infos[1]["Key"], "Tmdb");
+        assert_eq!(episode_infos[1]["Type"], "Episode");
+        assert_eq!(episode_infos[2]["Key"], "Tvdb");
+        assert_eq!(episode_infos[2]["Type"], "Episode");
+
+        let series_infos = external_id_infos_for_item_type("Series");
+        assert_eq!(series_infos.len(), 4);
+        assert_eq!(series_infos[0]["Key"], "Imdb");
+        assert_eq!(series_infos[1]["Key"], "Tmdb");
+        assert_eq!(series_infos[1]["Type"], "Series");
+        assert_eq!(series_infos[2]["Key"], "Tvdb");
+        assert_eq!(series_infos[2]["Type"], "Series");
+        assert_eq!(series_infos[3]["Key"], "Zap2It");
+
+        let ratings = metadata_editor_parental_rating_options();
+        assert_eq!(ratings.len(), 56);
+        assert_eq!(ratings[0]["Name"], "Unrated");
+        assert_eq!(ratings[43]["Name"], "TV-MA");
+        assert_eq!(ratings[43]["Value"], 17);
+    }
+
     #[tokio::test]
     async fn virtual_folder_scan_populates_items_endpoint() {
         let tmp = tempfile::tempdir().unwrap();
@@ -51951,6 +59311,7 @@ done
         assert_eq!(result["Items"][0]["Path"], movie.to_string_lossy().as_ref());
         let item_id = result["Items"][0]["Id"].as_str().unwrap();
         let parent_id = result["Items"][0]["ParentId"].as_str().unwrap();
+        let remote_metadata_image_url = "https://static.tvmaze.example/poster.png";
         test_db
             .update_media_item_media_info(
                 parse_jellyfin_uuid(item_id).unwrap(),
@@ -51973,6 +59334,7 @@ done
                         "Type": "Audio",
                         "Index": 1,
                         "Codec": "aac",
+                        "Language": "eng",
                         "IsDefault": true,
                         "Channels": 2,
                         "SampleRate": 48000
@@ -51981,9 +59343,19 @@ done
                         "Type": "Subtitle",
                         "Index": 2,
                         "Codec": "subrip",
+                        "Language": "spa",
                         "IsDefault": true,
                         "IsForced": false,
                         "IsTextSubtitleStream": true
+                    }),
+                    json!({
+                        "Type": "Subtitle",
+                        "Index": 3,
+                        "Codec": "PGSSUB",
+                        "Language": "spa",
+                        "IsDefault": false,
+                        "IsForced": false,
+                        "IsTextSubtitleStream": false
                     }),
                 ],
             )
@@ -52004,9 +59376,18 @@ done
                     "OriginalTitle": "Original Metadata Title",
                     "People": [{ "Name": "Actor One" }],
                     "PremiereDate": "2024-01-02T00:00:00.0000000Z",
+                    "PrimaryImageUrl": remote_metadata_image_url,
                     "ProductionYear": 2024,
                     "ProviderIds": { "Imdb": "tt1234567" },
+                    "MetadataSource": "TVMaze",
                     "RemoteTrailers": [{ "Name": "Main Trailer", "Url": "https://trailers.example/main.mp4" }],
+                    "Chapters": [
+                        {
+                            "StartPositionTicks": 0,
+                            "Name": "Chapter 1",
+                            "ImageDateModified": "0001-01-01T00:00:00.0000000Z"
+                        }
+                    ],
                     "Studios": ["Studio One", { "Name": "Studio Two" }],
                     "Taglines": ["One test movie"],
                     "Tags": ["Library Tag"]
@@ -52210,10 +59591,8 @@ done
         );
         assert_eq!(filtered["Items"][0]["Genres"], json!(["Drama", "Thriller"]));
         assert_eq!(filtered["Items"][0]["GenreItems"][0]["Name"], "Drama");
-        assert_eq!(
-            filtered["Items"][0]["Studios"],
-            json!(["Studio One", "Studio Two"])
-        );
+        assert_eq!(filtered["Items"][0]["Studios"][0]["Name"], "Studio One");
+        assert_eq!(filtered["Items"][0]["Studios"][1]["Name"], "Studio Two");
         assert_eq!(filtered["Items"][0]["People"][0]["Name"], "Actor One");
         assert_eq!(filtered["Items"][0]["Tags"], json!(["Library Tag"]));
         assert_eq!(filtered["Items"][0]["TagItems"][0]["Name"], "Library Tag");
@@ -52290,12 +59669,16 @@ done
         assert_eq!(filters["Years"], json!(["2024"]));
         assert_eq!(filters["MediaTypes"], json!(["Video"]));
         assert_eq!(filters["Containers"], json!(["mp4"]));
+        assert_eq!(filters["VideoTypes"], json!(["VideoFile"]));
         assert_eq!(
             filters["Artists"],
             json!(["Album Artist", "Artist One", "Artist Two"])
         );
         assert_eq!(filters["Albums"], json!(["Example Album"]));
         assert_eq!(filters["Studios"], json!(["Studio One", "Studio Two"]));
+        assert_eq!(filters["Staff"][0]["Name"], "Actor One");
+        assert_eq!(filters["Features"], json!(["HasSubtitles", "HasTrailer"]));
+        assert_eq!(filters["Trailers"], json!(["Trailer"]));
 
         let response = app
             .clone()
@@ -52329,8 +59712,62 @@ done
         let filters2: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(filters2["Genres"], json!(["Drama", "Thriller"]));
         assert_eq!(filters2["Tags"], json!(["Library Tag"]));
-        assert_eq!(filters2["AudioLanguages"].as_array().unwrap().len(), 0);
-        assert_eq!(filters2["SubtitleLanguages"].as_array().unwrap().len(), 0);
+        assert_eq!(filters2["AudioLanguages"], json!(["eng"]));
+        assert_eq!(filters2["SubtitleLanguages"], json!(["spa"]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?userId={user_id}&parentId={parent_id}&includeItemTypes=Movie&AudioLanguages=eng"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let audio_language_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(audio_language_items["TotalRecordCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?userId={user_id}&parentId={parent_id}&includeItemTypes=Movie&AudioLanguages=fra"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let missing_audio_language_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(missing_audio_language_items["TotalRecordCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?userId={user_id}&parentId={parent_id}&includeItemTypes=Movie&SubtitleLanguages=spa"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let subtitle_language_items: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(subtitle_language_items["TotalRecordCount"], 1);
 
         let response = app
             .clone()
@@ -52370,6 +59807,157 @@ done
         let repeated_include_types: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(repeated_include_types["TotalRecordCount"], 1);
         assert_eq!(repeated_include_types["Items"][0]["Id"], item_id);
+
+        for (endpoint, expected_total) in [
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&Containers=mp4"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&Containers=mkv"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&VideoTypes=VideoFile"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&VideoTypes=BluRay"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasSubtitles=true"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasSubtitles=false"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasTrailer=true"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasTrailer=false"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&Filters=HasSubtitles"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&Filters=HasTrailer"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasOverview=true"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasOverview=false"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasImdbId=true"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasImdbId=false"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasTmdbId=true"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&IsHD=true"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&Is4K=true"),
+                0,
+            ),
+            (
+                format!(
+                    "/Items?userId={user_id}&IncludeItemTypes=Movie&MinWidth=1900&MaxWidth=2000&MinHeight=1000&MaxHeight=1200"
+                ),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&MinWidth=3840"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&LocationTypes=FileSystem"),
+                1,
+            ),
+            (
+                format!(
+                    "/Items?userId={user_id}&IncludeItemTypes=Movie&ExcludeLocationTypes=FileSystem"
+                ),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&IsMissing=true"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&IsUnaired=true"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasOfficialRating=true"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&HasOfficialRating=false"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&IsLocked=false"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&IsLocked=true"),
+                0,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&MinDateCreated=2000-01-01"),
+                1,
+            ),
+            (
+                format!("/Items?userId={user_id}&IncludeItemTypes=Movie&MinDateCreated=2100-01-01"),
+                0,
+            ),
+            (
+                format!(
+                    "/Items?userId={user_id}&IncludeItemTypes=Movie&MaxDateLastSaved=2100-01-01"
+                ),
+                1,
+            ),
+            (
+                format!(
+                    "/Items?userId={user_id}&IncludeItemTypes=Movie&MaxDateLastSaved=2000-01-01"
+                ),
+                0,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.clone())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["TotalRecordCount"], expected_total, "{endpoint}");
+        }
 
         let response = app
             .clone()
@@ -52514,7 +60102,11 @@ done
         assert_eq!(detail["RunTimeTicks"], 987_650_000);
         assert_eq!(detail["FileName"], "Example Movie.mp4");
         assert_eq!(detail["OriginalTitle"], "Original Metadata Title");
-        assert_eq!(detail["ImageTags"]["Primary"], "placeholder");
+        assert!(
+            detail["ImageTags"]["Primary"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty())
+        );
         assert_eq!(detail["PrimaryImageAspectRatio"], 0.6666667);
         assert_eq!(detail["MediaSources"][0]["Id"], item_id);
         assert_eq!(
@@ -52567,7 +60159,8 @@ done
         assert_eq!(detail["Genres"], json!(["Drama", "Thriller"]));
         assert_eq!(detail["GenreItems"].as_array().unwrap().len(), 2);
         assert_eq!(detail["GenreItems"][0]["Name"], "Drama");
-        assert_eq!(detail["Studios"], json!(["Studio One", "Studio Two"]));
+        assert_eq!(detail["Studios"][0]["Name"], "Studio One");
+        assert_eq!(detail["Studios"][1]["Name"], "Studio Two");
         assert_eq!(detail["People"].as_array().unwrap().len(), 1);
         assert_eq!(detail["People"][0]["Name"], "Actor One");
         assert_eq!(detail["Tags"], json!(["Library Tag"]));
@@ -52579,6 +60172,8 @@ done
             detail["RemoteTrailers"][0]["Path"],
             "https://trailers.example/main.mp4"
         );
+        assert_eq!(detail["Chapters"][0]["Name"], "Chapter 1");
+        assert_eq!(detail["Chapters"][0]["StartPositionTicks"], 0);
 
         let response = app
             .clone()
@@ -52668,8 +60263,14 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let user_views: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(user_views["TotalRecordCount"], 1);
-        assert_eq!(user_views["Items"][0]["Id"], parent_id);
+        assert_eq!(user_views["TotalRecordCount"], 4);
+        assert!(
+            user_views["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["Id"] == parent_id && item["CollectionType"] == "movies" })
+        );
 
         let response = app
             .clone()
@@ -52685,7 +60286,7 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let legacy_user_views: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(legacy_user_views["TotalRecordCount"], 1);
+        assert_eq!(legacy_user_views["TotalRecordCount"], 4);
 
         let response = app
             .clone()
@@ -52750,9 +60351,35 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let grouping_options: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(grouping_options.as_array().unwrap().len(), 1);
-        assert_eq!(grouping_options[0]["Name"], "Movies");
-        assert_eq!(grouping_options[0]["Id"], "movies");
+        assert_eq!(grouping_options.as_array().unwrap().len(), 4);
+        assert!(
+            grouping_options
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| { option["Name"] == "Movies" && option["Id"] == "movies" })
+        );
+
+        for endpoint in [
+            format!("/Users/{user_id}/GroupingOptions"),
+            format!("/users/{user_id}/groupingoptions"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let user_grouping_options: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(user_grouping_options, grouping_options);
+        }
 
         let response = app
             .clone()
@@ -52847,6 +60474,22 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/UserItems/{item_id}/UserData"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_user_data, user_data);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!("/Items/Users/{user_id}/Items/{item_id}/UserData"))
                     .header("X-Emby-Token", &api_key)
@@ -52907,6 +60550,27 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/useritems/{item_id}/userdata"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "PlaybackPositionTicks": 654, "Played": true }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_updated_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_updated_user_data["PlaybackPositionTicks"], 654);
+        assert_eq!(sdk_updated_user_data["Played"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/UserLibrary/Items/{item_id}"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -52921,7 +60585,7 @@ done
         assert_eq!(current_user_library_detail["UserData"]["Played"], true);
         assert_eq!(
             current_user_library_detail["UserData"]["PlaybackPositionTicks"],
-            321
+            654
         );
 
         let response = app
@@ -52963,7 +60627,7 @@ done
         assert_eq!(played_current_user_latest[0]["UserData"]["Played"], true);
         assert_eq!(
             played_current_user_latest[0]["UserData"]["PlaybackPositionTicks"],
-            321
+            654
         );
 
         let response = app
@@ -52983,7 +60647,24 @@ done
         let favorite_user_data: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(favorite_user_data["IsFavorite"], true);
         assert_eq!(favorite_user_data["Played"], true);
-        assert_eq!(favorite_user_data["PlaybackPositionTicks"], 321);
+        assert_eq!(favorite_user_data["PlaybackPositionTicks"], 654);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/UserFavoriteItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_favorite_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_favorite_user_data["IsFavorite"], true);
 
         let response = app
             .clone()
@@ -53010,6 +60691,24 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/UserItems/{item_id}/Rating?likes=false"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_rated_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_rated_user_data["Likes"], false);
+        assert_eq!(sdk_rated_user_data["Rating"], 0.0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/Users/{user_id}/Items/{item_id}"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -53021,8 +60720,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let persisted_user_item: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(persisted_user_item["UserData"]["IsFavorite"], true);
-        assert_eq!(persisted_user_item["UserData"]["Likes"], true);
-        assert_eq!(persisted_user_item["UserData"]["Rating"], 1.0);
+        assert_eq!(persisted_user_item["UserData"]["Likes"], false);
+        assert_eq!(persisted_user_item["UserData"]["Rating"], 0.0);
 
         let response = app
             .clone()
@@ -53063,6 +60762,20 @@ done
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
+                    .uri(format!("/UserItems/{item_id}/Rating"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
                     .uri(format!(
                         "/UserLibrary/Users/{user_id}/FavoriteItems/{item_id}"
                     ))
@@ -53077,6 +60790,20 @@ done
         let unfavorited_user_data: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(unfavorited_user_data["IsFavorite"], false);
         assert_eq!(unfavorited_user_data["Played"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/UserFavoriteItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .clone()
@@ -53453,7 +61180,11 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
 
         let response = app
             .clone()
@@ -53536,22 +61267,33 @@ done
                 Method::GET,
                 "/Image/Genres/Drama/Images/Primary".to_string(),
             ),
+            (Method::GET, "/Genres/Drama/Images/Primary".to_string()),
             (
                 Method::HEAD,
                 "/Image/MusicGenres/Rock/Images/Primary/0".to_string(),
             ),
             (
+                Method::HEAD,
+                "/MusicGenres/Rock/Images/Primary/0".to_string(),
+            ),
+            (
                 Method::GET,
                 "/Image/Persons/Example/Images/Primary".to_string(),
             ),
+            (Method::GET, "/Persons/Example/Images/Primary".to_string()),
             (
                 Method::HEAD,
                 "/Image/Studios/Example/Images/Primary/0".to_string(),
             ),
             (
+                Method::HEAD,
+                "/Studios/Example/Images/Primary/0".to_string(),
+            ),
+            (
                 Method::GET,
                 "/Image/Artists/Example/Images/Primary/0".to_string(),
             ),
+            (Method::GET, "/Artists/Example/Images/Primary/0".to_string()),
             (Method::GET, "/Image/Branding/Splashscreen".to_string()),
         ] {
             let response = app
@@ -53712,9 +61454,13 @@ done
 
         for endpoint in [
             "/Image/Genres/Drama/Images/Primary".to_string(),
+            "/Genres/Drama/Images/Primary".to_string(),
             "/Image/Artists/Artist%20One/Images/Primary/0".to_string(),
+            "/Artists/Artist%20One/Images/Primary/0".to_string(),
             "/Image/Persons/Actor%20One/Images/Primary".to_string(),
+            "/Persons/Actor%20One/Images/Primary".to_string(),
             "/Image/Studios/Studio%20One/Images/Primary/0".to_string(),
+            "/Studios/Studio%20One/Images/Primary/0".to_string(),
         ] {
             let response = app
                 .clone()
@@ -53751,6 +61497,7 @@ done
 
         for (method, endpoint) in [
             (Method::GET, "/Image/UserImage".to_string()),
+            (Method::HEAD, "/UserImage".to_string()),
             (
                 Method::HEAD,
                 format!("/Image/Users/{user_id}/Images/Primary"),
@@ -53781,6 +61528,7 @@ done
 
         for (method, endpoint) in [
             (Method::POST, "/Image/UserImage".to_string()),
+            (Method::POST, "/UserImage".to_string()),
             (
                 Method::DELETE,
                 format!("/Image/Users/{user_id}/Images/Primary"),
@@ -53902,6 +61650,38 @@ done
             assert_eq!(body.as_ref(), uploaded_png.as_slice(), "{endpoint}");
         }
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages?ImageType=Primary"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let metadata_remote_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metadata_remote_images["TotalRecordCount"], 1);
+        assert_eq!(metadata_remote_images["Items"][0]["ProviderName"], "TVMaze");
+        assert_eq!(metadata_remote_images["Items"][0]["Type"], "Primary");
+        let metadata_remote_image_preview =
+            metadata_remote_images["Items"][0]["Url"].as_str().unwrap();
+        assert!(
+            metadata_remote_image_preview
+                .starts_with(&format!("/Items/{item_id}/RemoteImages/Preview?ImageUrl="))
+        );
+        assert!(
+            metadata_remote_images["Items"][0]["ImageUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("remote-url-image:")
+        );
+
         let remote_image_dir = tmp.path().join(".jellyrin-remote-images");
         tokio::fs::create_dir_all(&remote_image_dir).await.unwrap();
         tokio::fs::write(remote_image_dir.join("poster-primary.png"), &uploaded_png)
@@ -53922,11 +61702,47 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let remote_images: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(remote_images["TotalRecordCount"], 1);
-        assert_eq!(remote_images["Items"][0]["ProviderName"], "Local cache");
-        assert_eq!(remote_images["Items"][0]["Type"], "Primary");
-        assert_eq!(remote_images["Items"][0]["MimeType"], "image/png");
-        let remote_image_id = remote_images["Items"][0]["Url"].as_str().unwrap();
+        assert_eq!(remote_images["TotalRecordCount"], 2);
+        let local_remote_image = remote_images["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|image| image["ProviderName"] == "Local cache")
+            .unwrap();
+        assert_eq!(local_remote_image["Type"], "Primary");
+        assert_eq!(local_remote_image["MimeType"], "image/png");
+        assert_eq!(remote_images["Images"][0], remote_images["Items"][0]);
+        assert_eq!(remote_images["Providers"], json!(["Local cache", "TVMaze"]));
+        let remote_image_id = local_remote_image["Url"].as_str().unwrap();
+        assert!(
+            remote_image_id
+                .starts_with(&format!("/Items/{item_id}/RemoteImages/Preview?ImageUrl="))
+        );
+        assert!(
+            local_remote_image["ImageUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("local-image:")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(remote_image_id)
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), uploaded_png.as_slice());
 
         let response = app
             .clone()
@@ -53944,8 +61760,9 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let remote_providers: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(remote_providers.as_array().unwrap().len(), 1);
+        assert_eq!(remote_providers.as_array().unwrap().len(), 2);
         assert_eq!(remote_providers[0]["Name"], "Local cache");
+        assert_eq!(remote_providers[1]["Name"], "TVMaze");
 
         let response = app
             .clone()
@@ -54309,6 +62126,39 @@ done
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
+                    .uri("/LiveStreams/Open")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "ItemId": item_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_live_stream: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_live_stream["LiveStreamId"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/livestreams/close")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "LiveStreamId": item_id }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
                     .uri(format!(
                         "/Playstate/PlayingItems/{item_id}?positionTicks=123&audioStreamIndex=1&subtitleStreamIndex=-1"
                     ))
@@ -54327,6 +62177,26 @@ done
         assert_eq!(playback_state.position_ticks, 123);
         assert_eq!(playback_state.audio_stream_index, Some(1));
         assert_eq!(playback_state.subtitle_stream_index, Some(-1));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/PlayingItems/{item_id}?positionTicks=234"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(playback_state.position_ticks, 234);
 
         let response = app
             .clone()
@@ -54354,6 +62224,28 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/playingitems/{item_id}/progress?positionticks=567"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(playback_state.position_ticks, 567);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::DELETE)
                     .uri(format!(
                         "/Playstate/PlayingItems/{item_id}?PositionTicks=789"
@@ -54366,6 +62258,20 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(test_db.active_playback_sessions().await.unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/playingitems/{item_id}?PositionTicks=890"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let response = app
             .clone()
@@ -54391,8 +62297,42 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/UserPlayedItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::DELETE)
                     .uri(format!("/Playstate/UserPlayedItems/{item_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!playback_state.played);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/userplayeditems/{item_id}"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -54627,6 +62567,73 @@ done
             .oneshot(
                 Request::builder()
                     .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&SubtitleStreamIndex=2"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let subtitle_transcode_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_hls_transcode_playback_info(&subtitle_transcode_info, item_id, &api_key);
+        assert_eq!(
+            subtitle_transcode_info["MediaSources"][0]["DefaultSubtitleStreamIndex"],
+            2
+        );
+        assert_eq!(
+            subtitle_transcode_info["MediaSources"][0]["MediaStreams"][2]["Codec"],
+            "webvtt"
+        );
+        assert_eq!(
+            subtitle_transcode_info["MediaSources"][0]["MediaStreams"][2]["IsTextSubtitleStream"],
+            true
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&SubtitleStreamIndex=3"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let image_subtitle_transcode_info: Value = serde_json::from_slice(&body).unwrap();
+        let image_subtitle_play_session_id =
+            assert_hls_transcode_playback_info(&image_subtitle_transcode_info, item_id, &api_key);
+        assert_eq!(
+            image_subtitle_transcode_info["MediaSources"][0]["DefaultSubtitleStreamIndex"],
+            Value::Null
+        );
+        assert_eq!(
+            image_subtitle_transcode_info["MediaSources"][0]["MediaStreams"][3]["Codec"],
+            "PGSSUB"
+        );
+        assert_eq!(
+            image_subtitle_transcode_info["MediaSources"][0]["MediaStreams"][3]["IsTextSubtitleStream"],
+            false
+        );
+        let image_subtitle_session = test_db
+            .transcode_session_by_play_session_id(&image_subtitle_play_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(image_subtitle_session.subtitle_stream_index, Some(3));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
                         "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&StartTimeTicks=12345000000"
                     ))
                     .header("X-Emby-Token", &api_key)
@@ -54646,7 +62653,10 @@ done
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(seek_transcode_session.position_ticks, 12_345_000_000);
+        assert_eq!(
+            seek_transcode_session.position_ticks,
+            hls_effective_start_position_ticks(12_345_000_000, Some(987_650_000))
+        );
 
         let response = app
             .clone()
@@ -54989,6 +62999,72 @@ done
         assert_eq!(sessions[0]["PlayState"]["IsPaused"], false);
         assert_eq!(sessions[0]["PlayState"]["AudioStreamIndex"], 1);
         assert_eq!(sessions[0]["PlayState"]["SubtitleStreamIndex"], -1);
+
+        let transcode_start_position_ticks = 100_000_000;
+        let transcode_relative_position_ticks = 25_000_000;
+        test_db
+            .upsert_transcode_session(UpsertTranscodeSession {
+                play_session_id: "play-session-relative-progress".to_string(),
+                dedupe_key: None,
+                device_id: Some("playback-device".to_string()),
+                user_id: user.id,
+                item_id: parse_jellyfin_uuid(item_id).unwrap(),
+                media_source_id: Some(item_id.to_string()),
+                audio_stream_index: Some(1),
+                subtitle_stream_index: Some(-1),
+                video_stream_index: Some(0),
+                output_path: "/tmp/jellyrin-transcodes/play-session-relative-progress/main.m3u8"
+                    .to_string(),
+                process_id: None,
+                status: "running".to_string(),
+                progress_percent: None,
+                position_ticks: transcode_start_position_ticks,
+                start_position_ticks: transcode_start_position_ticks,
+            })
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Playing/Progress")
+                    .header("X-Emby-Token", playback_token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ItemId": item_id,
+                            "MediaSourceId": item_id,
+                            "AudioStreamIndex": 1,
+                            "SubtitleStreamIndex": -1,
+                            "PositionTicks": transcode_relative_position_ticks,
+                            "PlayMethod": "Transcode",
+                            "PlaySessionId": "play-session-relative-progress",
+                            "CanSeek": true,
+                            "IsPaused": false,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let transcode_progress_event =
+            next_playback_event_type(&mut playback_report_events, playback_token, "Sessions").await;
+        assert_eq!(
+            transcode_progress_event["Data"][0]["PlayState"]["PositionTicks"],
+            transcode_start_position_ticks + transcode_relative_position_ticks
+        );
+        let playback_state = test_db
+            .playback_state_for_item(user.id, parse_jellyfin_uuid(item_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            playback_state.position_ticks,
+            transcode_start_position_ticks + transcode_relative_position_ticks
+        );
 
         let response = app
             .clone()
@@ -55789,6 +63865,11 @@ done
                 1,
             ),
             (
+                format!("/Movies/{item_id}/Similar?UserId={user_id}&Limit=1"),
+                0,
+                1,
+            ),
+            (
                 format!("/library/movies/{item_id}/similar?StartIndex=1&Limit=1"),
                 1,
                 0,
@@ -55945,6 +64026,25 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/Items/{movie_id}/File"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "video/mp4"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake video");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/Library/Items/{movie_id}/Download"))
                     .header("X-Emby-Token", &api_key)
                     .header(header::RANGE, "bytes=0-3")
@@ -55968,6 +64068,25 @@ done
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), b"fake");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{movie_id}/Download"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"Download Movie.mp4\""
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"fake video");
 
         let response = app
             .clone()
@@ -56173,6 +64292,22 @@ done
         assert_eq!(suggestions["TotalRecordCount"], 1);
         assert_eq!(suggestions["Items"][0]["Name"], "Fresh Suggestion");
         assert_eq!(suggestions["Items"][0]["UserData"]["Played"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/Suggestions?Limit=1")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_suggestions: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_suggestions, suggestions);
 
         let response = app
             .oneshot(
@@ -56462,6 +64597,499 @@ done
     }
 
     #[tokio::test]
+    async fn apply_remote_series_search_updates_virtual_series_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let season_dir = tmp.path().join("Silicon Valley Release").join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await.unwrap();
+        tokio::fs::write(
+            season_dir.join("Silicon Valley Release S01E01.mp4"),
+            b"episode 1",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            season_dir.join("Silicon Valley Release S01E02.mp4"),
+            b"episode 2",
+        )
+        .await
+        .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "series-identify-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Shows",
+                Some("tvshows"),
+                vec![tmp.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let scanned_episode = db.media_items().await.unwrap().remove(0);
+        db.update_media_item_metadata(
+            scanned_episode.id,
+            json!({
+                "ContentType": "Episode"
+            }),
+        )
+        .await
+        .unwrap();
+        let test_db = db.clone();
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Users/{}/Items?IncludeItemTypes=Series&Recursive=true",
+                        admin.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let series_result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(series_result["TotalRecordCount"], 1);
+        assert_eq!(series_result["Items"][0]["Name"], "Silicon Valley Release");
+        assert_eq!(series_result["Items"][0]["Type"], "Series");
+        assert_eq!(series_result["Items"][0]["IsFolder"], true);
+        assert!(
+            !series_result["Items"][0]
+                .as_object()
+                .unwrap()
+                .contains_key("CollectionType")
+        );
+        let series_id = series_result["Items"][0]["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Items/RemoteSearch/Series")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ItemId": series_id,
+                            "SearchInfo": {
+                                "Name": "Silicon Valley Release",
+                                "ProviderIds": {}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let search_results: Value = serde_json::from_slice(&body).unwrap();
+        assert!(search_results.as_array().unwrap().iter().any(|result| {
+            result["Name"] == "Silicon Valley Release" && result["Type"] == "Series"
+        }));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/RemoteSearch/Apply/{series_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "SearchResult": {
+                                "Name": "Silicon Valley",
+                                "Overview": "Remote series overview",
+                                "ProductionYear": 2014,
+                                "PremiereDate": "2014-04-06T00:00:00.0000000Z",
+                                "ProviderIds": {
+                                    "TvMaze": "143",
+                                    "Imdb": "tt2575988"
+                                },
+                                "Genres": ["Comedy"],
+                                "People": [{
+                                    "Name": "Thomas Middleditch",
+                                    "Role": "Richard Hendricks",
+                                    "Type": "Actor",
+                                    "PrimaryImageTag": "person-richard"
+                                }],
+                                "SearchProviderName": "TVMaze",
+                                "Type": "Series"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Items/{series_id}/ContentType?ContentType=tvshows-custom"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}/Items/{series_id}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let series: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(series["Name"], "Silicon Valley");
+        assert_eq!(series["Overview"], "Remote series overview");
+        assert_eq!(series["ProductionYear"], 2014);
+        assert_eq!(series["PremiereDate"], "2014-04-06T00:00:00.0000000Z");
+        assert_eq!(series["ProviderIds"]["TvMaze"], "143");
+        assert_eq!(series["ProviderIds"]["Imdb"], "tt2575988");
+        assert_eq!(series["ImageTags"]["Primary"], "tvmaze-primary-143");
+
+        let updated_items = test_db.media_items().await.unwrap();
+        let metadata_by_item = super::media_metadata_by_item_id(
+            &test_db,
+            updated_items
+                .iter()
+                .map(|item| item.id)
+                .collect::<std::collections::HashSet<_>>(),
+        )
+        .await
+        .unwrap();
+        let updated_item_count = updated_items.len();
+        assert!(updated_item_count >= 1);
+        for item in updated_items {
+            let metadata = metadata_by_item.get(&item.id).unwrap();
+            assert_eq!(metadata["SeriesName"], "Silicon Valley");
+            assert_eq!(metadata["SeriesOverview"], "Remote series overview");
+            assert_eq!(metadata["SeriesProviderIds"]["TvMaze"], "143");
+            assert_eq!(metadata["SeriesProviderIds"]["Imdb"], "tt2575988");
+            assert_eq!(metadata["SeriesGenres"][0], "Comedy");
+            assert_eq!(metadata["SeriesPeople"][0]["Name"], "Thomas Middleditch");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Shows/{series_id}/Episodes?UserId={}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let episodes: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(episodes["TotalRecordCount"], updated_item_count);
+        for episode in episodes["Items"].as_array().unwrap() {
+            assert_eq!(episode["SeriesName"], "Silicon Valley");
+            assert_eq!(episode["SeriesId"], series_id);
+        }
+
+        let first_episode_id = episodes["Items"][0]["Id"].as_str().unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}/Items/{first_episode_id}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let episode_detail: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(episode_detail["ProviderIds"]["TvMaze"], "143");
+        assert_eq!(episode_detail["ProviderIds"]["Imdb"], "tt2575988");
+        assert_eq!(episode_detail["ExternalUrls"][0]["Name"], "Imdb");
+        assert_eq!(episode_detail["Genres"], json!(["Comedy"]));
+        assert_eq!(episode_detail["GenreItems"][0]["Name"], "Comedy");
+        assert_eq!(episode_detail["People"][0]["Name"], "Thomas Middleditch");
+        assert_eq!(episode_detail["People"][0]["Role"], "Richard Hendricks");
+        assert_eq!(episode_detail["LockData"], false);
+        assert_eq!(episode_detail["LockedFields"], json!([]));
+        assert_eq!(episode_detail["SpecialFeatureCount"], 0);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{series_id}/MetadataEditor"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let editor: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(editor["Item"]["Id"], series_id);
+        assert_eq!(editor["Item"]["Type"], "Series");
+        assert_eq!(editor["Item"]["Name"], "Silicon Valley");
+        assert!(
+            editor["ExternalIdInfos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|info| info["Key"] == "Tvdb")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ItemLookup/Items/{series_id}/ExternalIdInfos"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let external_id_infos: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            external_id_infos
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|info| info["Key"] == "Tvdb")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/ItemUpdate/Items/{series_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": series_id,
+                            "Name": "Silicon Valley Manual",
+                            "Overview": "Manual series overview",
+                            "ProductionYear": "2014",
+                            "PremiereDate": "2014-04-06T00:00:00.0000000Z",
+                            "Status": "Ended",
+                            "AirDays": ["Sunday"],
+                            "ProviderIds": {
+                                "TvMaze": "143",
+                                "Imdb": "tt2575988"
+                            },
+                            "Genres": ["Comedy", "Tech"],
+                            "Studios": [{ "Name": "HBO" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/Items/{series_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": series_id,
+                            "Name": "Silicon Valley Manual",
+                            "Overview": "Manual series overview",
+                            "ProductionYear": "2014",
+                            "PremiereDate": "2014-04-06T00:00:00.0000000Z",
+                            "Status": "Ended",
+                            "AirDays": ["Sunday"],
+                            "ProviderIds": {
+                                "TvMaze": "143",
+                                "Imdb": "tt2575988"
+                            },
+                            "Genres": ["Comedy", "Tech"],
+                            "Studios": [{ "Name": "HBO" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{}/Items/{series_id}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_series: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_series["Name"], "Silicon Valley Manual");
+        assert_eq!(updated_series["Overview"], "Manual series overview");
+        assert_eq!(updated_series["Genres"], json!(["Comedy", "Tech"]));
+        assert_eq!(updated_series["Studios"][0]["Name"], "HBO");
+        assert_eq!(
+            updated_series["Studios"][0]["Id"],
+            stable_entity_id("Studio", "HBO")
+        );
+        assert_eq!(updated_series["Status"], "Ended");
+        assert_eq!(updated_series["AirDays"], json!(["Sunday"]));
+        assert_eq!(updated_series["ContentType"], "tvshows-custom");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Filters?userId={}&IncludeItemTypes=Series",
+                        admin.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let series_filters: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(series_filters["SeriesStatuses"], json!(["Ended"]));
+        assert!(
+            series_filters["Staff"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|staff| staff["Name"] == "Thomas Middleditch")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?userId={}&IncludeItemTypes=Series&SeriesStatus=Ended",
+                        admin.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let ended_series: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ended_series["TotalRecordCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?userId={}&IncludeItemTypes=Series&HasImdbId=true",
+                        admin.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let imdb_series: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(imdb_series["TotalRecordCount"], 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{series_id}/MetadataEditor"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_editor: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated_editor["ContentType"], "tvshows-custom");
+        assert_eq!(updated_editor["Metadata"]["ContentType"], "tvshows-custom");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Shows/{series_id}/Episodes?UserId={}", admin.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let updated_episodes: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            updated_episodes["Items"][0]["SeriesName"],
+            "Silicon Valley Manual"
+        );
+    }
+
+    #[tokio::test]
     async fn trickplay_generates_tiles_from_real_video_media() {
         let tmp = tempfile::tempdir().unwrap();
         let movie = tmp.path().join("Trickplay Source.mp4");
@@ -56623,6 +65251,19 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body.starts_with(&[0xff, 0xd8]));
         assert!(body.ends_with(&[0xff, 0xd9]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/videos/{item_id}/trickplay/320/0.jpg"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let cached_item = media_item_by_id(&test_db, item_id).await.unwrap();
         let trickplay_settings = trickplay_settings(&test_db).await.unwrap();
@@ -56947,6 +65588,19 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/FallbackFont/Fonts")
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Subtitle/FallbackFont/Fonts/Arial")
                     .header("X-Emby-Token", &user_key)
                     .body(Body::empty())
@@ -57023,6 +65677,19 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/fallbackfont/fonts/JellyrinSans.ttf")
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/Subtitle/FallbackFont/Fonts/ignored.txt")
                     .header("X-Emby-Token", &user_key)
                     .body(Body::empty())
@@ -57054,6 +65721,22 @@ done
                     .uri(format!(
                         "/Subtitle/Items/{item_id}/RemoteSearch/Subtitles/eng"
                     ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_results, json!([]));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{item_id}/RemoteSearch/Subtitles/eng"))
                     .header("X-Emby-Token", &admin_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -57101,6 +65784,23 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/Items/{item_id}/RemoteSearch/Subtitles/eng"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let web_remote_results: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(web_remote_results.as_array().unwrap().len(), 1);
+        assert_eq!(web_remote_results[0]["Id"], remote_subtitle_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!(
                         "/Subtitle/Providers/Subtitles/Subtitles/{remote_subtitle_id}"
                     ))
@@ -57121,6 +65821,21 @@ done
                 .unwrap()
                 .contains("Remote Jellyrin subtitle")
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Providers/Subtitles/Subtitles/{remote_subtitle_id}"
+                    ))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
             .clone()
@@ -57157,7 +65872,7 @@ done
                 Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/subtitle/items/{item_id}/remotesearch/subtitles/{remote_subtitle_id}"
+                        "/items/{item_id}/remotesearch/subtitles/{remote_subtitle_id}"
                     ))
                     .header("X-Emby-Token", &admin_key)
                     .body(Body::empty())
@@ -58268,7 +66983,7 @@ done
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics?fileName=song.lrc"))
+                    .uri(format!("/Audio/{item_id}/Lyrics?fileName=song.lrc"))
                     .header("X-Emby-Token", &admin_key)
                     .header(header::CONTENT_TYPE, "text/plain")
                     .body(Body::from(lyric_body))
@@ -58284,6 +66999,22 @@ done
         assert_eq!(lyrics["Lyrics"][0]["Text"], "Hello from Jellyrin");
         assert_eq!(lyrics["Lyrics"][0]["Start"], 10_000_000);
         assert_eq!(lyrics["Lyrics"][1]["Start"], 25_000_000);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Audio/{item_id}/Lyrics"))
+                    .header("X-Emby-Token", &user_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_persisted: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_persisted, lyrics);
 
         let response = app
             .clone()
@@ -58318,7 +67049,7 @@ done
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics"))
+                    .uri(format!("/Audio/{item_id}/RemoteSearch/Lyrics"))
                     .header("X-Emby-Token", &admin_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -58356,9 +67087,22 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/Providers/Lyrics/{remote_lyric_id}"))
+                    .header("X-Emby-Token", &admin_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!(
-                        "/Lyrics/Audio/{item_id}/RemoteSearch/Lyrics/{remote_lyric_id}"
+                        "/audio/{item_id}/remotesearch/lyrics/{remote_lyric_id}"
                     ))
                     .header("X-Emby-Token", &admin_key)
                     .body(Body::empty())
@@ -58402,7 +67146,7 @@ done
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(format!("/Lyrics/Audio/{item_id}/Lyrics"))
+                    .uri(format!("/Audio/{item_id}/Lyrics"))
                     .header("X-Emby-Token", &admin_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -58888,8 +67632,11 @@ done
             format!("/InstantMix/Items/{item_id}/InstantMix?Limit=2"),
             format!("/InstantMix/Songs/{item_id}/InstantMix?Limit=2"),
             format!("/InstantMix/Albums/{item_id}/InstantMix?Limit=2"),
+            format!("/Albums/{item_id}/InstantMix?Limit=2"),
             format!("/InstantMix/Artists/{item_id}/InstantMix?Limit=2"),
+            format!("/Artists/{item_id}/InstantMix?Limit=2"),
             format!("/InstantMix/Playlists/{item_id}/InstantMix?Limit=2"),
+            format!("/Playlists/{item_id}/InstantMix?Limit=2"),
         ] {
             let endpoint = endpoint.as_str();
             let response = app
@@ -58918,6 +67665,7 @@ done
                 2,
                 item_id,
             ),
+            (format!("/Albums/{album_id}/InstantMix?Limit=2"), 2, item_id),
             (
                 format!("/instantmix/albums/{album_id}/instantmix?StartIndex=1&Limit=1"),
                 2,
@@ -58965,12 +67713,29 @@ done
         assert_eq!(artist_mix["Items"][0]["Id"], item_id);
         assert_eq!(artist_mix["Items"][1]["Id"], second_item_id);
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Artists/{artist_id}/InstantMix?Limit=2"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_artist_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_artist_mix, artist_mix);
+
         for (endpoint, expected_first_id, expected_start_index) in [
             (
                 format!("/Library/Albums/{album_id}/Similar?Limit=1"),
                 item_id,
                 0,
             ),
+            (format!("/Albums/{album_id}/Similar?Limit=1"), item_id, 0),
             (
                 format!("/library/albums/{album_id}/similar?StartIndex=1&Limit=1"),
                 second_item_id.as_str(),
@@ -59006,6 +67771,7 @@ done
 
         for endpoint in [
             format!("/Library/Artists/{artist_id}/Similar?Limit=2"),
+            format!("/Artists/{artist_id}/Similar?Limit=2"),
             format!("/library/artists/{artist_id}/similar?UserId={user_id}&Limit=2"),
         ] {
             let endpoint = endpoint.as_str();
@@ -59054,6 +67820,22 @@ done
         assert_eq!(playlist_mix["TotalRecordCount"], 2);
         assert_eq!(playlist_mix["Items"][0]["Id"], second_item_id);
         assert_eq!(playlist_mix["Items"][1]["Id"], item_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Playlists/{playlist_id}/InstantMix?Limit=2"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let sdk_playlist_mix: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sdk_playlist_mix, playlist_mix);
 
         let response = app
             .clone()
@@ -59130,6 +67912,19 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri("/MusicGenres/InstantMix")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/InstantMix/MusicGenres/InstantMix?Id=missing")
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -59145,6 +67940,11 @@ done
                 format!(
                     "/InstantMix/MusicGenres/InstantMix?Id={rock_genre_id}&StartIndex=1&Limit=1"
                 ),
+                second_item_id.as_str(),
+                1,
+            ),
+            (
+                format!("/MusicGenres/InstantMix?Id={rock_genre_id}&StartIndex=1&Limit=1"),
                 second_item_id.as_str(),
                 1,
             ),
@@ -59197,6 +67997,11 @@ done
         for (endpoint, expected_id, expected_start_index) in [
             (
                 "/InstantMix/MusicGenres/Rock/InstantMix?StartIndex=1&Limit=1".to_string(),
+                second_item_id.as_str(),
+                1,
+            ),
+            (
+                "/MusicGenres/Rock/InstantMix?StartIndex=1&Limit=1".to_string(),
                 second_item_id.as_str(),
                 1,
             ),
@@ -60422,6 +69227,7 @@ done
                 status: "running".to_string(),
                 progress_percent: Some(10.0),
                 position_ticks: 10,
+                start_position_ticks: 10,
             })
             .await
             .unwrap();
@@ -60960,6 +69766,7 @@ done
                 status: "running".to_string(),
                 progress_percent: Some(20.0),
                 position_ticks: 20,
+                start_position_ticks: 20,
             })
             .await
             .unwrap();
@@ -61060,6 +69867,7 @@ done
             status: "starting".to_string(),
             progress_percent: Some(3.5),
             position_ticks: 99,
+            start_position_ticks: 99,
         })
         .await
         .unwrap();
@@ -61212,6 +70020,7 @@ done
             status: "running".to_string(),
             progress_percent: Some(12.0),
             position_ticks: 42,
+            start_position_ticks: 42,
         })
         .await
         .unwrap();
@@ -61230,6 +70039,7 @@ done
             status: "running".to_string(),
             progress_percent: Some(13.0),
             position_ticks: 43,
+            start_position_ticks: 43,
         })
         .await
         .unwrap();
@@ -61445,6 +70255,7 @@ done
                 status: status.to_string(),
                 progress_percent: Some(10.0),
                 position_ticks: 0,
+                start_position_ticks: 0,
             })
             .await
             .unwrap();
@@ -61517,6 +70328,7 @@ done
             status: "starting".to_string(),
             progress_percent: None,
             position_ticks: 0,
+            start_position_ticks: 0,
         })
         .await
         .unwrap();
@@ -61616,6 +70428,7 @@ done
                 status: status.to_string(),
                 progress_percent: None,
                 position_ticks: 0,
+                start_position_ticks: 0,
             })
             .await
             .unwrap();
@@ -61685,6 +70498,7 @@ done
             status: "completed".to_string(),
             progress_percent: None,
             position_ticks: 0,
+            start_position_ticks: 0,
         })
         .await
         .unwrap();
@@ -61761,6 +70575,34 @@ done
         assert!(direct_play_profile_matches(&item, &profile));
     }
 
+    #[test]
+    fn hls_effective_start_position_keeps_a_real_final_segment() {
+        let segment_ticks = hls_segment_ticks();
+        let runtime_ticks = 100_000_000;
+
+        assert_eq!(
+            hls_effective_start_position_ticks(0, Some(runtime_ticks)),
+            0
+        );
+        assert_eq!(
+            hls_effective_start_position_ticks(40_000_000, Some(runtime_ticks)),
+            40_000_000
+        );
+        assert_eq!(
+            hls_effective_start_position_ticks(runtime_ticks - 1, Some(runtime_ticks)),
+            runtime_ticks - segment_ticks
+        );
+        assert_eq!(
+            hls_effective_start_position_ticks(runtime_ticks + 1, Some(runtime_ticks)),
+            runtime_ticks - segment_ticks
+        );
+        assert_eq!(
+            hls_effective_start_position_ticks(10_000_000, Some(segment_ticks - 1)),
+            0
+        );
+        assert_eq!(hls_effective_start_position_ticks(55, None), 55);
+    }
+
     #[tokio::test]
     async fn playback_info_reuses_matching_active_hls_transcode_session() {
         let media_root = tempfile::tempdir().unwrap();
@@ -61817,6 +70659,7 @@ done
             status: "running".to_string(),
             progress_percent: Some(7.0),
             position_ticks: 0,
+            start_position_ticks: 0,
         })
         .await
         .unwrap();
@@ -61855,6 +70698,197 @@ done
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].play_session_id, "play-session-reuse");
         assert_eq!(sessions[0].process_id, Some(111));
+    }
+
+    #[tokio::test]
+    async fn playback_info_preserves_active_position_when_switching_streams() {
+        let media_root = tempfile::tempdir().unwrap();
+        let movie = media_root.path().join("Switch Tracks.mkv");
+        tokio::fs::write(&movie, b"fake video").await.unwrap();
+
+        let transcode_root = tempfile::tempdir().unwrap();
+        let continuity_dir = transcode_root.path().join("play-session-continuity");
+        let zero_dir = transcode_root.path().join("play-session-zero");
+        tokio::fs::create_dir_all(&continuity_dir).await.unwrap();
+        tokio::fs::create_dir_all(&zero_dir).await.unwrap();
+        let continuity_playlist = continuity_dir.join("main.m3u8");
+        let zero_playlist = zero_dir.join("main.m3u8");
+        tokio::fs::write(&continuity_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&zero_playlist, b"#EXTM3U\n")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "stream-switch-test-key")
+            .await
+            .unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Movies",
+                Some("movies"),
+                vec![media_root.path().to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        db.scan_virtual_folder_items(folder.id).await.unwrap();
+        let mut item = db.media_items().await.unwrap().remove(0);
+        db.update_media_item_media_info(
+            item.id,
+            Some(1_800_000_000),
+            Some(1_000_000),
+            Some(1920),
+            Some(1080),
+            vec![
+                json!({ "Type": "Video", "Index": 0, "Codec": "h264" }),
+                json!({ "Type": "Subtitle", "Index": 2, "Codec": "srt", "Language": "spa" }),
+            ],
+        )
+        .await
+        .unwrap();
+        item = db.media_item_by_id(item.id).await.unwrap();
+        let item_id = item.id.simple().to_string();
+        let selection = TranscodeStreamSelection {
+            video_stream_index: Some(0),
+            audio_stream_index: None,
+            subtitle_stream_index: Some(2),
+        };
+        let continuity_key = hls_transcode_dedupe_key(user.id, &item, &selection, 900);
+        let zero_key = hls_transcode_dedupe_key(user.id, &item, &selection, 0);
+
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item_id.clone()),
+            audio_stream_index: None,
+            subtitle_stream_index: Some(2),
+            position_ticks: 600,
+            is_paused: false,
+            played: false,
+        })
+        .await
+        .unwrap();
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-continuity".to_string(),
+            dedupe_key: Some(continuity_key),
+            device_id: None,
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item_id.clone()),
+            audio_stream_index: selection.audio_stream_index,
+            subtitle_stream_index: selection.subtitle_stream_index,
+            video_stream_index: selection.video_stream_index,
+            output_path: continuity_playlist.to_string_lossy().to_string(),
+            process_id: Some(222),
+            status: "running".to_string(),
+            progress_percent: Some(10.0),
+            position_ticks: 900,
+            start_position_ticks: 900,
+        })
+        .await
+        .unwrap();
+        db.upsert_transcode_session(UpsertTranscodeSession {
+            play_session_id: "play-session-zero".to_string(),
+            dedupe_key: Some(zero_key),
+            device_id: None,
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item_id.clone()),
+            audio_stream_index: selection.audio_stream_index,
+            subtitle_stream_index: selection.subtitle_stream_index,
+            video_stream_index: selection.video_stream_index,
+            output_path: zero_playlist.to_string_lossy().to_string(),
+            process_id: Some(333),
+            status: "running".to_string(),
+            progress_percent: Some(10.0),
+            position_ticks: 0,
+            start_position_ticks: 0,
+        })
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback_info["PlaySessionId"], "play-session-zero");
+        assert_eq!(
+            playback_info["MediaSources"][0]["DefaultSubtitleStreamIndex"],
+            2
+        );
+
+        db.upsert_active_playback_session(UpsertActivePlaybackSession {
+            session_id: api_key.clone(),
+            user_id: user.id,
+            item_id: item.id,
+            media_source_id: Some(item_id.clone()),
+            audio_stream_index: None,
+            subtitle_stream_index: Some(2),
+            position_ticks: 900,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&SubtitleStreamIndex=2"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback_info["PlaySessionId"], "play-session-continuity");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&SubtitleStreamIndex=2&StartTimeTicks=0"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let playback_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(playback_info["PlaySessionId"], "play-session-zero");
     }
 
     #[tokio::test]
@@ -61917,6 +70951,7 @@ done
             status: "running".to_string(),
             progress_percent: Some(50.0),
             position_ticks: 123,
+            start_position_ticks: 123,
         })
         .await
         .unwrap();
@@ -61962,10 +70997,10 @@ done
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let master = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(
-            master,
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmain.m3u8?PlaySessionId=play-session-hls\n"
+        assert!(
+            master.starts_with("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1000000")
         );
+        assert!(master.contains("main.m3u8?PlaySessionId=play-session-hls"));
         let response = app
             .clone()
             .oneshot(
@@ -62028,10 +71063,11 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let dynamic_master = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(
-            dynamic_master,
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmain.m3u8?PlaySessionId=play-session-hls\n"
+        assert!(
+            dynamic_master
+                .starts_with("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1000000")
         );
+        assert!(dynamic_master.contains("main.m3u8?PlaySessionId=play-session-hls"));
 
         let response = app
             .clone()
@@ -62072,6 +71108,21 @@ done
                 Request::builder()
                     .uri(format!(
                         "/DynamicHls/Videos/{item_id}/live.m3u8?PlaySessionId=play-session-hls"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/live.m3u8?PlaySessionId=play-session-hls"
                     ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -63536,7 +72587,7 @@ done
         let app = router(AppState {
             db,
             web_dir: ".".into(),
-            log_dir: ".".into(),
+            log_dir: tmp.path().join("log"),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
 
@@ -63611,6 +72662,7 @@ done
                 item.id,
                 json!({
                     "Genres": ["Drama", "drama", "Thriller"],
+                    "SeriesGenres": ["Comedy"],
                     "MusicGenres": ["Rock", "Jazz"],
                     "Artists": ["Artist One", "artist one", "Artist Two"],
                     "AlbumArtists": ["Album Artist", "Album Artist Two"],
@@ -63621,8 +72673,11 @@ done
                         { "Name": "Main Trailer", "Url": "https://trailers.example/main.mp4" },
                         "https://trailers.example/secondary.mp4"
                     ],
+                    "OfficialRating": "PG-13",
                     "People": [{ "Name": "Jane Composer" }, "John Williams"],
                     "Studios": ["Studio One", { "Name": "Studio Two" }],
+                    "SeriesStudios": ["HBO"],
+                    "Tags": ["Featured"],
                     "ProductionYear": [1984, 1999]
                 }),
             )
@@ -63836,6 +72891,7 @@ done
 
         for endpoint in [
             format!("/Library/Trailers/{trailer_id}/Similar?Limit=1"),
+            format!("/Trailers/{trailer_id}/Similar?Limit=1"),
             format!(
                 "/library/trailers/{trailer_id}/similar?UserId={}&Limit=1",
                 admin.id
@@ -64079,7 +73135,9 @@ done
                         json!({
                             "SearchResult": {
                                 "ProviderIds": { "Imdb": "tt1234567" },
-                                "Overview": "Remote overview"
+                                "Overview": "Remote overview",
+                                "ImageUrl": "https://static.example.test/remote-primary.jpg",
+                                "SearchProviderName": "Example Remote"
                             }
                         })
                         .to_string(),
@@ -64094,6 +73152,34 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{item_id}/RemoteImages?ImageType=Primary"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let applied_remote_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(applied_remote_images["TotalRecordCount"], 1);
+        assert_eq!(
+            applied_remote_images["Items"][0]["ProviderName"],
+            "Example Remote"
+        );
+        assert!(
+            applied_remote_images["Items"][0]["ImageUrl"]
+                .as_str()
+                .unwrap()
+                .starts_with("remote-url-image:")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .method(Method::POST)
                     .uri(format!("/ItemUpdate/Items/{item_id}"))
                     .header("X-Emby-Token", &api_key)
@@ -64101,6 +73187,9 @@ done
                     .body(Body::from(
                         json!({
                             "Overview": "Manual overview",
+                            "CommunityRating": 8.5,
+                            "CriticRating": 92,
+                            "PremiereDate": "1984-05-01T00:00:00.0000000Z",
                             "ProviderIds": { "Tmdb": "9876" },
                             "Tags": ["Edited"]
                         })
@@ -64124,11 +73213,28 @@ done
                         json!({
                             "Name": "Metadata Movie",
                             "Overview": "Manual overview canonical",
+                            "CommunityRating": 8.5,
+                            "CriticRating": 92,
+                            "PremiereDate": "1984-05-01T00:00:00.0000000Z",
                             "ProviderIds": { "Tmdb": "9876" },
                             "Tags": ["Edited"]
                         })
                         .to_string(),
                     ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Items/{item_id}/ContentType?ContentType=Movie"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -64179,7 +73285,51 @@ done
         assert_eq!(editor_payload["Metadata"]["ProviderIds"]["Tmdb"], "9876");
         assert_eq!(editor_payload["Metadata"]["ContentType"], "Movie");
         assert_eq!(editor_payload["ExternalIdInfos"][0]["Key"], "Imdb");
+        assert!(
+            editor_payload["ParentalRatingOptions"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 50
+        );
+        assert!(
+            editor_payload["ParentalRatingOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rating| rating["Name"] == "TV-MA")
+        );
         assert!(editor_payload["Cultures"].as_array().unwrap().len() > 100);
+
+        let metadata_folder = test_db.virtual_folders().await.unwrap()[0].clone();
+        let metadata_folder_id = metadata_folder.id.simple().to_string();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/Items/{metadata_folder_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Name": "Edited Metadata Folder",
+                            "ContentType": "tvshows"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let folders = test_db.virtual_folders().await.unwrap();
+        let edited_folder = folders
+            .iter()
+            .find(|folder| folder.id == metadata_folder.id)
+            .unwrap();
+        assert_eq!(edited_folder.name, "Edited Metadata Folder");
+        assert_eq!(edited_folder.collection_type.as_deref(), Some("tvshows"));
 
         let response = app
             .clone()
@@ -64245,7 +73395,7 @@ done
             ),
             (
                 "/Studios?SortOrder=Descending&Limit=1".to_string(),
-                2,
+                3,
                 "Studio Two",
                 "Studio",
             ),
@@ -64284,6 +73434,23 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/UserLibrary/Users/{}/FavoriteItems/{item_id}",
+                        admin.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
         for (endpoint, expected_total, expected_first) in [
             (
                 format!("/Albums?UserId={}&Filters=IsPlayed", admin.id),
@@ -64319,11 +73486,75 @@ done
             assert_eq!(albums["Items"][0]["Name"], expected_first);
         }
 
+        for (endpoint, expected_total) in [
+            (
+                format!(
+                    "/Items?UserId={}&IncludeItemTypes=Movie&IsFavorite=true",
+                    admin.id
+                ),
+                1,
+            ),
+            (
+                format!(
+                    "/Items?UserId={}&IncludeItemTypes=Movie&IsFavorite=false",
+                    admin.id
+                ),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&MinCommunityRating=8".to_string(),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&MinCommunityRating=9".to_string(),
+                0,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&MaxCommunityRating=8".to_string(),
+                0,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&MinCriticRating=90".to_string(),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&MinCriticRating=101".to_string(),
+                0,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&MinPremiereDate=2100-01-01T00%3A00%3A00.000Z"
+                    .to_string(),
+                0,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&MaxPremiereDate=1984-12-31".to_string(),
+                1,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.clone())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["TotalRecordCount"], expected_total, "{endpoint}");
+        }
+
         for (endpoint, name, item_type) in [
             ("/Artists/Artist%20One", "Artist One", "MusicArtist"),
+            ("/Genres/Comedy", "Comedy", "Genre"),
             ("/Genres/Drama", "Drama", "Genre"),
             ("/MusicGenres/Rock", "Rock", "MusicGenre"),
             ("/Persons/John%20Williams", "John Williams", "Person"),
+            ("/Studios/HBO", "HBO", "Studio"),
             ("/Studios/Studio%20One", "Studio One", "Studio"),
         ] {
             let response = app
@@ -64345,9 +73576,253 @@ done
             assert_eq!(entity["IsFolder"], true);
             assert_eq!(entity["MediaType"], Value::Null);
             assert_eq!(entity["ProviderIds"], json!({}));
-            assert_eq!(entity["ImageTags"], json!({}));
+            if item_type == "Person" {
+                assert!(entity["ImageTags"]["Primary"].as_str().is_some());
+            } else {
+                assert_eq!(entity["ImageTags"], json!({}));
+            }
             assert_eq!(entity["Id"].as_str().unwrap().len(), 32);
         }
+
+        let person_id = stable_entity_id("Person", "John Williams");
+        for (entity_id, expected_name, expected_type) in [
+            (stable_entity_id("Genre", "Comedy"), "Comedy", "Genre"),
+            (stable_entity_id("Studio", "HBO"), "HBO", "Studio"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/Items/{entity_id}"))
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let entity_detail: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(entity_detail["Id"], entity_id);
+            assert_eq!(entity_detail["Name"], expected_name);
+            assert_eq!(entity_detail["Type"], expected_type);
+        }
+
+        let jane_person_id = stable_entity_id("Person", "Jane Composer");
+        let comedy_genre_id = stable_entity_id("Genre", "Comedy");
+        let hbo_studio_id = stable_entity_id("Studio", "HBO");
+        for (endpoint, expected_total) in [
+            (
+                format!("/Items?IncludeItemTypes=Movie&PersonIds={person_id}"),
+                1,
+            ),
+            (
+                format!(
+                    "/Users/{}/Items?IncludeItemTypes=Movie&PersonIds={jane_person_id}",
+                    admin.id
+                ),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&PersonIds=00000000000000000000000000000000"
+                    .to_string(),
+                0,
+            ),
+            (
+                format!("/Items?IncludeItemTypes=Movie&GenreIds={comedy_genre_id}"),
+                1,
+            ),
+            (
+                format!("/Items?IncludeItemTypes=Movie&genreId={comedy_genre_id}"),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&GenreIds=00000000000000000000000000000000"
+                    .to_string(),
+                0,
+            ),
+            (
+                format!("/Items?IncludeItemTypes=Movie&StudioIds={hbo_studio_id}"),
+                1,
+            ),
+            (
+                format!("/Items?IncludeItemTypes=Movie&studioId={hbo_studio_id}"),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&StudioIds=00000000000000000000000000000000"
+                    .to_string(),
+                0,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&OfficialRatings=PG-13".to_string(),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&OfficialRatings=NO_SUCH_RATING".to_string(),
+                0,
+            ),
+            ("/Items?IncludeItemTypes=Movie&Tags=Edited".to_string(), 1),
+            (
+                "/Items?IncludeItemTypes=Movie&Tags=NO_SUCH_TAG".to_string(),
+                0,
+            ),
+            ("/Items?IncludeItemTypes=Movie&Years=1984".to_string(), 1),
+            (
+                "/Items?IncludeItemTypes=Movie&ProductionYear=1999".to_string(),
+                1,
+            ),
+            ("/Items?IncludeItemTypes=Movie&Years=1901".to_string(), 0),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.clone())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["TotalRecordCount"], expected_total, "{endpoint}");
+            assert_eq!(
+                result["Items"].as_array().unwrap().len(),
+                expected_total,
+                "{endpoint}"
+            );
+        }
+
+        for endpoint in [
+            format!("/Items/{person_id}"),
+            format!("/Items/{person_id}?userId={}", admin.id),
+            format!("/Users/{}/Items/{person_id}", admin.id),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.clone())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let person_detail: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(person_detail["Id"], person_id, "{endpoint}");
+            assert_eq!(person_detail["Name"], "John Williams", "{endpoint}");
+            assert_eq!(person_detail["Type"], "Person", "{endpoint}");
+            assert_eq!(person_detail["IsFolder"], true, "{endpoint}");
+            assert!(person_detail["ImageTags"]["Primary"].as_str().is_some());
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{person_id}/Ancestors"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let person_ancestors: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(person_ancestors, json!([]));
+
+        let png_bytes = vec![137, 80, 78, 71, 13, 10, 26, 10, 0];
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Image/Items/{person_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::from(png_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{person_id}/Images"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let person_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(person_images[0]["ImageType"], "Primary");
+        assert_eq!(person_images[0]["MimeType"], "image/png");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{person_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{person_id}/RemoteImages/Providers"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/RemoteImage/Items/{person_id}/RemoteImages?ImageType=Primary"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let remote_person_images: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(remote_person_images["TotalRecordCount"], 1);
+        assert_eq!(
+            remote_person_images["Items"][0]["ProviderName"],
+            "Local cache"
+        );
 
         let response = app
             .clone()
@@ -64519,6 +73994,40 @@ done
                 .as_str()
                 .unwrap()
                 .contains('T')
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/GetUtcTime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Tmdb/ClientConfiguration")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let tmdb_config: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tmdb_config["SecureBaseUrl"], "https://image.tmdb.org/t/p/");
+        assert!(
+            tmdb_config["PosterSizes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("original"))
         );
 
         let response = app

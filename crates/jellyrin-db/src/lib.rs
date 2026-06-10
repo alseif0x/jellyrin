@@ -95,6 +95,7 @@ pub struct MediaList {
     pub name: String,
     pub collection_type: Option<String>,
     pub owner_user_id: Option<Uuid>,
+    pub metadata: Value,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -225,6 +226,7 @@ pub struct TranscodeSession {
     pub status: String,
     pub progress_percent: Option<f64>,
     pub position_ticks: i64,
+    pub start_position_ticks: i64,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -245,6 +247,7 @@ pub struct UpsertTranscodeSession {
     pub status: String,
     pub progress_percent: Option<f64>,
     pub position_ticks: i64,
+    pub start_position_ticks: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3221,9 +3224,9 @@ impl Database {
             INSERT INTO transcode_sessions (
                 play_session_id, dedupe_key, device_id, user_id, item_id, media_source_id, audio_stream_index,
                 subtitle_stream_index, video_stream_index, output_path, process_id, status,
-                progress_percent, position_ticks, created_at, updated_at
+                progress_percent, position_ticks, start_position_ticks, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
             ON CONFLICT(play_session_id) DO UPDATE SET
                 dedupe_key = excluded.dedupe_key,
                 device_id = excluded.device_id,
@@ -3238,6 +3241,7 @@ impl Database {
                 status = excluded.status,
                 progress_percent = excluded.progress_percent,
                 position_ticks = excluded.position_ticks,
+                start_position_ticks = excluded.start_position_ticks,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -3255,6 +3259,7 @@ impl Database {
         .bind(&status)
         .bind(session.progress_percent)
         .bind(session.position_ticks.max(0))
+        .bind(session.start_position_ticks.max(0))
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -3291,9 +3296,9 @@ impl Database {
             INSERT OR IGNORE INTO transcode_sessions (
                 play_session_id, dedupe_key, device_id, user_id, item_id, media_source_id, audio_stream_index,
                 subtitle_stream_index, video_stream_index, output_path, process_id, status,
-                progress_percent, position_ticks, created_at, updated_at
+                progress_percent, position_ticks, start_position_ticks, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
             "#,
         )
         .bind(&play_session_id)
@@ -3310,6 +3315,7 @@ impl Database {
         .bind(&status)
         .bind(session.progress_percent)
         .bind(session.position_ticks.max(0))
+        .bind(session.start_position_ticks.max(0))
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -3437,6 +3443,7 @@ impl Database {
                    transcode_sessions.status,
                    transcode_sessions.progress_percent,
                    transcode_sessions.position_ticks,
+                   transcode_sessions.start_position_ticks,
                    transcode_sessions.created_at AS transcode_created_at,
                    transcode_sessions.updated_at AS transcode_updated_at,
                    media_items.id,
@@ -3528,6 +3535,7 @@ impl Database {
                    transcode_sessions.status,
                    transcode_sessions.progress_percent,
                    transcode_sessions.position_ticks,
+                   transcode_sessions.start_position_ticks,
                    transcode_sessions.created_at AS transcode_created_at,
                    transcode_sessions.updated_at AS transcode_updated_at,
                    media_items.id,
@@ -3585,6 +3593,7 @@ impl Database {
                    transcode_sessions.status,
                    transcode_sessions.progress_percent,
                    transcode_sessions.position_ticks,
+                   transcode_sessions.start_position_ticks,
                    transcode_sessions.created_at AS transcode_created_at,
                    transcode_sessions.updated_at AS transcode_updated_at,
                    media_items.id,
@@ -3803,6 +3812,57 @@ impl Database {
         .await?;
 
         Ok(result.rows_affected() as usize)
+    }
+
+    pub async fn import_task_run_history(
+        &self,
+        id: Option<Uuid>,
+        task_key: &str,
+        status: &str,
+        started_at: OffsetDateTime,
+        completed_at: OffsetDateTime,
+        result: Value,
+        error: Option<&str>,
+    ) -> anyhow::Result<TaskRun> {
+        let trimmed_key = task_key.trim();
+        anyhow::ensure!(!trimmed_key.is_empty(), "task key must not be empty");
+        anyhow::ensure!(
+            matches!(status, "completed" | "failed"),
+            "imported task history status must be completed or failed"
+        );
+
+        let id = id.unwrap_or_else(Uuid::new_v4);
+        let started_at = format_time(started_at)?;
+        let completed_at = format_time(completed_at)?;
+        let result_json = serde_json::to_string(&result)?;
+        sqlx::query(
+            r#"
+            INSERT INTO task_runs (
+                id, task_key, status, started_at, completed_at,
+                result_json, error_message, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5)
+            ON CONFLICT(id) DO UPDATE SET
+                task_key = excluded.task_key,
+                status = excluded.status,
+                started_at = excluded.started_at,
+                completed_at = excluded.completed_at,
+                result_json = excluded.result_json,
+                error_message = excluded.error_message,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(id.to_string())
+        .bind(trimmed_key)
+        .bind(status)
+        .bind(started_at)
+        .bind(completed_at)
+        .bind(result_json)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+
+        self.task_run_by_id(id).await
     }
 
     pub async fn current_task_run(&self, task_key: &str) -> anyhow::Result<Option<TaskRun>> {
@@ -4356,9 +4416,9 @@ impl Database {
         sqlx::query(
             r#"
             INSERT INTO media_lists (
-                id, kind, name, collection_type, owner_user_id, created_at, updated_at
+                id, kind, name, collection_type, owner_user_id, metadata_json, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?6)
             "#,
         )
         .bind(id.to_string())
@@ -4377,7 +4437,7 @@ impl Database {
     pub async fn media_lists(&self, kind: &str) -> anyhow::Result<Vec<MediaList>> {
         let rows = sqlx::query_as::<_, MediaListRow>(
             r#"
-            SELECT id, kind, name, collection_type, owner_user_id, created_at, updated_at
+            SELECT id, kind, name, collection_type, owner_user_id, metadata_json, created_at, updated_at
             FROM media_lists
             WHERE kind = ?1
             ORDER BY name COLLATE NOCASE
@@ -4393,7 +4453,7 @@ impl Database {
     pub async fn media_list_by_id(&self, list_id: Uuid) -> anyhow::Result<MediaList> {
         let row = sqlx::query_as::<_, MediaListRow>(
             r#"
-            SELECT id, kind, name, collection_type, owner_user_id, created_at, updated_at
+            SELECT id, kind, name, collection_type, owner_user_id, metadata_json, created_at, updated_at
             FROM media_lists
             WHERE id = ?1
             "#,
@@ -6007,6 +6067,7 @@ struct MediaListRow {
     name: String,
     collection_type: Option<String>,
     owner_user_id: Option<String>,
+    metadata_json: String,
     created_at: String,
     updated_at: String,
 }
@@ -6184,6 +6245,7 @@ struct TranscodeSessionRow {
     status: String,
     progress_percent: Option<f64>,
     position_ticks: i64,
+    start_position_ticks: i64,
     transcode_created_at: String,
     transcode_updated_at: String,
     id: String,
@@ -6336,6 +6398,8 @@ impl TryFrom<MediaListRow> for MediaList {
                 .map(Uuid::parse_str)
                 .transpose()
                 .context("invalid media list owner user id")?,
+            metadata: serde_json::from_str(&row.metadata_json)
+                .context("invalid media list metadata json")?,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         })
@@ -6579,6 +6643,7 @@ impl TryFrom<TranscodeSessionRow> for TranscodeSession {
             status: row.status,
             progress_percent: row.progress_percent,
             position_ticks: row.position_ticks,
+            start_position_ticks: row.start_position_ticks,
             created_at: parse_time(&row.transcode_created_at)?,
             updated_at: parse_time(&row.transcode_updated_at)?,
         })
@@ -6782,7 +6847,16 @@ fn format_time(value: OffsetDateTime) -> anyhow::Result<String> {
 }
 
 fn parse_time(value: &str) -> anyhow::Result<OffsetDateTime> {
-    OffsetDateTime::parse(value, &Rfc3339).context("failed to parse timestamp")
+    let trimmed = value.trim();
+    if let Ok(parsed) = OffsetDateTime::parse(trimmed, &Rfc3339) {
+        return Ok(parsed);
+    }
+
+    let mut normalized = trimmed.replacen(' ', "T", 1);
+    if !normalized.ends_with('Z') && !normalized.get(10..).is_some_and(|tail| tail.contains('+')) {
+        normalized.push('Z');
+    }
+    OffsetDateTime::parse(&normalized, &Rfc3339).context("failed to parse timestamp")
 }
 
 fn parse_media_streams_json(value: &str) -> anyhow::Result<Vec<Value>> {
@@ -6830,6 +6904,7 @@ async fn probe_media_info(path: &Path, media_type: &str) -> MediaInfo {
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
+        .arg("-show_chapters")
         .arg(path)
         .output()
         .await
@@ -6933,7 +7008,50 @@ fn ffprobe_tags_to_metadata(value: &Value) -> Value {
         metadata.insert("Genres".to_string(), json!(genres));
         metadata.insert("MusicGenres".to_string(), json!(genres));
     }
+    let chapters = ffprobe_chapters_to_metadata(value);
+    if !chapters.is_empty() {
+        metadata.insert("Chapters".to_string(), json!(chapters));
+    }
     Value::Object(metadata)
+}
+
+fn ffprobe_chapters_to_metadata(value: &Value) -> Vec<Value> {
+    value
+        .get("chapters")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .filter_map(|(position, chapter)| {
+            let start_ticks = chapter
+                .get("start_time")
+                .and_then(json_number_or_string_f64)
+                .or_else(|| {
+                    let start = chapter.get("start").and_then(json_number_or_string_f64)?;
+                    let time_base = chapter.get("time_base").and_then(Value::as_str)?;
+                    Some(start * parse_ffprobe_time_base(time_base)?)
+                })
+                .map(seconds_to_ticks)?;
+            let name = chapter
+                .get("tags")
+                .and_then(|tags| first_tag_value(&[tags], &["title"]))
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| format!("Chapter {}", position + 1));
+            Some(json!({
+                "StartPositionTicks": start_ticks,
+                "Name": name,
+                "ImageDateModified": "0001-01-01T00:00:00.0000000Z"
+            }))
+        })
+        .collect()
+}
+
+fn parse_ffprobe_time_base(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.trim().parse::<f64>().ok()?;
+    let denominator = denominator.trim().parse::<f64>().ok()?;
+    (denominator != 0.0).then_some(numerator / denominator)
 }
 
 async fn read_local_nfo_metadata(path: &Path) -> Option<Value> {
@@ -7274,6 +7392,135 @@ fn split_tag_values(value: &str) -> Vec<String> {
     values
 }
 
+fn stream_tag_value(stream: &Value, names: &[&str]) -> Option<String> {
+    stream
+        .get("tags")
+        .and_then(Value::as_object)
+        .and_then(|tags| {
+            tags.iter().find_map(|(key, value)| {
+                names
+                    .iter()
+                    .any(|name| key.eq_ignore_ascii_case(name))
+                    .then(|| {
+                        value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .flatten()
+                    .map(ToOwned::to_owned)
+            })
+        })
+}
+
+fn stream_disposition_flag(stream: &Value, name: &str) -> bool {
+    stream
+        .get("disposition")
+        .and_then(|disposition| disposition.get(name))
+        .and_then(json_number_or_string_i64)
+        .is_some_and(|value| value != 0)
+}
+
+fn codec_display_name(codec: &str) -> String {
+    match codec.to_ascii_lowercase().as_str() {
+        "ac3" => "AC3".to_string(),
+        "eac3" => "EAC3".to_string(),
+        "aac" => "AAC".to_string(),
+        "dts" => "DTS".to_string(),
+        "truehd" => "TrueHD".to_string(),
+        "flac" => "FLAC".to_string(),
+        "hevc" | "h265" => "HEVC".to_string(),
+        "h264" => "H264".to_string(),
+        "hdmv_pgs_subtitle" => "PGS".to_string(),
+        "subrip" => "SRT".to_string(),
+        "ass" | "ssa" => codec.to_ascii_uppercase(),
+        _ => codec.to_string(),
+    }
+}
+
+fn language_display_name(language: Option<&str>) -> Option<String> {
+    let language = language?.trim();
+    if language.is_empty() || language.eq_ignore_ascii_case("und") {
+        return None;
+    }
+    Some(
+        match language.to_ascii_lowercase().as_str() {
+            "eng" | "en" => "English",
+            "spa" | "es" => "Spanish",
+            "fre" | "fra" | "fr" => "French",
+            "ger" | "deu" | "de" => "German",
+            "dan" | "da" => "Danish",
+            "fin" | "fi" => "Finnish",
+            "nob" | "nor" | "no" => "Norwegian",
+            "swe" | "sv" => "Swedish",
+            _ => language,
+        }
+        .to_string(),
+    )
+}
+
+fn audio_channel_display(channels: Option<i64>, channel_layout: Option<&str>) -> Option<String> {
+    if let Some(layout) = channel_layout {
+        let normalized = layout.trim().trim_end_matches("(side)").trim();
+        if !normalized.is_empty() && normalized != "0" {
+            return Some(normalized.to_string());
+        }
+    }
+    match channels {
+        Some(1) => Some("Mono".to_string()),
+        Some(2) => Some("Stereo".to_string()),
+        Some(6) => Some("5.1".to_string()),
+        Some(8) => Some("7.1".to_string()),
+        Some(value) if value > 0 => Some(format!("{value} ch")),
+        _ => None,
+    }
+}
+
+fn media_stream_display_title(
+    stream_type: &str,
+    codec: &str,
+    language: Option<&str>,
+    title: Option<&str>,
+    channels: Option<i64>,
+    channel_layout: Option<&str>,
+    is_default: bool,
+    is_forced: bool,
+) -> String {
+    let mut parts = Vec::<String>::new();
+    if let Some(language) = language_display_name(language) {
+        parts.push(language);
+    }
+    if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
+        parts.push(title.to_string());
+    }
+    match stream_type {
+        "Audio" => {
+            parts.push(codec_display_name(codec));
+            if let Some(channels) = audio_channel_display(channels, channel_layout) {
+                parts.push(channels);
+            }
+        }
+        "Subtitle" => {
+            parts.push(codec_display_name(codec));
+        }
+        _ => parts.push(codec_display_name(codec)),
+    }
+    if is_default {
+        parts.push("Default".to_string());
+    }
+    if is_forced {
+        parts.push("Forced".to_string());
+    }
+    parts.join(" - ")
+}
+
+fn is_text_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec.to_ascii_lowercase().as_str(),
+        "subrip" | "srt" | "ass" | "ssa" | "webvtt" | "vtt" | "mov_text"
+    )
+}
+
 fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
     let codec_type = stream.get("codec_type")?.as_str()?;
     let index = stream.get("index").and_then(json_number_or_string_i64)?;
@@ -7285,12 +7532,10 @@ fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
         .get("tags")
         .and_then(|tags| tags.get("language"))
         .and_then(Value::as_str);
+    let title = stream_tag_value(stream, &["title"]);
     let bit_rate = stream.get("bit_rate").and_then(json_number_or_string_i64);
-    let is_default = stream
-        .get("disposition")
-        .and_then(|disposition| disposition.get("default"))
-        .and_then(json_number_or_string_i64)
-        .is_some_and(|value| value != 0);
+    let is_default = stream_disposition_flag(stream, "default");
+    let is_forced = stream_disposition_flag(stream, "forced");
 
     match codec_type {
         "video" => Some(serde_json::json!({
@@ -7302,7 +7547,7 @@ fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
             "BitDepth": stream.get("bits_per_raw_sample").and_then(json_number_or_string_i64),
             "RefFrames": null,
             "IsDefault": is_default,
-            "IsForced": false,
+            "IsForced": is_forced,
             "Height": stream.get("height").and_then(json_number_or_string_i64),
             "Width": stream.get("width").and_then(json_number_or_string_i64),
             "AverageFrameRate": parse_rational(stream.get("avg_frame_rate").and_then(Value::as_str)),
@@ -7322,14 +7567,25 @@ fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
         "audio" => Some(serde_json::json!({
             "Codec": codec,
             "Language": language,
-            "DisplayTitle": "Audio",
+            "Title": title,
+            "DisplayTitle": media_stream_display_title(
+                "Audio",
+                codec,
+                language,
+                title.as_deref(),
+                stream.get("channels").and_then(json_number_or_string_i64),
+                stream.get("channel_layout").and_then(Value::as_str),
+                is_default,
+                is_forced,
+            ),
             "IsInterlaced": false,
             "BitRate": bit_rate,
             "BitDepth": stream.get("bits_per_sample").and_then(json_number_or_string_i64),
             "Channels": stream.get("channels").and_then(json_number_or_string_i64),
+            "ChannelLayout": stream.get("channel_layout").and_then(Value::as_str),
             "SampleRate": stream.get("sample_rate").and_then(json_number_or_string_i64),
             "IsDefault": is_default,
-            "IsForced": false,
+            "IsForced": is_forced,
             "Type": "Audio",
             "Index": index,
             "IsExternal": false,
@@ -7338,14 +7594,24 @@ fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
         "subtitle" => Some(serde_json::json!({
             "Codec": codec,
             "Language": language,
-            "DisplayTitle": "Subtitle",
+            "Title": title,
+            "DisplayTitle": media_stream_display_title(
+                "Subtitle",
+                codec,
+                language,
+                title.as_deref(),
+                None,
+                None,
+                is_default,
+                is_forced,
+            ),
             "IsDefault": is_default,
-            "IsForced": false,
+            "IsForced": is_forced,
             "Type": "Subtitle",
             "Index": index,
             "IsExternal": false,
             "Path": null,
-            "IsTextSubtitleStream": true,
+            "IsTextSubtitleStream": is_text_subtitle_codec(codec),
             "SupportsExternalStream": false
         })),
         _ => None,
@@ -8824,6 +9090,7 @@ mod tests {
                 status: "RUNNING".to_string(),
                 progress_percent: Some(12.5),
                 position_ticks: 456,
+                start_position_ticks: 123,
             })
             .await
             .unwrap();
@@ -8898,6 +9165,7 @@ mod tests {
                     status: "starting".to_string(),
                     progress_percent: None,
                     position_ticks: 0,
+                    start_position_ticks: 0,
                 },
             )
             .await
@@ -9170,7 +9438,18 @@ mod tests {
                     "album_artist": "Album Artist",
                     "genre": "Rock/Jazz"
                 }
-            }
+            },
+            "chapters": [
+                {
+                    "start_time": "0.000000",
+                    "tags": { "title": "Opening" }
+                },
+                {
+                    "time_base": "1/1000",
+                    "start": 182432,
+                    "tags": {}
+                }
+            ]
         });
         let info = parse_ffprobe_media_info(&value);
         assert_eq!(info.runtime_ticks, Some(1_234_560_000));
@@ -9185,6 +9464,13 @@ mod tests {
         assert_eq!(info.metadata["AlbumArtists"], json!(["Album Artist"]));
         assert_eq!(info.metadata["MusicGenres"], json!(["Rock", "Jazz"]));
         assert_eq!(info.metadata["Genres"], json!(["Rock", "Jazz"]));
+        assert_eq!(info.metadata["Chapters"][0]["Name"], "Opening");
+        assert_eq!(info.metadata["Chapters"][0]["StartPositionTicks"], 0);
+        assert_eq!(info.metadata["Chapters"][1]["Name"], "Chapter 2");
+        assert_eq!(
+            info.metadata["Chapters"][1]["StartPositionTicks"],
+            1_824_320_000
+        );
     }
 
     #[test]
