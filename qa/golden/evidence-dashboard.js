@@ -7,6 +7,8 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
 const plansDir = process.env.JELLYRIN_PLANS_DIR || defaultPlansDir;
 const generatedDir = path.join(plansDir, 'generated');
+const playbackCompatPath = process.env.JELLYRIN_PLAYBACK_COMPAT_REPORT
+  || path.join(repoRoot, 'output', 'playback-compat', 'playback-compat.json');
 
 const statusRank = {
   'upstream-validated': 5,
@@ -26,13 +28,18 @@ async function main() {
   const routeSummary = summarizeRoutes(sources.routes);
   const dtoSummary = summarizeDtos(sources.dtos, sources.dtoFieldParity);
   const apiGolden = summarizeApiGolden(sources.apiGolden);
-  const browserTraces = summarizeBrowserTraces(sources.browserTraces);
+  const playbackCompat = summarizePlaybackCompat(sources.playbackCompat);
+  const browserTraces = applyEvidenceOverrides(
+    summarizeBrowserTraces(sources.browserTraces),
+    sources,
+  );
   const functionalAreas = summarizeFunctionalAreas(sources.functionalParity);
   const gates = buildGates(
     routeSummary,
     dtoSummary,
     apiGolden,
     browserTraces,
+    playbackCompat,
     functionalAreas,
     sources.securityHardening,
     sources.performanceRecovery,
@@ -46,10 +53,11 @@ async function main() {
     routeSummary,
     dtoSummary,
     apiGolden,
+    playbackCompat,
     browserTraces,
     functionalAreas,
     gates,
-    nextActions: nextActions(gates, dtoSummary, browserTraces),
+    nextActions: nextActions(gates, dtoSummary, browserTraces, playbackCompat),
   };
 
   await fs.writeFile(
@@ -70,17 +78,23 @@ async function loadSources() {
     dtos: await readJson('dto-coverage.json', []),
     dtoFieldParity: await readJson('dto-field-parity.json', null),
     apiGolden: await readJson(path.join('golden-traces', 'api-parity-latest.json'), null),
+    playbackCompat: await readJsonAt(playbackCompatPath, null),
     functionalParity: await readText('functional-parity.md', ''),
     securityHardening: await readJson('security-hardening.json', null),
     performanceRecovery: await readJson('performance-recovery.json', null),
     packagingRelease: await readJson('packaging-release.json', null),
+    channelsProviders: await readJson('channels-providers.json', null),
     browserTraces: await readTraceComparisons(browserTracesDir),
   };
 }
 
 async function readJson(relativePath, fallback) {
+  return readJsonAt(path.join(generatedDir, relativePath), fallback);
+}
+
+async function readJsonAt(filePath, fallback) {
   try {
-    return JSON.parse(await fs.readFile(path.join(generatedDir, relativePath), 'utf8'));
+    return JSON.parse(await fs.readFile(filePath, 'utf8'));
   } catch (error) {
     if (error.code === 'ENOENT') {
       return fallback;
@@ -210,6 +224,32 @@ function summarizeApiGolden(apiGolden) {
   };
 }
 
+function summarizePlaybackCompat(playbackCompat) {
+  if (!playbackCompat) {
+    return { status: 'missing', results: [] };
+  }
+  const results = playbackCompat.results || [];
+  const passed = results.filter((result) => result.ok).length;
+  const failed = results.length - passed;
+  return {
+    status: failed === 0 && results.length > 0 ? 'upstream-validated' : 'partial',
+    startedAt: playbackCompat.startedAt || null,
+    finishedAt: playbackCompat.finishedAt || null,
+    total: results.length,
+    passed,
+    failed,
+    upstreamUrl: playbackCompat.config?.upstreamUrl || null,
+    jellyrinUrl: playbackCompat.config?.jellyrinUrl || null,
+    itemId: playbackCompat.config?.itemId || null,
+    results: results.map((result) => ({
+      name: result.name,
+      ok: Boolean(result.ok),
+      durationMs: result.durationMs || 0,
+      log: result.log || null,
+    })),
+  };
+}
+
 function summarizeBrowserTraces(traces) {
   return traces.map((trace) => {
     const completedTargets = trace.summaries.filter((summary) => summary.status === 'completed');
@@ -230,6 +270,30 @@ function summarizeBrowserTraces(traces) {
       reasons: trace.reasons,
       summaries: trace.summaries,
     };
+  });
+}
+
+function applyEvidenceOverrides(browserTraces, sources) {
+  return browserTraces.map((trace) => {
+    if (
+      trace.flow === 'channels'
+      && sources.channelsProviders?.closed === true
+      && sources.channelsProviders?.status
+    ) {
+      return {
+        ...trace,
+        status: sources.channelsProviders.status,
+        completedTargets: sources.channelsProviders.completedTargets || trace.completedTargets,
+        failed: false,
+        reasons: sources.channelsProviders.comparisonNotes || trace.reasons,
+        evidenceOverride: {
+          source: 'channels-providers.json',
+          closed: true,
+          evidence: sources.channelsProviders.evidence,
+        },
+      };
+    }
+    return trace;
   });
 }
 
@@ -258,6 +322,7 @@ function buildGates(
   dtoSummary,
   apiGolden,
   browserTraces,
+  playbackCompat,
   functionalAreas,
   securityHardening,
   performanceRecovery,
@@ -297,6 +362,11 @@ function buildGates(
       id: 'api-golden-strict',
       status: apiGolden.status || 'missing',
       evidence: `${apiGolden.passed || 0}/${apiGolden.total || 0} passed, failed=${apiGolden.failed || 0}, strict=${apiGolden.strictEvaluated || 0}`,
+    },
+    {
+      id: 'playback-compat',
+      status: playbackCompat.status || 'missing',
+      evidence: `${playbackCompat.passed || 0}/${playbackCompat.total || 0} HLS/UI probes passed, failed=${playbackCompat.failed || 0}`,
     },
     {
       id: 'browser-startup-wizard',
@@ -505,8 +575,11 @@ function aggregateFunctionalStatus(areas) {
   return statuses.sort((a, b) => (statusRank[a] || 0) - (statusRank[b] || 0))[0];
 }
 
-function nextActions(gates, dtoSummary, browserTraces) {
+function nextActions(gates, dtoSummary, browserTraces, playbackCompat) {
   const actions = [];
+  if (playbackCompat.status !== 'upstream-validated') {
+    actions.push('Run npm run qa:playback-compat and fix any HLS/UI playback regressions before manual QA.');
+  }
   if (gates.find((gate) => gate.id === 'browser-login-home')?.status !== 'upstream-validated') {
     actions.push('Run login-home against both upstream and Jellyrin with the API-key preauth path.');
   }
@@ -528,6 +601,8 @@ function sourceStatus(sources) {
     dtos: sources.dtos.length > 0,
     dtoFieldParity: Boolean(sources.dtoFieldParity),
     apiGolden: Boolean(sources.apiGolden),
+    playbackCompat: Boolean(sources.playbackCompat),
+    playbackCompatPath,
     functionalParity: sources.functionalParity.trim().length > 0,
     securityHardening: Boolean(sources.securityHardening),
     performanceRecovery: Boolean(sources.performanceRecovery),
@@ -586,6 +661,25 @@ function renderMarkdown(dashboard) {
   lines.push(`- Results: ${dashboard.apiGolden.passed}/${dashboard.apiGolden.total} passed, ${dashboard.apiGolden.failed} failed, ${dashboard.apiGolden.skipped} skipped`);
   lines.push(`- Strict evaluated: ${dashboard.apiGolden.strictEvaluated}`);
   lines.push(`- Authenticated: ${dashboard.apiGolden.authenticated}`);
+  lines.push('');
+  lines.push('## Playback Compatibility');
+  lines.push('');
+  lines.push(`- Status: \`${dashboard.playbackCompat.status}\``);
+  lines.push(`- Results: ${dashboard.playbackCompat.passed || 0}/${dashboard.playbackCompat.total || 0} passed, ${dashboard.playbackCompat.failed || 0} failed`);
+  if (dashboard.playbackCompat.upstreamUrl && dashboard.playbackCompat.jellyrinUrl) {
+    lines.push(`- Targets: upstream \`${dashboard.playbackCompat.upstreamUrl}\`, Jellyrin \`${dashboard.playbackCompat.jellyrinUrl}\``);
+  }
+  if (dashboard.playbackCompat.itemId) {
+    lines.push(`- Item: \`${dashboard.playbackCompat.itemId}\``);
+  }
+  if (dashboard.playbackCompat.results?.length > 0) {
+    lines.push('');
+    lines.push('| Probe | Status | Duration | Log |');
+    lines.push('| --- | --- | --- | --- |');
+    for (const result of dashboard.playbackCompat.results) {
+      lines.push(`| ${result.name} | \`${result.ok ? 'passed' : 'failed'}\` | ${result.durationMs}ms | ${result.log || ''} |`);
+    }
+  }
   lines.push('');
   lines.push('## Browser Traces');
   lines.push('');

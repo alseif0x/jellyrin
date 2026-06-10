@@ -81,7 +81,7 @@ const authenticatedCases = [
   { name: 'item-images-movie', method: 'GET', requiresMovie: true, ensureMovieImage: true, path: ({ movieItemId }) => `/Items/${encodeURIComponent(movieItemId)}/Images`, shapeMode: 'strict-only' },
   { name: 'sessions', method: 'GET', dataDependentList: true, shapeMode: 'strict-only', path: '/Sessions' },
   { name: 'scheduled-tasks', method: 'GET', path: '/ScheduledTasks' },
-  { name: 'repositories', method: 'GET', path: '/Repositories' },
+  { name: 'repositories', method: 'GET', path: '/Repositories', shapeMode: 'strict-only' },
 ];
 
 async function main() {
@@ -721,6 +721,8 @@ function normalizeBody(body) {
   for (const [key, value] of Object.entries(body)) {
     if (['Id', 'ServerId', 'LocalAddress', 'ServerName', 'MediaSourceId'].includes(key)) {
       normalized[key] = '<dynamic>';
+    } else if (key === 'ImageBlurHashes') {
+      normalized[key] = normalizeImageBlurHashes(value);
     } else if (key === 'Items' && Array.isArray(value)) {
       normalized[key] = value.map(normalizeBody);
     } else {
@@ -728,6 +730,24 @@ function normalizeBody(body) {
     }
   }
   return normalized;
+}
+
+function normalizeImageBlurHashes(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return normalizeBody(value);
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([imageType, hashes]) => {
+      if (!hashes || typeof hashes !== 'object' || Array.isArray(hashes)) {
+        return [imageType, normalizeBody(hashes)];
+      }
+      const normalizedHashes = {};
+      for (const hashValue of Object.values(hashes)) {
+        normalizedHashes['<image-tag>'] = normalizeBody(hashValue);
+      }
+      return [imageType, normalizedHashes];
+    }),
+  );
 }
 
 function trimTrailingSlash(value) {

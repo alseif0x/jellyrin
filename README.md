@@ -19,6 +19,13 @@ cargo test --workspace
 cargo run -p jellyrin-server -- --web-dir /home/cdmonio/dev/jellyfin-web/dist
 ```
 
+When Jellyfin is running on `8096` and Jellyrin is running on `8097`, run the
+local compatibility acceptance gate with:
+
+```bash
+npm run qa:acceptance
+```
+
 The local development service is installed as `jellyrin-rust-dev.service` and
 listens on port `8097` so it can run alongside the upstream .NET Jellyfin
 development server on `8096`.
