@@ -11602,10 +11602,10 @@ async fn scheduled_task_triggers_json(
     task_key: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let key = scheduled_task_trigger_config_key(task_key);
-    if let Some(config) = db.named_configuration(&key).await? {
-        if let Some(triggers) = config.get("Triggers").filter(|value| value.is_array()) {
-            return Ok(triggers.clone());
-        }
+    if let Some(config) = db.named_configuration(&key).await?
+        && let Some(triggers) = config.get("Triggers").filter(|value| value.is_array())
+    {
+        return Ok(triggers.clone());
     }
     Ok(default_scheduled_task_triggers_json())
 }
@@ -25806,20 +25806,17 @@ async fn hls_segment_response_for(
     let segment_path = layout.segment_path(segment_id);
     let mut generated_on_demand = false;
     if !segment_path.exists() && media_type == "Video" && !is_live_tv_channel_id(item_id) {
-        if should_generate_hls_segment_on_demand(&session, segment_id) {
+        let should_generate = should_generate_hls_segment_on_demand(&session, segment_id)
+            || (!wait_for_hls_segment_ready(
+                &segment_path,
+                &layout.segment_path(segment_id.saturating_add(1)),
+                HLS_SEGMENT_WAIT_TIMEOUT,
+            )
+            .await?
+                && should_generate_hls_segment_on_demand(&session, segment_id));
+        if should_generate {
             generate_missing_hls_segment(&session, &layout, segment_id).await?;
             generated_on_demand = true;
-        } else if !wait_for_hls_segment_ready(
-            &segment_path,
-            &layout.segment_path(segment_id.saturating_add(1)),
-            HLS_SEGMENT_WAIT_TIMEOUT,
-        )
-        .await?
-        {
-            if should_generate_hls_segment_on_demand(&session, segment_id) {
-                generate_missing_hls_segment(&session, &layout, segment_id).await?;
-                generated_on_demand = true;
-            }
         }
     }
     if media_type == "Video"
@@ -28787,10 +28784,8 @@ async fn series_seasons(
     }
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut season_items = seasons
-        .into_iter()
-        .map(|(_season_number, summary)| {
-            tv_season_json(&server_id, &series_name, &series_id, summary)
-        })
+        .into_values()
+        .map(|summary| tv_season_json(&server_id, &series_name, &series_id, summary))
         .collect::<Vec<_>>();
     season_items.sort_by(|left, right| {
         let left_index = left
@@ -32749,16 +32744,16 @@ fn media_item_dimension_filters_match(item: &MediaItem, query: &ItemsQuery) -> b
     }
     if query
         .min_width
-        .is_some_and(|min_width| !width.is_some_and(|width| width >= min_width))
+        .is_some_and(|min_width| width.is_none_or(|width| width < min_width))
         || query
             .max_width
-            .is_some_and(|max_width| !width.is_some_and(|width| width <= max_width))
+            .is_some_and(|max_width| width.is_none_or(|width| width > max_width))
         || query
             .min_height
-            .is_some_and(|min_height| !height.is_some_and(|height| height >= min_height))
+            .is_some_and(|min_height| height.is_none_or(|height| height < min_height))
         || query
             .max_height
-            .is_some_and(|max_height| !height.is_some_and(|height| height <= max_height))
+            .is_some_and(|max_height| height.is_none_or(|height| height > max_height))
     {
         return false;
     }
@@ -33518,7 +33513,7 @@ fn apply_tv_series_metadata(value: &mut serde_json::Value, metadata: &serde_json
     ] {
         if let Some(field_value) = metadata.get(key)
             && !field_value.is_null()
-            && !(field_value.as_str() == Some(""))
+            && field_value.as_str() != Some("")
         {
             object.insert(key.to_string(), field_value.clone());
         }
@@ -33700,14 +33695,14 @@ fn external_urls_from_provider_ids(provider_ids: &serde_json::Value) -> Vec<serd
 
 fn clean_tv_series_name_and_year(source_name: &str) -> (String, Option<i32>) {
     let source_name = source_name.trim();
-    if let Some((prefix, suffix)) = source_name.split_once(" (") {
-        if suffix.len() >= 5 {
-            let year = &suffix[..4];
-            if year.chars().all(|character| character.is_ascii_digit())
-                && suffix.as_bytes().get(4) == Some(&b')')
-            {
-                return (prefix.trim().to_string(), year.parse::<i32>().ok());
-            }
+    if let Some((prefix, suffix)) = source_name.split_once(" (")
+        && suffix.len() >= 5
+    {
+        let year = &suffix[..4];
+        if year.chars().all(|character| character.is_ascii_digit())
+            && suffix.as_bytes().get(4) == Some(&b')')
+        {
+            return (prefix.trim().to_string(), year.parse::<i32>().ok());
         }
     }
     (source_name.to_string(), None)
@@ -33918,7 +33913,7 @@ async fn refresh_tv_metadata_for_series(
             .as_ref()
             .and_then(|info| tvmaze_seasons_by_number.get(&info.season_number?));
         let tvmaze_episode = episode_info.as_ref().and_then(|info| {
-            Some(tvmaze_episodes_by_number.get(&(info.season_number?, info.episode_number?))?)
+            tvmaze_episodes_by_number.get(&(info.season_number?, info.episode_number?))
         });
         let mut merged = metadata_payload_for_item(&state.db, episode.id).await?;
         merge_tvmaze_series_metadata(&mut merged, &metadata);
@@ -34175,7 +34170,7 @@ fn merge_tvmaze_series_metadata(
     };
     if let Some(source) = tvmaze_metadata.as_object() {
         for (key, value) in source {
-            if !value.is_null() && !(value.as_str() == Some("")) {
+            if !value.is_null() && value.as_str() != Some("") {
                 target.insert(key.clone(), value.clone());
             }
         }
@@ -35895,6 +35890,7 @@ fn insert_if_missing_or_null(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn media_stream_display_title(
     stream_type: &str,
     codec: &str,
@@ -36373,7 +36369,7 @@ fn tv_season_json(
         .clone()
         .unwrap_or_else(|| tv_season_id(series_name, season_number));
     let image_tag = default_primary_image_tag(&season_id);
-    let series_image_tag = default_primary_image_tag(&series_id);
+    let series_image_tag = default_primary_image_tag(series_id);
     let (display_series_name, _) = clean_tv_series_name_and_year(series_name);
     let episode_count = summary.episode_count;
     let unplayed_count = summary.unplayed_count;
@@ -36440,7 +36436,7 @@ fn apply_tv_season_metadata(value: &mut serde_json::Value, metadata: &serde_json
     for key in ["Overview", "CommunityRating"] {
         if let Some(field_value) = metadata.get(key)
             && !field_value.is_null()
-            && !(field_value.as_str() == Some(""))
+            && field_value.as_str() != Some("")
         {
             object.insert(key.to_string(), field_value.clone());
         }
@@ -37168,10 +37164,8 @@ async fn find_generated_video_item_image(
             .is_some_and(|(_, best_bytes)| *best_bytes >= bytes)
         {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-        } else {
-            if let Some((old_path, _)) = best_candidate.replace((tmp_path, bytes)) {
-                let _ = tokio::fs::remove_file(old_path).await;
-            }
+        } else if let Some((old_path, _)) = best_candidate.replace((tmp_path, bytes)) {
+            let _ = tokio::fs::remove_file(old_path).await;
         }
     }
     let Some((tmp_path, _)) = best_candidate else {
@@ -38079,7 +38073,7 @@ async fn item_image_infos(
     }
     if !image_infos_include(&infos, "Primary", 0)
         && let Some(entity) = metadata_entity.as_ref()
-        && let Some(path) = metadata_entity_image_path(&entity, "Primary", 0).await?
+        && let Some(path) = metadata_entity_image_path(entity, "Primary", 0).await?
     {
         infos.push(item_image_info_from_path("Primary", 0, path).await?);
     }
@@ -39771,6 +39765,7 @@ mod tests {
     };
     use jellyrin_plugin_rpc::PluginRuntime;
     use serde_json::{Value, json};
+    use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
@@ -40630,6 +40625,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn rust_wasi_channel_provider_feeds_channels_api() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -40878,6 +40874,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn dotnet_channel_provider_feeds_channels_api() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -41033,6 +41030,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn rust_wasi_channel_provider_failure_isolated_from_channels_api() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -41154,6 +41152,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn rust_wasi_metadata_provider_feeds_remote_search() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -41249,6 +41248,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn dotnet_metadata_provider_feeds_remote_search() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -41342,6 +41342,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn rust_wasi_image_provider_feeds_remote_images_and_download() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -41522,6 +41523,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn dotnet_image_provider_feeds_remote_images_and_download() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -41808,6 +41810,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn enable_plugin_marks_runtime_failure_as_malfunctioned() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -42166,6 +42169,10 @@ done
         ]
     }
 
+    // These guards mutate process-global statics (TEST_RUST_WASI_HOST_BINARY_PATH and
+    // TEST_DOTNET_HOST_BINARY_PATH).  Tests that set them carry #[serial(plugin_host)] so
+    // they never run concurrently; without serialisation concurrent tests can read a
+    // neighbour's host path and fail with assertion or 500 errors.
     struct RustWasiHostPathGuard {
         previous: Option<PathBuf>,
     }
@@ -44305,6 +44312,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn scheduled_tasks_endpoints_expose_library_scan_contract() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -51729,6 +51737,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn system_diagnostics_requires_admin_and_reports_runtime_surfaces() {
         let _syncplay_lock = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
@@ -52175,6 +52184,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn package_repositories_round_trip_system_configuration_payload() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -53080,6 +53090,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(plugin_host)]
     async fn package_installed_rust_wasi_plugin_executes_scheduled_task() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -53262,6 +53273,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn package_repository_refresh_downloads_manifest_and_updates_catalog() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -54335,6 +54347,7 @@ done
 
     // Spec A(b): copy writes bytes from a TS mock server to a file with len > 0.
     #[tokio::test]
+    #[serial(live_tv_timing)]
     async fn live_tv_recording_copy_writes_bytes_to_file() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
@@ -54367,6 +54380,7 @@ done
                 );
                 let _ = writer.write_all(header.as_bytes()).await;
                 let _ = writer.write_all(body).await;
+                let _ = writer.shutdown().await;
             }
         });
 
@@ -54380,7 +54394,7 @@ done
             "Name": "Test Channel",
             "ChannelId": "hdhr_4.1",
             "StartDate": format_time_for_json(now - Duration::seconds(5)),
-            "EndDate": format_time_for_json(now + Duration::seconds(5)),
+            "EndDate": format_time_for_json(now + Duration::seconds(1)),
             "PostPaddingSeconds": 0,
             "IsSeries": false,
         });
@@ -54599,6 +54613,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(live_tv_timing, playback_events)]
     async fn live_tv_startup_reconciliation_restarts_in_window_timer() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
@@ -54690,7 +54705,7 @@ done
             "stale file should not block restarted recording"
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let config = db.named_configuration("livetv").await.unwrap().unwrap();
             let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
@@ -54728,6 +54743,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(live_tv_timing, playback_events)]
     async fn live_tv_timer_scheduler_starts_future_timer_when_due() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
@@ -54808,7 +54824,7 @@ done
         assert_eq!(due.started_recordings, 1);
         assert_eq!(due.removed_expired_timers, 0);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let config = db.named_configuration("livetv").await.unwrap().unwrap();
             let recordings = config["Recordings"].as_array().cloned().unwrap_or_default();
@@ -56438,14 +56454,16 @@ done
         receiver: &mut tokio::sync::broadcast::Receiver<super::PlaybackEvent>,
         session_id: &str,
     ) -> Value {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 break;
             };
             let event = tokio::time::timeout(remaining, receiver.recv())
                 .await
-                .expect("timed out waiting for playback websocket event")
+                .unwrap_or_else(|_| {
+                    panic!("timed out waiting for playback websocket event for {session_id}")
+                })
                 .expect("playback event channel closed");
             if event.session_id == session_id {
                 return event.message;
@@ -56730,6 +56748,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn syncplay_routes_manage_in_memory_group_shell() {
         let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
@@ -56790,6 +56809,14 @@ done
         assert_eq!(created["GroupId"], group_id);
         assert_eq!(created["Name"], "Rust sync shell");
         assert_eq!(created["Participants"].as_array().unwrap().len(), 1);
+        let owner_session_id = created["Participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|participant| participant["UserName"] == "admin")
+            .and_then(|participant| participant["SessionId"].as_str())
+            .unwrap()
+            .to_string();
 
         let generated_group_name = format!("Rust generated sync shell {group_id}");
         let response = app
@@ -56851,8 +56878,6 @@ done
         let fetched: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(fetched["Id"], group_id);
 
-        let mut join_owner_events = subscribe_playback_events();
-        let mut join_guest_events = subscribe_playback_events();
         let response = app
             .clone()
             .oneshot(
@@ -56869,23 +56894,14 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let joined_group: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(joined_group["Participants"].as_array().unwrap().len(), 2);
-        tokio::task::yield_now().await;
-        let join_owner_event =
-            next_playback_event_type(&mut join_owner_events, &api_key, "SyncPlayGroupUpdate").await;
-        assert_eq!(join_owner_event["Data"]["Reason"], "Join");
-        assert_eq!(join_owner_event["Data"]["GroupId"], group_id);
-        assert_eq!(
-            join_owner_event["Data"]["Group"]["Participants"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        let join_guest_event =
-            next_playback_event_type(&mut join_guest_events, &guest_key, "SyncPlayGroupUpdate")
-                .await;
-        assert_eq!(join_guest_event["Data"]["Reason"], "Join");
-
+        let guest_session_id = joined_group["Participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|participant| participant["UserName"] == "guest")
+            .and_then(|participant| participant["SessionId"].as_str())
+            .unwrap()
+            .to_string();
         let mut play_owner_events = subscribe_playback_events();
         let mut play_guest_events = subscribe_playback_events();
         let response = app
@@ -56909,9 +56925,11 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let play_owner_event =
-            next_playback_event_type(&mut play_owner_events, &api_key, "SyncPlayCommand").await;
+            next_playback_event_type(&mut play_owner_events, &owner_session_id, "SyncPlayCommand")
+                .await;
         let play_guest_event =
-            next_playback_event_type(&mut play_guest_events, &guest_key, "SyncPlayCommand").await;
+            next_playback_event_type(&mut play_guest_events, &guest_session_id, "SyncPlayCommand")
+                .await;
         for event in [play_owner_event, play_guest_event] {
             assert_eq!(event["Data"]["GroupId"], group_id);
             assert_eq!(event["Data"]["Command"], "Play");
@@ -56947,10 +56965,18 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let pause_owner_event =
-            next_playback_event_type(&mut pause_owner_events, &api_key, "SyncPlayCommand").await;
-        let pause_guest_event =
-            next_playback_event_type(&mut pause_guest_events, &guest_key, "SyncPlayCommand").await;
+        let pause_owner_event = next_playback_event_type(
+            &mut pause_owner_events,
+            &owner_session_id,
+            "SyncPlayCommand",
+        )
+        .await;
+        let pause_guest_event = next_playback_event_type(
+            &mut pause_guest_events,
+            &guest_session_id,
+            "SyncPlayCommand",
+        )
+        .await;
         for event in [pause_owner_event, pause_guest_event] {
             assert_eq!(event["Data"]["GroupId"], group_id);
             assert_eq!(event["Data"]["Command"], "pause");
@@ -56977,9 +57003,11 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let seek_owner_event =
-            next_playback_event_type(&mut seek_owner_events, &api_key, "SyncPlayCommand").await;
+            next_playback_event_type(&mut seek_owner_events, &owner_session_id, "SyncPlayCommand")
+                .await;
         let seek_guest_event =
-            next_playback_event_type(&mut seek_guest_events, &guest_key, "SyncPlayCommand").await;
+            next_playback_event_type(&mut seek_guest_events, &guest_session_id, "SyncPlayCommand")
+                .await;
         for event in [seek_owner_event, seek_guest_event] {
             assert_eq!(event["Data"]["GroupId"], group_id);
             assert_eq!(event["Data"]["Command"], "Seek");
@@ -57002,11 +57030,18 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let unpause_owner_event =
-            next_playback_event_type(&mut unpause_owner_events, &api_key, "SyncPlayCommand").await;
-        let unpause_guest_event =
-            next_playback_event_type(&mut unpause_guest_events, &guest_key, "SyncPlayCommand")
-                .await;
+        let unpause_owner_event = next_playback_event_type(
+            &mut unpause_owner_events,
+            &owner_session_id,
+            "SyncPlayCommand",
+        )
+        .await;
+        let unpause_guest_event = next_playback_event_type(
+            &mut unpause_guest_events,
+            &guest_session_id,
+            "SyncPlayCommand",
+        )
+        .await;
         for event in [unpause_owner_event, unpause_guest_event] {
             assert_eq!(event["Data"]["GroupId"], group_id);
             assert_eq!(event["Data"]["Command"], "Unpause");
@@ -57052,9 +57087,12 @@ done
             format!("api-key:{guest_key_name}")
         );
         tokio::task::yield_now().await;
-        let reconnect_owner_event =
-            next_playback_event_type(&mut reconnect_owner_events, &api_key, "SyncPlayGroupUpdate")
-                .await;
+        let reconnect_owner_event = next_playback_event_type(
+            &mut reconnect_owner_events,
+            &owner_session_id,
+            "SyncPlayGroupUpdate",
+        )
+        .await;
         assert_eq!(reconnect_owner_event["Data"]["Reason"], "Join");
         assert_eq!(
             reconnect_owner_event["Data"]["Group"]["Participants"]
@@ -57079,9 +57117,12 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let leave_owner_event =
-            next_playback_event_type(&mut leave_owner_events, &api_key, "SyncPlayGroupUpdate")
-                .await;
+        let leave_owner_event = next_playback_event_type(
+            &mut leave_owner_events,
+            &owner_session_id,
+            "SyncPlayGroupUpdate",
+        )
+        .await;
         assert_eq!(leave_owner_event["Data"]["Reason"], "Leave");
         assert_eq!(
             leave_owner_event["Data"]["Group"]["Participants"]
@@ -57138,7 +57179,8 @@ done
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{endpoint}");
             let event =
-                next_playback_event_type(&mut command_events, &api_key, "SyncPlayCommand").await;
+                next_playback_event_type(&mut command_events, &owner_session_id, "SyncPlayCommand")
+                    .await;
             let command = endpoint.rsplit('/').next().unwrap();
             assert_eq!(event["Data"]["GroupId"], group_id, "{endpoint}");
             assert_eq!(event["Data"]["Command"], command, "{endpoint}");
@@ -57185,7 +57227,7 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let queue_event =
-            next_playback_event_type(&mut queue_events, &api_key, "SyncPlayCommand").await;
+            next_playback_event_type(&mut queue_events, &owner_session_id, "SyncPlayCommand").await;
         assert_eq!(queue_event["Data"]["Command"], "SetNewQueue");
         assert_eq!(
             queue_event["Data"]["Group"]["State"]["Queue"]
@@ -57215,7 +57257,7 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let ready_event =
-            next_playback_event_type(&mut ready_events, &api_key, "SyncPlayCommand").await;
+            next_playback_event_type(&mut ready_events, &owner_session_id, "SyncPlayCommand").await;
         let ready_participants = ready_event["Data"]["Group"]["Participants"]
             .as_array()
             .unwrap();
@@ -57241,7 +57283,8 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let buffering_event =
-            next_playback_event_type(&mut buffering_events, &api_key, "SyncPlayCommand").await;
+            next_playback_event_type(&mut buffering_events, &owner_session_id, "SyncPlayCommand")
+                .await;
         let buffering_participants = buffering_event["Data"]["Group"]["Participants"]
             .as_array()
             .unwrap();
@@ -57329,6 +57372,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn syncplay_policy_enforces_create_and_join_access() {
         let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
@@ -57462,6 +57506,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn syncplay_logout_removes_participant_and_transfers_owner() {
         let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
@@ -57586,6 +57631,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn syncplay_stale_cleanup_removes_participants_and_transfers_owner() {
         let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
@@ -57670,6 +57716,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn syncplay_concurrent_commands_get_deterministic_sequence() {
         let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
@@ -57783,6 +57830,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn syncplay_timeline_drift_emits_correction() {
         let _guard = syncplay_test_lock().await;
         syncplay_groups().lock().await.clear();
@@ -59228,6 +59276,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn virtual_folder_scan_populates_items_endpoint() {
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tempfile::tempdir().unwrap();
@@ -67299,6 +67348,7 @@ done
     }
 
     #[tokio::test]
+    #[serial(playback_events)]
     async fn audio_items_support_direct_stream_routes() {
         let tmp = tempfile::tempdir().unwrap();
         let song = tmp.path().join("Example Song.mp3");

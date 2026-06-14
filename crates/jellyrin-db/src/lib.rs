@@ -3814,6 +3814,7 @@ impl Database {
         Ok(result.rows_affected() as usize)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn import_task_run_history(
         &self,
         id: Option<Uuid>,
@@ -7476,6 +7477,7 @@ fn audio_channel_display(channels: Option<i64>, channel_layout: Option<&str>) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn media_stream_display_title(
     stream_type: &str,
     codec: &str,
