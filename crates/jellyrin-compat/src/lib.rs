@@ -46,6 +46,7 @@ pub struct StartupUserDto {
 #[serde(rename_all = "PascalCase")]
 pub struct AuthenticateUserByNameDto {
     pub username: Option<String>,
+    #[serde(alias = "Password", alias = "password")]
     pub pw: Option<String>,
 }
 
@@ -124,15 +125,34 @@ pub struct AuthenticationResultDto {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionInfoDto {
+    pub play_state: Option<serde_json::Value>,
+    pub additional_users: Vec<serde_json::Value>,
+    pub capabilities: Option<serde_json::Value>,
+    pub remote_end_point: Option<String>,
+    pub playable_media_types: Vec<String>,
     pub id: String,
     pub user_id: Uuid,
     pub user_name: String,
     pub client: String,
     pub last_activity_date: String,
+    pub last_playback_check_in: String,
+    pub last_paused_date: Option<String>,
     pub device_name: String,
+    pub device_type: Option<String>,
+    pub now_playing_item: Option<serde_json::Value>,
+    pub now_viewing_item: Option<serde_json::Value>,
     pub device_id: String,
     pub application_version: String,
+    pub transcoding_info: Option<serde_json::Value>,
     pub is_active: bool,
+    pub supports_media_control: bool,
+    pub supports_remote_control: bool,
+    pub now_playing_queue: Option<Vec<serde_json::Value>>,
+    pub has_custom_device_name: bool,
+    pub playlist_item_id: Option<String>,
+    pub server_id: Uuid,
+    pub user_primary_image_tag: Option<String>,
+    pub supported_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

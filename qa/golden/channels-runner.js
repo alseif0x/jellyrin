@@ -15,7 +15,11 @@ const jellyrinServer = process.env.JELLYRIN_SERVER_BIN
   || path.join(repoRoot, 'target/debug/jellyrin-server');
 const outputRoot = process.env.JELLYRIN_CHANNELS_RUNNER_TMP
   || path.join(os.tmpdir(), 'jellyrin-channels-');
-const adminPassword = process.env.JELLYRIN_CHANNELS_ADMIN_PASSWORD || 'e5-channels-secret';
+const adminPassword = process.env.JELLYRIN_CHANNELS_ADMIN_PASSWORD;
+if (!adminPassword) {
+  console.error('JELLYRIN_CHANNELS_ADMIN_PASSWORD is required');
+  process.exit(1);
+}
 
 async function main() {
   await assertPath(upstreamDll, 'upstream Jellyfin DLL');

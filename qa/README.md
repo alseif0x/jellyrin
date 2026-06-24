@@ -9,7 +9,8 @@ npm run qa:acceptance
 ```
 
 The runner executes the deployed playback gate, strict golden API parity, focused Rust
-playback/HLS tests, syntax checks for the QA harness and dashboard regeneration. It writes:
+playback/HLS tests, focused Xtream/SQLite Live TV tests, deployed Jellyrin Live TV HLS checks,
+syntax checks for the QA harness and dashboard regeneration. It writes:
 
 - `output/acceptance/acceptance.json`
 - `output/acceptance/acceptance.md`
@@ -21,8 +22,19 @@ Override defaults with:
 - `JELLYRIN_BASE_URL`
 - `JELLYRIN_E2E_USER`
 - `JELLYRIN_E2E_PASSWORD`
+- `JELLYRIN_E2E_LIVE_TV_ITEM_IDS`
+- `JELLYRIN_E2E_LIVE_TV_START_INDEX`
+- `JELLYRIN_E2E_LIVE_TV_LIMIT`
 - `JELLYRIN_ACCEPTANCE_TARGET_DIR`
 - `JELLYRIN_ACCEPTANCE_KEEP_GOING=1`
+- `JELLYRIN_ACCEPTANCE_JELLYRIN_ONLY=1`: skip upstream Jellyfin auth-dependent gates and run only Jellyrin checks.
+
+Use Jellyrin-only mode when the Jellyfin reference on `8096` is running but does not expose valid
+test credentials:
+
+```bash
+JELLYRIN_ACCEPTANCE_JELLYRIN_ONLY=1 npm run qa:acceptance
+```
 
 ## Playback Compatibility Runner
 
@@ -105,6 +117,37 @@ Useful optional variables:
 - `JELLYRIN_E2E_SEEK_SEGMENT_INDEX`: force a specific far segment index.
 - `JELLYRIN_E2E_SUBTITLE_STREAM_INDEX=-1`: run a lighter no-subtitle variant.
 - `JELLYRIN_E2E_ITEM_ID`: pin a known video instead of discovering the first one.
+
+## Deployed Live TV HLS Compatibility
+
+Run this suite against an already-running Jellyrin instance with Live TV channels configured. It
+validates the backend contract used by Jellyfin Web for live streams:
+
+- authenticates through `Users/AuthenticateByName`
+- discovers Live TV channels or uses pinned channel IDs
+- requests `PlaybackInfo`
+- validates the HLS master and media playlists
+- downloads a real `.ts` segment
+- reports `/Sessions/Playing/Stopped`
+- verifies `System/Diagnostics` reports zero active Live TV tuner leases after stopping
+
+Example against Jellyrin on `8097`:
+
+```bash
+JELLYRIN_E2E_DEPLOYED=1 \
+JELLYRIN_E2E_NO_WEBSERVER=1 \
+JELLYRIN_E2E_BASE_URL=http://127.0.0.1:8097 \
+JELLYRIN_E2E_USER=joe \
+JELLYRIN_E2E_PASSWORD='<password>' \
+JELLYRIN_E2E_LIVE_TV_ITEM_IDS=xtream_31039,xtream_31037,xtream_31040 \
+npx playwright test qa/e2e/deployed-live-tv-hls.spec.js --project=chromium
+```
+
+Useful optional variables:
+
+- `JELLYRIN_E2E_LIVE_TV_ITEM_IDS`: comma-separated channel IDs to pin stable channels.
+- `JELLYRIN_E2E_LIVE_TV_START_INDEX`: channel discovery offset when IDs are not pinned.
+- `JELLYRIN_E2E_LIVE_TV_LIMIT`: number of discovered channels to test.
 
 ## Deployed Jellyfin Web Playback
 

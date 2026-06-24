@@ -222,11 +222,12 @@ impl TranscodeProcess {
             return Ok(exit);
         }
 
-        let mut child = self
-            .child
-            .take()
-            .ok_or_else(|| io::Error::other("transcode process handle is missing"))?;
-        let status = child.wait().await?;
+        let status = if let Some(child) = self.child.as_mut() {
+            child.wait().await?
+        } else {
+            return Err(io::Error::other("transcode process handle is missing"));
+        };
+        self.child = None;
         self.finish_stderr_reader().await?;
         let exit = TranscodeProcessExit {
             code: status.code(),

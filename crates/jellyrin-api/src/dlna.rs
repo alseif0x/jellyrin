@@ -1652,6 +1652,9 @@ async fn run_ssdp_service(state: AppState, socket: UdpSocket) -> anyhow::Result<
             result = socket.recv_from(&mut buffer) => {
                 match result {
                     Ok((len, peer)) => {
+                        if parse_ssdp_search(&buffer[..len]).is_none() {
+                            continue;
+                        }
                         let server = state.db.server_state().await?;
                         let network = state
                             .db

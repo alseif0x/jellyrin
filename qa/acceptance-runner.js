@@ -16,6 +16,11 @@ const config = {
   jellyrinUrl: trimTrailingSlash(process.env.JELLYRIN_BASE_URL || 'http://127.0.0.1:8097'),
   user: process.env.JELLYRIN_E2E_USER || process.env.JELLYRIN_E2E_ADMIN_USER || 'joe',
   password: process.env.JELLYRIN_E2E_PASSWORD || process.env.JELLYRIN_E2E_ADMIN_PASSWORD,
+  jellyrinOnly: truthy(process.env.JELLYRIN_ACCEPTANCE_JELLYRIN_ONLY),
+  playbackItemId: process.env.JELLYRIN_E2E_ITEM_ID || '1bdad953-d342-d2d5-5760-75d1f172a4e4',
+  playbackAudioStreamIndex: process.env.JELLYRIN_E2E_AUDIO_STREAM_INDEX || '1',
+  playbackSubtitleStreamIndex: process.env.JELLYRIN_E2E_SUBTITLE_STREAM_INDEX || '4',
+  playbackStartPositionTicks: process.env.JELLYRIN_E2E_START_POSITION_TICKS || '601757610',
 };
 
 async function main() {
@@ -64,11 +69,12 @@ async function main() {
 }
 
 function buildCases() {
-  return [
+  const cases = [
     commandCase('node-check-playback-runner', 'node', ['--check', 'qa/playback-compat-runner.js']),
     commandCase('node-check-dashboard', 'node', ['--check', 'qa/golden/evidence-dashboard.js']),
     commandCase('node-check-playback-hls-spec', 'node', ['--check', 'qa/e2e/deployed-playback-hls.spec.js']),
     commandCase('node-check-playback-web-spec', 'node', ['--check', 'qa/e2e/deployed-playback-web.spec.js']),
+    commandCase('node-check-live-tv-hls-spec', 'node', ['--check', 'qa/e2e/deployed-live-tv-hls.spec.js']),
     commandCase('cargo-fmt-check', 'cargo', ['fmt', '--check']),
     commandCase('cargo-check-api', 'cargo', ['check', '-p', 'jellyrin-api'], cargoEnv()),
     commandCase('cargo-test-core-hls', 'cargo', ['test', '-p', 'jellyrin-core', 'hls_ffmpeg_command', '--', '--nocapture'], cargoEnv()),
@@ -84,25 +90,76 @@ function buildCases() {
       ['test', '-p', 'jellyrin-api', 'hls_routes_serve_active_transcode_files', '--', '--nocapture'],
       cargoEnv(),
     ),
-    probeCase('upstream-public-info', () => probeJson(`${config.upstreamUrl}/System/Info/Public`)),
+    commandCase(
+      'cargo-test-api-live-tv-xtream',
+      'cargo',
+      ['test', '-p', 'jellyrin-api', 'live_tv_persisted_xtream_channels_are_paged_from_sqlite', '--', '--nocapture'],
+      cargoEnv(),
+    ),
     probeCase('jellyrin-health', () => probeJson(`${config.jellyrinUrl}/health`)),
-    commandCase('golden-api-strict', 'npm', ['run', 'golden:api'], {
-      JELLYRIN_GOLDEN_MODE: 'strict',
-      JELLYFIN_UPSTREAM_URL: config.upstreamUrl,
-      JELLYRIN_URL: config.jellyrinUrl,
-      JELLYFIN_ADMIN_USER: process.env.JELLYFIN_ADMIN_USER || config.user,
-      JELLYFIN_ADMIN_PASSWORD: process.env.JELLYFIN_ADMIN_PASSWORD || config.password,
-      JELLYRIN_ADMIN_USER: process.env.JELLYRIN_ADMIN_USER || config.user,
-      JELLYRIN_ADMIN_PASSWORD: process.env.JELLYRIN_ADMIN_PASSWORD || config.password,
-    }),
-    commandCase('playback-compat', 'npm', ['run', 'qa:playback-compat'], {
-      JELLYFIN_BASE_URL: config.upstreamUrl,
-      JELLYRIN_BASE_URL: config.jellyrinUrl,
+  ];
+
+  if (config.jellyrinOnly) {
+    cases.push(
+      commandCase('jellyrin-hls', 'npx', ['playwright', 'test', 'qa/e2e/deployed-playback-hls.spec.js', '--project=chromium'], {
+        JELLYRIN_E2E_DEPLOYED: '1',
+        JELLYRIN_E2E_NO_WEBSERVER: '1',
+        JELLYRIN_E2E_BASE_URL: config.jellyrinUrl,
+        JELLYRIN_E2E_USER: config.user,
+        JELLYRIN_E2E_PASSWORD: config.password,
+        JELLYRIN_E2E_ITEM_ID: config.playbackItemId,
+        JELLYRIN_E2E_AUDIO_STREAM_INDEX: config.playbackAudioStreamIndex,
+        JELLYRIN_E2E_SUBTITLE_STREAM_INDEX: config.playbackSubtitleStreamIndex,
+        JELLYRIN_E2E_START_POSITION_TICKS: config.playbackStartPositionTicks,
+      }),
+      commandCase('jellyrin-web', 'npx', ['playwright', 'test', 'qa/e2e/deployed-playback-web.spec.js', '--project=chromium'], {
+        JELLYRIN_E2E_DEPLOYED: '1',
+        JELLYRIN_E2E_NO_WEBSERVER: '1',
+        JELLYRIN_E2E_BASE_URL: config.jellyrinUrl,
+        JELLYRIN_E2E_USER: config.user,
+        JELLYRIN_E2E_PASSWORD: config.password,
+        JELLYRIN_E2E_ITEM_ID: config.playbackItemId,
+        JELLYRIN_E2E_AUDIO_STREAM_INDEX: config.playbackAudioStreamIndex,
+        JELLYRIN_E2E_SUBTITLE_STREAM_INDEX: config.playbackSubtitleStreamIndex,
+        JELLYRIN_E2E_START_POSITION_TICKS: config.playbackStartPositionTicks,
+      }),
+    );
+  } else {
+    cases.push(
+      probeCase('upstream-public-info', () => probeJson(`${config.upstreamUrl}/System/Info/Public`)),
+      commandCase('golden-api-strict', 'npm', ['run', 'golden:api'], {
+        JELLYRIN_GOLDEN_MODE: 'strict',
+        JELLYFIN_UPSTREAM_URL: config.upstreamUrl,
+        JELLYRIN_URL: config.jellyrinUrl,
+        JELLYFIN_ADMIN_USER: process.env.JELLYFIN_ADMIN_USER || config.user,
+        JELLYFIN_ADMIN_PASSWORD: process.env.JELLYFIN_ADMIN_PASSWORD || config.password,
+        JELLYRIN_ADMIN_USER: process.env.JELLYRIN_ADMIN_USER || config.user,
+        JELLYRIN_ADMIN_PASSWORD: process.env.JELLYRIN_ADMIN_PASSWORD || config.password,
+      }),
+      commandCase('playback-compat', 'npm', ['run', 'qa:playback-compat'], {
+        JELLYFIN_BASE_URL: config.upstreamUrl,
+        JELLYRIN_BASE_URL: config.jellyrinUrl,
+        JELLYRIN_E2E_USER: config.user,
+        JELLYRIN_E2E_PASSWORD: config.password,
+      }),
+    );
+  }
+
+  cases.push(
+    commandCase('jellyrin-live-tv-hls', 'npx', ['playwright', 'test', 'qa/e2e/deployed-live-tv-hls.spec.js', '--project=chromium'], {
+      JELLYRIN_E2E_DEPLOYED: '1',
+      JELLYRIN_E2E_NO_WEBSERVER: '1',
+      JELLYRIN_E2E_BASE_URL: config.jellyrinUrl,
       JELLYRIN_E2E_USER: config.user,
       JELLYRIN_E2E_PASSWORD: config.password,
+      JELLYRIN_E2E_LIVE_TV_ITEM_IDS: process.env.JELLYRIN_E2E_LIVE_TV_ITEM_IDS || '',
+      JELLYRIN_E2E_LIVE_TV_START_INDEX: process.env.JELLYRIN_E2E_LIVE_TV_START_INDEX || '4',
+      JELLYRIN_E2E_LIVE_TV_LIMIT: process.env.JELLYRIN_E2E_LIVE_TV_LIMIT || '3',
     }),
     commandCase('evidence-dashboard', 'npm', ['run', 'evidence:dashboard']),
-  ];
+  );
+
+  return cases;
 }
 
 function commandCase(name, command, args, env = {}) {
@@ -239,6 +296,11 @@ function redactConfig(value) {
     jellyrinUrl: value.jellyrinUrl,
     user: value.user,
     password: '<redacted>',
+    jellyrinOnly: value.jellyrinOnly,
+    playbackItemId: value.playbackItemId,
+    playbackAudioStreamIndex: value.playbackAudioStreamIndex,
+    playbackSubtitleStreamIndex: value.playbackSubtitleStreamIndex,
+    playbackStartPositionTicks: value.playbackStartPositionTicks,
   };
 }
 
@@ -255,6 +317,10 @@ function requiredPassword(value, label) {
 
 function isKeepGoing() {
   return ['1', 'true', 'yes'].includes(String(process.env.JELLYRIN_ACCEPTANCE_KEEP_GOING || '').toLowerCase());
+}
+
+function truthy(value) {
+  return ['1', 'true', 'yes'].includes(String(value || '').toLowerCase());
 }
 
 function printHelp() {

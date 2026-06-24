@@ -1,5 +1,6 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashMap, HashSet},
+    ffi::OsStr,
     path::{Path, PathBuf},
 };
 
@@ -28,6 +29,14 @@ const DEFAULT_SYNC_PLAY_ACCESS: &str = "CreateAndJoinGroups";
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MediaItemFilterSummary {
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+    pub containers: Vec<String>,
+    pub media_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +91,21 @@ pub struct MediaItemMetadata {
 }
 
 #[derive(Debug, Clone)]
+pub struct RemoteMediaItemUpsert {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub media_type: String,
+    pub collection_type: String,
+    pub runtime_ticks: Option<i64>,
+    pub bitrate: Option<i64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub media_streams: Vec<Value>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct MediaItemLyrics {
     pub item_id: Uuid,
     pub payload: Value,
@@ -133,13 +157,13 @@ pub struct QuickConnectSession {
 }
 
 #[derive(Debug, Clone, Default)]
-struct MediaInfo {
-    runtime_ticks: Option<i64>,
-    bitrate: Option<i64>,
-    width: Option<i32>,
-    height: Option<i32>,
-    media_streams: Vec<Value>,
-    metadata: Value,
+pub struct MediaInfo {
+    pub runtime_ticks: Option<i64>,
+    pub bitrate: Option<i64>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub media_streams: Vec<Value>,
+    pub metadata: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -397,6 +421,78 @@ pub struct PluginRuntimeInstanceUpsert {
     pub health: Value,
     pub capabilities: Vec<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveTvTunerUpsert {
+    pub tuner_id: String,
+    pub provider_type: String,
+    pub name: String,
+    pub source_url: Option<String>,
+    pub configuration: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveTvCategoryUpsert {
+    pub category_id: String,
+    pub tuner_id: String,
+    pub remote_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveTvChannelUpsert {
+    pub channel_id: String,
+    pub tuner_id: String,
+    pub remote_id: String,
+    pub category_id: Option<String>,
+    pub name: String,
+    pub sort_name: String,
+    pub number: Option<String>,
+    pub stream_url: String,
+    pub logo_url: Option<String>,
+    pub channel_type: String,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveTvChannelRecord {
+    pub channel_id: String,
+    pub tuner_id: String,
+    pub remote_id: String,
+    pub category_id: Option<String>,
+    pub category_name: Option<String>,
+    pub name: String,
+    pub sort_name: String,
+    pub number: Option<String>,
+    pub stream_url: String,
+    pub logo_url: Option<String>,
+    pub channel_type: String,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveTvCategoryRecord {
+    pub category_id: String,
+    pub tuner_id: String,
+    pub remote_id: String,
+    pub name: String,
+    pub sort_name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LiveTvChannelQuery {
+    pub start_index: usize,
+    pub limit: Option<usize>,
+    pub search_term: Option<String>,
+    pub category_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveTvPage<T> {
+    pub items: Vec<T>,
+    pub total_record_count: usize,
+    pub start_index: usize,
 }
 
 impl Database {
@@ -697,6 +793,206 @@ impl Database {
                 "Items": plugin_audit_log
             }
         }))
+    }
+
+    pub async fn replace_live_tv_tuner_snapshot(
+        &self,
+        tuner: LiveTvTunerUpsert,
+        categories: Vec<LiveTvCategoryUpsert>,
+        channels: Vec<LiveTvChannelUpsert>,
+    ) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO live_tv_tuners (
+                tuner_id, provider_type, name, source_url, enabled, configuration_json,
+                last_sync_at, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?6, ?6)
+            ON CONFLICT(tuner_id) DO UPDATE SET
+                provider_type = excluded.provider_type,
+                name = excluded.name,
+                source_url = excluded.source_url,
+                enabled = 1,
+                configuration_json = excluded.configuration_json,
+                last_sync_at = excluded.last_sync_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(tuner.tuner_id.trim())
+        .bind(tuner.provider_type.trim())
+        .bind(tuner.name.trim())
+        .bind(tuner.source_url.as_deref())
+        .bind(serde_json::to_string(&tuner.configuration)?)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM live_tv_channels WHERE tuner_id = ?1")
+            .bind(tuner.tuner_id.trim())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM live_tv_categories WHERE tuner_id = ?1")
+            .bind(tuner.tuner_id.trim())
+            .execute(&mut *tx)
+            .await?;
+
+        for category in categories {
+            sqlx::query(
+                r#"
+                INSERT INTO live_tv_categories (
+                    category_id, tuner_id, remote_id, name, sort_name, created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                "#,
+            )
+            .bind(category.category_id.trim())
+            .bind(category.tuner_id.trim())
+            .bind(category.remote_id.trim())
+            .bind(category.name.trim())
+            .bind(category.name.trim().to_ascii_lowercase())
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        for channel in channels {
+            sqlx::query(
+                r#"
+                INSERT INTO live_tv_channels (
+                    channel_id, tuner_id, remote_id, category_id, name, sort_name, number,
+                    stream_url, logo_url, enabled, channel_type, metadata_json, created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)
+                "#,
+            )
+            .bind(channel.channel_id.trim())
+            .bind(channel.tuner_id.trim())
+            .bind(channel.remote_id.trim())
+            .bind(channel.category_id.as_deref())
+            .bind(channel.name.trim())
+            .bind(channel.sort_name.trim())
+            .bind(channel.number.as_deref())
+            .bind(channel.stream_url.trim())
+            .bind(channel.logo_url.as_deref())
+            .bind(channel.channel_type.trim())
+            .bind(serde_json::to_string(&channel.metadata)?)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn live_tv_channel_page(
+        &self,
+        query: LiveTvChannelQuery,
+    ) -> anyhow::Result<LiveTvPage<LiveTvChannelRecord>> {
+        let total_record_count = self.live_tv_channel_count(&query).await?;
+        let mut builder = live_tv_channel_select_builder();
+        append_live_tv_channel_filters(&mut builder, &query);
+        builder.push(" ORDER BY c.sort_name COLLATE NOCASE, c.name COLLATE NOCASE");
+        if let Some(limit) = query.limit {
+            builder.push(" LIMIT ");
+            builder.push_bind(limit as i64);
+            builder.push(" OFFSET ");
+            builder.push_bind(query.start_index as i64);
+        }
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        let items = rows
+            .into_iter()
+            .map(live_tv_channel_record_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(LiveTvPage {
+            items,
+            total_record_count,
+            start_index: query.start_index,
+        })
+    }
+
+    pub async fn live_tv_channel_count(&self, query: &LiveTvChannelQuery) -> anyhow::Result<usize> {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            r#"
+            SELECT COUNT(*) AS count
+            FROM live_tv_channels c
+            LEFT JOIN live_tv_categories cat ON cat.category_id = c.category_id
+            WHERE c.enabled = 1
+            "#,
+        );
+        append_live_tv_channel_filters(&mut builder, query);
+        let row = builder.build().fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("count").max(0) as usize)
+    }
+
+    pub async fn live_tv_channel_by_id(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<Option<LiveTvChannelRecord>> {
+        let mut builder = live_tv_channel_select_builder();
+        builder.push(" AND c.channel_id = ");
+        builder.push_bind(channel_id.trim().to_string());
+        let row = builder.build().fetch_optional(&self.pool).await?;
+        row.map(live_tv_channel_record_from_row).transpose()
+    }
+
+    pub async fn live_tv_categories(&self) -> anyhow::Result<Vec<LiveTvCategoryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT category_id, tuner_id, remote_id, name, sort_name
+            FROM live_tv_categories
+            ORDER BY sort_name COLLATE NOCASE, name COLLATE NOCASE
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(LiveTvCategoryRecord {
+                    category_id: row.get("category_id"),
+                    tuner_id: row.get("tuner_id"),
+                    remote_id: row.get("remote_id"),
+                    name: row.get("name"),
+                    sort_name: row.get("sort_name"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn live_tv_tuner_configurations_by_provider(
+        &self,
+        provider_type: &str,
+    ) -> anyhow::Result<Vec<Value>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT configuration_json
+            FROM live_tv_tuners
+            WHERE enabled = 1 AND provider_type = ?1 COLLATE NOCASE
+            ORDER BY name COLLATE NOCASE
+            "#,
+        )
+        .bind(provider_type.trim())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let configuration_json = row.get::<String, _>("configuration_json");
+                serde_json::from_str(&configuration_json)
+                    .context("invalid live TV tuner configuration json")
+            })
+            .collect()
+    }
+
+    pub async fn delete_live_tv_tuner_state(&self, tuner_id: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM live_tv_tuners WHERE tuner_id = ?1 COLLATE NOCASE")
+            .bind(tuner_id.trim())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn restore_plugin_platform_snapshot(&self, snapshot: &Value) -> anyhow::Result<()> {
@@ -2983,26 +3279,28 @@ impl Database {
             !trimmed_session_id.is_empty(),
             "session id must not be empty"
         );
-        let existing_stream_indexes = if playback.audio_stream_index.is_none()
-            || playback.subtitle_stream_index.is_none()
-        {
-            sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
-                r#"
+        let item_id = self.media_item_storage_id(playback.item_id).await?;
+        let existing_stream_indexes =
+            if playback.audio_stream_index.is_none() || playback.subtitle_stream_index.is_none() {
+                sqlx::query_as::<_, (String, Option<i64>, Option<i64>)>(
+                    r#"
                     SELECT item_id, audio_stream_index, subtitle_stream_index
                     FROM active_playback_sessions
                     WHERE session_id = ?1
                     "#,
-            )
-            .bind(trimmed_session_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .and_then(|(item_id, audio_stream_index, subtitle_stream_index)| {
-                (item_id == playback.item_id.to_string())
-                    .then_some((audio_stream_index, subtitle_stream_index))
-            })
-        } else {
-            None
-        };
+                )
+                .bind(trimmed_session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .and_then(
+                    |(stored_item_id, audio_stream_index, subtitle_stream_index)| {
+                        (stored_item_id == item_id)
+                            .then_some((audio_stream_index, subtitle_stream_index))
+                    },
+                )
+            } else {
+                None
+            };
         let audio_stream_index = playback
             .audio_stream_index
             .or_else(|| existing_stream_indexes.and_then(|indexes| indexes.0));
@@ -3030,7 +3328,7 @@ impl Database {
         )
         .bind(trimmed_session_id)
         .bind(playback.user_id.to_string())
-        .bind(playback.item_id.to_string())
+        .bind(item_id)
         .bind(playback.media_source_id)
         .bind(audio_stream_index)
         .bind(subtitle_stream_index)
@@ -3096,6 +3394,7 @@ impl Database {
             !trimmed_session_id.is_empty(),
             "session id must not be empty"
         );
+        let item_id = self.media_item_storage_id(viewing.item_id).await?;
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
@@ -3109,7 +3408,7 @@ impl Database {
         )
         .bind(trimmed_session_id)
         .bind(viewing.user_id.to_string())
-        .bind(viewing.item_id.to_string())
+        .bind(item_id)
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -3218,6 +3517,7 @@ impl Database {
         );
         anyhow::ensure!(!status.is_empty(), "transcode status must not be empty");
 
+        let item_id = self.media_item_storage_id(session.item_id).await?;
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
@@ -3249,7 +3549,7 @@ impl Database {
         .bind(session.dedupe_key)
         .bind(session.device_id)
         .bind(session.user_id.to_string())
-        .bind(session.item_id.to_string())
+        .bind(item_id)
         .bind(session.media_source_id)
         .bind(session.audio_stream_index)
         .bind(session.subtitle_stream_index)
@@ -3290,6 +3590,7 @@ impl Database {
         anyhow::ensure!(!status.is_empty(), "transcode status must not be empty");
         session.dedupe_key = Some(dedupe_key.to_string());
 
+        let item_id = self.media_item_storage_id(session.item_id).await?;
         let now = format_time(OffsetDateTime::now_utc())?;
         let result = sqlx::query(
             r#"
@@ -3305,7 +3606,7 @@ impl Database {
         .bind(dedupe_key)
         .bind(session.device_id)
         .bind(session.user_id.to_string())
-        .bind(session.item_id.to_string())
+        .bind(item_id)
         .bind(session.media_source_id)
         .bind(session.audio_stream_index)
         .bind(session.subtitle_stream_index)
@@ -3333,6 +3634,32 @@ impl Database {
             .await?
             .context("active transcode claim exists but no reusable session was visible")?;
         Ok((existing, false))
+    }
+
+    async fn media_item_storage_id(&self, item_id: Uuid) -> anyhow::Result<String> {
+        let simple = item_id.simple().to_string();
+        if sqlx::query_scalar::<_, Option<String>>("SELECT id FROM media_items WHERE id = ?1")
+            .bind(&simple)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten()
+            .is_some()
+        {
+            return Ok(simple);
+        }
+
+        let hyphenated = item_id.to_string();
+        if sqlx::query_scalar::<_, Option<String>>("SELECT id FROM media_items WHERE id = ?1")
+            .bind(&hyphenated)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten()
+            .is_some()
+        {
+            return Ok(hyphenated);
+        }
+
+        anyhow::bail!("media item {simple} does not exist")
     }
 
     pub async fn transcode_sessions(&self) -> anyhow::Result<Vec<TranscodeSession>> {
@@ -4119,7 +4446,249 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn media_items_by_collection_type(
+        &self,
+        collection_type: &str,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL AND collection_type = ?1
+            ORDER BY name COLLATE NOCASE
+            "#,
+        )
+        .bind(collection_type)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn media_items_by_name_search(
+        &self,
+        search_term: &str,
+        collection_types: &[&str],
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let search_term = search_term.trim();
+        if search_term.is_empty() || collection_types.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, virtual_folder_id, name, path, media_type, collection_type, \
+             file_size, runtime_ticks, bitrate, width, height, media_streams_json, \
+             created_at, updated_at \
+             FROM media_items \
+             WHERE missing_since IS NULL AND name LIKE ",
+        );
+        query.push_bind(format!("%{search_term}%"));
+        query.push(" COLLATE NOCASE AND LOWER(collection_type) IN (");
+        let mut separated = query.separated(", ");
+        for collection_type in collection_types {
+            separated.push_bind(collection_type.to_ascii_lowercase());
+        }
+        separated.push_unseparated(") ORDER BY name COLLATE NOCASE LIMIT ");
+        query.push_bind(limit as i64);
+
+        let rows = query
+            .build_query_as::<MediaItemRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn media_items_for_virtual_folders(
+        &self,
+        folder_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        if folder_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, virtual_folder_id, name, path, media_type, collection_type, \
+             file_size, runtime_ticks, bitrate, width, height, media_streams_json, \
+             created_at, updated_at \
+             FROM media_items \
+             WHERE missing_since IS NULL AND virtual_folder_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in folder_ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(") ORDER BY name COLLATE NOCASE");
+
+        let rows = query
+            .build_query_as::<MediaItemRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn media_item_counts_by_virtual_folder(
+        &self,
+    ) -> anyhow::Result<HashMap<Uuid, usize>> {
+        let rows = sqlx::query(
+            "SELECT virtual_folder_id, COUNT(*) AS count \
+             FROM media_items \
+             WHERE missing_since IS NULL \
+             GROUP BY virtual_folder_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut counts = HashMap::new();
+        for row in rows {
+            let folder_id: String = row.try_get("virtual_folder_id")?;
+            let count: i64 = row.try_get("count")?;
+            if let Ok(folder_id) = Uuid::parse_str(&folder_id) {
+                counts.insert(folder_id, count.max(0) as usize);
+            }
+        }
+        Ok(counts)
+    }
+
+    pub async fn media_item_filter_summary_for_virtual_folders(
+        &self,
+        folder_ids: &[Uuid],
+    ) -> anyhow::Result<MediaItemFilterSummary> {
+        if folder_ids.is_empty() {
+            return Ok(MediaItemFilterSummary::default());
+        }
+
+        let mut summary = MediaItemFilterSummary::default();
+        summary.genres = self
+            .distinct_media_item_metadata_values_for_virtual_folders(folder_ids, "Genres")
+            .await?;
+        summary.tags = self
+            .distinct_media_item_metadata_values_for_virtual_folders(folder_ids, "Tags")
+            .await?;
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT path, media_type FROM media_items \
+             WHERE missing_since IS NULL AND virtual_folder_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in folder_ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(")");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut containers = BTreeSet::new();
+        let mut media_types = BTreeSet::new();
+        for row in rows {
+            let path: String = row.try_get("path")?;
+            let media_type: String = row.try_get("media_type")?;
+            if !media_type.trim().is_empty() {
+                media_types.insert(media_type);
+            }
+            if let Some(extension) = Path::new(&path).extension().and_then(OsStr::to_str) {
+                let extension = extension.trim().to_ascii_lowercase();
+                if !extension.is_empty() {
+                    containers.insert(extension);
+                }
+            }
+        }
+        summary.containers = containers.into_iter().collect();
+        summary.media_types = media_types.into_iter().collect();
+        Ok(summary)
+    }
+
+    pub async fn distinct_media_item_metadata_values_for_virtual_folders(
+        &self,
+        folder_ids: &[Uuid],
+        key: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let json_path = format!("$.{key}");
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT DISTINCT json_each.value AS value \
+             FROM media_items, json_each(media_items.metadata_json, ",
+        );
+        query.push_bind(json_path);
+        query.push(") WHERE missing_since IS NULL AND virtual_folder_id IN (");
+        let mut separated = query.separated(", ");
+        for id in folder_ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(") ORDER BY value COLLATE NOCASE");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut values = BTreeSet::new();
+        for row in rows {
+            let value: Option<String> = row.try_get("value")?;
+            if let Some(value) = value {
+                let value = value.trim();
+                if !value.is_empty() {
+                    values.insert(value.to_string());
+                }
+            }
+        }
+        Ok(values.into_iter().collect())
+    }
+
+    pub async fn replace_remote_media_library_snapshot(
+        &self,
+        library_name: &str,
+        collection_type: &str,
+        source_location: &str,
+        items: Vec<RemoteMediaItemUpsert>,
+    ) -> anyhow::Result<VirtualFolder> {
+        let folder = self
+            .upsert_virtual_folder(
+                library_name,
+                Some(collection_type),
+                vec![source_location.to_string()],
+            )
+            .await?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let folder_id = folder.id.to_string();
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM media_items WHERE virtual_folder_id = ?1")
+            .bind(&folder_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for item in items {
+            let metadata_json = serde_json::to_string(&item.metadata)?;
+            let media_streams_json = serde_json::to_string(&item.media_streams)?;
+            sqlx::query(
+                r#"
+                INSERT INTO media_items (
+                    id, virtual_folder_id, name, path, media_type, collection_type,
+                    created_at, updated_at, last_seen_at, missing_since, file_size, modified_at,
+                    runtime_ticks, bitrate, width, height, media_streams_json, metadata_json
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, NULL, NULL, NULL,
+                    ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+            )
+            .bind(item.id.trim())
+            .bind(&folder_id)
+            .bind(item.name.trim())
+            .bind(item.path.trim())
+            .bind(item.media_type.trim())
+            .bind(item.collection_type.trim())
+            .bind(&now)
+            .bind(item.runtime_ticks)
+            .bind(item.bitrate)
+            .bind(item.width)
+            .bind(item.height)
+            .bind(media_streams_json)
+            .bind(metadata_json)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(folder)
+    }
+
     pub async fn media_item_by_id(&self, item_id: Uuid) -> anyhow::Result<MediaItem> {
+        let item_id = self.media_item_storage_id(item_id).await?;
         let row = sqlx::query_as::<_, MediaItemRow>(
             r#"
             SELECT id, virtual_folder_id, name, path, media_type, collection_type,
@@ -4129,7 +4698,7 @@ impl Database {
             WHERE id = ?1 AND missing_since IS NULL
             "#,
         )
-        .bind(item_id.to_string())
+        .bind(item_id)
         .fetch_one(&self.pool)
         .await?;
 
@@ -4336,6 +4905,36 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    pub async fn latest_media_items_for_virtual_folders(
+        &self,
+        folder_ids: &[Uuid],
+        limit: i64,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        if folder_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, virtual_folder_id, name, path, media_type, collection_type, \
+             file_size, runtime_ticks, bitrate, width, height, media_streams_json, \
+             created_at, updated_at \
+             FROM media_items \
+             WHERE missing_since IS NULL AND virtual_folder_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in folder_ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(") ORDER BY updated_at DESC, name COLLATE NOCASE LIMIT ");
+        query.push_bind(limit.max(0));
+
+        let rows = query
+            .build_query_as::<MediaItemRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn update_media_item_media_info(
         &self,
         item_id: Uuid,
@@ -4345,15 +4944,16 @@ impl Database {
         height: Option<i32>,
         media_streams: Vec<Value>,
     ) -> anyhow::Result<()> {
+        let item_id = self.media_item_storage_id(item_id).await?;
         let media_streams_json = serde_json::to_string(&media_streams)?;
         sqlx::query(
             r#"
             UPDATE media_items
             SET runtime_ticks = ?2, bitrate = ?3, width = ?4, height = ?5, media_streams_json = ?6
             WHERE id = ?1
-            "#,
+        "#,
         )
-        .bind(item_id.to_string())
+        .bind(item_id)
         .bind(runtime_ticks)
         .bind(bitrate)
         .bind(width)
@@ -4369,15 +4969,16 @@ impl Database {
         item_id: Uuid,
         metadata: Value,
     ) -> anyhow::Result<()> {
+        let item_id = self.media_item_storage_id(item_id).await?;
         let metadata_json = serde_json::to_string(&metadata)?;
         let result = sqlx::query(
             r#"
             UPDATE media_items
             SET metadata_json = ?2, updated_at = ?3
             WHERE id = ?1
-            "#,
+        "#,
         )
-        .bind(item_id.to_string())
+        .bind(item_id)
         .bind(metadata_json)
         .bind(format_time(OffsetDateTime::now_utc())?)
         .execute(&self.pool)
@@ -4398,6 +4999,43 @@ impl Database {
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn media_item_metadata_by_item_ids(
+        &self,
+        item_ids: &HashSet<Uuid>,
+    ) -> anyhow::Result<Vec<MediaItemMetadata>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let item_ids = item_ids
+            .iter()
+            .flat_map(|item_id| [item_id.simple().to_string(), item_id.to_string()])
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut metadata = Vec::new();
+        for chunk in item_ids.chunks(500) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT id, metadata_json FROM media_items WHERE missing_since IS NULL AND id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for item_id in chunk {
+                separated.push_bind(item_id);
+            }
+            separated.push_unseparated(")");
+            let rows = query
+                .build_query_as::<MediaItemMetadataRow>()
+                .fetch_all(&self.pool)
+                .await?;
+            metadata.extend(
+                rows.into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
+
+        Ok(metadata)
     }
 
     pub async fn create_media_list(
@@ -4770,6 +5408,7 @@ impl Database {
     }
 
     pub async fn upsert_playback_state(&self, playback: UpsertPlaybackState) -> anyhow::Result<()> {
+        let item_id = self.media_item_storage_id(playback.item_id).await?;
         let existing_user_item_data =
             if playback.audio_stream_index.is_none() || playback.subtitle_stream_index.is_none() {
                 sqlx::query_as::<_, (Option<i64>, Option<i64>, bool, Option<f64>)>(
@@ -4780,7 +5419,7 @@ impl Database {
                     "#,
                 )
                 .bind(playback.user_id.to_string())
-                .bind(playback.item_id.to_string())
+                .bind(&item_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .map(
@@ -4825,7 +5464,7 @@ impl Database {
             "#,
         )
         .bind(playback.user_id.to_string())
-        .bind(playback.item_id.to_string())
+        .bind(item_id)
         .bind(playback.media_source_id)
         .bind(audio_stream_index)
         .bind(subtitle_stream_index)
@@ -4846,7 +5485,10 @@ impl Database {
         item_id: Uuid,
         is_favorite: bool,
     ) -> anyhow::Result<()> {
-        let existing = self.existing_user_item_data(user_id, item_id).await?;
+        let item_id = self.media_item_storage_id(item_id).await?;
+        let existing = self
+            .existing_user_item_data_by_storage_id(user_id, &item_id)
+            .await?;
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
@@ -4858,10 +5500,10 @@ impl Database {
             ON CONFLICT(user_id, item_id) DO UPDATE SET
                 is_favorite = excluded.is_favorite,
                 updated_at = excluded.updated_at
-            "#,
+        "#,
         )
         .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(item_id)
         .bind(existing.audio_stream_index)
         .bind(existing.subtitle_stream_index)
         .bind(is_favorite)
@@ -4878,7 +5520,10 @@ impl Database {
         item_id: Uuid,
         rating: Option<f64>,
     ) -> anyhow::Result<()> {
-        let existing = self.existing_user_item_data(user_id, item_id).await?;
+        let item_id = self.media_item_storage_id(item_id).await?;
+        let existing = self
+            .existing_user_item_data_by_storage_id(user_id, &item_id)
+            .await?;
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
             r#"
@@ -4890,10 +5535,10 @@ impl Database {
             ON CONFLICT(user_id, item_id) DO UPDATE SET
                 rating = excluded.rating,
                 updated_at = excluded.updated_at
-            "#,
+        "#,
         )
         .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(item_id)
         .bind(existing.audio_stream_index)
         .bind(existing.subtitle_stream_index)
         .bind(existing.is_favorite)
@@ -4909,15 +5554,25 @@ impl Database {
         user_id: Uuid,
         item_id: Uuid,
     ) -> anyhow::Result<ExistingUserItemData> {
+        let item_id = self.media_item_storage_id(item_id).await?;
+        self.existing_user_item_data_by_storage_id(user_id, &item_id)
+            .await
+    }
+
+    async fn existing_user_item_data_by_storage_id(
+        &self,
+        user_id: Uuid,
+        item_id: &str,
+    ) -> anyhow::Result<ExistingUserItemData> {
         let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, bool, Option<f64>)>(
             r#"
             SELECT audio_stream_index, subtitle_stream_index, is_favorite, rating
             FROM playback_states
             WHERE user_id = ?1 AND item_id = ?2
-            "#,
+        "#,
         )
         .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(item_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row
@@ -4939,20 +5594,40 @@ impl Database {
         user_id: Uuid,
         item_id: Uuid,
     ) -> anyhow::Result<Option<PlaybackState>> {
+        let item_id = self.media_item_storage_id(item_id).await?;
         let row = sqlx::query_as::<_, PlaybackStateRow>(
             r#"
             SELECT user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
                    position_ticks, is_paused, played, is_favorite, rating, updated_at
             FROM playback_states
             WHERE user_id = ?1 AND item_id = ?2
-            "#,
+        "#,
         )
         .bind(user_id.to_string())
-        .bind(item_id.to_string())
+        .bind(item_id)
         .fetch_optional(&self.pool)
         .await?;
 
         row.map(TryInto::try_into).transpose()
+    }
+
+    pub async fn playback_states_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<PlaybackState>> {
+        let rows = sqlx::query_as::<_, PlaybackStateRow>(
+            r#"
+            SELECT user_id, item_id, media_source_id, audio_stream_index, subtitle_stream_index,
+                   position_ticks, is_paused, played, is_favorite, rating, updated_at
+            FROM playback_states
+            WHERE user_id = ?1
+        "#,
+        )
+        .bind(user_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     pub async fn resume_items_for_user(
@@ -6894,22 +7569,38 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<()> {
 }
 
 async fn probe_media_info(path: &Path, media_type: &str) -> MediaInfo {
+    probe_media_info_input(path.as_os_str(), media_type, &[]).await
+}
+
+pub async fn probe_remote_media_info(url: &str, media_type: &str) -> MediaInfo {
+    const REMOTE_PROBE_TIMEOUT_US: &str = "15000000";
+    probe_media_info_input(url, media_type, &["-rw_timeout", REMOTE_PROBE_TIMEOUT_US]).await
+}
+
+async fn probe_media_info_input(
+    input: impl AsRef<OsStr>,
+    media_type: &str,
+    input_args: &[&str],
+) -> MediaInfo {
     if !matches!(media_type, "Video" | "Audio") {
         return MediaInfo::default();
     }
 
-    let Ok(output) = Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    command
         .arg("-v")
         .arg("error")
         .arg("-print_format")
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
-        .arg("-show_chapters")
-        .arg(path)
-        .output()
-        .await
-    else {
+        .arg("-show_chapters");
+    for arg in input_args {
+        command.arg(arg);
+    }
+    command.arg(input);
+
+    let Ok(output) = command.output().await else {
         return MediaInfo::default();
     };
     if !output.status.success() {
@@ -8146,6 +8837,57 @@ fn plugin_runtime_instance_id(plugin_id: &str, runtime: &str) -> String {
     )
 }
 
+fn live_tv_channel_select_builder() -> QueryBuilder<'static, Sqlite> {
+    QueryBuilder::new(
+        r#"
+        SELECT c.channel_id, c.tuner_id, c.remote_id, c.category_id,
+            cat.name AS category_name,
+            c.name, c.sort_name, c.number, c.stream_url, c.logo_url,
+            c.channel_type, c.metadata_json
+        FROM live_tv_channels c
+        LEFT JOIN live_tv_categories cat ON cat.category_id = c.category_id
+        WHERE c.enabled = 1
+        "#,
+    )
+}
+
+fn append_live_tv_channel_filters(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    query: &LiveTvChannelQuery,
+) {
+    if let Some(category_id) = query.category_id.as_deref() {
+        builder.push(" AND c.category_id = ");
+        builder.push_bind(category_id.trim().to_string());
+    }
+    if let Some(search_term) = query.search_term.as_deref().map(str::trim)
+        && !search_term.is_empty()
+    {
+        builder.push(" AND c.name LIKE ");
+        builder.push_bind(format!("%{search_term}%"));
+    }
+}
+
+fn live_tv_channel_record_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<LiveTvChannelRecord> {
+    let metadata_json = row.get::<String, _>("metadata_json");
+    Ok(LiveTvChannelRecord {
+        channel_id: row.get("channel_id"),
+        tuner_id: row.get("tuner_id"),
+        remote_id: row.get("remote_id"),
+        category_id: row.get("category_id"),
+        category_name: row.get("category_name"),
+        name: row.get("name"),
+        sort_name: row.get("sort_name"),
+        number: row.get("number"),
+        stream_url: row.get("stream_url"),
+        logo_url: row.get("logo_url"),
+        channel_type: row.get("channel_type"),
+        metadata: serde_json::from_str(&metadata_json)
+            .context("invalid live TV channel metadata")?,
+    })
+}
+
 async fn enrich_plugin_runtime_state(pool: &SqlitePool, plugin: &mut Value) -> anyhow::Result<()> {
     let Some(plugin_id) = plugin.get("Id").and_then(Value::as_str).map(str::to_string) else {
         return Ok(());
@@ -9075,6 +9817,12 @@ mod tests {
             .unwrap();
         db.scan_virtual_folder_items(folder.id).await.unwrap();
         let item = db.media_items().await.unwrap().remove(0);
+        sqlx::query("UPDATE media_items SET id = ?1 WHERE id = ?2")
+            .bind(item.id.simple().to_string())
+            .bind(item.id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         let session = db
             .upsert_transcode_session(UpsertTranscodeSession {
@@ -9677,6 +10425,14 @@ mod tests {
         assert_eq!(playback.subtitle_stream_index, Some(-1));
         assert_eq!(playback.position_ticks, 84);
         assert!(playback.is_paused);
+
+        let playback_states = db.playback_states_for_user(user.id).await.unwrap();
+        assert_eq!(playback_states.len(), 1);
+        assert_eq!(playback_states[0].item_id, item.id);
+        assert_eq!(playback_states[0].audio_stream_index, Some(1));
+        assert_eq!(playback_states[0].subtitle_stream_index, Some(-1));
+        assert_eq!(playback_states[0].position_ticks, 84);
+        assert!(playback_states[0].is_paused);
     }
 
     #[tokio::test]
