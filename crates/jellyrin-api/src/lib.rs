@@ -3765,6 +3765,15 @@ pub fn spawn_periodic_xtream_media_sync_scheduler(state: AppState) -> tokio::tas
 }
 
 async fn maybe_run_due_xtream_media_sync(db: &Database) -> Result<bool, ApiError> {
+    // Skip if the xtream plugin is not active
+    if let Ok(Some(plugin)) = db.installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID).await {
+        let status = json_string_field(&plugin, "Status").unwrap_or_default();
+        if !status.eq_ignore_ascii_case("Active") {
+            return Ok(false);
+        }
+    } else {
+        return Ok(false);
+    }
     recover_stale_xtream_media_sync_runs(db).await?;
     if db
         .current_task_run(XTREAM_MEDIA_SYNC_TASK_KEY)
@@ -12353,6 +12362,7 @@ async fn xtream_media_sync_task_json(db: &Database) -> Result<serde_json::Value,
         "Category": "Live TV",
         "IsHidden": false,
         "Key": XTREAM_MEDIA_SYNC_TASK_KEY,
+        "PluginId": BUILTIN_XTREAM_PLUGIN_ID,
     }))
 }
 
