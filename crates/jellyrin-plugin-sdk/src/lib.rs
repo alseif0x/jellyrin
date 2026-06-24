@@ -209,6 +209,80 @@ impl MetadataResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+pub struct ImageLookupRequest {
+    pub item_id: String,
+    pub image_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u32>,
+}
+
+impl ImageLookupRequest {
+    pub fn new(item_id: impl Into<String>, image_type: impl Into<String>) -> Self {
+        Self {
+            item_id: item_id.into(),
+            image_type: image_type.into(),
+            max_width: None,
+            max_height: None,
+        }
+    }
+
+    pub fn max_width(mut self, width: u32) -> Self {
+        self.max_width = Some(width);
+        self
+    }
+
+    pub fn max_height(mut self, height: u32) -> Self {
+        self.max_height = Some(height);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl ImageResult {
+    pub fn url(url: impl Into<String>) -> Self {
+        Self {
+            image_url: Some(url.into()),
+            image_data: None,
+            content_type: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    pub fn data(data: impl Into<String>) -> Self {
+        Self {
+            image_url: None,
+            image_data: Some(data.into()),
+            content_type: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    pub fn content_type(mut self, ct: impl Into<String>) -> Self {
+        self.content_type = Some(ct.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct ChannelItem {
     pub id: String,
     pub name: String,

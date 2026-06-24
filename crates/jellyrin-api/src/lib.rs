@@ -40903,6 +40903,77 @@ async fn live_tv_item_image_response(
     Ok(Some((headers, bytes).into_response()))
 }
 
+/// Try to get an image from an active ImageProvider plugin.
+async fn item_image_from_plugins(
+    db: &Database,
+    item_id: &str,
+    image_type: &str,
+) -> Result<Option<Response<Body>>, ApiError> {
+    let plugins = db.installed_plugins_json().await?;
+    for plugin in plugins {
+        if !plugin_is_active_image_provider(&plugin) {
+            continue;
+        }
+        let request = serde_json::json!({
+            "ItemId": item_id,
+            "ImageType": image_type,
+        });
+        let capability = match invoke_plugin_capability_via_runtime_host(
+            &plugin,
+            "ImageProvider",
+            request,
+        )
+        .await
+        {
+            Ok(Some(capability)) => capability,
+            _ => continue,
+        };
+        let value = &capability.value;
+        // Check for image URL (proxy it)
+        if let Some(image_url) =
+            json_string_field(value, "ImageUrl").or_else(|| json_string_field(value, "Url"))
+        {
+            if image_url.starts_with("http://") || image_url.starts_with("https://") {
+                match reqwest::get(&image_url).await {
+                    Ok(response) if response.status().is_success() => {
+                        let content_type = response
+                            .headers()
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("image/jpeg")
+                            .to_string();
+                        if let Ok(bytes) = response.bytes().await {
+                            return Ok(Some(
+                                Response::builder()
+                                    .header("content-type", &content_type)
+                                    .header("cache-control", "public, max-age=86400")
+                                    .body(Body::from(bytes))
+                                    .unwrap(),
+                            ));
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        }
+        // Check for base64 image data
+        if let Some(image_data) = json_string_field(value, "ImageData") {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image_data) {
+                let content_type = json_string_field(value, "ContentType")
+                    .unwrap_or_else(|| "image/jpeg".to_string());
+                return Ok(Some(
+                    Response::builder()
+                        .header("content-type", &content_type)
+                        .header("cache-control", "public, max-age=86400")
+                        .body(Body::from(bytes))
+                        .unwrap(),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
 async fn item_image_or_placeholder(
     state: &AppState,
     item_id: &str,
@@ -40941,6 +41012,10 @@ async fn item_image_or_placeholder(
     }
     if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
         return stored_image_response(local_image).await;
+    }
+    // Try plugin ImageProvider as fallback
+    if let Some(plugin_image) = item_image_from_plugins(&state.db, item_id, image_type).await? {
+        return Ok(plugin_image);
     }
     if let Some(generated_image) =
         find_generated_video_item_image(state, &item, item_id, image_type, image_index).await?
