@@ -9206,12 +9206,20 @@ async fn plugin_configuration(
     {
         return Ok(Json(configuration));
     }
-    state
-        .db
-        .plugin_configuration_json(&plugin_id)
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("Plugin not found"))
+    if let Some(configuration) = state.db.plugin_configuration_json(&plugin_id).await? {
+        return Ok(Json(configuration));
+    }
+    // Fallback: return default configuration from the plugin manifest
+    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await? {
+        if let Some(manifest) = plugin.get("Manifest") {
+            if let Some(configuration) = manifest.get("Configuration") {
+                if configuration.is_object() && !configuration.as_object().unwrap().is_empty() {
+                    return Ok(Json(configuration.clone()));
+                }
+            }
+        }
+    }
+    Err(ApiError::not_found("Plugin not found"))
 }
 
 async fn update_plugin_configuration(
@@ -11512,6 +11520,7 @@ async fn dashboard_configuration_pages(
     require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let mut pages = discover_dashboard_configuration_pages(&state.web_dir).await?;
     pages.extend(plugin_configuration_pages_from_runtime_hosts(&state.db).await?);
+    pages.extend(builtin_plugin_configuration_pages(&state.db).await?);
     if query.enable_in_main_menu == Some(true) {
         pages.retain(|page| {
             page.get("EnableInMainMenu")
@@ -11520,6 +11529,47 @@ async fn dashboard_configuration_pages(
         });
     }
     Ok(Json(pages))
+}
+
+/// Extract configuration pages from built-in plugins (no runtime host needed).
+async fn builtin_plugin_configuration_pages(
+    db: &Database,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut pages = Vec::new();
+    for plugin in db.installed_plugins_json().await? {
+        let runtime = json_string_field(&plugin, "Runtime").unwrap_or_default();
+        if !runtime.eq_ignore_ascii_case("Builtin") {
+            continue;
+        }
+        let Some(plugin_id) = json_string_field(&plugin, "Id") else {
+            continue;
+        };
+        let Some(manifest) = plugin.get("Manifest") else {
+            continue;
+        };
+        if let Some(web_pages) = manifest.get("WebPages").and_then(|v| v.as_array()) {
+            for page in web_pages {
+                let name = json_string_field(page, "Name").unwrap_or_default();
+                let path = json_string_field(page, "Path").unwrap_or_default();
+                if name.is_empty() || path.is_empty() {
+                    continue;
+                }
+                let display_name =
+                    json_string_field(page, "DisplayName").unwrap_or_else(|| name.clone());
+                let enable_in_main_menu = page
+                    .get("EnableInMainMenu")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                pages.push(serde_json::json!({
+                    "Name": display_name,
+                    "PluginId": plugin_id,
+                    "EmbeddedResourcePath": format!("/Plugins/{}/WebPages/{}", plugin_id, path),
+                    "EnableInMainMenu": enable_in_main_menu,
+                }));
+            }
+        }
+    }
+    Ok(pages)
 }
 
 async fn plugin_configuration_pages_from_runtime_hosts(

@@ -1781,7 +1781,10 @@ impl Database {
         plugin_id: &str,
         configuration: Value,
     ) -> anyhow::Result<bool> {
-        if self.installed_plugin_manifest(plugin_id).await?.is_none() {
+        // Check if plugin exists in either plugin_manifests or installed_plugins
+        let has_manifest = self.installed_plugin_manifest(plugin_id).await?.is_some();
+        let has_installed = self.installed_plugin_json(plugin_id).await?.is_some();
+        if !has_manifest && !has_installed {
             return Ok(false);
         }
         let now = format_time(OffsetDateTime::now_utc())?;
