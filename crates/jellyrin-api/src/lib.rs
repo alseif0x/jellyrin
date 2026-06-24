@@ -14947,77 +14947,10 @@ async fn persist_live_tv_provider_import(
     Ok(())
 }
 
-async fn persist_xtream_media_import(
-    db: &Database,
-    import: live_tv_xtream::XtreamMediaImport,
-) -> Result<(usize, usize), ApiError> {
-    let movie_count = import.movies.len();
-    let series_episode_count = import.series_episodes.len();
-    if movie_count > 0 {
-        db.replace_remote_media_library_snapshot(
-            "Xtream Movies",
-            "movies",
-            "xtream://movies",
-            import.movies,
-        )
-        .await?;
-    }
-    if series_episode_count > 0 {
-        db.replace_remote_media_library_snapshot(
-            "Xtream Series",
-            "tvshows",
-            "xtream://series",
-            import.series_episodes,
-        )
-        .await?;
-    }
-    Ok((movie_count, series_episode_count))
-}
-
-async fn sync_xtream_media_from_payload(
-    db: &Database,
-    payload: &serde_json::Value,
-) -> Result<Option<serde_json::Value>, ApiError> {
-    let Some(media_import) = live_tv_xtream::import_media_from_payload(payload).await else {
-        return Ok(None);
-    };
-    let (movie_count, series_episode_count) = persist_xtream_media_import(db, media_import).await?;
-    Ok(Some(serde_json::json!({
-        "MovieCount": movie_count,
-        "SeriesEpisodeCount": series_episode_count,
-    })))
-}
-
 async fn sync_all_configured_xtream_media(db: &Database) -> Result<serde_json::Value, ApiError> {
-    let tuners = db
-        .live_tv_tuner_configurations_by_provider("xtream")
-        .await?;
-    let mut synced_tuners = 0usize;
-    let mut skipped_tuners = 0usize;
-    let mut movie_count = 0usize;
-    let mut series_episode_count = 0usize;
-    for tuner in tuners {
-        match sync_xtream_media_from_payload(db, &tuner).await? {
-            Some(result) => {
-                synced_tuners += 1;
-                movie_count += result
-                    .get("MovieCount")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                series_episode_count += result
-                    .get("SeriesEpisodeCount")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-            }
-            None => skipped_tuners += 1,
-        }
-    }
-    Ok(serde_json::json!({
-        "TunersSynced": synced_tuners,
-        "TunersSkipped": skipped_tuners,
-        "MovieCount": movie_count,
-        "SeriesEpisodeCount": series_episode_count,
-    }))
+    live_tv_xtream::sync_all_configured_xtream_media(db)
+        .await
+        .map_err(|error| ApiError::internal(format!("Xtream media sync failed: {error}")))
 }
 
 async fn start_xtream_media_sync_task(
