@@ -9801,6 +9801,17 @@ async fn enable_plugin(
     require_installed_plugin_version(&state.db, &plugin_id, &version).await?;
     if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await? {
         let activation = match json_string_field(&plugin, "Runtime").as_deref() {
+            Some("Builtin") => {
+                // Built-in plugins activate immediately
+                state
+                    .db
+                    .set_installed_plugin_status(&plugin_id, "Active", None, Some(user.id))
+                    .await?;
+                if plugin_id.eq_ignore_ascii_case(BUILTIN_XTREAM_PLUGIN_ID) {
+                    register_live_tv_provider(&XTREAM_LIVE_TV_PROVIDER).await;
+                }
+                return Ok(StatusCode::NO_CONTENT);
+            }
             Some("RustWasi") => {
                 Some(try_activate_rust_wasi_plugin(&state.db, &plugin, Some(user.id)).await)
             }
@@ -9854,6 +9865,9 @@ async fn disable_plugin(
         .set_installed_plugin_status(&plugin_id, "Disabled", None, Some(user.id))
         .await?
     {
+        if plugin_id.eq_ignore_ascii_case(BUILTIN_XTREAM_PLUGIN_ID) {
+            unregister_live_tv_provider("xtream").await;
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("Plugin not found"))
@@ -14708,8 +14722,7 @@ static LIVE_TV_PROVIDER_REGISTRY: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn live_tv_provider_registry() -> &'static tokio::sync::RwLock<Vec<&'static dyn LiveTvProvider>> {
-    LIVE_TV_PROVIDER_REGISTRY
-        .get_or_init(|| tokio::sync::RwLock::new(vec![&XTREAM_LIVE_TV_PROVIDER]))
+    LIVE_TV_PROVIDER_REGISTRY.get_or_init(|| tokio::sync::RwLock::new(Vec::new()))
 }
 
 async fn live_tv_provider_for_type(provider_type: &str) -> Option<&'static dyn LiveTvProvider> {
@@ -14724,6 +14737,65 @@ async fn live_tv_provider_for_type(provider_type: &str) -> Option<&'static dyn L
 async fn live_tv_provider_types() -> Vec<&'static str> {
     let registry = live_tv_provider_registry().read().await;
     registry.iter().map(|p| p.provider_type()).collect()
+}
+
+async fn register_live_tv_provider(provider: &'static dyn LiveTvProvider) {
+    let mut registry = live_tv_provider_registry().write().await;
+    if !registry.iter().any(|p| {
+        p.provider_type()
+            .eq_ignore_ascii_case(provider.provider_type())
+    }) {
+        registry.push(provider);
+    }
+}
+
+async fn unregister_live_tv_provider(provider_type: &str) {
+    let mut registry = live_tv_provider_registry().write().await;
+    registry.retain(|p| !p.provider_type().eq_ignore_ascii_case(provider_type));
+}
+
+const BUILTIN_XTREAM_PLUGIN_ID: &str = "jellyrin-xtream-provider";
+
+pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError> {
+    let existing = db.installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID).await?;
+    if existing.is_none() {
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+        let manifest = serde_json::json!({
+            "Guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "Name": "Xtream Codes Provider",
+            "Version": "1.0.0",
+            "Runtime": "Builtin",
+            "Capabilities": ["LiveTvProvider", "ScheduledTask"],
+            "Description": "Built-in Xtream Codes IPTV provider for live TV, VOD, and series."
+        });
+        sqlx::query(
+            r#"INSERT INTO installed_plugins (
+                plugin_id, name, version, runtime, target_abi, server_compatibility_json,
+                status, capabilities_json, permissions_json, configuration_state,
+                last_error, health_json, manifest_json, installed_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, '{}', 'Active', ?6, '[]', 'Default', NULL, '{}', ?7, ?8, ?8)"#,
+        )
+        .bind(BUILTIN_XTREAM_PLUGIN_ID)
+        .bind("Xtream Codes Provider")
+        .bind("1.0.0")
+        .bind("Builtin")
+        .bind("")
+        .bind(serde_json::to_string(&serde_json::json!(["LiveTvProvider", "ScheduledTask"]))?)
+        .bind(serde_json::to_string(&manifest)?)
+        .bind(&now)
+        .execute(db.pool())
+        .await?;
+    }
+    // Register in the live TV provider registry if active
+    if let Some(plugin) = db.installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID).await? {
+        let status = json_string_field(&plugin, "Status").unwrap_or_default();
+        if status.eq_ignore_ascii_case("Active") {
+            register_live_tv_provider(&XTREAM_LIVE_TV_PROVIDER).await;
+        }
+    }
+    Ok(())
 }
 
 async fn live_tv_provider_import_from_payload(
@@ -53662,10 +53734,14 @@ done
 
     #[tokio::test]
     async fn live_tv_provider_registry_resolves_xtream_only() {
+        // Register xtream provider (normally done by ensure_builtin_xtream_plugin)
+        super::register_live_tv_provider(&super::XTREAM_LIVE_TV_PROVIDER).await;
         let provider = super::live_tv_provider_for_type("XtReAm").await.unwrap();
         assert_eq!(provider.provider_type(), "xtream");
         assert!(super::live_tv_provider_for_type("m3u").await.is_none());
         assert!(super::live_tv_provider_for_type("unknown").await.is_none());
+        // Cleanup
+        super::unregister_live_tv_provider("xtream").await;
     }
 
     #[tokio::test]
