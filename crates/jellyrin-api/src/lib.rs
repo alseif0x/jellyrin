@@ -26,7 +26,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     extract::{Path, Query, RawQuery, State},
-    http::{HeaderMap, StatusCode, Uri, header},
+    http::{HeaderMap, Response, StatusCode, Uri, header},
     response::{IntoResponse, Redirect},
     routing::{any, delete, get, head, post},
 };
@@ -706,6 +706,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/plugins/{plugin_id}/{version}/image",
             get(plugin_image),
+        )
+        .route(
+            "/Plugins/{plugin_id}/WebPages/{page_name}",
+            get(plugin_web_page_content),
+        )
+        .route(
+            "/plugins/{plugin_id}/webpages/{page_name}",
+            get(plugin_web_page_content),
         )
         .route("/Packages", get(available_packages))
         .route("/packages", get(available_packages))
@@ -9145,13 +9153,110 @@ async fn update_plugin_configuration(
             .unwrap_or(payload);
     if state
         .db
-        .update_plugin_configuration_json(&plugin_id, payload)
+        .update_plugin_configuration_json(&plugin_id, payload.clone())
         .await?
     {
+        // Post-save hook: auto-create/update tuner for xtream plugin
+        if plugin_id.eq_ignore_ascii_case(BUILTIN_XTREAM_PLUGIN_ID) {
+            if let Err(error) = sync_xtream_tuner_from_plugin_config(&state, &payload).await {
+                tracing::warn!(?error, "failed to sync xtream tuner from plugin config");
+            }
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found("Plugin not found"))
     }
+}
+
+const XTREAM_PLUGIN_TUNER_ID: &str = "xtream-plugin";
+
+async fn sync_xtream_tuner_from_plugin_config(
+    state: &AppState,
+    config: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let url = json_string_field(config, "Url").filter(|u| !u.is_empty());
+    let username =
+        json_string_field(config, "Username").or_else(|| json_string_field(config, "UserName"));
+    let password = json_string_field(config, "Password");
+
+    let (Some(url), Some(username), Some(password)) = (url, username, password) else {
+        // Incomplete config — remove existing tuner if present
+        let _ = state
+            .db
+            .delete_live_tv_tuner_state(XTREAM_PLUGIN_TUNER_ID)
+            .await;
+        return Ok(());
+    };
+
+    // Build the tuner host payload
+    let mut payload = serde_json::json!({
+        "Id": XTREAM_PLUGIN_TUNER_ID,
+        "Type": "xtream",
+        "Url": url,
+        "Username": username,
+        "Password": password,
+        "FriendlyName": "Xtream Codes (Plugin)",
+    });
+
+    // Apply optional filters from config
+    if let Some(category_ids) = config.get("CategoryIds").and_then(|v| v.as_array()) {
+        if !category_ids.is_empty() {
+            payload["CategoryIds"] = serde_json::json!(category_ids);
+        }
+    }
+    if let Some(exclude_ids) = config.get("ExcludeCategoryIds").and_then(|v| v.as_array()) {
+        if !exclude_ids.is_empty() {
+            payload["ExcludeCategoryIds"] = serde_json::json!(exclude_ids);
+        }
+    }
+    if let Some(limit) = config.get("ChannelLimit").and_then(|v| v.as_u64()) {
+        if limit > 0 {
+            payload["ChannelLimit"] = serde_json::json!(limit);
+        }
+    }
+    if let Some(limit) = config.get("SeriesLimit").and_then(|v| v.as_u64()) {
+        if limit > 0 {
+            payload["SeriesLimit"] = serde_json::json!(limit);
+        }
+    }
+
+    // Import channels via the provider
+    let tuner_type = "xtream";
+    if let Some(import) = live_tv_provider_import_from_payload(state, &payload, tuner_type).await? {
+        persist_live_tv_provider_import(&state.db, &payload, &import).await?;
+        // Update the livetv config to include this tuner
+        let mut livetv_config = state
+            .db
+            .named_configuration("livetv")
+            .await?
+            .unwrap_or_else(default_live_tv_configuration);
+        let tuner_hosts = livetv_config
+            .get("TunerHosts")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut found = false;
+        let mut new_hosts = Vec::new();
+        for mut host in tuner_hosts {
+            if host.get("Id").and_then(serde_json::Value::as_str) == Some(XTREAM_PLUGIN_TUNER_ID) {
+                host = payload.clone();
+                found = true;
+            }
+            new_hosts.push(host);
+        }
+        if !found {
+            new_hosts.push(payload.clone());
+        }
+        livetv_config["TunerHosts"] = serde_json::json!(new_hosts);
+        state
+            .db
+            .update_named_configuration("livetv", live_tv_configuration_json(livetv_config))
+            .await?;
+
+        // Trigger media sync
+        let _ = start_xtream_media_sync_task(state.db.clone(), None).await;
+    }
+    Ok(())
 }
 
 async fn plugin_permissions(
@@ -10045,6 +10150,25 @@ async fn plugin_image(
         return stream_path(path, content_type, &headers, true).await;
     }
     Ok(placeholder_png_response())
+}
+
+async fn plugin_web_page_content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path((plugin_id, page_name)): Path<(String, String)>,
+) -> Result<Response<Body>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    // Built-in plugin web pages
+    if plugin_id.eq_ignore_ascii_case(BUILTIN_XTREAM_PLUGIN_ID)
+        && page_name.eq_ignore_ascii_case("configuration.html")
+    {
+        return Ok(Response::builder()
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::from(XTREAM_CONFIG_HTML))
+            .unwrap());
+    }
+    Err(ApiError::not_found("Web page not found"))
 }
 
 async fn plugin_image_from_runtime_host(
@@ -14756,6 +14880,60 @@ async fn unregister_live_tv_provider(provider_type: &str) {
 
 const BUILTIN_XTREAM_PLUGIN_ID: &str = "jellyrin-xtream-provider";
 
+const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Xtream Codes Configuration</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:600px;margin:2rem auto;padding:0 1rem;background:#1a1a2e;color:#e0e0e0}
+h1{color:#00d4ff;border-bottom:2px solid #00d4ff;padding-bottom:.5rem}
+label{display:block;margin-top:1rem;font-weight:600;color:#a0a0c0}
+input,select{width:100%;padding:.5rem;margin-top:.25rem;border:1px solid #333;border-radius:4px;background:#16213e;color:#e0e0e0;box-sizing:border-box}
+button{margin-top:1.5rem;padding:.75rem 2rem;background:#00d4ff;color:#1a1a2e;border:none;border-radius:4px;font-weight:700;cursor:pointer;width:100%}
+button:hover{background:#00b8d4}
+.msg{margin-top:1rem;padding:.75rem;border-radius:4px;display:none}
+.ok{background:#1b5e20;color:#a5d6a7;border:1px solid #2e7d32}
+.err{background:#b71c1c;color:#ef9a9a;border:1px solid #c62828}
+.hint{font-size:.85rem;color:#808080;margin-top:.25rem}
+</style></head>
+<body>
+<h1>Xtream Codes Provider</h1>
+<form id="f">
+  <label>Server URL<input id="url" placeholder="http://example.com:8080" required></label>
+  <label>Username<input id="user" required></label>
+  <label>Password<input id="pass" type="password" required></label>
+  <label>Channel Limit<input id="limit" type="number" value="0" min="0">
+    <div class="hint">0 = no limit</div></label>
+  <label>Category IDs (comma-separated, leave empty for all)<input id="cats" placeholder="10,20,30"></label>
+  <label>Exclude Category IDs<input id="exc" placeholder="15,25"></label>
+  <label>Series Limit<input id="slimit" type="number" value="250" min="0"></label>
+  <button type="submit">Save Configuration</button>
+</form>
+<div id="msg" class="msg"></div>
+<script>
+const api=(m,b)=>fetch('/Plugins/jellyrin-xtream-provider/Configuration',{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined,credentials:'same-origin'});
+function show(m,t){const e=document.getElementById('msg');e.textContent=m;e.className='msg '+(t||'ok');e.style.display='block'}
+function split(s){return s?s.split(',').map(x=>x.trim()).filter(Boolean):[]}
+fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origin'}).then(r=>r.ok?r.json():null).then(c=>{
+  if(!c)return;
+  document.getElementById('url').value=c.Url||'';
+  document.getElementById('user').value=c.Username||c.UserName||'';
+  document.getElementById('pass').value=c.Password||'';
+  document.getElementById('limit').value=c.ChannelLimit||0;
+  document.getElementById('cats').value=(c.CategoryIds||[]).join(',');
+  document.getElementById('exc').value=(c.ExcludeCategoryIds||[]).join(',');
+  document.getElementById('slimit').value=c.SeriesLimit||250;
+}).catch(()=>{});
+document.getElementById('f').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const cfg={Url:document.getElementById('url').value,Username:document.getElementById('user').value,
+    Password:document.getElementById('pass').value,ChannelLimit:+document.getElementById('limit').value||0,
+    CategoryIds:split(document.getElementById('cats').value),ExcludeCategoryIds:split(document.getElementById('exc').value),
+    SeriesLimit:+document.getElementById('slimit').value||250};
+  try{const r=await api('POST',cfg);if(r&&r.ok||r.status===204)show('Configuration saved successfully. Channels will sync shortly.','ok');
+    else show('Error: '+r.statusText,'err')}catch(err){show('Error: '+err,'err')}
+});
+</script></body></html>"#;
+
 pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError> {
     let existing = db.installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID).await?;
     if existing.is_none() {
@@ -14768,7 +14946,22 @@ pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError>
             "Version": "1.0.0",
             "Runtime": "Builtin",
             "Capabilities": ["LiveTvProvider", "ScheduledTask"],
-            "Description": "Built-in Xtream Codes IPTV provider for live TV, VOD, and series."
+            "Description": "Built-in Xtream Codes IPTV provider for live TV, VOD, and series.",
+            "WebPages": [{
+                "Name": "xtream-config",
+                "Path": "configuration.html",
+                "DisplayName": "Xtream Codes Configuration",
+                "EnableInMainMenu": false
+            }],
+            "Configuration": {
+                "Url": "",
+                "Username": "",
+                "Password": "",
+                "CategoryIds": [],
+                "ExcludeCategoryIds": [],
+                "ChannelLimit": 0,
+                "SeriesLimit": 250
+            }
         });
         sqlx::query(
             r#"INSERT INTO installed_plugins (
