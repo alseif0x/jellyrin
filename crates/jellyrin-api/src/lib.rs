@@ -15132,10 +15132,12 @@ const BUILTIN_XTREAM_PLUGIN_ID: &str = "jellyrin-xtream-provider";
 
 const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>Xtream Codes Configuration</title>
+<head><meta charset="utf-8"><title>Xtream Codes Configuration</title></head>
+<body>
+<div data-role="page" class="page type-interior pluginConfigurationPage">
+<div class="pageContainer"><div data-role="content">
 <style>
-/* Isolate from Jellyfin styles */
-.xtream-config{all:initial;font-family:inherit;color:inherit;line-height:1.5}
+.xtream-config{font-family:'Segoe UI',system-ui,sans-serif;color:rgba(255,255,255,.87);line-height:1.5;max-width:800px;margin:0 auto;padding:1.5rem}
 .xtream-config *{box-sizing:border-box}
 .xtream-config .hdr{font-size:1.4rem;font-weight:300;color:rgba(255,255,255,.87);margin:0 0 1.5rem;padding:0 0 .5rem;border-bottom:1px solid rgba(255,255,255,.1)}
 .xtream-config .sub{font-size:.9rem;color:rgba(255,255,255,.5);margin-bottom:1.5rem;display:block}
@@ -15188,10 +15190,7 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 @keyframes xsp{to{transform:rotate(360deg)}}
 .xtream-config .sum{font-size:.85rem;color:rgba(255,255,255,.5);line-height:1.6}
 .xtream-config .sum strong{color:rgba(255,255,255,.8)}
-</style></head>
-<body>
-<div data-role="page" class="page type-interior pluginConfigurationPage">
-<div class="pageContainer"><div data-role="content">
+</style>
 <div class="xtream-config">
 
 <div class="hdr">Xtream Codes Provider</div>
