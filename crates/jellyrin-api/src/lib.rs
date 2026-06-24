@@ -14804,6 +14804,18 @@ struct LiveTvProviderImport {
     category_upserts: Vec<LiveTvCategoryUpsert>,
 }
 
+struct PostImportActions {
+    trigger_media_sync: bool,
+}
+
+impl PostImportActions {
+    fn none() -> Self {
+        Self {
+            trigger_media_sync: false,
+        }
+    }
+}
+
 trait LiveTvProvider: Send + Sync {
     fn provider_type(&self) -> &'static str;
 
@@ -14816,6 +14828,10 @@ trait LiveTvProvider: Send + Sync {
         &'a self,
         payload: &'a serde_json::Value,
     ) -> LiveTvProviderProgramsFuture<'a>;
+
+    fn post_import_actions(&self) -> PostImportActions {
+        PostImportActions::none()
+    }
 }
 
 struct XtreamLiveTvProvider;
@@ -14846,6 +14862,12 @@ impl LiveTvProvider for XtreamLiveTvProvider {
         payload: &'a serde_json::Value,
     ) -> LiveTvProviderProgramsFuture<'a> {
         Box::pin(async move { Ok(live_tv_xtream::programs_from_payload(payload).await) })
+    }
+
+    fn post_import_actions(&self) -> PostImportActions {
+        PostImportActions {
+            trigger_media_sync: true,
+        }
     }
 }
 
@@ -16407,9 +16429,13 @@ async fn add_live_tv_tuner_host(
         live_tv_provider_import_from_payload(&state, &payload, &tuner_type).await?
     {
         persist_live_tv_provider_import(&state.db, &payload, &import).await?;
-        if tuner_type == "xtream" {
-            start_xtream_media_sync_task(state.db.clone(), None).await?;
-            payload["MediaSync"] = serde_json::json!("scheduled");
+        // Check provider's post-import actions (e.g., media sync)
+        if let Some(provider) = live_tv_provider_for_type(&tuner_type).await {
+            let actions = provider.post_import_actions();
+            if actions.trigger_media_sync {
+                start_xtream_media_sync_task(state.db.clone(), None).await?;
+                payload["MediaSync"] = serde_json::json!("scheduled");
+            }
         }
         payload["Channels"] = serde_json::json!([]);
         payload["Categories"] = serde_json::json!([]);
