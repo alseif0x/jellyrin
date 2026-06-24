@@ -15221,7 +15221,7 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
     </div>
   </div>
   <div class="btns">
-    <button class="btn btn-p btn-f" onclick="doTest()" id="bTest">Test Connection</button>
+    <button class="btn btn-p btn-f" id="bTest">Test Connection</button>
   </div>
   <div class="msg" id="mTest"></div>
 </div>
@@ -15233,7 +15233,7 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
     <div class="card-h">Live TV Channels</div>
     <div class="sec">
       <div class="sec-h"><h4>Categories</h4><span class="cnt" id="cLive">0</span></div>
-      <button class="sel-all" onclick="togAll('gLive',sLive)">Select / Deselect All</button>
+      <button class="sel-all" data-toggle="gLive">Select / Deselect All</button>
       <div class="grid" id="gLive"></div>
     </div>
   </div>
@@ -15241,7 +15241,7 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
     <div class="card-h">VOD Movies</div>
     <div class="sec">
       <div class="sec-h"><h4>Categories</h4><span class="cnt" id="cVod">0</span></div>
-      <button class="sel-all" onclick="togAll('gVod',sVod)">Select / Deselect All</button>
+      <button class="sel-all" data-toggle="gVod">Select / Deselect All</button>
       <div class="grid" id="gVod"></div>
     </div>
   </div>
@@ -15249,13 +15249,13 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
     <div class="card-h">Series</div>
     <div class="sec">
       <div class="sec-h"><h4>Categories</h4><span class="cnt" id="cSer">0</span></div>
-      <button class="sel-all" onclick="togAll('gSer',sSer)">Select / Deselect All</button>
+      <button class="sel-all" data-toggle="gSer">Select / Deselect All</button>
       <div class="grid" id="gSer"></div>
     </div>
   </div>
   <div class="btns">
-    <button class="btn btn-s" onclick="go(1)">Back</button>
-    <button class="btn btn-p btn-f" onclick="go(3)">Next</button>
+    <button class="btn btn-s" data-go="1">Back</button>
+    <button class="btn btn-p btn-f" data-go="3">Next</button>
   </div>
 </div>
 
@@ -15278,16 +15278,15 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
     <div class="sum" id="sumTxt"></div>
   </div>
   <div class="btns">
-    <button class="btn btn-s" onclick="go(2)">Back</button>
-    <button class="btn btn-g btn-f" onclick="doSave()" id="bSave">Save & Sync</button>
+    <button class="btn btn-s" data-go="2">Back</button>
+    <button class="btn btn-g btn-f" id="bSave">Save & Sync</button>
   </div>
   <div class="msg" id="mSave"></div>
 </div>
 
 </div>
-</div></div>
-</div>
-<script>
+<!--<script>
+(function(){
 var td={LiveCategories:[],VodCategories:[],SeriesCategories:[]};
 var sLive=new Set(),sVod=new Set(),sSer=new Set(),tok=null;
 
@@ -15339,7 +15338,7 @@ async function doTest(){
   if(!url||!user||!pass){merr('mTest','Fill in all fields');return}
   var btn=document.getElementById('bTest');btn.disabled=true;btn.innerHTML='<span class="sp"></span> Testing...';
   try{
-    tok=tok||await gtok(pass);
+    tok=tok||gtok();
     var r=await fetch('/LiveTv/Xtream/Test',{method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':tok},
       body:JSON.stringify({Url:url,Username:user,Password:pass})});
     var d=await r.json();
@@ -15371,12 +15370,21 @@ async function doTest(){
   finally{btn.disabled=false;btn.textContent='Test Connection'}
 }
 
-async function gtok(pw){
-  var r=await fetch('/Users/AuthenticateByName',{method:'POST',
-    headers:{'Content-Type':'application/json','X-Emby-Authorization':'MediaBrowser Client="Cfg",Device="Cfg",DeviceId="cfg"'},
-    body:JSON.stringify({Username:'admin',Pw:pw||document.getElementById('pass').value})});
-  if(!r.ok)throw new Error('Auth failed');
-  return(await r.json()).AccessToken;
+function gtok(){
+  // Reuse the existing Jellyfin Web session token from localStorage
+  try{
+    var creds=JSON.parse(localStorage.getItem('jellyfin_credentials')||'{}');
+    var srv=(creds.Servers||creds.servers||[])[0];
+    if(srv&&(srv.AccessToken||srv.accessToken))return srv.AccessToken||srv.accessToken;
+  }catch(e){}
+  // Fallback: scan localStorage for any stored token
+  for(var i=0;i<localStorage.length;i++){
+    var k=localStorage.key(i);
+    try{var v=JSON.parse(localStorage.getItem(k));
+      if(v&&v.Servers&&v.Servers[0]&&v.Servers[0].AccessToken)return v.Servers[0].AccessToken;
+    }catch(e){}
+  }
+  throw new Error('No session token found');
 }
 
 async function doSave(){
@@ -15390,7 +15398,7 @@ async function doSave(){
   try{
     var cfg={Url:url,Username:user,Password:pass,ChannelLimit:lim,SeriesLimit:slim,
       CategoryIds:Array.from(sLive),ExcludeCategoryIds:[]};
-    tok=tok||await gtok(pass);
+    tok=tok||gtok();
     var r=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{
       method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':tok},body:JSON.stringify(cfg)});
     if(r.ok||r.status===204)mok('mSave','Saved! Syncing channels...');
@@ -15409,7 +15417,25 @@ fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origi
     document.getElementById('slimit').value=c.SeriesLimit||250;
     if(c.CategoryIds&&c.CategoryIds.length)c.CategoryIds.forEach(function(id){sLive.add(id)});
   }).catch(function(){});
-</script></body></html>"#;
+
+// Wire up event listeners (Jellyfin Web runs scripts in isolated scope, onclick won't work)
+document.getElementById('bTest').addEventListener('click',doTest);
+document.getElementById('bSave').addEventListener('click',doSave);
+document.querySelectorAll('[data-go]').forEach(function(b){
+  b.addEventListener('click',function(){go(+b.getAttribute('data-go'))});
+});
+document.querySelectorAll('[data-toggle]').forEach(function(b){
+  b.addEventListener('click',function(){
+    var gid=b.getAttribute('data-toggle');
+    var set=gid==='gLive'?sLive:gid==='gVod'?sVod:sSer;
+    togAll(gid,set);
+  });
+});
+})();
+</script>-->
+</div></div>
+</div>
+</body></html>"#;
 
 pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError> {
     let existing = db.installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID).await?;
