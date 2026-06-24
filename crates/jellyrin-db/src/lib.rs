@@ -4991,6 +4991,48 @@ impl Database {
         Ok(())
     }
 
+    /// Update a media item's metadata_json by string ID (used for image tag population).
+    pub async fn update_media_item_metadata_json(
+        &self,
+        item_id: &str,
+        metadata: &Value,
+    ) -> anyhow::Result<()> {
+        let metadata_json = serde_json::to_string(metadata)?;
+        let result = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET metadata_json = ?2, updated_at = ?3
+            WHERE id = ?1
+            "#,
+        )
+        .bind(item_id)
+        .bind(metadata_json)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .execute(&self.pool)
+        .await?;
+        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        Ok(())
+    }
+
+    /// Get media items that don't have a PrimaryImageTag set yet.
+    pub async fn media_items_without_primary_image_tag(
+        &self,
+    ) -> anyhow::Result<Vec<MediaItemForImageTag>> {
+        Ok(sqlx::query_as::<_, MediaItemForImageTagRow>(
+            r#"
+            SELECT id, path, metadata_json
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND media_type IN ('Video', 'Audio', 'Photo', 'Book')
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.into())
+        .collect())
+    }
+
     pub async fn media_item_metadata(&self) -> anyhow::Result<Vec<MediaItemMetadata>> {
         let rows = sqlx::query_as::<_, MediaItemMetadataRow>(
             r#"
@@ -6740,6 +6782,30 @@ struct MediaItemMetadataRow {
     metadata_json: String,
 }
 
+/// Lightweight struct for image tag population.
+pub struct MediaItemForImageTag {
+    pub id: String,
+    pub path: String,
+    pub metadata_json: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MediaItemForImageTagRow {
+    id: String,
+    path: String,
+    metadata_json: String,
+}
+
+impl From<MediaItemForImageTagRow> for MediaItemForImageTag {
+    fn from(row: MediaItemForImageTagRow) -> Self {
+        Self {
+            id: row.id,
+            path: row.path,
+            metadata_json: row.metadata_json,
+        }
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct MediaListRow {
     id: String,
@@ -7813,7 +7879,51 @@ fn parse_local_nfo_metadata(contents: &str) -> Value {
         metadata.insert("ProviderIds".to_string(), Value::Object(provider_ids));
     }
 
+    // Extract image URLs/paths from NFO
+    // <thumb> can be a direct URL or a local path
+    if let Some(thumb) = nfo_first_text(contents, "thumb") {
+        let thumb = thumb.trim().to_string();
+        if !thumb.is_empty() {
+            if thumb.starts_with("http://") || thumb.starts_with("https://") {
+                metadata.insert("PrimaryImageUrl".to_string(), Value::String(thumb));
+            } else {
+                metadata.insert("PrimaryImagePath".to_string(), Value::String(thumb));
+            }
+        }
+    }
+    // <fanart><thumb>URL</thumb></fanart> for backdrop
+    if let Some(fanart_thumb) = nfo_fanart_thumb(contents) {
+        let fanart_thumb = fanart_thumb.trim().to_string();
+        if !fanart_thumb.is_empty() {
+            if fanart_thumb.starts_with("http://") || fanart_thumb.starts_with("https://") {
+                metadata.insert("BackdropImageUrl".to_string(), Value::String(fanart_thumb));
+            } else {
+                metadata.insert("BackdropImagePath".to_string(), Value::String(fanart_thumb));
+            }
+        }
+    }
+    // <banner>URL</banner>
+    if let Some(banner) = nfo_first_text(contents, "banner") {
+        let banner = banner.trim().to_string();
+        if !banner.is_empty() {
+            if banner.starts_with("http://") || banner.starts_with("https://") {
+                metadata.insert("ThumbImageUrl".to_string(), Value::String(banner));
+            }
+        }
+    }
+
     Value::Object(metadata)
+}
+
+/// Extract the first <thumb> inside a <fanart> element.
+fn nfo_fanart_thumb(contents: &str) -> Option<String> {
+    let fanart_start = contents.find("<fanart")?;
+    let fanart_section = &contents[fanart_start..];
+    let fanart_end = fanart_section
+        .find("</fanart>")
+        .unwrap_or(fanart_section.len());
+    let fanart_inner = &fanart_section[..fanart_end];
+    nfo_first_text(fanart_inner, "thumb")
 }
 
 fn insert_nfo_text(

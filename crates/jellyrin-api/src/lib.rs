@@ -12274,9 +12274,63 @@ async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
         scanned += db.scan_virtual_folder_items(folder.id).await?;
     }
     if scanned > 0 {
+        populate_image_tags_for_library(db).await?;
         dlna::notify_dlna_content_directory_changed(db).await?;
     }
     Ok(scanned)
+}
+
+/// Populate PrimaryImageTag in metadata_json for items that have images
+/// but no tag set yet. This enables the web client to know which items have images.
+async fn populate_image_tags_for_library(db: &Database) -> Result<(), ApiError> {
+    let items = db.media_items_without_primary_image_tag().await?;
+    let mut updated = 0usize;
+    for item in items {
+        let metadata: serde_json::Value =
+            serde_json::from_str(&item.metadata_json).unwrap_or_else(|_| serde_json::json!({}));
+        // Check if item has any image source
+        let has_image = metadata.get("PrimaryImageUrl").is_some()
+            || metadata.get("ImageUrl").is_some()
+            || metadata.get("PrimaryImagePath").is_some()
+            || metadata.get("PrimaryImageTag").is_some()
+            || has_local_image_file(&item.path, "primary")
+            || metadata.get("RemoteSourceUrl").is_some(); // xtream items get thumbnails
+        if has_image {
+            let tag = stable_entity_id("item-image", &item.id);
+            let mut metadata = metadata;
+            metadata["PrimaryImageTag"] = serde_json::json!(tag);
+            if metadata.get("ImageTags").is_none() {
+                metadata["ImageTags"] = serde_json::json!({ "Primary": tag });
+            }
+            db.update_media_item_metadata_json(&item.id, &metadata)
+                .await?;
+            updated += 1;
+        }
+    }
+    if updated > 0 {
+        tracing::info!(updated, "populated image tags for library items");
+    }
+    Ok(())
+}
+
+fn has_local_image_file(media_path: &str, image_type: &str) -> bool {
+    let path = std::path::Path::new(media_path);
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let stems = local_item_image_stems(image_type, 0);
+    for stem in stems {
+        for format in IMAGE_FORMATS {
+            if format.extension == "bin" {
+                continue;
+            }
+            let image_path = dir.join(format!("{stem}.{}", format.extension));
+            if image_path.exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn library_scan_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
@@ -41033,32 +41087,55 @@ async fn find_local_item_image(
     if is_xtream_virtual_item(item) {
         return Ok(None);
     }
-    let Some(item_dir) = media_item_path(item).parent().map(FsPath::to_path_buf) else {
+    let media_path = media_item_path(item);
+    let Some(item_dir) = media_path.parent().map(FsPath::to_path_buf) else {
         return Ok(None);
     };
     let canonical_dir = match tokio::fs::canonicalize(&item_dir).await {
         Ok(path) => path,
         Err(_) => return Ok(None),
     };
-    for stem in local_item_image_stems(image_type, image_index) {
-        for format in IMAGE_FORMATS {
-            if format.extension == "bin" {
-                continue;
-            }
-            let path = item_dir.join(format!("{stem}.{}", format.extension));
-            let canonical_path = match tokio::fs::canonicalize(&path).await {
-                Ok(path) => path,
-                Err(_) => continue,
-            };
-            if !canonical_path.starts_with(&canonical_dir) {
-                continue;
-            }
-            if tokio::fs::metadata(&canonical_path)
-                .await
-                .map(|metadata| metadata.is_file())
-                .unwrap_or(false)
-            {
-                return Ok(Some(canonical_path));
+    // Get the file stem for pattern matching (e.g., "My Movie" from "My Movie.mkv")
+    let file_stem = media_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let stems = if item.media_type == "Video" && !file_stem.is_empty() {
+        local_item_image_stems_with_file_stem(image_type, image_index, file_stem)
+    } else {
+        local_item_image_stems(image_type, image_index)
+    };
+    // Search in: item dir, then item dir/metadata/
+    let search_dirs = [item_dir.clone(), item_dir.join("metadata")];
+    for search_dir in &search_dirs {
+        let canonical_search = match tokio::fs::canonicalize(search_dir).await {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !canonical_search.starts_with(&canonical_dir) && search_dir != &item_dir {
+            continue;
+        }
+        for stem in &stems {
+            for format in IMAGE_FORMATS {
+                if format.extension == "bin" {
+                    continue;
+                }
+                let path = search_dir.join(format!("{stem}.{}", format.extension));
+                let canonical_path = match tokio::fs::canonicalize(&path).await {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                };
+                // Security: ensure we don't escape the item directory
+                if !canonical_path.starts_with(&canonical_dir) {
+                    continue;
+                }
+                if tokio::fs::metadata(&canonical_path)
+                    .await
+                    .map(|metadata| metadata.is_file())
+                    .unwrap_or(false)
+                {
+                    return Ok(Some(canonical_path));
+                }
             }
         }
     }
@@ -41067,16 +41144,25 @@ async fn find_local_item_image(
 
 fn local_item_image_stems(image_type: &str, image_index: usize) -> Vec<String> {
     match normalize_image_type(image_type).as_str() {
-        "primary" if image_index == 0 => ["poster", "folder", "cover", "default", "movie"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        "primary" if image_index == 0 => [
+            "poster",
+            "folder",
+            "cover",
+            "default",
+            "movie",
+            "banner",
+            "landscape",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
         "backdrop" => {
             let mut stems = if image_index == 0 {
                 vec![
                     "backdrop".to_string(),
                     "fanart".to_string(),
                     "background".to_string(),
+                    "art".to_string(),
                 ]
             } else {
                 Vec::new()
@@ -41086,10 +41172,33 @@ fn local_item_image_stems(image_type: &str, image_index: usize) -> Vec<String> {
             stems.push(format!("background{image_index}"));
             stems
         }
-        "thumb" if image_index == 0 => vec!["thumb".to_string()],
-        "logo" if image_index == 0 => vec!["logo".to_string()],
+        "thumb" if image_index == 0 => {
+            vec!["thumb".to_string(), "banner".to_string()]
+        }
+        "logo" if image_index == 0 => vec!["logo".to_string(), "clearlogo".to_string()],
+        "clearart" if image_index == 0 => vec!["clearart".to_string()],
+        "disc" if image_index == 0 => vec!["disc".to_string()],
         _ => Vec::new(),
     }
+}
+
+/// Additional stems for video items using the file stem pattern
+/// (e.g., "My Movie.mkv" -> looks for "My Movie.jpg", "My Movie-poster.jpg")
+fn local_item_image_stems_with_file_stem(
+    image_type: &str,
+    image_index: usize,
+    file_stem: &str,
+) -> Vec<String> {
+    let mut stems = local_item_image_stems(image_type, image_index);
+    if !file_stem.is_empty() && normalize_image_type(image_type).as_str() == "primary" {
+        stems.push(file_stem.to_string());
+        stems.push(format!("{file_stem}-poster"));
+        stems.push(format!("{file_stem}-folder"));
+    }
+    if !file_stem.is_empty() && normalize_image_type(image_type).as_str() == "thumb" {
+        stems.push(format!("{file_stem}-thumb"));
+    }
+    stems
 }
 
 async fn find_generated_video_item_image(
