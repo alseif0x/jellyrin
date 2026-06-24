@@ -24879,6 +24879,117 @@ fn plugin_is_active_metadata_provider(plugin: &serde_json::Value) -> bool {
             .any(|capability| capability.eq_ignore_ascii_case("MetadataProvider"))
 }
 
+/// Enrich a media item's metadata by querying active MetadataProvider plugins.
+/// Returns merged metadata JSON if any plugin provides enrichment, or None if no plugin matched.
+pub async fn enrich_metadata_from_plugins(
+    db: &Database,
+    item_name: &str,
+    item_type: &str,
+    existing_metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let plugins = db.installed_plugins_json().await.ok()?;
+    let mut best_enrichment: Option<serde_json::Value> = None;
+    for plugin in plugins {
+        if !plugin_is_active_metadata_provider(&plugin) {
+            continue;
+        }
+        let request = serde_json::json!({
+            "ItemType": item_type,
+            "SearchInfo": {
+                "Name": item_name,
+                "Year": existing_metadata.get("ProductionYear")
+            }
+        });
+        let capability =
+            invoke_plugin_capability_via_runtime_host(&plugin, "MetadataProvider", request)
+                .await
+                .ok()
+                .flatten()?;
+        let values = capability
+            .value
+            .get("Items")
+            .or_else(|| capability.value.get("Results"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| vec![capability.value.clone()]);
+        // Use the first result that has a name matching or any result if no exact match
+        for value in values {
+            let plugin_name = json_string_field(&value, "Name").unwrap_or_default();
+            if plugin_name.is_empty() {
+                continue;
+            }
+            // Merge plugin metadata into existing
+            let mut merged = existing_metadata.clone();
+            if let Some(overview) =
+                json_string_field(&value, "Overview").or_else(|| json_string_field(&value, "Plot"))
+            {
+                if existing_metadata.get("Overview").is_none()
+                    || existing_metadata
+                        .get("Overview")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.is_empty())
+                {
+                    merged["Overview"] = serde_json::json!(overview);
+                }
+            }
+            if let Some(year) = value
+                .get("ProductionYear")
+                .or_else(|| value.get("Year"))
+                .and_then(|v| v.as_i64())
+            {
+                if existing_metadata.get("ProductionYear").is_none() {
+                    merged["ProductionYear"] = serde_json::json!(year);
+                }
+            }
+            if let Some(rating) = value.get("CommunityRating").and_then(|v| v.as_f64()) {
+                if existing_metadata.get("CommunityRating").is_none() {
+                    merged["CommunityRating"] = serde_json::json!(rating);
+                }
+            }
+            if let Some(genres) = value.get("Genres").and_then(|v| v.as_array()) {
+                if !genres.is_empty()
+                    && (existing_metadata.get("Genres").is_none()
+                        || existing_metadata
+                            .get("Genres")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|a| a.is_empty()))
+                {
+                    merged["Genres"] = serde_json::json!(genres);
+                }
+            }
+            if let Some(image_url) = json_string_field(&value, "ImageUrl")
+                .or_else(|| json_string_field(&value, "PrimaryImageUrl"))
+            {
+                if existing_metadata.get("PrimaryImageUrl").is_none() {
+                    merged["PrimaryImageUrl"] = serde_json::json!(image_url);
+                    merged["ImageUrl"] = serde_json::json!(image_url);
+                }
+            }
+            if let Some(provider_ids) = value.get("ProviderIds") {
+                if provider_ids.is_object() {
+                    let mut existing_ids = existing_metadata
+                        .get("ProviderIds")
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(obj) = provider_ids.as_object() {
+                        for (k, v) in obj {
+                            existing_ids.insert(k.clone(), v.clone());
+                        }
+                    }
+                    merged["ProviderIds"] = serde_json::json!(existing_ids);
+                }
+            }
+            // Track which plugin provided the enrichment
+            let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
+            merged["MetadataProviderPlugin"] = serde_json::json!(plugin_id);
+            best_enrichment = Some(merged);
+            break; // Use first plugin's result
+        }
+    }
+    best_enrichment
+}
+
 fn plugin_metadata_provider_result_values(
     item_type: &str,
     provider_name: &str,

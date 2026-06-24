@@ -101,6 +101,32 @@ pub struct MetadataResult {
     pub genres: Vec<String>,
     #[serde(default)]
     pub provider_ids: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production_year: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_rating: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_rating: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub studios: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub people: Vec<MetadataPerson>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premiere_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tagline: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MetadataPerson {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_type: Option<String>,
 }
 
 impl MetadataResult {
@@ -110,6 +136,14 @@ impl MetadataResult {
             overview: None,
             genres: Vec::new(),
             provider_ids: Map::new(),
+            production_year: None,
+            community_rating: None,
+            official_rating: None,
+            studios: Vec::new(),
+            people: Vec::new(),
+            image_url: None,
+            premiere_date: None,
+            tagline: None,
         }
     }
 
@@ -120,6 +154,55 @@ impl MetadataResult {
 
     pub fn genre(mut self, genre: impl Into<String>) -> Self {
         self.genres.push(genre.into());
+        self
+    }
+
+    pub fn production_year(mut self, year: i32) -> Self {
+        self.production_year = Some(year);
+        self
+    }
+
+    pub fn community_rating(mut self, rating: f64) -> Self {
+        self.community_rating = Some(rating);
+        self
+    }
+
+    pub fn official_rating(mut self, rating: impl Into<String>) -> Self {
+        self.official_rating = Some(rating.into());
+        self
+    }
+
+    pub fn studio(mut self, studio: impl Into<String>) -> Self {
+        self.studios.push(studio.into());
+        self
+    }
+
+    pub fn person(
+        mut self,
+        name: impl Into<String>,
+        role: Option<String>,
+        person_type: Option<String>,
+    ) -> Self {
+        self.people.push(MetadataPerson {
+            name: name.into(),
+            role,
+            person_type,
+        });
+        self
+    }
+
+    pub fn image_url(mut self, url: impl Into<String>) -> Self {
+        self.image_url = Some(url.into());
+        self
+    }
+
+    pub fn premiere_date(mut self, date: impl Into<String>) -> Self {
+        self.premiere_date = Some(date.into());
+        self
+    }
+
+    pub fn tagline(mut self, tagline: impl Into<String>) -> Self {
+        self.tagline = Some(tagline.into());
         self
     }
 }
