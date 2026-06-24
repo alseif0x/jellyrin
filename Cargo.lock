@@ -940,6 +940,7 @@ dependencies = [
  "jellyrin-db",
  "jellyrin-plugin-rpc",
  "jellyrin-transcode",
+ "jellyrin-xtream-provider",
  "rand_core 0.6.4",
  "reqwest",
  "serde",
@@ -1062,6 +1063,21 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "jellyrin-xtream-provider"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "jellyrin-core",
+ "jellyrin-db",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

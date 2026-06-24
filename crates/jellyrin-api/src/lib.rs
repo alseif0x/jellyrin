@@ -1,7 +1,8 @@
 #![recursion_limit = "256"]
 
 mod dlna;
-mod live_tv_xtream;
+
+use jellyrin_xtream_provider as live_tv_xtream;
 
 use std::{
     cmp::Ordering,
@@ -45,7 +46,8 @@ use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
     ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
     DeviceSession, DiscoveredPluginPackage, InstallPluginPackage, LiveTvCategoryUpsert,
-    LiveTvChannelQuery, LiveTvChannelRecord, LiveTvTunerUpsert, MediaItemFilterSummary,
+    LiveTvChannelQuery, LiveTvChannelRecord, LiveTvChannelUpsert, LiveTvTunerUpsert,
+    MediaItemFilterSummary,
     MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission,
     NamedConfigurationPayload, PluginRuntimeInstanceUpsert, QuickConnectSession, SortDirection,
     SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
@@ -138,10 +140,7 @@ static LIVE_STREAM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 // Broadcast capacity: enough buffering so a slow consumer doesn't cause the fast path to block.
 const LIVE_STREAM_BROADCAST_CAPACITY: usize = 256;
-const LIVE_TV_REMOTE_USER_AGENT: &str = "VLC/3.0.20 LibVLC/3.0.20";
-const LIVE_TV_XTREAM_DEFAULT_EPG_LIMIT: usize = 6;
-const LIVE_TV_XTREAM_MAX_EPG_CHANNELS: usize = 12;
-const LIVE_TV_XTREAM_MAX_IMPORT_LIMIT: usize = 100_000;
+use jellyrin_core::{LIVE_TV_REMOTE_USER_AGENT, LIVE_TV_XTREAM_MAX_IMPORT_LIMIT};
 
 // In-memory registry for live TV HLS transcode sessions.
 // Keyed by play_session_id; mirrors the VOD transcode session lifecycle but without
@@ -14654,6 +14653,8 @@ type LiveTvProviderProgramsFuture<'a> =
 struct LiveTvProviderImport {
     channels: Vec<serde_json::Value>,
     categories: Vec<serde_json::Value>,
+    channel_upserts: Vec<LiveTvChannelUpsert>,
+    category_upserts: Vec<LiveTvCategoryUpsert>,
 }
 
 trait LiveTvProvider: Send + Sync {
@@ -14687,6 +14688,8 @@ impl LiveTvProvider for XtreamLiveTvProvider {
                 .map(|import| LiveTvProviderImport {
                     channels: import.channels,
                     categories: import.categories,
+                    channel_upserts: Vec::new(),
+                    category_upserts: Vec::new(),
                 }))
         })
     }
@@ -14700,14 +14703,29 @@ impl LiveTvProvider for XtreamLiveTvProvider {
 }
 
 static XTREAM_LIVE_TV_PROVIDER: XtreamLiveTvProvider = XtreamLiveTvProvider;
-static LIVE_TV_PROVIDERS: [&dyn LiveTvProvider; 1] = [&XTREAM_LIVE_TV_PROVIDER];
 
-fn live_tv_provider_for_type(provider_type: &str) -> Option<&'static dyn LiveTvProvider> {
+static LIVE_TV_PROVIDER_REGISTRY: std::sync::OnceLock<
+    tokio::sync::RwLock<Vec<&'static dyn LiveTvProvider>>,
+> = std::sync::OnceLock::new();
+
+fn live_tv_provider_registry() -> &'static tokio::sync::RwLock<Vec<&'static dyn LiveTvProvider>> {
+    LIVE_TV_PROVIDER_REGISTRY.get_or_init(|| {
+        tokio::sync::RwLock::new(vec![&XTREAM_LIVE_TV_PROVIDER])
+    })
+}
+
+async fn live_tv_provider_for_type(provider_type: &str) -> Option<&'static dyn LiveTvProvider> {
     let provider_type = provider_type.trim();
-    LIVE_TV_PROVIDERS
+    let registry = live_tv_provider_registry().read().await;
+    registry
         .iter()
         .copied()
         .find(|provider| provider.provider_type().eq_ignore_ascii_case(provider_type))
+}
+
+async fn live_tv_provider_types() -> Vec<&'static str> {
+    let registry = live_tv_provider_registry().read().await;
+    registry.iter().map(|p| p.provider_type()).collect()
 }
 
 async fn live_tv_provider_import_from_payload(
@@ -14715,7 +14733,7 @@ async fn live_tv_provider_import_from_payload(
     payload: &serde_json::Value,
     provider_type: &str,
 ) -> Result<Option<LiveTvProviderImport>, ApiError> {
-    if let Some(provider) = live_tv_provider_for_type(provider_type) {
+    if let Some(provider) = live_tv_provider_for_type(provider_type).await {
         return provider.import_channels(payload).await;
     }
     live_tv_plugin_channel_provider_import(&state.db, payload, provider_type).await
@@ -14725,7 +14743,7 @@ async fn live_tv_provider_programs_from_payload(
     payload: &serde_json::Value,
     provider_type: &str,
 ) -> Result<Option<Vec<serde_json::Value>>, ApiError> {
-    if let Some(provider) = live_tv_provider_for_type(provider_type) {
+    if let Some(provider) = live_tv_provider_for_type(provider_type).await {
         return provider.import_programs(payload).await;
     }
     Ok(None)
@@ -14796,6 +14814,8 @@ async fn live_tv_plugin_channel_provider_import(
     Ok((!channels.is_empty()).then_some(LiveTvProviderImport {
         channels,
         categories: Vec::new(),
+        channel_upserts: Vec::new(),
+        category_upserts: Vec::new(),
     }))
 }
 
@@ -14869,26 +14889,34 @@ async fn persist_live_tv_provider_import(
     let source_url = json_string_field(tuner, "Url");
     let provider_type = json_string_field(tuner, "Type").unwrap_or_else(|| "unknown".to_string());
 
-    let categories = import
-        .categories
-        .iter()
-        .filter_map(|category| {
-            let remote_id = json_string_field(category, "Id")?;
-            let name = json_string_field(category, "Name").unwrap_or_else(|| remote_id.clone());
-            Some(LiveTvCategoryUpsert {
-                category_id: live_tv_xtream::category_db_id(&tuner_id, &remote_id),
-                tuner_id: tuner_id.clone(),
-                remote_id,
-                name,
+    let categories = if !import.category_upserts.is_empty() {
+        import.category_upserts.clone()
+    } else {
+        import
+            .categories
+            .iter()
+            .filter_map(|category| {
+                let remote_id = json_string_field(category, "Id")?;
+                let name = json_string_field(category, "Name").unwrap_or_else(|| remote_id.clone());
+                Some(LiveTvCategoryUpsert {
+                    category_id: live_tv_xtream::category_db_id(&tuner_id, &remote_id),
+                    tuner_id: tuner_id.clone(),
+                    remote_id,
+                    name,
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    };
 
-    let channels = import
-        .channels
-        .iter()
-        .filter_map(|channel| live_tv_xtream::channel_upsert_from_json(&tuner_id, channel))
-        .collect::<Vec<_>>();
+    let channels = if !import.channel_upserts.is_empty() {
+        import.channel_upserts.clone()
+    } else {
+        import
+            .channels
+            .iter()
+            .filter_map(|channel| live_tv_xtream::channel_upsert_from_json(&tuner_id, channel))
+            .collect::<Vec<_>>()
+    };
 
     let mut configuration = tuner.clone();
     if let Some(object) = configuration.as_object_mut() {
@@ -16110,8 +16138,16 @@ async fn live_tv_tuner_host_types(
     let mut types = vec![
         serde_json::json!({ "Id": "hdhomerun", "Name": "HDHomeRun" }),
         serde_json::json!({ "Id": "m3u", "Name": "M3U Tuner" }),
-        serde_json::json!({ "Id": "xtream", "Name": "Xtream Codes" }),
     ];
+    for provider_type in live_tv_provider_types().await {
+        if provider_type.eq_ignore_ascii_case("hdhomerun") || provider_type.eq_ignore_ascii_case("m3u") {
+            continue;
+        }
+        types.push(serde_json::json!({
+            "Id": provider_type,
+            "Name": format!("{} Tuner", provider_type),
+        }));
+    }
     for plugin in state.db.installed_plugins_json().await? {
         if !plugin_is_active_channel_provider(&plugin) {
             continue;
@@ -53691,12 +53727,12 @@ done
         );
     }
 
-    #[test]
-    fn live_tv_provider_registry_resolves_xtream_only() {
-        let provider = super::live_tv_provider_for_type("XtReAm").unwrap();
+    #[tokio::test]
+    async fn live_tv_provider_registry_resolves_xtream_only() {
+        let provider = super::live_tv_provider_for_type("XtReAm").await.unwrap();
         assert_eq!(provider.provider_type(), "xtream");
-        assert!(super::live_tv_provider_for_type("m3u").is_none());
-        assert!(super::live_tv_provider_for_type("unknown").is_none());
+        assert!(super::live_tv_provider_for_type("m3u").await.is_none());
+        assert!(super::live_tv_provider_for_type("unknown").await.is_none());
     }
 
     #[tokio::test]

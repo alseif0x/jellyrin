@@ -5,6 +5,11 @@ use uuid::Uuid;
 pub const DEFAULT_HLS_SEGMENT_TIME_SECONDS: u32 = 3;
 pub const DEFAULT_HLS_SEGMENT_PATTERN: &str = "segment_%05d.ts";
 
+pub const LIVE_TV_REMOTE_USER_AGENT: &str = "VLC/3.0.20 LibVLC/3.0.20";
+pub const LIVE_TV_XTREAM_DEFAULT_EPG_LIMIT: usize = 6;
+pub const LIVE_TV_XTREAM_MAX_EPG_CHANNELS: usize = 12;
+pub const LIVE_TV_XTREAM_MAX_IMPORT_LIMIT: usize = 100_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerState {
     pub server_id: Uuid,
@@ -398,6 +403,106 @@ fn format_ticks_as_seconds(ticks: i64) -> String {
 
 fn non_empty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Case-insensitive JSON field lookup.
+pub fn json_field_case_insensitive<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    value.as_object()?.iter().find_map(|(key, value)| {
+        if key.eq_ignore_ascii_case(field) {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+/// Extract a trimmed, non-empty string from a JSON object field (case-insensitive key).
+pub fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    json_field_case_insensitive(value, field).and_then(|value| match value {
+        serde_json::Value::String(value) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    })
+}
+
+fn comma_delimited_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Extract a list of strings from a JSON field (supports array or comma-separated string).
+pub fn json_string_list_field(value: &serde_json::Value, field: &str) -> Option<Vec<String>> {
+    let value = json_field_case_insensitive(value, field)?;
+    match value {
+        serde_json::Value::Array(values) => Some(
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+        ),
+        serde_json::Value::String(value) => Some(comma_delimited_values(value)),
+        _ => None,
+    }
+}
+
+/// Parse a u64 from a JSON field (supports number or string).
+pub fn live_tv_u64_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    match value.get(key)? {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Generate a stable lowercase hyphenated ID from a prefix and value.
+pub fn live_tv_stable_id(prefix: &str, value: &str) -> String {
+    let normalized = value
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if normalized.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}-{normalized}")
+    }
+}
+
+fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
+    bytes.iter().fold(seed, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3) ^ u64::from(*byte)
+    })
+}
+
+/// Generate a stable 32-char hex entity ID from a type and name.
+pub fn stable_entity_id(item_type: &str, name: &str) -> String {
+    let key = format!("{}:{}", item_type, name.trim().to_ascii_lowercase());
+    format!(
+        "{:016x}{:016x}",
+        fnv1a64(key.as_bytes(), 0xcbf29ce484222325),
+        fnv1a64(key.as_bytes(), 0x84222325cbf29ce4)
+    )
+}
+
+/// Format an OffsetDateTime as RFC 3339 for JSON responses.
+pub fn format_time_for_json(value: OffsetDateTime) -> String {
+    use time::format_description::well_known::Rfc3339;
+    value
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 #[cfg(test)]

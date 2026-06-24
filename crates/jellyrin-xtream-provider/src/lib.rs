@@ -1,35 +1,37 @@
 use std::collections::{HashMap, HashSet};
 
 use base64::{Engine as _, engine::general_purpose};
-use jellyrin_db::{LiveTvChannelUpsert, RemoteMediaItemUpsert};
-use reqwest::Client as HttpClient;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
-use crate::{
+use jellyrin_core::{
     LIVE_TV_REMOTE_USER_AGENT, LIVE_TV_XTREAM_DEFAULT_EPG_LIMIT, LIVE_TV_XTREAM_MAX_EPG_CHANNELS,
     LIVE_TV_XTREAM_MAX_IMPORT_LIMIT, format_time_for_json, json_string_field,
     json_string_list_field, live_tv_stable_id, live_tv_u64_field, stable_entity_id,
 };
+use jellyrin_db::{LiveTvChannelUpsert, RemoteMediaItemUpsert};
+use reqwest::Client as HttpClient;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-pub(crate) struct LiveTvXtreamImport {
-    pub(crate) channels: Vec<serde_json::Value>,
-    pub(crate) categories: Vec<serde_json::Value>,
+/// Xtream provider type identifier.
+pub const XTREAM_PROVIDER_TYPE: &str = "xtream";
+
+pub struct LiveTvXtreamImport {
+    pub channels: Vec<serde_json::Value>,
+    pub categories: Vec<serde_json::Value>,
 }
 
-pub(crate) struct XtreamMediaImport {
-    pub(crate) movies: Vec<RemoteMediaItemUpsert>,
-    pub(crate) series_episodes: Vec<RemoteMediaItemUpsert>,
+pub struct XtreamMediaImport {
+    pub movies: Vec<RemoteMediaItemUpsert>,
+    pub series_episodes: Vec<RemoteMediaItemUpsert>,
 }
 
 #[derive(Default)]
-pub(crate) struct LiveTvXtreamImportOptions {
+pub struct LiveTvXtreamImportOptions {
     include_category_ids: HashSet<String>,
     exclude_category_ids: HashSet<String>,
     limit: Option<usize>,
 }
 
 impl LiveTvXtreamImportOptions {
-    pub(crate) fn from_payload(payload: &serde_json::Value) -> Self {
+    pub fn from_payload(payload: &serde_json::Value) -> Self {
         let include_category_ids = category_id_filter(
             payload,
             &["CategoryIds", "IncludeCategoryIds", "Categories"],
@@ -46,7 +48,7 @@ impl LiveTvXtreamImportOptions {
     }
 }
 
-pub(crate) async fn import_from_payload(payload: &serde_json::Value) -> Option<LiveTvXtreamImport> {
+pub async fn import_from_payload(payload: &serde_json::Value) -> Option<LiveTvXtreamImport> {
     let base_url = json_string_field(payload, "Url")?;
     let username = json_string_field(payload, "Username")
         .or_else(|| json_string_field(payload, "UserName"))?;
@@ -102,7 +104,7 @@ pub(crate) async fn import_from_payload(payload: &serde_json::Value) -> Option<L
     })
 }
 
-pub(crate) async fn import_media_from_payload(
+pub async fn import_media_from_payload(
     payload: &serde_json::Value,
 ) -> Option<XtreamMediaImport> {
     let base_url = json_string_field(payload, "Url")?;
@@ -234,7 +236,7 @@ async fn fetch_series_info(
     response.json().await.ok()
 }
 
-pub(crate) fn channel_upsert_from_json(
+pub fn channel_upsert_from_json(
     tuner_id: &str,
     channel: &serde_json::Value,
 ) -> Option<LiveTvChannelUpsert> {
@@ -266,7 +268,7 @@ pub(crate) fn channel_upsert_from_json(
     })
 }
 
-pub(crate) fn category_db_id(tuner_id: &str, remote_id: &str) -> String {
+pub fn category_db_id(tuner_id: &str, remote_id: &str) -> String {
     live_tv_stable_id("livetv-category", &format!("{tuner_id}-{remote_id}"))
 }
 
@@ -286,7 +288,7 @@ fn category_id_filter(payload: &serde_json::Value, keys: &[&str]) -> HashSet<Str
     ids
 }
 
-pub(crate) async fn programs_from_payload(
+pub async fn programs_from_payload(
     payload: &serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
     let base_url = json_string_field(payload, "Url")?;
@@ -453,7 +455,7 @@ fn series_url(
     Some(url.to_string())
 }
 
-pub(crate) fn parse_streams(
+pub fn parse_streams(
     base_url: &reqwest::Url,
     username: &str,
     password: &str,
@@ -931,7 +933,7 @@ fn xtream_f64(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     None
 }
 
-pub(crate) fn parse_epg_programs(
+pub fn parse_epg_programs(
     channel_id: &str,
     epg: &serde_json::Value,
 ) -> Vec<serde_json::Value> {
@@ -1042,6 +1044,84 @@ fn format_datetime(value: &str) -> Option<String> {
         return Some(format!("{}T{}Z", &date_time[0..10], &date_time[11..19]));
     }
     None
+}
+
+/// Persist media import (movies + series episodes) to the database.
+pub async fn persist_xtream_media_import(
+    db: &jellyrin_db::Database,
+    import: XtreamMediaImport,
+) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+    let movie_count = import.movies.len();
+    let series_episode_count = import.series_episodes.len();
+    if movie_count > 0 {
+        db.replace_remote_media_library_snapshot(
+            "Xtream Movies",
+            "movies",
+            "xtream://movies",
+            import.movies,
+        )
+        .await?;
+    }
+    if series_episode_count > 0 {
+        db.replace_remote_media_library_snapshot(
+            "Xtream Series",
+            "tvshows",
+            "xtream://series",
+            import.series_episodes,
+        )
+        .await?;
+    }
+    Ok((movie_count, series_episode_count))
+}
+
+/// Sync media for a single tuner from its payload.
+pub async fn sync_xtream_media_from_payload(
+    db: &jellyrin_db::Database,
+    payload: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(media_import) = import_media_from_payload(payload).await else {
+        return Ok(None);
+    };
+    let (movie_count, series_episode_count) = persist_xtream_media_import(db, media_import).await?;
+    Ok(Some(serde_json::json!({
+        "MovieCount": movie_count,
+        "SeriesEpisodeCount": series_episode_count,
+    })))
+}
+
+/// Sync media for all configured xtream tuners.
+pub async fn sync_all_configured_xtream_media(
+    db: &jellyrin_db::Database,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let tuners = db
+        .live_tv_tuner_configurations_by_provider(XTREAM_PROVIDER_TYPE)
+        .await?;
+    let mut synced_tuners = 0usize;
+    let mut skipped_tuners = 0usize;
+    let mut movie_count = 0usize;
+    let mut series_episode_count = 0usize;
+    for tuner in tuners {
+        match sync_xtream_media_from_payload(db, &tuner).await? {
+            Some(result) => {
+                synced_tuners += 1;
+                movie_count += result
+                    .get("MovieCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                series_episode_count += result
+                    .get("SeriesEpisodeCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+            }
+            None => skipped_tuners += 1,
+        }
+    }
+    Ok(serde_json::json!({
+        "TunersSynced": synced_tuners,
+        "TunersSkipped": skipped_tuners,
+        "MovieCount": movie_count,
+        "SeriesEpisodeCount": series_episode_count,
+    }))
 }
 
 #[cfg(test)]
