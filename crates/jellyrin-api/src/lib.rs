@@ -1221,6 +1221,8 @@ pub fn router(state: AppState) -> Router {
         .route("/livetv/channelmappings", post(set_live_tv_channel_mapping))
         .route("/LiveTv/TunerHosts/Types", get(live_tv_tuner_host_types))
         .route("/livetv/tunerhosts/types", get(live_tv_tuner_host_types))
+        .route("/LiveTv/Xtream/Test", post(test_xtream_credentials))
+        .route("/livetv/xtream/test", post(test_xtream_credentials))
         .route("/LiveTv/TunerHosts", post(add_live_tv_tuner_host))
         .route("/livetv/tunerhosts", post(add_live_tv_tuner_host))
         .route("/LiveTv/TunerHosts", delete(delete_live_tv_tuner_host))
@@ -15132,60 +15134,212 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Xtream Codes Configuration</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:600px;margin:2rem auto;padding:0 1rem;background:#1a1a2e;color:#e0e0e0}
+body{font-family:system-ui,sans-serif;max-width:700px;margin:2rem auto;padding:0 1rem;background:#1a1a2e;color:#e0e0e0}
 h1{color:#00d4ff;border-bottom:2px solid #00d4ff;padding-bottom:.5rem}
+h3{color:#a0a0c0;margin-top:1.5rem}
 label{display:block;margin-top:1rem;font-weight:600;color:#a0a0c0}
-input,select{width:100%;padding:.5rem;margin-top:.25rem;border:1px solid #333;border-radius:4px;background:#16213e;color:#e0e0e0;box-sizing:border-box}
-button{margin-top:1.5rem;padding:.75rem 2rem;background:#00d4ff;color:#1a1a2e;border:none;border-radius:4px;font-weight:700;cursor:pointer;width:100%}
-button:hover{background:#00b8d4}
+input[type=text],input[type=password],input[type=number]{width:100%;padding:.5rem;margin-top:.25rem;border:1px solid #333;border-radius:4px;background:#16213e;color:#e0e0e0;box-sizing:border-box}
+.hint{font-size:.85rem;color:#808080;margin-top:.25rem}
+.btn{display:inline-block;padding:.6rem 1.5rem;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:.95rem}
+.btn-primary{background:#00d4ff;color:#1a1a2e}
+.btn-primary:hover{background:#00b8d4}
+.btn-secondary{background:#333;color:#e0e0e0;margin-left:.5rem}
+.btn-secondary:hover{background:#444}
+.btn-success{background:#2e7d32;color:#fff}
+.btn-success:hover{background:#1b5e20}
+.btn-block{width:100%;margin-top:1.5rem}
 .msg{margin-top:1rem;padding:.75rem;border-radius:4px;display:none}
 .ok{background:#1b5e20;color:#a5d6a7;border:1px solid #2e7d32}
 .err{background:#b71c1c;color:#ef9a9a;border:1px solid #c62828}
-.hint{font-size:.85rem;color:#808080;margin-top:.25rem}
+.step{display:none}
+.step.active{display:block}
+.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:.5rem;margin-top:.5rem;max-height:300px;overflow-y:auto;padding:.5rem;background:#16213e;border-radius:4px;border:1px solid #333}
+.cat-item{display:flex;align-items:center;gap:.5rem;padding:.4rem .5rem;border-radius:3px;cursor:pointer}
+.cat-item:hover{background:#1a2744}
+.cat-item input[type=checkbox]{accent-color:#00d4ff;width:16px;height:16px}
+.cat-item label{margin:0;font-weight:400;color:#e0e0e0;cursor:pointer;flex:1}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid #333;border-top-color:#00d4ff;border-radius:50%;animation:spin .6s linear infinite;margin-right:.5rem;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.badge{display:inline-block;padding:.15rem .5rem;border-radius:3px;font-size:.8rem;margin-left:.5rem}
+.badge-ok{background:#1b5e20;color:#a5d6a7}
+.badge-err{background:#b71c1c;color:#ef9a9a}
+.stats{margin-top:.5rem;color:#808080;font-size:.9rem}
 </style></head>
 <body>
 <div data-role="page" class="page type-interior pluginConfigurationPage">
 <div class="pageContainer">
 <div data-role="content">
+
 <h1>Xtream Codes Provider</h1>
-<form id="f">
-  <label>Server URL<input id="url" placeholder="http://example.com:8080" required></label>
-  <label>Username<input id="user" required></label>
-  <label>Password<input id="pass" type="password" required></label>
-  <label>Channel Limit<input id="limit" type="number" value="0" min="0">
+
+<!-- Step 1: Credentials -->
+<div id="step1" class="step active">
+  <h3>1. Server Connection</h3>
+  <label>Server URL<input type="text" id="url" placeholder="http://example.com:8080"></label>
+  <label>Username<input type="text" id="user"></label>
+  <label>Password<input type="password" id="pass"></label>
+  <div style="margin-top:1rem;display:flex;gap:.5rem">
+    <button class="btn btn-primary" onclick="testConnection()" id="btnTest">Test Connection</button>
+  </div>
+  <div id="testMsg" class="msg"></div>
+</div>
+
+<!-- Step 2: Categories -->
+<div id="step2" class="step">
+  <h3>2. Select Categories</h3>
+  <div class="stats" id="catStats"></div>
+  <div id="catSection">
+    <h4 style="color:#00d4ff;margin-bottom:.25rem">Live TV Categories</h4>
+    <div class="cat-grid" id="liveCats"></div>
+  </div>
+  <div id="vodSection" style="margin-top:1rem">
+    <h4 style="color:#00d4ff;margin-bottom:.25rem">VOD Categories</h4>
+    <div class="cat-grid" id="vodCats"></div>
+  </div>
+  <div id="seriesSection" style="margin-top:1rem">
+    <h4 style="color:#00d4ff;margin-bottom:.25rem">Series Categories</h4>
+    <div class="cat-grid" id="seriesCats"></div>
+  </div>
+  <div style="margin-top:1rem;display:flex;gap:.5rem">
+    <button class="btn btn-secondary" onclick="goToStep(1)">Back</button>
+    <button class="btn btn-primary" onclick="goToStep(3)">Next</button>
+  </div>
+</div>
+
+<!-- Step 3: Settings & Save -->
+<div id="step3" class="step">
+  <h3>3. Settings</h3>
+  <label>Channel Limit<input type="number" id="limit" value="0" min="0">
     <div class="hint">0 = no limit</div></label>
-  <label>Category IDs (comma-separated, leave empty for all)<input id="cats" placeholder="10,20,30"></label>
-  <label>Exclude Category IDs<input id="exc" placeholder="15,25"></label>
-  <label>Series Limit<input id="slimit" type="number" value="250" min="0"></label>
-  <button type="submit">Save Configuration</button>
-</form>
-<div id="msg" class="msg"></div>
+  <label>Series Limit<input type="number" id="slimit" value="250" min="0"></label>
+  <div style="margin-top:1.5rem;display:flex;gap:.5rem">
+    <button class="btn btn-secondary" onclick="goToStep(2)">Back</button>
+    <button class="btn btn-success btn-block" onclick="saveConfig()" id="btnSave">Save & Sync</button>
+  </div>
+  <div id="saveMsg" class="msg"></div>
+</div>
+
 </div>
 </div>
 </div>
 <script>
-const api=(m,b)=>fetch('/Plugins/jellyrin-xtream-provider/Configuration',{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined,credentials:'same-origin'});
-function show(m,t){const e=document.getElementById('msg');e.textContent=m;e.className='msg '+(t||'ok');e.style.display='block'}
-function split(s){return s?s.split(',').map(x=>x.trim()).filter(Boolean):[]}
-fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origin'}).then(r=>r.ok?r.json():null).then(c=>{
-  if(!c)return;
-  document.getElementById('url').value=c.Url||'';
-  document.getElementById('user').value=c.Username||c.UserName||'';
-  document.getElementById('pass').value=c.Password||'';
-  document.getElementById('limit').value=c.ChannelLimit||0;
-  document.getElementById('cats').value=(c.CategoryIds||[]).join(',');
-  document.getElementById('exc').value=(c.ExcludeCategoryIds||[]).join(',');
-  document.getElementById('slimit').value=c.SeriesLimit||250;
-}).catch(()=>{});
-document.getElementById('f').addEventListener('submit',async e=>{
-  e.preventDefault();
-  const cfg={Url:document.getElementById('url').value,Username:document.getElementById('user').value,
-    Password:document.getElementById('pass').value,ChannelLimit:+document.getElementById('limit').value||0,
-    CategoryIds:split(document.getElementById('cats').value),ExcludeCategoryIds:split(document.getElementById('exc').value),
-    SeriesLimit:+document.getElementById('slimit').value||250};
-  try{const r=await api('POST',cfg);if(r&&r.ok||r.status===204)show('Configuration saved successfully. Channels will sync shortly.','ok');
-    else show('Error: '+r.statusText,'err')}catch(err){show('Error: '+err,'err')}
-});
+let testData={LiveCategories:[],VodCategories:[],SeriesCategories:[]};
+let selectedLiveCats=new Set(),selectedVodCats=new Set(),selectedSeriesCats=new Set();
+
+function goToStep(n){
+  document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
+  document.getElementById('step'+n).classList.add('active');
+}
+
+function showMsg(id,m,t){const e=document.getElementById(id);e.textContent=m;e.className='msg '+(t||'ok');e.style.display='block'}
+function hideMsg(id){document.getElementById(id).style.display='none'}
+
+function renderCats(containerId,cats,selectedSet){
+  const el=document.getElementById(containerId);
+  el.innerHTML='';
+  cats.forEach(c=>{
+    const id=c.Id||'';
+    const name=c.Name||id;
+    const div=document.createElement('div');
+    div.className='cat-item';
+    const cb=document.createElement('input');
+    cb.type='checkbox';cb.id='cat_'+containerId+'_'+id;
+    cb.checked=selectedSet.has(id);
+    cb.onchange=()=>{if(cb.checked)selectedSet.add(id);else selectedSet.delete(id)};
+    const lbl=document.createElement('label');
+    lbl.htmlFor=cb.id;lbl.textContent=name;
+    div.appendChild(cb);div.appendChild(lbl);
+    el.appendChild(div);
+  });
+}
+
+async function testConnection(){
+  hideMsg('testMsg');
+  const url=document.getElementById('url').value.trim();
+  const user=document.getElementById('user').value.trim();
+  const pass=document.getElementById('pass').value;
+  if(!url||!user||!pass){showMsg('testMsg','Please fill in all fields','err');return}
+  const btn=document.getElementById('btnTest');
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Testing...';
+  try{
+    const token=await getToken();
+    const r=await fetch('/LiveTv/Xtream/Test',{method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':token},
+      body:JSON.stringify({Url:url,Username:user,Password:pass})});
+    const d=await r.json();
+    if(!r.ok){showMsg('testMsg','Error: '+(d.Message||r.statusText),'err');return}
+    testData=d;
+    // Pre-select all categories
+    selectedLiveCats.clear();selectedVodCats.clear();selectedSeriesCats.clear();
+    (d.LiveCategories||[]).forEach(c=>selectedLiveCats.add(c.Id));
+    (d.VodCategories||[]).forEach(c=>selectedVodCats.add(c.Id));
+    (d.SeriesCategories||[]).forEach(c=>selectedSeriesCats.add(c.Id));
+    renderCats('liveCats',d.LiveCategories||[],selectedLiveCats);
+    renderCats('vodCats',d.VodCategories||[],selectedVodCats);
+    renderCats('seriesCats',d.SeriesCategories||[],selectedSeriesCats);
+    const lc=(d.LiveCategories||[]).length,vc=(d.VodCategories||[]).length,sc=(d.SeriesCategories||[]).length;
+    document.getElementById('catStats').textContent=lc+' live, '+vc+' VOD, '+sc+' series categories found.';
+    showMsg('testMsg','Connection successful!'+(lc+vc+sc>0?' Found '+(lc+vc+sc)+' categories.':''),'ok');
+    // Load saved config to restore selections
+    const cfg=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{headers:{'X-Emby-Token':token}}).then(r=>r.ok?r.json():null).catch(()=>null);
+    if(cfg){
+      document.getElementById('limit').value=cfg.ChannelLimit||0;
+      document.getElementById('slimit').value=cfg.SeriesLimit||250;
+      if(cfg.CategoryIds&&cfg.CategoryIds.length){
+        selectedLiveCats.clear();cfg.CategoryIds.forEach(id=>selectedLiveCats.add(id));
+        renderCats('liveCats',d.LiveCategories||[],selectedLiveCats);
+      }
+      if(cfg.ExcludeCategoryIds&&cfg.ExcludeCategoryIds.length){
+        cfg.ExcludeCategoryIds.forEach(id=>selectedLiveCats.delete(id));
+        renderCats('liveCats',d.LiveCategories||[],selectedLiveCats);
+      }
+    }
+    goToStep(2);
+  }catch(err){showMsg('testMsg','Error: '+err,'err')}
+  finally{btn.disabled=false;btn.textContent='Test Connection'}
+}
+
+async function getToken(){
+  const r=await fetch('/Users/AuthenticateByName',{method:'POST',
+    headers:{'Content-Type':'application/json','X-Emby-Authorization':'MediaBrowser Client="Config",Device="Config",DeviceId="config"'},
+    body:JSON.stringify({Username:'admin',Pw:document.getElementById('pass').value})});
+  if(!r.ok)throw new Error('Auth failed');
+  return(await r.json()).AccessToken;
+}
+
+async function saveConfig(){
+  hideMsg('saveMsg');
+  const url=document.getElementById('url').value.trim();
+  const user=document.getElementById('user').value.trim();
+  const pass=document.getElementById('pass').value;
+  const limit=+document.getElementById('limit').value||0;
+  const slimit=+document.getElementById('slimit').value||250;
+  const btn=document.getElementById('btnSave');
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Saving...';
+  try{
+    const cfg={Url:url,Username:user,Password:pass,ChannelLimit:limit,SeriesLimit:slimit,
+      CategoryIds:Array.from(selectedLiveCats),ExcludeCategoryIds:[]};
+    const token=await getToken();
+    const r=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{
+      method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':token},body:JSON.stringify(cfg)});
+    if(r.ok||r.status===204){showMsg('saveMsg','Configuration saved! Channels syncing...','ok')}
+    else{showMsg('saveMsg','Error: '+r.statusText,'err')}
+  }catch(err){showMsg('saveMsg','Error: '+err,'err')}
+  finally{btn.disabled=false;btn.textContent='Save & Sync'}
+}
+
+// Load existing config on page load
+fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origin'})
+  .then(r=>r.ok?r.json():null).then(c=>{
+    if(!c)return;
+    document.getElementById('url').value=c.Url||'';
+    document.getElementById('user').value=c.Username||c.UserName||'';
+    document.getElementById('pass').value=c.Password||'';
+    document.getElementById('limit').value=c.ChannelLimit||0;
+    document.getElementById('slimit').value=c.SeriesLimit||250;
+    if(c.CategoryIds&&c.CategoryIds.length){
+      c.CategoryIds.forEach(id=>selectedLiveCats.add(id));
+    }
+  }).catch(()=>{});
 </script></body></html>"#;
 
 pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError> {
@@ -16616,6 +16770,119 @@ async fn live_tv_tuner_host_types(
         }));
     }
     Ok(Json(types))
+}
+
+/// Test Xtream credentials and return available categories.
+/// POST /LiveTv/Xtream/Test
+/// Body: { "Url": "...", "Username": "...", "Password": "..." }
+async fn test_xtream_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let url = json_string_field(&payload, "Url")
+        .ok_or_else(|| ApiError::bad_request("Url is required"))?;
+    let username = json_string_field(&payload, "Username")
+        .or_else(|| json_string_field(&payload, "UserName"))
+        .ok_or_else(|| ApiError::bad_request("Username is required"))?;
+    let password = json_string_field(&payload, "Password")
+        .ok_or_else(|| ApiError::bad_request("Password is required"))?;
+
+    // Test connection by fetching live categories
+    let client = reqwest::Client::new();
+    let mut categories_url =
+        reqwest::Url::parse(&url).map_err(|_| ApiError::bad_request("Invalid Url format"))?;
+    categories_url.set_path("player_api.php");
+    categories_url
+        .query_pairs_mut()
+        .append_pair("username", &username)
+        .append_pair("password", &password)
+        .append_pair("action", "get_live_categories");
+
+    let response = client
+        .get(categories_url.clone())
+        .header("User-Agent", LIVE_TV_REMOTE_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_request(format!("Connection failed: {error}")))?;
+
+    if !response.status().is_success() {
+        return Err(ApiError::bad_request(format!(
+            "Server returned HTTP {}",
+            response.status()
+        )));
+    }
+
+    let categories: Vec<serde_json::Value> = response
+        .json()
+        .await
+        .map_err(|_| ApiError::bad_request("Invalid response from Xtream server"))?;
+
+    // Also fetch VOD categories
+    let mut vod_url =
+        reqwest::Url::parse(&url).map_err(|_| ApiError::bad_request("Invalid Url"))?;
+    vod_url.set_path("player_api.php");
+    vod_url
+        .query_pairs_mut()
+        .append_pair("username", &username)
+        .append_pair("password", &password)
+        .append_pair("action", "get_vod_categories");
+    let vod_categories = match client
+        .get(vod_url)
+        .header("User-Agent", LIVE_TV_REMOTE_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    // Fetch series categories
+    let mut series_url =
+        reqwest::Url::parse(&url).map_err(|_| ApiError::bad_request("Invalid Url"))?;
+    series_url.set_path("player_api.php");
+    series_url
+        .query_pairs_mut()
+        .append_pair("username", &username)
+        .append_pair("password", &password)
+        .append_pair("action", "get_series_categories");
+    let series_categories = match client
+        .get(series_url)
+        .header("User-Agent", LIVE_TV_REMOTE_USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    let format_category = |cat: &serde_json::Value| -> serde_json::Value {
+        let id = json_string_field(cat, "category_id")
+            .or_else(|| live_tv_u64_field(cat, "category_id").map(|v| v.to_string()))
+            .unwrap_or_default();
+        let name = json_string_field(cat, "category_name")
+            .or_else(|| json_string_field(cat, "name"))
+            .unwrap_or_else(|| id.clone());
+        serde_json::json!({ "Id": id, "Name": name })
+    };
+
+    Ok(Json(serde_json::json!({
+        "Success": true,
+        "LiveCategories": categories.iter().map(format_category).collect::<Vec<_>>(),
+        "VodCategories": vod_categories.iter().map(format_category).collect::<Vec<_>>(),
+        "SeriesCategories": series_categories.iter().map(format_category).collect::<Vec<_>>(),
+    })))
 }
 
 async fn add_live_tv_tuner_host(
