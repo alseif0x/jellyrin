@@ -15144,6 +15144,8 @@ button:hover{background:#00b8d4}
 .hint{font-size:.85rem;color:#808080;margin-top:.25rem}
 </style></head>
 <body>
+<div class="pageContainer">
+<div data-role="content">
 <h1>Xtream Codes Provider</h1>
 <form id="f">
   <label>Server URL<input id="url" placeholder="http://example.com:8080" required></label>
@@ -15157,6 +15159,8 @@ button:hover{background:#00b8d4}
   <button type="submit">Save Configuration</button>
 </form>
 <div id="msg" class="msg"></div>
+</div>
+</div>
 <script>
 const api=(m,b)=>fetch('/Plugins/jellyrin-xtream-provider/Configuration',{method:m,headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):undefined,credentials:'same-origin'});
 function show(m,t){const e=document.getElementById('msg');e.textContent=m;e.className='msg '+(t||'ok');e.style.display='block'}
