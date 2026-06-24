@@ -104,9 +104,7 @@ pub async fn import_from_payload(payload: &serde_json::Value) -> Option<LiveTvXt
     })
 }
 
-pub async fn import_media_from_payload(
-    payload: &serde_json::Value,
-) -> Option<XtreamMediaImport> {
+pub async fn import_media_from_payload(payload: &serde_json::Value) -> Option<XtreamMediaImport> {
     let base_url = json_string_field(payload, "Url")?;
     let username = json_string_field(payload, "Username")
         .or_else(|| json_string_field(payload, "UserName"))?;
@@ -288,9 +286,7 @@ fn category_id_filter(payload: &serde_json::Value, keys: &[&str]) -> HashSet<Str
     ids
 }
 
-pub async fn programs_from_payload(
-    payload: &serde_json::Value,
-) -> Option<Vec<serde_json::Value>> {
+pub async fn programs_from_payload(payload: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
     let base_url = json_string_field(payload, "Url")?;
     let username = json_string_field(payload, "Username")
         .or_else(|| json_string_field(payload, "UserName"))?;
@@ -933,10 +929,7 @@ fn xtream_f64(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
     None
 }
 
-pub fn parse_epg_programs(
-    channel_id: &str,
-    epg: &serde_json::Value,
-) -> Vec<serde_json::Value> {
+pub fn parse_epg_programs(channel_id: &str, epg: &serde_json::Value) -> Vec<serde_json::Value> {
     epg_listings(epg)
         .into_iter()
         .enumerate()

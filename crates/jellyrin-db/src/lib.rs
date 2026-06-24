@@ -4560,13 +4560,17 @@ impl Database {
             return Ok(MediaItemFilterSummary::default());
         }
 
-        let mut summary = MediaItemFilterSummary::default();
-        summary.genres = self
+        let genres = self
             .distinct_media_item_metadata_values_for_virtual_folders(folder_ids, "Genres")
             .await?;
-        summary.tags = self
+        let tags = self
             .distinct_media_item_metadata_values_for_virtual_folders(folder_ids, "Tags")
             .await?;
+        let mut summary = MediaItemFilterSummary {
+            genres,
+            tags,
+            ..Default::default()
+        };
 
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT path, media_type FROM media_items \

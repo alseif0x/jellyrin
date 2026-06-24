@@ -47,8 +47,7 @@ use jellyrin_db::{
     ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
     DeviceSession, DiscoveredPluginPackage, InstallPluginPackage, LiveTvCategoryUpsert,
     LiveTvChannelQuery, LiveTvChannelRecord, LiveTvChannelUpsert, LiveTvTunerUpsert,
-    MediaItemFilterSummary,
-    MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission,
+    MediaItemFilterSummary, MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission,
     NamedConfigurationPayload, PluginRuntimeInstanceUpsert, QuickConnectSession, SortDirection,
     SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
     UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
@@ -14709,9 +14708,8 @@ static LIVE_TV_PROVIDER_REGISTRY: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn live_tv_provider_registry() -> &'static tokio::sync::RwLock<Vec<&'static dyn LiveTvProvider>> {
-    LIVE_TV_PROVIDER_REGISTRY.get_or_init(|| {
-        tokio::sync::RwLock::new(vec![&XTREAM_LIVE_TV_PROVIDER])
-    })
+    LIVE_TV_PROVIDER_REGISTRY
+        .get_or_init(|| tokio::sync::RwLock::new(vec![&XTREAM_LIVE_TV_PROVIDER]))
 }
 
 async fn live_tv_provider_for_type(provider_type: &str) -> Option<&'static dyn LiveTvProvider> {
@@ -16073,7 +16071,9 @@ async fn live_tv_tuner_host_types(
         serde_json::json!({ "Id": "m3u", "Name": "M3U Tuner" }),
     ];
     for provider_type in live_tv_provider_types().await {
-        if provider_type.eq_ignore_ascii_case("hdhomerun") || provider_type.eq_ignore_ascii_case("m3u") {
+        if provider_type.eq_ignore_ascii_case("hdhomerun")
+            || provider_type.eq_ignore_ascii_case("m3u")
+        {
             continue;
         }
         types.push(serde_json::json!({
@@ -22124,7 +22124,7 @@ async fn live_tv_channel_items_result(
         .is_some();
     let requested_limit = query.limit.unwrap_or(25);
     let limit = if is_channel_search {
-        requested_limit.max(5000).min(5000)
+        5000
     } else {
         requested_limit.min(500)
     };

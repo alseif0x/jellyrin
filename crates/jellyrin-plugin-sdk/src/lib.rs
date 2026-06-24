@@ -13,6 +13,7 @@ pub const CAPABILITY_SCHEDULED_TASK: &str = "ScheduledTask";
 pub const CAPABILITY_METADATA_PROVIDER: &str = "MetadataProvider";
 pub const CAPABILITY_IMAGE_PROVIDER: &str = "ImageProvider";
 pub const CAPABILITY_CHANNEL_PROVIDER: &str = "ChannelProvider";
+pub const CAPABILITY_LIVE_TV_PROVIDER: &str = "LiveTvProvider";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -173,6 +174,94 @@ impl ChannelResult {
         Self {
             items,
             total_record_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveTvProviderRequest {
+    pub action: String,
+    #[serde(default)]
+    pub tuner_config: Value,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+impl LiveTvProviderRequest {
+    pub fn import_channels(tuner_config: Value) -> Self {
+        Self {
+            action: "ImportChannels".to_string(),
+            tuner_config,
+            arguments: json!({}),
+        }
+    }
+
+    pub fn import_programs(tuner_config: Value) -> Self {
+        Self {
+            action: "ImportPrograms".to_string(),
+            tuner_config,
+            arguments: json!({}),
+        }
+    }
+
+    pub fn sync_media(tuner_config: Value) -> Self {
+        Self {
+            action: "SyncMedia".to_string(),
+            tuner_config,
+            arguments: json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveTvProviderResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_items: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub movie_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_episode_count: Option<u64>,
+}
+
+impl LiveTvProviderResult {
+    pub fn channels(channels: Vec<Value>, categories: Vec<Value>) -> Self {
+        Self {
+            channels,
+            categories,
+            programs: Vec::new(),
+            media_items: Vec::new(),
+            movie_count: None,
+            series_episode_count: None,
+        }
+    }
+
+    pub fn programs(programs: Vec<Value>) -> Self {
+        Self {
+            channels: Vec::new(),
+            categories: Vec::new(),
+            programs,
+            media_items: Vec::new(),
+            movie_count: None,
+            series_episode_count: None,
+        }
+    }
+
+    pub fn media_sync(movie_count: u64, series_episode_count: u64) -> Self {
+        Self {
+            channels: Vec::new(),
+            categories: Vec::new(),
+            programs: Vec::new(),
+            media_items: Vec::new(),
+            movie_count: Some(movie_count),
+            series_episode_count: Some(series_episode_count),
         }
     }
 }
@@ -445,6 +534,13 @@ impl CapabilityResponse {
         Self::executed(
             CAPABILITY_CHANNEL_PROVIDER,
             serde_json::to_value(result).expect("ChannelResult must serialize"),
+        )
+    }
+
+    pub fn live_tv_provider(result: LiveTvProviderResult) -> Self {
+        Self::executed(
+            CAPABILITY_LIVE_TV_PROVIDER,
+            serde_json::to_value(result).expect("LiveTvProviderResult must serialize"),
         )
     }
 
