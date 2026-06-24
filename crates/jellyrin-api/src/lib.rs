@@ -15144,6 +15144,7 @@ button:hover{background:#00b8d4}
 .hint{font-size:.85rem;color:#808080;margin-top:.25rem}
 </style></head>
 <body>
+<div data-role="page" class="page type-interior pluginConfigurationPage">
 <div class="pageContainer">
 <div data-role="content">
 <h1>Xtream Codes Provider</h1>
@@ -15159,6 +15160,7 @@ button:hover{background:#00b8d4}
   <button type="submit">Save Configuration</button>
 </form>
 <div id="msg" class="msg"></div>
+</div>
 </div>
 </div>
 <script>
