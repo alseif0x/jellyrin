@@ -11659,6 +11659,17 @@ async fn dashboard_configuration_page(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| ApiError::bad_request("Configuration page name is required"))?;
+
+    // Check if this is a built-in plugin configuration page
+    if let Some(html) = builtin_plugin_web_page_by_name(&state.db, name).await? {
+        return Ok(Response::builder()
+            .header("content-type", "text/html; charset=utf-8")
+            .header("cache-control", "no-cache")
+            .body(Body::from(html))
+            .unwrap());
+    }
+
+    // Fall back to web directory files
     let relative_path = safe_web_relative_path(name)?;
     let path = state.web_dir.join(relative_path);
     let bytes = tokio::fs::read(&path)
@@ -11674,6 +11685,41 @@ async fn dashboard_configuration_page(
     );
     headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
     Ok((headers, bytes).into_response())
+}
+
+/// Look up a built-in plugin's web page content by its display name.
+async fn builtin_plugin_web_page_by_name(
+    db: &Database,
+    name: &str,
+) -> Result<Option<&'static str>, ApiError> {
+    for plugin in db.installed_plugins_json().await? {
+        let runtime = json_string_field(&plugin, "Runtime").unwrap_or_default();
+        if !runtime.eq_ignore_ascii_case("Builtin") {
+            continue;
+        }
+        let Some(manifest) = plugin.get("Manifest") else {
+            continue;
+        };
+        if let Some(web_pages) = manifest.get("WebPages").and_then(|v| v.as_array()) {
+            for page in web_pages {
+                let display_name = json_string_field(page, "DisplayName").unwrap_or_default();
+                if display_name.eq_ignore_ascii_case(name) {
+                    // Return the embedded HTML content
+                    let page_name = json_string_field(page, "Name").unwrap_or_default();
+                    return Ok(Some(builtin_web_page_content(&page_name)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Return the HTML content for a built-in plugin web page.
+fn builtin_web_page_content(page_name: &str) -> &'static str {
+    match page_name {
+        "xtream-config" => XTREAM_CONFIG_HTML,
+        _ => "<html><body><p>Page not found</p></body></html>",
+    }
 }
 
 async fn discover_dashboard_configuration_pages(
