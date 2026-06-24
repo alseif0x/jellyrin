@@ -15134,329 +15134,282 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Xtream Codes Configuration</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:transparent;color:rgba(255,255,255,.87);line-height:1.5}
-
-/* Stepper */
-.stepper{display:flex;gap:0;margin-bottom:2rem;counter-reset:step}
-.stepper-item{flex:1;text-align:center;padding:.75rem .5rem;position:relative;border-bottom:3px solid rgba(255,255,255,.1);color:rgba(255,255,255,.4);font-size:.85rem;transition:all .3s}
-.stepper-item.active{border-bottom-color:#00d4ff;color:#00d4ff}
-.stepper-item.done{border-bottom-color:#4caf50;color:#4caf50}
-.stepper-item::before{content:counter(step);counter-increment:step;display:block;width:28px;height:28px;line-height:28px;border-radius:50%;background:rgba(255,255,255,.1);margin:0 auto .4rem;font-weight:700;font-size:.85rem}
-.stepper-item.active::before{background:#00d4ff;color:#000}
-.stepper-item.done::before{content:'✓';background:#4caf50;color:#fff}
-
-/* Cards */
-.card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:1.5rem;margin-bottom:1rem}
-.card-title{font-size:1.1rem;font-weight:600;color:#fff;margin-bottom:1rem;display:flex;align-items:center;gap:.5rem}
-.card-title .icon{font-size:1.2rem}
-
-/* Form controls */
-.form-group{margin-bottom:1.25rem}
-.form-group label{display:block;font-size:.85rem;font-weight:500;color:rgba(255,255,255,.6);margin-bottom:.4rem;letter-spacing:.02em}
-.form-group input[type=text],
-.form-group input[type=password],
-.form-group input[type=number]{width:100%;padding:.65rem .85rem;border:1px solid rgba(255,255,255,.15);border-radius:6px;background:rgba(0,0,0,.25);color:#fff;font-size:.95rem;transition:border-color .2s}
-.form-group input:focus{outline:none;border-color:#00d4ff;box-shadow:0 0 0 2px rgba(0,212,255,.15)}
-.form-group input::placeholder{color:rgba(255,255,255,.25)}
-.form-hint{font-size:.8rem;color:rgba(255,255,255,.35);margin-top:.3rem}
-
-/* Buttons */
-.actions{display:flex;gap:.75rem;margin-top:1.5rem}
-.btn{padding:.65rem 1.5rem;border:none;border-radius:6px;font-weight:600;font-size:.9rem;cursor:pointer;display:inline-flex;align-items:center;gap:.5rem;transition:all .2s}
-.btn:disabled{opacity:.5;cursor:not-allowed}
-.btn-primary{background:#00d4ff;color:#000}
-.btn-primary:hover:not(:disabled){background:#33ddff}
-.btn-secondary{background:rgba(255,255,255,.1);color:rgba(255,255,255,.8)}
-.btn-secondary:hover:not(:disabled){background:rgba(255,255,255,.15)}
-.btn-success{background:#4caf50;color:#fff}
-.btn-success:hover:not(:disabled){background:#66bb6a}
-.btn-block{flex:1;justify-content:center}
-
-/* Messages */
-.alert{padding:.75rem 1rem;border-radius:6px;font-size:.9rem;margin-top:1rem;display:none;align-items:center;gap:.5rem}
-.alert.show{display:flex}
-.alert-success{background:rgba(76,175,80,.15);border:1px solid rgba(76,175,80,.3);color:#81c784}
-.alert-error{background:rgba(244,67,54,.15);border:1px solid rgba(244,67,54,.3);color:#e57373}
-.alert .icon{font-size:1.1rem}
-
-/* Categories */
-.cat-section{margin-bottom:1.25rem}
-.cat-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.5rem}
-.cat-header h4{font-size:.9rem;font-weight:600;color:rgba(255,255,255,.7)}
-.cat-count{font-size:.8rem;color:rgba(255,255,255,.35);background:rgba(255,255,255,.05);padding:.15rem .5rem;border-radius:10px}
-.select-all{font-size:.8rem;color:#00d4ff;cursor:pointer;background:none;border:none;padding:.15rem .5rem}
-.select-all:hover{text-decoration:underline}
-.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.35rem;max-height:200px;overflow-y:auto;padding:.5rem;background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.06);border-radius:6px}
-.cat-grid::-webkit-scrollbar{width:6px}
-.cat-grid::-webkit-scrollbar-track{background:transparent}
-.cat-grid::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:3px}
-.cat-item{display:flex;align-items:center;gap:.5rem;padding:.4rem .6rem;border-radius:4px;cursor:pointer;transition:background .15s}
-.cat-item:hover{background:rgba(255,255,255,.05)}
-.cat-item input[type=checkbox]{accent-color:#00d4ff;width:15px;height:15px;flex-shrink:0}
-.cat-item label{margin:0;font-weight:400;font-size:.85rem;color:rgba(255,255,255,.75);cursor:pointer;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-/* Spinner */
-.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* Steps */
-.step{display:none}
-.step.active{display:block}
-
-/* Stats */
-.stats{display:flex;gap:1rem;margin-bottom:1rem;flex-wrap:wrap}
-.stat{background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.15);border-radius:6px;padding:.5rem .85rem;text-align:center}
-.stat-value{font-size:1.2rem;font-weight:700;color:#00d4ff}
-.stat-label{font-size:.75rem;color:rgba(255,255,255,.4);margin-top:.15rem}
+/* Isolate from Jellyfin styles */
+.xtream-config{all:initial;font-family:inherit;color:inherit;line-height:1.5}
+.xtream-config *{box-sizing:border-box}
+.xtream-config .hdr{font-size:1.4rem;font-weight:300;color:rgba(255,255,255,.87);margin:0 0 1.5rem;padding:0 0 .5rem;border-bottom:1px solid rgba(255,255,255,.1)}
+.xtream-config .sub{font-size:.9rem;color:rgba(255,255,255,.5);margin-bottom:1.5rem;display:block}
+.xtream-config .steps{display:flex;gap:0;margin-bottom:2rem;border-bottom:2px solid rgba(255,255,255,.08)}
+.xtream-config .step-tab{flex:1;text-align:center;padding:.75rem .5rem;font-size:.82rem;color:rgba(255,255,255,.35);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:.2s}
+.xtream-config .step-tab.on{color:#00a4dc;border-bottom-color:#00a4dc}
+.xtream-config .step-tab.done{color:rgba(76,175,80,.7)}
+.xtream-config .panel{display:none}
+.xtream-config .panel.on{display:block}
+.xtream-config .card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:1.25rem;margin-bottom:1rem}
+.xtream-config .card-h{font-size:.95rem;font-weight:600;color:rgba(255,255,255,.8);margin-bottom:1rem}
+.xtream-config .fg{margin-bottom:1rem}
+.xtream-config .fg label{display:block;font-size:.8rem;color:rgba(255,255,255,.45);margin-bottom:.3rem;text-transform:uppercase;letter-spacing:.04em}
+.xtream-config .fg input{width:100%;padding:.55rem .75rem;border:1px solid rgba(255,255,255,.12);border-radius:4px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.87);font-size:.9rem;outline:none}
+.xtream-config .fg input:focus{border-color:#00a4dc}
+.xtream-config .fg input::placeholder{color:rgba(255,255,255,.2)}
+.xtream-config .hint{font-size:.75rem;color:rgba(255,255,255,.25);margin-top:.2rem}
+.xtream-config .btns{display:flex;gap:.5rem;margin-top:1.25rem}
+.xtream-config .btn{padding:.55rem 1.25rem;border:none;border-radius:4px;font-size:.85rem;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:.4rem}
+.xtream-config .btn:disabled{opacity:.4;cursor:default}
+.xtream-config .btn-p{background:#00a4dc;color:#000}
+.xtream-config .btn-p:hover:not(:disabled){background:#26bbee}
+.xtream-config .btn-s{background:rgba(255,255,255,.08);color:rgba(255,255,255,.7)}
+.xtream-config .btn-s:hover:not(:disabled){background:rgba(255,255,255,.12)}
+.xtream-config .btn-g{background:rgba(76,175,80,.2);color:#81c784;border:1px solid rgba(76,175,80,.3)}
+.xtream-config .btn-g:hover:not(:disabled){background:rgba(76,175,80,.3)}
+.xtream-config .btn-f{flex:1;justify-content:center}
+.xtream-config .msg{padding:.65rem .85rem;border-radius:4px;font-size:.85rem;margin-top:.75rem;display:none}
+.xtream-config .msg.show{display:block}
+.xtream-config .msg.ok{background:rgba(76,175,80,.1);color:#81c784;border:1px solid rgba(76,175,80,.2)}
+.xtream-config .msg.err{background:rgba(244,67,54,.1);color:#e57373;border:1px solid rgba(244,67,54,.2)}
+.xtream-config .row{display:flex;gap:1rem;margin-bottom:1rem;flex-wrap:wrap}
+.xtream-config .chip{background:rgba(0,164,220,.08);border:1px solid rgba(0,164,220,.15);border-radius:4px;padding:.4rem .75rem;text-align:center;flex:1;min-width:80px}
+.xtream-config .chip-v{font-size:1.1rem;font-weight:700;color:#00a4dc}
+.xtream-config .chip-l{font-size:.7rem;color:rgba(255,255,255,.35);margin-top:.1rem}
+.xtream-config .sec{margin-bottom:1rem}
+.xtream-config .sec-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem}
+.xtream-config .sec-h h4{font-size:.82rem;color:rgba(255,255,255,.5);font-weight:500;margin:0}
+.xtream-config .sec-h .cnt{font-size:.72rem;color:rgba(255,255,255,.25);background:rgba(255,255,255,.04);padding:.1rem .4rem;border-radius:3px}
+.xtream-config .sel-all{font-size:.75rem;color:#00a4dc;cursor:pointer;background:none;border:none;padding:0;margin-bottom:.3rem;display:inline-block}
+.xtream-config .sel-all:hover{text-decoration:underline}
+.xtream-config .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:2px;max-height:180px;overflow-y:auto;padding:.35rem;background:rgba(0,0,0,.15);border-radius:4px}
+.xtream-config .grid::-webkit-scrollbar{width:4px}
+.xtream-config .grid::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:2px}
+.xtream-config .ci{display:flex;align-items:center;gap:.4rem;padding:.3rem .5rem;border-radius:3px;cursor:pointer}
+.xtream-config .ci:hover{background:rgba(255,255,255,.04)}
+.xtream-config .ci input{accent-color:#00a4dc;width:14px;height:14px;flex-shrink:0}
+.xtream-config .ci label{font-size:.82rem;color:rgba(255,255,255,.65);cursor:pointer;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:0}
+.xtream-config .sp{display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.15);border-top-color:#00a4dc;border-radius:50%;animation:xsp .5s linear infinite}
+@keyframes xsp{to{transform:rotate(360deg)}}
+.xtream-config .sum{font-size:.85rem;color:rgba(255,255,255,.5);line-height:1.6}
+.xtream-config .sum strong{color:rgba(255,255,255,.8)}
 </style></head>
 <body>
 <div data-role="page" class="page type-interior pluginConfigurationPage">
-<div class="pageContainer">
-<div data-role="content">
+<div class="pageContainer"><div data-role="content">
+<div class="xtream-config">
 
-<div class="stepper">
-  <div class="stepper-item active" id="si1">Connection</div>
-  <div class="stepper-item" id="si2">Categories</div>
-  <div class="stepper-item" id="si3">Settings</div>
+<div class="hdr">Xtream Codes Provider</div>
+<span class="sub">Connect to an Xtream Codes IPTV server to import live TV channels, VOD movies, and series.</span>
+
+<div class="steps">
+  <div class="step-tab on" id="tab1">1. Connection</div>
+  <div class="step-tab" id="tab2">2. Categories</div>
+  <div class="step-tab" id="tab3">3. Save</div>
 </div>
 
-<!-- Step 1: Connection -->
-<div id="step1" class="step active">
+<!-- Panel 1 -->
+<div class="panel on" id="p1">
   <div class="card">
-    <div class="card-title"><span class="icon">🔗</span> Server Connection</div>
-    <div class="form-group">
+    <div class="card-h">Server Credentials</div>
+    <div class="fg">
       <label for="url">Server URL</label>
-      <input type="text" id="url" placeholder="http://example.com:8080">
-      <div class="form-hint">Xtream Codes server address with port</div>
+      <input type="text" id="url" placeholder="http://host:port">
+      <div class="hint">Include the port number</div>
     </div>
-    <div class="form-group">
+    <div class="fg">
       <label for="user">Username</label>
-      <input type="text" id="user" placeholder="your-username">
+      <input type="text" id="user">
     </div>
-    <div class="form-group">
+    <div class="fg">
       <label for="pass">Password</label>
-      <input type="password" id="pass" placeholder="your-password">
+      <input type="password" id="pass">
     </div>
   </div>
-  <div class="actions">
-    <button class="btn btn-primary btn-block" onclick="testConnection()" id="btnTest">
-      <span>Test Connection</span>
-    </button>
+  <div class="btns">
+    <button class="btn btn-p btn-f" onclick="doTest()" id="bTest">Test Connection</button>
   </div>
-  <div id="testMsg" class="alert"></div>
+  <div class="msg" id="mTest"></div>
 </div>
 
-<!-- Step 2: Categories -->
-<div id="step2" class="step">
-  <div class="stats" id="catStats"></div>
-  <div class="card">
-    <div class="card-title"><span class="icon">📺</span> Live TV Channels</div>
-    <div class="cat-section">
-      <div class="cat-header">
-        <h4>Categories</h4>
-        <span class="cat-count" id="liveCatCount">0</span>
-      </div>
-      <button class="select-all" onclick="toggleAll('liveCats',selectedLiveCats)">Select / Deselect All</button>
-      <div class="cat-grid" id="liveCats"></div>
+<!-- Panel 2 -->
+<div class="panel" id="p2">
+  <div class="row" id="stats"></div>
+  <div class="card" id="secLive">
+    <div class="card-h">Live TV Channels</div>
+    <div class="sec">
+      <div class="sec-h"><h4>Categories</h4><span class="cnt" id="cLive">0</span></div>
+      <button class="sel-all" onclick="togAll('gLive',sLive)">Select / Deselect All</button>
+      <div class="grid" id="gLive"></div>
     </div>
   </div>
-  <div class="card">
-    <div class="card-title"><span class="icon">🎬</span> VOD Movies</div>
-    <div class="cat-section">
-      <div class="cat-header">
-        <h4>Categories</h4>
-        <span class="cat-count" id="vodCatCount">0</span>
-      </div>
-      <button class="select-all" onclick="toggleAll('vodCats',selectedVodCats)">Select / Deselect All</button>
-      <div class="cat-grid" id="vodCats"></div>
+  <div class="card" id="secVod">
+    <div class="card-h">VOD Movies</div>
+    <div class="sec">
+      <div class="sec-h"><h4>Categories</h4><span class="cnt" id="cVod">0</span></div>
+      <button class="sel-all" onclick="togAll('gVod',sVod)">Select / Deselect All</button>
+      <div class="grid" id="gVod"></div>
     </div>
   </div>
-  <div class="card">
-    <div class="card-title"><span class="icon">📺</span> Series</div>
-    <div class="cat-section">
-      <div class="cat-header">
-        <h4>Categories</h4>
-        <span class="cat-count" id="seriesCatCount">0</span>
-      </div>
-      <button class="select-all" onclick="toggleAll('seriesCats',selectedSeriesCats)">Select / Deselect All</button>
-      <div class="cat-grid" id="seriesCats"></div>
+  <div class="card" id="secSer">
+    <div class="card-h">Series</div>
+    <div class="sec">
+      <div class="sec-h"><h4>Categories</h4><span class="cnt" id="cSer">0</span></div>
+      <button class="sel-all" onclick="togAll('gSer',sSer)">Select / Deselect All</button>
+      <div class="grid" id="gSer"></div>
     </div>
   </div>
-  <div class="actions">
-    <button class="btn btn-secondary" onclick="goToStep(1)">← Back</button>
-    <button class="btn btn-primary btn-block" onclick="goToStep(3)">Next →</button>
+  <div class="btns">
+    <button class="btn btn-s" onclick="go(1)">Back</button>
+    <button class="btn btn-p btn-f" onclick="go(3)">Next</button>
   </div>
 </div>
 
-<!-- Step 3: Settings & Save -->
-<div id="step3" class="step">
+<!-- Panel 3 -->
+<div class="panel" id="p3">
   <div class="card">
-    <div class="card-title"><span class="icon">⚙️</span> Import Settings</div>
-    <div class="form-group">
+    <div class="card-h">Import Settings</div>
+    <div class="fg">
       <label for="limit">Channel Limit</label>
       <input type="number" id="limit" value="0" min="0">
-      <div class="form-hint">Maximum channels to import (0 = no limit)</div>
+      <div class="hint">0 = import all channels</div>
     </div>
-    <div class="form-group">
+    <div class="fg">
       <label for="slimit">Series Limit</label>
       <input type="number" id="slimit" value="250" min="0">
-      <div class="form-hint">Maximum series to import</div>
     </div>
   </div>
-  <div class="card" id="summaryCard" style="display:none">
-    <div class="card-title"><span class="icon">📋</span> Summary</div>
-    <div id="summaryContent" style="font-size:.9rem;color:rgba(255,255,255,.6)"></div>
+  <div class="card" id="sumCard" style="display:none">
+    <div class="card-h">Summary</div>
+    <div class="sum" id="sumTxt"></div>
   </div>
-  <div class="actions">
-    <button class="btn btn-secondary" onclick="goToStep(2)">← Back</button>
-    <button class="btn btn-success btn-block" onclick="saveConfig()" id="btnSave">
-      <span>Save & Sync</span>
-    </button>
+  <div class="btns">
+    <button class="btn btn-s" onclick="go(2)">Back</button>
+    <button class="btn btn-g btn-f" onclick="doSave()" id="bSave">Save & Sync</button>
   </div>
-  <div id="saveMsg" class="alert"></div>
+  <div class="msg" id="mSave"></div>
 </div>
 
 </div>
-</div>
+</div></div>
 </div>
 <script>
-let testData={LiveCategories:[],VodCategories:[],SeriesCategories:[]};
-let selectedLiveCats=new Set(),selectedVodCats=new Set(),selectedSeriesCats=new Set();
-let authToken=null;
+var td={LiveCategories:[],VodCategories:[],SeriesCategories:[]};
+var sLive=new Set(),sVod=new Set(),sSer=new Set(),tok=null;
 
-function goToStep(n){
-  document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
-  document.getElementById('step'+n).classList.add('active');
-  document.querySelectorAll('.stepper-item').forEach((s,i)=>{
-    s.classList.remove('active','done');
-    if(i+1===n)s.classList.add('active');
-    else if(i+1<n)s.classList.add('done');
+function go(n){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
+  document.getElementById('p'+n).classList.add('on');
+  document.querySelectorAll('.step-tab').forEach((t,i)=>{
+    t.classList.remove('on','done');
+    if(i+1===n)t.classList.add('on');
+    else if(i+1<n)t.classList.add('done');
   });
-  if(n===3)updateSummary();
+  if(n===3)mkSum();
 }
+function mok(id,m){var e=document.getElementById(id);e.innerHTML=m;e.className='msg show ok'}
+function merr(id,m){var e=document.getElementById(id);e.innerHTML=m;e.className='msg show err'}
+function mhide(id){document.getElementById(id).className='msg'}
 
-function showMsg(id,m,type){
-  const e=document.getElementById(id);
-  const icon=type==='error'?'✕':'✓';
-  e.innerHTML='<span class="icon">'+icon+'</span> '+m;
-  e.className='alert show alert-'+(type==='error'?'error':'success');
-}
-function hideMsg(id){document.getElementById(id).className='alert'}
-
-function renderCats(containerId,cats,selectedSet,countId){
-  const el=document.getElementById(containerId);
-  el.innerHTML='';
-  cats.forEach(c=>{
-    const id=c.Id||'';
-    const name=c.Name||id;
-    const div=document.createElement('div');div.className='cat-item';
-    const cb=document.createElement('input');cb.type='checkbox';
-    cb.id='cat_'+containerId+'_'+id;cb.checked=selectedSet.has(id);
-    cb.onchange=()=>{if(cb.checked)selectedSet.add(id);else selectedSet.delete(id)};
-    const lbl=document.createElement('label');lbl.htmlFor=cb.id;lbl.textContent=name;
-    div.appendChild(cb);div.appendChild(lbl);el.appendChild(div);
+function rc(gid,cats,set,cid){
+  var el=document.getElementById(gid);el.innerHTML='';
+  cats.forEach(function(c){
+    var id=c.Id||'',nm=c.Name||id;
+    var d=document.createElement('div');d.className='ci';
+    var cb=document.createElement('input');cb.type='checkbox';cb.id='c_'+gid+'_'+id;cb.checked=set.has(id);
+    cb.onchange=function(){if(cb.checked)set.add(id);else set.delete(id)};
+    var l=document.createElement('label');l.htmlFor=cb.id;l.textContent=nm;
+    d.appendChild(cb);d.appendChild(l);el.appendChild(d);
   });
-  if(countId)document.getElementById(countId).textContent=cats.length+' selected';
+  document.getElementById(cid).textContent=cats.length;
+}
+function togAll(gid,set){
+  var cbs=document.getElementById(gid).querySelectorAll('input');
+  var all=Array.from(cbs).every(function(c){return c.checked});
+  cbs.forEach(function(c){c.checked=!all;if(c.checked)set.add(c.id.split('_').pop());else set.delete(c.id.split('_').pop())});
+}
+function mkSum(){
+  var lc=sLive.size,vc=sVod.size,sc=sSer.size;
+  var t=td.LiveCategories.length+td.VodCategories.length+td.SeriesCategories.length;
+  var h='<p>Importing <strong>'+lc+'</strong> live, <strong>'+vc+'</strong> VOD, <strong>'+sc+'</strong> series categories.</p>';
+  if(t>lc+vc+sc)h+='<p style="margin-top:.35rem">'+(t-lc-vc-sc)+' excluded.</p>';
+  document.getElementById('sumTxt').innerHTML=h;
+  document.getElementById('sumCard').style.display='';
 }
 
-function toggleAll(containerId,set){
-  const cbs=document.getElementById(containerId).querySelectorAll('input[type=checkbox]');
-  const allChecked=Array.from(cbs).every(cb=>cb.checked);
-  cbs.forEach(cb=>{cb.checked=!allChecked;if(cb.checked)set.add(cb.id.split('_').pop());else set.delete(cb.id.split('_').pop())});
-}
-
-function updateSummary(){
-  const lc=selectedLiveCats.size,vc=selectedVodCats.size,sc=selectedSeriesCats.size;
-  const total=testData.LiveCategories.length+testData.VodCategories.length+testData.SeriesCategories.length;
-  let html='<p>Importing <strong>'+lc+'</strong> live TV, <strong>'+vc+'</strong> VOD, and <strong>'+sc+'</strong> series categories.</p>';
-  if(total>lc+vc+sc)html+='<p style="margin-top:.5rem;color:rgba(255,255,255,.35)">'+(total-lc-vc-sc)+' categories excluded.</p>';
-  document.getElementById('summaryContent').innerHTML=html;
-  document.getElementById('summaryCard').style.display='block';
-}
-
-async function testConnection(){
-  hideMsg('testMsg');
-  const url=document.getElementById('url').value.trim();
-  const user=document.getElementById('user').value.trim();
-  const pass=document.getElementById('pass').value;
-  if(!url||!user||!pass){showMsg('testMsg','Please fill in all fields','error');return}
-  const btn=document.getElementById('btnTest');
-  btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Testing...';
+async function doTest(){
+  mhide('mTest');
+  var url=document.getElementById('url').value.trim(),
+      user=document.getElementById('user').value.trim(),
+      pass=document.getElementById('pass').value;
+  if(!url||!user||!pass){merr('mTest','Fill in all fields');return}
+  var btn=document.getElementById('bTest');btn.disabled=true;btn.innerHTML='<span class="sp"></span> Testing...';
   try{
-    authToken=authToken||await getToken(pass);
-    const r=await fetch('/LiveTv/Xtream/Test',{method:'POST',
-      headers:{'Content-Type':'application/json','X-Emby-Token':authToken},
+    tok=tok||await gtok(pass);
+    var r=await fetch('/LiveTv/Xtream/Test',{method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':tok},
       body:JSON.stringify({Url:url,Username:user,Password:pass})});
-    const d=await r.json();
-    if(!r.ok){showMsg('testMsg',d.Message||r.statusText,'error');return}
-    testData=d;
-    selectedLiveCats.clear();selectedVodCats.clear();selectedSeriesCats.clear();
-    (d.LiveCategories||[]).forEach(c=>selectedLiveCats.add(c.Id));
-    (d.VodCategories||[]).forEach(c=>selectedVodCats.add(c.Id));
-    (d.SeriesCategories||[]).forEach(c=>selectedSeriesCats.add(c.Id));
-    renderCats('liveCats',d.LiveCategories||[],selectedLiveCats,'liveCatCount');
-    renderCats('vodCats',d.VodCategories||[],selectedVodCats,'vodCatCount');
-    renderCats('seriesCats',d.SeriesCategories||[],selectedSeriesCats,'seriesCatCount');
-    const lc=(d.LiveCategories||[]).length,vc=(d.VodCategories||[]).length,sc=(d.SeriesCategories||[]).length;
-    document.getElementById('catStats').innerHTML=
-      '<div class="stat"><div class="stat-value">'+lc+'</div><div class="stat-label">Live TV</div></div>'+
-      '<div class="stat"><div class="stat-value">'+vc+'</div><div class="stat-label">VOD</div></div>'+
-      '<div class="stat"><div class="stat-value">'+sc+'</div><div class="stat-label">Series</div></div>';
-    const cfg=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{headers:{'X-Emby-Token':authToken}})
-      .then(r=>r.ok?r.json():null).catch(()=>null);
+    var d=await r.json();
+    if(!r.ok){merr('mTest',d.Message||r.statusText);return}
+    td=d;sLive.clear();sVod.clear();sSer.clear();
+    (d.LiveCategories||[]).forEach(function(c){sLive.add(c.Id)});
+    (d.VodCategories||[]).forEach(function(c){sVod.add(c.Id)});
+    (d.SeriesCategories||[]).forEach(function(c){sSer.add(c.Id)});
+    rc('gLive',d.LiveCategories||[],sLive,'cLive');
+    rc('gVod',d.VodCategories||[],sVod,'cVod');
+    rc('gSer',d.SeriesCategories||[],sSer,'cSer');
+    var lc=(d.LiveCategories||[]).length,vc=(d.VodCategories||[]).length,sc=(d.SeriesCategories||[]).length;
+    document.getElementById('stats').innerHTML=
+      '<div class="chip"><div class="chip-v">'+lc+'</div><div class="chip-l">Live TV</div></div>'+
+      '<div class="chip"><div class="chip-v">'+vc+'</div><div class="chip-l">VOD</div></div>'+
+      '<div class="chip"><div class="chip-v">'+sc+'</div><div class="chip-l">Series</div></div>';
+    var cfg=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{headers:{'X-Emby-Token':tok}})
+      .then(function(r){return r.ok?r.json():null}).catch(function(){return null});
     if(cfg){
       document.getElementById('limit').value=cfg.ChannelLimit||0;
       document.getElementById('slimit').value=cfg.SeriesLimit||250;
       if(cfg.CategoryIds&&cfg.CategoryIds.length){
-        selectedLiveCats.clear();cfg.CategoryIds.forEach(id=>selectedLiveCats.add(id));
-        renderCats('liveCats',d.LiveCategories||[],selectedLiveCats,'liveCatCount');
+        sLive.clear();cfg.CategoryIds.forEach(function(id){sLive.add(id)});
+        rc('gLive',d.LiveCategories||[],sLive,'cLive');
       }
     }
-    goToStep(2);
-  }catch(err){showMsg('testMsg',''+err,'error')}
-  finally{btn.disabled=false;btn.innerHTML='<span>Test Connection</span>'}
+    go(2);
+  }catch(e){merr('mTest',''+e)}
+  finally{btn.disabled=false;btn.textContent='Test Connection'}
 }
 
-async function getToken(pw){
-  const r=await fetch('/Users/AuthenticateByName',{method:'POST',
-    headers:{'Content-Type':'application/json','X-Emby-Authorization':'MediaBrowser Client="Config",Device="Config",DeviceId="config"'},
+async function gtok(pw){
+  var r=await fetch('/Users/AuthenticateByName',{method:'POST',
+    headers:{'Content-Type':'application/json','X-Emby-Authorization':'MediaBrowser Client="Cfg",Device="Cfg",DeviceId="cfg"'},
     body:JSON.stringify({Username:'admin',Pw:pw||document.getElementById('pass').value})});
-  if(!r.ok)throw new Error('Authentication failed');
+  if(!r.ok)throw new Error('Auth failed');
   return(await r.json()).AccessToken;
 }
 
-async function saveConfig(){
-  hideMsg('saveMsg');
-  const url=document.getElementById('url').value.trim();
-  const user=document.getElementById('user').value.trim();
-  const pass=document.getElementById('pass').value;
-  const limit=+document.getElementById('limit').value||0;
-  const slimit=+document.getElementById('slimit').value||250;
-  const btn=document.getElementById('btnSave');
-  btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Saving...';
+async function doSave(){
+  mhide('mSave');
+  var url=document.getElementById('url').value.trim(),
+      user=document.getElementById('user').value.trim(),
+      pass=document.getElementById('pass').value,
+      lim=+document.getElementById('limit').value||0,
+      slim=+document.getElementById('slimit').value||250;
+  var btn=document.getElementById('bSave');btn.disabled=true;btn.innerHTML='<span class="sp"></span> Saving...';
   try{
-    const cfg={Url:url,Username:user,Password:pass,ChannelLimit:limit,SeriesLimit:slimit,
-      CategoryIds:Array.from(selectedLiveCats),ExcludeCategoryIds:[]};
-    authToken=authToken||await getToken(pass);
-    const r=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{
-      method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':authToken},body:JSON.stringify(cfg)});
-    if(r.ok||r.status===204)showMsg('saveMsg','Configuration saved! Channels are syncing in the background.','success');
-    else{const d=await r.json().catch(()=>({}));showMsg('saveMsg',d.Message||r.statusText,'error')}
-  }catch(err){showMsg('saveMsg',''+err,'error')}
-  finally{btn.disabled=false;btn.innerHTML='<span>Save & Sync</span>'}
+    var cfg={Url:url,Username:user,Password:pass,ChannelLimit:lim,SeriesLimit:slim,
+      CategoryIds:Array.from(sLive),ExcludeCategoryIds:[]};
+    tok=tok||await gtok(pass);
+    var r=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{
+      method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':tok},body:JSON.stringify(cfg)});
+    if(r.ok||r.status===204)mok('mSave','Saved! Syncing channels...');
+    else{var d=await r.json().catch(function(){return{}});merr('mSave',d.Message||r.statusText)}
+  }catch(e){merr('mSave',''+e)}
+  finally{btn.disabled=false;btn.textContent='Save & Sync'}
 }
 
 fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origin'})
-  .then(r=>r.ok?r.json():null).then(c=>{
+  .then(function(r){return r.ok?r.json():null}).then(function(c){
     if(!c)return;
     document.getElementById('url').value=c.Url||'';
     document.getElementById('user').value=c.Username||c.UserName||'';
     document.getElementById('pass').value=c.Password||'';
     document.getElementById('limit').value=c.ChannelLimit||0;
     document.getElementById('slimit').value=c.SeriesLimit||250;
-    if(c.CategoryIds&&c.CategoryIds.length)c.CategoryIds.forEach(id=>selectedLiveCats.add(id));
-  }).catch(()=>{});
+    if(c.CategoryIds&&c.CategoryIds.length)c.CategoryIds.forEach(function(id){sLive.add(id)});
+  }).catch(function(){});
 </script></body></html>"#;
 
 pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError> {
