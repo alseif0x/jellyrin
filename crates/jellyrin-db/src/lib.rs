@@ -6342,6 +6342,56 @@ impl Database {
 
         Ok(())
     }
+
+    /// Mark a single media item as missing by its path (for incremental scan).
+    pub async fn mark_media_item_missing_by_path(&self, path: &str) -> anyhow::Result<bool> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET missing_since = ?1, updated_at = ?1
+            WHERE path = ?2 AND missing_since IS NULL
+            "#,
+        )
+        .bind(&now)
+        .bind(path)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Incremental scan: upsert a single file (new or modified).
+    /// Returns true if the item was created or updated.
+    pub async fn scan_single_file(&self, path: &Path) -> anyhow::Result<bool> {
+        let path_string = path.to_string_lossy().to_string();
+        if self.media_item_path_is_deleted(&path_string).await? {
+            return Ok(false);
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            return Ok(false);
+        };
+        let Some(media_type) = media_type_for_path(path) else {
+            return Ok(false);
+        };
+        // Find the virtual folder that contains this path
+        let folders = self.virtual_folders().await?;
+        for folder in folders {
+            for location in &folder.locations {
+                if path_string.starts_with(location) {
+                    self.upsert_media_item(&folder, &name, path, media_type)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 fn should_enable_wal(database_url: &str) -> bool {

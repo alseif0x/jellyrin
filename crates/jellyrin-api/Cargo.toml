@@ -18,6 +18,8 @@ jellyrin-db = { path = "../jellyrin-db" }
 jellyrin-plugin-rpc = { path = "../jellyrin-plugin-rpc" }
 jellyrin-transcode = { path = "../jellyrin-transcode" }
 jellyrin-xtream-provider = { path = "../jellyrin-xtream-provider" }
+notify.workspace = true
+notify-debouncer-mini.workspace = true
 rand_core.workspace = true
 reqwest.workspace = true
 serde.workspace = true

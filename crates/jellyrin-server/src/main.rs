@@ -6,9 +6,9 @@ use jellyrin_api::{
     AppState, SystemLifecycleCommand, cleanup_stale_hls_transcodes, ensure_builtin_xtream_plugin,
     last_system_lifecycle_command, publish_system_lifecycle_command,
     reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup, router,
-    spawn_dlna_ssdp_service, spawn_periodic_live_tv_timer_scheduler,
-    spawn_periodic_transcode_cleanup, spawn_periodic_xtream_media_sync_scheduler,
-    subscribe_system_lifecycle_commands,
+    spawn_dlna_ssdp_service, spawn_file_watcher_with_consumer,
+    spawn_periodic_live_tv_timer_scheduler, spawn_periodic_transcode_cleanup,
+    spawn_periodic_xtream_media_sync_scheduler, subscribe_system_lifecycle_commands,
 };
 use jellyrin_db::Database;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
     let _live_tv_timer_scheduler_task = spawn_periodic_live_tv_timer_scheduler(state.clone());
     let _xtream_media_sync_scheduler_task =
         spawn_periodic_xtream_media_sync_scheduler(state.clone());
+    let _file_watcher = spawn_file_watcher_with_consumer(state.clone()).await;
 
     let listener = tokio::net::TcpListener::bind(address)
         .await

@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod dlna;
+mod file_watcher;
 
 use jellyrin_xtream_provider as live_tv_xtream;
 
@@ -3762,6 +3763,71 @@ pub fn spawn_periodic_xtream_media_sync_scheduler(state: AppState) -> tokio::tas
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     })
+}
+
+/// Spawn the file watcher and its scan consumer.
+/// Returns the watcher handle (must be kept alive) and the consumer task handle.
+pub async fn spawn_file_watcher_with_consumer(
+    state: AppState,
+) -> Option<(
+    notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let (watcher, mut rx) = match file_watcher::start_file_watcher(&state.db).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(?error, "failed to start file watcher");
+            return None;
+        }
+    };
+    let consumer = tokio::spawn(async move {
+        while let Some(events) = rx.recv().await {
+            let changes = file_watcher::deduplicate_changes(events);
+            if changes.is_empty() {
+                continue;
+            }
+            tracing::info!(count = changes.len(), "file watcher detected changes");
+            let mut scanned = 0usize;
+            for change in &changes {
+                match change.change_type {
+                    file_watcher::FileChangeType::Created
+                    | file_watcher::FileChangeType::Modified => {
+                        match state.db.scan_single_file(&change.path).await {
+                            Ok(true) => scanned += 1,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    ?error,
+                                    path = ?change.path,
+                                    "failed to scan changed file"
+                                );
+                            }
+                        }
+                    }
+                    file_watcher::FileChangeType::Deleted => {
+                        let path_str = change.path.to_string_lossy().to_string();
+                        match state.db.mark_media_item_missing_by_path(&path_str).await {
+                            Ok(true) => scanned += 1,
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    ?error,
+                                    path = ?change.path,
+                                    "failed to mark file as missing"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if scanned > 0 {
+                tracing::info!(scanned, "incremental scan completed");
+                let _ = populate_image_tags_for_library(&state.db).await;
+                let _ = dlna::notify_dlna_content_directory_changed(&state.db).await;
+            }
+        }
+    });
+    Some((watcher, consumer))
 }
 
 async fn maybe_run_due_xtream_media_sync(db: &Database) -> Result<bool, ApiError> {
