@@ -9283,25 +9283,30 @@ async fn sync_xtream_tuner_from_plugin_config(
         "FriendlyName": "Xtream Codes (Plugin)",
     });
 
-    // Apply optional filters from config
-    if let Some(category_ids) = config.get("CategoryIds").and_then(|v| v.as_array()) {
-        if !category_ids.is_empty() {
-            payload["CategoryIds"] = serde_json::json!(category_ids);
+    // Forward per-content category selections to the provider.
+    // Live TV (LiveCategoryIds preferred, legacy CategoryIds kept for compatibility),
+    // VOD/movies (VodCategoryIds) and series (SeriesCategoryIds) are independent.
+    for key in [
+        "LiveCategoryIds",
+        "CategoryIds",
+        "ExcludeCategoryIds",
+        "VodCategoryIds",
+        "ExcludeVodCategoryIds",
+        "SeriesCategoryIds",
+        "ExcludeSeriesCategoryIds",
+    ] {
+        if let Some(ids) = config.get(key).and_then(|v| v.as_array()) {
+            if !ids.is_empty() {
+                payload[key] = serde_json::json!(ids);
+            }
         }
     }
-    if let Some(exclude_ids) = config.get("ExcludeCategoryIds").and_then(|v| v.as_array()) {
-        if !exclude_ids.is_empty() {
-            payload["ExcludeCategoryIds"] = serde_json::json!(exclude_ids);
-        }
-    }
-    if let Some(limit) = config.get("ChannelLimit").and_then(|v| v.as_u64()) {
-        if limit > 0 {
-            payload["ChannelLimit"] = serde_json::json!(limit);
-        }
-    }
-    if let Some(limit) = config.get("SeriesLimit").and_then(|v| v.as_u64()) {
-        if limit > 0 {
-            payload["SeriesLimit"] = serde_json::json!(limit);
+    // Independent per-content limits (0 / absent = no limit).
+    for key in ["ChannelLimit", "MovieLimit", "SeriesLimit"] {
+        if let Some(limit) = config.get(key).and_then(|v| v.as_u64()) {
+            if limit > 0 {
+                payload[key] = serde_json::json!(limit);
+            }
         }
     }
 
@@ -15262,15 +15267,21 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 <!-- Panel 3 -->
 <div class="panel" id="p3">
   <div class="card">
-    <div class="card-h">Import Settings</div>
+    <div class="card-h">Import Limits</div>
     <div class="fg">
-      <label for="limit">Channel Limit</label>
+      <label for="limit">Live TV Channel Limit</label>
       <input type="number" id="limit" value="0" min="0">
-      <div class="hint">0 = import all channels</div>
+      <div class="hint">0 = import all channels from selected categories</div>
+    </div>
+    <div class="fg">
+      <label for="mlimit">Movie Limit</label>
+      <input type="number" id="mlimit" value="0" min="0">
+      <div class="hint">0 = import all movies from selected categories</div>
     </div>
     <div class="fg">
       <label for="slimit">Series Limit</label>
-      <input type="number" id="slimit" value="250" min="0">
+      <input type="number" id="slimit" value="250" min="1">
+      <div class="hint">Max series to import (each series is fetched individually)</div>
     </div>
   </div>
   <div class="card" id="sumCard" style="display:none">
@@ -15359,10 +15370,21 @@ async function doTest(){
       .then(function(r){return r.ok?r.json():null}).catch(function(){return null});
     if(cfg){
       document.getElementById('limit').value=cfg.ChannelLimit||0;
+      document.getElementById('mlimit').value=cfg.MovieLimit||0;
       document.getElementById('slimit').value=cfg.SeriesLimit||250;
-      if(cfg.CategoryIds&&cfg.CategoryIds.length){
-        sLive.clear();cfg.CategoryIds.forEach(function(id){sLive.add(id)});
+      // Restore each saved selection independently (LiveCategoryIds with legacy fallback).
+      var savedLive=cfg.LiveCategoryIds&&cfg.LiveCategoryIds.length?cfg.LiveCategoryIds:cfg.CategoryIds;
+      if(savedLive&&savedLive.length){
+        sLive.clear();savedLive.forEach(function(id){sLive.add(id)});
         rc('gLive',d.LiveCategories||[],sLive,'cLive');
+      }
+      if(cfg.VodCategoryIds&&cfg.VodCategoryIds.length){
+        sVod.clear();cfg.VodCategoryIds.forEach(function(id){sVod.add(id)});
+        rc('gVod',d.VodCategories||[],sVod,'cVod');
+      }
+      if(cfg.SeriesCategoryIds&&cfg.SeriesCategoryIds.length){
+        sSer.clear();cfg.SeriesCategoryIds.forEach(function(id){sSer.add(id)});
+        rc('gSer',d.SeriesCategories||[],sSer,'cSer');
       }
     }
     go(2);
@@ -15393,11 +15415,15 @@ async function doSave(){
       user=document.getElementById('user').value.trim(),
       pass=document.getElementById('pass').value,
       lim=+document.getElementById('limit').value||0,
+      mlim=+document.getElementById('mlimit').value||0,
       slim=+document.getElementById('slimit').value||250;
   var btn=document.getElementById('bSave');btn.disabled=true;btn.innerHTML='<span class="sp"></span> Saving...';
   try{
-    var cfg={Url:url,Username:user,Password:pass,ChannelLimit:lim,SeriesLimit:slim,
-      CategoryIds:Array.from(sLive),ExcludeCategoryIds:[]};
+    var cfg={Url:url,Username:user,Password:pass,
+      ChannelLimit:lim,MovieLimit:mlim,SeriesLimit:slim,
+      LiveCategoryIds:Array.from(sLive),
+      VodCategoryIds:Array.from(sVod),
+      SeriesCategoryIds:Array.from(sSer)};
     tok=tok||gtok();
     var r=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{
       method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':tok},body:JSON.stringify(cfg)});
@@ -15414,8 +15440,12 @@ fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origi
     document.getElementById('user').value=c.Username||c.UserName||'';
     document.getElementById('pass').value=c.Password||'';
     document.getElementById('limit').value=c.ChannelLimit||0;
+    document.getElementById('mlimit').value=c.MovieLimit||0;
     document.getElementById('slimit').value=c.SeriesLimit||250;
-    if(c.CategoryIds&&c.CategoryIds.length)c.CategoryIds.forEach(function(id){sLive.add(id)});
+    var sl=c.LiveCategoryIds&&c.LiveCategoryIds.length?c.LiveCategoryIds:c.CategoryIds;
+    if(sl&&sl.length)sl.forEach(function(id){sLive.add(id)});
+    if(c.VodCategoryIds&&c.VodCategoryIds.length)c.VodCategoryIds.forEach(function(id){sVod.add(id)});
+    if(c.SeriesCategoryIds&&c.SeriesCategoryIds.length)c.SeriesCategoryIds.forEach(function(id){sSer.add(id)});
   }).catch(function(){});
 
 // Wire up event listeners (Jellyfin Web runs scripts in isolated scope, onclick won't work)
@@ -15438,58 +15468,78 @@ document.querySelectorAll('[data-toggle]').forEach(function(b){
 </body></html>"#;
 
 pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError> {
-    let existing = db.installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID).await?;
-    if existing.is_none() {
-        let now = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
-        let manifest = serde_json::json!({
-            "Guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-            "Name": "Xtream Codes Provider",
-            "Version": "1.0.0",
-            "Runtime": "Builtin",
-            "Capabilities": ["LiveTvProvider", "ScheduledTask"],
-            "Description": "Built-in Xtream Codes IPTV provider for live TV, VOD, and series.",
-            "WebPages": [{
-                "Name": "xtream-config",
-                "Path": "configuration.html",
-                "DisplayName": "Xtream Codes Configuration",
-                "EnableInMainMenu": false
-            }],
-            "Configuration": {
-                "Url": "",
-                "Username": "",
-                "Password": "",
-                "CategoryIds": [],
-                "ExcludeCategoryIds": [],
-                "ChannelLimit": 0,
-                "SeriesLimit": 250
-            }
-        });
-        sqlx::query(
-            r#"INSERT INTO installed_plugins (
-                plugin_id, name, version, runtime, target_abi, server_compatibility_json,
-                status, capabilities_json, permissions_json, configuration_state,
-                last_error, health_json, manifest_json, installed_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, '{}', 'Active', ?6, '[]', 'Default', NULL, '{}', ?7, ?8, ?8)"#,
-        )
-        .bind(BUILTIN_XTREAM_PLUGIN_ID)
-        .bind("Xtream Codes Provider")
-        .bind("1.0.0")
-        .bind("Builtin")
-        .bind("")
-        .bind(serde_json::to_string(&serde_json::json!(["LiveTvProvider", "ScheduledTask"]))?)
-        .bind(serde_json::to_string(&manifest)?)
-        .bind(&now)
-        .execute(db.pool())
-        .await?;
-    }
-    // Register in the live TV provider registry if active
-    if let Some(plugin) = db.installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID).await? {
-        let status = json_string_field(&plugin, "Status").unwrap_or_default();
-        if status.eq_ignore_ascii_case("Active") {
-            register_live_tv_provider(&XTREAM_LIVE_TV_PROVIDER).await;
+    let now = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
+    let manifest = serde_json::json!({
+        "Guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "Name": "Xtream Codes Provider",
+        "Version": "1.0.0",
+        "Runtime": "Builtin",
+        "Capabilities": ["LiveTvProvider", "ScheduledTask"],
+        "Description": "Built-in Xtream Codes IPTV provider for live TV, VOD, and series.",
+        "WebPages": [{
+            "Name": "xtream-config",
+            "Path": "configuration.html",
+            "DisplayName": "Xtream Codes Configuration",
+            "EnableInMainMenu": false
+        }],
+        "Configuration": {
+            "Url": "",
+            "Username": "",
+            "Password": "",
+            "LiveCategoryIds": [],
+            "VodCategoryIds": [],
+            "SeriesCategoryIds": [],
+            "ChannelLimit": 0,
+            "MovieLimit": 0,
+            "SeriesLimit": 250
         }
+    });
+
+    // Preserve the existing status (so a user-disabled plugin stays disabled);
+    // default to Active for a fresh install. Always refresh the manifest so
+    // configuration schema changes propagate on upgrade.
+    let existing_status = db
+        .installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID)
+        .await?
+        .and_then(|plugin| json_string_field(&plugin, "Status"))
+        .filter(|status| !status.is_empty())
+        .unwrap_or_else(|| "Active".to_string());
+
+    sqlx::query(
+        r#"INSERT INTO installed_plugins (
+            plugin_id, name, version, runtime, target_abi, server_compatibility_json,
+            status, capabilities_json, permissions_json, configuration_state,
+            last_error, health_json, manifest_json, installed_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, '[]', 'Default', NULL, '{}', ?8, ?9, ?9)
+        ON CONFLICT(plugin_id) DO UPDATE SET
+            name = excluded.name,
+            version = excluded.version,
+            runtime = excluded.runtime,
+            capabilities_json = excluded.capabilities_json,
+            manifest_json = excluded.manifest_json,
+            status = excluded.status,
+            updated_at = excluded.updated_at"#,
+    )
+    .bind(BUILTIN_XTREAM_PLUGIN_ID)
+    .bind("Xtream Codes Provider")
+    .bind("1.0.0")
+    .bind("Builtin")
+    .bind("")
+    .bind(&existing_status)
+    .bind(serde_json::to_string(&serde_json::json!([
+        "LiveTvProvider",
+        "ScheduledTask"
+    ]))?)
+    .bind(serde_json::to_string(&manifest)?)
+    .bind(&now)
+    .execute(db.pool())
+    .await?;
+
+    // Register in the live TV provider registry if active
+    if existing_status.eq_ignore_ascii_case("Active") {
+        register_live_tv_provider(&XTREAM_LIVE_TV_PROVIDER).await;
     }
     Ok(())
 }

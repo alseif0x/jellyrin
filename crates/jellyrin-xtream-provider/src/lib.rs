@@ -32,11 +32,18 @@ pub struct LiveTvXtreamImportOptions {
 
 impl LiveTvXtreamImportOptions {
     pub fn from_payload(payload: &serde_json::Value) -> Self {
+        // Prefer the live-specific key; fall back to legacy keys for compatibility.
         let include_category_ids = category_id_filter(
             payload,
-            &["CategoryIds", "IncludeCategoryIds", "Categories"],
+            &[
+                "LiveCategoryIds",
+                "CategoryIds",
+                "IncludeCategoryIds",
+                "Categories",
+            ],
         );
-        let exclude_category_ids = category_id_filter(payload, &["ExcludeCategoryIds"]);
+        let exclude_category_ids =
+            category_id_filter(payload, &["ExcludeLiveCategoryIds", "ExcludeCategoryIds"]);
         let limit = live_tv_u64_field(payload, "Limit")
             .or_else(|| live_tv_u64_field(payload, "ChannelLimit"))
             .map(|value| (value as usize).clamp(1, LIVE_TV_XTREAM_MAX_IMPORT_LIMIT));
@@ -112,6 +119,15 @@ pub async fn import_media_from_payload(payload: &serde_json::Value) -> Option<Xt
     let client = HttpClient::new();
     let base = base_url_root(&base_url)?;
 
+    // VOD / movies: filter by selected VOD categories and an optional movie limit.
+    let vod_selection = CategorySelection::from_payload(
+        payload,
+        &["VodCategoryIds", "MovieCategoryIds"],
+        &["ExcludeVodCategoryIds", "ExcludeMovieCategoryIds"],
+    );
+    let movie_limit = live_tv_u64_field(payload, "MovieLimit")
+        .or_else(|| live_tv_u64_field(payload, "VodLimit"))
+        .map(|value| (value as usize).clamp(1, LIVE_TV_XTREAM_MAX_IMPORT_LIMIT));
     let movie_categories = fetch_xtream_array(
         &client,
         &base_url,
@@ -132,9 +148,25 @@ pub async fn import_media_from_payload(payload: &serde_json::Value) -> Option<Xt
         45,
     )
     .await
-    .map(|streams| parse_vod_streams(&base, &username, &password, &streams, &movie_categories))
+    .map(|streams| {
+        let filtered = streams
+            .into_iter()
+            .filter(|stream| vod_selection.allows(item_category_id(stream).as_deref()))
+            .collect::<Vec<_>>();
+        let limited: &[serde_json::Value] = match movie_limit {
+            Some(limit) => &filtered[..filtered.len().min(limit)],
+            None => &filtered,
+        };
+        parse_vod_streams(&base, &username, &password, limited, &movie_categories)
+    })
     .unwrap_or_default();
 
+    // Series: filter by selected series categories before applying the series limit.
+    let series_selection = CategorySelection::from_payload(
+        payload,
+        &["SeriesCategoryIds"],
+        &["ExcludeSeriesCategoryIds"],
+    );
     let series_categories = fetch_xtream_array(
         &client,
         &base_url,
@@ -157,7 +189,11 @@ pub async fn import_media_from_payload(payload: &serde_json::Value) -> Option<Xt
         .or_else(|| live_tv_u64_field(payload, "XtreamSeriesEpisodeLimit"))
         .map(|value| value as usize);
     let mut series_episodes = Vec::new();
-    for series_item in series.iter().take(series_limit) {
+    for series_item in series
+        .iter()
+        .filter(|item| series_selection.allows(item_category_id(item).as_deref()))
+        .take(series_limit)
+    {
         let Some(series_id) = json_string_field(series_item, "series_id")
             .or_else(|| live_tv_u64_field(series_item, "series_id").map(|id| id.to_string()))
         else {
@@ -270,20 +306,68 @@ pub fn category_db_id(tuner_id: &str, remote_id: &str) -> String {
     live_tv_stable_id("livetv-category", &format!("{tuner_id}-{remote_id}"))
 }
 
+/// Collect category ids from the first key in `keys` that yields any values.
+///
+/// Using first-match (rather than merging every key) keeps the specific key
+/// authoritative when both a specific and a legacy key are present.
 fn category_id_filter(payload: &serde_json::Value, keys: &[&str]) -> HashSet<String> {
-    let mut ids = HashSet::new();
     for key in keys {
         let Some(values) = json_string_list_field(payload, key) else {
             continue;
         };
-        ids.extend(
-            values
-                .into_iter()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-        );
+        let ids = values
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>();
+        if !ids.is_empty() {
+            return ids;
+        }
     }
-    ids
+    HashSet::new()
+}
+
+/// A reusable include/exclude category selection.
+///
+/// `include` empty means "no restriction" (import every category).
+#[derive(Default)]
+struct CategorySelection {
+    include: HashSet<String>,
+    exclude: HashSet<String>,
+}
+
+impl CategorySelection {
+    /// Build a selection from the payload, trying `include_keys` in order for the
+    /// include set and `exclude_keys` for the exclude set.
+    fn from_payload(
+        payload: &serde_json::Value,
+        include_keys: &[&str],
+        exclude_keys: &[&str],
+    ) -> Self {
+        Self {
+            include: category_id_filter(payload, include_keys),
+            exclude: category_id_filter(payload, exclude_keys),
+        }
+    }
+
+    /// Whether a stream/series with the given (optional) category id should be kept.
+    fn allows(&self, category_id: Option<&str>) -> bool {
+        if !self.include.is_empty() && category_id.is_none_or(|id| !self.include.contains(id)) {
+            return false;
+        }
+        if let Some(id) = category_id
+            && self.exclude.contains(id)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Extract the category id of an Xtream stream/series item as a string.
+fn item_category_id(item: &serde_json::Value) -> Option<String> {
+    json_string_field(item, "category_id")
+        .or_else(|| live_tv_u64_field(item, "category_id").map(|value| value.to_string()))
 }
 
 pub async fn programs_from_payload(payload: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
@@ -1212,5 +1296,51 @@ mod tests {
         );
         assert_eq!(items[0].metadata["ParentIndexNumber"], serde_json::json!(2));
         assert_eq!(items[0].metadata["IndexNumber"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn category_selection_empty_include_allows_everything() {
+        let sel = CategorySelection::default();
+        assert!(sel.allows(Some("10")));
+        assert!(sel.allows(None));
+    }
+
+    #[test]
+    fn category_selection_respects_include_and_exclude() {
+        let payload = serde_json::json!({
+            "VodCategoryIds": ["10", "20"],
+            "ExcludeVodCategoryIds": ["20"]
+        });
+        let sel = CategorySelection::from_payload(
+            &payload,
+            &["VodCategoryIds"],
+            &["ExcludeVodCategoryIds"],
+        );
+        assert!(sel.allows(Some("10")));
+        // excluded wins even though it is in include
+        assert!(!sel.allows(Some("20")));
+        // not in include set
+        assert!(!sel.allows(Some("30")));
+        // no category id and a non-empty include set => excluded
+        assert!(!sel.allows(None));
+    }
+
+    #[test]
+    fn live_tv_options_prefer_live_category_ids() {
+        let payload = serde_json::json!({
+            "LiveCategoryIds": ["5"],
+            "CategoryIds": ["99"]
+        });
+        let opts = LiveTvXtreamImportOptions::from_payload(&payload);
+        // LiveCategoryIds wins (first-match); legacy CategoryIds is ignored.
+        assert!(opts.include_category_ids.contains("5"));
+        assert!(!opts.include_category_ids.contains("99"));
+    }
+
+    #[test]
+    fn live_tv_options_fall_back_to_legacy_category_ids() {
+        let payload = serde_json::json!({ "CategoryIds": ["7"] });
+        let opts = LiveTvXtreamImportOptions::from_payload(&payload);
+        assert!(opts.include_category_ids.contains("7"));
     }
 }
