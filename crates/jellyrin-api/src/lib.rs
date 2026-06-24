@@ -15134,89 +15134,187 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Xtream Codes Configuration</title>
 <style>
-body{font-family:system-ui,sans-serif;max-width:700px;margin:2rem auto;padding:0 1rem;background:#1a1a2e;color:#e0e0e0}
-h1{color:#00d4ff;border-bottom:2px solid #00d4ff;padding-bottom:.5rem}
-h3{color:#a0a0c0;margin-top:1.5rem}
-label{display:block;margin-top:1rem;font-weight:600;color:#a0a0c0}
-input[type=text],input[type=password],input[type=number]{width:100%;padding:.5rem;margin-top:.25rem;border:1px solid #333;border-radius:4px;background:#16213e;color:#e0e0e0;box-sizing:border-box}
-.hint{font-size:.85rem;color:#808080;margin-top:.25rem}
-.btn{display:inline-block;padding:.6rem 1.5rem;border:none;border-radius:4px;font-weight:700;cursor:pointer;font-size:.95rem}
-.btn-primary{background:#00d4ff;color:#1a1a2e}
-.btn-primary:hover{background:#00b8d4}
-.btn-secondary{background:#333;color:#e0e0e0;margin-left:.5rem}
-.btn-secondary:hover{background:#444}
-.btn-success{background:#2e7d32;color:#fff}
-.btn-success:hover{background:#1b5e20}
-.btn-block{width:100%;margin-top:1.5rem}
-.msg{margin-top:1rem;padding:.75rem;border-radius:4px;display:none}
-.ok{background:#1b5e20;color:#a5d6a7;border:1px solid #2e7d32}
-.err{background:#b71c1c;color:#ef9a9a;border:1px solid #c62828}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:transparent;color:rgba(255,255,255,.87);line-height:1.5}
+
+/* Stepper */
+.stepper{display:flex;gap:0;margin-bottom:2rem;counter-reset:step}
+.stepper-item{flex:1;text-align:center;padding:.75rem .5rem;position:relative;border-bottom:3px solid rgba(255,255,255,.1);color:rgba(255,255,255,.4);font-size:.85rem;transition:all .3s}
+.stepper-item.active{border-bottom-color:#00d4ff;color:#00d4ff}
+.stepper-item.done{border-bottom-color:#4caf50;color:#4caf50}
+.stepper-item::before{content:counter(step);counter-increment:step;display:block;width:28px;height:28px;line-height:28px;border-radius:50%;background:rgba(255,255,255,.1);margin:0 auto .4rem;font-weight:700;font-size:.85rem}
+.stepper-item.active::before{background:#00d4ff;color:#000}
+.stepper-item.done::before{content:'✓';background:#4caf50;color:#fff}
+
+/* Cards */
+.card{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:1.5rem;margin-bottom:1rem}
+.card-title{font-size:1.1rem;font-weight:600;color:#fff;margin-bottom:1rem;display:flex;align-items:center;gap:.5rem}
+.card-title .icon{font-size:1.2rem}
+
+/* Form controls */
+.form-group{margin-bottom:1.25rem}
+.form-group label{display:block;font-size:.85rem;font-weight:500;color:rgba(255,255,255,.6);margin-bottom:.4rem;letter-spacing:.02em}
+.form-group input[type=text],
+.form-group input[type=password],
+.form-group input[type=number]{width:100%;padding:.65rem .85rem;border:1px solid rgba(255,255,255,.15);border-radius:6px;background:rgba(0,0,0,.25);color:#fff;font-size:.95rem;transition:border-color .2s}
+.form-group input:focus{outline:none;border-color:#00d4ff;box-shadow:0 0 0 2px rgba(0,212,255,.15)}
+.form-group input::placeholder{color:rgba(255,255,255,.25)}
+.form-hint{font-size:.8rem;color:rgba(255,255,255,.35);margin-top:.3rem}
+
+/* Buttons */
+.actions{display:flex;gap:.75rem;margin-top:1.5rem}
+.btn{padding:.65rem 1.5rem;border:none;border-radius:6px;font-weight:600;font-size:.9rem;cursor:pointer;display:inline-flex;align-items:center;gap:.5rem;transition:all .2s}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:#00d4ff;color:#000}
+.btn-primary:hover:not(:disabled){background:#33ddff}
+.btn-secondary{background:rgba(255,255,255,.1);color:rgba(255,255,255,.8)}
+.btn-secondary:hover:not(:disabled){background:rgba(255,255,255,.15)}
+.btn-success{background:#4caf50;color:#fff}
+.btn-success:hover:not(:disabled){background:#66bb6a}
+.btn-block{flex:1;justify-content:center}
+
+/* Messages */
+.alert{padding:.75rem 1rem;border-radius:6px;font-size:.9rem;margin-top:1rem;display:none;align-items:center;gap:.5rem}
+.alert.show{display:flex}
+.alert-success{background:rgba(76,175,80,.15);border:1px solid rgba(76,175,80,.3);color:#81c784}
+.alert-error{background:rgba(244,67,54,.15);border:1px solid rgba(244,67,54,.3);color:#e57373}
+.alert .icon{font-size:1.1rem}
+
+/* Categories */
+.cat-section{margin-bottom:1.25rem}
+.cat-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.5rem}
+.cat-header h4{font-size:.9rem;font-weight:600;color:rgba(255,255,255,.7)}
+.cat-count{font-size:.8rem;color:rgba(255,255,255,.35);background:rgba(255,255,255,.05);padding:.15rem .5rem;border-radius:10px}
+.select-all{font-size:.8rem;color:#00d4ff;cursor:pointer;background:none;border:none;padding:.15rem .5rem}
+.select-all:hover{text-decoration:underline}
+.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.35rem;max-height:200px;overflow-y:auto;padding:.5rem;background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.06);border-radius:6px}
+.cat-grid::-webkit-scrollbar{width:6px}
+.cat-grid::-webkit-scrollbar-track{background:transparent}
+.cat-grid::-webkit-scrollbar-thumb{background:rgba(255,255,255,.15);border-radius:3px}
+.cat-item{display:flex;align-items:center;gap:.5rem;padding:.4rem .6rem;border-radius:4px;cursor:pointer;transition:background .15s}
+.cat-item:hover{background:rgba(255,255,255,.05)}
+.cat-item input[type=checkbox]{accent-color:#00d4ff;width:15px;height:15px;flex-shrink:0}
+.cat-item label{margin:0;font-weight:400;font-size:.85rem;color:rgba(255,255,255,.75);cursor:pointer;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Spinner */
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Steps */
 .step{display:none}
 .step.active{display:block}
-.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:.5rem;margin-top:.5rem;max-height:300px;overflow-y:auto;padding:.5rem;background:#16213e;border-radius:4px;border:1px solid #333}
-.cat-item{display:flex;align-items:center;gap:.5rem;padding:.4rem .5rem;border-radius:3px;cursor:pointer}
-.cat-item:hover{background:#1a2744}
-.cat-item input[type=checkbox]{accent-color:#00d4ff;width:16px;height:16px}
-.cat-item label{margin:0;font-weight:400;color:#e0e0e0;cursor:pointer;flex:1}
-.spinner{display:inline-block;width:16px;height:16px;border:2px solid #333;border-top-color:#00d4ff;border-radius:50%;animation:spin .6s linear infinite;margin-right:.5rem;vertical-align:middle}
-@keyframes spin{to{transform:rotate(360deg)}}
-.badge{display:inline-block;padding:.15rem .5rem;border-radius:3px;font-size:.8rem;margin-left:.5rem}
-.badge-ok{background:#1b5e20;color:#a5d6a7}
-.badge-err{background:#b71c1c;color:#ef9a9a}
-.stats{margin-top:.5rem;color:#808080;font-size:.9rem}
+
+/* Stats */
+.stats{display:flex;gap:1rem;margin-bottom:1rem;flex-wrap:wrap}
+.stat{background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.15);border-radius:6px;padding:.5rem .85rem;text-align:center}
+.stat-value{font-size:1.2rem;font-weight:700;color:#00d4ff}
+.stat-label{font-size:.75rem;color:rgba(255,255,255,.4);margin-top:.15rem}
 </style></head>
 <body>
 <div data-role="page" class="page type-interior pluginConfigurationPage">
 <div class="pageContainer">
 <div data-role="content">
 
-<h1>Xtream Codes Provider</h1>
+<div class="stepper">
+  <div class="stepper-item active" id="si1">Connection</div>
+  <div class="stepper-item" id="si2">Categories</div>
+  <div class="stepper-item" id="si3">Settings</div>
+</div>
 
-<!-- Step 1: Credentials -->
+<!-- Step 1: Connection -->
 <div id="step1" class="step active">
-  <h3>1. Server Connection</h3>
-  <label>Server URL<input type="text" id="url" placeholder="http://example.com:8080"></label>
-  <label>Username<input type="text" id="user"></label>
-  <label>Password<input type="password" id="pass"></label>
-  <div style="margin-top:1rem;display:flex;gap:.5rem">
-    <button class="btn btn-primary" onclick="testConnection()" id="btnTest">Test Connection</button>
+  <div class="card">
+    <div class="card-title"><span class="icon">🔗</span> Server Connection</div>
+    <div class="form-group">
+      <label for="url">Server URL</label>
+      <input type="text" id="url" placeholder="http://example.com:8080">
+      <div class="form-hint">Xtream Codes server address with port</div>
+    </div>
+    <div class="form-group">
+      <label for="user">Username</label>
+      <input type="text" id="user" placeholder="your-username">
+    </div>
+    <div class="form-group">
+      <label for="pass">Password</label>
+      <input type="password" id="pass" placeholder="your-password">
+    </div>
   </div>
-  <div id="testMsg" class="msg"></div>
+  <div class="actions">
+    <button class="btn btn-primary btn-block" onclick="testConnection()" id="btnTest">
+      <span>Test Connection</span>
+    </button>
+  </div>
+  <div id="testMsg" class="alert"></div>
 </div>
 
 <!-- Step 2: Categories -->
 <div id="step2" class="step">
-  <h3>2. Select Categories</h3>
   <div class="stats" id="catStats"></div>
-  <div id="catSection">
-    <h4 style="color:#00d4ff;margin-bottom:.25rem">Live TV Categories</h4>
-    <div class="cat-grid" id="liveCats"></div>
+  <div class="card">
+    <div class="card-title"><span class="icon">📺</span> Live TV Channels</div>
+    <div class="cat-section">
+      <div class="cat-header">
+        <h4>Categories</h4>
+        <span class="cat-count" id="liveCatCount">0</span>
+      </div>
+      <button class="select-all" onclick="toggleAll('liveCats',selectedLiveCats)">Select / Deselect All</button>
+      <div class="cat-grid" id="liveCats"></div>
+    </div>
   </div>
-  <div id="vodSection" style="margin-top:1rem">
-    <h4 style="color:#00d4ff;margin-bottom:.25rem">VOD Categories</h4>
-    <div class="cat-grid" id="vodCats"></div>
+  <div class="card">
+    <div class="card-title"><span class="icon">🎬</span> VOD Movies</div>
+    <div class="cat-section">
+      <div class="cat-header">
+        <h4>Categories</h4>
+        <span class="cat-count" id="vodCatCount">0</span>
+      </div>
+      <button class="select-all" onclick="toggleAll('vodCats',selectedVodCats)">Select / Deselect All</button>
+      <div class="cat-grid" id="vodCats"></div>
+    </div>
   </div>
-  <div id="seriesSection" style="margin-top:1rem">
-    <h4 style="color:#00d4ff;margin-bottom:.25rem">Series Categories</h4>
-    <div class="cat-grid" id="seriesCats"></div>
+  <div class="card">
+    <div class="card-title"><span class="icon">📺</span> Series</div>
+    <div class="cat-section">
+      <div class="cat-header">
+        <h4>Categories</h4>
+        <span class="cat-count" id="seriesCatCount">0</span>
+      </div>
+      <button class="select-all" onclick="toggleAll('seriesCats',selectedSeriesCats)">Select / Deselect All</button>
+      <div class="cat-grid" id="seriesCats"></div>
+    </div>
   </div>
-  <div style="margin-top:1rem;display:flex;gap:.5rem">
-    <button class="btn btn-secondary" onclick="goToStep(1)">Back</button>
-    <button class="btn btn-primary" onclick="goToStep(3)">Next</button>
+  <div class="actions">
+    <button class="btn btn-secondary" onclick="goToStep(1)">← Back</button>
+    <button class="btn btn-primary btn-block" onclick="goToStep(3)">Next →</button>
   </div>
 </div>
 
 <!-- Step 3: Settings & Save -->
 <div id="step3" class="step">
-  <h3>3. Settings</h3>
-  <label>Channel Limit<input type="number" id="limit" value="0" min="0">
-    <div class="hint">0 = no limit</div></label>
-  <label>Series Limit<input type="number" id="slimit" value="250" min="0"></label>
-  <div style="margin-top:1.5rem;display:flex;gap:.5rem">
-    <button class="btn btn-secondary" onclick="goToStep(2)">Back</button>
-    <button class="btn btn-success btn-block" onclick="saveConfig()" id="btnSave">Save & Sync</button>
+  <div class="card">
+    <div class="card-title"><span class="icon">⚙️</span> Import Settings</div>
+    <div class="form-group">
+      <label for="limit">Channel Limit</label>
+      <input type="number" id="limit" value="0" min="0">
+      <div class="form-hint">Maximum channels to import (0 = no limit)</div>
+    </div>
+    <div class="form-group">
+      <label for="slimit">Series Limit</label>
+      <input type="number" id="slimit" value="250" min="0">
+      <div class="form-hint">Maximum series to import</div>
+    </div>
   </div>
-  <div id="saveMsg" class="msg"></div>
+  <div class="card" id="summaryCard" style="display:none">
+    <div class="card-title"><span class="icon">📋</span> Summary</div>
+    <div id="summaryContent" style="font-size:.9rem;color:rgba(255,255,255,.6)"></div>
+  </div>
+  <div class="actions">
+    <button class="btn btn-secondary" onclick="goToStep(2)">← Back</button>
+    <button class="btn btn-success btn-block" onclick="saveConfig()" id="btnSave">
+      <span>Save & Sync</span>
+    </button>
+  </div>
+  <div id="saveMsg" class="alert"></div>
 </div>
 
 </div>
@@ -15225,32 +15323,56 @@ input[type=text],input[type=password],input[type=number]{width:100%;padding:.5re
 <script>
 let testData={LiveCategories:[],VodCategories:[],SeriesCategories:[]};
 let selectedLiveCats=new Set(),selectedVodCats=new Set(),selectedSeriesCats=new Set();
+let authToken=null;
 
 function goToStep(n){
   document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
   document.getElementById('step'+n).classList.add('active');
+  document.querySelectorAll('.stepper-item').forEach((s,i)=>{
+    s.classList.remove('active','done');
+    if(i+1===n)s.classList.add('active');
+    else if(i+1<n)s.classList.add('done');
+  });
+  if(n===3)updateSummary();
 }
 
-function showMsg(id,m,t){const e=document.getElementById(id);e.textContent=m;e.className='msg '+(t||'ok');e.style.display='block'}
-function hideMsg(id){document.getElementById(id).style.display='none'}
+function showMsg(id,m,type){
+  const e=document.getElementById(id);
+  const icon=type==='error'?'✕':'✓';
+  e.innerHTML='<span class="icon">'+icon+'</span> '+m;
+  e.className='alert show alert-'+(type==='error'?'error':'success');
+}
+function hideMsg(id){document.getElementById(id).className='alert'}
 
-function renderCats(containerId,cats,selectedSet){
+function renderCats(containerId,cats,selectedSet,countId){
   const el=document.getElementById(containerId);
   el.innerHTML='';
   cats.forEach(c=>{
     const id=c.Id||'';
     const name=c.Name||id;
-    const div=document.createElement('div');
-    div.className='cat-item';
-    const cb=document.createElement('input');
-    cb.type='checkbox';cb.id='cat_'+containerId+'_'+id;
-    cb.checked=selectedSet.has(id);
+    const div=document.createElement('div');div.className='cat-item';
+    const cb=document.createElement('input');cb.type='checkbox';
+    cb.id='cat_'+containerId+'_'+id;cb.checked=selectedSet.has(id);
     cb.onchange=()=>{if(cb.checked)selectedSet.add(id);else selectedSet.delete(id)};
-    const lbl=document.createElement('label');
-    lbl.htmlFor=cb.id;lbl.textContent=name;
-    div.appendChild(cb);div.appendChild(lbl);
-    el.appendChild(div);
+    const lbl=document.createElement('label');lbl.htmlFor=cb.id;lbl.textContent=name;
+    div.appendChild(cb);div.appendChild(lbl);el.appendChild(div);
   });
+  if(countId)document.getElementById(countId).textContent=cats.length+' selected';
+}
+
+function toggleAll(containerId,set){
+  const cbs=document.getElementById(containerId).querySelectorAll('input[type=checkbox]');
+  const allChecked=Array.from(cbs).every(cb=>cb.checked);
+  cbs.forEach(cb=>{cb.checked=!allChecked;if(cb.checked)set.add(cb.id.split('_').pop());else set.delete(cb.id.split('_').pop())});
+}
+
+function updateSummary(){
+  const lc=selectedLiveCats.size,vc=selectedVodCats.size,sc=selectedSeriesCats.size;
+  const total=testData.LiveCategories.length+testData.VodCategories.length+testData.SeriesCategories.length;
+  let html='<p>Importing <strong>'+lc+'</strong> live TV, <strong>'+vc+'</strong> VOD, and <strong>'+sc+'</strong> series categories.</p>';
+  if(total>lc+vc+sc)html+='<p style="margin-top:.5rem;color:rgba(255,255,255,.35)">'+(total-lc-vc-sc)+' categories excluded.</p>';
+  document.getElementById('summaryContent').innerHTML=html;
+  document.getElementById('summaryCard').style.display='block';
 }
 
 async function testConnection(){
@@ -15258,51 +15380,49 @@ async function testConnection(){
   const url=document.getElementById('url').value.trim();
   const user=document.getElementById('user').value.trim();
   const pass=document.getElementById('pass').value;
-  if(!url||!user||!pass){showMsg('testMsg','Please fill in all fields','err');return}
+  if(!url||!user||!pass){showMsg('testMsg','Please fill in all fields','error');return}
   const btn=document.getElementById('btnTest');
-  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Testing...';
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Testing...';
   try{
-    const token=await getToken();
-    const r=await fetch('/LiveTv/Xtream/Test',{method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':token},
+    authToken=authToken||await getToken(pass);
+    const r=await fetch('/LiveTv/Xtream/Test',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Emby-Token':authToken},
       body:JSON.stringify({Url:url,Username:user,Password:pass})});
     const d=await r.json();
-    if(!r.ok){showMsg('testMsg','Error: '+(d.Message||r.statusText),'err');return}
+    if(!r.ok){showMsg('testMsg',d.Message||r.statusText,'error');return}
     testData=d;
-    // Pre-select all categories
     selectedLiveCats.clear();selectedVodCats.clear();selectedSeriesCats.clear();
     (d.LiveCategories||[]).forEach(c=>selectedLiveCats.add(c.Id));
     (d.VodCategories||[]).forEach(c=>selectedVodCats.add(c.Id));
     (d.SeriesCategories||[]).forEach(c=>selectedSeriesCats.add(c.Id));
-    renderCats('liveCats',d.LiveCategories||[],selectedLiveCats);
-    renderCats('vodCats',d.VodCategories||[],selectedVodCats);
-    renderCats('seriesCats',d.SeriesCategories||[],selectedSeriesCats);
+    renderCats('liveCats',d.LiveCategories||[],selectedLiveCats,'liveCatCount');
+    renderCats('vodCats',d.VodCategories||[],selectedVodCats,'vodCatCount');
+    renderCats('seriesCats',d.SeriesCategories||[],selectedSeriesCats,'seriesCatCount');
     const lc=(d.LiveCategories||[]).length,vc=(d.VodCategories||[]).length,sc=(d.SeriesCategories||[]).length;
-    document.getElementById('catStats').textContent=lc+' live, '+vc+' VOD, '+sc+' series categories found.';
-    showMsg('testMsg','Connection successful!'+(lc+vc+sc>0?' Found '+(lc+vc+sc)+' categories.':''),'ok');
-    // Load saved config to restore selections
-    const cfg=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{headers:{'X-Emby-Token':token}}).then(r=>r.ok?r.json():null).catch(()=>null);
+    document.getElementById('catStats').innerHTML=
+      '<div class="stat"><div class="stat-value">'+lc+'</div><div class="stat-label">Live TV</div></div>'+
+      '<div class="stat"><div class="stat-value">'+vc+'</div><div class="stat-label">VOD</div></div>'+
+      '<div class="stat"><div class="stat-value">'+sc+'</div><div class="stat-label">Series</div></div>';
+    const cfg=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{headers:{'X-Emby-Token':authToken}})
+      .then(r=>r.ok?r.json():null).catch(()=>null);
     if(cfg){
       document.getElementById('limit').value=cfg.ChannelLimit||0;
       document.getElementById('slimit').value=cfg.SeriesLimit||250;
       if(cfg.CategoryIds&&cfg.CategoryIds.length){
         selectedLiveCats.clear();cfg.CategoryIds.forEach(id=>selectedLiveCats.add(id));
-        renderCats('liveCats',d.LiveCategories||[],selectedLiveCats);
-      }
-      if(cfg.ExcludeCategoryIds&&cfg.ExcludeCategoryIds.length){
-        cfg.ExcludeCategoryIds.forEach(id=>selectedLiveCats.delete(id));
-        renderCats('liveCats',d.LiveCategories||[],selectedLiveCats);
+        renderCats('liveCats',d.LiveCategories||[],selectedLiveCats,'liveCatCount');
       }
     }
     goToStep(2);
-  }catch(err){showMsg('testMsg','Error: '+err,'err')}
-  finally{btn.disabled=false;btn.textContent='Test Connection'}
+  }catch(err){showMsg('testMsg',''+err,'error')}
+  finally{btn.disabled=false;btn.innerHTML='<span>Test Connection</span>'}
 }
 
-async function getToken(){
+async function getToken(pw){
   const r=await fetch('/Users/AuthenticateByName',{method:'POST',
     headers:{'Content-Type':'application/json','X-Emby-Authorization':'MediaBrowser Client="Config",Device="Config",DeviceId="config"'},
-    body:JSON.stringify({Username:'admin',Pw:document.getElementById('pass').value})});
-  if(!r.ok)throw new Error('Auth failed');
+    body:JSON.stringify({Username:'admin',Pw:pw||document.getElementById('pass').value})});
+  if(!r.ok)throw new Error('Authentication failed');
   return(await r.json()).AccessToken;
 }
 
@@ -15314,20 +15434,19 @@ async function saveConfig(){
   const limit=+document.getElementById('limit').value||0;
   const slimit=+document.getElementById('slimit').value||250;
   const btn=document.getElementById('btnSave');
-  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Saving...';
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Saving...';
   try{
     const cfg={Url:url,Username:user,Password:pass,ChannelLimit:limit,SeriesLimit:slimit,
       CategoryIds:Array.from(selectedLiveCats),ExcludeCategoryIds:[]};
-    const token=await getToken();
+    authToken=authToken||await getToken(pass);
     const r=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{
-      method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':token},body:JSON.stringify(cfg)});
-    if(r.ok||r.status===204){showMsg('saveMsg','Configuration saved! Channels syncing...','ok')}
-    else{showMsg('saveMsg','Error: '+r.statusText,'err')}
-  }catch(err){showMsg('saveMsg','Error: '+err,'err')}
-  finally{btn.disabled=false;btn.textContent='Save & Sync'}
+      method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':authToken},body:JSON.stringify(cfg)});
+    if(r.ok||r.status===204)showMsg('saveMsg','Configuration saved! Channels are syncing in the background.','success');
+    else{const d=await r.json().catch(()=>({}));showMsg('saveMsg',d.Message||r.statusText,'error')}
+  }catch(err){showMsg('saveMsg',''+err,'error')}
+  finally{btn.disabled=false;btn.innerHTML='<span>Save & Sync</span>'}
 }
 
-// Load existing config on page load
 fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origin'})
   .then(r=>r.ok?r.json():null).then(c=>{
     if(!c)return;
@@ -15336,9 +15455,7 @@ fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origi
     document.getElementById('pass').value=c.Password||'';
     document.getElementById('limit').value=c.ChannelLimit||0;
     document.getElementById('slimit').value=c.SeriesLimit||250;
-    if(c.CategoryIds&&c.CategoryIds.length){
-      c.CategoryIds.forEach(id=>selectedLiveCats.add(id));
-    }
+    if(c.CategoryIds&&c.CategoryIds.length)c.CategoryIds.forEach(id=>selectedLiveCats.add(id));
   }).catch(()=>{});
 </script></body></html>"#;
 
