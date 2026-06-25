@@ -485,7 +485,8 @@ pub struct LiveTvChannelQuery {
     pub start_index: usize,
     pub limit: Option<usize>,
     pub search_term: Option<String>,
-    pub category_id: Option<String>,
+    /// Resolved category ids to match (OR). Empty = no category filter.
+    pub category_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -9022,9 +9023,19 @@ fn append_live_tv_channel_filters(
     builder: &mut QueryBuilder<'_, Sqlite>,
     query: &LiveTvChannelQuery,
 ) {
-    if let Some(category_id) = query.category_id.as_deref() {
-        builder.push(" AND c.category_id = ");
-        builder.push_bind(category_id.trim().to_string());
+    let category_ids = query
+        .category_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if !category_ids.is_empty() {
+        builder.push(" AND c.category_id IN (");
+        let mut separated = builder.separated(", ");
+        for id in &category_ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(")");
     }
     if let Some(search_term) = query.search_term.as_deref().map(str::trim)
         && !search_term.is_empty()

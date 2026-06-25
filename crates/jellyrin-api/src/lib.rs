@@ -16098,7 +16098,7 @@ async fn live_tv_channel_record_by_any_id(
             start_index: 0,
             limit: Some(total.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
             search_term: None,
-            category_id: None,
+            category_ids: Vec::new(),
         })
         .await?;
     Ok(page.items.into_iter().find(|record| {
@@ -17555,6 +17555,13 @@ struct LiveTvChannelsQuery {
     #[serde(
         default,
         deserialize_with = "deserialize_csv_values",
+        alias = "Genres",
+        alias = "genres"
+    )]
+    genres: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
         alias = "Tags",
         alias = "tags"
     )]
@@ -17577,12 +17584,12 @@ async fn live_tv_channels(
             .map(|limit| limit.min(LIVE_TV_CHANNELS_MAX_LIMIT))
             .unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT),
     );
-    let category_id = live_tv_channel_category_filter(&state.db, &query).await?;
+    let category_ids = live_tv_channel_category_filter(&state.db, &query).await?;
     let db_query = LiveTvChannelQuery {
         start_index: query.start_index.unwrap_or(0),
         limit,
         search_term: query.search_term.clone(),
-        category_id,
+        category_ids,
     };
     let page = state.db.live_tv_channel_page(db_query).await?;
     if page.total_record_count > 0 {
@@ -17620,28 +17627,55 @@ async fn live_tv_channels(
 async fn live_tv_channel_category_filter(
     db: &Database,
     query: &LiveTvChannelsQuery,
-) -> Result<Option<String>, ApiError> {
+) -> Result<Vec<String>, ApiError> {
+    // Collect every requested category/genre/tag selector (multi-select).
     let requested = query
         .category_id
         .iter()
         .map(String::as_str)
         .chain(query.genre_ids.iter().map(String::as_str))
+        .chain(query.genres.iter().map(String::as_str))
         .chain(query.tags.iter().map(String::as_str))
         .map(str::trim)
-        .find(|value| !value.is_empty() && !value.eq_ignore_ascii_case("null"));
-    let Some(requested) = requested else {
-        return Ok(None);
-    };
-    let categories = db.live_tv_categories().await?;
-    Ok(categories
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("null"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    resolve_live_tv_category_ids(db, &requested).await
+}
+
+/// Resolve raw category selectors (category_id / remote_id / name / the FNV
+/// "LiveTvGenre" hash that channels expose as GenreItems[].Id) into real stored
+/// category ids. Unmatched values are passed through unchanged. Shared by the
+/// channels and programs endpoints so both honor the same selectors.
+async fn resolve_live_tv_category_ids(
+    db: &Database,
+    requested: &[String],
+) -> Result<Vec<String>, ApiError> {
+    let requested = requested
         .iter()
-        .find(|category| {
-            requested.eq_ignore_ascii_case(&category.category_id)
-                || requested.eq_ignore_ascii_case(&category.name)
-                || requested.eq_ignore_ascii_case(&category.remote_id)
-        })
-        .map(|category| category.category_id.clone())
-        .or_else(|| Some(requested.to_string())))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("null"))
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let categories = db.live_tv_categories().await?;
+    let mut resolved = Vec::new();
+    for value in requested {
+        let matched = categories.iter().find(|category| {
+            value.eq_ignore_ascii_case(&category.category_id)
+                || value.eq_ignore_ascii_case(&category.name)
+                || value.eq_ignore_ascii_case(&category.remote_id)
+                || value.eq_ignore_ascii_case(&stable_entity_id("LiveTvGenre", &category.name))
+        });
+        let id = matched
+            .map(|category| category.category_id.clone())
+            .unwrap_or_else(|| value.to_string());
+        if !resolved.contains(&id) {
+            resolved.push(id);
+        }
+    }
+    Ok(resolved)
 }
 
 fn filter_channel_items_by_category(
@@ -17653,6 +17687,7 @@ fn filter_channel_items_by_category(
         .iter()
         .map(String::as_str)
         .chain(query.genre_ids.iter().map(String::as_str))
+        .chain(query.genres.iter().map(String::as_str))
         .chain(query.tags.iter().map(String::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("null"))
@@ -17661,17 +17696,24 @@ fn filter_channel_items_by_category(
     if requested.is_empty() {
         return;
     }
+    // A channel matches if its CategoryId, any Genre, any Tag, or the FNV
+    // "LiveTvGenre" hash of any Genre is in the requested set (so a funnel built
+    // from GenreItems[].Id matches here too).
+    let matches = |value: &str| -> bool {
+        let lower = value.to_ascii_lowercase();
+        requested.contains(&lower)
+            || requested.contains(&stable_entity_id("LiveTvGenre", value).to_ascii_lowercase())
+    };
     channels.retain(|channel| {
-        json_string_field(channel, "CategoryId")
-            .is_some_and(|value| requested.contains(&value.to_ascii_lowercase()))
+        json_string_field(channel, "CategoryId").is_some_and(|value| matches(&value))
             || json_string_list_field(channel, "Genres")
                 .unwrap_or_default()
                 .iter()
-                .any(|value| requested.contains(&value.to_ascii_lowercase()))
+                .any(|value| matches(value))
             || json_string_list_field(channel, "Tags")
                 .unwrap_or_default()
                 .iter()
-                .any(|value| requested.contains(&value.to_ascii_lowercase()))
+                .any(|value| matches(value))
     });
 }
 
@@ -17731,8 +17773,10 @@ async fn live_tv_programs(
     require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let query = parse_live_tv_programs_query(raw_query.as_deref());
     let channel_ids = query.channel_ids;
-    let category_ids =
+    let requested =
         live_tv_category_filter_values(query.genre_ids.as_deref(), query.tags.as_deref());
+    // Resolve genre-hash / name selectors to real category ids (same as channels).
+    let category_ids = resolve_live_tv_category_ids(&state.db, &requested).await?;
     live_tv_program_result(
         &state.db,
         &channel_ids,
@@ -17817,9 +17861,11 @@ async fn live_tv_programs_post(
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let payload = optional_json_body(body).await?;
     let channel_ids = json_string_list_field(&payload, "ChannelIds").unwrap_or_default();
-    let category_ids = json_string_list_field(&payload, "GenreIds")
+    let requested = json_string_list_field(&payload, "GenreIds")
         .or_else(|| json_string_list_field(&payload, "Tags"))
         .unwrap_or_default();
+    // Resolve genre-hash / name selectors to real category ids (same as channels).
+    let category_ids = resolve_live_tv_category_ids(&state.db, &requested).await?;
     let start_index = live_tv_u64_field(&payload, "StartIndex").map(|value| value as usize);
     let limit = live_tv_u64_field(&payload, "Limit").map(|value| value as usize);
     let filters = live_tv_program_filters_from_body(&payload);
@@ -17911,7 +17957,7 @@ async fn live_tv_program_by_id(
                         start_index: 0,
                         limit: Some(persisted_count.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
                         search_term: None,
-                        category_id: None,
+                        category_ids: Vec::new(),
                     })
                     .await?;
                 for record in page.items {
@@ -18048,13 +18094,13 @@ async fn live_tv_program_result(
             .live_tv_channel_count(&LiveTvChannelQuery::default())
             .await?;
         if persisted_count > 0 {
-            let category_id = category_ids.first().cloned();
+            let category_ids_filter = category_ids.to_vec();
             let persisted_count = db
                 .live_tv_channel_count(&LiveTvChannelQuery {
                     start_index: 0,
                     limit: None,
                     search_term: None,
-                    category_id: category_id.clone(),
+                    category_ids: category_ids_filter.clone(),
                 })
                 .await?;
             if filters.has_category_filters() {
@@ -18063,7 +18109,7 @@ async fn live_tv_program_result(
                         start_index: 0,
                         limit: Some(persisted_count.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
                         search_term: None,
-                        category_id,
+                        category_ids: category_ids_filter,
                     })
                     .await?;
                 let channels = page
@@ -18098,7 +18144,7 @@ async fn live_tv_program_result(
                     start_index,
                     limit: Some(limit),
                     search_term: None,
-                    category_id,
+                    category_ids: category_ids.to_vec(),
                 })
                 .await?;
             let channels = page
@@ -23283,7 +23329,7 @@ async fn live_tv_channel_items_result(
         start_index: query.start_index.unwrap_or(0),
         limit: Some(limit),
         search_term: query.search_term.clone(),
-        category_id: None,
+        category_ids: Vec::new(),
     };
     let page = db.live_tv_channel_page(db_query).await?;
     if page.total_record_count > 0 {
@@ -34023,7 +34069,7 @@ async fn channel_items(
             start_index: query.start_index.unwrap_or(0),
             limit: Some(query.limit.unwrap_or(100).min(500)),
             search_term: query.search_term.clone(),
-            category_id: None,
+            category_ids: Vec::new(),
         };
         let page = state.db.live_tv_channel_page(db_query).await?;
         if page.total_record_count > 0 {
@@ -34194,7 +34240,7 @@ async fn channel_content_items(
                 start_index: 0,
                 limit: Some(100),
                 search_term: None,
-                category_id: None,
+                category_ids: Vec::new(),
             })
             .await?;
         if page.total_record_count > 0 {
@@ -36944,18 +36990,49 @@ async fn filtered_media_items(
         items = filtered;
     }
 
-    if let Some(is_favorite) = query.is_favorite {
+    // Resolve the favorite filter from the explicit IsFavorite query param OR a
+    // Filters= token. The token distinguishes favorite-only from favorite-or-likes.
+    let favorite_filter: Option<(bool, FavoriteFilterMode)> = match query.is_favorite {
+        Some(value) => Some((value, FavoriteFilterMode::FavoriteOnly)),
+        None => filters
+            .as_deref()
+            .and_then(favorite_filter_value)
+            .map(|mode| (true, mode)),
+    };
+    if let Some((want, mode)) = favorite_filter {
         let Some(user_id) = user_id else {
             items.clear();
             return Ok(items);
         };
         let mut filtered = Vec::new();
         for item in items {
-            let favorite = db
+            let state = db.playback_state_for_item(user_id, item.id).await?;
+            let matches = state.is_some_and(|state| match mode {
+                FavoriteFilterMode::FavoriteOnly => state.is_favorite,
+                FavoriteFilterMode::FavoriteOrLikes => {
+                    state.is_favorite || state.rating.is_some_and(|rating| rating > 0.0)
+                }
+            });
+            if matches == want {
+                filtered.push(item);
+            }
+        }
+        items = filtered;
+    }
+
+    // Filters=IsResumable: keep only items with a saved playback position > 0.
+    if filters.as_deref().is_some_and(resumable_filter_value) {
+        let Some(user_id) = user_id else {
+            items.clear();
+            return Ok(items);
+        };
+        let mut filtered = Vec::new();
+        for item in items {
+            let resumable = db
                 .playback_state_for_item(user_id, item.id)
                 .await?
-                .is_some_and(|state| state.is_favorite);
-            if favorite == is_favorite {
+                .is_some_and(|state| state.position_ticks > 0 && !state.played);
+            if resumable {
                 filtered.push(item);
             }
         }
@@ -37403,9 +37480,19 @@ where
     D: Deserializer<'de>,
 {
     let values = Option::<QueryStringValues>::deserialize(deserializer)?;
+    // Split comma-separated values so both repeated params (a&a=b) and a single
+    // CSV param (a=b,c) yield individual values — Jellyfin clients use both forms.
+    let split = |value: String| -> Vec<String> {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    };
     Ok(match values {
-        Some(QueryStringValues::One(value)) => vec![value],
-        Some(QueryStringValues::Many(values)) => values,
+        Some(QueryStringValues::One(value)) => split(value),
+        Some(QueryStringValues::Many(values)) => values.into_iter().flat_map(split).collect(),
         None => Vec::new(),
     })
 }
@@ -37435,6 +37522,34 @@ fn played_filter_value(filters: &[String]) -> Option<bool> {
     } else {
         None
     }
+}
+
+/// How a `Filters=` favorite/likes token should match playback state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FavoriteFilterMode {
+    /// `IsFavorite` — only items explicitly marked favorite.
+    FavoriteOnly,
+    /// `IsFavoriteOrLikes` / `Likes` — favorite OR positively rated (like).
+    FavoriteOrLikes,
+}
+
+/// Resolve the favorite/likes CSV token (Jellyfin web funnel) into a match mode.
+fn favorite_filter_value(filters: &[String]) -> Option<FavoriteFilterMode> {
+    if filters
+        .iter()
+        .any(|filter| filter == "isfavoriteorlikes" || filter == "likes")
+    {
+        Some(FavoriteFilterMode::FavoriteOrLikes)
+    } else if filters.iter().any(|filter| filter == "isfavorite") {
+        Some(FavoriteFilterMode::FavoriteOnly)
+    } else {
+        None
+    }
+}
+
+/// `Filters=IsResumable` CSV token — items with saved playback position.
+fn resumable_filter_value(filters: &[String]) -> bool {
+    filters.iter().any(|filter| filter == "isresumable")
 }
 
 fn query_filters_played_value(filters: &[String]) -> Option<bool> {
@@ -41681,7 +41796,7 @@ async fn precache_live_tv_logos(state: &AppState) -> Result<(), ApiError> {
             start_index: 0,
             limit: Some(LIVE_TV_LOGO_PRECACHE_MAX),
             search_term: None,
-            category_id: None,
+            category_ids: Vec::new(),
         })
         .await?;
     if page.total_record_count > LIVE_TV_LOGO_PRECACHE_MAX {
