@@ -15387,7 +15387,7 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 <!--<script>
 (function(){
 var td={LiveCategories:[],VodCategories:[],SeriesCategories:[]};
-var sLive=new Set(),sVod=new Set(),sSer=new Set(),tok=null;
+var sLive=new Set(),sVod=new Set(),sSer=new Set(),tok=null,tested=false;
 
 function go(n){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
@@ -15507,6 +15507,7 @@ async function doTest(){
       body:JSON.stringify({Url:url,Username:user,Password:pass})});
     var d=await r.json();
     if(!r.ok){merr('mTest',d.Message||r.statusText);return}
+    tested=true;
     td=d;sLive.clear();sVod.clear();sSer.clear();
     (d.LiveCategories||[]).forEach(function(c){sLive.add(c.Id)});
     (d.VodCategories||[]).forEach(function(c){sVod.add(c.Id)});
@@ -15638,6 +15639,27 @@ document.getElementById('schedmode').addEventListener('change',updateSchedFields
   });
 });
 updateSchedFields();
+
+// Make the stepper tabs clickable. Categories (tab 2) needs a successful
+// test first; clicking it without one runs the test automatically.
+[1,2,3,4].forEach(function(n){
+  var tab=document.getElementById('tab'+n);
+  tab.addEventListener('click',function(){
+    if(n===2&&!tested){ doTest(); return; }
+    go(n);
+  });
+});
+
+// Load the saved auto-sync schedule on page open so the Schedule tab
+// reflects the current setting even before testing the connection.
+(function loadSavedSchedule(){
+  var headers={};
+  try{ headers={'X-Emby-Token':gtok()}; }catch(e){ return; }
+  fetch('/ScheduledTasks/sync-xtream-media',{headers:headers,credentials:'same-origin'})
+    .then(function(r){return r.ok?r.json():null}).then(function(t){
+      if(t&&t.Triggers)applyTriggers(t.Triggers);
+    }).catch(function(){});
+})();
 })();
 </script>-->
 </div></div>
