@@ -103,6 +103,10 @@ const SUBTITLE_JSON_FALLBACK_WINDOW_TICKS: i64 = 600_000_000;
 const XTREAM_REMOTE_PROBE_FAILED_RETRY_AFTER_SECONDS: i64 = 30 * 60;
 const DLNA_TRANSCODE_DEVICE_ID: &str = "dlna-upnp";
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
+/// Default page size for `/LiveTv/Channels` when the client omits `Limit`.
+const LIVE_TV_CHANNELS_DEFAULT_LIMIT: usize = 100;
+/// Hard cap for an explicit `Limit` on `/LiveTv/Channels`.
+const LIVE_TV_CHANNELS_MAX_LIMIT: usize = 500;
 const HDHOMERUN_DISCOVERY_PORT: u16 = 65001;
 const HDHOMERUN_DISCOVERY_DURATION_MS: u64 = 3000;
 const HDHOMERUN_LEGACY_DEFAULT_TUNERS: usize = 2;
@@ -9356,6 +9360,8 @@ async fn sync_xtream_tuner_from_plugin_config(
     let tuner_type = "xtream";
     if let Some(import) = live_tv_provider_import_from_payload(state, &payload, tuner_type).await? {
         persist_live_tv_provider_import(&state.db, &payload, &import).await?;
+        // Warm the channel-logo disk cache in the background.
+        spawn_live_tv_logo_precache(state.clone());
         // Update the livetv config to include this tuner
         let mut livetv_config = state
             .db
@@ -17262,6 +17268,8 @@ async fn add_live_tv_tuner_host(
         live_tv_provider_import_from_payload(&state, &payload, &tuner_type).await?
     {
         persist_live_tv_provider_import(&state.db, &payload, &import).await?;
+        // Warm the channel-logo disk cache in the background.
+        spawn_live_tv_logo_precache(state.clone());
         // Check provider's post-import actions (e.g., media sync)
         if let Some(provider) = live_tv_provider_for_type(&tuner_type).await {
             let actions = provider.post_import_actions();
@@ -17559,7 +17567,16 @@ async fn live_tv_channels(
     Query(query): Query<LiveTvChannelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    let limit = query.limit.map(|limit| limit.min(500));
+    // Cap explicit limits at 500, and apply a sane default page size when the
+    // client omits Limit — otherwise a large channel list (thousands of items)
+    // is returned and rendered in one shot, which is slow and floods the image
+    // endpoint with concurrent logo fetches.
+    let limit = Some(
+        query
+            .limit
+            .map(|limit| limit.min(LIVE_TV_CHANNELS_MAX_LIMIT))
+            .unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT),
+    );
     let category_id = live_tv_channel_category_filter(&state.db, &query).await?;
     let db_query = LiveTvChannelQuery {
         start_index: query.start_index.unwrap_or(0),
@@ -41599,6 +41616,107 @@ async fn cache_live_tv_image(
     ));
     tokio::fs::write(&path, bytes).await?;
     Ok(path)
+}
+
+/// Max channels to pre-cache logos for in one background pass (safety cap).
+const LIVE_TV_LOGO_PRECACHE_MAX: usize = 10_000;
+/// How many logo downloads run concurrently during pre-cache.
+const LIVE_TV_LOGO_PRECACHE_CONCURRENCY: usize = 8;
+
+/// Spawn a background task that downloads and caches every channel logo so the
+/// Live TV channel grid renders from disk instead of hitting the remote provider
+/// on first view. Idempotent: already-cached logos are skipped.
+fn spawn_live_tv_logo_precache(state: AppState) {
+    tokio::spawn(async move {
+        if let Err(error) = precache_live_tv_logos(&state).await {
+            tracing::warn!(?error, "live TV logo pre-cache failed");
+        }
+    });
+}
+
+async fn precache_live_tv_logos(state: &AppState) -> Result<(), ApiError> {
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    // Bound the fetch in SQL (LIMIT) so we never materialize an unbounded
+    // channel list into memory — providers can expose tens of thousands.
+    let page = state
+        .db
+        .live_tv_channel_page(LiveTvChannelQuery {
+            start_index: 0,
+            limit: Some(LIVE_TV_LOGO_PRECACHE_MAX),
+            search_term: None,
+            category_id: None,
+        })
+        .await?;
+    if page.total_record_count > LIVE_TV_LOGO_PRECACHE_MAX {
+        tracing::info!(
+            total = page.total_record_count,
+            cap = LIVE_TV_LOGO_PRECACHE_MAX,
+            "live TV logo pre-cache capped; remaining logos cache lazily on first view"
+        );
+    }
+
+    // Derive the exact (item_id, image_url) pairs the serving path will use.
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for record in page.items.iter() {
+        let item = live_tv_channel_record_to_json(record, &server_id);
+        let Some(item_id) = json_string_field(&item, "Id") else {
+            continue;
+        };
+        let Some(image_url) = live_tv_image_url(&item) else {
+            continue;
+        };
+        if image_url.starts_with("http://") || image_url.starts_with("https://") {
+            targets.push((item_id, image_url));
+        }
+    }
+
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let total = targets.len();
+    tracing::info!(total, "starting live TV logo pre-cache");
+
+    let mut cached = 0usize;
+    let mut failed = 0usize;
+    for chunk in targets.chunks(LIVE_TV_LOGO_PRECACHE_CONCURRENCY) {
+        let results =
+            futures_util::future::join_all(chunk.iter().map(|(item_id, image_url)| {
+                precache_single_live_tv_logo(state, item_id, image_url)
+            }))
+            .await;
+        for result in results {
+            match result {
+                Ok(true) => cached += 1,
+                Ok(false) => {}
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    tracing::info!(total, cached, failed, "live TV logo pre-cache complete");
+    Ok(())
+}
+
+/// Returns Ok(true) if the logo was newly downloaded and cached, Ok(false) if
+/// it was already cached.
+async fn precache_single_live_tv_logo(
+    state: &AppState,
+    item_id: &str,
+    image_url: &str,
+) -> Result<bool, ApiError> {
+    if find_cached_live_tv_image(state, item_id, image_url)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+    match fetch_channel_remote_image_payload(image_url).await {
+        Ok(Some((bytes, _mime))) => {
+            cache_live_tv_image(state, item_id, image_url, &bytes).await?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn live_tv_generated_image_response(

@@ -34,7 +34,9 @@ async function main() {
     ...(options.excludeCategoryIds.length ? { ExcludeCategoryIds: options.excludeCategoryIds } : {}),
     ...(options.channelLimit ? { Limit: options.channelLimit } : {}),
   });
-  const channels = await getJson(`/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`, auth.AccessToken);
+  // Request an explicit large page: /LiveTv/Channels now defaults to 100 items
+  // when Limit is omitted, so probe scripts must opt into a full scan.
+  const channels = await getJson(`/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&Limit=500`, auth.AccessToken);
   const items = Array.isArray(channels.Items) ? channels.Items : [];
   const guideProbeChannelIds = selectGuideProbeChannels(items, options.guideChannels);
   const listing = options.skipGuide

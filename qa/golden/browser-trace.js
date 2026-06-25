@@ -3898,7 +3898,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
 
     const channels = await browserFetchJson(page, {
       method: 'GET',
-      url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`,
+      url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&Limit=500`,
       token: auth.AccessToken,
     });
     if (channels.status !== 200 || !Array.isArray(channels.json?.Items)) {
@@ -4077,7 +4077,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
   while (Date.now() < hdhrPollDeadline) {
     const hdhrChannels = await browserFetchJson(page, {
       method: 'GET',
-      url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`,
+      url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&Limit=500`,
       token: auth.AccessToken,
     });
     if (hdhrChannels.status !== 200 || !Array.isArray(hdhrChannels.json?.Items)) {
@@ -5348,7 +5348,7 @@ async function runLiveTvFlow(page, summary, publicInfo, target) {
       while (Date.now() < limitPollDeadline) {
         const ch = await browserFetchJson(page, {
           method: 'GET',
-          url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`,
+          url: `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&Limit=500`,
           token: auth.AccessToken,
         });
         if (ch.status === 200 && Array.isArray(ch.json?.Items)) {
