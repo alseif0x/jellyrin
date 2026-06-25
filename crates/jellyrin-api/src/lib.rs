@@ -24713,8 +24713,14 @@ async fn item_detail(
         let child_count = state.db.media_list_items(list.id).await?.len();
         return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
     }
-    if let Ok(item) = media_item_by_id(&state.db, &item_id).await {
-        let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    if let Ok(mut item) = media_item_by_id(&state.db, &item_id).await {
+        let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        // Xtream VOD/series items import with synthetic 1-video/1-audio streams;
+        // probe the remote source on-demand so the detail page can expose real
+        // audio languages and subtitle tracks for selection. Cached after first probe.
+        if is_xtream_remote_media(Some(&metadata)) {
+            item = ensure_xtream_remote_media_info(&state.db, item, Some(&mut metadata)).await?;
+        }
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -39749,6 +39755,19 @@ fn is_xtream_remote_media(metadata: Option<&serde_json::Value>) -> bool {
         && xtream_remote_source_url(metadata).is_some()
 }
 
+/// Per-item async locks that serialize remote ffprobe so that concurrent detail
+/// or playback-info opens of the same Xtream VOD item probe the network once,
+/// instead of all racing (thundering herd) before the first probe persists.
+static XTREAM_PROBE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn xtream_probe_lock_for(item_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let registry = XTREAM_PROBE_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap();
+    guard.entry(item_id).or_default().clone()
+}
+
 async fn ensure_xtream_remote_media_info(
     db: &Database,
     item: MediaItem,
@@ -39762,6 +39781,24 @@ async fn ensure_xtream_remote_media_info(
     };
     if xtream_remote_media_probe_current(metadata, &source_url) {
         return Ok(item);
+    }
+
+    // Serialize concurrent probes of the same item.
+    let lock = xtream_probe_lock_for(item.id);
+    let _probe_guard = lock.lock().await;
+
+    // Double-checked locking: another caller may have completed the probe while
+    // we waited for the lock. Re-read fresh metadata and re-check before probing.
+    if let Some(fresh) = db
+        .media_item_metadata_by_item_ids(&HashSet::from([item.id]))
+        .await?
+        .into_iter()
+        .next()
+        .map(|metadata| metadata.payload)
+        && xtream_remote_media_probe_current(&fresh, &source_url)
+    {
+        *metadata = fresh;
+        return Ok(db.media_item_by_id(item.id).await?);
     }
 
     let media_info = probe_remote_media_info(&source_url, &item.media_type).await;
