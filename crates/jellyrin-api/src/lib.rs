@@ -3889,6 +3889,33 @@ fn scheduled_trigger_due(
             .unwrap_or(now - interval - Duration::seconds(1));
         return now - last_time >= interval;
     }
+    if trigger_type.contains("weekly") {
+        // WeeklyTrigger: { Type, DayOfWeek: "Monday", TimeOfDayTicks }
+        let Some(target_weekday) =
+            json_string_field(trigger, "DayOfWeek").and_then(|day| weekday_from_name(&day))
+        else {
+            return false;
+        };
+        if now.weekday() != target_weekday {
+            return false;
+        }
+        let time_of_day_ticks = trigger
+            .get("TimeOfDayTicks")
+            .and_then(json_value_i64)
+            .unwrap_or(3 * 60 * 60 * 10_000_000)
+            .clamp(0, 86_399 * 10_000_000);
+        let now_seconds =
+            i64::from(now.hour()) * 3600 + i64::from(now.minute()) * 60 + i64::from(now.second());
+        let due_seconds = time_of_day_ticks / 10_000_000;
+        if now_seconds < due_seconds {
+            return false;
+        }
+        let Some(last_time) = last_result.and_then(|run| run.completed_at) else {
+            return true;
+        };
+        // Only run once on the target day: skip if already run today.
+        return last_time.date() < now.date();
+    }
     if trigger_type.contains("daily") {
         let time_of_day_ticks = trigger
             .get("TimeOfDayTicks")
@@ -3907,6 +3934,21 @@ fn scheduled_trigger_due(
         return last_time.date() < now.date();
     }
     false
+}
+
+/// Parse a Jellyfin `DayOfWeek` name into a `time::Weekday` (case-insensitive).
+fn weekday_from_name(name: &str) -> Option<time::Weekday> {
+    use time::Weekday::*;
+    match name.trim().to_ascii_lowercase().as_str() {
+        "monday" => Some(Monday),
+        "tuesday" => Some(Tuesday),
+        "wednesday" => Some(Wednesday),
+        "thursday" => Some(Thursday),
+        "friday" => Some(Friday),
+        "saturday" => Some(Saturday),
+        "sunday" => Some(Sunday),
+        _ => None,
+    }
 }
 
 pub fn spawn_periodic_transcode_cleanup(db: Database) -> tokio::task::JoinHandle<()> {
@@ -15156,9 +15198,12 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 .xtream-config .card-h{font-size:.95rem;font-weight:600;color:rgba(255,255,255,.8);margin-bottom:1rem}
 .xtream-config .fg{margin-bottom:1rem}
 .xtream-config .fg label{display:block;font-size:.8rem;color:rgba(255,255,255,.45);margin-bottom:.3rem;text-transform:uppercase;letter-spacing:.04em}
-.xtream-config .fg input{width:100%;padding:.55rem .75rem;border:1px solid rgba(255,255,255,.12);border-radius:4px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.87);font-size:.9rem;outline:none}
-.xtream-config .fg input:focus{border-color:#00a4dc}
+.xtream-config .fg input,.xtream-config .fg select{width:100%;padding:.55rem .75rem;border:1px solid rgba(255,255,255,.12);border-radius:4px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.87);font-size:.9rem;outline:none}
+.xtream-config .fg input:focus,.xtream-config .fg select:focus{border-color:#00a4dc}
 .xtream-config .fg input::placeholder{color:rgba(255,255,255,.2)}
+.xtream-config .fg select option{background:#101820;color:rgba(255,255,255,.87)}
+.xtream-config .sched-field{display:none}
+.xtream-config .sched-field.on{display:block}
 .xtream-config .hint{font-size:.75rem;color:rgba(255,255,255,.25);margin-top:.2rem}
 .xtream-config .btns{display:flex;gap:.5rem;margin-top:1.25rem}
 .xtream-config .btn{padding:.55rem 1.25rem;border:none;border-radius:4px;font-size:.85rem;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;gap:.4rem}
@@ -15204,7 +15249,8 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
 <div class="steps">
   <div class="step-tab on" id="tab1">1. Connection</div>
   <div class="step-tab" id="tab2">2. Categories</div>
-  <div class="step-tab" id="tab3">3. Save</div>
+  <div class="step-tab" id="tab3">3. Limits</div>
+  <div class="step-tab" id="tab4">4. Schedule</div>
 </div>
 
 <!-- Panel 1 -->
@@ -15284,13 +15330,55 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
       <div class="hint">Max series to import (each series is fetched individually)</div>
     </div>
   </div>
+  <div class="btns">
+    <button class="btn btn-s" data-go="2">Back</button>
+    <button class="btn btn-p btn-f" data-go="4">Next</button>
+  </div>
+</div>
+
+<!-- Panel 4: Schedule -->
+<div class="panel" id="p4">
+  <div class="card">
+    <div class="card-h">Automatic Sync Schedule</div>
+    <div class="hint" style="margin-bottom:1rem">How often Jellyrin re-imports movies and series in the background. Live TV channels always refresh when you save.</div>
+    <div class="fg">
+      <label for="schedmode">Mode</label>
+      <select id="schedmode">
+        <option value="daily">Daily (at a set time)</option>
+        <option value="interval">Every N hours</option>
+        <option value="weekly">Weekly (on a chosen day)</option>
+        <option value="manual">Manual only (no auto-sync)</option>
+      </select>
+    </div>
+    <div class="fg sched-field" id="fieldTime">
+      <label for="schedtime">Time of day (UTC)</label>
+      <input type="time" id="schedtime" value="03:00">
+      <div class="hint">Server time is UTC</div>
+    </div>
+    <div class="fg sched-field" id="fieldInterval">
+      <label for="schedhours">Interval (hours)</label>
+      <input type="number" id="schedhours" value="12" min="1" max="168">
+    </div>
+    <div class="fg sched-field" id="fieldDay">
+      <label for="schedday">Day of week</label>
+      <select id="schedday">
+        <option value="Monday">Monday</option>
+        <option value="Tuesday">Tuesday</option>
+        <option value="Wednesday">Wednesday</option>
+        <option value="Thursday">Thursday</option>
+        <option value="Friday">Friday</option>
+        <option value="Saturday">Saturday</option>
+        <option value="Sunday">Sunday</option>
+      </select>
+    </div>
+  </div>
   <div class="card" id="sumCard" style="display:none">
     <div class="card-h">Summary</div>
     <div class="sum" id="sumTxt"></div>
   </div>
   <div class="btns">
-    <button class="btn btn-s" data-go="2">Back</button>
-    <button class="btn btn-g btn-f" id="bSave">Save & Sync</button>
+    <button class="btn btn-s" data-go="3">Back</button>
+    <button class="btn btn-g btn-f" id="bSave">Save &amp; Sync</button>
   </div>
   <div class="msg" id="mSave"></div>
 </div>
@@ -15309,7 +15397,64 @@ function go(n){
     if(i+1===n)t.classList.add('on');
     else if(i+1<n)t.classList.add('done');
   });
-  if(n===3)mkSum();
+  if(n===4)mkSum();
+}
+
+// Show only the schedule fields relevant to the selected mode.
+function updateSchedFields(){
+  var mode=document.getElementById('schedmode').value;
+  var showTime=mode==='daily'||mode==='weekly';
+  document.getElementById('fieldTime').classList.toggle('on',showTime);
+  document.getElementById('fieldInterval').classList.toggle('on',mode==='interval');
+  document.getElementById('fieldDay').classList.toggle('on',mode==='weekly');
+  // Keep the summary in sync if it is already shown.
+  if(document.getElementById('sumCard').style.display==='')mkSum();
+}
+
+// Convert "HH:MM" to .NET ticks since midnight (1 tick = 100ns).
+function timeToTicks(hhmm){
+  var parts=(hhmm||'03:00').split(':');
+  var h=parseInt(parts[0],10)||0, m=parseInt(parts[1],10)||0;
+  return (h*3600+m*60)*10000000;
+}
+// Convert .NET ticks since midnight to "HH:MM".
+function ticksToTime(ticks){
+  var secs=Math.floor((ticks||0)/10000000);
+  var h=Math.floor(secs/3600), m=Math.floor((secs%3600)/60);
+  return (h<10?'0':'')+h+':'+(m<10?'0':'')+m;
+}
+// Build the triggers array the backend expects from the current UI state.
+function buildTriggers(){
+  var mode=document.getElementById('schedmode').value;
+  if(mode==='manual')return [];
+  if(mode==='interval'){
+    var hrs=Math.max(1,+document.getElementById('schedhours').value||12);
+    return [{Type:'IntervalTrigger',IntervalTicks:hrs*3600*10000000}];
+  }
+  if(mode==='weekly'){
+    return [{Type:'WeeklyTrigger',DayOfWeek:document.getElementById('schedday').value,
+      TimeOfDayTicks:timeToTicks(document.getElementById('schedtime').value)}];
+  }
+  // daily (default)
+  return [{Type:'DailyTrigger',TimeOfDayTicks:timeToTicks(document.getElementById('schedtime').value)}];
+}
+// Populate the schedule UI from an existing triggers array.
+function applyTriggers(triggers){
+  var t=(triggers&&triggers.length)?triggers[0]:null;
+  if(!t){document.getElementById('schedmode').value='manual';updateSchedFields();return}
+  var type=(t.Type||'').toLowerCase();
+  if(type.indexOf('interval')>=0){
+    document.getElementById('schedmode').value='interval';
+    document.getElementById('schedhours').value=Math.max(1,Math.round((t.IntervalTicks||43200000000)/(3600*10000000)));
+  }else if(type.indexOf('weekly')>=0){
+    document.getElementById('schedmode').value='weekly';
+    if(t.DayOfWeek)document.getElementById('schedday').value=t.DayOfWeek;
+    document.getElementById('schedtime').value=ticksToTime(t.TimeOfDayTicks);
+  }else{
+    document.getElementById('schedmode').value='daily';
+    document.getElementById('schedtime').value=ticksToTime(t.TimeOfDayTicks);
+  }
+  updateSchedFields();
 }
 function mok(id,m){var e=document.getElementById(id);e.innerHTML=m;e.className='msg show ok'}
 function merr(id,m){var e=document.getElementById(id);e.innerHTML=m;e.className='msg show err'}
@@ -15332,11 +15477,19 @@ function togAll(gid,set){
   var all=Array.from(cbs).every(function(c){return c.checked});
   cbs.forEach(function(c){c.checked=!all;if(c.checked)set.add(c.id.split('_').pop());else set.delete(c.id.split('_').pop())});
 }
+function schedSummary(){
+  var mode=document.getElementById('schedmode').value;
+  if(mode==='manual')return 'Manual only — no automatic sync.';
+  if(mode==='interval')return 'Every '+(+document.getElementById('schedhours').value||12)+' hours.';
+  if(mode==='weekly')return 'Weekly on '+document.getElementById('schedday').value+' at '+document.getElementById('schedtime').value+' UTC.';
+  return 'Daily at '+document.getElementById('schedtime').value+' UTC.';
+}
 function mkSum(){
   var lc=sLive.size,vc=sVod.size,sc=sSer.size;
   var t=td.LiveCategories.length+td.VodCategories.length+td.SeriesCategories.length;
   var h='<p>Importing <strong>'+lc+'</strong> live, <strong>'+vc+'</strong> VOD, <strong>'+sc+'</strong> series categories.</p>';
   if(t>lc+vc+sc)h+='<p style="margin-top:.35rem">'+(t-lc-vc-sc)+' excluded.</p>';
+  h+='<p style="margin-top:.35rem">Auto-sync: <strong>'+schedSummary()+'</strong></p>';
   document.getElementById('sumTxt').innerHTML=h;
   document.getElementById('sumCard').style.display='';
 }
@@ -15387,6 +15540,10 @@ async function doTest(){
         rc('gSer',d.SeriesCategories||[],sSer,'cSer');
       }
     }
+    // Load the current auto-sync schedule from the scheduled task.
+    var task=await fetch('/ScheduledTasks/sync-xtream-media',{headers:{'X-Emby-Token':tok}})
+      .then(function(r){return r.ok?r.json():null}).catch(function(){return null});
+    if(task&&task.Triggers)applyTriggers(task.Triggers);
     go(2);
   }catch(e){merr('mTest',''+e)}
   finally{btn.disabled=false;btn.textContent='Test Connection'}
@@ -15418,6 +15575,9 @@ async function doSave(){
       mlim=+document.getElementById('mlimit').value||0,
       slim=+document.getElementById('slimit').value||250;
   var btn=document.getElementById('bSave');btn.disabled=true;btn.innerHTML='<span class="sp"></span> Saving...';
+  // Snapshot the schedule NOW, before any await — the config POST is slow
+  // (it imports live channels synchronously) and the DOM could change meanwhile.
+  var triggers=buildTriggers(),schedText=schedSummary().toLowerCase();
   try{
     var cfg={Url:url,Username:user,Password:pass,
       ChannelLimit:lim,MovieLimit:mlim,SeriesLimit:slim,
@@ -15425,28 +15585,38 @@ async function doSave(){
       VodCategoryIds:Array.from(sVod),
       SeriesCategoryIds:Array.from(sSer)};
     tok=tok||gtok();
+    // Persist the auto-sync schedule first (fast), then the config (slow, triggers import).
+    var tr=await fetch('/ScheduledTasks/sync-xtream-media/Triggers',{
+      method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':tok},body:JSON.stringify(triggers)});
     var r=await fetch('/Plugins/jellyrin-xtream-provider/Configuration',{
       method:'POST',headers:{'Content-Type':'application/json','X-Emby-Token':tok},body:JSON.stringify(cfg)});
-    if(r.ok||r.status===204)mok('mSave','Saved! Syncing channels...');
-    else{var d=await r.json().catch(function(){return{}});merr('mSave',d.Message||r.statusText)}
+    if(!(r.ok||r.status===204)){var d=await r.json().catch(function(){return{}});merr('mSave',d.Message||r.statusText);return}
+    if(tr.ok||tr.status===204)mok('mSave','Saved! Channels syncing now; movies/series sync '+schedText);
+    else mok('mSave','Config saved and syncing, but schedule update failed.');
   }catch(e){merr('mSave',''+e)}
   finally{btn.disabled=false;btn.textContent='Save & Sync'}
 }
 
-fetch('/Plugins/jellyrin-xtream-provider/Configuration',{credentials:'same-origin'})
-  .then(function(r){return r.ok?r.json():null}).then(function(c){
-    if(!c)return;
-    document.getElementById('url').value=c.Url||'';
-    document.getElementById('user').value=c.Username||c.UserName||'';
-    document.getElementById('pass').value=c.Password||'';
-    document.getElementById('limit').value=c.ChannelLimit||0;
-    document.getElementById('mlimit').value=c.MovieLimit||0;
-    document.getElementById('slimit').value=c.SeriesLimit||250;
-    var sl=c.LiveCategoryIds&&c.LiveCategoryIds.length?c.LiveCategoryIds:c.CategoryIds;
-    if(sl&&sl.length)sl.forEach(function(id){sLive.add(id)});
-    if(c.VodCategoryIds&&c.VodCategoryIds.length)c.VodCategoryIds.forEach(function(id){sVod.add(id)});
-    if(c.SeriesCategoryIds&&c.SeriesCategoryIds.length)c.SeriesCategoryIds.forEach(function(id){sSer.add(id)});
-  }).catch(function(){});
+// Pre-fill the form from saved config. The endpoint requires admin auth,
+// so we must send the session token (a cookie-only request returns 401).
+(function loadSavedConfig(){
+  var headers={};
+  try{ headers={'X-Emby-Token':gtok()}; }catch(e){ /* no session yet */ }
+  fetch('/Plugins/jellyrin-xtream-provider/Configuration',{headers:headers,credentials:'same-origin'})
+    .then(function(r){return r.ok?r.json():null}).then(function(c){
+      if(!c)return;
+      document.getElementById('url').value=c.Url||'';
+      document.getElementById('user').value=c.Username||c.UserName||'';
+      document.getElementById('pass').value=c.Password||'';
+      document.getElementById('limit').value=c.ChannelLimit||0;
+      document.getElementById('mlimit').value=c.MovieLimit||0;
+      document.getElementById('slimit').value=c.SeriesLimit||250;
+      var sl=c.LiveCategoryIds&&c.LiveCategoryIds.length?c.LiveCategoryIds:c.CategoryIds;
+      if(sl&&sl.length)sl.forEach(function(id){sLive.add(id)});
+      if(c.VodCategoryIds&&c.VodCategoryIds.length)c.VodCategoryIds.forEach(function(id){sVod.add(id)});
+      if(c.SeriesCategoryIds&&c.SeriesCategoryIds.length)c.SeriesCategoryIds.forEach(function(id){sSer.add(id)});
+    }).catch(function(){});
+})();
 
 // Wire up event listeners (Jellyfin Web runs scripts in isolated scope, onclick won't work)
 document.getElementById('bTest').addEventListener('click',doTest);
@@ -15461,6 +15631,13 @@ document.querySelectorAll('[data-toggle]').forEach(function(b){
     togAll(gid,set);
   });
 });
+document.getElementById('schedmode').addEventListener('change',updateSchedFields);
+['schedtime','schedhours','schedday'].forEach(function(id){
+  document.getElementById(id).addEventListener('change',function(){
+    if(document.getElementById('sumCard').style.display==='')mkSum();
+  });
+});
+updateSchedFields();
 })();
 </script>-->
 </div></div>
@@ -60093,6 +60270,113 @@ done
             uuid1, uuid_other,
             "different channels must get different UUIDs"
         );
+    }
+
+    #[test]
+    fn weekday_from_name_parses_case_insensitive() {
+        assert_eq!(
+            super::weekday_from_name("Monday"),
+            Some(time::Weekday::Monday)
+        );
+        assert_eq!(
+            super::weekday_from_name("sunday"),
+            Some(time::Weekday::Sunday)
+        );
+        assert_eq!(
+            super::weekday_from_name("  FRIDAY "),
+            Some(time::Weekday::Friday)
+        );
+        assert_eq!(super::weekday_from_name("notaday"), None);
+    }
+
+    #[test]
+    fn daily_trigger_fires_after_due_time_once_per_day() {
+        use time::macros::datetime;
+        // DailyTrigger at 03:00 UTC.
+        let trigger = serde_json::json!({
+            "Type": "DailyTrigger",
+            "TimeOfDayTicks": 3i64 * 60 * 60 * 10_000_000
+        });
+        // Before 03:00 -> not due.
+        let before = datetime!(2026-06-25 02:59:00 UTC);
+        assert!(!super::scheduled_trigger_due(&trigger, None, before));
+        // After 03:00, never run -> due.
+        let after = datetime!(2026-06-25 03:01:00 UTC);
+        assert!(super::scheduled_trigger_due(&trigger, None, after));
+    }
+
+    #[test]
+    fn interval_trigger_respects_elapsed_time() {
+        use time::macros::datetime;
+        // 6h interval = 6*3600*10_000_000 ticks.
+        let trigger = serde_json::json!({
+            "Type": "IntervalTrigger",
+            "IntervalTicks": 6i64 * 3600 * 10_000_000
+        });
+        let now = datetime!(2026-06-25 12:00:00 UTC);
+        let recent = jellyrin_db::TaskRun {
+            id: uuid::Uuid::nil(),
+            task_key: "SyncXtreamMedia".to_string(),
+            status: "completed".to_string(),
+            started_at: datetime!(2026-06-25 09:00:00 UTC),
+            completed_at: Some(datetime!(2026-06-25 09:00:00 UTC)),
+            result_json: None,
+            error_message: None,
+            updated_at: datetime!(2026-06-25 09:00:00 UTC),
+        };
+        // Only 3h elapsed -> not due.
+        assert!(!super::scheduled_trigger_due(&trigger, Some(&recent), now));
+        // 7h elapsed -> due.
+        let old = jellyrin_db::TaskRun {
+            completed_at: Some(datetime!(2026-06-25 05:00:00 UTC)),
+            ..recent.clone()
+        };
+        assert!(super::scheduled_trigger_due(&trigger, Some(&old), now));
+    }
+
+    #[test]
+    fn weekly_trigger_fires_only_on_target_day_after_time() {
+        use time::macros::datetime;
+        // 2026-06-25 is a Thursday.
+        let trigger = serde_json::json!({
+            "Type": "WeeklyTrigger",
+            "DayOfWeek": "Thursday",
+            "TimeOfDayTicks": 3i64 * 60 * 60 * 10_000_000
+        });
+        // Thursday after 03:00, never run -> due.
+        let thu_after = datetime!(2026-06-25 04:00:00 UTC);
+        assert_eq!(thu_after.weekday(), time::Weekday::Thursday);
+        assert!(super::scheduled_trigger_due(&trigger, None, thu_after));
+        // Thursday before 03:00 -> not due.
+        let thu_before = datetime!(2026-06-25 02:00:00 UTC);
+        assert!(!super::scheduled_trigger_due(&trigger, None, thu_before));
+        // Friday (wrong day) -> not due.
+        let fri = datetime!(2026-06-26 04:00:00 UTC);
+        assert_eq!(fri.weekday(), time::Weekday::Friday);
+        assert!(!super::scheduled_trigger_due(&trigger, None, fri));
+        // Thursday, already ran today -> not due again.
+        let ran_today = jellyrin_db::TaskRun {
+            id: uuid::Uuid::nil(),
+            task_key: "SyncXtreamMedia".to_string(),
+            status: "completed".to_string(),
+            started_at: datetime!(2026-06-25 03:05:00 UTC),
+            completed_at: Some(datetime!(2026-06-25 03:05:00 UTC)),
+            result_json: None,
+            error_message: None,
+            updated_at: datetime!(2026-06-25 03:05:00 UTC),
+        };
+        assert!(!super::scheduled_trigger_due(
+            &trigger,
+            Some(&ran_today),
+            thu_after
+        ));
+    }
+
+    #[test]
+    fn manual_mode_empty_triggers_never_due() {
+        // An empty trigger array means "manual only" -> never auto-runs.
+        let triggers = serde_json::json!([]);
+        assert!(!super::scheduled_task_due(&triggers, None));
     }
 
     // Spec A(a): recording file name == <Name> <yyyy_MM_dd_HH_mm_ss>.ts
