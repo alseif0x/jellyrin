@@ -67,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Database::connect(&database_url).await?;
     bootstrap_e2e_admin(&db, &args).await?;
+    match db.remove_invalid_xtream_primary_image_tags().await {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "removed invalid Xtream image tags on startup");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(?error, "failed to repair Xtream image tags on startup");
+        }
+    }
     let stopped_transcodes = reconcile_transcode_sessions_on_startup(&db)
         .await
         .context("failed to reconcile transcode sessions")?;
@@ -117,7 +126,19 @@ async fn main() -> anyhow::Result<()> {
     let _live_tv_timer_scheduler_task = spawn_periodic_live_tv_timer_scheduler(state.clone());
     let _xtream_media_sync_scheduler_task =
         spawn_periodic_xtream_media_sync_scheduler(state.clone());
-    let _file_watcher = spawn_file_watcher_with_consumer(state.clone()).await;
+    let _file_watcher_startup_task = tokio::spawn({
+        let state = state.clone();
+        async move {
+            let Some((watcher, consumer)) = spawn_file_watcher_with_consumer(state).await else {
+                return;
+            };
+            if let Err(error) = consumer.await {
+                tracing::warn!(?error, "file watcher consumer stopped unexpectedly");
+            }
+            // Keep the OS watcher alive for exactly as long as its consumer.
+            drop(watcher);
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(address)
         .await

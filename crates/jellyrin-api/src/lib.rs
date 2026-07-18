@@ -17,9 +17,9 @@ use std::{
     process::{Output, Stdio},
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
-        atomic::{AtomicU8, Ordering as AtomicOrdering},
+        atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering},
     },
-    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+    time::{Duration as StdDuration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -100,9 +100,14 @@ const TERMINAL_TRANSCODE_CLEANUP_RETENTION_HOURS: i64 = 24;
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
 const HLS_SEGMENT_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const HLS_SEGMENT_WAIT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
-const HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS: i64 = 8;
+const TRANSCODE_PROGRESS_PERSIST_INTERVAL: StdDuration = StdDuration::from_secs(2);
+// A request-bound seek transcode must finish before Android's HTTP timeout. Generate only the
+// requested segment; subsequent segments are produced as the client asks for them.
+const HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS: i64 = 0;
+const HLS_NEGOTIATION_REUSE_WINDOW_SECONDS: i64 = 2;
 const SUBTITLE_JSON_FALLBACK_WINDOW_TICKS: i64 = 600_000_000;
 const XTREAM_REMOTE_PROBE_FAILED_RETRY_AFTER_SECONDS: i64 = 30 * 60;
+const REMOTE_IMAGE_FAILURE_CACHE_TTL: StdDuration = StdDuration::from_secs(10 * 60);
 const DLNA_TRANSCODE_DEVICE_ID: &str = "dlna-upnp";
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
 /// Default page size for `/LiveTv/Channels` when the client omits `Limit`.
@@ -126,10 +131,12 @@ const HDHOMERUN_DISCOVERY_MESSAGE: [u8; 20] = [
 static PLAYBACK_EVENTS: OnceLock<broadcast::Sender<PlaybackEvent>> = OnceLock::new();
 static SYSTEM_LIFECYCLE: OnceLock<broadcast::Sender<SystemLifecycleCommand>> = OnceLock::new();
 static SYSTEM_LIFECYCLE_LAST: AtomicU8 = AtomicU8::new(0);
-static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
+static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, TranscodeStopHandle>>> = OnceLock::new();
+static TRANSCODE_STOP_GENERATION: AtomicU64 = AtomicU64::new(1);
 static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLock::new();
 static AUTH_FAILURES: OnceLock<Mutex<HashMap<String, AuthFailureState>>> = OnceLock::new();
+static REMOTE_IMAGE_FAILURES: OnceLock<StdMutex<HashMap<String, StdInstant>>> = OnceLock::new();
 const AUTH_LOCKOUT_FAILURE_LIMIT: u32 = 5;
 const AUTH_LOCKOUT_SECONDS: u64 = 60;
 
@@ -138,6 +145,14 @@ const AUTH_LOCKOUT_SECONDS: u64 = 60;
 // When refcount drops to 0 the producer task is cancelled and the handle is removed.
 static LIVE_STREAM_REGISTRY: OnceLock<Mutex<HashMap<String, SharedLiveStreamHandle>>> =
     OnceLock::new();
+
+// Public Jellyfin channel UUIDs are deterministic hashes of provider-native IDs.  Keep a
+// compact UUID -> native ID index so image, detail and PlaybackInfo requests do not load and
+// parse every persisted channel.  With large Xtream lineups that old fallback was both slow
+// and memory intensive (one scan per cover request).
+static LIVE_TV_CHANNEL_ID_INDEX: OnceLock<Mutex<HashMap<Uuid, HashMap<String, String>>>> =
+    OnceLock::new();
+static LIVE_TV_CHANNEL_ID_INDEX_REFRESH: OnceLock<Mutex<()>> = OnceLock::new();
 
 // Monotonic counter that assigns a unique identity to each handle inserted into the registry.
 // Guards carry the generation of the handle they were issued from; a stale guard from a
@@ -156,7 +171,8 @@ static LIVE_HLS_SESSIONS: OnceLock<Mutex<HashMap<String, LiveHlsSessionEntry>>> 
 // Longer readiness timeout for live TV HLS (compared to VOD 5s) because an HTTP live
 // stream source may need a few extra seconds for ffmpeg to buffer the first segment.
 // Only applied to live TV sessions; VOD keeps the original 5s limit.
-const LIVE_HLS_READINESS_TIMEOUT_SECS: u64 = 15;
+const LIVE_HLS_READINESS_TIMEOUT_SECS: u64 = 8;
+const REQUEST_FFMPEG_TIMEOUT_SECS: u64 = 8;
 
 // Registry of active live TV recordings keyed by timer_id.
 // Stores the cancel sender and the recording file path so callers can cancel in-progress
@@ -185,6 +201,13 @@ struct LiveTunerLeaseKey {
 #[derive(Debug)]
 struct LiveTunerLease {
     refcount: usize,
+}
+
+struct TranscodeStopHandle {
+    generation: u64,
+    user_id: Uuid,
+    device_id: Option<String>,
+    sender: oneshot::Sender<()>,
 }
 
 struct LiveTunerLeaseGuard {
@@ -402,6 +425,7 @@ impl Drop for ActiveSessionConnection {
 // by play_session_id. Lifecycle mirrors VOD TranscodeSession without the DB media_item JOIN.
 #[derive(Debug, Clone)]
 struct LiveHlsSessionEntry {
+    generation: u64,
     play_session_id: String,
     dedupe_key: String,
     channel_id: String,
@@ -3699,7 +3723,7 @@ pub async fn reconcile_live_tv_recordings_on_startup(
         let Ok(channel) = live_tv_channel_by_id(db, &channel_id).await else {
             continue;
         };
-        let Ok(channel_path) = live_tv_channel_path(&channel) else {
+        let Ok(channel_path) = live_tv_channel_source_path(db, &channel).await else {
             continue;
         };
         if !live_tv_channel_is_remote(&channel_path) {
@@ -9467,6 +9491,7 @@ async fn sync_xtream_tuner_from_plugin_config(
             .db
             .delete_live_tv_tuner_state(XTREAM_PLUGIN_TUNER_ID)
             .await;
+        invalidate_live_tv_channel_id_index().await;
         return Ok(());
     };
 
@@ -12651,23 +12676,36 @@ async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
 /// Populate PrimaryImageTag in metadata_json for items that have images
 /// but no tag set yet. This enables the web client to know which items have images.
 async fn populate_image_tags_for_library(db: &Database) -> Result<(), ApiError> {
+    let removed = db.remove_invalid_xtream_primary_image_tags().await?;
+    if removed > 0 {
+        tracing::info!(removed, "removed invalid Xtream image tags");
+    }
     let items = db.media_items_without_primary_image_tag().await?;
     let mut updated = 0usize;
     for item in items {
         let metadata: serde_json::Value =
             serde_json::from_str(&item.metadata_json).unwrap_or_else(|_| serde_json::json!({}));
+        if metadata
+            .get("PrimaryImageTag")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|tag| !tag.trim().is_empty())
+        {
+            continue;
+        }
         // Check if item has any image source
-        let has_image = metadata.get("PrimaryImageUrl").is_some()
-            || metadata.get("ImageUrl").is_some()
-            || metadata.get("PrimaryImagePath").is_some()
-            || metadata.get("PrimaryImageTag").is_some()
-            || has_local_image_file(&item.path, "primary")
-            || metadata.get("RemoteSourceUrl").is_some(); // xtream items get thumbnails
+        let has_image = metadata_remote_image_url(&metadata, "Primary").is_some()
+            || json_string_field(&metadata, "PrimaryImagePath").is_some()
+            || has_local_image_file(&item.path, "primary");
         if has_image {
             let tag = stable_entity_id("item-image", &item.id);
             let mut metadata = metadata;
             metadata["PrimaryImageTag"] = serde_json::json!(tag);
-            if metadata.get("ImageTags").is_none() {
+            if let Some(image_tags) = metadata
+                .get_mut("ImageTags")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                image_tags.insert("Primary".to_string(), serde_json::json!(tag));
+            } else {
                 metadata["ImageTags"] = serde_json::json!({ "Primary": tag });
             }
             db.update_media_item_metadata_json(&item.id, &metadata)
@@ -13155,19 +13193,26 @@ async fn report_playback(
     playback_active: bool,
 ) -> Result<StatusCode, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if !playback_active
+        && let Some(play_session_id) = payload
+            .play_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        stop_hls_transcode_session_for_user(
+            &state.db,
+            play_session_id,
+            &user,
+            Some(&token.device_id),
+        )
+        .await?;
+    }
     if live_tv_channel_json_for_playable_item(&state.db, &payload.item_id)
         .await?
         .is_some()
     {
         if !playback_active {
-            if let Some(play_session_id) = payload
-                .play_session_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                stop_live_hls_session_by_id(play_session_id).await;
-            }
             state
                 .db
                 .clear_active_playback_session(&token.access_token)
@@ -16266,6 +16311,7 @@ async fn persist_live_tv_provider_import(
         channels,
     )
     .await?;
+    invalidate_live_tv_channel_id_index().await;
     Ok(())
 }
 
@@ -16372,8 +16418,10 @@ fn live_tv_channel_record_to_json(
     if live_tv_channel_path(&base).is_ok()
         && let Ok(media_source) = live_tv_channel_media_source(&base)
     {
+        base["Path"] = media_source["Path"].clone();
         base["MediaSources"] = serde_json::json!([media_source]);
     }
+    scrub_live_tv_public_source_urls(&mut base);
     base
 }
 
@@ -16385,30 +16433,15 @@ async fn live_tv_channel_record_by_any_id(
     if let Some(channel) = db.live_tv_channel_by_id(channel_id).await? {
         return Ok(Some(channel));
     }
-    if parse_jellyfin_uuid(channel_id).is_err() {
+    let Some(native_id) = indexed_live_tv_channel_id(db, channel_id).await? else {
+        return Ok(None);
+    };
+    if !jellyfin_id_matches(&live_tv_channel_public_id(&native_id), channel_id)
+        && !jellyfin_id_matches(&live_tv_playback_channel_public_id(&native_id), channel_id)
+    {
         return Ok(None);
     }
-    let total = db
-        .live_tv_channel_count(&LiveTvChannelQuery::default())
-        .await?;
-    if total == 0 {
-        return Ok(None);
-    }
-    let page = db
-        .live_tv_channel_page(LiveTvChannelQuery {
-            start_index: 0,
-            limit: Some(total.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
-            search_term: None,
-            category_ids: Vec::new(),
-        })
-        .await?;
-    Ok(page.items.into_iter().find(|record| {
-        jellyfin_id_matches(&live_tv_channel_public_id(&record.channel_id), channel_id)
-            || jellyfin_id_matches(
-                &live_tv_playback_channel_public_id(&record.channel_id),
-                channel_id,
-            )
-    }))
+    Ok(db.live_tv_channel_by_id(&native_id).await?)
 }
 
 async fn live_tv_channel_json_by_id(
@@ -16447,7 +16480,16 @@ async fn live_tv_channel_json_for_playable_item(
     if let Some(channel) = live_tv_channel_json_by_id(db, item_id).await? {
         return Ok(Some(channel));
     }
-    if looks_like_live_tv_program_id(item_id)
+    let is_fallback_program = if looks_like_live_tv_program_id(item_id) {
+        true
+    } else {
+        indexed_live_tv_channel_id(db, item_id)
+            .await?
+            .is_some_and(|channel_id| {
+                jellyfin_id_matches(&live_tv_fallback_program_public_id(&channel_id), item_id)
+            })
+    };
+    if is_fallback_program
         && let Some(program) = live_tv_program_by_id(db, item_id).await?
         && let Some(channel_id) = json_string_field(&program, "JellyrinChannelId")
             .or_else(|| json_string_field(&program, "ChannelId"))
@@ -17410,6 +17452,74 @@ fn live_tv_public_id_matches(entity_type: &str, raw_id: &str, requested_id: &str
         || jellyfin_id_matches(&live_tv_client_uuid_id(entity_type, raw_id), requested_id)
 }
 
+fn live_tv_channel_id_index() -> &'static Mutex<HashMap<Uuid, HashMap<String, String>>> {
+    LIVE_TV_CHANNEL_ID_INDEX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn live_tv_channel_id_index_refresh_lock() -> &'static Mutex<()> {
+    LIVE_TV_CHANNEL_ID_INDEX_REFRESH.get_or_init(|| Mutex::new(()))
+}
+
+fn live_tv_channel_id_index_key(value: &str) -> Option<String> {
+    Uuid::parse_str(value.trim())
+        .or_else(|_| Uuid::parse_str(&hyphenate_uuid(value.trim())))
+        .ok()
+        .map(|uuid| uuid.simple().to_string())
+}
+
+async fn invalidate_live_tv_channel_id_index() {
+    let _refresh_guard = live_tv_channel_id_index_refresh_lock().lock().await;
+    live_tv_channel_id_index().lock().await.clear();
+}
+
+async fn indexed_live_tv_channel_id(
+    db: &Database,
+    requested_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(requested_key) = live_tv_channel_id_index_key(requested_id) else {
+        return Ok(None);
+    };
+    // Tests and tools can host several independent databases in one process.  Key the cache
+    // by server identity so one lineup can never resolve a UUID against another database.
+    let server_id = db.server_state().await?.server_id;
+    {
+        let index = live_tv_channel_id_index().lock().await;
+        if let Some(index) = index.get(&server_id) {
+            return Ok(index.get(&requested_key).cloned());
+        }
+    }
+
+    // Serialize the first build.  Database I/O happens without holding the index lock so
+    // already-resolved requests are never blocked by a future refresh.
+    let _refresh_guard = live_tv_channel_id_index_refresh_lock().lock().await;
+    {
+        let index = live_tv_channel_id_index().lock().await;
+        if let Some(index) = index.get(&server_id) {
+            return Ok(index.get(&requested_key).cloned());
+        }
+    }
+
+    let channel_ids = db.live_tv_channel_ids().await?;
+    let mut index = HashMap::with_capacity(channel_ids.len().saturating_mul(3));
+    for channel_id in channel_ids {
+        for public_id in [
+            live_tv_channel_public_id(&channel_id),
+            live_tv_playback_channel_public_id(&channel_id),
+            live_tv_fallback_program_public_id(&channel_id),
+        ] {
+            if let Some(key) = live_tv_channel_id_index_key(&public_id) {
+                index.insert(key, channel_id.clone());
+            }
+        }
+    }
+    let resolved = index.get(&requested_key).cloned();
+    live_tv_channel_id_index()
+        .lock()
+        .await
+        .insert(server_id, index);
+    Ok(resolved)
+}
+
 async fn live_tv_tuner_host_types(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -17684,6 +17794,7 @@ async fn delete_live_tv_tuner_host(
         .update_named_configuration("livetv", live_tv_configuration_json(config))
         .await?;
     state.db.delete_live_tv_tuner_state(tuner_id).await?;
+    invalidate_live_tv_channel_id_index().await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -18272,29 +18383,20 @@ async fn live_tv_program_by_id(
                     }
                 }
             }
-            if parse_jellyfin_uuid(program_id).is_ok() {
-                let page = db
-                    .live_tv_channel_page(LiveTvChannelQuery {
-                        start_index: 0,
-                        limit: Some(persisted_count.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
-                        search_term: None,
-                        category_ids: Vec::new(),
-                    })
-                    .await?;
-                for record in page.items {
-                    if jellyfin_id_matches(
-                        &live_tv_fallback_program_public_id(&record.channel_id),
-                        program_id.trim(),
-                    ) {
-                        let channel = live_tv_channel_record_to_json(&record, &server_id);
-                        return Ok(live_tv_fallback_program_item(
-                            &channel,
-                            &server_id,
-                            &start_date,
-                            &end_date,
-                        ));
-                    }
-                }
+            if let Some(channel_id) = indexed_live_tv_channel_id(db, program_id).await?
+                && jellyfin_id_matches(
+                    &live_tv_fallback_program_public_id(&channel_id),
+                    program_id.trim(),
+                )
+                && let Some(record) = db.live_tv_channel_by_id(&channel_id).await?
+            {
+                let channel = live_tv_channel_record_to_json(&record, &server_id);
+                return Ok(live_tv_fallback_program_item(
+                    &channel,
+                    &server_id,
+                    &start_date,
+                    &end_date,
+                ));
             }
         }
         let channels = live_tv_channel_items(&config, &server_id);
@@ -18604,7 +18706,7 @@ async fn live_tv_stream_file(
         return stream_live_tv_recording(recording, &headers).await;
     }
     let channel = live_tv_channel_by_id(&state.db, &stream_id).await?;
-    let path = live_tv_channel_path(&channel)?;
+    let path = live_tv_channel_source_path(&state.db, &channel).await?;
     if !live_tv_channel_is_remote(&path) && !live_tv_channel_is_legacy_hdhomerun_path(&path) {
         let path_container = path
             .extension()
@@ -18760,7 +18862,7 @@ async fn stream_live_tv_channel(
     headers: &HeaderMap,
     db: &Database,
 ) -> Result<axum::response::Response, ApiError> {
-    let path = live_tv_channel_path(&channel)?;
+    let path = live_tv_channel_source_path(db, &channel).await?;
     if live_tv_channel_is_legacy_hdhomerun_path(&path) {
         let tuner_host_id = json_string_field(&channel, "TunerHostId");
         let params = legacy_hdhomerun_stream_params_for_host(db, tuner_host_id.as_deref()).await?;
@@ -18950,39 +19052,50 @@ async fn proxy_live_tv_channel_url(
                 // established (reverting the duplicate-prevention property), or (b) marking the
                 // handle as "connecting" and having late consumers await a separate ready signal.
                 // Documented as a known limitation; the test suite does not exercise this window.
-                let upstream = match HttpClient::new()
-                    .get(&url)
-                    .header("User-Agent", LIVE_TV_REMOTE_USER_AGENT)
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => resp,
-                    Ok(resp) => {
-                        let mut registry = live_stream_registry().lock().await;
-                        if registry
-                            .get(&url)
-                            .is_some_and(|h| h.generation == handle_gen)
-                        {
-                            registry.remove(&url);
+                let upstream_request = live_tv_stream_http_client().get(&url).send();
+                let upstream =
+                    match tokio::time::timeout(StdDuration::from_secs(7), upstream_request).await {
+                        Err(_) => {
+                            let mut registry = live_stream_registry().lock().await;
+                            if registry
+                                .get(&url)
+                                .is_some_and(|h| h.generation == handle_gen)
+                            {
+                                registry.remove(&url);
+                            }
+                            return Err(ApiError::service_unavailable(
+                                "Live TV source timed out while opening",
+                            ));
                         }
-                        return Err(ApiError::internal(format!(
-                            "HDHomeRun upstream returned HTTP {}",
-                            resp.status()
-                        )));
-                    }
-                    Err(error) => {
-                        let mut registry = live_stream_registry().lock().await;
-                        if registry
-                            .get(&url)
-                            .is_some_and(|h| h.generation == handle_gen)
-                        {
-                            registry.remove(&url);
-                        }
-                        return Err(ApiError::internal(format!(
-                            "HDHomeRun proxy error: {error}"
-                        )));
-                    }
-                };
+                        Ok(result) => match result {
+                            Ok(resp) if resp.status().is_success() => resp,
+                            Ok(resp) => {
+                                let mut registry = live_stream_registry().lock().await;
+                                if registry
+                                    .get(&url)
+                                    .is_some_and(|h| h.generation == handle_gen)
+                                {
+                                    registry.remove(&url);
+                                }
+                                return Err(ApiError::internal(format!(
+                                    "HDHomeRun upstream returned HTTP {}",
+                                    resp.status()
+                                )));
+                            }
+                            Err(error) => {
+                                let mut registry = live_stream_registry().lock().await;
+                                if registry
+                                    .get(&url)
+                                    .is_some_and(|h| h.generation == handle_gen)
+                                {
+                                    registry.remove(&url);
+                                }
+                                return Err(ApiError::internal(format!(
+                                    "HDHomeRun proxy error: {error}"
+                                )));
+                            }
+                        },
+                    };
 
                 // Phase 3: start the producer task. The registry entry already exists.
                 // Producer task: reads chunks from the outgoing connection and broadcasts them.
@@ -19031,6 +19144,17 @@ async fn proxy_live_tv_channel_url(
             consumer_tuner_lease,
         },
     ))
+}
+
+fn live_tv_stream_http_client() -> &'static HttpClient {
+    static CLIENT: OnceLock<HttpClient> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        HttpClient::builder()
+            .connect_timeout(StdDuration::from_secs(3))
+            .user_agent(LIVE_TV_REMOTE_USER_AGENT)
+            .build()
+            .expect("Live TV HTTP client configuration is valid")
+    })
 }
 
 async fn subscribe_legacy_hdhomerun_stream(
@@ -19360,8 +19484,10 @@ fn live_tv_channel_item(
     if live_tv_channel_path(&base).is_ok()
         && let Ok(media_source) = live_tv_channel_media_source(&base)
     {
+        base["Path"] = media_source["Path"].clone();
         base["MediaSources"] = serde_json::json!([media_source]);
     }
+    scrub_live_tv_public_source_urls(&mut base);
     Some(base)
 }
 
@@ -19373,20 +19499,136 @@ fn live_tv_channel_path(channel: &serde_json::Value) -> Result<PathBuf, ApiError
         .ok_or_else(|| ApiError::not_found("Live TV stream not found"))
 }
 
+async fn live_tv_channel_source_path(
+    db: &Database,
+    channel: &serde_json::Value,
+) -> Result<PathBuf, ApiError> {
+    if let Some(channel_id) =
+        json_string_field(channel, "JellyrinChannelId").or_else(|| json_string_field(channel, "Id"))
+    {
+        if let Some(record) = live_tv_channel_record_by_any_id(db, &channel_id).await? {
+            return Ok(PathBuf::from(record.stream_url));
+        }
+        if let Some(config) = db.named_configuration("livetv").await?
+            && let Some(path) = live_tv_config_channel_source_path(&config, &channel_id)
+        {
+            return Ok(path);
+        }
+    }
+    live_tv_channel_path(channel)
+}
+
+fn live_tv_config_channel_source_path(
+    config: &serde_json::Value,
+    requested_id: &str,
+) -> Option<PathBuf> {
+    config
+        .get("TunerHosts")?
+        .as_array()?
+        .iter()
+        .filter_map(|tuner| tuner.get("Channels").and_then(serde_json::Value::as_array))
+        .flatten()
+        .find_map(|channel| {
+            let channel_id = json_string_field(channel, "Id")
+                .or_else(|| json_string_field(channel, "ChannelId"))?;
+            (jellyfin_id_matches(&channel_id, requested_id)
+                || jellyfin_id_matches(&live_tv_channel_public_id(&channel_id), requested_id)
+                || jellyfin_id_matches(
+                    &live_tv_playback_channel_public_id(&channel_id),
+                    requested_id,
+                ))
+            .then(|| {
+                json_string_field(channel, "Path")
+                    .or_else(|| json_string_field(channel, "MediaPath"))
+                    .map(PathBuf::from)
+            })
+            .flatten()
+        })
+}
+
 fn live_tv_channel_is_remote(path: &FsPath) -> bool {
     let s = path.to_string_lossy();
     s.starts_with("http://") || s.starts_with("https://")
 }
 
-// Returns a stable play_session_id for a live TV channel used in the HLS TranscodingUrl.
-// Deterministic so clients can predict it from the channel_id; changes only when channel_id changes.
-fn live_tv_channel_hls_play_session_id(channel_id: &str) -> String {
-    stable_entity_id("LiveTvHls", channel_id)
+fn live_tv_channel_path_extension(path: &FsPath) -> Option<String> {
+    let value = path.to_string_lossy();
+    let path_value = reqwest::Url::parse(&value)
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| value.split('?').next().unwrap_or_default().to_string());
+    FsPath::new(&path_value)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+fn live_tv_channel_is_known_transport_stream(channel: &serde_json::Value, path: &FsPath) -> bool {
+    if live_tv_channel_is_legacy_hdhomerun_path(path) {
+        return true;
+    }
+    if live_tv_channel_path_extension(path)
+        .is_some_and(|extension| matches!(extension.as_str(), "ts" | "m2ts" | "mpegts"))
+    {
+        return true;
+    }
+    let value = path.to_string_lossy().to_ascii_lowercase();
+    json_string_field(channel, "JellyrinChannelId")
+        .or_else(|| json_string_field(channel, "Id"))
+        .is_some_and(|id| id.to_ascii_lowercase().starts_with("hdhr_"))
+        && value.contains("/auto/")
+}
+
+fn live_tv_channel_known_media_streams(channel: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut streams = json_field_case_insensitive(channel, "MediaStreams")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if streams.is_empty() {
+        if let Some(codec) = json_string_field(channel, "VideoCodec") {
+            streams.push(serde_json::json!({
+                "Codec": codec,
+                "Type": "Video",
+                "Index": 0,
+                "IsDefault": true,
+                "IsForced": false,
+                "IsExternal": false
+            }));
+        }
+        if let Some(codec) = json_string_field(channel, "AudioCodec") {
+            streams.push(serde_json::json!({
+                "Codec": codec,
+                "Type": "Audio",
+                "Index": 1,
+                "IsDefault": true,
+                "IsForced": false,
+                "IsExternal": false
+            }));
+        }
+    }
+    streams.into_iter().map(normalize_media_stream).collect()
+}
+
+fn new_live_tv_channel_hls_play_session_id() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 // Returns a dedupe key used to claim/find a live transcode session for a channel.
 fn live_tv_channel_hls_dedupe_key(channel_id: &str) -> String {
     format!("livetv:hls:{channel_id}")
+}
+
+fn live_tv_channel_hls_dedupe_key_for_session(
+    channel_id: &str,
+    user_id: Uuid,
+    play_session_id: &str,
+) -> String {
+    format!(
+        "{}:user:{}:session:{}",
+        live_tv_channel_hls_dedupe_key(channel_id),
+        user_id.simple(),
+        play_session_id
+    )
 }
 
 fn live_tv_channel_playback_id(channel: &serde_json::Value) -> Option<String> {
@@ -19467,6 +19709,18 @@ fn apply_live_tv_image_metadata(item: &mut serde_json::Value) {
 fn live_tv_channel_media_source(
     channel: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
+    if let Some(media_source) = json_field_case_insensitive(channel, "MediaSources")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|sources| sources.first())
+    {
+        let mut media_source = media_source.clone();
+        scrub_live_tv_public_source_urls(&mut media_source);
+        if json_string_field(&media_source, "Path")
+            .is_some_and(|path| path.starts_with("/LiveTv/LiveStreamFiles/"))
+        {
+            return Ok(media_source);
+        }
+    }
     let public_channel_id = json_string_field(channel, "Id")
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
     let playback_channel_id =
@@ -19476,13 +19730,11 @@ fn live_tv_channel_media_source(
     let is_legacy_hdhomerun = live_tv_channel_is_legacy_hdhomerun_path(&path);
     let is_http_remote = live_tv_channel_is_remote(&path);
     let is_remote = is_http_remote || is_legacy_hdhomerun;
-    let container = if is_remote {
+    let is_known_transport_stream = live_tv_channel_is_known_transport_stream(channel, &path);
+    let container = if is_known_transport_stream {
         "ts".to_string()
     } else {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "ts".to_string())
+        live_tv_channel_path_extension(&path).unwrap_or_else(|| "bin".to_string())
     };
     let protocol = if is_legacy_hdhomerun {
         "Udp"
@@ -19492,12 +19744,11 @@ fn live_tv_channel_media_source(
         "File"
     };
 
-    // Remote (HDHomeRun) channels support HLS transcode in addition to direct TS stream.
-    // The stable play_session_id is embedded in the TranscodingUrl so clients can reuse it
-    // across channel-detail fetches without starting a new session each time.
+    // Remote channels support HLS in addition to direct TS. Each advertised URL owns a fresh
+    // session id so a delayed Stopped report cannot terminate a later playback of this channel.
     let (supports_transcoding, transcoding_sub_protocol, transcoding_container, transcoding_url) =
         if is_remote {
-            let play_session_id = live_tv_channel_hls_play_session_id(&playback_channel_id);
+            let play_session_id = new_live_tv_channel_hls_play_session_id();
             let url = format!(
                 "/Videos/{playback_channel_id}/master.m3u8?PlaySessionId={play_session_id}"
             );
@@ -19515,17 +19766,56 @@ fn live_tv_channel_media_source(
                 serde_json::Value::Null,
             )
         };
-    let supports_direct = !is_remote;
+    // Remote channels are served through Jellyrin's authenticated stream proxy, so clients
+    // that understand MPEG-TS can direct-stream them without an ffmpeg transcode.  DirectPlay
+    // remains disabled for remote URLs because clients must not receive provider credentials.
+    let supports_direct_play = !is_remote;
+    let supports_direct_stream = !is_remote || is_known_transport_stream;
+    let direct_stream_url = format!(
+        "/LiveTv/LiveStreamFiles/{}/stream.{container}",
+        query_path_segment_encode(&playback_channel_id)
+    );
+    let mut media_streams = live_tv_channel_known_media_streams(channel);
+    if media_streams.is_empty() && is_known_transport_stream {
+        // Preserve Jellyfin's stream shape without inventing codecs. Device-profile matching
+        // treats these codecs as unknown and selects HLS whenever the client constrains them.
+        media_streams = vec![
+            normalize_media_stream(serde_json::json!({
+                "Codec": null,
+                "Type": "Video",
+                "Index": 0,
+                "IsDefault": true,
+                "IsForced": false,
+                "IsExternal": false
+            })),
+            normalize_media_stream(serde_json::json!({
+                "Codec": null,
+                "Type": "Audio",
+                "Index": 1,
+                "IsDefault": true,
+                "IsForced": false,
+                "IsExternal": false
+            })),
+        ];
+    }
+    let default_audio_stream_index = media_streams.iter().find_map(|stream| {
+        json_string_field(stream, "Type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Audio"))
+            .then(|| json_i64_field(stream, "Index"))
+            .flatten()
+    });
 
-    Ok(serde_json::json!({
+    let mut media_source = serde_json::json!({
         "Protocol": protocol,
         "Id": playback_channel_id,
-        "Path": path.to_string_lossy().to_string(),
+        // Only expose Jellyrin's authenticated proxy. Provider URLs often contain Xtream
+        // credentials and must remain server-side.
+        "Path": direct_stream_url,
         "Type": "Default",
         "Container": container,
         "Name": name,
         "IsRemote": is_remote,
-        "DirectStreamUrl": format!("/LiveTv/LiveStreamFiles/{playback_channel_id}/stream.{container}"),
+        "DirectStreamUrl": supports_direct_stream.then_some(direct_stream_url),
         "ETag": null,
         "RunTimeTicks": null,
         "ReadAtNativeFramerate": true,
@@ -19536,8 +19826,8 @@ fn live_tv_channel_media_source(
         "TranscodingSubProtocol": transcoding_sub_protocol,
         "TranscodingContainer": transcoding_container,
         "TranscodingUrl": transcoding_url,
-        "SupportsDirectStream": supports_direct,
-        "SupportsDirectPlay": supports_direct,
+        "SupportsDirectStream": supports_direct_stream,
+        "SupportsDirectPlay": supports_direct_play,
         "IsInfiniteStream": true,
         "CanSeek": false,
         "UseMostCompatibleTranscodingProfile": false,
@@ -19546,35 +19836,79 @@ fn live_tv_channel_media_source(
         "RequiresLooping": false,
         "SupportsProbing": false,
         "VideoType": "VideoFile",
-        "MediaStreams": [
-            normalize_media_stream(serde_json::json!({
-                "Codec": container,
-                "Type": "Video",
-                "Index": 0,
-                "IsDefault": true,
-                "IsForced": false,
-                "IsInterlaced": false,
-                "IsExternal": false
-            })),
-            normalize_media_stream(serde_json::json!({
-                "Codec": "aac",
-                "Type": "Audio",
-                "Index": 1,
-                "Channels": 2,
-                "ChannelLayout": "stereo",
-                "BitRate": 192000,
-                "IsDefault": true,
-                "IsForced": false,
-                "IsExternal": false
-            }))
-        ],
-        "DefaultAudioStreamIndex": 1,
+        "MediaStreams": media_streams,
+        "DefaultAudioStreamIndex": default_audio_stream_index,
         "MediaAttachments": [],
         "Formats": [],
         "RequiredHttpHeaders": {},
         "HasSegments": false,
         "Bitrate": null
-    }))
+    });
+    scrub_live_tv_public_source_urls(&mut media_source);
+    Ok(media_source)
+}
+
+fn live_tv_public_source_url_is_allowed(value: &str) -> bool {
+    ["/LiveTv/", "/Videos/", "/Audio/", "/Items/", "/Image/"]
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+}
+
+fn scrub_live_tv_public_source_urls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                scrub_live_tv_public_source_urls(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let keys = object.keys().cloned().collect::<Vec<_>>();
+            for key in keys {
+                let normalized_key = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                if matches!(
+                    normalized_key.as_str(),
+                    "requiredhttpheaders" | "httpheaders" | "requestheaders"
+                ) {
+                    object.insert(key, serde_json::json!({}));
+                    continue;
+                }
+                if matches!(
+                    normalized_key.as_str(),
+                    "path"
+                        | "mediapath"
+                        | "url"
+                        | "uri"
+                        | "directstreamurl"
+                        | "transcodingurl"
+                        | "deliveryurl"
+                        | "sourceurl"
+                        | "remotesourceurl"
+                        | "originalurl"
+                        | "originalpath"
+                        | "streamurl"
+                ) {
+                    let keep = object.get(&key).is_some_and(|value| {
+                        value.is_null()
+                            || value
+                                .as_str()
+                                .is_some_and(live_tv_public_source_url_is_allowed)
+                    });
+                    if !keep {
+                        object.remove(&key);
+                    }
+                    continue;
+                }
+                if let Some(child) = object.get_mut(&key) {
+                    scrub_live_tv_public_source_urls(child);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn live_tv_program_items(config: &serde_json::Value, server_id: &str) -> Vec<serde_json::Value> {
@@ -20429,7 +20763,7 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
         Ok(ch) => ch,
         Err(_) => return false,
     };
-    let channel_path = match live_tv_channel_path(&channel) {
+    let channel_path = match live_tv_channel_source_path(&state.db, &channel).await {
         Ok(p) => p,
         Err(_) => return false,
     };
@@ -28100,9 +28434,13 @@ async fn playback_info_response(
     let direct_play_supported = !is_xtream_remote
         && playback_direct_play_supported(&item, &options)
         && !selected_audio_needs_transcode;
-    let direct_stream_supported = !is_xtream_remote
-        && (options.enable_direct_stream || direct_play_supported)
-        && !selected_audio_needs_transcode;
+    let direct_stream_supported = if is_xtream_remote {
+        options.enable_direct_stream
+            && playback_profile_supports_direct(&item, &options)
+            && !selected_audio_needs_transcode
+    } else {
+        (options.enable_direct_stream || direct_play_supported) && !selected_audio_needs_transcode
+    };
     if !playback_selection_supported(&item, &options) {
         return Ok(Json(serde_json::json!({
             "MediaSources": [],
@@ -28139,7 +28477,18 @@ async fn playback_info_response(
             serde_json::json!(direct_stream_supported),
         );
         media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(false));
-        media_source.remove("DirectStreamUrl");
+        if is_xtream_remote {
+            let item_id = item.id.simple().to_string();
+            media_source.insert(
+                "DirectStreamUrl".to_string(),
+                serde_json::json!(format!(
+                    "/Videos/{item_id}/stream?static=true&MediaSourceId={item_id}&api_key={}",
+                    token.access_token
+                )),
+            );
+        } else {
+            media_source.remove("DirectStreamUrl");
+        }
         apply_playback_stream_selection(media_source, &options);
     }
 
@@ -28158,22 +28507,45 @@ fn live_tv_playback_info_response(
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
     let playback_channel_id =
         live_tv_channel_playback_id(channel).unwrap_or_else(|| public_channel_id.clone());
-    let play_session_id = live_tv_channel_hls_play_session_id(&playback_channel_id);
+    // A new negotiation must get a distinct session. Reusing a deterministic id lets a
+    // delayed Stopped report from the previous playback terminate the new ffmpeg process.
+    let play_session_id = new_live_tv_channel_hls_play_session_id();
     let mut media_source = live_tv_channel_media_source(channel)?;
+    let direct_stream_supported =
+        options.enable_direct_stream && live_tv_profile_supports_direct(&media_source, &options);
+    if !direct_stream_supported && !options.enable_transcoding {
+        return Ok(Json(serde_json::json!({
+            "MediaSources": [],
+            "PlaySessionId": play_session_id,
+            "ErrorCode": "NoCompatibleStream",
+        })));
+    }
     if let Some(media_source) = media_source.as_object_mut() {
         media_source.insert("SupportsDirectPlay".to_string(), serde_json::json!(false));
-        media_source.insert("SupportsDirectStream".to_string(), serde_json::json!(false));
-        media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(true));
         media_source.insert(
-            "TranscodingUrl".to_string(),
-            serde_json::json!(hls_master_url(
-                "Video",
-                &playback_channel_id,
-                &play_session_id,
-                access_token
-            )),
+            "SupportsDirectStream".to_string(),
+            serde_json::json!(direct_stream_supported),
         );
-        media_source.remove("DirectStreamUrl");
+        media_source.insert(
+            "SupportsTranscoding".to_string(),
+            serde_json::json!(options.enable_transcoding),
+        );
+        if options.enable_transcoding {
+            media_source.insert(
+                "TranscodingUrl".to_string(),
+                serde_json::json!(hls_master_url(
+                    "Video",
+                    &playback_channel_id,
+                    &play_session_id,
+                    access_token
+                )),
+            );
+        } else {
+            media_source.remove("TranscodingUrl");
+        }
+        if !direct_stream_supported {
+            media_source.remove("DirectStreamUrl");
+        }
         apply_playback_stream_selection(media_source, &options);
     }
     Ok(Json(serde_json::json!({
@@ -28273,20 +28645,40 @@ async fn playback_transcode_info_response(
         },
         subtitle_stream_index: options.subtitle_stream_index,
     };
-    let dedupe_key =
+    let base_dedupe_key =
         hls_transcode_dedupe_key(user.id, item, &selection, options.start_position_ticks);
+    let dedupe_key = hls_transcode_dedupe_key_for_device(&base_dedupe_key, &token.device_id);
     let dedupe_lock = transcode_dedupe_lock(&dedupe_key).await;
     let _dedupe_guard = dedupe_lock.lock().await;
 
     if let Some(session) = reusable_hls_transcode_session(&state.db, &dedupe_key).await? {
-        return playback_transcode_session_info_response(
-            item_json,
-            &item.media_type,
-            &token.access_token,
-            &item_id,
-            &session.play_session_id,
-            &options,
-        );
+        let belongs_to_device = session.device_id.as_deref() == Some(token.device_id.as_str());
+        let is_duplicate_negotiation = belongs_to_device
+            && session.created_at
+                >= OffsetDateTime::now_utc()
+                    - Duration::seconds(HLS_NEGOTIATION_REUSE_WINDOW_SECONDS);
+        if is_duplicate_negotiation {
+            return playback_transcode_session_info_response(
+                item_json,
+                &item.media_type,
+                &token.access_token,
+                &item_id,
+                &session.play_session_id,
+                &options,
+            );
+        }
+        if belongs_to_device && matches!(session.status.as_str(), "starting" | "running") {
+            // End the previous generation before claiming this device-scoped key. Its old
+            // PlaySessionId remains distinct, so a delayed Stopped report cannot affect the
+            // replacement process.
+            stop_hls_transcode_session_for_user(
+                &state.db,
+                &session.play_session_id,
+                user,
+                Some(&token.device_id),
+            )
+            .await?;
+        }
     }
 
     let layout = HlsTranscodeLayout::new(transcode_temp_root(), &play_session_id);
@@ -28301,7 +28693,10 @@ async fn playback_transcode_info_response(
     request.start_position_ticks = options.start_position_ticks;
     request.include_video = include_video;
     request.burn_in_subtitle = options.burn_in_subtitle;
-    let command = build_hls_ffmpeg_command(&request);
+    let mut command = build_hls_ffmpeg_command(&request);
+    if is_xtream_remote_media(metadata) {
+        apply_live_tv_remote_ffmpeg_input_options(&mut command);
+    }
 
     let (session, claimed_new_session) = state
         .db
@@ -28328,7 +28723,14 @@ async fn playback_transcode_info_response(
         .await?;
     let play_session_id = session.play_session_id;
     if claimed_new_session {
-        spawn_hls_transcode_task(state.db.clone(), play_session_id.clone(), command).await;
+        spawn_hls_transcode_task(
+            state.db.clone(),
+            play_session_id.clone(),
+            user.id,
+            Some(token.device_id.clone()),
+            command,
+        )
+        .await;
     } else {
         cleanup_hls_transcode_dir(&layout.session_dir).await;
     }
@@ -28559,6 +28961,13 @@ fn hls_transcode_dedupe_key(
     )
 }
 
+fn hls_transcode_dedupe_key_for_device(base_key: &str, device_id: &str) -> String {
+    format!(
+        "{base_key}:device:{}",
+        stable_entity_id("HlsDevice", device_id)
+    )
+}
+
 async fn transcode_dedupe_lock(key: &str) -> Arc<Mutex<()>> {
     let mut locks = transcode_dedupe_registry().lock().await;
     locks
@@ -28600,21 +29009,19 @@ async fn reusable_hls_transcode_session(
 async fn spawn_hls_transcode_task(
     db: Database,
     play_session_id: String,
+    user_id: Uuid,
+    device_id: Option<String>,
     command: jellyrin_core::FfmpegCommandSpec,
 ) {
     let (stop_tx, stop_rx) = oneshot::channel();
-    if let Some(previous_stop) = transcode_stop_registry()
-        .lock()
-        .await
-        .insert(play_session_id.clone(), stop_tx)
-    {
-        let _ = previous_stop.send(());
-    }
+    let stop_generation =
+        register_transcode_stop_handle(&play_session_id, user_id, device_id, stop_tx).await;
 
     tokio::spawn(async move {
         let mut process = match spawn_transcode_process(&command) {
             Ok(process) => process,
             Err(error) => {
+                remove_transcode_stop_handle_if_generation(&play_session_id, stop_generation).await;
                 let _ = db
                     .update_transcode_session_status(&play_session_id, "failed")
                     .await;
@@ -28694,10 +29101,7 @@ async fn spawn_hls_transcode_task(
         let _ = db
             .update_transcode_session_status(&play_session_id, final_status)
             .await;
-        transcode_stop_registry()
-            .lock()
-            .await
-            .remove(&play_session_id);
+        remove_transcode_stop_handle_if_generation(&play_session_id, stop_generation).await;
         if stopped && let Some(session) = session {
             cleanup_hls_transcode_files(&session.output_path).await;
         }
@@ -28712,6 +29116,8 @@ fn spawn_transcode_progress_persistence_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_position_ticks = None;
+        let mut last_persisted_position_ticks = None;
+        let mut last_persisted_at: Option<tokio::time::Instant> = None;
         while let Ok(progress) = progress_rx.recv().await {
             let Some(position_ticks) = progress.position_ticks() else {
                 continue;
@@ -28720,6 +29126,34 @@ fn spawn_transcode_progress_persistence_task(
                 continue;
             }
             last_position_ticks = Some(position_ticks);
+            if last_persisted_at
+                .is_some_and(|last| last.elapsed() < TRANSCODE_PROGRESS_PERSIST_INTERVAL)
+            {
+                continue;
+            }
+            // Throttle failed writes too; retrying every ffmpeg progress line amplifies a
+            // temporary SQLite lock into sustained contention for all clients.
+            last_persisted_at = Some(tokio::time::Instant::now());
+            let progress_percent = transcode_progress_percent(position_ticks, runtime_ticks);
+            match db
+                .update_transcode_session_progress(
+                    &play_session_id,
+                    progress_percent,
+                    position_ticks,
+                )
+                .await
+            {
+                Ok(()) => last_persisted_position_ticks = Some(position_ticks),
+                Err(error) => {
+                    tracing::warn!(%play_session_id, %error, "failed to persist HLS transcode progress");
+                }
+            }
+        }
+        // A short transcode can finish inside the throttle window.  Persist its last observed
+        // position once the progress channel closes so resume state and completion stay exact.
+        if let Some(position_ticks) = last_position_ticks
+            && last_persisted_position_ticks != Some(position_ticks)
+        {
             let progress_percent = transcode_progress_percent(position_ticks, runtime_ticks);
             if let Err(error) = db
                 .update_transcode_session_progress(
@@ -28729,7 +29163,7 @@ fn spawn_transcode_progress_persistence_task(
                 )
                 .await
             {
-                tracing::warn!(%play_session_id, %error, "failed to persist HLS transcode progress");
+                tracing::warn!(%play_session_id, %error, "failed to persist final HLS transcode progress");
             }
         }
     })
@@ -28743,8 +29177,40 @@ fn transcode_progress_percent(position_ticks: i64, runtime_ticks: Option<i64>) -
     Some(((position_ticks as f64 / runtime_ticks as f64) * 100.0).clamp(0.0, 100.0))
 }
 
-fn transcode_stop_registry() -> &'static Mutex<HashMap<String, oneshot::Sender<()>>> {
+fn transcode_stop_registry() -> &'static Mutex<HashMap<String, TranscodeStopHandle>> {
     TRANSCODE_STOPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn register_transcode_stop_handle(
+    play_session_id: &str,
+    user_id: Uuid,
+    device_id: Option<String>,
+    sender: oneshot::Sender<()>,
+) -> u64 {
+    let generation = TRANSCODE_STOP_GENERATION.fetch_add(1, AtomicOrdering::Relaxed);
+    let previous = transcode_stop_registry().lock().await.insert(
+        play_session_id.to_string(),
+        TranscodeStopHandle {
+            generation,
+            user_id,
+            device_id,
+            sender,
+        },
+    );
+    if let Some(previous) = previous {
+        let _ = previous.sender.send(());
+    }
+    generation
+}
+
+async fn remove_transcode_stop_handle_if_generation(play_session_id: &str, generation: u64) {
+    let mut registry = transcode_stop_registry().lock().await;
+    if registry
+        .get(play_session_id)
+        .is_some_and(|handle| handle.generation == generation)
+    {
+        registry.remove(play_session_id);
+    }
 }
 
 fn live_hls_session_registry() -> &'static Mutex<HashMap<String, LiveHlsSessionEntry>> {
@@ -28806,7 +29272,7 @@ fn live_hls_session_json(entry: &LiveHlsSessionEntry) -> serde_json::Value {
         "UserId": entry.user_id.simple().to_string(),
         "ItemId": entry.channel_id,
         "MediaSourceId": entry.channel_id,
-        "DeviceId": null,
+        "DeviceId": entry.device_id,
         "Path": entry.output_path,
         "OutputPath": entry.output_path,
         "Status": entry.status,
@@ -28816,7 +29282,7 @@ fn live_hls_session_json(entry: &LiveHlsSessionEntry) -> serde_json::Value {
         "TranscodingPositionTicks": 0,
         "TranscodingStartPositionTicks": 0,
         "Container": "ts",
-        "VideoCodec": "ts",
+        "VideoCodec": null,
         "AudioCodec": null,
         "Width": null,
         "Height": null,
@@ -28836,6 +29302,7 @@ fn live_hls_session_json(entry: &LiveHlsSessionEntry) -> serde_json::Value {
 // mirrors spawn_hls_transcode_task but without DB calls.
 struct LiveHlsTranscodeStart {
     play_session_id: String,
+    dedupe_key: String,
     channel_id: String,
     channel_url: String,
     device_id: Option<String>,
@@ -28878,6 +29345,7 @@ async fn feed_live_hls_stdin_from_broadcast(
 async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
     let LiveHlsTranscodeStart {
         play_session_id,
+        dedupe_key,
         channel_id,
         channel_url,
         device_id,
@@ -28890,19 +29358,16 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
 
     // Register the stop sender in TRANSCODE_STOPS so DELETE ActiveEncodings can kill ffmpeg.
     let (stop_tx, stop_rx) = oneshot::channel();
-    {
-        let mut registry = transcode_stop_registry().lock().await;
-        if let Some(prev) = registry.insert(play_session_id.clone(), stop_tx) {
-            let _ = prev.send(());
-        }
-    }
+    let stop_generation =
+        register_transcode_stop_handle(&play_session_id, user_id, device_id.clone(), stop_tx).await;
 
     // Register the live HLS session entry.
     {
         let now = OffsetDateTime::now_utc();
         let entry = LiveHlsSessionEntry {
+            generation: stop_generation,
             play_session_id: play_session_id.clone(),
-            dedupe_key: live_tv_channel_hls_dedupe_key(&channel_id),
+            dedupe_key,
             channel_id: channel_id.clone(),
             channel_url: channel_url.clone(),
             output_path: output_path.clone(),
@@ -28938,14 +29403,14 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
             Err(error) => {
                 tracing::error!(%play_session_id, %error, "failed to spawn live HLS transcode process");
                 let mut registry = live_hls_session_registry().lock().await;
-                if let Some(entry) = registry.get_mut(&play_session_id) {
+                if let Some(entry) = registry
+                    .get_mut(&play_session_id)
+                    .filter(|entry| entry.generation == stop_generation)
+                {
                     entry.status = "failed".to_string();
                     entry.updated_at = OffsetDateTime::now_utc();
                 }
-                transcode_stop_registry()
-                    .lock()
-                    .await
-                    .remove(&play_session_id);
+                remove_transcode_stop_handle_if_generation(&play_session_id, stop_generation).await;
                 return;
             }
         };
@@ -28953,7 +29418,10 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
         let process_id = process.process_id().map(i64::from);
         {
             let mut registry = live_hls_session_registry().lock().await;
-            if let Some(entry) = registry.get_mut(&play_session_id) {
+            if let Some(entry) = registry
+                .get_mut(&play_session_id)
+                .filter(|entry| entry.generation == stop_generation)
+            {
                 entry.status = "running".to_string();
                 entry.process_id = process_id;
                 entry.updated_at = OffsetDateTime::now_utc();
@@ -28984,14 +29452,14 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
             task.abort();
             let _ = task.await;
         }
-        transcode_stop_registry()
-            .lock()
-            .await
-            .remove(&play_session_id);
+        remove_transcode_stop_handle_if_generation(&play_session_id, stop_generation).await;
 
         {
             let mut registry = live_hls_session_registry().lock().await;
-            if let Some(entry) = registry.get_mut(&play_session_id) {
+            if let Some(entry) = registry
+                .get_mut(&play_session_id)
+                .filter(|entry| entry.generation == stop_generation)
+            {
                 entry.status = final_status.to_string();
                 entry.updated_at = OffsetDateTime::now_utc();
             }
@@ -28999,10 +29467,13 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) {
 
         if stopped {
             cleanup_hls_transcode_files(&output_path).await;
-            live_hls_session_registry()
-                .lock()
-                .await
-                .remove(&play_session_id);
+            let mut registry = live_hls_session_registry().lock().await;
+            if registry
+                .get(&play_session_id)
+                .is_some_and(|entry| entry.generation == stop_generation)
+            {
+                registry.remove(&play_session_id);
+            }
         }
     });
 }
@@ -29113,6 +29584,10 @@ fn playback_direct_play_supported(item: &MediaItem, options: &PlaybackInfoOption
         return false;
     }
 
+    playback_profile_supports_direct(item, options)
+}
+
+fn playback_profile_supports_direct(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
     let Some(profiles) = options.direct_play_profiles.as_ref() else {
         return true;
     };
@@ -29120,6 +29595,66 @@ fn playback_direct_play_supported(item: &MediaItem, options: &PlaybackInfoOption
     profiles
         .iter()
         .any(|profile| direct_play_profile_matches(item, profile))
+}
+
+fn live_tv_profile_supports_direct(
+    media_source: &serde_json::Value,
+    options: &PlaybackInfoOptions,
+) -> bool {
+    if !json_bool_field(media_source, "SupportsDirectStream").unwrap_or(false) {
+        return false;
+    }
+    let Some(profiles) = options.direct_play_profiles.as_ref() else {
+        return true;
+    };
+    let container = json_string_field(media_source, "Container");
+    let video_codec = json_field_case_insensitive(media_source, "MediaStreams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| {
+            streams.iter().find_map(|stream| {
+                json_string_field(stream, "Type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("Video"))
+                    .then(|| json_string_field(stream, "Codec"))
+                    .flatten()
+            })
+        });
+    let audio_codec = json_field_case_insensitive(media_source, "MediaStreams")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|streams| {
+            streams.iter().find_map(|stream| {
+                json_string_field(stream, "Type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("Audio"))
+                    .then(|| json_string_field(stream, "Codec"))
+                    .flatten()
+            })
+        });
+    profiles.iter().any(|profile| {
+        profile
+            .profile_type
+            .as_deref()
+            .is_none_or(|kind| kind.eq_ignore_ascii_case("Video"))
+            && (profile.containers.is_empty()
+                || container.as_ref().is_some_and(|container| {
+                    profile
+                        .containers
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(container))
+                }))
+            && (profile.video_codecs.is_empty()
+                || video_codec.as_ref().is_some_and(|video_codec| {
+                    profile
+                        .video_codecs
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(video_codec))
+                }))
+            && (profile.audio_codecs.is_empty()
+                || audio_codec.as_ref().is_some_and(|audio_codec| {
+                    profile
+                        .audio_codecs
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(audio_codec))
+                }))
+    })
 }
 
 fn selected_audio_stream_needs_transcode(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
@@ -30120,7 +30655,7 @@ async fn hls_media_playlist_response_for(
     )
     .await?;
     if !ready {
-        return Err(ApiError::not_found("HLS playlist is not ready"));
+        return Err(ApiError::service_unavailable("HLS playlist is not ready"));
     }
 
     let playlist = tokio::fs::read_to_string(&layout.media_playlist_path).await?;
@@ -30275,17 +30810,24 @@ async fn generate_missing_hls_segment(
     request.burn_in_subtitle =
         selected_subtitle_stream_is_image(&streams, session.subtitle_stream_index);
 
-    let command = build_hls_ffmpeg_command(&request);
-    let status = Command::new(&command.program)
+    let mut command = build_hls_ffmpeg_command(&request);
+    if is_xtream_virtual_item(&session.item) {
+        apply_live_tv_remote_ffmpeg_input_options(&mut command);
+    }
+    let mut process = Command::new(&command.program);
+    process
         .args(&command.args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .await
-        .map_err(|error| {
-            ApiError::internal(format!("failed to generate HLS seek segment: {error}"))
-        })?;
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(REQUEST_FFMPEG_TIMEOUT_SECS),
+        process.status(),
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("HLS seek segment generation timed out"))?
+    .map_err(|error| ApiError::internal(format!("failed to generate HLS seek segment: {error}")))?;
     if !status.success() || !segment_path.exists() {
         return Err(ApiError::not_found("HLS segment not found"));
     }
@@ -30450,7 +30992,14 @@ async fn ensure_dlna_hls_transcode_session(
         )
         .await?;
     if claimed_new_session {
-        spawn_hls_transcode_task(state.db.clone(), session.play_session_id.clone(), command).await;
+        spawn_hls_transcode_task(
+            state.db.clone(),
+            session.play_session_id.clone(),
+            user.id,
+            Some(DLNA_TRANSCODE_DEVICE_ID.to_string()),
+            command,
+        )
+        .await;
     } else {
         cleanup_hls_transcode_dir(&layout.session_dir).await;
     }
@@ -31853,6 +32402,7 @@ pub(crate) async fn subtitle_stream_response(
             extraction_format,
             start_position_ticks,
             extraction_end_position_ticks,
+            is_xtream_virtual_item(&item),
         )
         .await?
     };
@@ -32064,6 +32614,7 @@ async fn subtitle_output_from_external_path(
         format,
         start_position_ticks,
         end_position_ticks,
+        false,
     )
     .await
 }
@@ -32074,6 +32625,7 @@ async fn subtitle_output_from_ffmpeg(
     format: &str,
     start_position_ticks: i64,
     end_position_ticks: Option<i64>,
+    remote_input: bool,
 ) -> Result<Vec<u8>, ApiError> {
     if !matches!(format, "vtt" | "srt" | "ass" | "ssa") {
         return Err(ApiError::bad_request("Unsupported subtitle format"));
@@ -32088,6 +32640,9 @@ async fn subtitle_output_from_ffmpeg(
         command
             .arg("-ss")
             .arg(format_ticks_as_ffmpeg_seconds(start_position_ticks));
+    }
+    if remote_input {
+        command.arg("-user_agent").arg(LIVE_TV_REMOTE_USER_AGENT);
     }
     command.arg("-i").arg(input);
     if let Some(end_position_ticks) = end_position_ticks
@@ -32105,9 +32660,15 @@ async fn subtitle_output_from_ffmpeg(
         .arg(subtitle_ffmpeg_format(format))
         .arg("pipe:1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
-    let output = command.output().await?;
+    let output = tokio::time::timeout(
+        StdDuration::from_secs(REQUEST_FFMPEG_TIMEOUT_SECS),
+        command.output(),
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("Subtitle extraction timed out"))??;
     if !output.status.success() {
         tracing::warn!(
             index,
@@ -32787,7 +33348,7 @@ async fn active_hls_transcode_session_for(
     query: &HlsQuery,
     media_type: &str,
 ) -> Result<TranscodeSession, ApiError> {
-    let user = require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, headers, query.api_key.as_deref()).await?;
     let play_session_id = query
         .play_session_id
         .as_deref()
@@ -32804,6 +33365,7 @@ async fn active_hls_transcode_session_for(
             play_session_id,
             media_type,
             user.id,
+            Some(token.device_id.clone()),
         )
         .await;
     }
@@ -32836,16 +33398,21 @@ async fn active_hls_transcode_session_for_live_tv(
     play_session_id: &str,
     media_type: &str,
     user_id: Uuid,
+    device_id: Option<String>,
 ) -> Result<TranscodeSession, ApiError> {
     if media_type != "Video" {
         return Err(ApiError::not_found("HLS transcode session not found"));
     }
 
     let channel = live_tv_channel_by_id(&state.db, channel_id).await?;
-    let channel_path = live_tv_channel_path(&channel)?;
+    let channel_path = live_tv_channel_source_path(&state.db, &channel).await?;
     let is_legacy_hdhomerun = live_tv_channel_is_legacy_hdhomerun_path(&channel_path);
     let channel_url = channel_path.to_string_lossy().to_string();
     let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(&state.db, &channel).await;
+    let dedupe_key =
+        live_tv_channel_hls_dedupe_key_for_session(channel_id, user_id, play_session_id);
+    let dedupe_lock = transcode_dedupe_lock(&dedupe_key).await;
+    let _dedupe_guard = dedupe_lock.lock().await;
 
     // Check for an existing active session by play_session_id.
     {
@@ -32853,12 +33420,14 @@ async fn active_hls_transcode_session_for_live_tv(
         if let Some(entry) = registry.get(play_session_id)
             && matches!(entry.status.as_str(), "starting" | "running")
         {
+            if entry.user_id != user_id {
+                return Err(ApiError::forbidden("Transcode session access denied"));
+            }
             return Ok(live_hls_entry_to_transcode_session(entry));
         }
     }
 
     // No active session found. Check by dedupe_key to avoid starting a duplicate.
-    let dedupe_key = live_tv_channel_hls_dedupe_key(channel_id);
     {
         let registry = live_hls_session_registry().lock().await;
         if let Some(entry) = registry.values().find(|e| {
@@ -32910,18 +33479,25 @@ async fn active_hls_transcode_session_for_live_tv(
         },
     );
     request.event_playlist = true;
-    let command = if is_legacy_hdhomerun {
+    let mut command = if is_legacy_hdhomerun {
         build_hls_ffmpeg_command_from_stdin(&request)
     } else {
         build_hls_ffmpeg_command(&request)
     };
+    if !is_legacy_hdhomerun && live_tv_channel_is_remote(&channel_path) {
+        // Xtream panels commonly reject ffmpeg's default User-Agent even though the same
+        // stream works through Jellyrin's direct proxy (which already sends this header).
+        // Input protocol options must appear before `-i`.
+        apply_live_tv_remote_ffmpeg_input_options(&mut command);
+    }
     let output_path = layout.media_playlist_path.to_string_lossy().to_string();
 
     spawn_live_hls_transcode_task(LiveHlsTranscodeStart {
         play_session_id: new_play_session_id.clone(),
+        dedupe_key,
         channel_id: channel_id.to_string(),
         channel_url,
-        device_id: None,
+        device_id,
         user_id,
         command,
         output_path,
@@ -32936,6 +33512,18 @@ async fn active_hls_transcode_session_for_live_tv(
         .get(&new_play_session_id)
         .map(live_hls_entry_to_transcode_session)
         .ok_or_else(|| ApiError::internal("Failed to register live HLS session"))
+}
+
+fn apply_live_tv_remote_ffmpeg_input_options(command: &mut jellyrin_core::FfmpegCommandSpec) {
+    if let Some(input_index) = command.args.iter().position(|arg| arg == "-i") {
+        command.args.splice(
+            input_index..input_index,
+            [
+                "-user_agent".to_string(),
+                LIVE_TV_REMOTE_USER_AGENT.to_string(),
+            ],
+        );
+    }
 }
 
 fn playlist_response(
@@ -33049,7 +33637,129 @@ async fn direct_stream_media(
         )));
     }
 
+    let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    if is_xtream_remote_media(Some(&metadata))
+        && let Some(source_url) = xtream_remote_source_url(Some(&metadata))
+    {
+        return proxy_xtream_remote_media(
+            &source_url,
+            headers,
+            include_body,
+            media_item_content_type(&item),
+        )
+        .await;
+    }
+
     stream_media_item(item, headers, include_body).await
+}
+
+fn xtream_remote_media_http_client() -> &'static HttpClient {
+    static CLIENT: OnceLock<HttpClient> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        HttpClient::builder()
+            .connect_timeout(StdDuration::from_secs(10))
+            .user_agent(LIVE_TV_REMOTE_USER_AGENT)
+            .build()
+            .expect("Xtream remote media HTTP client configuration is valid")
+    })
+}
+
+async fn proxy_xtream_remote_media(
+    source_url: &str,
+    request_headers: &HeaderMap,
+    include_body: bool,
+    fallback_content_type: String,
+) -> Result<axum::response::Response, ApiError> {
+    let client = xtream_remote_media_http_client();
+    let method = if include_body {
+        reqwest::Method::GET
+    } else {
+        reqwest::Method::HEAD
+    };
+    let mut upstream =
+        send_xtream_remote_media_request(client, method, source_url, request_headers, None).await?;
+    if !include_body
+        && matches!(
+            upstream.status(),
+            StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        )
+    {
+        // Some Xtream panels reject HEAD even though byte-range GET works. Probe one byte
+        // without forwarding the body so Android clients can still inspect the stream.
+        upstream = send_xtream_remote_media_request(
+            client,
+            reqwest::Method::GET,
+            source_url,
+            request_headers,
+            Some("bytes=0-0"),
+        )
+        .await?;
+    }
+    let status = upstream.status();
+    if !status.is_success()
+        && status != StatusCode::NOT_MODIFIED
+        && status != StatusCode::RANGE_NOT_SATISFIABLE
+    {
+        return Err(ApiError::service_unavailable(format!(
+            "Xtream media source returned HTTP {status}"
+        )));
+    }
+
+    let mut response_headers = HeaderMap::new();
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+        header::ETAG,
+        header::LAST_MODIFIED,
+        header::CACHE_CONTROL,
+    ] {
+        if let Some(value) = upstream.headers().get(&name) {
+            response_headers.insert(name, value.clone());
+        }
+    }
+    if !response_headers.contains_key(header::CONTENT_TYPE) {
+        response_headers.insert(
+            header::CONTENT_TYPE,
+            fallback_content_type
+                .parse()
+                .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+        );
+    }
+    let body = if include_body {
+        Body::from_stream(upstream.bytes_stream())
+    } else {
+        Body::empty()
+    };
+    Ok((status, response_headers, body).into_response())
+}
+
+async fn send_xtream_remote_media_request(
+    client: &HttpClient,
+    method: reqwest::Method,
+    source_url: &str,
+    request_headers: &HeaderMap,
+    range_override: Option<&str>,
+) -> Result<reqwest::Response, ApiError> {
+    let mut request = client.request(method, source_url);
+    for name in [header::RANGE, header::IF_RANGE, header::IF_NONE_MATCH] {
+        if name == header::RANGE
+            && let Some(range) = range_override
+        {
+            request = request.header(header::RANGE, range);
+            continue;
+        }
+        if let Some(value) = request_headers.get(&name) {
+            request = request.header(name, value);
+        }
+    }
+    tokio::time::timeout(StdDuration::from_secs(10), request.send())
+        .await
+        .map_err(|_| ApiError::service_unavailable("Xtream media source timed out"))?
+        .map_err(|error| {
+            ApiError::service_unavailable(format!("Xtream media source is unavailable: {error}"))
+        })
 }
 
 async fn library_item_file_response(
@@ -35420,9 +36130,86 @@ async fn hydrate_configured_channel_provider_remote_images(
     Ok(images_cached)
 }
 
+fn remote_image_failure_registry() -> &'static StdMutex<HashMap<String, StdInstant>> {
+    REMOTE_IMAGE_FAILURES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn remote_image_failure_key(image_url: &str) -> String {
+    stable_entity_id("RemoteImageFailure", image_url)
+}
+
+fn remote_image_failure_is_fresh(image_url: &str) -> bool {
+    let Ok(mut failures) = remote_image_failure_registry().lock() else {
+        return false;
+    };
+    let key = remote_image_failure_key(image_url);
+    match failures.get(&key).copied() {
+        Some(failed_at) if failed_at.elapsed() < REMOTE_IMAGE_FAILURE_CACHE_TTL => true,
+        Some(_) => {
+            failures.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+fn record_remote_image_failure(image_url: &str) {
+    if let Ok(mut failures) = remote_image_failure_registry().lock() {
+        if failures.len() >= 8_192 {
+            failures.retain(|_, failed_at| failed_at.elapsed() < REMOTE_IMAGE_FAILURE_CACHE_TTL);
+        }
+        if failures.len() >= 8_192
+            && let Some(oldest_key) = failures
+                .iter()
+                .max_by_key(|(_, failed_at)| failed_at.elapsed())
+                .map(|(key, _)| key.clone())
+        {
+            failures.remove(&oldest_key);
+        }
+        failures.insert(remote_image_failure_key(image_url), StdInstant::now());
+    }
+}
+
+fn clear_remote_image_failure(image_url: &str) {
+    if let Ok(mut failures) = remote_image_failure_registry().lock() {
+        failures.remove(&remote_image_failure_key(image_url));
+    }
+}
+
+async fn limited_http_response_body(
+    response: reqwest::Response,
+    limit: usize,
+    description: &str,
+) -> Result<Vec<u8>, ApiError> {
+    use futures_util::StreamExt;
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(limit);
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            ApiError::service_unavailable(format!("{description} download failed: {error}"))
+        })?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(ApiError::bad_request(format!(
+                "{description} file is too large"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn fetch_channel_remote_image_payload(
     image_url: &str,
 ) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    if remote_image_failure_is_fresh(image_url) {
+        return Ok(None);
+    }
     let url = reqwest::Url::parse(image_url)
         .map_err(|error| ApiError::bad_request(format!("Invalid channel image URL: {error}")))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -35433,70 +36220,127 @@ async fn fetch_channel_remote_image_payload(
         .is_some_and(|host| host.eq_ignore_ascii_case("lo1.in"))
         && let Some(payload) = fetch_lo1_image_payload_with_curl(&url).await?
     {
+        clear_remote_image_failure(image_url);
         return Ok(Some(payload));
     }
-    let mut client_builder = HttpClient::builder()
-        .timeout(StdDuration::from_secs(5))
-        .user_agent(LIVE_TV_REMOTE_USER_AGENT);
-    if url
+    let is_lo1 = url
         .host_str()
-        .is_some_and(|host| host.eq_ignore_ascii_case("lo1.in"))
-    {
+        .is_some_and(|host| host.eq_ignore_ascii_case("lo1.in"));
+    let response_result = if is_lo1 {
         let addrs = [
             SocketAddr::from(([104, 21, 17, 161], 443)),
             SocketAddr::from(([172, 67, 177, 168], 443)),
         ];
-        client_builder = client_builder.resolve_to_addrs("lo1.in", &addrs);
-    }
-    let response = client_builder
-        .build()
-        .map_err(|error| ApiError::internal(format!("Image HTTP client failed: {error}")))?
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("Channel image fetch failed: {error}")))?;
+        HttpClient::builder()
+            .timeout(StdDuration::from_secs(3))
+            .user_agent(LIVE_TV_REMOTE_USER_AGENT)
+            .resolve_to_addrs("lo1.in", &addrs)
+            .build()
+            .map_err(|error| ApiError::internal(format!("Image HTTP client failed: {error}")))?
+            .get(url)
+            .send()
+            .await
+    } else {
+        channel_remote_image_http_client().get(url).send().await
+    };
+    let response = match response_result {
+        Ok(response) => response,
+        Err(error) => {
+            record_remote_image_failure(image_url);
+            return Err(ApiError::internal(format!(
+                "Channel image fetch failed: {error}"
+            )));
+        }
+    };
     if !response.status().is_success() {
+        record_remote_image_failure(image_url);
         return Ok(None);
     }
-    let mime_type = response
+    let advertised_mime_type = response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .filter(|value| value.starts_with("image/"))
         .map(str::to_string);
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| ApiError::internal(format!("Channel image fetch failed: {error}")))?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    if bytes.len() > IMAGE_UPLOAD_LIMIT_BYTES {
+    if response
+        .content_length()
+        .is_some_and(|length| length > IMAGE_UPLOAD_LIMIT_BYTES as u64)
+    {
+        record_remote_image_failure(image_url);
         return Err(ApiError::bad_request("Channel image file is too large"));
     }
-    let bytes = bytes.to_vec();
-    let mime_type =
-        mime_type.unwrap_or_else(|| image_format_from_bytes(&bytes).content_type.to_string());
+    let bytes =
+        match limited_http_response_body(response, IMAGE_UPLOAD_LIMIT_BYTES, "Channel image").await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                record_remote_image_failure(image_url);
+                return Err(error);
+            }
+        };
+    if bytes.is_empty() {
+        record_remote_image_failure(image_url);
+        return Ok(None);
+    }
+    let detected_format = image_format_from_bytes(&bytes);
+    if detected_format.extension == "bin" {
+        record_remote_image_failure(image_url);
+        return Ok(None);
+    }
+    let mime_type = advertised_mime_type
+        .filter(|mime_type| mime_type.eq_ignore_ascii_case(detected_format.content_type))
+        .unwrap_or_else(|| detected_format.content_type.to_string());
+    clear_remote_image_failure(image_url);
     Ok(Some((bytes, mime_type)))
+}
+
+fn channel_remote_image_http_client() -> &'static HttpClient {
+    static CLIENT: OnceLock<HttpClient> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        HttpClient::builder()
+            .timeout(StdDuration::from_secs(5))
+            .user_agent(LIVE_TV_REMOTE_USER_AGENT)
+            .build()
+            .expect("channel image HTTP client configuration is valid")
+    })
 }
 
 async fn fetch_lo1_image_payload_with_curl(
     url: &reqwest::Url,
 ) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    // Reserve at most two seconds for the curl/SNI workaround; the reqwest fallback below has
+    // its own three-second budget, keeping one Android artwork request below five seconds.
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(2);
     for address in ["104.21.17.161", "172.67.177.168"] {
-        let output = Command::new("curl")
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut command = Command::new("curl");
+        command
+            .kill_on_drop(true)
             .arg("-sfSL")
             .arg("--max-time")
-            .arg("10")
+            .arg(format!("{:.3}", remaining.as_secs_f64()))
+            .arg("--connect-timeout")
+            .arg(format!("{:.3}", remaining.as_secs_f64().min(1.0)))
+            .arg("--max-filesize")
+            .arg(IMAGE_UPLOAD_LIMIT_BYTES.to_string())
+            .arg("--user-agent")
+            .arg(LIVE_TV_REMOTE_USER_AGENT)
             .arg("--resolve")
             .arg(format!("lo1.in:443:{address}"))
             .arg(url.as_str())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .await
-            .map_err(|error| ApiError::internal(format!("Image curl failed: {error}")))?;
+            .stderr(Stdio::null());
+        let output = match tokio::time::timeout(remaining, command.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                return Err(ApiError::internal(format!("Image curl failed: {error}")));
+            }
+            Err(_) => break,
+        };
         if !output.status.success() || output.stdout.is_empty() {
             continue;
         }
@@ -35509,6 +36353,7 @@ async fn fetch_lo1_image_payload_with_curl(
         }
         return Ok(Some((output.stdout, format.content_type.to_string())));
     }
+    record_remote_image_failure(url.as_str());
     Ok(None)
 }
 
@@ -36095,29 +36940,135 @@ async fn active_encodings(
     Ok(Json(result))
 }
 
-async fn stop_live_hls_session_by_id(play_session_id: &str) -> Option<LiveHlsSessionEntry> {
-    let live_entry = live_hls_session_registry()
-        .lock()
-        .await
-        .get(play_session_id)
-        .cloned();
+async fn stop_live_hls_session_by_id(
+    play_session_id: &str,
+    expected_generation: u64,
+) -> Option<LiveHlsSessionEntry> {
+    let live_entry = {
+        let mut registry = live_hls_session_registry().lock().await;
+        if registry
+            .get(play_session_id)
+            .is_some_and(|entry| entry.generation == expected_generation)
+        {
+            registry.remove(play_session_id)
+        } else {
+            None
+        }
+    };
     if let Some(entry) = &live_entry {
-        let stop_sender = transcode_stop_registry()
-            .lock()
-            .await
-            .remove(play_session_id);
+        let stop_sender = {
+            let mut registry = transcode_stop_registry().lock().await;
+            if registry
+                .get(play_session_id)
+                .is_some_and(|handle| handle.generation == expected_generation)
+            {
+                registry.remove(play_session_id)
+            } else {
+                None
+            }
+        };
         if let Some(stop_sender) = stop_sender {
             // spawn_live_hls_transcode_task will set status, clean files and release tuner lease.
-            let _ = stop_sender.send(());
+            let _ = stop_sender.sender.send(());
         } else {
-            live_hls_session_registry()
-                .lock()
-                .await
-                .remove(play_session_id);
             cleanup_hls_transcode_files(&entry.output_path).await;
         }
     }
     live_entry
+}
+
+async fn stop_hls_transcode_session_for_user(
+    db: &Database,
+    play_session_id: &str,
+    user: &User,
+    requested_device_id: Option<&str>,
+) -> Result<bool, ApiError> {
+    // Drop the registry guard before calling the stop helper, which takes the same lock.
+    // Keeping the temporary guard alive for the `if let` body deadlocks stopped reports.
+    let live_entry = {
+        live_hls_session_registry()
+            .lock()
+            .await
+            .get(play_session_id)
+            .cloned()
+    };
+    if let Some(entry) = live_entry {
+        if entry.user_id != user.id && !user.is_administrator {
+            return Err(ApiError::forbidden("Transcode session access denied"));
+        }
+        if requested_device_id.is_some_and(|requested| {
+            entry
+                .device_id
+                .as_deref()
+                .is_some_and(|device_id| device_id != requested)
+        }) {
+            return Err(ApiError::forbidden("Transcode session device mismatch"));
+        }
+        stop_live_hls_session_by_id(play_session_id, entry.generation).await;
+        return Ok(true);
+    }
+
+    // Standard HLS sessions keep ownership with their in-memory stop sender.  Authorize and
+    // signal from that registry before touching SQLite so a busy database cannot strand ffmpeg.
+    let stop_handle = {
+        let mut registry = transcode_stop_registry().lock().await;
+        match registry.get(play_session_id) {
+            Some(handle) if handle.user_id != user.id && !user.is_administrator => {
+                return Err(ApiError::forbidden("Transcode session access denied"));
+            }
+            Some(handle)
+                if requested_device_id.is_some_and(|requested| {
+                    handle
+                        .device_id
+                        .as_deref()
+                        .is_some_and(|device_id| device_id != requested)
+                }) =>
+            {
+                return Err(ApiError::forbidden("Transcode session device mismatch"));
+            }
+            Some(_) => registry.remove(play_session_id),
+            None => None,
+        }
+    };
+    if let Some(stop_handle) = stop_handle {
+        let _ = stop_handle.sender.send(());
+        if let Err(error) = db
+            .update_transcode_session_status(play_session_id, "stopping")
+            .await
+        {
+            tracing::warn!(%play_session_id, %error, "failed to persist stopping transcode status");
+        }
+        return Ok(true);
+    }
+
+    let Some(session) = db
+        .transcode_session_by_play_session_id(play_session_id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if session.user_id != user.id && !user.is_administrator {
+        return Err(ApiError::forbidden("Transcode session access denied"));
+    }
+    if requested_device_id.is_some_and(|requested| {
+        session
+            .device_id
+            .as_deref()
+            .is_some_and(|device_id| device_id != requested)
+    }) {
+        return Err(ApiError::forbidden("Transcode session device mismatch"));
+    }
+    let already_terminal = matches!(session.status.as_str(), "stopped" | "completed" | "failed");
+    if !already_terminal {
+        if let Err(error) = db
+            .update_transcode_session_status(play_session_id, "stopped")
+            .await
+        {
+            tracing::warn!(%play_session_id, %error, "failed to persist stopped transcode status");
+        }
+        cleanup_hls_transcode_files(&session.output_path).await;
+    }
+    Ok(true)
 }
 
 async fn stop_active_encoding(
@@ -36133,63 +37084,18 @@ async fn stop_active_encoding(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
 
-    // Check the live HLS in-memory registry first (live TV channels are not in the DB).
-    let live_entry = live_hls_session_registry()
-        .lock()
-        .await
-        .get(play_session_id)
-        .cloned();
-    if let Some(entry) = live_entry {
-        if entry.user_id != user.id && !user.is_administrator {
-            return Err(ApiError::forbidden("Transcode session access denied"));
-        }
-        stop_live_hls_session_by_id(play_session_id).await;
-        return Ok(StatusCode::OK);
-    }
-
-    let session = state
-        .db
-        .transcode_session_by_play_session_id(play_session_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Transcode session not found"))?;
-    if session.user_id != user.id && !user.is_administrator {
-        return Err(ApiError::forbidden("Transcode session access denied"));
-    }
-    if let Some(query_device_id) = query
+    let requested_device_id = query
         .device_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        && session
-            .device_id
-            .as_deref()
-            .is_some_and(|session_device_id| session_device_id != query_device_id)
+        .filter(|value| !value.is_empty());
+    if stop_hls_transcode_session_for_user(&state.db, play_session_id, &user, requested_device_id)
+        .await?
     {
-        return Err(ApiError::forbidden("Transcode session device mismatch"));
-    }
-
-    let already_terminal = matches!(session.status.as_str(), "stopped" | "completed" | "failed");
-    let stop_sender = transcode_stop_registry()
-        .lock()
-        .await
-        .remove(play_session_id);
-    if let Some(stop_sender) = stop_sender {
-        state
-            .db
-            .update_transcode_session_status(play_session_id, "stopping")
-            .await?;
-        let _ = stop_sender.send(());
-    } else if !already_terminal {
-        state
-            .db
-            .update_transcode_session_status(play_session_id, "stopped")
-            .await?;
-        cleanup_hls_transcode_files(&session.output_path).await;
+        Ok(StatusCode::OK)
     } else {
-        cleanup_hls_transcode_files(&session.output_path).await;
+        Err(ApiError::not_found("Transcode session not found"))
     }
-
-    Ok(StatusCode::OK)
 }
 
 async fn authenticated_item_theme_media(
@@ -38004,7 +38910,12 @@ async fn items_to_json(
             None
         };
         values.push(if compact {
-            compact_media_item_to_json(&item, server_id, playback.as_ref())
+            compact_media_item_to_json(
+                &item,
+                server_id,
+                playback.as_ref(),
+                metadata_by_item.get(&item.id),
+            )
         } else {
             media_item_to_json_with_playback_and_metadata(
                 &item,
@@ -38039,11 +38950,14 @@ fn compact_media_item_to_json(
     item: &MediaItem,
     server_id: &str,
     playback: Option<&PlaybackState>,
+    metadata: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let item_id = item.id.simple().to_string();
     let image_tag = default_primary_image_tag(&item_id);
     let playback_position_ticks = playback.map_or(0, |state| state.position_ticks);
     let played = playback.is_some_and(|state| state.played);
+    let advertise_primary_image = !is_xtream_remote_media(metadata)
+        || metadata.is_some_and(metadata_has_primary_image_source);
     serde_json::json!({
         "Name": item.name,
         "ServerId": server_id,
@@ -38062,11 +38976,15 @@ fn compact_media_item_to_json(
             "Key": item_id,
             "ItemId": item_id,
         },
-        "ImageTags": { "Primary": image_tag },
-        "ImageBlurHashes": {
-            "Primary": {
-                image_tag: default_primary_blur_hash()
-            }
+        "ImageTags": if advertise_primary_image {
+            serde_json::json!({ "Primary": image_tag })
+        } else {
+            serde_json::json!({})
+        },
+        "ImageBlurHashes": if advertise_primary_image {
+            serde_json::json!({ "Primary": { image_tag: default_primary_blur_hash() } })
+        } else {
+            serde_json::json!({})
         },
         "BackdropImageTags": [],
     })
@@ -39406,21 +40324,10 @@ async fn fetch_remote_image_bytes(url: &str) -> Result<Vec<u8>, ApiError> {
 }
 
 async fn fetch_remote_image_payload(url: &str) -> Result<(Vec<u8>, Option<String>), ApiError> {
-    let url = url.replacen("https://", "http://", 1);
-    let client = HttpClient::builder()
-        .timeout(StdDuration::from_secs(5))
-        .user_agent("Jellyrin/0.1")
-        .build()?;
-    let response = client.get(url).send().await?;
-    if !response.status().is_success() {
-        return Err(ApiError::not_found("Remote image not found"));
+    match fetch_channel_remote_image_payload(url).await? {
+        Some((bytes, content_type)) => Ok((bytes, Some(content_type))),
+        None => Err(ApiError::not_found("Remote image not found")),
     }
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    Ok((response.bytes().await?.to_vec(), content_type))
 }
 
 fn strip_html_summary(value: &str) -> String {
@@ -39738,6 +40645,8 @@ fn media_item_to_json_with_playback_and_metadata(
         .or(default_audio_stream_index);
     let selected_subtitle_stream_index =
         selected_subtitle_stream_index(playback, default_subtitle_stream_index);
+    let advertise_primary_image = !is_xtream_remote_media(metadata)
+        || metadata.is_some_and(metadata_has_primary_image_source);
     let video_type = if item.media_type == "Video" {
         serde_json::json!("VideoFile")
     } else {
@@ -39878,7 +40787,11 @@ fn media_item_to_json_with_playback_and_metadata(
         "MediaType": item.media_type,
         "RunTimeTicks": item.runtime_ticks,
         "UserData": { "PlaybackPositionTicks": playback_position_ticks, "PlayCount": play_count, "IsFavorite": is_favorite, "Likes": likes, "Played": played, "Key": item_id, "ItemId": item_id, "PlayedPercentage": null, "LastPlayedDate": null, "Rating": rating },
-        "ImageTags": { "Primary": image_tag },
+        "ImageTags": if advertise_primary_image {
+            serde_json::json!({ "Primary": image_tag })
+        } else {
+            serde_json::json!({})
+        },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
@@ -40104,6 +41017,17 @@ fn apply_media_item_metadata(
     }
 }
 
+fn metadata_has_primary_image_source(metadata: &serde_json::Value) -> bool {
+    first_metadata_value_from_json(metadata, &["PrimaryImageTag", "ImageTag"])
+        .is_some_and(|tag| !tag.trim().is_empty())
+        || json_field_case_insensitive(metadata, "ImageTags")
+            .and_then(|tags| json_string_field(tags, "Primary"))
+            .is_some_and(|tag| !tag.trim().is_empty())
+        || metadata_remote_image_url(metadata, "Primary").is_some()
+        || json_string_any_field(metadata, &["PrimaryImagePath", "ImagePath"])
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
 fn first_metadata_json_from_case_insensitive(
     metadata: &serde_json::Value,
     keys: &[&str],
@@ -40261,6 +41185,7 @@ fn hls_master_url(
     play_session_id: &str,
     access_token: &str,
 ) -> String {
+    let item_id = query_path_segment_encode(item_id);
     if media_type == "Audio" {
         format!(
             "/Audio/{item_id}/master.m3u8?PlaySessionId={play_session_id}&api_key={access_token}"
@@ -42296,7 +43221,10 @@ const TRANSPARENT_PLACEHOLDER_PNG: &[u8] = &[
 
 fn placeholder_png_response() -> axum::response::Response {
     (
-        [(header::CONTENT_TYPE, "image/png")],
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=60"),
+        ],
         TRANSPARENT_PLACEHOLDER_PNG.to_vec(),
     )
         .into_response()
@@ -42307,7 +43235,11 @@ async fn stored_image_is_transparent_placeholder(path: &FsPath) -> Result<bool, 
     // malformed) but all occupy at most the same 67 bytes. A library cover
     // this small is never useful, so do not let it suppress a real source or
     // the visible application-art fallback.
-    Ok(tokio::fs::metadata(path).await?.len() <= TRANSPARENT_PLACEHOLDER_PNG.len() as u64)
+    if tokio::fs::metadata(path).await?.len() > TRANSPARENT_PLACEHOLDER_PNG.len() as u64 {
+        return Ok(false);
+    }
+    let bytes = tokio::fs::read(path).await?;
+    Ok(bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
 }
 
 pub(crate) enum ImageOwner<'a> {
@@ -42384,15 +43316,64 @@ async fn find_cached_live_tv_image(
             continue;
         }
         let path = dir.join(format!("{tag}.{}", format.extension));
-        if tokio::fs::metadata(&path)
-            .await
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-        {
+        if cached_image_file_is_usable(&path).await {
             return Ok(Some(path));
         }
+        let _ = tokio::fs::remove_file(path).await;
     }
     Ok(None)
+}
+
+async fn cached_image_file_is_usable(path: &FsPath) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
+        return false;
+    };
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > IMAGE_UPLOAD_LIMIT_BYTES as u64
+    {
+        return false;
+    }
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return false;
+    };
+    let mut signature = [0_u8; 16];
+    let Ok(read) = file.read(&mut signature).await else {
+        return false;
+    };
+    let format = image_format_from_bytes(&signature[..read]);
+    match format.extension {
+        "jpg" => {
+            let mut trailer = [0_u8; 2];
+            file.seek(std::io::SeekFrom::End(-2)).await.is_ok()
+                && file.read_exact(&mut trailer).await.is_ok()
+                && trailer == [0xff, 0xd9]
+        }
+        "png" => {
+            const PNG_IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82];
+            let mut trailer = [0_u8; PNG_IEND.len()];
+            file.seek(std::io::SeekFrom::End(-(PNG_IEND.len() as i64)))
+                .await
+                .is_ok()
+                && file.read_exact(&mut trailer).await.is_ok()
+                && trailer == PNG_IEND
+        }
+        "gif" => {
+            let mut trailer = [0_u8; 1];
+            file.seek(std::io::SeekFrom::End(-1)).await.is_ok()
+                && file.read_exact(&mut trailer).await.is_ok()
+                && trailer == [0x3b]
+        }
+        "webp" => {
+            let declared_payload = signature
+                .get(4..8)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes)
+                .map(u64::from);
+            declared_payload.is_some_and(|payload| payload.saturating_add(8) == metadata.len())
+        }
+        _ => false,
+    }
 }
 
 async fn cache_live_tv_image(
@@ -42401,6 +43382,11 @@ async fn cache_live_tv_image(
     image_url: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, ApiError> {
+    if bytes.is_empty() || bytes.len() > IMAGE_UPLOAD_LIMIT_BYTES {
+        return Err(ApiError::bad_request(
+            "Live TV image payload has an invalid size",
+        ));
+    }
     let format = image_format_from_bytes(bytes);
     if format.extension == "bin" {
         return Err(ApiError::bad_request(
@@ -42414,7 +43400,24 @@ async fn cache_live_tv_image(
         live_tv_image_tag(item_id, image_url),
         format.extension
     ));
-    tokio::fs::write(&path, bytes).await?;
+    let image_lock = trickplay_tile_lock(&path).await;
+    let _guard = image_lock.lock().await;
+    if cached_image_file_is_usable(&path).await {
+        return Ok(path);
+    }
+    let temporary_path = path.with_extension(format!(
+        "{}.tmp.{}",
+        format.extension,
+        Uuid::new_v4().simple()
+    ));
+    if let Err(error) = tokio::fs::write(&temporary_path, bytes).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(error.into());
+    }
+    if let Err(error) = tokio::fs::rename(&temporary_path, &path).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(error.into());
+    }
     Ok(path)
 }
 
@@ -42519,82 +43522,6 @@ async fn precache_single_live_tv_logo(
     }
 }
 
-fn live_tv_generated_image_response(
-    item: &serde_json::Value,
-    item_id: &str,
-    image_url: &str,
-) -> axum::response::Response {
-    let name = json_string_field(item, "Name").unwrap_or_else(|| item_id.to_string());
-    let label = live_tv_generated_image_label(&name);
-    let hash = live_tv_image_tag(item_id, image_url);
-    let bg = &hash[..6.min(hash.len())];
-    let fg = if u8::from_str_radix(&bg[..2], 16).unwrap_or(0) > 170 {
-        "111827"
-    } else {
-        "ffffff"
-    };
-    let svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-<rect width="512" height="512" rx="56" fill="#{bg}"/>
-<text x="256" y="244" text-anchor="middle" dominant-baseline="middle" font-family="Arial, Helvetica, sans-serif" font-size="116" font-weight="700" fill="#{fg}">{}</text>
-<text x="256" y="338" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="600" fill="#{fg}" opacity="0.9">{}</text>
-</svg>"##,
-        escape_xml_text(&label),
-        escape_xml_text(&live_tv_generated_image_caption(&name)),
-    );
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        "image/svg+xml; charset=utf-8".parse().unwrap(),
-    );
-    headers.insert(
-        header::CACHE_CONTROL,
-        "public, max-age=3600".parse().unwrap(),
-    );
-    headers.insert(header::ETAG, hash.parse().unwrap());
-    (headers, svg.into_bytes()).into_response()
-}
-
-fn live_tv_generated_image_label(name: &str) -> String {
-    let words = name
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let label = words
-        .iter()
-        .filter_map(|word| word.chars().next())
-        .take(3)
-        .collect::<String>();
-    if label.is_empty() {
-        "TV".to_string()
-    } else {
-        label.to_ascii_uppercase()
-    }
-}
-
-fn live_tv_generated_image_caption(name: &str) -> String {
-    let trimmed = name.trim();
-    let caption = if trimmed.chars().count() > 18 {
-        trimmed.chars().take(17).collect::<String>() + "..."
-    } else {
-        trimmed.to_string()
-    };
-    if caption.is_empty() {
-        "Live TV".to_string()
-    } else {
-        caption
-    }
-}
-
-fn escape_xml_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 async fn live_tv_item_image_response(
     state: &AppState,
     item: &serde_json::Value,
@@ -42624,9 +43551,17 @@ async fn live_tv_item_image_response(
                 tracing::warn!(%image_url, ?error, "failed to cache live TV item image");
             }
         }
-        return Ok(Some(live_tv_generated_image_response(
-            item, &item_id, &image_url,
-        )));
+        if let Some(mut response) = user_view_fallback_image_response(state).await? {
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, "public, max-age=60".parse().unwrap());
+            return Ok(Some(response));
+        }
+        let mut response = placeholder_png_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, "public, max-age=60".parse().unwrap());
+        return Ok(Some(response));
     }
     let payload = if let Some(payload) = data_uri_image_payload(&image_url)? {
         Some(payload)
@@ -42685,33 +43620,36 @@ async fn item_image_from_plugins(
             json_string_field(value, "ImageUrl").or_else(|| json_string_field(value, "Url"))
         {
             if image_url.starts_with("http://") || image_url.starts_with("https://") {
-                match reqwest::get(&image_url).await {
-                    Ok(response) if response.status().is_success() => {
-                        let content_type = response
-                            .headers()
-                            .get("content-type")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("image/jpeg")
-                            .to_string();
-                        if let Ok(bytes) = response.bytes().await {
-                            return Ok(Some(
-                                Response::builder()
-                                    .header("content-type", &content_type)
-                                    .header("cache-control", "public, max-age=86400")
-                                    .body(Body::from(bytes))
-                                    .unwrap(),
-                            ));
-                        }
-                    }
-                    _ => continue,
+                if let Ok((bytes, advertised_content_type)) =
+                    fetch_remote_image_payload(&image_url).await
+                {
+                    let detected_content_type = image_format_from_bytes(&bytes).content_type;
+                    let content_type = advertised_content_type
+                        .filter(|value| value.starts_with("image/"))
+                        .unwrap_or_else(|| detected_content_type.to_string());
+                    return Ok(Some(
+                        Response::builder()
+                            .header("content-type", &content_type)
+                            .header("cache-control", "public, max-age=86400")
+                            .body(Body::from(bytes))
+                            .unwrap(),
+                    ));
                 }
             }
         }
         // Check for base64 image data
         if let Some(image_data) = json_string_field(value, "ImageData") {
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image_data) {
+                if bytes.is_empty()
+                    || bytes.len() > IMAGE_UPLOAD_LIMIT_BYTES
+                    || image_format_from_bytes(&bytes).extension == "bin"
+                {
+                    continue;
+                }
+                let detected_content_type = image_format_from_bytes(&bytes).content_type;
                 let content_type = json_string_field(value, "ContentType")
-                    .unwrap_or_else(|| "image/jpeg".to_string());
+                    .filter(|value| value.starts_with("image/"))
+                    .unwrap_or_else(|| detected_content_type.to_string());
                 return Ok(Some(
                     Response::builder()
                         .header("content-type", &content_type)
@@ -42774,13 +43712,13 @@ async fn media_item_image_response(
         Err(error) if error.status == StatusCode::NOT_FOUND => return Ok(None),
         Err(error) => return Err(error),
     };
+    if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
+        return stored_image_response(local_image).await.map(Some);
+    }
     if let Some(response) =
         remote_metadata_item_image_response(state, item_id, &item, image_type, image_index).await?
     {
         return Ok(Some(response));
-    }
-    if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
-        return stored_image_response(local_image).await.map(Some);
     }
     // Try plugin ImageProvider as fallback
     if let Some(plugin_image) = item_image_from_plugins(&state.db, item_id, image_type).await? {
@@ -43100,6 +44038,14 @@ async fn find_generated_video_item_image(
     {
         return Ok(None);
     }
+    let usable_source = tokio::fs::metadata(media_item_path(item))
+        .await
+        .map(|metadata| metadata.is_file() && metadata.len() > 0)
+        .unwrap_or(false);
+    if !usable_source {
+        // Stale library rows must not launch four doomed ffmpeg probes on every image request.
+        return Ok(None);
+    }
 
     let dir = stored_image_owner_dir(state, ImageOwner::Item(cache_item_id));
     let path = dir.join("generated_video_primary.jpg");
@@ -43112,17 +44058,30 @@ async fn find_generated_video_item_image(
     if generated_video_image_is_usable(&path).await {
         return Ok(Some(path));
     }
+    let generation_failure_key =
+        format!("generated-video-image:{}", media_item_path(item).display());
+    if remote_image_failure_is_fresh(&generation_failure_key) {
+        return Ok(None);
+    }
 
     tokio::fs::create_dir_all(&dir).await?;
     let _ = tokio::fs::remove_file(&path).await;
-    let mut best_candidate: Option<(PathBuf, u64)> = None;
+    // Keep the entire thumbnail attempt below a typical Android HTTP timeout.  A damaged or
+    // remote-backed file may otherwise consume the per-candidate timeout four times in a row.
+    let generation_deadline = tokio::time::Instant::now() + StdDuration::from_secs(8);
     for (index, seek_seconds) in generated_video_image_seek_seconds(item)
         .into_iter()
         .enumerate()
     {
+        let remaining = generation_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
         let tmp_path =
             path.with_extension(format!("jpg.tmp.{}.{}", index, Uuid::new_v4().simple()));
-        let output = Command::new("ffmpeg")
+        let mut command = Command::new("ffmpeg");
+        command
+            .kill_on_drop(true)
             .arg("-hide_banner")
             .arg("-nostdin")
             .arg("-y")
@@ -43142,12 +44101,27 @@ async fn find_generated_video_item_image(
             .arg("mjpeg")
             .arg(&tmp_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(remaining, command.output()).await;
 
         let Ok(output) = output else {
             let _ = tokio::fs::remove_file(&tmp_path).await;
+            tracing::warn!(
+                item_id = %item.id,
+                cache_item_id,
+                seek_seconds,
+                "ffmpeg video image generation exhausted its time budget"
+            );
+            break;
+        };
+        let Ok(output) = output else {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            tracing::warn!(
+                item_id = %item.id,
+                cache_item_id,
+                seek_seconds,
+                "ffmpeg video image candidate failed to start"
+            );
             continue;
         };
         if !output.status.success() {
@@ -43166,36 +44140,25 @@ async fn find_generated_video_item_image(
             );
             continue;
         }
-        let bytes = tokio::fs::metadata(&tmp_path)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if bytes == 0 {
+        if !generated_video_image_is_usable(&tmp_path).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             continue;
         }
-        if best_candidate
-            .as_ref()
-            .is_some_and(|(_, best_bytes)| *best_bytes >= bytes)
+        if tokio::fs::metadata(&path)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
         {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-        } else if let Some((old_path, _)) = best_candidate.replace((tmp_path, bytes)) {
-            let _ = tokio::fs::remove_file(old_path).await;
+            clear_remote_image_failure(&generation_failure_key);
+            return Ok(Some(path));
         }
-    }
-    let Some((tmp_path, _)) = best_candidate else {
-        return Ok(None);
-    };
-    if tokio::fs::metadata(&path)
-        .await
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
-    {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
+        tokio::fs::rename(&tmp_path, &path).await?;
+        clear_remote_image_failure(&generation_failure_key);
         return Ok(Some(path));
     }
-    tokio::fs::rename(&tmp_path, &path).await?;
-    Ok(Some(path))
+    record_remote_image_failure(&generation_failure_key);
+    Ok(None)
 }
 
 async fn remote_metadata_item_image_response(
@@ -43251,12 +44214,12 @@ fn metadata_remote_image_url(metadata: &serde_json::Value, image_type: &str) -> 
 }
 
 async fn generated_video_image_is_usable(path: &std::path::Path) -> bool {
-    const MIN_GENERATED_IMAGE_BYTES: u64 = 4 * 1024;
-
-    tokio::fs::metadata(path)
-        .await
-        .map(|metadata| metadata.is_file() && metadata.len() >= MIN_GENERATED_IMAGE_BYTES)
-        .unwrap_or(false)
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return false;
+    };
+    // Small low-detail frames can be valid JPEGs below 4 KiB.  Validate their signature
+    // instead of repeatedly regenerating them based on an arbitrary size threshold.
+    bytes.len() >= 128 && bytes.starts_with(&[0xff, 0xd8, 0xff]) && bytes.ends_with(&[0xff, 0xd9])
 }
 
 fn generated_video_image_seek_seconds(item: &MediaItem) -> Vec<String> {
@@ -45874,11 +46837,11 @@ mod tests {
         ensure_package_install_not_cancelled, external_id_infos_for_item_type, filter_package_list,
         format_time_for_json, get_valid_filename, hdhomerun_bool_field,
         hls_effective_start_position_ticks, hls_segment_ticks, hls_transcode_dedupe_key,
-        hls_transcode_session_input_path, is_live_tv_channel_id, json_string_field, json_value_i64,
-        last_system_lifecycle_command, live_hls_session_registry, live_tv_channel_is_remote,
-        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
-        live_tv_m3u_channels_from_payload, live_tv_recording_name,
-        live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
+        hls_transcode_dedupe_key_for_device, hls_transcode_session_input_path,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
+        live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
+        live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_m3u_channels_from_payload,
+        live_tv_recording_name, live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
         metadata_editor_parental_rating_options, normalize_media_stream,
         package_infos_from_repositories, package_install_task_key, paged_media_items,
@@ -45893,10 +46856,10 @@ mod tests {
         spawn_hls_transcode_task, stable_entity_id, store_image_bytes, subscribe_playback_events,
         subscribe_system_lifecycle_commands, subtitle_vtt_to_track_events_json,
         syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
-        tvmaze_remote_search_series_result, update_plugin_configuration_via_runtime_host_path,
-        validate_zip_entry_path, verify_plugin_package_checksum, with_live_tuner_leases,
-        xtream_remote_media_probe_current,
+        transcode_stop_registry, transcode_temp_root, trickplay_settings,
+        trickplay_tile_cache_path, tvmaze_remote_search_series_result,
+        update_plugin_configuration_via_runtime_host_path, validate_zip_entry_path,
+        verify_plugin_package_checksum, with_live_tuner_leases, xtream_remote_media_probe_current,
     };
     use crate::dlna;
     use crate::live_tv_xtream::{
@@ -45906,7 +46869,7 @@ mod tests {
     };
     use axum::{
         body::Body,
-        http::{Method, Request, StatusCode, header},
+        http::{HeaderMap, Method, Request, StatusCode, header},
     };
     use base64::{Engine as _, engine::general_purpose};
     use futures_util::{SinkExt, StreamExt};
@@ -46307,6 +47270,7 @@ mod tests {
             local_address: "http://127.0.0.1:8097".to_string(),
         });
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Plugins")
@@ -47155,10 +48119,11 @@ mod tests {
         let channels: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channels["TotalRecordCount"], 1);
         assert_eq!(channels["Items"][0]["Name"], "WASI Channel Item");
-        assert_eq!(
-            channels["Items"][0]["Path"],
-            "https://example.invalid/wasi.m3u8"
-        );
+        let public_path = channels["Items"][0]["Path"]
+            .as_str()
+            .expect("public live TV proxy path");
+        assert!(public_path.starts_with("/LiveTv/LiveStreamFiles/"));
+        assert!(!channels["Items"][0].to_string().contains("example.invalid"));
         assert_eq!(
             channels["Items"][0]["ProviderIds"]["JellyrinPlugin"],
             plugin_id
@@ -48982,6 +49947,156 @@ done
             key,
             hls_transcode_dedupe_key(user_id, &item, &selection, 12_346_000_000)
         );
+    }
+
+    #[test]
+    fn xtream_media_item_json_only_advertises_real_primary_images() {
+        let item = MediaItem {
+            id: uuid::Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            virtual_folder_id: uuid::Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc")
+                .unwrap(),
+            name: "Remote Movie".to_string(),
+            path: "xtream://movies/Remote Movie [42].mkv".to_string(),
+            media_type: "Video".to_string(),
+            collection_type: Some("movies".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let source_only = json!({
+            "Provider": "xtream",
+            "RemoteSourceUrl": "http://example.test/movie/user/pass/42.mkv"
+        });
+
+        let without_artwork = super::media_item_to_json_with_playback_and_metadata(
+            &item,
+            "server",
+            None,
+            Some(&source_only),
+        );
+        assert_eq!(without_artwork["ImageTags"], json!({}));
+
+        let with_artwork_url = json!({
+            "Provider": "xtream",
+            "RemoteSourceUrl": "http://example.test/movie/user/pass/42.mkv",
+            "PrimaryImageUrl": "https://images.example.test/poster.jpg"
+        });
+        let with_artwork_url = super::media_item_to_json_with_playback_and_metadata(
+            &item,
+            "server",
+            None,
+            Some(&with_artwork_url),
+        );
+        assert!(
+            with_artwork_url["ImageTags"]["Primary"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty())
+        );
+
+        let with_real_tag = json!({
+            "Provider": "xtream",
+            "RemoteSourceUrl": "http://example.test/movie/user/pass/42.mkv",
+            "PrimaryImageTag": "real-primary-tag"
+        });
+        let with_real_tag = super::media_item_to_json_with_playback_and_metadata(
+            &item,
+            "server",
+            None,
+            Some(&with_real_tag),
+        );
+        assert_eq!(with_real_tag["ImageTags"]["Primary"], "real-primary-tag");
+    }
+
+    #[tokio::test]
+    async fn cached_image_file_is_usable_rejects_truncated_png_and_jpeg() {
+        let temp = tempfile::tempdir().unwrap();
+        let complete_png = temp.path().join("complete.png");
+        let truncated_png = temp.path().join("truncated.png");
+        let truncated_jpeg = temp.path().join("truncated.jpg");
+
+        tokio::fs::write(&complete_png, super::TRANSPARENT_PLACEHOLDER_PNG)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &truncated_png,
+            &super::TRANSPARENT_PLACEHOLDER_PNG[..super::TRANSPARENT_PLACEHOLDER_PNG.len() - 12],
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &truncated_jpeg,
+            [
+                0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x01,
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert!(super::cached_image_file_is_usable(&complete_png).await);
+        assert!(!super::cached_image_file_is_usable(&truncated_png).await);
+        assert!(!super::cached_image_file_is_usable(&truncated_jpeg).await);
+    }
+
+    #[test]
+    fn scrub_live_tv_public_source_urls_preserves_proxies_and_removes_remote_sources() {
+        let mut public_item = json!({
+            "Path": "/LiveTv/LiveStreamFiles/xtream_42/stream.ts",
+            "DirectStreamUrl": "/Videos/xtream_42/master.m3u8?api_key=test",
+            "TranscodingUrl": "https://provider.example/live/user/password/42.ts",
+            "RequiredHttpHeaders": { "Authorization": "Bearer secret" },
+            "MediaStreams": [
+                {
+                    "Index": 0,
+                    "Path": "http://provider.example/live/user/password/42.ts",
+                    "DeliveryUrl": "/Videos/xtream_42/stream.ts",
+                    "HttpHeaders": { "X-Provider-Token": "secret" }
+                },
+                {
+                    "Index": 1,
+                    "Path": "/Items/xtream_42/Images/Primary",
+                    "RemoteSourceUrl": "https://provider.example/movie/user/password/42.mkv",
+                    "RequestHeaders": { "Cookie": "session=secret" }
+                }
+            ]
+        });
+
+        super::scrub_live_tv_public_source_urls(&mut public_item);
+
+        assert_eq!(
+            public_item["Path"],
+            "/LiveTv/LiveStreamFiles/xtream_42/stream.ts"
+        );
+        assert_eq!(
+            public_item["DirectStreamUrl"],
+            "/Videos/xtream_42/master.m3u8?api_key=test"
+        );
+        assert!(public_item.get("TranscodingUrl").is_none());
+        assert_eq!(public_item["RequiredHttpHeaders"], json!({}));
+        assert!(public_item["MediaStreams"][0].get("Path").is_none());
+        assert_eq!(
+            public_item["MediaStreams"][0]["DeliveryUrl"],
+            "/Videos/xtream_42/stream.ts"
+        );
+        assert_eq!(public_item["MediaStreams"][0]["HttpHeaders"], json!({}));
+        assert_eq!(
+            public_item["MediaStreams"][1]["Path"],
+            "/Items/xtream_42/Images/Primary"
+        );
+        assert!(
+            public_item["MediaStreams"][1]
+                .get("RemoteSourceUrl")
+                .is_none()
+        );
+        assert_eq!(public_item["MediaStreams"][1]["RequestHeaders"], json!({}));
+        let serialized = public_item.to_string();
+        assert!(!serialized.contains("provider.example"));
+        assert!(!serialized.contains("secret"));
     }
 
     #[tokio::test]
@@ -56330,6 +57445,11 @@ done
                 "/Items/fallback-program-xtream-2/PlaybackInfo?UserId={}",
                 user.id
             ),
+            format!(
+                "/Items/{}/PlaybackInfo?UserId={}",
+                crate::live_tv_fallback_program_public_id("xtream_2"),
+                user.id
+            ),
         ] {
             let response = app
                 .clone()
@@ -56349,13 +57469,17 @@ done
                 playback_info["MediaSources"][0]["Id"], "xtream_2",
                 "{endpoint}"
             );
-            assert!(playback_info["MediaSources"][0]["DirectStreamUrl"].is_null());
+            assert_eq!(
+                playback_info["MediaSources"][0]["DirectStreamUrl"],
+                "/LiveTv/LiveStreamFiles/xtream_2/stream.ts",
+                "{endpoint}"
+            );
             assert_eq!(
                 playback_info["MediaSources"][0]["SupportsDirectPlay"], false,
                 "{endpoint}"
             );
             assert_eq!(
-                playback_info["MediaSources"][0]["SupportsDirectStream"], false,
+                playback_info["MediaSources"][0]["SupportsDirectStream"], true,
                 "{endpoint}"
             );
             assert_eq!(
@@ -56414,6 +57538,7 @@ done
         live_hls_session_registry().lock().await.insert(
             live_stop_session_id.to_string(),
             LiveHlsSessionEntry {
+                generation: 0,
                 play_session_id: live_stop_session_id.to_string(),
                 dedupe_key: "livetv:hls:xtream_2".to_string(),
                 channel_id: "xtream_2".to_string(),
@@ -61631,7 +62756,7 @@ done
         assert_eq!(ms["Container"], "ts");
         assert_eq!(ms["IsRemote"], true);
         assert_eq!(ms["RequiresOpening"], true);
-        assert_eq!(ms["SupportsDirectStream"], false);
+        assert_eq!(ms["SupportsDirectStream"], true);
         assert_eq!(ms["SupportsTranscoding"], true);
         assert_eq!(ms["TranscodingSubProtocol"], "hls");
         assert_eq!(ms["TranscodingContainer"], "ts");
@@ -61661,8 +62786,14 @@ done
             },
         );
         request.event_playlist = true;
-        let command = build_hls_ffmpeg_command(&request);
+        let mut command = build_hls_ffmpeg_command(&request);
+        super::apply_live_tv_remote_ffmpeg_input_options(&mut command);
         assert_eq!(command.program, "ffmpeg");
+        let input_index = command.args.iter().position(|arg| arg == "-i").unwrap();
+        assert_eq!(
+            &command.args[input_index - 2..input_index],
+            ["-user_agent", crate::LIVE_TV_REMOTE_USER_AGENT]
+        );
         // -i must point to the HTTP URL directly (no file path wrapping).
         assert!(
             command
@@ -61714,6 +62845,32 @@ done
         );
     }
 
+    #[tokio::test]
+    async fn live_tv_remote_image_rejects_invalid_payload_and_negative_caches() {
+        let (url, mut requests) =
+            spawn_http_image_response(b"<html>not an image</html>".to_vec(), "image/png", 2).await;
+
+        assert!(
+            super::fetch_channel_remote_image_payload(&url)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::fetch_channel_remote_image_payload(&url)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(requests.recv().await.is_some());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), requests.recv())
+                .await
+                .is_err(),
+            "the fresh negative cache must prevent a second upstream request"
+        );
+    }
+
     // Spec: live_tv_channel_media_source of a remote (HDHomeRun) channel includes
     // SupportsTranscoding:true, TranscodingSubProtocol:"hls", and TranscodingUrl pointing to
     // master.m3u8 (or live.m3u8) with a stable PlaySessionId embedded.
@@ -61742,13 +62899,59 @@ done
             "TranscodingUrl must include PlaySessionId: {url}"
         );
         assert_eq!(
-            ms["SupportsDirectStream"], false,
-            "remote live TV should force HLS transcode for browser-compatible audio"
+            ms["SupportsDirectStream"], true,
+            "remote live TV should expose the authenticated MPEG-TS proxy"
         );
         assert_eq!(ms["SupportsDirectPlay"], false);
         assert_eq!(ms["DefaultAudioStreamIndex"], 1);
         assert_eq!(ms["MediaStreams"][1]["Type"], "Audio");
-        assert_eq!(ms["MediaStreams"][1]["Codec"], "aac");
+        assert_eq!(ms["MediaStreams"][1]["Codec"], Value::Null);
+    }
+
+    #[test]
+    fn live_tv_direct_stream_requires_known_transport_and_profile_codecs() {
+        let hls_channel = json!({
+            "Id": "m3u-hls",
+            "Name": "Native HLS",
+            "Path": "https://example.test/live/channel.m3u8",
+        });
+        let hls_source = live_tv_channel_media_source(&hls_channel).unwrap();
+        assert_eq!(hls_source["Container"], "m3u8");
+        assert_eq!(hls_source["SupportsDirectStream"], false);
+        assert!(hls_source["DirectStreamUrl"].is_null());
+
+        let ts_channel = json!({
+            "Id": "xtream_42",
+            "Name": "Unknown codecs",
+            "Path": "https://example.test/live/user/pass/42.ts",
+        });
+        let unknown_codec_source = live_tv_channel_media_source(&ts_channel).unwrap();
+        let constrained = super::PlaybackInfoOptions {
+            direct_play_profiles: Some(vec![super::DirectPlayProfileMatcher {
+                profile_type: Some("Video".to_string()),
+                containers: vec!["ts".to_string()],
+                video_codecs: vec!["h264".to_string()],
+                audio_codecs: vec!["aac".to_string()],
+            }]),
+            ..Default::default()
+        };
+        assert!(!super::live_tv_profile_supports_direct(
+            &unknown_codec_source,
+            &constrained
+        ));
+
+        let known_codec_source = live_tv_channel_media_source(&json!({
+            "Id": "xtream_43",
+            "Name": "Known codecs",
+            "Path": "https://example.test/live/user/pass/43.ts",
+            "VideoCodec": "h264",
+            "AudioCodec": "aac",
+        }))
+        .unwrap();
+        assert!(super::live_tv_profile_supports_direct(
+            &known_codec_source,
+            &constrained
+        ));
     }
 
     // Spec: local (non-remote) channels must NOT expose SupportsTranscoding:true (no HLS for local TS).
@@ -71181,6 +72384,16 @@ done
             transcode_start_position_ticks + transcode_relative_position_ticks
         );
 
+        let (transcode_stop_tx, transcode_stop_rx) = tokio::sync::oneshot::channel();
+        transcode_stop_registry().lock().await.insert(
+            "play-session-relative-progress".to_string(),
+            super::TranscodeStopHandle {
+                generation: 0,
+                user_id: user.id,
+                device_id: None,
+                sender: transcode_stop_tx,
+            },
+        );
         let response = app
             .clone()
             .oneshot(
@@ -71196,6 +72409,8 @@ done
                             "AudioStreamIndex": 1,
                             "SubtitleStreamIndex": -1,
                             "PositionTicks": 25_000_000,
+                            "PlayMethod": "Transcode",
+                            "PlaySessionId": "play-session-relative-progress",
                             "IsPaused": false,
                         })
                         .to_string(),
@@ -71205,6 +72420,19 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        tokio::time::timeout(std::time::Duration::from_secs(1), transcode_stop_rx)
+            .await
+            .expect("stopped playback did not signal the HLS transcode")
+            .expect("HLS transcode stop sender was dropped without a signal");
+        assert_eq!(
+            test_db
+                .transcode_session_by_play_session_id("play-session-relative-progress")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopping"
+        );
         let stopped_sessions_event =
             next_playback_event_type(&mut playback_report_events, playback_token, "Sessions").await;
         assert_eq!(stopped_sessions_event["Data"][0]["Id"], playback_token);
@@ -78477,6 +79705,37 @@ done
     }
 
     #[tokio::test]
+    async fn hls_stop_signal_survives_an_unavailable_database() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let play_session_id = format!("db-unavailable-stop-{}", Uuid::new_v4().simple());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        transcode_stop_registry().lock().await.insert(
+            play_session_id.clone(),
+            super::TranscodeStopHandle {
+                generation: 0,
+                user_id: user.id,
+                device_id: None,
+                sender: stop_tx,
+            },
+        );
+
+        db.pool().close().await;
+        assert!(
+            super::stop_hls_transcode_session_for_user(&db, &play_session_id, &user, None)
+                .await
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), stop_rx)
+            .await
+            .expect("database failure delayed the transcode stop signal")
+            .expect("transcode stop sender was dropped without a signal");
+    }
+
+    #[tokio::test]
     async fn hls_transcode_task_persists_incremental_progress() {
         let media_root = tempfile::tempdir().unwrap();
         let movie = media_root.path().join("Progress.mkv");
@@ -78536,7 +79795,14 @@ done
                     .to_string(),
             ],
         );
-        spawn_hls_transcode_task(db.clone(), "play-session-progress".to_string(), command).await;
+        spawn_hls_transcode_task(
+            db.clone(),
+            "play-session-progress".to_string(),
+            user.id,
+            None,
+            command,
+        )
+        .await;
 
         let mut session = None;
         for _ in 0..100 {
@@ -78685,6 +79951,111 @@ done
     }
 
     #[tokio::test]
+    async fn xtream_direct_proxy_preserves_range_and_falls_back_from_head() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(3);
+        let server = tokio::spawn(async move {
+            for request_index in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut scratch = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut scratch).await.unwrap();
+                    assert!(read > 0, "mock client closed before sending HTTP headers");
+                    request.extend_from_slice(&scratch[..read]);
+                    if http_header_end(&request).is_some() {
+                        break;
+                    }
+                }
+                request_tx
+                    .send(String::from_utf8_lossy(&request).to_string())
+                    .await
+                    .unwrap();
+
+                let (headers, body): (&str, &[u8]) = match request_index {
+                    0 => (
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes 2-5/12\r\nAccept-Ranges: bytes\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                        b"mote",
+                    ),
+                    1 => (
+                        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        b"",
+                    ),
+                    2 => (
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes 0-0/12\r\nAccept-Ranges: bytes\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+                        b"r",
+                    ),
+                    _ => unreachable!(),
+                };
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+        let url = format!("http://{addr}/movie.ts");
+
+        let mut range_headers = HeaderMap::new();
+        range_headers.insert(header::RANGE, "bytes=2-5".parse().unwrap());
+        let range_response =
+            super::proxy_xtream_remote_media(&url, &range_headers, true, "video/mp4".to_string())
+                .await
+                .unwrap();
+        assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            range_response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 2-5/12"
+        );
+        assert_eq!(
+            range_response.headers().get(header::ACCEPT_RANGES).unwrap(),
+            "bytes"
+        );
+        let range_body = range_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(range_body.as_ref(), b"mote");
+
+        let head_response = super::proxy_xtream_remote_media(
+            &url,
+            &HeaderMap::new(),
+            false,
+            "video/mp4".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(head_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            head_response.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-0/12"
+        );
+        let head_body = head_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(head_body.is_empty());
+
+        let range_request = request_rx.recv().await.unwrap().to_ascii_lowercase();
+        let head_request = request_rx.recv().await.unwrap().to_ascii_lowercase();
+        let fallback_request = request_rx.recv().await.unwrap().to_ascii_lowercase();
+        assert!(range_request.starts_with("get /movie.ts http/1.1"));
+        assert!(range_request.contains("range: bytes=2-5"));
+        assert!(head_request.starts_with("head /movie.ts http/1.1"));
+        assert!(fallback_request.starts_with("get /movie.ts http/1.1"));
+        assert!(fallback_request.contains("range: bytes=0-0"));
+        for request in [&range_request, &head_request, &fallback_request] {
+            assert!(request.contains(&format!(
+                "user-agent: {}",
+                crate::LIVE_TV_REMOTE_USER_AGENT.to_ascii_lowercase()
+            )));
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn xtream_hls_session_input_uses_remote_source_url() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let item_id = stable_entity_id("xtream-vod", "42");
@@ -78733,6 +80104,13 @@ done
             .issue_api_key_for_user(user.id, "xtream-vod-playback-key")
             .await
             .unwrap();
+        let device_id = db
+            .find_user_by_api_key(&api_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .device_id;
         let item_id = stable_entity_id("xtream-vod", "42");
         db.replace_remote_media_library_snapshot(
             "Xtream Movies",
@@ -78775,7 +80153,10 @@ done
             audio_stream_index: None,
             subtitle_stream_index: Some(2),
         };
-        let dedupe_key = hls_transcode_dedupe_key(user.id, &item, &selection, 0);
+        let dedupe_key = hls_transcode_dedupe_key_for_device(
+            &hls_transcode_dedupe_key(user.id, &item, &selection, 0),
+            &device_id,
+        );
         let transcode_root = tempfile::tempdir().unwrap();
         let transcode_dir = transcode_root.path().join("play-session-xtream-vod");
         tokio::fs::create_dir_all(&transcode_dir).await.unwrap();
@@ -78786,7 +80167,7 @@ done
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-xtream-vod".to_string(),
             dedupe_key: Some(dedupe_key),
-            device_id: None,
+            device_id: Some(device_id),
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
@@ -78856,6 +80237,7 @@ done
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!(
@@ -78878,6 +80260,31 @@ done
             "segmentLength={}",
             jellyrin_core::DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)
         )));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/{item_id}/PlaybackInfo?EnableDirectPlay=false&EnableDirectStream=true&EnableTranscoding=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let direct_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(direct_info["MediaSources"][0]["SupportsDirectPlay"], false);
+        assert_eq!(direct_info["MediaSources"][0]["SupportsDirectStream"], true);
+        assert_eq!(direct_info["MediaSources"][0]["SupportsTranscoding"], false);
+        assert_eq!(
+            direct_info["MediaSources"][0]["DirectStreamUrl"],
+            format!(
+                "/Videos/{item_id}/stream?static=true&MediaSourceId={item_id}&api_key={api_key}"
+            )
+        );
     }
 
     #[tokio::test]
@@ -79194,6 +80601,13 @@ done
             .issue_api_key_for_user(user.id, "reuse-transcode-test-key")
             .await
             .unwrap();
+        let device_id = db
+            .find_user_by_api_key(&api_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .device_id;
         let folder = db
             .upsert_virtual_folder(
                 "Movies",
@@ -79210,12 +80624,15 @@ done
             audio_stream_index: None,
             subtitle_stream_index: None,
         };
-        let dedupe_key = hls_transcode_dedupe_key(user.id, &item, &selection, 0);
+        let dedupe_key = hls_transcode_dedupe_key_for_device(
+            &hls_transcode_dedupe_key(user.id, &item, &selection, 0),
+            &device_id,
+        );
 
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-reuse".to_string(),
             dedupe_key: Some(dedupe_key),
-            device_id: None,
+            device_id: Some(device_id),
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
@@ -79297,6 +80714,13 @@ done
             .issue_api_key_for_user(user.id, "stream-switch-test-key")
             .await
             .unwrap();
+        let device_id = db
+            .find_user_by_api_key(&api_key)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .device_id;
         let folder = db
             .upsert_virtual_folder(
                 "Movies",
@@ -79327,8 +80751,14 @@ done
             audio_stream_index: None,
             subtitle_stream_index: Some(2),
         };
-        let continuity_key = hls_transcode_dedupe_key(user.id, &item, &selection, 900);
-        let zero_key = hls_transcode_dedupe_key(user.id, &item, &selection, 0);
+        let continuity_key = hls_transcode_dedupe_key_for_device(
+            &hls_transcode_dedupe_key(user.id, &item, &selection, 900),
+            &device_id,
+        );
+        let zero_key = hls_transcode_dedupe_key_for_device(
+            &hls_transcode_dedupe_key(user.id, &item, &selection, 0),
+            &device_id,
+        );
 
         db.upsert_playback_state(UpsertPlaybackState {
             user_id: user.id,
@@ -79345,7 +80775,7 @@ done
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-continuity".to_string(),
             dedupe_key: Some(continuity_key),
-            device_id: None,
+            device_id: Some(device_id.clone()),
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
@@ -79364,7 +80794,7 @@ done
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-zero".to_string(),
             dedupe_key: Some(zero_key),
-            device_id: None,
+            device_id: Some(device_id),
             user_id: user.id,
             item_id: item.id,
             media_source_id: Some(item_id.clone()),
@@ -84146,6 +85576,7 @@ done
                 "play-session-hls-limit",
                 "Video",
                 uuid::Uuid::nil(),
+                None,
             )
             .await;
             assert!(

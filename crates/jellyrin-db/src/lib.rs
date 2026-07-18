@@ -13,7 +13,8 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use jellyrin_core::{
-    DeviceToken, MediaItem, PlaybackState, ServerState, StartupConfig, User, VirtualFolder,
+    DeviceToken, LIVE_TV_REMOTE_USER_AGENT, MediaItem, PlaybackState, ServerState, StartupConfig,
+    User, VirtualFolder,
 };
 use serde_json::{Value, json};
 use sqlx::{
@@ -30,6 +31,8 @@ const SQLITE_MAX_CONNECTIONS: u32 = 5;
 const CREDENTIAL_ACTIVITY_BUSY_TIMEOUT_MS: u64 = 100;
 const CREDENTIAL_ACTIVITY_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_SYNC_PLAY_ACCESS: &str = "CreateAndJoinGroups";
+const REMOTE_MEDIA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const REMOTE_MEDIA_PROBE_READ_TIMEOUT_US: &str = "2500000";
 
 #[derive(Clone)]
 pub struct Database {
@@ -975,6 +978,29 @@ impl Database {
         builder.push_bind(channel_id.trim().to_string());
         let row = builder.build().fetch_optional(&self.pool).await?;
         row.map(live_tv_channel_record_from_row).transpose()
+    }
+
+    /// Return only the enabled channel identifiers.
+    ///
+    /// Compatibility clients address Live TV channels through a deterministic
+    /// public UUID, while providers persist their native identifier.  The API
+    /// builds a small UUID-to-native-id index from this projection.  Keeping
+    /// this query separate avoids loading and parsing every channel's metadata,
+    /// stream URL and logo for each UUID lookup.
+    pub async fn live_tv_channel_ids(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT channel_id
+            FROM live_tv_channels
+            WHERE enabled = 1
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("channel_id"))
+            .collect())
     }
 
     pub async fn live_tv_categories(&self) -> anyhow::Result<Vec<LiveTvCategoryRecord>> {
@@ -5049,25 +5075,27 @@ impl Database {
     }
 
     /// Update a media item's metadata_json by string ID (used for image tag population).
+    ///
+    /// Image-tag backfills are not library-content updates, so they deliberately
+    /// leave `updated_at` untouched.  Updating that timestamp made old items jump
+    /// to the front of "latest" views every time image metadata was repaired.
     pub async fn update_media_item_metadata_json(
         &self,
         item_id: &str,
         metadata: &Value,
     ) -> anyhow::Result<()> {
         let metadata_json = serde_json::to_string(metadata)?;
-        let result = sqlx::query(
+        sqlx::query(
             r#"
             UPDATE media_items
-            SET metadata_json = ?2, updated_at = ?3
-            WHERE id = ?1
+            SET metadata_json = ?2
+            WHERE id = ?1 AND metadata_json != ?2
             "#,
         )
         .bind(item_id)
         .bind(metadata_json)
-        .bind(format_time(OffsetDateTime::now_utc())?)
         .execute(&self.pool)
         .await?;
-        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
         Ok(())
     }
 
@@ -5081,6 +5109,13 @@ impl Database {
             FROM media_items
             WHERE missing_since IS NULL
               AND media_type IN ('Video', 'Audio', 'Photo', 'Book')
+              AND NULLIF(
+                    TRIM(CAST(json_extract(
+                        CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,
+                        '$.PrimaryImageTag'
+                    ) AS TEXT)),
+                    ''
+                  ) IS NULL
             "#,
         )
         .fetch_all(&self.pool)
@@ -5088,6 +5123,39 @@ impl Database {
         .into_iter()
         .map(|row| row.into())
         .collect())
+    }
+
+    /// Remove stale image tags that were inferred from an Xtream media URL even though the
+    /// item has no artwork URL.  The media stream itself is not a cover and advertising it as
+    /// one makes Android clients repeatedly request an image that can never be served.
+    pub async fn remove_invalid_xtream_primary_image_tags(&self) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET metadata_json = json_remove(
+                metadata_json,
+                '$.PrimaryImageTag',
+                '$.ImageTags.Primary',
+                '$.SeriesPrimaryImageTag',
+                '$.SeriesImageTags.Primary'
+            )
+            WHERE json_valid(metadata_json)
+              AND LOWER(COALESCE(json_extract(metadata_json, '$.Provider'), '')) = 'xtream'
+              AND NULLIF(TRIM(CAST(json_extract(metadata_json, '$.PrimaryImageTag') AS TEXT)), '')
+                    IS NOT NULL
+              AND COALESCE(
+                    NULLIF(TRIM(CAST(json_extract(metadata_json, '$.PrimaryImageUrl') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(metadata_json, '$.SeriesPrimaryImageUrl') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(metadata_json, '$.ImageUrl') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(metadata_json, '$.SeriesImageUrl') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(metadata_json, '$.PrimaryImagePath') AS TEXT)), ''),
+                    NULLIF(TRIM(CAST(json_extract(metadata_json, '$.SeriesPrimaryImagePath') AS TEXT)), '')
+                  ) IS NULL
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn media_item_metadata(&self) -> anyhow::Result<Vec<MediaItemMetadata>> {
@@ -7829,18 +7897,34 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<()> {
 }
 
 async fn probe_media_info(path: &Path, media_type: &str) -> MediaInfo {
-    probe_media_info_input(path.as_os_str(), media_type, &[]).await
+    probe_media_info_input(path.as_os_str(), media_type, &[], None).await
 }
 
 pub async fn probe_remote_media_info(url: &str, media_type: &str) -> MediaInfo {
-    const REMOTE_PROBE_TIMEOUT_US: &str = "15000000";
-    probe_media_info_input(url, media_type, &["-rw_timeout", REMOTE_PROBE_TIMEOUT_US]).await
+    let input_args = remote_media_probe_input_args();
+    probe_media_info_input(
+        url,
+        media_type,
+        &input_args,
+        Some(REMOTE_MEDIA_PROBE_TIMEOUT),
+    )
+    .await
+}
+
+fn remote_media_probe_input_args() -> [&'static str; 4] {
+    [
+        "-rw_timeout",
+        REMOTE_MEDIA_PROBE_READ_TIMEOUT_US,
+        "-user_agent",
+        LIVE_TV_REMOTE_USER_AGENT,
+    ]
 }
 
 async fn probe_media_info_input(
     input: impl AsRef<OsStr>,
     media_type: &str,
     input_args: &[&str],
+    timeout: Option<std::time::Duration>,
 ) -> MediaInfo {
     if !matches!(media_type, "Video" | "Audio") {
         return MediaInfo::default();
@@ -7848,6 +7932,9 @@ async fn probe_media_info_input(
 
     let mut command = Command::new("ffprobe");
     command
+        // When the remote probe exceeds its global deadline, dropping the output future also
+        // terminates ffprobe instead of leaving a detached process consuming a provider stream.
+        .kill_on_drop(true)
         .arg("-v")
         .arg("error")
         .arg("-print_format")
@@ -7860,7 +7947,14 @@ async fn probe_media_info_input(
     }
     command.arg(input);
 
-    let Ok(output) = command.output().await else {
+    let output = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, command.output())
+            .await
+            .ok()
+            .and_then(Result::ok),
+        None => command.output().await.ok(),
+    };
+    let Some(output) = output else {
         return MediaInfo::default();
     };
     if !output.status.success() {
@@ -10569,6 +10663,145 @@ mod tests {
         assert_eq!(updated.width, Some(1920));
         assert_eq!(updated.height, Some(1080));
         assert_eq!(updated.media_streams[0]["Codec"], "h264");
+    }
+
+    #[tokio::test]
+    async fn invalid_xtream_image_tag_cleanup_preserves_real_artwork_and_timestamps() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let folder = db
+            .upsert_virtual_folder(
+                "Xtream Movies",
+                Some("movies"),
+                vec!["xtream://movies".to_string()],
+            )
+            .await
+            .unwrap();
+        let updated_at = "2026-01-02T03:04:05Z";
+        let fixtures = [
+            (
+                "00000000-0000-0000-0000-000000000001",
+                json!({
+                    "Provider": "XtReAm",
+                    "RemoteSourceUrl": "https://provider.invalid/movie/1.mp4",
+                    "PrimaryImageTag": "stale-primary",
+                    "ImageTags": {
+                        "Primary": "stale-primary",
+                        "Backdrop": "keep-backdrop"
+                    },
+                    "SeriesPrimaryImageTag": "stale-series",
+                    "SeriesImageTags": {
+                        "Primary": "stale-series",
+                        "Backdrop": "keep-series-backdrop"
+                    },
+                    "Overview": "keep metadata"
+                }),
+            ),
+            (
+                "00000000-0000-0000-0000-000000000002",
+                json!({
+                    "Provider": "xtream",
+                    "PrimaryImageTag": "real-primary",
+                    "ImageTags": { "Primary": "real-primary" },
+                    "PrimaryImageUrl": "https://images.invalid/poster.jpg"
+                }),
+            ),
+            (
+                "00000000-0000-0000-0000-000000000003",
+                json!({
+                    "Provider": "xtream",
+                    "PrimaryImageTag": "real-series-primary",
+                    "SeriesPrimaryImageTag": "real-series-primary",
+                    "SeriesPrimaryImagePath": "/metadata/series/poster.jpg"
+                }),
+            ),
+            (
+                "00000000-0000-0000-0000-000000000004",
+                json!({
+                    "Provider": "local",
+                    "PrimaryImageTag": "non-xtream-primary",
+                    "ImageTags": { "Primary": "non-xtream-primary" }
+                }),
+            ),
+        ];
+
+        for (id, metadata) in &fixtures {
+            sqlx::query(
+                r#"
+                INSERT INTO media_items (
+                    id, virtual_folder_id, name, path, media_type, collection_type,
+                    created_at, updated_at, metadata_json
+                )
+                VALUES (?1, ?2, ?1, ?3, 'Video', 'movies', ?4, ?4, ?5)
+                "#,
+            )
+            .bind(id)
+            .bind(folder.id.to_string())
+            .bind(format!("xtream://movies/{id}"))
+            .bind(updated_at)
+            .bind(metadata.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.remove_invalid_xtream_primary_image_tags().await.unwrap(),
+            1
+        );
+
+        let cleaned: String =
+            sqlx::query_scalar("SELECT metadata_json FROM media_items WHERE id = ?1")
+                .bind(fixtures[0].0)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let cleaned: serde_json::Value = serde_json::from_str(&cleaned).unwrap();
+        assert!(cleaned.get("PrimaryImageTag").is_none());
+        assert!(cleaned["ImageTags"].get("Primary").is_none());
+        assert!(cleaned.get("SeriesPrimaryImageTag").is_none());
+        assert!(cleaned["SeriesImageTags"].get("Primary").is_none());
+        assert_eq!(cleaned["ImageTags"]["Backdrop"], "keep-backdrop");
+        assert_eq!(
+            cleaned["SeriesImageTags"]["Backdrop"],
+            "keep-series-backdrop"
+        );
+        assert_eq!(cleaned["Overview"], "keep metadata");
+
+        for (id, expected_metadata) in &fixtures[1..] {
+            let actual: String =
+                sqlx::query_scalar("SELECT metadata_json FROM media_items WHERE id = ?1")
+                    .bind(id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actual).unwrap(),
+                *expected_metadata
+            );
+        }
+        let timestamps: Vec<String> =
+            sqlx::query_scalar("SELECT updated_at FROM media_items ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(timestamps, vec![updated_at; fixtures.len()]);
+    }
+
+    #[test]
+    fn remote_media_probe_has_a_bounded_deadline_and_provider_user_agent() {
+        assert!(
+            super::REMOTE_MEDIA_PROBE_TIMEOUT <= std::time::Duration::from_secs(10),
+            "remote ffprobe must finish before Android playback requests time out"
+        );
+        assert_eq!(
+            super::remote_media_probe_input_args(),
+            [
+                "-rw_timeout",
+                super::REMOTE_MEDIA_PROBE_READ_TIMEOUT_US,
+                "-user_agent",
+                jellyrin_core::LIVE_TV_REMOTE_USER_AGENT,
+            ]
+        );
     }
 
     #[test]
