@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     ffi::OsStr,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use anyhow::Context;
@@ -24,11 +27,16 @@ use uuid::Uuid;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const SQLITE_MAX_CONNECTIONS: u32 = 5;
+const CREDENTIAL_ACTIVITY_BUSY_TIMEOUT_MS: u64 = 100;
+const CREDENTIAL_ACTIVITY_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_SYNC_PLAY_ACCESS: &str = "CreateAndJoinGroups";
 
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+    credential_activity_pool: Option<SqlitePool>,
+    credential_activity_touches: Arc<Mutex<HashMap<u64, Instant>>>,
+    credential_activity_writer: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -503,9 +511,17 @@ impl Database {
             .with_context(|| format!("failed to parse SQLite database URL at {database_url}"))?
             .busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
             .foreign_keys(true);
-        if should_enable_wal(database_url) {
+        let enable_wal = should_enable_wal(database_url);
+        if enable_wal {
             options = options.journal_mode(SqliteJournalMode::Wal);
         }
+        let credential_activity_options = enable_wal.then(|| {
+            options
+                .clone()
+                .busy_timeout(std::time::Duration::from_millis(
+                    CREDENTIAL_ACTIVITY_BUSY_TIMEOUT_MS,
+                ))
+        });
 
         let pool = SqlitePoolOptions::new()
             .max_connections(SQLITE_MAX_CONNECTIONS)
@@ -521,7 +537,28 @@ impl Database {
             .await
             .context("failed to run migrations")?;
 
-        Ok(Self { pool })
+        let credential_activity_pool = if let Some(options) = credential_activity_options {
+            Some(
+                SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect_with(options)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to connect SQLite credential activity pool at {database_url}"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            pool,
+            credential_activity_pool,
+            credential_activity_touches: Arc::new(Mutex::new(HashMap::new())),
+            credential_activity_writer: Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -2774,8 +2811,11 @@ impl Database {
         verify_password(password, &password_hash)
     }
 
-    pub async fn user_by_token(&self, token: &str) -> anyhow::Result<(User, DeviceToken)> {
-        let token_row = sqlx::query_as::<_, DeviceTokenRow>(
+    pub async fn find_user_by_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<(User, DeviceToken)>> {
+        let Some(token_row) = sqlx::query_as::<_, DeviceTokenRow>(
             r#"
             SELECT access_token, user_id, device_id, device_name, client, version
             FROM devices
@@ -2785,16 +2825,27 @@ impl Database {
         .bind(token)
         .fetch_optional(&self.pool)
         .await?
-        .context("invalid token")?;
+        else {
+            return Ok(None);
+        };
 
         let token: DeviceToken = token_row.try_into()?;
-        self.touch_device_token(&token.access_token).await?;
         let user = self.user_by_id(token.user_id).await?;
-        Ok((user, token))
+        self.schedule_device_token_touch(&token.access_token);
+        Ok(Some((user, token)))
     }
 
-    pub async fn user_by_api_key(&self, api_key: &str) -> anyhow::Result<(User, DeviceToken)> {
-        let row = sqlx::query_as::<_, ApiKeyRow>(
+    pub async fn user_by_token(&self, token: &str) -> anyhow::Result<(User, DeviceToken)> {
+        self.find_user_by_token(token)
+            .await?
+            .context("invalid token")
+    }
+
+    pub async fn find_user_by_api_key(
+        &self,
+        api_key: &str,
+    ) -> anyhow::Result<Option<(User, DeviceToken)>> {
+        let Some(row) = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             SELECT access_token, user_id, name
             FROM api_keys
@@ -2804,26 +2855,28 @@ impl Database {
         .bind(api_key)
         .fetch_optional(&self.pool)
         .await?
-        .context("invalid api key")?;
+        else {
+            return Ok(None);
+        };
 
-        sqlx::query("UPDATE api_keys SET last_activity_at = ?1 WHERE access_token = ?2")
-            .bind(format_time(OffsetDateTime::now_utc())?)
-            .bind(api_key)
-            .execute(&self.pool)
-            .await?;
+        let user_id = Uuid::parse_str(&row.user_id)?;
+        let user = self.user_by_id(user_id).await?;
+        let token = DeviceToken {
+            access_token: row.access_token,
+            user_id,
+            device_id: format!("api-key:{}", row.name),
+            device_name: row.name,
+            client: "API Key".to_string(),
+            version: "dev".to_string(),
+        };
+        self.schedule_api_key_touch(&token.access_token);
+        Ok(Some((user, token)))
+    }
 
-        let user = self.user_by_id(Uuid::parse_str(&row.user_id)?).await?;
-        Ok((
-            user,
-            DeviceToken {
-                access_token: row.access_token,
-                user_id: Uuid::parse_str(&row.user_id)?,
-                device_id: format!("api-key:{}", row.name),
-                device_name: row.name,
-                client: "API Key".to_string(),
-                version: "dev".to_string(),
-            },
-        ))
+    pub async fn user_by_api_key(&self, api_key: &str) -> anyhow::Result<(User, DeviceToken)> {
+        self.find_user_by_api_key(api_key)
+            .await?
+            .context("invalid api key")
     }
 
     pub async fn issue_api_key_for_user(
@@ -6017,6 +6070,12 @@ impl Database {
     }
 
     pub async fn user_by_id(&self, user_id: Uuid) -> anyhow::Result<User> {
+        self.optional_user_by_id(user_id)
+            .await?
+            .context("user not found")
+    }
+
+    pub async fn optional_user_by_id(&self, user_id: Uuid) -> anyhow::Result<Option<User>> {
         let row = sqlx::query_as::<_, UserRow>(
             r#"
             SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
@@ -6026,10 +6085,9 @@ impl Database {
         )
         .bind(user_id.to_string())
         .fetch_optional(&self.pool)
-        .await?
-        .context("user not found")?;
+        .await?;
 
-        row.try_into()
+        row.map(TryInto::try_into).transpose()
     }
 
     async fn activity_log_entry_by_rowid(&self, rowid: i64) -> anyhow::Result<ActivityLogEntry> {
@@ -6047,11 +6105,89 @@ impl Database {
         row.try_into()
     }
 
-    async fn touch_device_token(&self, token: &str) -> anyhow::Result<()> {
+    fn reserve_credential_activity_touch(&self, kind: &str, token: &str) -> bool {
+        let now = Instant::now();
+        let mut recent_touches = self
+            .credential_activity_touches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        recent_touches.retain(|_, touched_at| {
+            now.saturating_duration_since(*touched_at) < CREDENTIAL_ACTIVITY_TOUCH_INTERVAL
+        });
+
+        let mut hasher = DefaultHasher::new();
+        kind.hash(&mut hasher);
+        token.hash(&mut hasher);
+        let key = hasher.finish();
+        if recent_touches.contains_key(&key) {
+            return false;
+        }
+        recent_touches.insert(key, now);
+        true
+    }
+
+    fn schedule_device_token_touch(&self, token: &str) {
+        let Some(activity_pool) = self.credential_activity_pool.clone() else {
+            return;
+        };
+        let Ok(writer_guard) = self.credential_activity_writer.clone().try_lock_owned() else {
+            return;
+        };
+        if !self.reserve_credential_activity_touch("device", token) {
+            return;
+        }
+
+        let token = token.to_string();
+        tokio::spawn(async move {
+            let _writer_guard = writer_guard;
+            if let Err(error) = Self::touch_device_token(&activity_pool, &token).await {
+                tracing::warn!(
+                    error = %error,
+                    credential_kind = "device",
+                    "failed to update credential activity"
+                );
+            }
+        });
+    }
+
+    fn schedule_api_key_touch(&self, api_key: &str) {
+        let Some(activity_pool) = self.credential_activity_pool.clone() else {
+            return;
+        };
+        let Ok(writer_guard) = self.credential_activity_writer.clone().try_lock_owned() else {
+            return;
+        };
+        if !self.reserve_credential_activity_touch("api-key", api_key) {
+            return;
+        }
+
+        let api_key = api_key.to_string();
+        tokio::spawn(async move {
+            let _writer_guard = writer_guard;
+            if let Err(error) = Self::touch_api_key(&activity_pool, &api_key).await {
+                tracing::warn!(
+                    error = %error,
+                    credential_kind = "api-key",
+                    "failed to update credential activity"
+                );
+            }
+        });
+    }
+
+    async fn touch_device_token(pool: &SqlitePool, token: &str) -> anyhow::Result<()> {
         sqlx::query("UPDATE devices SET last_activity_at = ?1 WHERE access_token = ?2")
             .bind(format_time(OffsetDateTime::now_utc())?)
             .bind(token)
-            .execute(&self.pool)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn touch_api_key(pool: &SqlitePool, api_key: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE api_keys SET last_activity_at = ?1 WHERE access_token = ?2")
+            .bind(format_time(OffsetDateTime::now_utc())?)
+            .bind(api_key)
+            .execute(pool)
             .await?;
         Ok(())
     }
@@ -9302,6 +9438,101 @@ mod tests {
 
         db.revoke_token(&token.access_token).await.unwrap();
         assert!(db.user_by_token(&token.access_token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn credential_activity_touch_runs_on_the_dedicated_pool() {
+        let storage_root = tempfile::tempdir().unwrap();
+        let database_path = storage_root.path().join("credential-activity.sqlite");
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.to_string_lossy());
+        let db = Database::connect(&database_url).await.unwrap();
+        let user = db
+            .update_first_user("activity-user".to_string(), "secret")
+            .await
+            .unwrap();
+        let (_, token) = db
+            .issue_device_token_for_user(
+                user.id,
+                "activity-device",
+                "Android",
+                "Jellyfin Android",
+                "2.6.3",
+            )
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "activity-api-key")
+            .await
+            .unwrap();
+        let stale_activity = "2000-01-01T00:00:00Z";
+        sqlx::query("UPDATE devices SET last_activity_at = ?1 WHERE access_token = ?2")
+            .bind(stale_activity)
+            .bind(&token.access_token)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_keys SET last_activity_at = ?1 WHERE access_token = ?2")
+            .bind(stale_activity)
+            .bind(&api_key)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(
+            db.find_user_by_token(&token.access_token)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "credential lookup waited for its activity update"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let last_activity: String =
+                sqlx::query_scalar("SELECT last_activity_at FROM devices WHERE access_token = ?1")
+                    .bind(&token.access_token)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            if last_activity != stale_activity {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "credential activity update did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let started = std::time::Instant::now();
+        assert!(db.find_user_by_api_key(&api_key).await.unwrap().is_some());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "API key lookup waited for its activity update"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let last_activity: String =
+                sqlx::query_scalar("SELECT last_activity_at FROM api_keys WHERE access_token = ?1")
+                    .bind(&api_key)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            if last_activity != stale_activity {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "API key activity update did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

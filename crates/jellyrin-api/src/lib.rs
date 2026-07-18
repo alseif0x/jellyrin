@@ -23,7 +23,7 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::{Body, to_bytes},
     extract::ws::{Message, WebSocket, WebSocketUpgrade, rejection::WebSocketUpgradeRejection},
     extract::{Path, Query, RawQuery, State},
@@ -83,6 +83,8 @@ use uuid::Uuid;
 
 const COMPATIBLE_SERVER_VERSION: &str = "12.0.0";
 const COMPATIBLE_PRODUCT_NAME: &str = "Jellyfin Server";
+const CAST_RECEIVER_STABLE_ID: &str = "F007D354";
+const CAST_RECEIVER_UNSTABLE_ID: &str = "6F511C87";
 const DEFAULT_AUTHENTICATION_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider";
 const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
@@ -347,6 +349,55 @@ struct AuthFailureState {
     locked_until_epoch: Option<u64>,
 }
 
+#[derive(Debug, Default)]
+struct ActiveSessionRegistry {
+    connections: StdMutex<HashMap<String, usize>>,
+}
+
+impl ActiveSessionRegistry {
+    fn connect(self: &Arc<Self>, session_id: String) -> ActiveSessionConnection {
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *connections.entry(session_id.clone()).or_default() += 1;
+        ActiveSessionConnection {
+            registry: Arc::clone(self),
+            session_id,
+        }
+    }
+
+    fn is_active(&self, session_id: &str) -> bool {
+        self.connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .is_some_and(|connections| *connections > 0)
+    }
+}
+
+struct ActiveSessionConnection {
+    registry: Arc<ActiveSessionRegistry>,
+    session_id: String,
+}
+
+impl Drop for ActiveSessionConnection {
+    fn drop(&mut self) {
+        let mut connections = self
+            .registry
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = connections.get_mut(&self.session_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            connections.remove(&self.session_id);
+        }
+    }
+}
+
 // Entry for an active live TV HLS transcode session. Stored in LIVE_HLS_SESSIONS keyed
 // by play_session_id. Lifecycle mirrors VOD TranscodeSession without the DB media_item JOIN.
 #[derive(Debug, Clone)]
@@ -366,6 +417,7 @@ struct LiveHlsSessionEntry {
 
 pub fn router(state: AppState) -> Router {
     let web_dir = state.web_dir.clone();
+    let active_sessions = Arc::new(ActiveSessionRegistry::default());
 
     Router::new()
         .route("/", get(|| async { Redirect::temporary("/web/") }))
@@ -3512,6 +3564,7 @@ pub fn router(state: AppState) -> Router {
                         .latency_unit(LatencyUnit::Millis),
                 ),
         )
+        .layer(Extension(active_sessions))
         .with_state(state)
 }
 
@@ -4121,7 +4174,16 @@ async fn system_info(
         "CachePath": data_root,
         "CanLaunchWebBrowser": false,
         "CanSelfRestart": false,
-        "CastReceiverApplications": [],
+        "CastReceiverApplications": [
+            {
+                "Id": CAST_RECEIVER_STABLE_ID,
+                "Name": "Stable"
+            },
+            {
+                "Id": CAST_RECEIVER_UNSTABLE_ID,
+                "Name": "Unstable"
+            }
+        ],
         "CompletedInstallations": [],
         "EncoderLocation": "System",
         "HasPendingRestart": false,
@@ -6372,11 +6434,8 @@ async fn update_user_configuration_for_id(
         None => auth_user.id,
     };
     ensure_user_access(&auth_user, user_id)?;
-    let current = state
-        .db
-        .user_configuration(user_id)
-        .await?
-        .unwrap_or_else(default_user_configuration);
+    let current = state.db.user_configuration(user_id).await?;
+    let current = user_configuration_with_defaults(current)?;
     let merged = merge_user_configuration(current, payload)?;
     state.db.update_user_configuration(user_id, merged).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -6417,8 +6476,38 @@ fn default_user_configuration() -> serde_json::Value {
         "HidePlayedInLatest": true,
         "RememberAudioSelections": true,
         "RememberSubtitleSelections": true,
-        "EnableNextEpisodeAutoPlay": true
+        "EnableNextEpisodeAutoPlay": true,
+        "CastReceiverId": CAST_RECEIVER_STABLE_ID
     })
+}
+
+fn user_configuration_with_defaults(
+    stored: Option<serde_json::Value>,
+) -> Result<serde_json::Value, ApiError> {
+    let serde_json::Value::Object(mut defaults) = default_user_configuration() else {
+        unreachable!("default user configuration must be an object");
+    };
+    match stored {
+        Some(serde_json::Value::Object(stored)) => defaults.extend(stored),
+        Some(_) => return Err(ApiError::internal("Stored user configuration is invalid")),
+        None => {}
+    }
+    let receiver_is_supported = defaults
+        .get("CastReceiverId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|receiver_id| {
+            matches!(
+                receiver_id,
+                CAST_RECEIVER_STABLE_ID | CAST_RECEIVER_UNSTABLE_ID
+            )
+        });
+    if !receiver_is_supported {
+        defaults.insert(
+            "CastReceiverId".to_string(),
+            serde_json::Value::String(CAST_RECEIVER_STABLE_ID.to_string()),
+        );
+    }
+    Ok(serde_json::Value::Object(defaults))
 }
 
 async fn logout(
@@ -6583,7 +6672,11 @@ fn default_session_capabilities() -> serde_json::Value {
         "PlayableMediaTypes": [],
         "SupportedCommands": [],
         "SupportsRemoteControl": false,
-        "SupportsMediaControl": false
+        "SupportsMediaControl": false,
+        "SupportsPersistentIdentifier": true,
+        "DeviceProfile": null,
+        "AppStoreUrl": null,
+        "IconUrl": null
     })
 }
 
@@ -7229,21 +7322,78 @@ async fn record_activity(
     Ok(())
 }
 
-async fn session_sessions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(session_list_json(&state.db, &user).await?))
+#[derive(Debug, Default, Deserialize)]
+struct SessionsQuery {
+    #[serde(flatten)]
+    auth: AuthQuery,
+    #[serde(alias = "ControllableByUserId", alias = "controllableByUserId")]
+    controllable_by_user_id: Option<String>,
+    #[serde(alias = "DeviceId", alias = "deviceId")]
+    device_id: Option<String>,
+    #[serde(alias = "ActiveWithinSeconds", alias = "activeWithinSeconds")]
+    active_within_seconds: Option<i64>,
 }
 
-async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json::Value>, ApiError> {
-    let sessions = if user.is_administrator {
+async fn session_sessions(
+    State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
+    headers: HeaderMap,
+    Query(query): Query<SessionsQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    if let Some(controllable_by_user_id) = query.controllable_by_user_id.as_deref() {
+        let controllable_by_user_id = resolve_user_id(controllable_by_user_id)?;
+        ensure_user_access(&user, controllable_by_user_id)?;
+        if state
+            .db
+            .optional_user_by_id(controllable_by_user_id)
+            .await?
+            .is_none()
+        {
+            return Err(ApiError::not_found("User not found"));
+        }
+    }
+    Ok(Json(
+        session_list_json(&state.db, &user, Some(&active_sessions), Some(&query)).await?,
+    ))
+}
+
+async fn session_list_json(
+    db: &Database,
+    user: &User,
+    active_sessions: Option<&ActiveSessionRegistry>,
+    query: Option<&SessionsQuery>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut sessions = if user.is_administrator {
         db.device_sessions().await?
     } else {
         db.device_sessions_for_user(user.id).await?
     };
+    if let Some(query) = query {
+        if let Some(device_id) = query
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|device_id| !device_id.is_empty())
+        {
+            sessions.retain(|session| session.device_id.eq_ignore_ascii_case(device_id));
+        }
+        if let Some(active_within_seconds) = query.active_within_seconds.filter(|value| *value > 0)
+        {
+            let active_after = OffsetDateTime::now_utc()
+                .checked_sub(Duration::seconds(active_within_seconds))
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+            sessions.retain(|session| session.last_activity_at >= active_after);
+        }
+        if query.controllable_by_user_id.is_some() {
+            sessions.retain(|session| {
+                active_sessions.is_some_and(|registry| {
+                    registry.is_active(&session.access_token)
+                        && capability_bool(session.capabilities.as_ref(), "SupportsMediaControl")
+                })
+            });
+        }
+    }
     let active_playback = db
         .active_playback_sessions()
         .await?
@@ -7276,6 +7426,7 @@ async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json:
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
                 &server_id,
+                active_sessions.is_some_and(|registry| registry.is_active(&session.access_token)),
             )
         })
         .collect::<Vec<serde_json::Value>>())
@@ -12777,29 +12928,32 @@ struct PlaybackReportBody {
 
 async fn report_playback_start(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Json(payload): Json<PlaybackReportBody>,
 ) -> Result<StatusCode, ApiError> {
-    report_playback(state, headers, query, payload, true).await
+    report_playback(state, &active_sessions, headers, query, payload, true).await
 }
 
 async fn report_playback_progress(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Json(payload): Json<PlaybackReportBody>,
 ) -> Result<StatusCode, ApiError> {
-    report_playback(state, headers, query, payload, true).await
+    report_playback(state, &active_sessions, headers, query, payload, true).await
 }
 
 async fn report_playback_stopped(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     Json(payload): Json<PlaybackReportBody>,
 ) -> Result<StatusCode, ApiError> {
-    report_playback(state, headers, query, payload, false).await
+    report_playback(state, &active_sessions, headers, query, payload, false).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -12871,62 +13025,116 @@ impl PathPlaybackReportQuery {
 
 async fn report_path_playback_start(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<PathPlaybackReportQuery>,
     Path(item_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let payload = query.playback_body(item_id);
-    report_playback(state, headers, query.auth_query(), payload, true).await
+    report_playback(
+        state,
+        &active_sessions,
+        headers,
+        query.auth_query(),
+        payload,
+        true,
+    )
+    .await
 }
 
 async fn report_path_playback_start_legacy(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<PathPlaybackReportQuery>,
     Path((_user_id, item_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let payload = query.playback_body(item_id);
-    report_playback(state, headers, query.auth_query(), payload, true).await
+    report_playback(
+        state,
+        &active_sessions,
+        headers,
+        query.auth_query(),
+        payload,
+        true,
+    )
+    .await
 }
 
 async fn report_path_playback_progress(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<PathPlaybackReportQuery>,
     Path(item_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let payload = query.playback_body(item_id);
-    report_playback(state, headers, query.auth_query(), payload, true).await
+    report_playback(
+        state,
+        &active_sessions,
+        headers,
+        query.auth_query(),
+        payload,
+        true,
+    )
+    .await
 }
 
 async fn report_path_playback_progress_legacy(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<PathPlaybackReportQuery>,
     Path((_user_id, item_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let payload = query.playback_body(item_id);
-    report_playback(state, headers, query.auth_query(), payload, true).await
+    report_playback(
+        state,
+        &active_sessions,
+        headers,
+        query.auth_query(),
+        payload,
+        true,
+    )
+    .await
 }
 
 async fn report_path_playback_stopped(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<PathPlaybackReportQuery>,
     Path(item_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let payload = query.playback_body(item_id);
-    report_playback(state, headers, query.auth_query(), payload, false).await
+    report_playback(
+        state,
+        &active_sessions,
+        headers,
+        query.auth_query(),
+        payload,
+        false,
+    )
+    .await
 }
 
 async fn report_path_playback_stopped_legacy(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<PathPlaybackReportQuery>,
     Path((_user_id, item_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let payload = query.playback_body(item_id);
-    report_playback(state, headers, query.auth_query(), payload, false).await
+    report_playback(
+        state,
+        &active_sessions,
+        headers,
+        query.auth_query(),
+        payload,
+        false,
+    )
+    .await
 }
 
 async fn ping_playback_session(
@@ -12940,6 +13148,7 @@ async fn ping_playback_session(
 
 async fn report_playback(
     state: AppState,
+    active_sessions: &ActiveSessionRegistry,
     headers: HeaderMap,
     query: AuthQuery,
     payload: PlaybackReportBody,
@@ -12964,7 +13173,7 @@ async fn report_playback(
                 .clear_active_playback_session(&token.access_token)
                 .await?;
         }
-        broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
+        broadcast_sessions_message(&state.db, active_sessions, &token.access_token, &user).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
     let item = media_item_by_id(&state.db, &payload.item_id).await?;
@@ -13017,7 +13226,7 @@ async fn report_playback(
             .clear_active_playback_session(&token.access_token)
             .await?;
     }
-    broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
+    broadcast_sessions_message(&state.db, active_sessions, &token.access_token, &user).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13099,6 +13308,7 @@ struct SendPlayCommandQuery {
 
 async fn send_play_command(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
@@ -13121,7 +13331,7 @@ async fn send_play_command(
     let item_ids = parse_play_command_item_ids(query.item_ids.as_deref())?;
     let start_index = query.start_index.unwrap_or_default();
 
-    let (selected_item, event_item_ids, event_play_command) =
+    let (selected_item, selected_live_tv, event_item_ids, event_play_command) =
         match play_command.to_ascii_lowercase().as_str() {
             "playinstantmix" => {
                 let mix_items = audio_instant_mix_items(&state.db, &item_ids[0]).await?;
@@ -13131,15 +13341,29 @@ async fn send_play_command(
                     .take(200)
                     .map(|item| item.id.simple().to_string())
                     .collect::<Vec<_>>();
-                (selected_item, event_item_ids, "PlayNow")
+                (selected_item, false, event_item_ids, "PlayNow")
             }
             "playnow" | "playnext" | "playlast" | "playshuffle" => {
                 let selected_id = item_ids
                     .get(start_index)
                     .or_else(|| item_ids.first())
                     .ok_or_else(|| ApiError::bad_request("ItemIds is required"))?;
+                let selected_live_tv = match live_tv_channel_by_id(&state.db, selected_id).await {
+                    Ok(_) => true,
+                    Err(error) if error.status == StatusCode::NOT_FOUND => {
+                        live_tv_channel_json_for_playable_item(&state.db, selected_id)
+                            .await?
+                            .is_some()
+                    }
+                    Err(error) => return Err(error),
+                };
                 (
-                    Some(media_item_by_id(&state.db, selected_id).await?),
+                    if selected_live_tv {
+                        None
+                    } else {
+                        Some(media_item_by_id(&state.db, selected_id).await?)
+                    },
+                    selected_live_tv,
                     item_ids.clone(),
                     canonical_play_command(play_command),
                 )
@@ -13147,6 +13371,7 @@ async fn send_play_command(
             _ => return Err(ApiError::bad_request("Unsupported PlayCommand")),
         };
 
+    let should_broadcast_play = selected_live_tv || selected_item.is_some();
     if let Some(item) = selected_item {
         let media_source_id = query
             .media_source_id
@@ -13165,6 +13390,13 @@ async fn send_play_command(
                 is_paused: false,
             })
             .await?;
+    } else {
+        state
+            .db
+            .clear_active_playback_session(&target_session.access_token)
+            .await?;
+    }
+    if should_broadcast_play {
         broadcast_session_message(
             &target_session.access_token,
             serde_json::json!({
@@ -13180,13 +13412,14 @@ async fn send_play_command(
                 }
             }),
         );
-    } else {
-        state
-            .db
-            .clear_active_playback_session(&target_session.access_token)
-            .await?;
     }
-    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
+    broadcast_sessions_message(
+        &state.db,
+        &active_sessions,
+        &target_session.access_token,
+        &auth_user,
+    )
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -13248,6 +13481,7 @@ struct SendPlaystateCommandQuery {
 
 async fn send_playstate_command(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
@@ -13315,7 +13549,13 @@ async fn send_playstate_command(
             }
         }),
     );
-    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
+    broadcast_sessions_message(
+        &state.db,
+        &active_sessions,
+        &target_session.access_token,
+        &auth_user,
+    )
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -13338,6 +13578,7 @@ async fn command_target_session(
 
 async fn send_general_command(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path((session_id, command)): Path<(String, String)>,
@@ -13353,8 +13594,15 @@ async fn send_general_command(
         .cloned()
         .unwrap_or_default();
     broadcast_general_command(&target_session, &auth_user, &command, arguments.clone());
-    apply_general_command_side_effect(&state.db, &target_session, &auth_user, &command, &arguments)
-        .await?;
+    apply_general_command_side_effect(
+        &state.db,
+        &active_sessions,
+        &target_session,
+        &auth_user,
+        &command,
+        &arguments,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13374,6 +13622,7 @@ async fn send_system_command(
 
 async fn send_full_general_command(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path(session_id): Path<String>,
@@ -13398,8 +13647,15 @@ async fn send_full_general_command(
         .unwrap_or_default();
 
     broadcast_general_command(&target_session, &auth_user, &command, arguments.clone());
-    apply_general_command_side_effect(&state.db, &target_session, &auth_user, &command, &arguments)
-        .await?;
+    apply_general_command_side_effect(
+        &state.db,
+        &active_sessions,
+        &target_session,
+        &auth_user,
+        &command,
+        &arguments,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13506,6 +13762,7 @@ fn broadcast_general_command(
 
 async fn apply_general_command_side_effect(
     db: &Database,
+    active_sessions: &ActiveSessionRegistry,
     target_session: &DeviceSession,
     auth_user: &User,
     command: &str,
@@ -13515,6 +13772,7 @@ async fn apply_general_command_side_effect(
     if matches!(command, "SetAudioStreamIndex" | "SetSubtitleStreamIndex") {
         return apply_stream_index_command_side_effect(
             db,
+            active_sessions,
             target_session,
             auth_user,
             command,
@@ -13544,11 +13802,12 @@ async fn apply_general_command_side_effect(
             }
         }),
     );
-    broadcast_sessions_message(db, &target_session.access_token, auth_user).await
+    broadcast_sessions_message(db, active_sessions, &target_session.access_token, auth_user).await
 }
 
 async fn apply_stream_index_command_side_effect(
     db: &Database,
+    active_sessions: &ActiveSessionRegistry,
     target_session: &DeviceSession,
     auth_user: &User,
     command: &str,
@@ -13607,7 +13866,7 @@ async fn apply_stream_index_command_side_effect(
         is_paused: playback.is_paused,
     })
     .await?;
-    broadcast_sessions_message(db, &target_session.access_token, auth_user).await
+    broadcast_sessions_message(db, active_sessions, &target_session.access_token, auth_user).await
 }
 
 fn general_command_stream_index(
@@ -13649,6 +13908,7 @@ struct DisplayContentQuery {
 
 async fn display_content(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<DisplayContentQuery>,
     Path(session_id): Path<String>,
@@ -13671,7 +13931,13 @@ async fn display_content(
             }
         }),
     );
-    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
+    broadcast_sessions_message(
+        &state.db,
+        &active_sessions,
+        &target_session.access_token,
+        &auth_user,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13691,6 +13957,7 @@ struct ReportViewingQuery {
 
 async fn report_viewing(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<ReportViewingQuery>,
     body: Option<Json<serde_json::Value>>,
@@ -13733,7 +14000,13 @@ async fn report_viewing(
             }
         }),
     );
-    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
+    broadcast_sessions_message(
+        &state.db,
+        &active_sessions,
+        &target_session.access_token,
+        &auth_user,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -13902,24 +14175,45 @@ fn json_value_non_negative_i64(value: &serde_json::Value) -> Result<i64, ApiErro
 
 async fn add_user_to_session(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path((session_id, user_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    modify_session_user(state, headers, auth_query, session_id, user_id, true).await
+    modify_session_user(
+        state,
+        &active_sessions,
+        headers,
+        auth_query,
+        session_id,
+        user_id,
+        true,
+    )
+    .await
 }
 
 async fn remove_user_from_session(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     Path((session_id, user_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    modify_session_user(state, headers, auth_query, session_id, user_id, false).await
+    modify_session_user(
+        state,
+        &active_sessions,
+        headers,
+        auth_query,
+        session_id,
+        user_id,
+        false,
+    )
+    .await
 }
 
 async fn modify_session_user(
     state: AppState,
+    active_sessions: &ActiveSessionRegistry,
     headers: HeaderMap,
     auth_query: AuthQuery,
     session_id: String,
@@ -13947,9 +14241,16 @@ async fn modify_session_user(
             .remove_session_user(&target_session.access_token, requested_user_id)
             .await?;
     }
-    broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
+    broadcast_sessions_message(
+        &state.db,
+        active_sessions,
+        &target_session.access_token,
+        &auth_user,
+    )
+    .await?;
     broadcast_sessions_message_to_user_owned_sessions(
         &state.db,
+        active_sessions,
         &requested_user,
         Some(&target_session.access_token),
     )
@@ -16148,9 +16449,14 @@ async fn live_tv_channel_json_for_playable_item(
     }
     if looks_like_live_tv_program_id(item_id)
         && let Some(program) = live_tv_program_by_id(db, item_id).await?
-        && let Some(channel_id) = json_string_field(&program, "ChannelId")
+        && let Some(channel_id) = json_string_field(&program, "JellyrinChannelId")
+            .or_else(|| json_string_field(&program, "ChannelId"))
     {
-        return live_tv_channel_json_by_id(db, &channel_id).await;
+        return match live_tv_channel_by_id(db, &channel_id).await {
+            Ok(channel) => Ok(Some(channel)),
+            Err(error) if error.status == StatusCode::NOT_FOUND => Ok(None),
+            Err(error) => Err(error),
+        };
     }
     Ok(None)
 }
@@ -17072,15 +17378,36 @@ fn live_tv_stable_id(prefix: &str, value: &str) -> String {
 }
 
 fn live_tv_channel_public_id(channel_id: &str) -> String {
-    hyphenate_uuid(&stable_entity_id("LiveTvChannel", channel_id))
+    live_tv_client_uuid_id("LiveTvChannel", channel_id)
 }
 
 fn live_tv_playback_channel_public_id(channel_id: &str) -> String {
-    hyphenate_uuid(&stable_entity_id("LiveTvPlaybackChannel", channel_id))
+    live_tv_stable_client_uuid_id("LiveTvPlaybackChannel", channel_id)
 }
 
 fn live_tv_fallback_program_public_id(channel_id: &str) -> String {
-    channel_id.to_string()
+    live_tv_stable_client_uuid_id("LiveTvFallbackProgram", channel_id)
+}
+
+fn live_tv_client_uuid_id(entity_type: &str, raw_id: &str) -> String {
+    let raw_id = raw_id.trim();
+    if raw_id.is_empty() {
+        return live_tv_stable_client_uuid_id(entity_type, entity_type);
+    }
+    if let Ok(uuid) = Uuid::parse_str(raw_id).or_else(|_| Uuid::parse_str(&hyphenate_uuid(raw_id)))
+    {
+        return uuid.hyphenated().to_string();
+    }
+    live_tv_stable_client_uuid_id(entity_type, raw_id)
+}
+
+fn live_tv_stable_client_uuid_id(entity_type: &str, raw_id: &str) -> String {
+    hyphenate_uuid(&stable_entity_id(entity_type, raw_id))
+}
+
+fn live_tv_public_id_matches(entity_type: &str, raw_id: &str, requested_id: &str) -> bool {
+    jellyfin_id_matches(raw_id, requested_id)
+        || jellyfin_id_matches(&live_tv_client_uuid_id(entity_type, raw_id), requested_id)
 }
 
 async fn live_tv_tuner_host_types(
@@ -17735,10 +18062,7 @@ async fn live_tv_channel(
     let server_id = state.db.server_state().await?.server_id.to_string();
     let channel = live_tv_channel_items(&config, &server_id)
         .into_iter()
-        .find(|channel| {
-            json_string_field(channel, "Id")
-                .is_some_and(|id| id.eq_ignore_ascii_case(channel_id.trim()))
-        })
+        .find(|channel| live_tv_channel_matches_id(channel, &channel_id))
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
     Ok(Json(channel))
 }
@@ -17757,10 +18081,7 @@ async fn live_tv_channel_by_id(
     let server_id = db.server_state().await?.server_id.to_string();
     live_tv_channel_items(&config, &server_id)
         .into_iter()
-        .find(|channel| {
-            json_string_field(channel, "Id")
-                .is_some_and(|id| id.eq_ignore_ascii_case(channel_id.trim()))
-        })
+        .find(|channel| live_tv_channel_matches_id(channel, channel_id))
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))
 }
 
@@ -17961,9 +18282,8 @@ async fn live_tv_program_by_id(
                     })
                     .await?;
                 for record in page.items {
-                    let channel_id = live_tv_channel_public_id(&record.channel_id);
                     if jellyfin_id_matches(
-                        &live_tv_fallback_program_public_id(&channel_id),
+                        &live_tv_fallback_program_public_id(&record.channel_id),
                         program_id.trim(),
                     ) {
                         let channel = live_tv_channel_record_to_json(&record, &server_id);
@@ -17980,17 +18300,20 @@ async fn live_tv_program_by_id(
         let channels = live_tv_channel_items(&config, &server_id);
         return Ok(channels.iter().find_map(|channel| {
             let channel_id = json_string_field(channel, "Id")?;
-            (live_tv_fallback_program_public_id(&channel_id)
+            let raw_channel_id = json_string_field(channel, "JellyrinChannelId")
+                .unwrap_or_else(|| channel_id.clone());
+            (live_tv_fallback_program_public_id(&raw_channel_id)
                 .eq_ignore_ascii_case(program_id.trim())
-                || live_tv_stable_id("fallback-program", &channel_id)
+                || live_tv_stable_id("fallback-program", &raw_channel_id)
                     .eq_ignore_ascii_case(program_id.trim()))
             .then(|| live_tv_fallback_program_item(channel, &server_id, &start_date, &end_date))
             .flatten()
         }));
     }
     Ok(programs.into_iter().find(|program| {
-        json_string_field(program, "Id")
-            .is_some_and(|id| id.eq_ignore_ascii_case(program_id.trim()))
+        json_string_field(&program, "Id").is_some_and(|id| jellyfin_id_matches(&id, program_id))
+            || json_string_field(&program, "JellyrinProgramId")
+                .is_some_and(|id| id.eq_ignore_ascii_case(program_id.trim()))
     }))
 }
 
@@ -18022,10 +18345,15 @@ async fn live_tv_program_result(
             .collect::<Vec<_>>();
         if !channel_ids.is_empty() {
             programs.retain(|program| {
-                json_string_field(program, "ChannelId").is_some_and(|channel_id| {
-                    channel_ids
+                let program_channel_ids = [
+                    json_string_field(program, "ChannelId"),
+                    json_string_field(program, "JellyrinChannelId"),
+                ];
+                channel_ids.iter().any(|requested| {
+                    program_channel_ids
                         .iter()
-                        .any(|requested| jellyfin_id_matches(requested, &channel_id))
+                        .flatten()
+                        .any(|channel_id| jellyfin_id_matches(requested, channel_id))
                 })
             });
         }
@@ -18321,10 +18649,7 @@ async fn live_tv_recording(
     let server_id = state.db.server_state().await?.server_id.to_string();
     let recording = live_tv_recording_items(&config, &server_id)
         .into_iter()
-        .find(|recording| {
-            json_string_field(recording, "Id")
-                .is_some_and(|id| id.eq_ignore_ascii_case(recording_id.trim()))
-        })
+        .find(|recording| live_tv_recording_matches_id(recording, recording_id.trim()))
         .ok_or_else(|| ApiError::not_found("Live TV recording not found"))?;
     Ok(Json(recording))
 }
@@ -18340,12 +18665,7 @@ async fn live_tv_recording_by_id(
     let server_id = db.server_state().await?.server_id.to_string();
     live_tv_recording_items(&config, &server_id)
         .into_iter()
-        .find(|recording| {
-            json_string_field(recording, "Id")
-                .is_some_and(|id| id.eq_ignore_ascii_case(recording_id.trim()))
-                || json_string_field(recording, "TimerId")
-                    .is_some_and(|id| id.eq_ignore_ascii_case(recording_id.trim()))
-        })
+        .find(|recording| live_tv_recording_matches_id(recording, recording_id.trim()))
         .ok_or_else(|| ApiError::not_found("Live TV recording not found"))
 }
 
@@ -18997,8 +19317,10 @@ fn live_tv_channel_item(
         .or_else(|| number.clone())
         .unwrap_or_else(|| format!("{tuner_id}-{}", index + 1));
 
-    base["Id"] = serde_json::json!(id);
+    let public_id = live_tv_channel_public_id(&id);
+    base["Id"] = serde_json::json!(public_id);
     base["ChannelId"] = base["Id"].clone();
+    base["JellyrinChannelId"] = serde_json::json!(id);
     base["ServerId"] = serde_json::json!(server_id);
     base["Name"] = serde_json::json!(name);
     base["SortName"] = serde_json::json!(
@@ -19069,6 +19391,17 @@ fn live_tv_channel_hls_dedupe_key(channel_id: &str) -> String {
 
 fn live_tv_channel_playback_id(channel: &serde_json::Value) -> Option<String> {
     json_string_field(channel, "JellyrinChannelId").or_else(|| json_string_field(channel, "Id"))
+}
+
+fn live_tv_channel_matches_id(channel: &serde_json::Value, requested_id: &str) -> bool {
+    let requested_id = requested_id.trim();
+    let raw_id = json_string_field(channel, "JellyrinChannelId")
+        .or_else(|| json_string_field(channel, "Id"))
+        .unwrap_or_default();
+    json_string_field(channel, "Id").is_some_and(|id| jellyfin_id_matches(&id, requested_id))
+        || (!raw_id.is_empty()
+            && (live_tv_public_id_matches("LiveTvChannel", &raw_id, requested_id)
+                || jellyfin_id_matches(&live_tv_playback_channel_public_id(&raw_id), requested_id)))
 }
 
 // Returns a stable UUID for a live TV channel, used as the item_id when registering a
@@ -19320,18 +19653,23 @@ fn live_tv_fallback_program_item(
     let channel_id = json_string_field(channel, "Id")?;
     let raw_channel_id =
         json_string_field(channel, "JellyrinChannelId").unwrap_or_else(|| channel_id.clone());
+    let legacy_program_id = live_tv_stable_id("fallback-program", &raw_channel_id);
+    let public_channel_id = live_tv_channel_public_id(&raw_channel_id);
+    let public_program_id = live_tv_fallback_program_public_id(&raw_channel_id);
     let channel_name = json_string_field(channel, "Name").unwrap_or_else(|| channel_id.clone());
     let channel_number = json_string_field(channel, "Number");
     let playback_channel_id = live_tv_playback_channel_public_id(&raw_channel_id);
     let mut program = serde_json::json!({
-        "Id": live_tv_fallback_program_public_id(&channel_id),
+        "Id": public_program_id,
+        "JellyrinProgramId": legacy_program_id,
         "Name": channel_name,
         "SortName": channel_name,
         "Type": "Program",
         "ServerId": server_id,
         "MediaType": "Video",
         "ParentId": playback_channel_id,
-        "ChannelId": channel_id,
+        "ChannelId": public_channel_id,
+        "JellyrinChannelId": raw_channel_id,
         "ChannelName": channel_name,
         "ChannelNumber": channel_number,
         "IsFolder": false,
@@ -19352,22 +19690,15 @@ fn live_tv_fallback_program_item(
             "PlayCount": 0,
             "IsFavorite": false,
             "Played": false,
-            "Key": channel_id,
-            "ItemId": channel_id
+            "Key": public_program_id,
+            "ItemId": public_program_id
         }
     });
     if let Some(image_url) = live_tv_image_url(channel) {
         program["ImageUrl"] = serde_json::json!(image_url);
     }
     apply_live_tv_image_metadata(&mut program);
-    for key in [
-        "Genres",
-        "Tags",
-        "GenreItems",
-        "JellyrinChannelId",
-        "Path",
-        "MediaSources",
-    ] {
+    for key in ["Genres", "Tags", "GenreItems", "Path", "MediaSources"] {
         if let Some(value) = json_field_case_insensitive(channel, key) {
             program[key] = value.clone();
         }
@@ -19513,21 +19844,23 @@ fn live_tv_program_item(
         .unwrap_or_default();
     let channel_name = channels
         .iter()
-        .find(|channel| {
-            json_string_field(channel, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
-        })
+        .find(|channel| live_tv_channel_matches_id(channel, &channel_id))
         .and_then(|channel| json_string_field(channel, "Name"));
     let id = json_string_field(&base, "Id")
         .or_else(|| json_string_field(&base, "ProgramId"))
         .unwrap_or_else(|| format!("{source_id}-program-{}", index + 1));
 
-    base["Id"] = serde_json::json!(id);
+    let public_id = live_tv_client_uuid_id("LiveTvProgram", &id);
+    let public_channel_id = live_tv_channel_public_id(&channel_id);
+    base["Id"] = serde_json::json!(public_id);
+    base["JellyrinProgramId"] = serde_json::json!(id);
     base["Name"] = serde_json::json!(name.clone());
     base["SortName"] = serde_json::json!(name);
     base["Type"] = serde_json::json!("Program");
     base["ServerId"] = serde_json::json!(server_id);
     base["MediaType"] = serde_json::json!("Video");
-    base["ChannelId"] = serde_json::json!(channel_id);
+    base["ChannelId"] = serde_json::json!(public_channel_id);
+    base["JellyrinChannelId"] = serde_json::json!(channel_id);
     base["ChannelName"] = channel_name
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null);
@@ -19554,10 +19887,7 @@ fn live_tv_program_item(
     if live_tv_image_url(&base).is_none()
         && let Some(channel_image_url) = channels
             .iter()
-            .find(|channel| {
-                json_string_field(channel, "Id")
-                    .is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
-            })
+            .find(|channel| live_tv_channel_matches_id(channel, &channel_id))
             .and_then(live_tv_image_url)
     {
         base["ImageUrl"] = serde_json::json!(channel_image_url);
@@ -19617,20 +19947,43 @@ fn live_tv_recording_item(
         .or_else(|| json_string_field(&item, "RecordingId"))
         .unwrap_or_else(|| format!("recording-{}", index + 1));
     let channel_id = json_string_field(&item, "ChannelId").unwrap_or_default();
+    let public_id = live_tv_client_uuid_id("LiveTvRecording", &id);
+    let public_channel_id = if channel_id.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(live_tv_channel_public_id(&channel_id))
+    };
     let channel_name = channels
         .iter()
-        .find(|channel| {
-            json_string_field(channel, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
-        })
+        .find(|channel| live_tv_channel_matches_id(channel, &channel_id))
         .and_then(|channel| json_string_field(channel, "Name"));
 
-    item["Id"] = serde_json::json!(id);
+    item["Id"] = serde_json::json!(public_id);
+    item["JellyrinRecordingId"] = serde_json::json!(id);
     item["Name"] = serde_json::json!(name.clone());
     item["SortName"] = serde_json::json!(name);
     item["Type"] = serde_json::json!("Recording");
     item["ServerId"] = serde_json::json!(server_id);
     item["MediaType"] = serde_json::json!("Video");
-    item["ChannelId"] = serde_json::json!(channel_id);
+    item["ChannelId"] = public_channel_id;
+    if !channel_id.is_empty() {
+        item["JellyrinChannelId"] = serde_json::json!(channel_id);
+    }
+    if let Some(timer_id) = json_string_field(&item, "TimerId") {
+        item["TimerId"] = serde_json::json!(live_tv_client_uuid_id("LiveTvTimer", &timer_id));
+        item["JellyrinTimerId"] = serde_json::json!(timer_id);
+    }
+    if let Some(program_id) = json_string_field(&item, "ProgramId") {
+        item["ProgramId"] = serde_json::json!(live_tv_client_uuid_id("LiveTvProgram", &program_id));
+        item["JellyrinProgramId"] = serde_json::json!(program_id);
+    }
+    if let Some(series_timer_id) = json_string_field(&item, "SeriesTimerId") {
+        item["SeriesTimerId"] = serde_json::json!(live_tv_client_uuid_id(
+            "LiveTvSeriesTimer",
+            &series_timer_id,
+        ));
+        item["JellyrinSeriesTimerId"] = serde_json::json!(series_timer_id);
+    }
     item["ChannelName"] = channel_name
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null);
@@ -19655,6 +20008,15 @@ fn live_tv_recording_item(
         .cloned()
         .unwrap_or_else(|| serde_json::json!("Manual"));
     Some(item)
+}
+
+fn live_tv_recording_matches_id(recording: &serde_json::Value, requested_id: &str) -> bool {
+    json_string_field(recording, "JellyrinRecordingId")
+        .or_else(|| json_string_field(recording, "Id"))
+        .is_some_and(|id| live_tv_public_id_matches("LiveTvRecording", &id, requested_id))
+        || json_string_field(recording, "JellyrinTimerId")
+            .or_else(|| json_string_field(recording, "TimerId"))
+            .is_some_and(|id| live_tv_public_id_matches("LiveTvTimer", &id, requested_id))
 }
 
 fn live_tv_recording_path(recording: &serde_json::Value) -> Result<PathBuf, ApiError> {
@@ -19764,7 +20126,9 @@ fn series_timer_child_id(series_timer_id: &str, program_id: &str) -> String {
 // maybe_spawn_live_tv_recording is called for each child timer so in-window programs
 // start recording immediately (paridad TimerManager.AddOrUpdateSystemTimer fire-on-create).
 async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_json::Value) {
-    let series_timer_id = match json_string_field(series_timer, "Id") {
+    let series_timer_id = match json_string_field(series_timer, "JellyrinTimerId")
+        .or_else(|| json_string_field(series_timer, "Id"))
+    {
         Some(id) if !id.is_empty() => id,
         _ => return,
     };
@@ -19776,7 +20140,8 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
         .get("RecordAnyChannel")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let series_channel_id = json_string_field(series_timer, "ChannelId");
+    let series_channel_id = json_string_field(series_timer, "JellyrinChannelId")
+        .or_else(|| json_string_field(series_timer, "ChannelId"));
 
     let now = OffsetDateTime::now_utc();
 
@@ -19798,7 +20163,9 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
     let mut new_timers: Vec<serde_json::Value> = Vec::new();
 
     for program in &programs {
-        let program_id = match json_string_field(program, "Id") {
+        let program_id = match json_string_field(program, "JellyrinProgramId")
+            .or_else(|| json_string_field(program, "Id"))
+        {
             Some(id) if !id.is_empty() => id,
             _ => continue,
         };
@@ -19828,7 +20195,9 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
         // Channel scope check.
         // Program ChannelId may be an XMLTV guide number (e.g. "4.1") while the series timer
         // ChannelId is the Jellyrin channel Id (e.g. "hdhr_4.1"). Accept both forms.
-        let program_channel_id = json_string_field(program, "ChannelId").unwrap_or_default();
+        let program_channel_id = json_string_field(program, "JellyrinChannelId")
+            .or_else(|| json_string_field(program, "ChannelId"))
+            .unwrap_or_default();
         // Resolve the effective channel Id for the child timer: prefer the series timer's
         // channel Id if it matches (so maybe_spawn can find the channel), else use the program's.
         let effective_channel_id = if let Some(ref scid) = series_channel_id {
@@ -19966,8 +20335,9 @@ async fn cascade_delete_series_timer_timers(db: &Database, series_timer_id: &str
     let kept: Vec<serde_json::Value> = timers
         .into_iter()
         .filter(|timer| {
-            let belongs = json_string_field(timer, "SeriesTimerId")
-                .is_some_and(|stid| stid.eq_ignore_ascii_case(series_timer_id));
+            let belongs = json_string_field(timer, "SeriesTimerId").is_some_and(|stid| {
+                live_tv_public_id_matches("LiveTvSeriesTimer", &stid, series_timer_id)
+            });
             if !belongs {
                 return true;
             }
@@ -20002,7 +20372,9 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
     if live_tv_timer_is_terminal(timer) {
         return false;
     }
-    let timer_id = match json_string_field(timer, "Id") {
+    let timer_id = match json_string_field(timer, "JellyrinTimerId")
+        .or_else(|| json_string_field(timer, "Id"))
+    {
         Some(id) if !id.is_empty() => id,
         _ => return false,
     };
@@ -20047,7 +20419,9 @@ async fn maybe_spawn_live_tv_recording(state: &AppState, timer: &serde_json::Val
     }
 
     // Resolve the channel URL.
-    let channel_id = match json_string_field(timer, "ChannelId") {
+    let channel_id = match json_string_field(timer, "JellyrinChannelId")
+        .or_else(|| json_string_field(timer, "ChannelId"))
+    {
         Some(id) if !id.is_empty() => id,
         _ => return false,
     };
@@ -20123,9 +20497,21 @@ async fn record_channel_to_file(
     start_guard: Option<LiveTvRecordingStartGuard>,
 ) {
     let _start_guard = start_guard;
-    let timer_id = json_string_field(&timer, "Id").unwrap_or_default();
+    let timer_id = json_string_field(&timer, "JellyrinTimerId")
+        .or_else(|| json_string_field(&timer, "Id"))
+        .unwrap_or_default();
     let name = json_string_field(&timer, "Name").unwrap_or_else(|| "Recording".to_string());
-    let channel_id = json_string_field(&timer, "ChannelId").unwrap_or_default();
+    let channel_id = json_string_field(&timer, "JellyrinChannelId")
+        .or_else(|| json_string_field(&timer, "ChannelId"))
+        .unwrap_or_default();
+    let program_id = json_string_field(&timer, "JellyrinProgramId")
+        .map(serde_json::Value::String)
+        .or_else(|| timer.get("ProgramId").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let series_timer_id = json_string_field(&timer, "JellyrinSeriesTimerId")
+        .map(serde_json::Value::String)
+        .or_else(|| timer.get("SeriesTimerId").cloned())
+        .unwrap_or(serde_json::Value::Null);
 
     // Parse StartDate and EndDate from the timer (RFC3339 strings).
     let start_date = json_string_field(&timer, "StartDate")
@@ -20241,8 +20627,8 @@ async fn record_channel_to_file(
         recordings.push(serde_json::json!({
             "Id": recording_id,
             "TimerId": timer_id,
-            "ProgramId": timer.get("ProgramId").cloned().unwrap_or(serde_json::Value::Null),
-            "SeriesTimerId": timer.get("SeriesTimerId").cloned().unwrap_or(serde_json::Value::Null),
+            "ProgramId": program_id,
+            "SeriesTimerId": series_timer_id,
             "Name": name,
             "ChannelId": channel_id,
             "Path": path_str,
@@ -20505,10 +20891,23 @@ fn live_tv_recording_group_items(
     groups
         .into_iter()
         .map(|(name, count)| {
+            let raw_group_id = sanitize_live_tv_group_id(&name);
+            // RecordingFolder/RecordingGroup/RecordingSeries are not valid
+            // Jellyfin BaseItemKind values and make strict SDK clients fail
+            // the entire response during deserialization. Upstream recording
+            // folders are collection folders; keep the legacy synthetic group
+            // endpoints useful by representing their entries as plain folders.
+            let item_type = if group_type == "Folder" {
+                "CollectionFolder"
+            } else {
+                "Folder"
+            };
             serde_json::json!({
-                "Id": sanitize_live_tv_group_id(&name),
+                "Id": live_tv_stable_client_uuid_id(&format!("LiveTvRecording{group_type}"), &name),
+                "JellyrinGroupId": raw_group_id,
                 "Name": name,
-                "Type": format!("Recording{group_type}"),
+                "ServerId": server_id,
+                "Type": item_type,
                 "IsFolder": true,
                 "ChildCount": count,
                 "RecordingCount": count
@@ -20549,7 +20948,7 @@ async fn delete_persisted_live_tv_recording(
     recordings.retain(|recording| {
         json_string_field(recording, "Id")
             .or_else(|| json_string_field(recording, "RecordingId"))
-            .is_none_or(|id| !id.eq_ignore_ascii_case(recording_id))
+            .is_none_or(|id| !live_tv_public_id_matches("LiveTvRecording", &id, recording_id))
     });
     if recordings.len() == before {
         return Err(ApiError::not_found("Live TV recording not found"));
@@ -20742,7 +21141,10 @@ async fn live_tv_timer_list(
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
-    let items = live_tv_timer_items(&config, key);
+    let items = live_tv_timer_items(&config, key)
+        .into_iter()
+        .map(|timer| live_tv_timer_public_item(timer, key))
+        .collect::<Vec<_>>();
     Ok(Json(query_result(items)))
 }
 
@@ -20757,12 +21159,8 @@ async fn live_tv_timer_by_id(
         .unwrap_or_else(default_live_tv_configuration);
     let timer = live_tv_timer_items(&config, key)
         .into_iter()
-        .find(|timer| {
-            timer
-                .get("Id")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| id.eq_ignore_ascii_case(timer_id))
-        })
+        .find(|timer| live_tv_timer_matches_id(timer, key, timer_id))
+        .map(|timer| live_tv_timer_public_item(timer, key))
         .ok_or_else(|| ApiError::not_found("Live TV timer not found"))?;
     Ok(Json(timer))
 }
@@ -20781,6 +21179,7 @@ async fn upsert_live_tv_timer(
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let mut timer = normalize_live_tv_timer(payload, path_timer_id, key == "SeriesTimers");
+    normalize_live_tv_timer_reference_ids(db, &config, &mut timer, key).await?;
     let timer_id = timer
         .get("Id")
         .and_then(serde_json::Value::as_str)
@@ -20792,11 +21191,15 @@ async fn upsert_live_tv_timer(
         .cloned()
         .unwrap_or_default();
     if let Some(existing) = timers.iter_mut().find(|existing| {
-        existing
-            .get("Id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| id.eq_ignore_ascii_case(&timer_id))
+        json_string_field(existing, "Id").is_some_and(|id| {
+            id.eq_ignore_ascii_case(&timer_id)
+                || live_tv_timer_matches_id(existing, key, &timer_id)
+                || live_tv_timer_matches_id(&timer, key, &id)
+        })
     }) {
+        if let Some(existing_id) = json_string_field(existing, "Id") {
+            timer["Id"] = serde_json::json!(existing_id);
+        }
         *existing = timer.clone();
     } else {
         timers.push(timer.clone());
@@ -20804,7 +21207,10 @@ async fn upsert_live_tv_timer(
     config[key] = serde_json::json!(timers);
     db.update_named_configuration("livetv", live_tv_configuration_json(config))
         .await?;
-    Ok(Json(std::mem::take(&mut timer)))
+    Ok(Json(live_tv_timer_public_item(
+        std::mem::take(&mut timer),
+        key,
+    )))
 }
 
 async fn delete_persisted_live_tv_timer(
@@ -20822,12 +21228,7 @@ async fn delete_persisted_live_tv_timer(
         .cloned()
         .unwrap_or_default();
     let before = timers.len();
-    timers.retain(|timer| {
-        timer
-            .get("Id")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|id| !id.eq_ignore_ascii_case(timer_id))
-    });
+    timers.retain(|timer| !live_tv_timer_matches_id(timer, key, timer_id));
     if timers.len() == before {
         return Err(ApiError::not_found("Live TV timer not found"));
     }
@@ -20843,6 +21244,105 @@ fn live_tv_timer_items(config: &serde_json::Value, key: &'static str) -> Vec<ser
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default()
+}
+
+async fn normalize_live_tv_timer_reference_ids(
+    db: &Database,
+    config: &serde_json::Value,
+    timer: &mut serde_json::Value,
+    key: &'static str,
+) -> Result<(), ApiError> {
+    if let Some(raw_id) = json_string_field(timer, "JellyrinTimerId").or_else(|| {
+        json_string_field(timer, "Id")
+            .and_then(|id| live_tv_timer_raw_id_from_public(config, key, &id))
+    }) {
+        timer["Id"] = serde_json::json!(raw_id);
+    }
+
+    if let Some(raw_channel_id) = json_string_field(timer, "JellyrinChannelId") {
+        timer["ChannelId"] = serde_json::json!(raw_channel_id);
+    } else if let Some(channel_id) = json_string_field(timer, "ChannelId")
+        && let Ok(channel) = live_tv_channel_by_id(db, &channel_id).await
+        && let Some(raw_channel_id) = json_string_field(&channel, "JellyrinChannelId")
+    {
+        timer["ChannelId"] = serde_json::json!(raw_channel_id);
+    }
+
+    if let Some(raw_program_id) = json_string_field(timer, "JellyrinProgramId") {
+        timer["ProgramId"] = serde_json::json!(raw_program_id);
+    } else if let Some(program_id) = json_string_field(timer, "ProgramId")
+        && let Some(program) = live_tv_program_by_id(db, &program_id).await?
+        && let Some(raw_program_id) = json_string_field(&program, "JellyrinProgramId")
+    {
+        timer["ProgramId"] = serde_json::json!(raw_program_id);
+    }
+
+    if let Some(raw_series_timer_id) =
+        json_string_field(timer, "JellyrinSeriesTimerId").or_else(|| {
+            json_string_field(timer, "SeriesTimerId")
+                .and_then(|id| live_tv_timer_raw_id_from_public(config, "SeriesTimers", &id))
+        })
+    {
+        timer["SeriesTimerId"] = serde_json::json!(raw_series_timer_id);
+    }
+
+    Ok(())
+}
+
+fn live_tv_timer_raw_id_from_public(
+    config: &serde_json::Value,
+    key: &'static str,
+    requested_id: &str,
+) -> Option<String> {
+    live_tv_timer_items(config, key)
+        .into_iter()
+        .filter_map(|timer| json_string_field(&timer, "Id"))
+        .find(|id| live_tv_public_id_matches(live_tv_timer_entity_type(key), id, requested_id))
+}
+
+fn live_tv_timer_public_item(mut timer: serde_json::Value, key: &'static str) -> serde_json::Value {
+    let timer_entity = live_tv_timer_entity_type(key);
+    if let Some(timer_id) = json_string_field(&timer, "Id") {
+        timer["Id"] = serde_json::json!(live_tv_client_uuid_id(timer_entity, &timer_id));
+        timer["JellyrinTimerId"] = serde_json::json!(timer_id);
+    }
+    if let Some(channel_id) = json_string_field(&timer, "ChannelId") {
+        timer["ChannelId"] = serde_json::json!(live_tv_channel_public_id(&channel_id));
+        timer["JellyrinChannelId"] = serde_json::json!(channel_id);
+    }
+    if let Some(program_id) = json_string_field(&timer, "ProgramId") {
+        timer["ProgramId"] =
+            serde_json::json!(live_tv_client_uuid_id("LiveTvProgram", &program_id));
+        timer["JellyrinProgramId"] = serde_json::json!(program_id);
+    }
+    if let Some(series_timer_id) = json_string_field(&timer, "SeriesTimerId") {
+        timer["SeriesTimerId"] = serde_json::json!(live_tv_client_uuid_id(
+            "LiveTvSeriesTimer",
+            &series_timer_id,
+        ));
+        timer["JellyrinSeriesTimerId"] = serde_json::json!(series_timer_id);
+    }
+    timer
+}
+
+fn live_tv_timer_matches_id(
+    timer: &serde_json::Value,
+    key: &'static str,
+    requested_id: &str,
+) -> bool {
+    json_string_field(timer, "JellyrinTimerId")
+        .or_else(|| json_string_field(timer, "Id"))
+        .is_some_and(|id| {
+            live_tv_public_id_matches(live_tv_timer_entity_type(key), &id, requested_id)
+        })
+}
+
+fn live_tv_timer_entity_type(key: &'static str) -> &'static str {
+    if key == "SeriesTimers" {
+        "LiveTvSeriesTimer"
+    } else {
+        "LiveTvTimer"
+    }
 }
 
 fn normalize_live_tv_timer(
@@ -22409,7 +22909,8 @@ async fn user_views_result(
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let items = user_views_for_query(&folders, &item_counts, &server_id, &query);
+    let mut items = user_views_for_query(&folders, &item_counts, &server_id, &query);
+    attach_user_view_primary_images(&state, &folders, &mut items).await?;
     Ok(Json(query_result(items)))
 }
 
@@ -22426,7 +22927,8 @@ async fn user_views_result_legacy(
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let items = user_views_for_query(&folders, &item_counts, &server_id, &query);
+    let mut items = user_views_for_query(&folders, &item_counts, &server_id, &query);
+    attach_user_view_primary_images(&state, &folders, &mut items).await?;
     Ok(Json(query_result(items)))
 }
 
@@ -22519,6 +23021,137 @@ fn user_views_for_query(
         })
     }));
     items
+}
+
+async fn attach_user_view_primary_images(
+    state: &AppState,
+    folders: &[VirtualFolder],
+    items: &mut [serde_json::Value],
+) -> Result<(), ApiError> {
+    for item in items {
+        let Some(item_id) = json_string_field(item, "Id") else {
+            continue;
+        };
+        let descriptor = resolve_user_view_primary_image(state, folders, &item_id).await?;
+        let Some(descriptor) = descriptor else {
+            continue;
+        };
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "ImageTags".to_string(),
+            serde_json::json!({ "Primary": descriptor.tag }),
+        );
+        object.insert(
+            "PrimaryImageAspectRatio".to_string(),
+            serde_json::json!(descriptor.aspect_ratio),
+        );
+    }
+    Ok(())
+}
+
+struct UserViewPrimaryImage {
+    tag: String,
+    aspect_ratio: f64,
+    source: UserViewPrimaryImageSource,
+}
+
+enum UserViewPrimaryImageSource {
+    Stored(PathBuf),
+    MediaItem(String),
+    LiveTv(serde_json::Value),
+}
+
+fn user_view_primary_image_tag(view_id: &str, source_key: &str) -> String {
+    default_primary_image_tag(&stable_entity_id(
+        "UserViewImage",
+        &format!("{view_id}:{source_key}"),
+    ))
+}
+
+async fn resolve_user_view_primary_image(
+    state: &AppState,
+    folders: &[VirtualFolder],
+    view_id: &str,
+) -> Result<Option<UserViewPrimaryImage>, ApiError> {
+    if let Some(path) = find_stored_image(state, ImageOwner::Item(view_id), "Primary", 0).await?
+        && !stored_image_is_transparent_placeholder(&path).await?
+    {
+        let tag = stored_image_tag(&path).await?;
+        return Ok(Some(UserViewPrimaryImage {
+            tag,
+            aspect_ratio: 0.666_666_7,
+            source: UserViewPrimaryImageSource::Stored(path),
+        }));
+    }
+
+    if let Some(folder) = folders
+        .iter()
+        .find(|folder| folder.id.simple().to_string().eq_ignore_ascii_case(view_id))
+    {
+        let mut folder_ids = vec![folder.id];
+        folder_ids.extend(
+            child_virtual_folders(folder, folders)
+                .into_iter()
+                .map(|child| child.id),
+        );
+        if let Some(candidate) =
+            virtual_folder_primary_image_candidate(state, &folder_ids, 24).await?
+        {
+            return Ok(Some(UserViewPrimaryImage {
+                tag: user_view_primary_image_tag(view_id, &candidate.source_key),
+                aspect_ratio: 0.666_666_7,
+                source: UserViewPrimaryImageSource::MediaItem(
+                    candidate.item.id.simple().to_string(),
+                ),
+            }));
+        }
+        return default_user_view_primary_image(state, view_id).await;
+    }
+
+    if special_user_view_collection_type_for_parent(Some(view_id)) == Some("livetv")
+        && let Some(channel) = live_tv_user_view_image_item(state).await?
+    {
+        let Some(channel_id) = json_string_field(&channel, "Id") else {
+            return Ok(None);
+        };
+        let Some(image_url) = live_tv_image_url(&channel) else {
+            return Ok(None);
+        };
+        return Ok(Some(UserViewPrimaryImage {
+            tag: user_view_primary_image_tag(view_id, &format!("{channel_id}:{image_url}")),
+            aspect_ratio: 1.0,
+            source: UserViewPrimaryImageSource::LiveTv(channel),
+        }));
+    }
+    if special_user_view_collection_type_for_parent(Some(view_id)).is_some() {
+        return default_user_view_primary_image(state, view_id).await;
+    }
+    Ok(None)
+}
+
+async fn default_user_view_primary_image(
+    state: &AppState,
+    view_id: &str,
+) -> Result<Option<UserViewPrimaryImage>, ApiError> {
+    for relative_path in ["favicons/touchicon512.png", "favicons/touchicon.png"] {
+        let path = state.web_dir.join(relative_path);
+        if !tokio::fs::metadata(&path)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let source_tag = stored_image_tag(&path).await?;
+        return Ok(Some(UserViewPrimaryImage {
+            tag: user_view_primary_image_tag(view_id, &format!("fallback:{source_tag}")),
+            aspect_ratio: 1.0,
+            source: UserViewPrimaryImageSource::Stored(path),
+        }));
+    }
+    Ok(None)
 }
 
 fn virtual_folder_recursive_count(
@@ -22615,8 +23248,10 @@ fn special_user_view_to_json(
         "Type": "CollectionFolder",
         "CollectionType": collection_type,
         "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": special_user_view_id(collection_type), "ItemId": special_user_view_id(collection_type) },
-        "ImageTags": { "Primary": "placeholder" },
-        "PrimaryImageAspectRatio": 1.0,
+        // A Primary tag is attached later only when this view has a real,
+        // servable image. Advertising a fake tag makes Android TV cache the
+        // transparent placeholder instead of using its native folder artwork.
+        "ImageTags": {},
         "BackdropImageTags": [],
         "LocationType": "Virtual",
         "MediaType": null,
@@ -23923,10 +24558,8 @@ async fn apply_latest_user_configuration(
     let Some(user_id) = user_id else {
         return Ok(items);
     };
-    let configuration = db
-        .user_configuration(user_id)
-        .await?
-        .unwrap_or_else(default_user_configuration);
+    let configuration = db.user_configuration(user_id).await?;
+    let configuration = user_configuration_with_defaults(configuration)?;
 
     let excluded_folder_ids = latest_items_excluded_folder_ids(db, &configuration).await?;
     if !excluded_folder_ids.is_empty() {
@@ -26676,6 +27309,13 @@ async fn item_ancestors(
             }
             return Ok(Json(vec![live_tv, root]));
         }
+    }
+    if live_tv_program_by_id(&state.db, &item_id).await?.is_some() {
+        let mut live_tv = special_user_view_to_json("Live TV", "livetv", &server_id);
+        if let Some(object) = live_tv.as_object_mut() {
+            object.insert("ParentId".to_string(), serde_json::json!(root_id));
+        }
+        return Ok(Json(vec![live_tv, root]));
     }
     if live_tv_channel_by_id(&state.db, &item_id).await.is_ok() {
         let mut live_tv = special_user_view_to_json("Live TV", "livetv", &server_id);
@@ -35777,9 +36417,7 @@ async fn authenticated_similar_items(
     {
         return Ok(Json(query_result(Vec::new())));
     }
-    if parse_jellyfin_uuid(&item_id).is_err()
-        && live_tv_program_by_id(&state.db, &item_id).await?.is_some()
-    {
+    if live_tv_program_by_id(&state.db, &item_id).await?.is_some() {
         return Ok(Json(query_result(Vec::new())));
     }
 
@@ -39021,8 +39659,9 @@ fn user_view_to_json_with_count(
         "Type": "CollectionFolder",
         "CollectionType": folder.collection_type,
         "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": folder.id.simple().to_string(), "ItemId": folder.id.simple().to_string() },
-        "ImageTags": { "Primary": "placeholder" },
-        "PrimaryImageAspectRatio": 0.6666667,
+        // Keep this empty until attach_user_view_primary_images has found a
+        // representative image that /Items/{Id}/Images/Primary can serve.
+        "ImageTags": {},
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
         "MediaType": null,
@@ -41649,17 +42288,26 @@ async fn splashscreen_placeholder_image(
     stored_image_or_placeholder(&state, ImageOwner::Branding, "Splashscreen", 0).await
 }
 
+const TRANSPARENT_PLACEHOLDER_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1, 13, 10,
+    45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
 fn placeholder_png_response() -> axum::response::Response {
-    const TRANSPARENT_PNG: &[u8] = &[
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
-        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1,
-        13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-    ];
     (
         [(header::CONTENT_TYPE, "image/png")],
-        TRANSPARENT_PNG.to_vec(),
+        TRANSPARENT_PLACEHOLDER_PNG.to_vec(),
     )
         .into_response()
+}
+
+async fn stored_image_is_transparent_placeholder(path: &FsPath) -> Result<bool, ApiError> {
+    // Historical placeholder variants are 1x1 PNGs (and one old variant is
+    // malformed) but all occupy at most the same 67 bytes. A library cover
+    // this small is never useful, so do not let it suppress a real source or
+    // the visible application-art fallback.
+    Ok(tokio::fs::metadata(path).await?.len() <= TRANSPARENT_PLACEHOLDER_PNG.len() as u64)
 }
 
 pub(crate) enum ImageOwner<'a> {
@@ -42096,36 +42744,219 @@ async fn item_image_or_placeholder(
     {
         return Ok(response);
     }
+    if let Some(response) =
+        media_item_image_response(state, item_id, image_type, image_index).await?
+    {
+        return Ok(response);
+    }
+    if let Some(response) =
+        user_view_primary_image_response(state, item_id, image_type, image_index).await?
+    {
+        return Ok(response);
+    }
+    Ok(placeholder_png_response())
+}
+
+async fn media_item_image_response(
+    state: &AppState,
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<axum::response::Response>, ApiError> {
     if let Some(stored) =
         find_stored_image(state, ImageOwner::Item(item_id), image_type, image_index).await?
+        && !stored_image_is_transparent_placeholder(&stored).await?
     {
-        return stored_image_response(stored).await;
+        return stored_image_response(stored).await.map(Some);
     }
     let item = match media_item_by_id(&state.db, item_id).await {
         Ok(item) => item,
-        Err(error) if error.status == StatusCode::NOT_FOUND => {
-            return Ok(placeholder_png_response());
-        }
+        Err(error) if error.status == StatusCode::NOT_FOUND => return Ok(None),
         Err(error) => return Err(error),
     };
     if let Some(response) =
         remote_metadata_item_image_response(state, item_id, &item, image_type, image_index).await?
     {
-        return Ok(response);
+        return Ok(Some(response));
     }
     if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
-        return stored_image_response(local_image).await;
+        return stored_image_response(local_image).await.map(Some);
     }
     // Try plugin ImageProvider as fallback
     if let Some(plugin_image) = item_image_from_plugins(&state.db, item_id, image_type).await? {
-        return Ok(plugin_image);
+        return Ok(Some(plugin_image));
     }
     if let Some(generated_image) =
         find_generated_video_item_image(state, &item, item_id, image_type, image_index).await?
     {
-        return stored_image_response(generated_image).await;
+        return stored_image_response(generated_image).await.map(Some);
     }
-    Ok(placeholder_png_response())
+    Ok(None)
+}
+
+async fn user_view_primary_image_response(
+    state: &AppState,
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<axum::response::Response>, ApiError> {
+    if !image_type.eq_ignore_ascii_case("Primary") || image_index != 0 {
+        return Ok(None);
+    }
+    let folders = state.db.virtual_folders().await?;
+    let Some(descriptor) = resolve_user_view_primary_image(state, &folders, item_id).await? else {
+        return Ok(None);
+    };
+    let response = match descriptor.source {
+        UserViewPrimaryImageSource::Stored(path) => stored_image_response(path).await.map(Some)?,
+        UserViewPrimaryImageSource::MediaItem(candidate_id) => {
+            media_item_image_response(state, &candidate_id, image_type, image_index).await?
+        }
+        UserViewPrimaryImageSource::LiveTv(channel) => {
+            live_tv_item_image_response(state, &channel, image_type, image_index).await?
+        }
+    };
+    if response.is_some() {
+        return Ok(response);
+    }
+    user_view_fallback_image_response(state).await
+}
+
+async fn user_view_fallback_image_response(
+    state: &AppState,
+) -> Result<Option<axum::response::Response>, ApiError> {
+    for relative_path in ["favicons/touchicon512.png", "favicons/touchicon.png"] {
+        let path = state.web_dir.join(relative_path);
+        if tokio::fs::metadata(&path)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            return stored_image_response(path).await.map(Some);
+        }
+    }
+    Ok(None)
+}
+
+struct UserViewMediaImageCandidate {
+    item: MediaItem,
+    source_key: String,
+}
+
+async fn virtual_folder_primary_image_candidate(
+    state: &AppState,
+    folder_ids: &[Uuid],
+    limit: usize,
+) -> Result<Option<UserViewMediaImageCandidate>, ApiError> {
+    let candidates = state
+        .db
+        .latest_media_items_for_virtual_folders(folder_ids, limit as i64)
+        .await?;
+    let metadata_by_item = media_metadata_by_item_id(
+        &state.db,
+        candidates.iter().map(|candidate| candidate.id).collect(),
+    )
+    .await?;
+    let mut best = None::<(u8, UserViewMediaImageCandidate)>;
+    for candidate in candidates {
+        let Some((priority, source_key)) = media_item_primary_image_source_key(
+            state,
+            &candidate,
+            metadata_by_item.get(&candidate.id),
+        )
+        .await?
+        else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_priority, _)| priority < *best_priority)
+        {
+            best = Some((
+                priority,
+                UserViewMediaImageCandidate {
+                    item: candidate,
+                    source_key,
+                },
+            ));
+            if priority == 0 {
+                break;
+            }
+        }
+    }
+    Ok(best.map(|(_, candidate)| candidate))
+}
+
+async fn media_item_primary_image_source_key(
+    state: &AppState,
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+) -> Result<Option<(u8, String)>, ApiError> {
+    let item_id = item.id.simple().to_string();
+    if let Some(path) = find_stored_image(state, ImageOwner::Item(&item_id), "Primary", 0).await?
+        && !stored_image_is_transparent_placeholder(&path).await?
+    {
+        return Ok(Some((
+            0,
+            format!("stored:{}", stored_image_tag(&path).await?),
+        )));
+    }
+    if let Some(path) = find_local_item_image(item, "Primary", 0).await? {
+        return Ok(Some((
+            0,
+            format!("local:{}", stored_image_tag(&path).await?),
+        )));
+    }
+    let generated_path = stored_image_owner_dir(state, ImageOwner::Item(&item_id))
+        .join("generated_video_primary.jpg");
+    if generated_video_image_is_usable(&generated_path).await {
+        return Ok(Some((
+            0,
+            format!("generated:{}", stored_image_tag(&generated_path).await?),
+        )));
+    }
+    if let Some(image_url) =
+        metadata.and_then(|metadata| metadata_remote_image_url(metadata, "Primary"))
+    {
+        return Ok(Some((1, format!("remote:{image_url}"))));
+    }
+    if is_xtream_virtual_item(item) || !item.media_type.eq_ignore_ascii_case("Video") {
+        return Ok(None);
+    }
+    let usable_video = tokio::fs::metadata(media_item_path(item))
+        .await
+        .map(|metadata| metadata.is_file() && metadata.len() >= 4 * 1024)
+        .unwrap_or(false);
+    if !usable_video {
+        return Ok(None);
+    }
+    Ok(Some((
+        2,
+        format!("video:{}", stored_image_tag(media_item_path(item)).await?),
+    )))
+}
+
+async fn live_tv_user_view_image_item(
+    state: &AppState,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let page = state
+        .db
+        .live_tv_channel_page(LiveTvChannelQuery {
+            start_index: 0,
+            limit: Some(64),
+            search_term: None,
+            category_ids: Vec::new(),
+        })
+        .await?;
+    if page.items.is_empty() {
+        return Ok(None);
+    }
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    Ok(page
+        .items
+        .iter()
+        .map(|record| live_tv_channel_record_to_json(record, &server_id))
+        .find(|item| live_tv_image_url(item).is_some()))
 }
 
 async fn find_local_item_image(
@@ -43248,6 +44079,19 @@ async fn item_image_infos(
     let metadata_entity = ensure_image_item_owner_exists(&state.db, &item_id).await?;
     let mut infos = stored_image_infos(&state, ImageOwner::Item(&item_id)).await?;
     if !image_infos_include(&infos, "Primary", 0)
+        && let Some(descriptor) =
+            resolve_user_view_primary_image(&state, &state.db.virtual_folders().await?, &item_id)
+                .await?
+    {
+        infos.push(serde_json::json!({
+            "ImageType": "Primary",
+            "ImageIndex": 0,
+            "ImageTag": descriptor.tag,
+            "Size": 0,
+            "MimeType": "image/jpeg",
+        }));
+    }
+    if !image_infos_include(&infos, "Primary", 0)
         && let Some(info) = representative_item_primary_image_info(&state, &item_id).await?
     {
         infos.push(info);
@@ -44132,7 +44976,9 @@ async fn ensure_image_item_owner_exists(
     match media_item_or_folder_by_id(db, item_id).await {
         Ok(()) => Ok(None),
         Err(error) if error.status == StatusCode::NOT_FOUND => {
-            if let Some(entity) = metadata_entity_by_stable_id(db, item_id).await? {
+            if special_user_view_collection_type_for_parent(Some(item_id)).is_some() {
+                Ok(None)
+            } else if let Some(entity) = metadata_entity_by_stable_id(db, item_id).await? {
                 Ok(Some(entity))
             } else {
                 Err(error)
@@ -44167,6 +45013,7 @@ fn broadcast_session_message(session_id: &str, mut message: serde_json::Value) {
 
 async fn broadcast_sessions_message(
     db: &Database,
+    active_sessions: &ActiveSessionRegistry,
     session_id: &str,
     user: &User,
 ) -> Result<(), ApiError> {
@@ -44175,7 +45022,7 @@ async fn broadcast_sessions_message(
         serde_json::json!({
             "MessageId": Uuid::new_v4().to_string(),
             "MessageType": "Sessions",
-            "Data": session_list_json(db, user).await?
+            "Data": session_list_json(db, user, Some(active_sessions), None).await?
         }),
     );
     Ok(())
@@ -44183,10 +45030,11 @@ async fn broadcast_sessions_message(
 
 async fn broadcast_sessions_message_to_user_owned_sessions(
     db: &Database,
+    active_sessions: &ActiveSessionRegistry,
     user: &User,
     exclude_session_id: Option<&str>,
 ) -> Result<(), ApiError> {
-    let data = session_list_json(db, user).await?;
+    let data = session_list_json(db, user, Some(active_sessions), None).await?;
     for session in db
         .device_sessions()
         .await?
@@ -44210,6 +45058,7 @@ async fn broadcast_sessions_message_to_user_owned_sessions(
 
 async fn websocket(
     State(state): State<AppState>,
+    Extension(active_sessions): Extension<Arc<ActiveSessionRegistry>>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
@@ -44222,14 +45071,25 @@ async fn websocket(
 
     match ws {
         Ok(ws) => ws
-            .on_upgrade(move |socket| handle_websocket(socket, state, user, session_id))
+            .on_upgrade(move |socket| {
+                handle_websocket(socket, state, user, session_id, active_sessions)
+            })
             .into_response(),
         Err(rejection) => rejection.into_response(),
     }
 }
 
-async fn handle_websocket(mut socket: WebSocket, state: AppState, user: User, session_id: String) {
-    let _ = socket
+async fn handle_websocket(
+    mut socket: WebSocket,
+    state: AppState,
+    user: User,
+    session_id: String,
+    active_sessions: Arc<ActiveSessionRegistry>,
+) {
+    // Subscribe before advertising this session as controllable so a command
+    // sent immediately after discovery is already buffered for this socket.
+    let mut receiver = subscribe_playback_events();
+    if socket
         .send(Message::Text(
             serde_json::json!({
                 "MessageId": Uuid::new_v4().to_string(),
@@ -44239,8 +45099,12 @@ async fn handle_websocket(mut socket: WebSocket, state: AppState, user: User, se
             .to_string()
             .into(),
         ))
-        .await;
-    let mut receiver = subscribe_playback_events();
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _active_connection = active_sessions.connect(session_id.clone());
     loop {
         tokio::select! {
             event = receiver.recv() => {
@@ -44263,7 +45127,14 @@ async fn handle_websocket(mut socket: WebSocket, state: AppState, user: User, se
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         if should_send_sessions_message(&text) {
-                            let sessions = match session_list_json(&state.db, &user).await {
+                            let sessions = match session_list_json(
+                                &state.db,
+                                &user,
+                                Some(&active_sessions),
+                                None,
+                            )
+                            .await
+                            {
                                 Ok(sessions) => sessions,
                                 Err(_) => break,
                             };
@@ -44487,10 +45358,8 @@ fn startup_config_to_dto(config: StartupConfig) -> StartupConfigurationDto {
 }
 
 async fn user_to_dto(db: &Database, user: &User, server_id: Uuid) -> Result<UserDto, ApiError> {
-    let configuration = db
-        .user_configuration(user.id)
-        .await?
-        .unwrap_or_else(default_user_configuration);
+    let configuration = db.user_configuration(user.id).await?;
+    let configuration = user_configuration_with_defaults(configuration)?;
     let has_configured_password = db.user_has_password(user.id).await?;
     Ok(UserDto {
         id: user.id,
@@ -44562,9 +45431,9 @@ async fn authentication_result_to_dto(
     Ok(AuthenticationResultDto {
         user: user_to_dto(db, user, server_id).await?,
         session_info: SessionInfoDto {
-            play_state: None,
+            play_state: Some(default_active_playback_state_json()),
             additional_users: Vec::new(),
-            capabilities: None,
+            capabilities: Some(default_session_capabilities()),
             remote_end_point: None,
             playable_media_types: Vec::new(),
             id: token.access_token.clone(),
@@ -44584,7 +45453,7 @@ async fn authentication_result_to_dto(
             is_active: true,
             supports_media_control: false,
             supports_remote_control: false,
-            now_playing_queue: None,
+            now_playing_queue: Some(Vec::new()),
             has_custom_device_name: false,
             playlist_item_id: None,
             server_id,
@@ -44602,8 +45471,12 @@ fn session_to_json(
     active_viewing: Option<&ActiveViewingSession>,
     additional_users: &[ActiveSessionUser],
     server_id: &str,
+    is_active: bool,
 ) -> serde_json::Value {
-    let capabilities = session.capabilities.as_ref();
+    let capabilities = session
+        .capabilities
+        .clone()
+        .unwrap_or_else(default_session_capabilities);
     let additional_users = additional_users
         .iter()
         .map(|user| {
@@ -44614,7 +45487,8 @@ fn session_to_json(
         })
         .collect::<Vec<_>>();
     let last_activity_date = format_time_for_json(session.last_activity_at);
-    let supports_media_control = capability_bool(capabilities, "SupportsMediaControl");
+    let supports_media_control =
+        is_active && capability_bool(Some(&capabilities), "SupportsMediaControl");
     serde_json::json!({
         "Id": session.access_token,
         "UserId": session.user_id,
@@ -44627,19 +45501,21 @@ fn session_to_json(
         "DeviceType": null,
         "DeviceId": session.device_id,
         "ApplicationVersion": session.version,
-        "IsActive": true,
+        "IsActive": is_active,
         "SupportsMediaControl": supports_media_control,
-        "SupportsRemoteControl": capability_bool(capabilities, "SupportsRemoteControl")
-            || supports_media_control,
-        "PlayableMediaTypes": capability_array(capabilities, "PlayableMediaTypes"),
-        "SupportedCommands": capability_array(capabilities, "SupportedCommands"),
-        "Capabilities": capabilities.cloned(),
+        "SupportsRemoteControl": supports_media_control,
+        "PlayableMediaTypes": capability_array(Some(&capabilities), "PlayableMediaTypes"),
+        "SupportedCommands": capability_array(Some(&capabilities), "SupportedCommands"),
+        "Capabilities": capabilities,
         "RemoteEndPoint": null,
         "NowPlayingItem": active_playback.map(|playback| media_item_to_json(&playback.item, server_id)),
-        "PlayState": active_playback.map(active_playback_state_json),
+        "PlayState": active_playback
+            .map(active_playback_state_json)
+            .unwrap_or_else(default_active_playback_state_json),
         "NowViewingItem": active_viewing.map(|viewing| media_item_to_json(&viewing.item, server_id)),
         "TranscodingInfo": null,
-        "NowPlayingQueue": null,
+        "NowPlayingQueue": [],
+        "NowPlayingQueueFullItems": [],
         "HasCustomDeviceName": false,
         "PlaylistItemId": null,
         "ServerId": server_id,
@@ -44679,6 +45555,23 @@ fn active_playback_state_json(playback: &ActivePlaybackSession) -> serde_json::V
     })
 }
 
+fn default_active_playback_state_json() -> serde_json::Value {
+    serde_json::json!({
+        "PositionTicks": null,
+        "CanSeek": false,
+        "IsPaused": false,
+        "IsMuted": false,
+        "VolumeLevel": null,
+        "AudioStreamIndex": null,
+        "SubtitleStreamIndex": null,
+        "MediaSourceId": null,
+        "PlayMethod": null,
+        "RepeatMode": "RepeatNone",
+        "PlaybackOrder": "Default",
+        "LiveStreamId": null,
+    })
+}
+
 async fn require_user(
     db: &Database,
     headers: &HeaderMap,
@@ -44687,12 +45580,38 @@ async fn require_user(
     let token = bearer_token(headers)
         .or_else(|| query_token.map(ToOwned::to_owned))
         .ok_or_else(|| ApiError::unauthorized("Missing token"))?;
-    match db.user_by_token(&token).await {
-        Ok(auth) => Ok(auth),
-        Err(_) => db
-            .user_by_api_key(&token)
-            .await
-            .map_err(|_| ApiError::unauthorized("Invalid token")),
+
+    if let Some(auth) = db
+        .find_user_by_token(&token)
+        .await
+        .map_err(authentication_lookup_error)?
+    {
+        return Ok(auth);
+    }
+
+    db.find_user_by_api_key(&token)
+        .await
+        .map_err(authentication_lookup_error)?
+        .ok_or_else(|| ApiError::unauthorized("Invalid token"))
+}
+
+fn authentication_lookup_error(error: anyhow::Error) -> ApiError {
+    let retryable = error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::PoolTimedOut) => true,
+            Some(sqlx::Error::Database(database_error)) => database_error
+                .code()
+                .and_then(|code| code.parse::<i64>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+            _ => false,
+        });
+    tracing::error!(error = ?error, retryable, "authentication credential lookup failed");
+
+    if retryable {
+        ApiError::service_unavailable("Authentication temporarily unavailable")
+    } else {
+        ApiError::internal("Authentication backend failed")
     }
 }
 
@@ -44941,25 +45860,25 @@ mod tests {
     use super::{
         AUTH_LOCKOUT_FAILURE_LIMIT, ApiError, AppState, COMPATIBLE_SERVER_VERSION,
         DEFAULT_AUTHENTICATION_PROVIDER_ID, DEFAULT_PASSWORD_RESET_PROVIDER_ID,
-        DirectPlayProfileMatcher, ItemsQuery, LiveHlsSessionEntry, LiveTunerLease,
+        DirectPlayProfileMatcher, ImageOwner, ItemsQuery, LiveHlsSessionEntry, LiveTunerLease,
         LiveTunerLeaseKey, LiveTvTimerSchedulerRun, PACKAGE_REPOSITORIES_REFRESH_TASK_KEY,
-        PackageListQuery, PlaybackReportOutcome, SUBTITLE_JSON_FALLBACK_WINDOW_TICKS,
-        SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand, TvMazeExternals, TvMazeImage,
-        TvMazeNetwork, TvMazeRating, TvMazeSchedule, TvMazeShow,
-        activate_dotnet_plugin_with_host_path, activate_rust_wasi_plugin_with_host_path,
-        await_package_install_cancelable, backup_restore_snapshot_json,
-        cascade_delete_series_timer_timers, cleanup_hls_transcode_files,
-        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
-        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
-        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
-        enrich_media_streams_with_context, ensure_package_install_not_cancelled,
-        external_id_infos_for_item_type, filter_package_list, format_time_for_json,
-        get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
-        hls_segment_ticks, hls_transcode_dedupe_key, hls_transcode_session_input_path,
-        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
-        live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
-        live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_m3u_channels_from_payload,
-        live_tv_recording_name, live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
+        PackageListQuery, PlaybackReportOutcome, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
+        SystemLifecycleCommand, TvMazeExternals, TvMazeImage, TvMazeNetwork, TvMazeRating,
+        TvMazeSchedule, TvMazeShow, activate_dotnet_plugin_with_host_path,
+        activate_rust_wasi_plugin_with_host_path, await_package_install_cancelable,
+        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
+        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes, default_audio_stream_index, default_live_tv_configuration,
+        default_subtitle_stream_index, default_user_configuration, direct_play_profile_matches,
+        encoding_configuration_json, enrich_media_streams_with_context,
+        ensure_package_install_not_cancelled, external_id_infos_for_item_type, filter_package_list,
+        format_time_for_json, get_valid_filename, hdhomerun_bool_field,
+        hls_effective_start_position_ticks, hls_segment_ticks, hls_transcode_dedupe_key,
+        hls_transcode_session_input_path, is_live_tv_channel_id, json_string_field, json_value_i64,
+        last_system_lifecycle_command, live_hls_session_registry, live_tv_channel_is_remote,
+        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
+        live_tv_m3u_channels_from_payload, live_tv_recording_name,
+        live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
         metadata_editor_parental_rating_options, normalize_media_stream,
         package_infos_from_repositories, package_install_task_key, paged_media_items,
@@ -44971,7 +45890,7 @@ mod tests {
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
         record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start, router,
         run_due_live_tv_timers, scan_all_library_items, series_timer_child_id,
-        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        spawn_hls_transcode_task, stable_entity_id, store_image_bytes, subscribe_playback_events,
         subscribe_system_lifecycle_commands, subtitle_vtt_to_track_events_json,
         syncplay_cleanup_stale_participants, syncplay_groups, transcode_dedupe_lock,
         transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
@@ -48426,6 +49345,12 @@ done
         let token = result["AccessToken"].as_str().unwrap();
         assert!(!token.is_empty());
         assert_eq!(result["User"]["Name"], "admin");
+        assert_eq!(
+            result["User"]["Configuration"]["CastReceiverId"],
+            "F007D354"
+        );
+        assert!(result["SessionInfo"]["Capabilities"].is_object());
+        assert_eq!(result["SessionInfo"]["NowPlayingQueue"], json!([]));
 
         let response = app
             .clone()
@@ -48471,6 +49396,15 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let system_info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            system_info["CastReceiverApplications"],
+            json!([
+                { "Id": "F007D354", "Name": "Stable" },
+                { "Id": "6F511C87", "Name": "Unstable" }
+            ])
+        );
 
         let response = app
             .clone()
@@ -48506,7 +49440,10 @@ done
             .unwrap();
         assert_eq!(session["UserName"], "admin");
         assert_eq!(session["Client"], "Jellyfin Web");
-        assert_eq!(session["IsActive"], true);
+        assert_eq!(session["IsActive"], false);
+        assert!(session["Capabilities"].is_object());
+        assert_eq!(session["Capabilities"]["SupportedCommands"], json!([]));
+        assert_eq!(session["NowPlayingQueue"], json!([]));
     }
 
     #[tokio::test]
@@ -48599,6 +49536,127 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn valid_credentials_are_not_rejected_when_sqlite_writer_is_busy() {
+        let storage_root = tempfile::tempdir().unwrap();
+        let database_path = storage_root.path().join("auth-lock.sqlite");
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.to_string_lossy());
+        let db = Database::connect(&database_url).await.unwrap();
+        let user = db
+            .update_first_user("android-user".to_string(), "secret")
+            .await
+            .unwrap();
+        let (_, token) = db
+            .issue_device_token_for_user(
+                user.id,
+                "android-device",
+                "Android",
+                "Jellyfin Android",
+                "2.6.3",
+            )
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "android-api-key")
+            .await
+            .unwrap();
+        db.server_state().await.unwrap();
+
+        let mut connections = Vec::new();
+        for _ in 0..5 {
+            connections.push(db.pool().acquire().await.unwrap());
+        }
+        let mut writer = connections.pop().unwrap();
+        drop(connections);
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let mut results = Vec::new();
+        for (kind, credential) in [
+            ("session token", token.access_token.as_str()),
+            ("API key", api_key.as_str()),
+        ] {
+            let started = std::time::Instant::now();
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/System/Info")
+                        .header("X-Emby-Token", credential)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            results.push((kind, started.elapsed(), response));
+        }
+
+        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        for (kind, elapsed, response) in results {
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "valid {kind} failed after {elapsed:?}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{kind} authentication waited for the SQLite busy timeout: {elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_distinguishes_unknown_credentials_from_backend_failures() {
+        let retryable_error =
+            super::authentication_lookup_error(anyhow::Error::new(sqlx::Error::PoolTimedOut));
+        assert_eq!(retryable_error.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Info")
+                    .header("X-Emby-Token", "unknown-credential")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        db.pool().close().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Info")
+                    .header("X-Emby-Token", "unknown-credential")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -54697,7 +55755,14 @@ done
         assert_eq!(fallback_programs["TotalRecordCount"], 1);
         assert_eq!(fallback_programs["Items"].as_array().unwrap().len(), 1);
         assert_eq!(fallback_programs["Items"][0]["Type"], "Program");
-        assert_eq!(fallback_programs["Items"][0]["ChannelId"], "xtream_1");
+        assert_eq!(
+            fallback_programs["Items"][0]["ChannelId"],
+            Value::String(crate::live_tv_channel_public_id("xtream_1"))
+        );
+        assert_eq!(
+            fallback_programs["Items"][0]["JellyrinChannelId"],
+            "xtream_1"
+        );
         assert_eq!(fallback_programs["Items"][0]["ChannelName"], "News HD");
         assert_eq!(fallback_programs["Items"][0]["IsLive"], true);
         assert_eq!(fallback_programs["Items"][0]["IsNews"], true);
@@ -54721,7 +55786,11 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let movie_programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(movie_programs["TotalRecordCount"], 1);
-        assert_eq!(movie_programs["Items"][0]["ChannelId"], "xtream_2");
+        assert_eq!(
+            movie_programs["Items"][0]["ChannelId"],
+            Value::String(crate::live_tv_channel_public_id("xtream_2"))
+        );
+        assert_eq!(movie_programs["Items"][0]["JellyrinChannelId"], "xtream_2");
         assert_eq!(movie_programs["Items"][0]["IsMovie"], true);
 
         for endpoint in [
@@ -54745,7 +55814,12 @@ done
             let program: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(program["Id"], fallback_program_id, "{endpoint}");
             assert_eq!(program["Type"], "Program", "{endpoint}");
-            assert_eq!(program["ChannelId"], "xtream_1", "{endpoint}");
+            assert_eq!(
+                program["ChannelId"],
+                Value::String(crate::live_tv_channel_public_id("xtream_1")),
+                "{endpoint}"
+            );
+            assert_eq!(program["JellyrinChannelId"], "xtream_1", "{endpoint}");
         }
 
         let response = app
@@ -54860,6 +55934,48 @@ done
             );
             assert_eq!(filters["Tags"], json!([]), "{endpoint}");
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Users/AuthenticateByName")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        r#"MediaBrowser Client="Jellyfin TV", Device="Remote TV", DeviceId="livetv-remote-tv", Version="dev""#,
+                    )
+                    .body(Body::from(
+                        json!({ "Username": "admin", "Pw": "secret" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let remote_token = login["AccessToken"].as_str().unwrap();
+        let channel_id = crate::live_tv_channel_public_id("xtream_1");
+        let mut playback_events = subscribe_playback_events();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Sessions/{remote_token}/Playing?PlayCommand=PlayNow&ItemIds={channel_id}"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let play_event = next_playback_event_type(&mut playback_events, remote_token, "Play").await;
+        assert_eq!(play_event["Data"]["ItemIds"], json!([channel_id]));
+        assert_eq!(play_event["Data"]["PlayCommand"], "PlayNow");
     }
 
     #[tokio::test]
@@ -54953,7 +56069,13 @@ done
         assert_eq!(channels["TotalRecordCount"], 2);
         assert_eq!(channels["StartIndex"], 1);
         assert_eq!(channels["Items"].as_array().unwrap().len(), 1);
-        assert_eq!(channels["Items"][0]["Id"], "xtream_2");
+        // The public channel Id is the stable Jellyfin-style UUID derived from
+        // the raw channel id; the raw id is preserved in JellyrinChannelId.
+        assert_eq!(
+            channels["Items"][0]["Id"],
+            Value::String(crate::live_tv_channel_public_id("xtream_2"))
+        );
+        assert_eq!(channels["Items"][0]["JellyrinChannelId"], "xtream_2");
 
         let response = app
             .clone()
@@ -55067,7 +56189,14 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(programs["TotalRecordCount"], 2);
-        assert_eq!(programs["Items"][0]["Id"], "fallback-program-xtream-2");
+        assert_eq!(
+            programs["Items"][0]["Id"],
+            Value::String(crate::live_tv_fallback_program_public_id("xtream_2"))
+        );
+        assert_eq!(
+            programs["Items"][0]["JellyrinProgramId"],
+            "fallback-program-xtream-2"
+        );
 
         let response = app
             .clone()
@@ -55088,6 +56217,10 @@ done
         assert_eq!(filtered_programs["TotalRecordCount"], 1);
         assert_eq!(
             filtered_programs["Items"][0]["Id"],
+            Value::String(crate::live_tv_fallback_program_public_id("xtream_2"))
+        );
+        assert_eq!(
+            filtered_programs["Items"][0]["JellyrinProgramId"],
             "fallback-program-xtream-2"
         );
 
@@ -55108,6 +56241,10 @@ done
         assert_eq!(movie_programs["TotalRecordCount"], 1);
         assert_eq!(
             movie_programs["Items"][0]["Id"],
+            Value::String(crate::live_tv_fallback_program_public_id("xtream_2"))
+        );
+        assert_eq!(
+            movie_programs["Items"][0]["JellyrinProgramId"],
             "fallback-program-xtream-2"
         );
         assert_eq!(movie_programs["Items"][0]["IsMovie"], true);
@@ -55127,7 +56264,14 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let news_programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(news_programs["TotalRecordCount"], 1);
-        assert_eq!(news_programs["Items"][0]["Id"], "fallback-program-xtream-1");
+        assert_eq!(
+            news_programs["Items"][0]["Id"],
+            Value::String(crate::live_tv_fallback_program_public_id("xtream_1"))
+        );
+        assert_eq!(
+            news_programs["Items"][0]["JellyrinProgramId"],
+            "fallback-program-xtream-1"
+        );
         assert_eq!(news_programs["Items"][0]["IsNews"], true);
 
         let response = app
@@ -55145,7 +56289,11 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let program: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(program["Type"], "Program");
-        assert_eq!(program["ChannelId"], "xtream_2");
+        assert_eq!(
+            program["ChannelId"],
+            Value::String(crate::live_tv_channel_public_id("xtream_2"))
+        );
+        assert_eq!(program["JellyrinChannelId"], "xtream_2");
 
         let response = app
             .clone()
@@ -55161,8 +56309,16 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let channel_detail: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(channel_detail["Id"], "xtream_2");
-        assert_eq!(channel_detail["Type"], "TvChannel");
+        assert_eq!(
+            channel_detail["Id"],
+            Value::String(crate::live_tv_fallback_program_public_id("xtream_2"))
+        );
+        assert_eq!(
+            channel_detail["JellyrinProgramId"],
+            "fallback-program-xtream-2"
+        );
+        assert_eq!(channel_detail["JellyrinChannelId"], "xtream_2");
+        assert_eq!(channel_detail["Type"], "Program");
         assert_eq!(
             channel_detail["MediaSources"][0]["DirectStreamUrl"],
             "/LiveTv/LiveStreamFiles/xtream_2/stream.ts"
@@ -55344,6 +56500,15 @@ done
             log_dir: ".".into(),
             local_address: "http://127.0.0.1:8097".to_string(),
         });
+        let channel_1_public_id = crate::live_tv_channel_public_id("channel-1");
+        let channel_2_public_id = crate::live_tv_channel_public_id("channel-2");
+        let program_1_public_id = crate::live_tv_client_uuid_id("LiveTvProgram", "program-1");
+        let program_2_public_id = crate::live_tv_client_uuid_id("LiveTvProgram", "program-2");
+        let recording_1_public_id = crate::live_tv_client_uuid_id("LiveTvRecording", "recording-1");
+        let recording_2_public_id = crate::live_tv_client_uuid_id("LiveTvRecording", "recording-2");
+        let timer_1_public_id = crate::live_tv_client_uuid_id("LiveTvTimer", "timer-1");
+        let series_timer_1_public_id =
+            crate::live_tv_client_uuid_id("LiveTvSeriesTimer", "series-timer-1");
 
         let response = app
             .clone()
@@ -55953,7 +57118,7 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let options: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(options["TunerChannels"].as_array().unwrap().len(), 2);
-        assert_eq!(options["TunerChannels"][0]["Id"], "channel-1");
+        assert_eq!(options["TunerChannels"][0]["Id"], channel_1_public_id);
         assert!(options["ProviderChannels"].as_array().unwrap().is_empty());
         assert!(options["Mappings"].as_array().unwrap().is_empty());
         assert_eq!(options["ProviderName"], "xmltv");
@@ -56095,7 +57260,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let channels: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channels["TotalRecordCount"], 2);
-        assert_eq!(channels["Items"][0]["Id"], "channel-1");
+        assert_eq!(channels["Items"][0]["Id"], channel_1_public_id);
+        assert_eq!(channels["Items"][0]["JellyrinChannelId"], "channel-1");
         assert_eq!(channels["Items"][0]["Type"], "TvChannel");
         assert_eq!(channels["Items"][0]["TunerHostId"], "tuner-1");
         assert_eq!(channels["Items"][0]["MediaSources"][0]["Id"], "channel-1");
@@ -56276,7 +57442,14 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let searched_channel_items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(searched_channel_items["TotalRecordCount"], 1);
-        assert_eq!(searched_channel_items["Items"][0]["Id"], "channel-1");
+        assert_eq!(
+            searched_channel_items["Items"][0]["Id"],
+            channel_1_public_id
+        );
+        assert_eq!(
+            searched_channel_items["Items"][0]["JellyrinChannelId"],
+            "channel-1"
+        );
         assert_eq!(searched_channel_items["Items"][0]["ChannelId"], "livetv");
 
         let response = app
@@ -56312,7 +57485,14 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let latest_searched_channel_items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(latest_searched_channel_items["TotalRecordCount"], 1);
-        assert_eq!(latest_searched_channel_items["Items"][0]["Id"], "channel-2");
+        assert_eq!(
+            latest_searched_channel_items["Items"][0]["Id"],
+            channel_2_public_id
+        );
+        assert_eq!(
+            latest_searched_channel_items["Items"][0]["JellyrinChannelId"],
+            "channel-2"
+        );
         assert_eq!(
             latest_searched_channel_items["Items"][0]["ChannelId"],
             "livetv"
@@ -56352,7 +57532,7 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let live_stream: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(live_stream["LiveStreamId"], "channel-1");
+        assert_eq!(live_stream["LiveStreamId"], channel_1_public_id);
         assert_eq!(live_stream["MediaSource"]["Id"], "channel-1");
         assert_eq!(live_stream["MediaSource"]["SupportsDirectPlay"], true);
         assert_eq!(
@@ -56440,7 +57620,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(programs["TotalRecordCount"], 1);
-        assert_eq!(programs["Items"][0]["Id"], "program-1");
+        assert_eq!(programs["Items"][0]["Id"], program_1_public_id);
+        assert_eq!(programs["Items"][0]["JellyrinProgramId"], "program-1");
         assert_eq!(programs["Items"][0]["ChannelName"], "News HD");
 
         let response = app
@@ -56491,11 +57672,13 @@ done
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let program: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(program["Id"], "program-1", "{endpoint}");
+            assert_eq!(program["Id"], program_1_public_id, "{endpoint}");
+            assert_eq!(program["JellyrinProgramId"], "program-1", "{endpoint}");
             assert_eq!(program["Name"], "Morning News", "{endpoint}");
             assert_eq!(program["Type"], "Program", "{endpoint}");
             assert_eq!(program["MediaType"], "Video", "{endpoint}");
-            assert_eq!(program["ChannelId"], "channel-1", "{endpoint}");
+            assert_eq!(program["ChannelId"], channel_1_public_id, "{endpoint}");
+            assert_eq!(program["JellyrinChannelId"], "channel-1", "{endpoint}");
             assert_eq!(program["ChannelName"], "News HD", "{endpoint}");
             assert_eq!(program["StartDate"], "2026-05-26T08:00:00Z", "{endpoint}");
             assert_eq!(program["EndDate"], "2026-05-26T09:00:00Z", "{endpoint}");
@@ -56548,14 +57731,25 @@ done
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let recommended: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(recommended["TotalRecordCount"], 2, "{endpoint}");
-            assert_eq!(recommended["Items"][0]["Id"], "program-1", "{endpoint}");
+            assert_eq!(
+                recommended["Items"][0]["Id"], program_1_public_id,
+                "{endpoint}"
+            );
+            assert_eq!(
+                recommended["Items"][0]["JellyrinProgramId"], "program-1",
+                "{endpoint}"
+            );
             assert_eq!(
                 recommended["Items"][0]["Name"], "Morning News",
                 "{endpoint}"
             );
             assert_eq!(recommended["Items"][0]["Type"], "Program", "{endpoint}");
             assert_eq!(
-                recommended["Items"][0]["ChannelId"], "channel-1",
+                recommended["Items"][0]["ChannelId"], channel_1_public_id,
+                "{endpoint}"
+            );
+            assert_eq!(
+                recommended["Items"][0]["JellyrinChannelId"], "channel-1",
                 "{endpoint}"
             );
             assert_eq!(
@@ -56599,7 +57793,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let recordings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(recordings["TotalRecordCount"], 2);
-        assert_eq!(recordings["Items"][0]["Id"], "recording-2");
+        assert_eq!(recordings["Items"][0]["Id"], recording_2_public_id);
+        assert_eq!(recordings["Items"][0]["JellyrinRecordingId"], "recording-2");
         assert_eq!(recordings["Items"][0]["Type"], "Recording");
         assert_eq!(recordings["Items"][0]["ChannelName"], "Movies");
 
@@ -56633,11 +57828,16 @@ done
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let recording: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(recording["Id"], "recording-1", "{endpoint}");
+            assert_eq!(recording["Id"], recording_1_public_id, "{endpoint}");
+            assert_eq!(
+                recording["JellyrinRecordingId"], "recording-1",
+                "{endpoint}"
+            );
             assert_eq!(recording["Name"], "Morning News", "{endpoint}");
             assert_eq!(recording["Type"], "Recording", "{endpoint}");
             assert_eq!(recording["MediaType"], "Video", "{endpoint}");
-            assert_eq!(recording["ChannelId"], "channel-1", "{endpoint}");
+            assert_eq!(recording["ChannelId"], channel_1_public_id, "{endpoint}");
+            assert_eq!(recording["JellyrinChannelId"], "channel-1", "{endpoint}");
             assert_eq!(recording["ChannelName"], "News HD", "{endpoint}");
             assert_eq!(recording["Status"], "Completed", "{endpoint}");
             assert_eq!(recording["SeriesName"], "Morning News", "{endpoint}");
@@ -56665,37 +57865,37 @@ done
             (
                 "/LiveTv/Recordings/Folders",
                 "Movies",
-                "RecordingFolder",
+                "CollectionFolder",
                 "movies",
             ),
             (
                 "/livetv/recordings/folders",
                 "Movies",
-                "RecordingFolder",
+                "CollectionFolder",
                 "movies",
             ),
             (
                 "/livetv/recordings/groups",
                 "Morning News",
-                "RecordingGroup",
+                "Folder",
                 "morning-news",
             ),
             (
                 "/LiveTv/Recordings/Series",
                 "Morning News",
-                "RecordingSeries",
+                "Folder",
                 "morning-news",
             ),
             (
                 "/livetv/recordings/series",
                 "Morning News",
-                "RecordingSeries",
+                "Folder",
                 "morning-news",
             ),
             (
                 "/LiveTv/RecordingGroups",
                 "Morning News",
-                "RecordingGroup",
+                "Folder",
                 "morning-news",
             ),
         ] {
@@ -56732,7 +57932,28 @@ done
                 .iter()
                 .find(|group| group["Name"] == expected_name)
                 .unwrap_or_else(|| panic!("{endpoint} missing {expected_name}"));
-            assert_eq!(group["Id"], expected_id, "{endpoint}");
+            let group_type = if endpoint.to_ascii_lowercase().contains("folders") {
+                "Folder"
+            } else if endpoint.to_ascii_lowercase().contains("series") {
+                "Series"
+            } else {
+                "Group"
+            };
+            assert_eq!(
+                group["Id"],
+                Value::String(crate::live_tv_stable_client_uuid_id(
+                    &format!("LiveTvRecording{group_type}"),
+                    expected_name
+                )),
+                "{endpoint}"
+            );
+            assert_eq!(group["JellyrinGroupId"], expected_id, "{endpoint}");
+            assert!(
+                group["ServerId"]
+                    .as_str()
+                    .is_some_and(|server_id| !server_id.is_empty()),
+                "{endpoint}"
+            );
             assert_eq!(group["Type"], expected_type, "{endpoint}");
             assert_eq!(group["IsFolder"], true, "{endpoint}");
             assert_eq!(group["ChildCount"], 1, "{endpoint}");
@@ -56927,7 +58148,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let recordings: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(recordings["TotalRecordCount"], 1);
-        assert_eq!(recordings["Items"][0]["Id"], "recording-1");
+        assert_eq!(recordings["Items"][0]["Id"], recording_1_public_id);
+        assert_eq!(recordings["Items"][0]["JellyrinRecordingId"], "recording-1");
 
         let response = app
             .clone()
@@ -57050,7 +58272,12 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let timer: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(timer["Id"], "timer-1");
+        assert_eq!(timer["Id"], timer_1_public_id);
+        assert_eq!(timer["JellyrinTimerId"], "timer-1");
+        assert_eq!(timer["ProgramId"], program_1_public_id);
+        assert_eq!(timer["JellyrinProgramId"], "program-1");
+        assert_eq!(timer["ChannelId"], channel_1_public_id);
+        assert_eq!(timer["JellyrinChannelId"], "channel-1");
         assert_eq!(timer["Name"], "Evening News");
         assert_eq!(timer["IsSeries"], false);
 
@@ -57069,7 +58296,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let timers: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(timers["TotalRecordCount"], 1);
-        assert_eq!(timers["Items"][0]["Id"], "timer-1");
+        assert_eq!(timers["Items"][0]["Id"], timer_1_public_id);
+        assert_eq!(timers["Items"][0]["JellyrinTimerId"], "timer-1");
 
         let response = app
             .clone()
@@ -57094,7 +58322,10 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let updated_timer: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(updated_timer["Id"], "timer-1");
+        assert_eq!(updated_timer["Id"], timer_1_public_id);
+        assert_eq!(updated_timer["JellyrinTimerId"], "timer-1");
+        assert_eq!(updated_timer["ProgramId"], program_2_public_id);
+        assert_eq!(updated_timer["JellyrinProgramId"], "program-2");
         assert_eq!(updated_timer["Name"], "Late News");
         assert_eq!(updated_timer["PostPaddingSeconds"], 45);
 
@@ -57133,7 +58364,8 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let series_timer: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(series_timer["Id"], "series-timer-1");
+        assert_eq!(series_timer["Id"], series_timer_1_public_id);
+        assert_eq!(series_timer["JellyrinTimerId"], "series-timer-1");
         assert_eq!(series_timer["IsSeries"], true);
 
         let response = app
@@ -57151,7 +58383,11 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let series_timers: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(series_timers["TotalRecordCount"], 1);
-        assert_eq!(series_timers["Items"][0]["Id"], "series-timer-1");
+        assert_eq!(series_timers["Items"][0]["Id"], series_timer_1_public_id);
+        assert_eq!(
+            series_timers["Items"][0]["JellyrinTimerId"],
+            "series-timer-1"
+        );
 
         for endpoint in [
             "/LiveTv/Timers/timer-1",
@@ -59953,7 +61189,11 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let channels: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channels["TotalRecordCount"], 1);
-        assert_eq!(channels["Items"][0]["Id"], "channel-1");
+        assert_eq!(
+            channels["Items"][0]["Id"],
+            Value::String(crate::live_tv_channel_public_id("channel-1"))
+        );
+        assert_eq!(channels["Items"][0]["JellyrinChannelId"], "channel-1");
         assert_eq!(channels["Items"][0]["Name"], "News HD");
         assert_eq!(
             channels["Items"][0]["MediaSources"][0]["SupportsDirectPlay"],
@@ -59976,6 +61216,11 @@ done
         let programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(programs["TotalRecordCount"], 1);
         assert_eq!(programs["Items"][0]["Name"], "Morning News");
+        assert_eq!(
+            programs["Items"][0]["ChannelId"],
+            Value::String(crate::live_tv_channel_public_id("channel-1"))
+        );
+        assert_eq!(programs["Items"][0]["JellyrinChannelId"], "channel-1");
         assert_eq!(programs["Items"][0]["ChannelName"], "News HD");
 
         let response = app
@@ -61888,6 +63133,100 @@ done
     }
 
     #[tokio::test]
+    async fn session_list_defaults_and_controllable_filter_follow_websocket_presence() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let (_, token) = db
+            .issue_device_token_for_user(user.id, "remote-tv", "Remote TV", "Jellyfin TV", "dev")
+            .await
+            .unwrap();
+        let registry = std::sync::Arc::new(crate::ActiveSessionRegistry::default());
+
+        let sessions = crate::session_list_json(&db, &user, Some(&registry), None)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0]["Capabilities"].is_object());
+        assert_eq!(sessions[0]["Capabilities"]["SupportedCommands"], json!([]));
+        assert_eq!(sessions[0]["NowPlayingQueue"], json!([]));
+        assert_eq!(sessions[0]["IsActive"], false);
+
+        db.update_device_capabilities(
+            &token.access_token,
+            json!({
+                "PlayableMediaTypes": ["Video"],
+                "SupportedCommands": ["DisplayContent"],
+                "SupportsMediaControl": true
+            }),
+        )
+        .await
+        .unwrap();
+        let query = crate::SessionsQuery {
+            controllable_by_user_id: Some(user.id.to_string()),
+            device_id: Some("remote-tv".to_string()),
+            active_within_seconds: Some(60),
+            ..Default::default()
+        };
+        let sessions = crate::session_list_json(&db, &user, Some(&registry), Some(&query))
+            .await
+            .unwrap();
+        assert!(sessions.is_empty());
+
+        let connection = registry.connect(token.access_token.clone());
+        let sessions = crate::session_list_json(&db, &user, Some(&registry), Some(&query))
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["IsActive"], true);
+        assert_eq!(sessions[0]["SupportsMediaControl"], true);
+        assert_eq!(sessions[0]["SupportsRemoteControl"], true);
+
+        let mut events = crate::subscribe_playback_events();
+        crate::broadcast_sessions_message(&db, &registry, &token.access_token, &user)
+            .await
+            .unwrap();
+        let event = next_playback_event_type(&mut events, &token.access_token, "Sessions").await;
+        assert_eq!(event["Data"][0]["IsActive"], true);
+        assert_eq!(event["Data"][0]["SupportsRemoteControl"], true);
+
+        let wrong_device_query = crate::SessionsQuery {
+            device_id: Some("another-device".to_string()),
+            ..Default::default()
+        };
+        let sessions =
+            crate::session_list_json(&db, &user, Some(&registry), Some(&wrong_device_query))
+                .await
+                .unwrap();
+        assert!(sessions.is_empty());
+
+        drop(connection);
+
+        let sessions = crate::session_list_json(&db, &user, Some(&registry), Some(&query))
+            .await
+            .unwrap();
+        assert!(sessions.is_empty());
+
+        sqlx::query(
+            "UPDATE devices SET last_activity_at = '2000-01-01T00:00:00Z' WHERE access_token = ?1",
+        )
+        .bind(&token.access_token)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let recent_query = crate::SessionsQuery {
+            active_within_seconds: Some(60),
+            ..Default::default()
+        };
+        let sessions = crate::session_list_json(&db, &user, Some(&registry), Some(&recent_query))
+            .await
+            .unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
     async fn session_capabilities_round_trip_to_sessions_and_devices() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -61981,7 +63320,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let sessions: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(sessions[0]["DeviceId"], "capable-device");
-        assert_eq!(sessions[0]["SupportsRemoteControl"], true);
+        assert_eq!(sessions[0]["SupportsRemoteControl"], false);
+        assert_eq!(sessions[0]["Capabilities"]["SupportsMediaControl"], true);
         assert_eq!(sessions[0]["PlayableMediaTypes"], json!(["Audio", "Video"]));
         assert_eq!(
             sessions[0]["SupportedCommands"],
@@ -62198,7 +63538,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let sessions: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(sessions[0]["DeviceId"], "query-capable");
-        assert_eq!(sessions[0]["SupportsRemoteControl"], true);
+        assert_eq!(sessions[0]["SupportsRemoteControl"], false);
+        assert_eq!(sessions[0]["Capabilities"]["SupportsMediaControl"], true);
         assert_eq!(sessions[0]["PlayableMediaTypes"], json!(["Video", "Audio"]));
         assert_eq!(
             sessions[0]["SupportedCommands"],
@@ -62705,6 +64046,31 @@ done
     #[tokio::test]
     async fn websocket_negotiates_upgrade_and_serves_sessions_messages() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.replace_live_tv_tuner_snapshot(
+            LiveTvTunerUpsert {
+                tuner_id: "socket-live-tv".to_string(),
+                provider_type: "xtream".to_string(),
+                name: "Socket Live TV".to_string(),
+                source_url: Some("http://example.invalid".to_string()),
+                configuration: json!({ "Type": "xtream" }),
+            },
+            Vec::new(),
+            vec![LiveTvChannelUpsert {
+                channel_id: "socket-channel".to_string(),
+                tuner_id: "socket-live-tv".to_string(),
+                remote_id: "1".to_string(),
+                category_id: None,
+                name: "Socket Channel".to_string(),
+                sort_name: "1".to_string(),
+                number: Some("1".to_string()),
+                stream_url: "http://example.invalid/live/1.ts".to_string(),
+                logo_url: None,
+                channel_type: "TV".to_string(),
+                metadata: json!({ "Id": "socket-channel", "Name": "Socket Channel" }),
+            }],
+        )
+        .await
+        .unwrap();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -62750,12 +64116,49 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let result: Value = serde_json::from_slice(&body).unwrap();
         let token = result["AccessToken"].as_str().unwrap();
+        let user_id = result["User"]["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/Sessions/Capabilities/Full")
+                    .header("X-Emby-Token", token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "PlayableMediaTypes": ["Audio", "Video"],
+                            "SupportedCommands": ["DisplayContent", "PlayMediaSource"],
+                            "SupportsMediaControl": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+
+        let client = reqwest::Client::new();
+        let sessions_url =
+            format!("http://{addr}/Sessions?ControllableByUserId={user_id}&DeviceId=socket-test");
+        let sessions: Value = client
+            .get(&sessions_url)
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sessions, json!([]));
 
         let (mut socket, response) = tokio_tungstenite::connect_async(format!(
             "ws://{addr}/socket?api_key={token}&deviceId=socket-test"
@@ -62775,6 +64178,44 @@ done
         assert!(message["MessageId"].is_string());
         assert_eq!(message["MessageType"], "ForceKeepAlive");
         assert_eq!(message["Data"], 60);
+
+        let sessions: Value = client
+            .get(&sessions_url)
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sessions.as_array().unwrap().len(), 1);
+        assert_eq!(sessions[0]["DeviceId"], "socket-test");
+        assert_eq!(sessions[0]["IsActive"], true);
+        assert_eq!(sessions[0]["SupportsRemoteControl"], true);
+        assert!(sessions[0]["Capabilities"].is_object());
+        assert_eq!(sessions[0]["NowPlayingQueue"], json!([]));
+
+        let channel_id = crate::live_tv_channel_public_id("socket-channel");
+        let response = client
+            .post(format!(
+                "http://{addr}/Sessions/{token}/Playing?PlayCommand=PlayNow&ItemIds={channel_id}"
+            ))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let text = socket
+            .next()
+            .await
+            .expect("expected live TV Play message")
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let play_message: Value = serde_json::from_str(text.as_ref()).unwrap();
+        assert_eq!(play_message["MessageType"], "Play");
+        assert_eq!(play_message["Data"]["PlayCommand"], "PlayNow");
+        assert_eq!(play_message["Data"]["ItemIds"], json!([channel_id]));
 
         socket
             .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -62796,8 +64237,28 @@ done
                 .as_array()
                 .is_some_and(|sessions| !sessions.is_empty())
         );
+        assert_eq!(message["Data"][0]["IsActive"], true);
+        assert_eq!(message["Data"][0]["SupportsRemoteControl"], true);
 
         socket.close(None).await.unwrap();
+        let mut disconnected = false;
+        for _ in 0..20 {
+            let sessions: Value = client
+                .get(&sessions_url)
+                .header("X-Emby-Token", token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if sessions.as_array().is_some_and(Vec::is_empty) {
+                disconnected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(disconnected, "closed WebSocket remained controllable");
         server.abort();
     }
 
@@ -63196,9 +64657,17 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let generated_group: Value = serde_json::from_slice(&body).unwrap();
-        assert_ne!(generated_group["GroupId"], group_id);
+        let generated_group_id = generated_group["GroupId"].as_str().unwrap().to_string();
+        assert_ne!(generated_group_id, group_id);
         assert_eq!(generated_group["GroupName"], generated_group_name);
         assert_eq!(generated_group["Name"], generated_group_name);
+        assert!(
+            syncplay_groups()
+                .lock()
+                .await
+                .remove(&generated_group_id)
+                .is_some()
+        );
 
         let response = app
             .clone()
@@ -65437,6 +66906,221 @@ done
     }
 
     #[tokio::test]
+    async fn user_views_only_advertise_primary_images_the_view_can_serve() {
+        let media_root = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let artwork_dir = media_root.path().join("artwork");
+        let empty_dir = media_root.path().join("empty");
+        let custom_dir = media_root.path().join("custom");
+        let web_dir = storage_root.path().join("web");
+        tokio::fs::create_dir_all(&artwork_dir).await.unwrap();
+        tokio::fs::create_dir_all(&empty_dir).await.unwrap();
+        tokio::fs::create_dir_all(&custom_dir).await.unwrap();
+        tokio::fs::create_dir_all(web_dir.join("favicons"))
+            .await
+            .unwrap();
+        let mut fallback_bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        fallback_bytes.extend(vec![0x33; 128]);
+        tokio::fs::write(
+            web_dir.join("favicons").join("touchicon512.png"),
+            &fallback_bytes,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(artwork_dir.join("Cover Movie.mp4"), b"fake movie")
+            .await
+            .unwrap();
+        let mut poster_bytes = b"\xff\xd8\xff\xe0".to_vec();
+        poster_bytes.extend(vec![0x55; 128]);
+        poster_bytes.extend(b"\xff\xd9");
+        tokio::fs::write(artwork_dir.join("Cover Movie-poster.jpg"), &poster_bytes)
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "user-view-image-test")
+            .await
+            .unwrap();
+        let artwork_folder = db
+            .upsert_virtual_folder(
+                "Movies With Artwork",
+                Some("movies"),
+                vec![artwork_dir.to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.scan_virtual_folder_items(artwork_folder.id)
+                .await
+                .unwrap(),
+            2
+        );
+        let empty_folder = db
+            .upsert_virtual_folder(
+                "Empty Movies",
+                Some("movies"),
+                vec![empty_dir.to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        let custom_folder = db
+            .upsert_virtual_folder(
+                "Custom Artwork",
+                Some("movies"),
+                vec![custom_dir.to_string_lossy().to_string()],
+            )
+            .await
+            .unwrap();
+        let custom_id = custom_folder.id.simple().to_string();
+        let state = AppState {
+            db,
+            web_dir,
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+        let mut custom_bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        custom_bytes.extend(vec![0x44; 128]);
+        store_image_bytes(
+            &state,
+            ImageOwner::Item(&custom_id),
+            "Primary",
+            0,
+            custom_bytes.clone(),
+        )
+        .await
+        .unwrap();
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserViews")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let views: Value = serde_json::from_slice(&body).unwrap();
+        let artwork_id = artwork_folder.id.simple().to_string();
+        let empty_id = empty_folder.id.simple().to_string();
+        let artwork_view = views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["Id"] == artwork_id)
+            .unwrap();
+        assert!(
+            artwork_view["ImageTags"]["Primary"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty() && tag != "placeholder")
+        );
+        assert_eq!(artwork_view["PrimaryImageAspectRatio"], 0.6666667);
+        let empty_view = views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["Id"] == empty_id)
+            .unwrap();
+        assert!(
+            empty_view["ImageTags"]["Primary"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty() && tag != "placeholder")
+        );
+        assert_eq!(empty_view["PrimaryImageAspectRatio"], 1.0);
+        let custom_view = views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["Id"] == custom_id)
+            .unwrap();
+        assert!(
+            custom_view["ImageTags"]["Primary"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty() && tag != "placeholder")
+        );
+        for collection_type in ["boxsets", "livetv", "playlists"] {
+            let special_view = views["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|view| view["CollectionType"] == collection_type)
+                .unwrap();
+            assert!(
+                special_view["ImageTags"]["Primary"]
+                    .as_str()
+                    .is_some_and(|tag| !tag.is_empty() && tag != "placeholder"),
+                "{collection_type}"
+            );
+            assert_eq!(
+                special_view["PrimaryImageAspectRatio"], 1.0,
+                "{collection_type}"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{artwork_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], poster_bytes);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{custom_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], custom_bytes);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{empty_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], fallback_bytes);
+    }
+
+    #[tokio::test]
     async fn music_video_library_counts_as_music_video() {
         let tmp = tempfile::tempdir().unwrap();
         let clip = tmp.path().join("Example Clip.mp4");
@@ -66674,12 +68358,28 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let user_views: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(user_views["TotalRecordCount"], 4);
+        let movie_view = user_views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Id"] == parent_id && item["CollectionType"] == "movies")
+            .expect("movies user view");
+        assert!(
+            movie_view["ImageTags"]["Primary"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty() && tag != "placeholder")
+        );
+        assert_eq!(movie_view["PrimaryImageAspectRatio"], 0.6666667);
         assert!(
             user_views["Items"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| { item["Id"] == parent_id && item["CollectionType"] == "movies" })
+                .filter(|item| item["Id"] != parent_id)
+                .all(|item| item["ImageTags"]
+                    .as_object()
+                    .is_some_and(|tags| tags.is_empty())
+                    && item.get("PrimaryImageAspectRatio").is_none())
         );
 
         let response = app
@@ -68326,7 +70026,12 @@ done
         assert_eq!(ancestors.as_array().unwrap().len(), 2);
         assert_eq!(ancestors[0]["Id"], parent_id);
         assert_eq!(ancestors[0]["Type"], "CollectionFolder");
-        assert_eq!(ancestors[0]["ImageTags"]["Primary"], "placeholder");
+        assert!(
+            ancestors[0]["ImageTags"]
+                .as_object()
+                .is_some_and(|tags| tags.is_empty())
+        );
+        assert!(ancestors[0].get("PrimaryImageAspectRatio").is_none());
         assert_eq!(ancestors[0]["ParentId"], ancestors[1]["Id"]);
         assert_eq!(ancestors[1]["Type"], "Folder");
 
@@ -77126,11 +78831,11 @@ done
         assert_eq!(media_source["CanSeek"], true);
         assert_eq!(media_source["DefaultSubtitleStreamIndex"], 2);
         assert_eq!(media_source["MediaStreams"][2]["Codec"], "webvtt");
-        assert_eq!(
-            media_source["MediaStreams"][2]["DeliveryMethod"],
-            "External"
-        );
-        assert_eq!(media_source["MediaStreams"][2]["IsExternal"], true);
+        // Text subtitles on transcoded video are delivered through the HLS
+        // playlist (subtitles.m3u8), matching the SUBTITLES group advertised in
+        // the master manifest below, rather than as an external VTT stream.
+        assert_eq!(media_source["MediaStreams"][2]["DeliveryMethod"], "Hls");
+        assert_eq!(media_source["MediaStreams"][2]["IsExternal"], false);
         assert_eq!(
             media_source["MediaStreams"][2]["SupportsExternalStream"],
             true
@@ -77138,7 +78843,8 @@ done
         assert_eq!(
             media_source["MediaStreams"][2]["DeliveryUrl"],
             format!(
-                "/Videos/{item_id}/{item_id}/Subtitles/2/Stream.vtt?PlaySessionId=play-session-xtream-vod&api_key={api_key}&StartPositionTicks=0&EndPositionTicks={SUBTITLE_JSON_FALLBACK_WINDOW_TICKS}"
+                "/Videos/{item_id}/{item_id}/Subtitles/2/subtitles.m3u8?api_key={api_key}&segmentLength={}",
+                crate::DEFAULT_HLS_SEGMENT_TIME_SECONDS
             )
         );
         assert_eq!(media_source["TranscodingSubProtocol"], "hls");
@@ -79438,6 +81144,7 @@ done
             .issue_api_key_for_user(user.id, "test-key")
             .await
             .unwrap();
+        let test_db = db.clone();
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -79464,6 +81171,38 @@ done
         assert_eq!(me["Configuration"]["HidePlayedInLatest"], true);
         assert_eq!(me["Configuration"]["DisplayCollectionsView"], false);
         assert_eq!(me["Configuration"]["LatestItemsExcludes"], json!([]));
+        assert_eq!(me["Configuration"]["CastReceiverId"], "F007D354");
+
+        // Configurations written by older server versions may be valid but lack
+        // newly introduced defaults. Stored values win while new defaults are
+        // filled in when the user DTO is read.
+        test_db
+            .update_user_configuration(user.id, json!({ "SubtitleMode": "Legacy" }))
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Users/Me")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let legacy_me: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(legacy_me["Configuration"]["SubtitleMode"], "Legacy");
+        assert_eq!(legacy_me["Configuration"]["CastReceiverId"], "F007D354");
+        for invalid_receiver in ["", "obsolete-receiver"] {
+            let normalized = crate::user_configuration_with_defaults(Some(json!({
+                "CastReceiverId": invalid_receiver
+            })))
+            .unwrap();
+            assert_eq!(normalized["CastReceiverId"], "F007D354");
+        }
 
         let response = app
             .clone()
@@ -79552,6 +81291,7 @@ done
         );
         assert_eq!(updated_me["Configuration"]["PlayDefaultAudioTrack"], true);
         assert_eq!(updated_me["Configuration"]["UnknownFutureSetting"], "kept");
+        assert_eq!(updated_me["Configuration"]["CastReceiverId"], "F007D354");
 
         let response = app
             .clone()
