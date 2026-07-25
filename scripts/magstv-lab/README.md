@@ -58,10 +58,46 @@ Required, with pinned hashes checked by the runner's preflight:
 - patched HAL — sha256 `be184a34…1998e`, built by `patch_audio_hal.py` from the
   guest HAL sha256 `220d1868…5203`.
 
+## L3 — offline APK execution (`run-apk`, gated)
+
+`run-apk` boots+patches, then installs the APK offline, launches it once without
+credentials, and collects loader-focused artifacts (install/verify output,
+`ps -A`, the app's `/proc/<pid>/maps`, logcat, tombstones, guest sockets) plus
+containment evidence (guest external reachability before and after). The
+disposable AVD is destroyed afterward.
+
+It is **gated off by default**: without `MAGSTV_ALLOW_APK_EXEC=1` it boots,
+patches, records `apk_executed: no (gated)`, and stops — nothing untrusted runs.
+The network stays isolated the whole time; the run aborts if the guest can reach
+outside before the install.
+
+```sh
+# harness only (no APK executed):
+MAGSTV_APK=/path/to/com.android.mgstv.apk \
+  scripts/magstv-lab/magstv-lab-runner.sh run-apk
+
+# actually execute the APK in the isolated lab (opt-in):
+MAGSTV_APK=/path/to/com.android.mgstv.apk MAGSTV_ALLOW_APK_EXEC=1 \
+  scripts/magstv-lab/magstv-lab-runner.sh run-apk
+```
+
+## Known limitation — this emulator can't run the APK's native code
+
+Empirically (plan `0037`, L3), the APK does **not** install or run on this
+QEMU-TCG ARM64 setup. The install helper `DefaultContainerService`, plus
+`omx@1.0-service` and the audio HAL, all SIGSEGV with the same non-canonical
+`0xffffff8…` garbage-pointer signature — a **systemic TCG codegen bug**, not
+anything specific to MAGSTV. Because TCG translates the offending instruction
+the same way regardless of `-cpu`, the APK's own protected native loader would
+crash the same way. Dynamic execution/capture therefore needs a **native ARM64
+runtime** (a physical device or an ARM host with KVM), not this x86-hosted TCG
+emulator. Containment held throughout (no network egress).
+
 ## Usage
 
 ```sh
 scripts/magstv-lab/magstv-lab-runner.sh boot 3
 ```
 
-Requires `bwrap` (bubblewrap) and the external artifacts above.
+Requires `bwrap` (bubblewrap) and the external artifacts above. The disposable
+AVD copy is destroyed after each run by default (`MAGSTV_KEEP_AVD=1` to keep it).

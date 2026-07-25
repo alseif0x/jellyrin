@@ -49,6 +49,9 @@ readonly PATCHED_HAL_SHA_EXPECT=be184a3474ecbd6bf7ae166e753c180f19e8269fd2c990c0
 readonly GUEST_HAL_SHA_EXPECT=220d1868f779fbe151d7bc2fd49b3e1d97a23877fed21675bf4472417c1a5203
 
 readonly SENTINEL="${MAGSTV_SANDBOXED:-0}"
+# Absolute path to this script, so the bwrap RO-bind + re-exec work regardless
+# of how it was invoked (relative paths break inside the sandbox).
+readonly SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
 log(){ printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -92,18 +95,32 @@ EOF
 
 host_main(){
   local cmd="${1:-boot}"; shift || true
-  [[ "$cmd" == "boot" ]] || die "unknown command: $cmd (only 'boot')"
+  case "$cmd" in
+    boot|run-apk) : ;;
+    *) die "unknown command: $cmd (boot | run-apk)" ;;
+  esac
   local count="${1:-1}"
 
   host_preflight
 
+  # `run-apk` boots+patches, then (only if MAGSTV_ALLOW_APK_EXEC=1) installs and
+  # launches the APK once, offline. The APK is bound read-only into the sandbox.
+  local apk_bind=() sandbox_cmd=__sandboxed_boot label=boot
+  if [[ "$cmd" == "run-apk" ]]; then
+    count=1                                    # a single offline install + launch
+    [[ -n "${MAGSTV_APK:-}" && -f "${MAGSTV_APK}" ]] || die "run-apk requires MAGSTV_APK=<path to a signed apk>"
+    apk_bind=(--ro-bind "$MAGSTV_APK" "$MAGSTV_APK")
+    sandbox_cmd=__sandboxed_run_apk
+    label=run-apk
+  fi
+
   local session="$(date -u +%Y%m%dT%H%M%SZ)-magstv-lab"
   local pass=0
   for n in $(seq 1 "$count"); do
-    local run="$LAB/runs/${session}-boot${n}"
+    local run="$LAB/runs/${session}-${label}${n}"
     mkdir -p "$run/sbxhome"
     prepare_avd_copy "$run"
-    log "=== boot $n/$count -> $run ==="
+    log "=== $label $n/$count -> $run ==="
 
     # Re-exec this script inside the hardened sandbox. Only the paths listed
     # below exist inside; the user's home is NOT among them.
@@ -124,7 +141,8 @@ host_main(){
         --ro-bind "$EMU_HOME" "$EMU_HOME" \
         --ro-bind "$DTB" "$DTB" \
         --ro-bind "$PATCHED_HAL" "$PATCHED_HAL" \
-        --ro-bind "$0" "$0" \
+        --ro-bind "$SELF" "$SELF" \
+        "${apk_bind[@]}" \
         --bind "$run" /sbx \
         --setenv MAGSTV_SANDBOXED 1 \
         --setenv HOME /sbx/sbxhome \
@@ -139,15 +157,20 @@ host_main(){
         --setenv ANDROID_EMULATOR_LAUNCHER_DIR "$EMU_HOME" \
         --setenv ANDROID_ADB_SERVER_PORT 5044 \
         --setenv LD_LIBRARY_PATH "$EMU_HOME/lib64:$EMU_HOME/lib64/qt/lib" \
-        -- "$0" __sandboxed_boot "$n" "$count"; then
+        --setenv MAGSTV_APK "${MAGSTV_APK:-}" \
+        --setenv MAGSTV_ALLOW_APK_EXEC "${MAGSTV_ALLOW_APK_EXEC:-0}" \
+        --setenv MAGSTV_APK_LAUNCH_SECONDS "${MAGSTV_APK_LAUNCH_SECONDS:-45}" \
+        -- "$SELF" "$sandbox_cmd" "$n" "$count"; then
       pass=$((pass+1))
-      log "boot $n: PASS"
+      log "$label $n: PASS"
     else
-      log "boot $n: FAIL"
+      log "$label $n: FAIL"
     fi
+    # Destroy the disposable AVD copy by default (logs/artifacts are kept).
+    [[ "${MAGSTV_KEEP_AVD:-0}" == "1" ]] || rm -rf "$run/sbxhome" 2>/dev/null || true
   done
 
-  log "=== summary: $pass/$count boots reached sys.boot_completed=1 ==="
+  log "=== summary: $pass/$count $label run(s) ok ==="
   [[ "$pass" -eq "$count" ]]
 }
 
@@ -301,9 +324,85 @@ sandbox_boot(){
 }
 
 # ---------------------------------------------------------------------------
-if [[ "${1:-}" == "__sandboxed_boot" ]]; then
-  shift
-  sandbox_boot "$@"
-  exit $?
-fi
+# L3 sandbox phase: offline install + single launch of the (untrusted) APK.
+# Boots+patches first, then only touches the APK if MAGSTV_ALLOW_APK_EXEC=1.
+# The guest stays offline (verified before install); artifacts are loader-
+# focused; the disposable AVD is destroyed by the host afterwards.
+# ---------------------------------------------------------------------------
+sandbox_run_apk(){
+  local n="$1" count="$2"
+  local pkg=com.android.mgstv
+  local act=com.interactive.brasiliptv.ui.activity.WelcomeActivity
+
+  # Boot + patch the clean image first (sets globals, EXIT trap, manifest, adb).
+  sandbox_boot "$n" "$count" || { log "boot/patch failed; NOT installing the APK"; return 1; }
+
+  # HARD GATE: never execute the untrusted APK unless explicitly unlocked.
+  if [[ "${MAGSTV_ALLOW_APK_EXEC:-0}" != "1" ]]; then
+    log "APK execution is GATED (harness ready, nothing run)."
+    log "  set MAGSTV_ALLOW_APK_EXEC=1 to install+launch: ${MAGSTV_APK:-<unset>}"
+    echo "apk_executed: no (gated)" >> "$manifest"
+    return 0
+  fi
+  [[ -n "${MAGSTV_APK:-}" && -f "$MAGSTV_APK" ]] || { log "MAGSTV_APK not present in sandbox"; return 1; }
+
+  # Re-confirm the guest is offline BEFORE touching the APK (defense in depth).
+  local pre; pre=$(adb_lab shell 'ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 && echo REACHABLE || echo blocked' 2>/dev/null | tr -d '\r')
+  echo "pre_apk_guest_external: ${pre:-unknown}" >> "$manifest"
+  [[ "$pre" == "blocked" ]] || { log "ABORT: guest can reach the network; refusing to run the APK"; return 1; }
+
+  # Everything below is best-effort diagnostics collection; a single failed adb
+  # or grep must not abort the run (we still want logcat/tombstones even if the
+  # install or launch misbehaves).
+  set +e
+
+  echo "apk_sha256: $(sha256sum "$MAGSTV_APK" | cut -d' ' -f1)" >> "$manifest"
+  log "installing APK offline, non-streamed (dexopt of a protected APK can be slow): $(basename "$MAGSTV_APK")"
+  ADB_TO=900 adb_lab install --no-streaming -r -d "$MAGSTV_APK" > "$run/apk-install.txt" 2>&1 \
+    || log "adb install returned non-zero (see apk-install.txt)"
+
+  # verify: path, uid, selected ABI, native lib dir, version
+  { adb_lab shell "pm path $pkg";
+    adb_lab shell "dumpsys package $pkg" 2>/dev/null \
+      | grep -E "userId=|primaryCpuAbi=|legacyNativeLibraryDir=|codePath=|versionName=|versionCode="; } \
+    > "$run/apk-verify.txt" 2>&1 || true
+  echo "apk_installed: $(adb_lab shell "pm path $pkg" 2>/dev/null | grep -qc 'package:' && echo yes || echo no)" >> "$manifest"
+
+  log "launching $act once (no credentials); observing loader for ${MAGSTV_APK_LAUNCH_SECONDS:-45}s"
+  ADB_TO=180 adb_lab shell "am start -W -n $pkg/$act" > "$run/apk-launch.txt" 2>&1 || true
+  sleep "${MAGSTV_APK_LAUNCH_SECONDS:-45}"
+
+  # --- collect loader-focused artifacts (no business data) ---
+  adb_lab shell 'ps -A' > "$run/apk-processes.txt" 2>&1 || true
+  local pid; pid=$(adb_lab shell "pidof $pkg" 2>/dev/null | tr -d '\r' | awk '{print $1}')
+  echo "app_pid: ${pid:-none}" >> "$manifest"
+  if [[ -n "${pid:-}" ]]; then
+    adb_lab shell "cat /proc/$pid/maps" 2>/dev/null | grep -aoE '/[^ ]+\.so' | sort -u > "$run/apk-loaded-libs.txt" 2>&1 || true
+  fi
+  adb_lab logcat -d -b all -v threadtime > "$run/apk-logcat.txt" 2>&1 || true
+  grep -aE "s\.h\.e\.l\.l|UnsatisfiedLinkError|JNI_OnLoad|libranger|[Ii]jiami|GoMediaService|gomedia|Fatal signal|FATAL EXCEPTION|$pkg" \
+    "$run/apk-logcat.txt" > "$run/apk-loader-signals.txt" 2>&1 || true
+  adb_lab shell 'ls -l /data/tombstones' > "$run/apk-tombstones.txt" 2>&1 || true
+
+  # --- containment evidence ---
+  adb_lab shell 'cat /proc/net/tcp /proc/net/tcp6 2>/dev/null' > "$run/apk-guest-sockets.txt" 2>&1 || true
+  local post; post=$(adb_lab shell 'ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 && echo REACHABLE || echo blocked' 2>/dev/null | tr -d '\r')
+  {
+    echo "post_apk_guest_external: ${post:-unknown}"
+    echo "apk_executed: yes"
+    echo "ijiami_jni_unsatisfied: $(grep -qaE 's\.h\.e\.l\.l|UnsatisfiedLinkError' "$run/apk-logcat.txt" && echo yes || echo no)"
+    echo "libranger_loaded: $(grep -qa 'libranger' "$run/apk-logcat.txt" "$run/apk-loaded-libs.txt" 2>/dev/null && echo yes || echo no)"
+    echo "gomediaservice_seen: $(grep -qaiE 'GoMediaService|gomedia' "$run/apk-logcat.txt" "$run/apk-processes.txt" 2>/dev/null && echo yes || echo no)"
+    echo "app_fatal: $(grep -qaE 'FATAL EXCEPTION|Fatal signal' "$run/apk-logcat.txt" && echo yes || echo no)"
+  } >> "$manifest"
+
+  log "L3 artifacts collected in $run (disposable AVD destroyed by the host)"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+  __sandboxed_boot)    shift; sandbox_boot "$@"; exit $? ;;
+  __sandboxed_run_apk) shift; sandbox_run_apk "$@"; exit $? ;;
+esac
 host_main "$@"
