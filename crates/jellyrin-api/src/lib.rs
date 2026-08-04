@@ -3886,7 +3886,7 @@ fn scheduled_trigger_due(
             .get("IntervalTicks")
             .and_then(json_value_i64)
             .unwrap_or(864_000_000_000_i64)
-            .max(60_000_000_0);
+            .max(600_000_000);
         let interval = Duration::seconds(interval_ticks / 10_000_000);
         let last_time = last_result
             .and_then(|run| run.completed_at)

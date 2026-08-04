@@ -14,6 +14,10 @@ pub struct FileChangeEvent {
     pub change_type: FileChangeType,
 }
 
+// `notify-debouncer-mini` intentionally normalizes filesystem notifications to
+// `Any`/`AnyContinuous`, so this adapter cannot construct precise create/delete
+// events. Keep those variants in the normalized contract for other adapters.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileChangeType {
     Created,

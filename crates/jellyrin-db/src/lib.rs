@@ -7959,10 +7959,8 @@ fn parse_local_nfo_metadata(contents: &str) -> Value {
     // <banner>URL</banner>
     if let Some(banner) = nfo_first_text(contents, "banner") {
         let banner = banner.trim().to_string();
-        if !banner.is_empty() {
-            if banner.starts_with("http://") || banner.starts_with("https://") {
-                metadata.insert("ThumbImageUrl".to_string(), Value::String(banner));
-            }
+        if !banner.is_empty() && (banner.starts_with("http://") || banner.starts_with("https://")) {
+            metadata.insert("ThumbImageUrl".to_string(), Value::String(banner));
         }
     }
 
