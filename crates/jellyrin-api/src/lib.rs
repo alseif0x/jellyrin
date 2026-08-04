@@ -5,15 +5,19 @@ mod dlna;
 mod errors;
 mod file_watcher;
 mod state;
+mod session;
 
 pub(crate) use auth::{
-    bearer_token, client_auth_from_headers, ensure_user_access, parse_authorization_token,
-    parse_media_browser_pairs, require_admin, require_admin_or_startup_incomplete,
+    bearer_token, client_auth_from_headers, ensure_user_access, require_admin,
+    require_admin_or_startup_incomplete,
     require_admin_or_startup_incomplete_user, require_admin_session, require_request_user,
     require_startup_wizard_incomplete, require_user, require_user_or_startup_incomplete,
 };
 pub use errors::ApiError;
 pub use state::{AppState, SystemLifecycleCommand};
+pub(crate) use session::session_to_json;
+#[cfg(test)]
+pub(crate) use auth::{parse_authorization_token, parse_media_browser_pairs};
 
 use jellyrin_xtream_provider as live_tv_xtream;
 
@@ -56,7 +60,7 @@ use jellyrin_core::{
     build_hls_ffmpeg_command_from_stdin,
 };
 use jellyrin_db::{
-    ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, ActivityLogEntry,
+    ActivePlaybackSession, ActiveSessionUser, ActivityLogEntry,
     ActivityLogFilter, ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database,
     DeviceSession, DiscoveredPluginPackage, InstallPluginPackage, LiveTvCategoryUpsert,
     LiveTvChannelQuery, LiveTvChannelRecord, LiveTvChannelUpsert, LiveTvTunerUpsert,
@@ -12731,7 +12735,7 @@ fn default_plugin_task_result_json(task_key: &str, plugin_name: &str) -> serde_j
     })
 }
 
-fn format_time_for_json(value: OffsetDateTime) -> String {
+pub(crate) fn format_time_for_json(value: OffsetDateTime) -> String {
     value
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
@@ -39027,7 +39031,7 @@ fn user_view_to_json_with_count(
     })
 }
 
-fn media_item_to_json(item: &MediaItem, server_id: &str) -> serde_json::Value {
+pub(crate) fn media_item_to_json(item: &MediaItem, server_id: &str) -> serde_json::Value {
     media_item_to_json_with_playback(item, server_id, None)
 }
 
@@ -44583,89 +44587,6 @@ async fn authentication_result_to_dto(
         },
         access_token: token.access_token.clone(),
         server_id,
-    })
-}
-
-fn session_to_json(
-    session: &DeviceSession,
-    active_playback: Option<&ActivePlaybackSession>,
-    active_viewing: Option<&ActiveViewingSession>,
-    additional_users: &[ActiveSessionUser],
-    server_id: &str,
-) -> serde_json::Value {
-    let capabilities = session.capabilities.as_ref();
-    let additional_users = additional_users
-        .iter()
-        .map(|user| {
-            serde_json::json!({
-                "UserId": user.user_id,
-                "UserName": user.user_name,
-            })
-        })
-        .collect::<Vec<_>>();
-    let last_activity_date = format_time_for_json(session.last_activity_at);
-    let supports_media_control = capability_bool(capabilities, "SupportsMediaControl");
-    serde_json::json!({
-        "Id": session.access_token,
-        "UserId": session.user_id,
-        "UserName": session.user_name,
-        "Client": session.client,
-        "LastActivityDate": last_activity_date,
-        "LastPlaybackCheckIn": last_activity_date,
-        "LastPausedDate": null,
-        "DeviceName": session.device_name,
-        "DeviceType": null,
-        "DeviceId": session.device_id,
-        "ApplicationVersion": session.version,
-        "IsActive": true,
-        "SupportsMediaControl": supports_media_control,
-        "SupportsRemoteControl": capability_bool(capabilities, "SupportsRemoteControl")
-            || supports_media_control,
-        "PlayableMediaTypes": capability_array(capabilities, "PlayableMediaTypes"),
-        "SupportedCommands": capability_array(capabilities, "SupportedCommands"),
-        "Capabilities": capabilities.cloned(),
-        "RemoteEndPoint": null,
-        "NowPlayingItem": active_playback.map(|playback| media_item_to_json(&playback.item, server_id)),
-        "PlayState": active_playback.map(active_playback_state_json),
-        "NowViewingItem": active_viewing.map(|viewing| media_item_to_json(&viewing.item, server_id)),
-        "TranscodingInfo": null,
-        "NowPlayingQueue": null,
-        "HasCustomDeviceName": false,
-        "PlaylistItemId": null,
-        "ServerId": server_id,
-        "UserPrimaryImageTag": null,
-        "AdditionalUsers": additional_users,
-    })
-}
-
-fn capability_bool(capabilities: Option<&serde_json::Value>, key: &str) -> bool {
-    capabilities
-        .and_then(|capabilities| capabilities.get(key))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn capability_array(capabilities: Option<&serde_json::Value>, key: &str) -> serde_json::Value {
-    capabilities
-        .and_then(|capabilities| capabilities.get(key))
-        .filter(|value| value.is_array())
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!([]))
-}
-
-fn active_playback_state_json(playback: &ActivePlaybackSession) -> serde_json::Value {
-    serde_json::json!({
-        "PositionTicks": playback.position_ticks,
-        "CanSeek": true,
-        "IsPaused": playback.is_paused,
-        "IsMuted": false,
-        "VolumeLevel": 100,
-        "AudioStreamIndex": playback.audio_stream_index,
-        "SubtitleStreamIndex": playback.subtitle_stream_index,
-        "MediaSourceId": playback.media_source_id.clone(),
-        "PlayMethod": "DirectPlay",
-        "RepeatMode": "RepeatNone",
-        "PlaybackOrder": "Default",
     })
 }
 
