@@ -516,14 +516,14 @@ pub(crate) async fn content_directory_control(
         "x_getfeaturelist" => format!("<FeatureList>{}</FeatureList>", escape_xml(feature_list())),
         "browse" => match browse_response(&state.db, &request, render_context).await {
             Ok(response) => response,
-            Err(error) if error.status == StatusCode::NOT_FOUND => {
+            Err(error) if error.status() == StatusCode::NOT_FOUND => {
                 return Ok(soap_fault_response(701, "No such object"));
             }
             Err(error) => return Err(error),
         },
         "search" => match search_response(&state.db, &request, render_context).await {
             Ok(response) => response,
-            Err(error) if error.status == StatusCode::NOT_FOUND => {
+            Err(error) if error.status() == StatusCode::NOT_FOUND => {
                 return Ok(soap_fault_response(701, "No such object"));
             }
             Err(error) => return Err(error),
