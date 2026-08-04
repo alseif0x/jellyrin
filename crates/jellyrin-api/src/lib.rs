@@ -3,8 +3,10 @@
 mod dlna;
 mod errors;
 mod file_watcher;
+mod state;
 
 pub use errors::ApiError;
+pub use state::{AppState, SystemLifecycleCommand};
 
 use jellyrin_xtream_provider as live_tv_xtream;
 
@@ -300,21 +302,7 @@ fn live_stream_registry() -> &'static Mutex<HashMap<String, SharedLiveStreamHand
     LIVE_STREAM_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Database,
-    pub web_dir: PathBuf,
-    pub log_dir: PathBuf,
-    pub local_address: String,
-}
-
 pub use dlna::spawn_dlna_ssdp_service;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum SystemLifecycleCommand {
-    Restart,
-    Shutdown,
-}
 
 #[derive(Debug, Clone)]
 struct PlaybackEvent {
