@@ -6,6 +6,7 @@ mod errors;
 mod file_watcher;
 mod session;
 mod state;
+mod syncplay_types;
 mod system;
 
 pub(crate) use auth::{
@@ -19,6 +20,7 @@ pub(crate) use auth::{parse_authorization_token, parse_media_browser_pairs};
 pub use errors::ApiError;
 pub(crate) use session::session_to_json;
 pub use state::{AppState, SystemLifecycleCommand};
+use syncplay_types::{PlaybackEvent, SyncPlayGroup, SyncPlayParticipant};
 pub(crate) use system::{
     authentication_providers, get_public_users, get_startup_configuration, get_startup_user,
     get_users, health, password_reset_providers, post_startup_complete, post_startup_configuration,
@@ -320,34 +322,6 @@ fn live_stream_registry() -> &'static Mutex<HashMap<String, SharedLiveStreamHand
 }
 
 pub use dlna::spawn_dlna_ssdp_service;
-
-#[derive(Debug, Clone)]
-struct PlaybackEvent {
-    session_id: String,
-    message: serde_json::Value,
-}
-
-#[derive(Debug, Clone)]
-struct SyncPlayGroup {
-    id: String,
-    name: String,
-    owner_user_id: Uuid,
-    participants: BTreeMap<String, SyncPlayParticipant>,
-    state: serde_json::Value,
-    command_sequence: u64,
-    updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, Clone)]
-struct SyncPlayParticipant {
-    user_id: Uuid,
-    user_name: String,
-    session_id: String,
-    device_id: String,
-    is_ready: bool,
-    is_buffering: bool,
-    last_seen_at: OffsetDateTime,
-}
 
 #[derive(Debug, Clone)]
 struct AuthFailureState {
