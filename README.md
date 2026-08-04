@@ -19,6 +19,10 @@ cargo test --workspace
 cargo run -p jellyrin-server -- --web-dir /home/cdmonio/dev/jellyfin-web/dist
 ```
 
+Service-specific integrations are maintained as out-of-tree plugins. See
+[`docs/plugin-boundary.md`](docs/plugin-boundary.md) for the public/private
+boundary and the rules for extending the generic plugin SDK.
+
 When Jellyfin is running on `8096` and Jellyrin is running on `8097`, run the
 local compatibility acceptance gate with:
 
