@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod api_keys;
 mod auth;
 mod dlna;
 mod errors;
@@ -10,6 +11,7 @@ mod state;
 mod syncplay_types;
 mod system;
 
+pub(crate) use api_keys::{api_keys, create_api_key, revoke_api_key};
 pub(crate) use auth::{
     bearer_token, client_auth_from_headers, ensure_user_access, require_admin,
     require_admin_or_startup_incomplete, require_admin_or_startup_incomplete_user,
@@ -76,7 +78,7 @@ use jellyrin_core::{
 };
 use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActivityLogEntry, ActivityLogFilter,
-    ActivityLogSortField, ApiKey, BackupManifest, BrandingConfig, Database, DeviceSession,
+    ActivityLogSortField, BackupManifest, BrandingConfig, Database, DeviceSession,
     DiscoveredPluginPackage, InstallPluginPackage, LiveTvCategoryUpsert, LiveTvChannelQuery,
     LiveTvChannelRecord, LiveTvChannelUpsert, LiveTvTunerUpsert, MediaItemFilterSummary,
     MediaItemMetadata, MediaList, MediaListItem, MediaListUserPermission,
@@ -5360,78 +5362,6 @@ fn migration_i64_field(
     fields
         .iter()
         .find_map(|field| object.get(*field).and_then(serde_json::Value::as_i64))
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateApiKeyQuery {
-    #[serde(flatten)]
-    auth: AuthQuery,
-    #[serde(alias = "App")]
-    app: Option<String>,
-}
-
-async fn api_keys(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    let keys = state.db.api_keys().await?;
-    let items = keys
-        .iter()
-        .enumerate()
-        .map(|(index, key)| api_key_to_json(index, key))
-        .collect::<Vec<_>>();
-
-    Ok(Json(serde_json::json!({
-        "Items": items,
-        "TotalRecordCount": keys.len(),
-        "StartIndex": 0
-    })))
-}
-
-async fn create_api_key(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<CreateApiKeyQuery>,
-) -> Result<StatusCode, ApiError> {
-    let user = require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    let app = query
-        .app
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::bad_request("App must not be empty"))?;
-    state.db.issue_api_key_for_user(user.id, app).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn revoke_api_key(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path(key): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    state.db.revoke_api_key(&key).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn api_key_to_json(index: usize, key: &ApiKey) -> serde_json::Value {
-    serde_json::json!({
-        "Id": index + 1,
-        "AccessToken": key.access_token,
-        "DeviceId": null,
-        "AppName": key.name,
-        "AppVersion": null,
-        "DeviceName": null,
-        "UserId": key.user_id,
-        "UserName": key.user_name,
-        "IsActive": true,
-        "DateCreated": format_time_for_json(key.created_at),
-        "DateRevoked": null,
-        "DateLastActivity": format_time_for_json(key.last_activity_at)
-    })
 }
 
 #[derive(Debug, Deserialize)]
