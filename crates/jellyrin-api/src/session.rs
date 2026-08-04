@@ -61,7 +61,10 @@ pub(crate) fn capability_bool(capabilities: Option<&serde_json::Value>, key: &st
         .unwrap_or(false)
 }
 
-pub(crate) fn capability_array(capabilities: Option<&serde_json::Value>, key: &str) -> serde_json::Value {
+pub(crate) fn capability_array(
+    capabilities: Option<&serde_json::Value>,
+    key: &str,
+) -> serde_json::Value {
     capabilities
         .and_then(|capabilities| capabilities.get(key))
         .filter(|value| value.is_array())
