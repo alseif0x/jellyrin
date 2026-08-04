@@ -9021,14 +9021,13 @@ async fn plugin_configuration(
         return Ok(Json(configuration));
     }
     // Fallback: return default configuration from the plugin manifest
-    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await? {
-        if let Some(manifest) = plugin.get("Manifest") {
-            if let Some(configuration) = manifest.get("Configuration") {
-                if configuration.is_object() && !configuration.as_object().unwrap().is_empty() {
-                    return Ok(Json(configuration.clone()));
-                }
-            }
-        }
+    if let Some(plugin) = state.db.installed_plugin_json(&plugin_id).await?
+        && let Some(manifest) = plugin.get("Manifest")
+        && let Some(configuration) = manifest.get("Configuration")
+        && configuration.is_object()
+        && !configuration.as_object().unwrap().is_empty()
+    {
+        return Ok(Json(configuration.clone()));
     }
     Err(ApiError::not_found("Plugin not found"))
 }
@@ -9051,10 +9050,10 @@ async fn update_plugin_configuration(
         .await?
     {
         // Post-save hook: auto-create/update tuner for xtream plugin
-        if plugin_id.eq_ignore_ascii_case(BUILTIN_XTREAM_PLUGIN_ID) {
-            if let Err(error) = sync_xtream_tuner_from_plugin_config(&state, &payload).await {
-                tracing::warn!(?error, "failed to sync xtream tuner from plugin config");
-            }
+        if plugin_id.eq_ignore_ascii_case(BUILTIN_XTREAM_PLUGIN_ID)
+            && let Err(error) = sync_xtream_tuner_from_plugin_config(&state, &payload).await
+        {
+            tracing::warn!(?error, "failed to sync xtream tuner from plugin config");
         }
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -9104,18 +9103,18 @@ async fn sync_xtream_tuner_from_plugin_config(
         "SeriesCategoryIds",
         "ExcludeSeriesCategoryIds",
     ] {
-        if let Some(ids) = config.get(key).and_then(|v| v.as_array()) {
-            if !ids.is_empty() {
-                payload[key] = serde_json::json!(ids);
-            }
+        if let Some(ids) = config.get(key).and_then(|v| v.as_array())
+            && !ids.is_empty()
+        {
+            payload[key] = serde_json::json!(ids);
         }
     }
     // Independent per-content limits (0 / absent = no limit).
     for key in ["ChannelLimit", "MovieLimit", "SeriesLimit"] {
-        if let Some(limit) = config.get(key).and_then(|v| v.as_u64()) {
-            if limit > 0 {
-                payload[key] = serde_json::json!(limit);
-            }
+        if let Some(limit) = config.get(key).and_then(|v| v.as_u64())
+            && limit > 0
+        {
+            payload[key] = serde_json::json!(limit);
         }
     }
 
@@ -24254,10 +24253,10 @@ async fn item_detail(
     if item_id.eq_ignore_ascii_case("livetv") {
         return Ok(Json(live_tv_root_item_json(&state.db).await?));
     }
-    if looks_like_live_tv_program_id(&item_id) {
-        if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
-            return Ok(Json(program));
-        }
+    if looks_like_live_tv_program_id(&item_id)
+        && let Some(program) = live_tv_program_by_id(&state.db, &item_id).await?
+    {
+        return Ok(Json(program));
     }
     if parse_jellyfin_uuid(&item_id).is_err() {
         if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
@@ -24356,10 +24355,10 @@ async fn current_user_item_detail(
     if item_id.eq_ignore_ascii_case("livetv") {
         return Ok(Json(live_tv_root_item_json(&state.db).await?));
     }
-    if looks_like_live_tv_program_id(&item_id) {
-        if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
-            return Ok(Json(program));
-        }
+    if looks_like_live_tv_program_id(&item_id)
+        && let Some(program) = live_tv_program_by_id(&state.db, &item_id).await?
+    {
+        return Ok(Json(program));
     }
     if parse_jellyfin_uuid(&item_id).is_err() {
         if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
@@ -24447,10 +24446,10 @@ async fn user_item_detail(
     if item_id.eq_ignore_ascii_case("livetv") {
         return Ok(Json(live_tv_root_item_json(&state.db).await?));
     }
-    if looks_like_live_tv_program_id(&item_id) {
-        if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
-            return Ok(Json(program));
-        }
+    if looks_like_live_tv_program_id(&item_id)
+        && let Some(program) = live_tv_program_by_id(&state.db, &item_id).await?
+    {
+        return Ok(Json(program));
     }
     if parse_jellyfin_uuid(&item_id).is_err() {
         if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
@@ -25357,63 +25356,58 @@ pub async fn enrich_metadata_from_plugins(
             let mut merged = existing_metadata.clone();
             if let Some(overview) =
                 json_string_field(&value, "Overview").or_else(|| json_string_field(&value, "Plot"))
-            {
-                if existing_metadata.get("Overview").is_none()
+                && (existing_metadata.get("Overview").is_none()
                     || existing_metadata
                         .get("Overview")
                         .and_then(|v| v.as_str())
-                        .is_some_and(|s| s.is_empty())
-                {
-                    merged["Overview"] = serde_json::json!(overview);
-                }
+                        .is_some_and(|s| s.is_empty()))
+            {
+                merged["Overview"] = serde_json::json!(overview);
             }
             if let Some(year) = value
                 .get("ProductionYear")
                 .or_else(|| value.get("Year"))
                 .and_then(|v| v.as_i64())
+                && existing_metadata.get("ProductionYear").is_none()
             {
-                if existing_metadata.get("ProductionYear").is_none() {
-                    merged["ProductionYear"] = serde_json::json!(year);
-                }
+                merged["ProductionYear"] = serde_json::json!(year);
             }
-            if let Some(rating) = value.get("CommunityRating").and_then(|v| v.as_f64()) {
-                if existing_metadata.get("CommunityRating").is_none() {
-                    merged["CommunityRating"] = serde_json::json!(rating);
-                }
+            if let Some(rating) = value.get("CommunityRating").and_then(|v| v.as_f64())
+                && existing_metadata.get("CommunityRating").is_none()
+            {
+                merged["CommunityRating"] = serde_json::json!(rating);
             }
-            if let Some(genres) = value.get("Genres").and_then(|v| v.as_array()) {
-                if !genres.is_empty()
-                    && (existing_metadata.get("Genres").is_none()
-                        || existing_metadata
-                            .get("Genres")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|a| a.is_empty()))
-                {
-                    merged["Genres"] = serde_json::json!(genres);
-                }
+            if let Some(genres) = value.get("Genres").and_then(|v| v.as_array())
+                && !genres.is_empty()
+                && (existing_metadata.get("Genres").is_none()
+                    || existing_metadata
+                        .get("Genres")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|a| a.is_empty()))
+            {
+                merged["Genres"] = serde_json::json!(genres);
             }
             if let Some(image_url) = json_string_field(&value, "ImageUrl")
                 .or_else(|| json_string_field(&value, "PrimaryImageUrl"))
+                && existing_metadata.get("PrimaryImageUrl").is_none()
             {
-                if existing_metadata.get("PrimaryImageUrl").is_none() {
-                    merged["PrimaryImageUrl"] = serde_json::json!(image_url);
-                    merged["ImageUrl"] = serde_json::json!(image_url);
-                }
+                merged["PrimaryImageUrl"] = serde_json::json!(image_url);
+                merged["ImageUrl"] = serde_json::json!(image_url);
             }
-            if let Some(provider_ids) = value.get("ProviderIds") {
-                if provider_ids.is_object() {
-                    let mut existing_ids = existing_metadata
-                        .get("ProviderIds")
-                        .and_then(|v| v.as_object())
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(obj) = provider_ids.as_object() {
-                        for (k, v) in obj {
-                            existing_ids.insert(k.clone(), v.clone());
-                        }
+            if let Some(provider_ids) = value.get("ProviderIds")
+                && provider_ids.is_object()
+            {
+                let mut existing_ids = existing_metadata
+                    .get("ProviderIds")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(obj) = provider_ids.as_object() {
+                    for (k, v) in obj {
+                        existing_ids.insert(k.clone(), v.clone());
                     }
-                    merged["ProviderIds"] = serde_json::json!(existing_ids);
                 }
+                merged["ProviderIds"] = serde_json::json!(existing_ids);
             }
             // Track which plugin provided the enrichment
             let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
@@ -26201,14 +26195,14 @@ async fn item_ancestors(
     let root = root_folder_json(&state.db).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let root_id = root["Id"].as_str().unwrap_or_default().to_string();
-    if looks_like_live_tv_program_id(&item_id) {
-        if live_tv_program_by_id(&state.db, &item_id).await?.is_some() {
-            let mut live_tv = special_user_view_to_json("Live TV", "livetv", &server_id);
-            if let Some(object) = live_tv.as_object_mut() {
-                object.insert("ParentId".to_string(), serde_json::json!(root_id));
-            }
-            return Ok(Json(vec![live_tv, root]));
+    if looks_like_live_tv_program_id(&item_id)
+        && live_tv_program_by_id(&state.db, &item_id).await?.is_some()
+    {
+        let mut live_tv = special_user_view_to_json("Live TV", "livetv", &server_id);
+        if let Some(object) = live_tv.as_object_mut() {
+            object.insert("ParentId".to_string(), serde_json::json!(root_id));
         }
+        return Ok(Json(vec![live_tv, root]));
     }
     if live_tv_channel_by_id(&state.db, &item_id).await.is_ok() {
         let mut live_tv = special_user_view_to_json("Live TV", "livetv", &server_id);
@@ -32946,7 +32940,7 @@ fn metadata_values_response(
         .into_iter()
         .skip(start_index)
         .take(limit)
-        .map(|name| metadata_entity_json(&server_id, &name, item_type, year_from_name(&name)))
+        .map(|name| metadata_entity_json(server_id, &name, item_type, year_from_name(&name)))
         .collect::<Vec<_>>();
     query_result_with_total(items, total, start_index)
 }
@@ -35843,12 +35837,15 @@ async fn xtream_filter_summary_for_query(
 }
 
 fn xtream_item_filter_response(summary: MediaItemFilterSummary) -> serde_json::Value {
-    let video_types = summary
+    let video_types = if summary
         .media_types
         .iter()
         .any(|media_type| media_type.eq_ignore_ascii_case("Video"))
-        .then(|| vec!["VideoFile".to_string()])
-        .unwrap_or_default();
+    {
+        vec!["VideoFile".to_string()]
+    } else {
+        Vec::new()
+    };
     serde_json::json!({
         "Genres": summary.genres,
         "Tags": summary.tags,
@@ -41513,11 +41510,7 @@ async fn live_tv_item_image_response(
             item, &item_id, &image_url,
         )));
     }
-    let payload = if let Some(payload) = data_uri_image_payload(&image_url)? {
-        Some(payload)
-    } else {
-        None
-    };
+    let payload = data_uri_image_payload(&image_url)?;
     let Some((bytes, mime_type)) = payload else {
         return Ok(None);
     };
@@ -41568,43 +41561,42 @@ async fn item_image_from_plugins(
         // Check for image URL (proxy it)
         if let Some(image_url) =
             json_string_field(value, "ImageUrl").or_else(|| json_string_field(value, "Url"))
+            && (image_url.starts_with("http://") || image_url.starts_with("https://"))
         {
-            if image_url.starts_with("http://") || image_url.starts_with("https://") {
-                match reqwest::get(&image_url).await {
-                    Ok(response) if response.status().is_success() => {
-                        let content_type = response
-                            .headers()
-                            .get("content-type")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("image/jpeg")
-                            .to_string();
-                        if let Ok(bytes) = response.bytes().await {
-                            return Ok(Some(
-                                Response::builder()
-                                    .header("content-type", &content_type)
-                                    .header("cache-control", "public, max-age=86400")
-                                    .body(Body::from(bytes))
-                                    .unwrap(),
-                            ));
-                        }
+            match reqwest::get(&image_url).await {
+                Ok(response) if response.status().is_success() => {
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("image/jpeg")
+                        .to_string();
+                    if let Ok(bytes) = response.bytes().await {
+                        return Ok(Some(
+                            Response::builder()
+                                .header("content-type", &content_type)
+                                .header("cache-control", "public, max-age=86400")
+                                .body(Body::from(bytes))
+                                .unwrap(),
+                        ));
                     }
-                    _ => continue,
                 }
+                _ => continue,
             }
         }
         // Check for base64 image data
-        if let Some(image_data) = json_string_field(value, "ImageData") {
-            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image_data) {
-                let content_type = json_string_field(value, "ContentType")
-                    .unwrap_or_else(|| "image/jpeg".to_string());
-                return Ok(Some(
-                    Response::builder()
-                        .header("content-type", &content_type)
-                        .header("cache-control", "public, max-age=86400")
-                        .body(Body::from(bytes))
-                        .unwrap(),
-                ));
-            }
+        if let Some(image_data) = json_string_field(value, "ImageData")
+            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image_data)
+        {
+            let content_type =
+                json_string_field(value, "ContentType").unwrap_or_else(|| "image/jpeg".to_string());
+            return Ok(Some(
+                Response::builder()
+                    .header("content-type", &content_type)
+                    .header("cache-control", "public, max-age=86400")
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            ));
         }
     }
     Ok(None)
@@ -42305,10 +42297,7 @@ async fn representative_item_primary_image_info(
     state: &AppState,
     item_id: &str,
 ) -> Result<Option<serde_json::Value>, ApiError> {
-    let item = match media_item_by_id(&state.db, item_id).await {
-        Ok(item) => Some(item),
-        Err(_) => None,
-    };
+    let item = media_item_by_id(&state.db, item_id).await.ok();
     let Some(item) = item else {
         return Ok(None);
     };
