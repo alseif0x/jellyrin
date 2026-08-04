@@ -206,7 +206,12 @@ pub(crate) async fn get_public_users(
         if user.is_disabled {
             continue;
         }
-        dtos.push(user_to_dto(&state.db, user, server.server_id).await?);
+        let dto = user_to_dto(&state.db, user, server.server_id).await?;
+        // Jellyfin's public-user surface is limited to passwordless accounts;
+        // configured accounts must authenticate through /Users/AuthenticateByName.
+        if !dto.has_password {
+            dtos.push(dto);
+        }
     }
     Ok(Json(dtos))
 }

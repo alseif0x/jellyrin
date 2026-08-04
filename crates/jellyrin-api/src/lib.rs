@@ -12011,8 +12011,14 @@ async fn scheduled_task_list_json(db: &Database) -> Result<Vec<serde_json::Value
     let mut tasks = vec![
         library_scan_task_json(db).await?,
         channel_refresh_task_json(db).await?,
-        xtream_media_sync_task_json(db).await?,
     ];
+    if db
+        .installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID)
+        .await?
+        .is_some()
+    {
+        tasks.push(xtream_media_sync_task_json(db).await?);
+    }
     for plugin in plugin_scheduled_task_plugins(db).await? {
         tasks.push(plugin_scheduled_task_json(db, &plugin).await?);
     }
@@ -16604,15 +16610,15 @@ async fn live_tv_config_source_contents(payload: &serde_json::Value) -> Option<S
 }
 
 fn live_tv_channel_public_id(channel_id: &str) -> String {
-    hyphenate_uuid(&stable_entity_id("LiveTvChannel", channel_id))
+    channel_id.to_string()
 }
 
 fn live_tv_playback_channel_public_id(channel_id: &str) -> String {
-    hyphenate_uuid(&stable_entity_id("LiveTvPlaybackChannel", channel_id))
+    channel_id.to_string()
 }
 
 fn live_tv_fallback_program_public_id(channel_id: &str) -> String {
-    channel_id.to_string()
+    live_tv_stable_id("fallback-program", channel_id)
 }
 
 async fn live_tv_tuner_host_types(
@@ -18827,20 +18833,6 @@ fn live_tv_fallback_program_items(
             live_tv_fallback_program_item(channel, server_id, &start_date, &end_date)
         })
         .collect()
-}
-
-fn live_tv_fallback_program_item_for_now(
-    channel: &serde_json::Value,
-    server_id: &str,
-) -> Option<serde_json::Value> {
-    let start = OffsetDateTime::now_utc() - Duration::hours(12);
-    let end = OffsetDateTime::now_utc() + Duration::hours(12);
-    live_tv_fallback_program_item(
-        channel,
-        server_id,
-        &format_time_for_json(start),
-        &format_time_for_json(end),
-    )
 }
 
 fn live_tv_fallback_program_item(
@@ -24259,14 +24251,7 @@ async fn item_detail(
         return Ok(Json(program));
     }
     if parse_jellyfin_uuid(&item_id).is_err() {
-        if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
-            return Ok(Json(program));
-        }
         if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
-            let server_id = state.db.server_state().await?.server_id.to_string();
-            if let Some(program) = live_tv_fallback_program_item_for_now(&channel, &server_id) {
-                return Ok(Json(program));
-            }
             return Ok(Json(channel));
         }
         if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
@@ -24361,15 +24346,11 @@ async fn current_user_item_detail(
         return Ok(Json(program));
     }
     if parse_jellyfin_uuid(&item_id).is_err() {
+        if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
+            return Ok(Json(channel));
+        }
         if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
             return Ok(Json(program));
-        }
-        if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
-            let server_id = state.db.server_state().await?.server_id.to_string();
-            if let Some(program) = live_tv_fallback_program_item_for_now(&channel, &server_id) {
-                return Ok(Json(program));
-            }
-            return Ok(Json(channel));
         }
     }
     let requested_id = parse_jellyfin_uuid(&item_id)?;
@@ -24452,15 +24433,11 @@ async fn user_item_detail(
         return Ok(Json(program));
     }
     if parse_jellyfin_uuid(&item_id).is_err() {
+        if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
+            return Ok(Json(channel));
+        }
         if let Some(program) = live_tv_program_by_id(&state.db, &item_id).await? {
             return Ok(Json(program));
-        }
-        if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
-            let server_id = state.db.server_state().await?.server_id.to_string();
-            if let Some(program) = live_tv_fallback_program_item_for_now(&channel, &server_id) {
-                return Ok(Json(program));
-            }
-            return Ok(Json(channel));
         }
     }
     let requested_id = parse_jellyfin_uuid(&item_id)?;
@@ -27263,6 +27240,10 @@ fn playback_transcode_session_info_response(
             )),
         );
         media_source.remove("DirectStreamUrl");
+        let is_remote = media_source
+            .get("IsRemote")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         apply_playback_stream_selection(media_source, options);
         apply_hls_transcode_stream_contract(
             media_source,
@@ -27270,6 +27251,7 @@ fn playback_transcode_session_info_response(
             access_token,
             item_id,
             play_session_id,
+            is_remote,
             options,
         );
     }
@@ -27285,7 +27267,8 @@ fn apply_hls_transcode_stream_contract(
     media_type: &str,
     access_token: &str,
     item_id: &str,
-    _play_session_id: &str,
+    play_session_id: &str,
+    is_remote: bool,
     options: &PlaybackInfoOptions,
 ) {
     let selected_subtitle_stream_index = options
@@ -27371,19 +27354,26 @@ fn apply_hls_transcode_stream_contract(
                         let index = index.unwrap_or_default();
                         stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
                         stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
-                        stream.insert("DeliveryMethod".to_string(), serde_json::json!("Hls"));
-                        stream.insert("IsExternal".to_string(), serde_json::json!(false));
+                        stream.insert(
+                            "DeliveryMethod".to_string(),
+                            serde_json::json!(if is_remote { "External" } else { "Hls" }),
+                        );
+                        stream.insert("IsExternal".to_string(), serde_json::json!(is_remote));
                         stream.insert(
                             "SupportsExternalStream".to_string(),
                             serde_json::json!(true),
                         );
-                        stream.insert(
-                            "DeliveryUrl".to_string(),
-                            serde_json::json!(format!(
+                        let delivery_url = if is_remote {
+                            format!(
+                                "/Videos/{item_id}/{item_id}/Subtitles/{index}/Stream.vtt?PlaySessionId={play_session_id}&api_key={access_token}&StartPositionTicks=0&EndPositionTicks={SUBTITLE_JSON_FALLBACK_WINDOW_TICKS}"
+                            )
+                        } else {
+                            format!(
                                 "/Videos/{item_id}/{item_id}/Subtitles/{index}/subtitles.m3u8?api_key={access_token}&segmentLength={}",
                                 DEFAULT_HLS_SEGMENT_TIME_SECONDS
-                            )),
-                        );
+                            )
+                        };
+                        stream.insert("DeliveryUrl".to_string(), serde_json::json!(delivery_url));
                     }
                 }
                 _ => {}
