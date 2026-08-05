@@ -1,4 +1,8 @@
-use axum::{Json, extract::{Query, State}, http::HeaderMap};
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::HeaderMap,
+};
 use serde::Deserialize;
 
 use crate::{
