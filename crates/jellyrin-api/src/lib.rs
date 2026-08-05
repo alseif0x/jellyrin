@@ -12152,7 +12152,8 @@ async fn apply_general_command_side_effect(
         Some(serde_json::Value::Object(arguments.clone())),
     )
     .await?;
-    persist_session_viewing(db, target_session, &payload).await?;
+    let service = SessionService::new(db);
+    persist_session_viewing(&service, target_session, &payload).await?;
     broadcast_session_message(
         &target_session.access_token,
         serde_json::json!({
@@ -12282,7 +12283,8 @@ async fn display_content(
         command_target_session(&state, &headers, &query.auth, &session_id).await?;
     let body = body.map(|Json(value)| value);
     let payload = display_content_payload(&state.db, query, body).await?;
-    persist_session_viewing(&state.db, &target_session, &payload).await?;
+    let service = SessionService::new(&state.db);
+    persist_session_viewing(&service, &target_session, &payload).await?;
     broadcast_session_message(
         &target_session.access_token,
         serde_json::json!({
@@ -12344,7 +12346,8 @@ async fn report_viewing(
         body,
     )
     .await?;
-    persist_session_viewing(&state.db, &target_session, &payload).await?;
+    let service = SessionService::new(&state.db);
+    persist_session_viewing(&service, &target_session, &payload).await?;
     broadcast_session_message(
         &target_session.access_token,
         serde_json::json!({
@@ -12362,21 +12365,23 @@ async fn report_viewing(
 }
 
 async fn persist_session_viewing(
-    db: &Database,
+    service: &SessionService<'_>,
     target_session: &DeviceSession,
     payload: &DisplayContentPayload,
 ) -> Result<(), ApiError> {
     let Some(item_id) = payload.item_id.as_deref() else {
-        db.clear_active_viewing_session(&target_session.access_token)
+        service
+            .clear_active_viewing(&target_session.access_token)
             .await?;
         return Ok(());
     };
-    db.upsert_active_viewing_session(UpsertActiveViewingSession {
-        session_id: target_session.access_token.clone(),
-        user_id: target_session.user_id,
-        item_id: parse_jellyfin_uuid(item_id)?,
-    })
-    .await?;
+    service
+        .upsert_active_viewing(UpsertActiveViewingSession {
+            session_id: target_session.access_token.clone(),
+            user_id: target_session.user_id,
+            item_id: parse_jellyfin_uuid(item_id)?,
+        })
+        .await?;
     Ok(())
 }
 
