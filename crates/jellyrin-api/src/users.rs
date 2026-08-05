@@ -8,7 +8,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, AuthQuery, require_admin, require_user, resolve_user_id, user_to_dto,
+    ApiError, AppState, AuthQuery, UserService, require_admin, require_user, resolve_user_id,
+    user_to_dto,
 };
 
 #[derive(Debug, Deserialize)]
@@ -26,15 +27,15 @@ pub(crate) async fn create_user_by_name(
     Json(payload): Json<CreateUserByNameBody>,
 ) -> Result<Json<UserDto>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let service = UserService::new(&state.db);
     let name = payload
         .name
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| ApiError::bad_request("Name must not be empty"))?;
-    let user = state
-        .db
-        .create_user(name, payload.password.as_deref())
+    let user = service
+        .create(name, payload.password.as_deref())
         .await
         .map_err(|_| ApiError::conflict("User could not be created"))?;
     let server = state.db.server_state().await?;
@@ -48,14 +49,13 @@ pub(crate) async fn delete_user(
     Path(user_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    state
-        .db
-        .user_by_id(user_id)
+    let service = UserService::new(&state.db);
+    service
+        .by_id(user_id)
         .await
         .map_err(|_| ApiError::not_found("User not found"))?;
-    state
-        .db
-        .delete_user(user_id)
+    service
+        .delete(user_id)
         .await
         .map_err(|_| ApiError::conflict("User could not be deleted"))?;
     Ok(StatusCode::NO_CONTENT)
@@ -76,12 +76,13 @@ pub(crate) async fn update_user(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let service = UserService::new(&state.db);
     let user_id = query
         .user_id
         .as_deref()
         .or_else(|| payload.get("Id").and_then(serde_json::Value::as_str))
         .ok_or_else(|| ApiError::bad_request("User id is required"))?;
-    update_user_profile_from_payload(&state.db, resolve_user_id(user_id)?, payload).await?;
+    update_user_profile_from_payload(&service, resolve_user_id(user_id)?, payload).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -93,7 +94,8 @@ pub(crate) async fn update_user_legacy(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    update_user_profile_from_payload(&state.db, user_id, payload).await?;
+    let service = UserService::new(&state.db);
+    update_user_profile_from_payload(&service, user_id, payload).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -105,18 +107,19 @@ pub(crate) async fn update_user_policy(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    update_user_profile_from_payload(&state.db, user_id, serde_json::json!({ "Policy": payload }))
+    let service = UserService::new(&state.db);
+    update_user_profile_from_payload(&service, user_id, serde_json::json!({ "Policy": payload }))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn update_user_profile_from_payload(
-    db: &jellyrin_db::Database,
+    service: &UserService<'_>,
     user_id: Uuid,
     payload: serde_json::Value,
 ) -> Result<jellyrin_core::User, ApiError> {
-    let current = db
-        .users()
+    let current = service
+        .list()
         .await?
         .into_iter()
         .find(|user| user.id == user_id)
@@ -134,15 +137,16 @@ async fn update_user_profile_from_payload(
         .and_then(serde_json::Value::as_str)
         .and_then(normalize_sync_play_access)
         .unwrap_or(current.sync_play_access);
-    db.update_user_profile(
-        user_id,
-        name,
-        is_administrator,
-        is_disabled,
-        &sync_play_access,
-    )
-    .await
-    .map_err(ApiError::from)
+    service
+        .update_profile(
+            user_id,
+            name,
+            is_administrator,
+            is_disabled,
+            &sync_play_access,
+        )
+        .await
+        .map_err(ApiError::from)
 }
 
 fn bool_value(payload: Option<&serde_json::Value>, key: &str) -> Option<bool> {
@@ -184,9 +188,8 @@ pub(crate) async fn get_user_by_id(
     let requested_user = if user.id == user_id {
         user
     } else {
-        state
-            .db
-            .users()
+        UserService::new(&state.db)
+            .list()
             .await?
             .into_iter()
             .find(|candidate| candidate.id == user_id)

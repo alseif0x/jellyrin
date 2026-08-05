@@ -16,6 +16,7 @@ mod state;
 mod syncplay_types;
 mod system;
 mod user_configuration;
+mod user_service;
 mod users;
 
 pub(crate) use api_keys::{api_keys, create_api_key, revoke_api_key};
@@ -57,6 +58,7 @@ pub(crate) use user_configuration::{
     default_user_configuration, logout, update_user_configuration,
     update_user_configuration_for_path,
 };
+pub(crate) use user_service::UserService;
 pub(crate) use users::{
     create_user_by_name, delete_user, get_current_user, get_user_by_id, normalize_sync_play_access,
     update_user, update_user_legacy, update_user_policy,

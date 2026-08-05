@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::{
     AUTH_FAILURES, AUTH_LOCKOUT_FAILURE_LIMIT, AUTH_LOCKOUT_SECONDS, ApiError, AppState,
-    AuthFailureState, AuthQuery, authentication_result_to_dto, client_auth_from_headers,
-    ensure_user_access, record_activity, require_user, resolve_user_id,
+    AuthFailureState, AuthQuery, UserService, authentication_result_to_dto,
+    client_auth_from_headers, ensure_user_access, record_activity, require_user, resolve_user_id,
 };
 
 #[derive(Debug, Deserialize)]
@@ -67,32 +67,29 @@ async fn update_user_password_inner(
     requested_user_id: Uuid,
     payload: UpdateUserPasswordBody,
 ) -> Result<StatusCode, ApiError> {
-    let target = state
-        .db
-        .users()
+    let service = UserService::new(&state.db);
+    let target = service
+        .list()
         .await?
         .into_iter()
         .find(|user| user.id == requested_user_id)
         .ok_or_else(|| ApiError::not_found("User not found"))?;
     ensure_user_access(auth_user, target.id)?;
     if payload.reset_password.unwrap_or(false) {
-        state.db.reset_user_password(target.id).await?;
+        service.reset_password(target.id).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
     if !auth_user.is_administrator || auth_user.id == target.id {
-        state
-            .db
-            .verify_user_password(target.id, payload.current_pw.as_deref().unwrap_or_default())
+        service
+            .verify_password(target.id, payload.current_pw.as_deref().unwrap_or_default())
             .await
             .map_err(|_| ApiError::forbidden("Invalid user or password entered"))?;
     }
-    state
-        .db
-        .set_user_password(target.id, payload.new_pw.as_deref().unwrap_or_default())
+    service
+        .set_password(target.id, payload.new_pw.as_deref().unwrap_or_default())
         .await?;
-    state
-        .db
-        .revoke_user_tokens_except(target.id, &token.access_token)
+    service
+        .revoke_tokens_except(target.id, &token.access_token)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -103,6 +100,7 @@ pub(crate) async fn authenticate_by_name(
     Json(payload): Json<AuthenticateUserByNameDto>,
 ) -> Result<Json<AuthenticationResultDto>, ApiError> {
     let auth = client_auth_from_headers(&headers);
+    let service = UserService::new(&state.db);
     let username = payload
         .username
         .as_deref()
@@ -112,9 +110,8 @@ pub(crate) async fn authenticate_by_name(
     ensure_auth_not_locked(&lockout_key).await?;
     let password = payload.pw.as_deref().unwrap_or("");
     tracing::info!(route = "Users/AuthenticateByName", username, client = %auth.client, device = %auth.device, device_id = %auth.device_id, version = %auth.version, password_present = !password.is_empty(), "authentication attempt");
-    let auth_result = state
-        .db
-        .authenticate_user_by_name(
+    let auth_result = service
+        .authenticate_by_name(
             username,
             password,
             &auth.device_id,
@@ -156,13 +153,13 @@ pub(crate) async fn authenticate_user_by_id(
     Json(payload): Json<AuthenticateUserByNameDto>,
 ) -> Result<Json<AuthenticationResultDto>, ApiError> {
     let auth = client_auth_from_headers(&headers);
+    let service = UserService::new(&state.db);
     let lockout_key = auth_lockout_key("id", &user_id.to_string());
     ensure_auth_not_locked(&lockout_key).await?;
     let password = payload.pw.as_deref().unwrap_or("");
     tracing::info!(route = "Users/{user_id}/Authenticate", %user_id, client = %auth.client, device = %auth.device, device_id = %auth.device_id, version = %auth.version, password_present = !password.is_empty(), "authentication attempt");
-    let auth_result = state
-        .db
-        .authenticate_user_by_id(
+    let auth_result = service
+        .authenticate_by_id(
             user_id,
             password,
             &auth.device_id,

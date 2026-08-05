@@ -6,7 +6,7 @@ use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{ApiError, AppState, format_time_for_json, stable_entity_id};
+use crate::{ApiError, AppState, UserService, format_time_for_json, stable_entity_id};
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ForgotPasswordBody {
@@ -120,7 +120,9 @@ pub(crate) async fn forgot_password_pin(
         else {
             continue;
         };
-        state.db.set_user_password(user.id, &new_password).await?;
+        UserService::new(&state.db)
+            .set_password(user.id, &new_password)
+            .await?;
         users_reset.push(user.name);
         let _ = tokio::fs::remove_file(&path).await;
     }

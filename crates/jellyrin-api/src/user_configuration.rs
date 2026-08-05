@@ -1,5 +1,5 @@
 use crate::{
-    ApiError, AppState, AuthQuery, bearer_token, ensure_user_access, record_activity,
+    ApiError, AppState, AuthQuery, UserService, bearer_token, ensure_user_access, record_activity,
     require_request_user, resolve_user_id, syncplay_remove_session,
 };
 use axum::{
@@ -51,18 +51,18 @@ async fn update_user_configuration_for_id(
     payload: serde_json::Value,
 ) -> Result<StatusCode, ApiError> {
     let auth_user = require_request_user(&state.db, &headers, auth.api_key.as_deref()).await?;
+    let service = UserService::new(&state.db);
     let user_id = match user_id {
         Some(user_id) => resolve_user_id(user_id)?,
         None => auth_user.id,
     };
     ensure_user_access(&auth_user, user_id)?;
-    let current = state
-        .db
-        .user_configuration(user_id)
+    let current = service
+        .configuration(user_id)
         .await?
         .unwrap_or_else(default_user_configuration);
     let merged = merge_user_configuration(current, payload)?;
-    state.db.update_user_configuration(user_id, merged).await?;
+    service.update_configuration(user_id, merged).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
