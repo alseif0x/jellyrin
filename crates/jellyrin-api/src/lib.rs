@@ -14,6 +14,7 @@ mod session;
 mod state;
 mod syncplay_types;
 mod system;
+mod user_configuration;
 
 pub(crate) use api_keys::{api_keys, create_api_key, revoke_api_key};
 pub(crate) use auth::{
@@ -37,6 +38,10 @@ pub(crate) use migration::{
     JellyfinMigrationBody, jellyfin_migration_dry_run, jellyfin_migration_import,
 };
 pub(crate) use password_reset::{forgot_password, forgot_password_pin};
+pub(crate) use user_configuration::{
+    default_user_configuration, logout, update_user_configuration,
+    update_user_configuration_for_path,
+};
 pub(crate) use session::session_to_json;
 pub use state::{AppState, SystemLifecycleCommand};
 use syncplay_types::{PlaybackEvent, SyncPlayGroup, SyncPlayParticipant};
@@ -5678,124 +5683,6 @@ async fn get_user_by_id(
     Ok(Json(
         user_to_dto(&state.db, &requested_user, server.server_id).await?,
     ))
-}
-
-#[derive(Debug, Deserialize)]
-struct UserConfigurationQuery {
-    #[serde(flatten)]
-    auth: AuthQuery,
-    #[serde(alias = "UserId", alias = "userId")]
-    user_id: Option<String>,
-}
-
-async fn update_user_configuration(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<UserConfigurationQuery>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    update_user_configuration_for_id(
-        state,
-        headers,
-        query.auth,
-        query.user_id.as_deref(),
-        payload,
-    )
-    .await
-}
-
-async fn update_user_configuration_for_path(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(auth): Query<AuthQuery>,
-    Path(user_id): Path<String>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    update_user_configuration_for_id(state, headers, auth, Some(&user_id), payload).await
-}
-
-async fn update_user_configuration_for_id(
-    state: AppState,
-    headers: HeaderMap,
-    auth: AuthQuery,
-    user_id: Option<&str>,
-    payload: serde_json::Value,
-) -> Result<StatusCode, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, auth.api_key.as_deref()).await?;
-    let user_id = match user_id {
-        Some(user_id) => resolve_user_id(user_id)?,
-        None => auth_user.id,
-    };
-    ensure_user_access(&auth_user, user_id)?;
-    let current = state
-        .db
-        .user_configuration(user_id)
-        .await?
-        .unwrap_or_else(default_user_configuration);
-    let merged = merge_user_configuration(current, payload)?;
-    state.db.update_user_configuration(user_id, merged).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn merge_user_configuration(
-    current: serde_json::Value,
-    update: serde_json::Value,
-) -> Result<serde_json::Value, ApiError> {
-    let serde_json::Value::Object(mut current) = current else {
-        return Err(ApiError::bad_request(
-            "Stored user configuration is invalid",
-        ));
-    };
-    let serde_json::Value::Object(update) = update else {
-        return Err(ApiError::bad_request(
-            "User configuration body must be an object",
-        ));
-    };
-    for (key, value) in update {
-        current.insert(key, value);
-    }
-    Ok(serde_json::Value::Object(current))
-}
-
-fn default_user_configuration() -> serde_json::Value {
-    serde_json::json!({
-        "PlayDefaultAudioTrack": true,
-        "SubtitleLanguagePreference": "",
-        "DisplayMissingEpisodes": false,
-        "GroupedFolders": [],
-        "SubtitleMode": "Default",
-        "DisplayCollectionsView": false,
-        "EnableLocalPassword": false,
-        "OrderedViews": [],
-        "LatestItemsExcludes": [],
-        "MyMediaExcludes": [],
-        "HidePlayedInLatest": true,
-        "RememberAudioSelections": true,
-        "RememberSubtitleSelections": true,
-        "EnableNextEpisodeAutoPlay": true
-    })
-}
-
-async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<StatusCode, ApiError> {
-    let token = bearer_token(&headers)
-        .or_else(|| query.api_key.clone())
-        .ok_or_else(|| ApiError::unauthorized("Missing token"))?;
-    let (user, _) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    record_activity(
-        &state.db,
-        &format!("{} signed out", user.name),
-        Some(&format!("{} signed out", user.name)),
-        "Authentication",
-        Some(user.id),
-    )
-    .await?;
-    syncplay_remove_session(&token, "Leave").await;
-    state.db.revoke_token(&token).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn ping() -> &'static str {
