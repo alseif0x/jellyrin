@@ -9,6 +9,7 @@ mod dlna;
 mod errors;
 mod file_watcher;
 mod livetv_parsing;
+mod livetv_service;
 mod migration;
 mod password_reset;
 mod session;
@@ -42,6 +43,7 @@ pub(crate) use livetv_parsing::{
     live_tv_stable_id, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
     parse_live_tv_xmltv_programs,
 };
+pub(crate) use livetv_service::LiveTvService;
 pub(crate) use migration::{
     JellyfinMigrationBody, jellyfin_migration_dry_run, jellyfin_migration_import,
 };
@@ -14709,21 +14711,22 @@ async fn live_tv_channel_record_by_any_id(
     db: &Database,
     channel_id: &str,
 ) -> Result<Option<LiveTvChannelRecord>, ApiError> {
+    let service = LiveTvService::new(db);
     let channel_id = channel_id.trim();
-    if let Some(channel) = db.live_tv_channel_by_id(channel_id).await? {
+    if let Some(channel) = service.channel_by_id(channel_id).await? {
         return Ok(Some(channel));
     }
     if parse_jellyfin_uuid(channel_id).is_err() {
         return Ok(None);
     }
-    let total = db
-        .live_tv_channel_count(&LiveTvChannelQuery::default())
+    let total = service
+        .channel_count(&LiveTvChannelQuery::default())
         .await?;
     if total == 0 {
         return Ok(None);
     }
-    let page = db
-        .live_tv_channel_page(LiveTvChannelQuery {
+    let page = service
+        .channel_page(LiveTvChannelQuery {
             start_index: 0,
             limit: Some(total.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
             search_term: None,
@@ -15755,7 +15758,9 @@ async fn delete_live_tv_tuner_host(
         .db
         .update_named_configuration("livetv", live_tv_configuration_json(config))
         .await?;
-    state.db.delete_live_tv_tuner_state(tuner_id).await?;
+    LiveTvService::new(&state.db)
+        .delete_tuner_state(tuner_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -15972,6 +15977,7 @@ async fn live_tv_channels(
     headers: HeaderMap,
     Query(query): Query<LiveTvChannelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let service = LiveTvService::new(&state.db);
     require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     // Cap explicit limits at 500, and apply a sane default page size when the
     // client omits Limit — otherwise a large channel list (thousands of items)
@@ -15990,7 +15996,7 @@ async fn live_tv_channels(
         search_term: query.search_term.clone(),
         category_ids,
     };
-    let page = state.db.live_tv_channel_page(db_query).await?;
+    let page = service.channel_page(db_query).await?;
     if page.total_record_count > 0 {
         let server_id = state.db.server_state().await?.server_id.to_string();
         let items = page
@@ -16058,7 +16064,7 @@ async fn resolve_live_tv_category_ids(
     if requested.is_empty() {
         return Ok(Vec::new());
     }
-    let categories = db.live_tv_categories().await?;
+    let categories = LiveTvService::new(db).categories().await?;
     let mut resolved = Vec::new();
     for value in requested {
         let matched = categories.iter().find(|category| {
@@ -16430,7 +16436,7 @@ async fn live_tv_program_result(
         }
     }
     if !category_ids.is_empty() {
-        let categories = db.live_tv_categories().await?;
+        let categories = LiveTvService::new(db).categories().await?;
         let category_names = categories
             .iter()
             .filter(|category| {
@@ -21716,7 +21722,7 @@ async fn live_tv_channel_items_result(
         search_term: query.search_term.clone(),
         category_ids: Vec::new(),
     };
-    let page = db.live_tv_channel_page(db_query).await?;
+    let page = LiveTvService::new(db).channel_page(db_query).await?;
     if page.total_record_count > 0 {
         let items = page
             .items
@@ -32449,7 +32455,7 @@ async fn channel_items(
             search_term: query.search_term.clone(),
             category_ids: Vec::new(),
         };
-        let page = state.db.live_tv_channel_page(db_query).await?;
+        let page = LiveTvService::new(&state.db).channel_page(db_query).await?;
         if page.total_record_count > 0 {
             let server_id = state.db.server_state().await?.server_id.to_string();
             let items = page
@@ -34748,7 +34754,7 @@ async fn live_tv_filter_response(db: &Database) -> Result<serde_json::Value, Api
 async fn live_tv_filter_metadata_values(
     db: &Database,
 ) -> Result<ItemFilterMetadataValues, ApiError> {
-    let persisted_categories = db.live_tv_categories().await?;
+    let persisted_categories = LiveTvService::new(db).categories().await?;
     if !persisted_categories.is_empty() {
         let mut values = ItemFilterMetadataValues::default();
         for category in persisted_categories {
@@ -34796,7 +34802,7 @@ async fn live_tv_filter_metadata_values(
 }
 
 async fn live_tv_filter_metadata_items(db: &Database) -> Result<Vec<serde_json::Value>, ApiError> {
-    let persisted_categories = db.live_tv_categories().await?;
+    let persisted_categories = LiveTvService::new(db).categories().await?;
     if !persisted_categories.is_empty() {
         return Ok(persisted_categories
             .into_iter()
