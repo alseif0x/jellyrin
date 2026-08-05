@@ -1,13 +1,13 @@
+use crate::{
+    ApiError, AppState, AuthQuery, bearer_token, ensure_user_access, record_activity,
+    require_request_user, resolve_user_id, syncplay_remove_session,
+};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
 use serde::Deserialize;
-use crate::{
-    ApiError, AppState, AuthQuery, bearer_token, ensure_user_access, record_activity,
-    require_request_user, resolve_user_id, syncplay_remove_session,
-};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct UserConfigurationQuery {
