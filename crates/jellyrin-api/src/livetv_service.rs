@@ -1,5 +1,6 @@
 use jellyrin_db::{
-    Database, LiveTvCategoryRecord, LiveTvChannelQuery, LiveTvChannelRecord, LiveTvPage,
+    Database, LiveTvCategoryRecord, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
+    LiveTvChannelUpsert, LiveTvPage, LiveTvTunerUpsert,
 };
 
 /// Persistence boundary for Live TV catalogue and tuner state.
@@ -36,5 +37,16 @@ impl<'a> LiveTvService<'a> {
 
     pub(crate) async fn delete_tuner_state(&self, tuner_id: &str) -> anyhow::Result<()> {
         self.db.delete_live_tv_tuner_state(tuner_id).await
+    }
+
+    pub(crate) async fn replace_tuner_snapshot(
+        &self,
+        tuner: LiveTvTunerUpsert,
+        categories: Vec<LiveTvCategoryUpsert>,
+        channels: Vec<LiveTvChannelUpsert>,
+    ) -> anyhow::Result<()> {
+        self.db
+            .replace_live_tv_tuner_snapshot(tuner, categories, channels)
+            .await
     }
 }

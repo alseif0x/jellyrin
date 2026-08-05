@@ -14584,18 +14584,19 @@ async fn persist_live_tv_provider_import(
         );
     }
 
-    db.replace_live_tv_tuner_snapshot(
-        LiveTvTunerUpsert {
-            tuner_id,
-            provider_type,
-            name: tuner_name,
-            source_url,
-            configuration,
-        },
-        categories,
-        channels,
-    )
-    .await?;
+    LiveTvService::new(db)
+        .replace_tuner_snapshot(
+            LiveTvTunerUpsert {
+                tuner_id,
+                provider_type,
+                name: tuner_name,
+                source_url,
+                configuration,
+            },
+            categories,
+            channels,
+        )
+        .await?;
     Ok(())
 }
 
