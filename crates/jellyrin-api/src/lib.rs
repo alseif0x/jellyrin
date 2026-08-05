@@ -9,6 +9,7 @@ mod errors;
 mod file_watcher;
 mod livetv_parsing;
 mod migration;
+mod password_reset;
 mod session;
 mod state;
 mod syncplay_types;
@@ -24,9 +25,6 @@ pub(crate) use auth::{
 #[cfg(test)]
 pub(crate) use auth::{parse_authorization_token, parse_media_browser_pairs};
 pub(crate) use backup::{backup_manifest, backups, create_backup, restore_backup};
-pub(crate) use migration::{
-    JellyfinMigrationBody, jellyfin_migration_dry_run, jellyfin_migration_import,
-};
 pub(crate) use capabilities::{parse_bool_query_value, update_session_capabilities};
 pub use errors::ApiError;
 #[cfg(test)]
@@ -35,6 +33,10 @@ pub(crate) use livetv_parsing::{
     live_tv_stable_id, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
     parse_live_tv_xmltv_programs,
 };
+pub(crate) use migration::{
+    JellyfinMigrationBody, jellyfin_migration_dry_run, jellyfin_migration_import,
+};
+pub(crate) use password_reset::{forgot_password, forgot_password_pin};
 pub(crate) use session::session_to_json;
 pub use state::{AppState, SystemLifecycleCommand};
 use syncplay_types::{PlaybackEvent, SyncPlayGroup, SyncPlayParticipant};
@@ -5639,172 +5641,6 @@ fn epoch_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ForgotPasswordBody {
-    #[serde(alias = "EnteredUsername", alias = "Username", alias = "Name")]
-    entered_username: Option<String>,
-}
-
-async fn forgot_password(
-    State(state): State<AppState>,
-    body: Option<Json<ForgotPasswordBody>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let entered_username = body
-        .map(|body| body.entered_username.clone())
-        .unwrap_or_default()
-        .unwrap_or_default();
-    let expire_time = OffsetDateTime::now_utc() + Duration::minutes(30);
-    let pin_file = password_reset_file_path(&entered_username);
-
-    if let Some(user) = state
-        .db
-        .users()
-        .await?
-        .into_iter()
-        .find(|user| user.name.eq_ignore_ascii_case(entered_username.trim()))
-    {
-        let pin = generate_password_reset_pin();
-        let reset = serde_json::json!({
-            "ExpirationDate": format_time_for_json(expire_time),
-            "Pin": pin,
-            "PinFile": pin_file.to_string_lossy(),
-            "UserName": user.name
-        });
-        tokio::fs::write(&pin_file, serde_json::to_vec(&reset)?).await?;
-    }
-
-    Ok(Json(serde_json::json!({
-        "Action": "PinCode",
-        "PinFile": pin_file.to_string_lossy(),
-        "PinExpirationDate": format_time_for_json(expire_time)
-    })))
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ForgotPasswordPinBody {
-    #[serde(alias = "Pin")]
-    pin: Option<String>,
-    #[serde(alias = "Password", alias = "NewPassword", alias = "NewPw")]
-    password: Option<String>,
-}
-
-async fn forgot_password_pin(
-    State(state): State<AppState>,
-    body: Option<Json<ForgotPasswordPinBody>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let pin = body
-        .as_ref()
-        .and_then(|body| body.pin.clone())
-        .unwrap_or_default();
-    let normalized_pin = normalize_password_reset_pin(&pin);
-    let new_password = body
-        .as_ref()
-        .and_then(|body| body.password.as_deref())
-        .map(str::trim)
-        .filter(|password| !password.is_empty())
-        .unwrap_or(pin.trim())
-        .to_string();
-    if normalized_pin.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "Success": false,
-            "UsersReset": []
-        })));
-    }
-
-    let mut users_reset = Vec::new();
-    let mut entries = tokio::fs::read_dir(password_reset_dir()).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if !is_password_reset_file(&path) {
-            continue;
-        }
-
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            continue;
-        };
-        let Ok(reset) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        let expiration = reset
-            .get("ExpirationDate")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
-
-        if expiration.is_some_and(|expiration| expiration < OffsetDateTime::now_utc()) {
-            let _ = tokio::fs::remove_file(&path).await;
-            continue;
-        }
-
-        let stored_pin = reset
-            .get("Pin")
-            .and_then(serde_json::Value::as_str)
-            .map(normalize_password_reset_pin)
-            .unwrap_or_default();
-        if stored_pin != normalized_pin {
-            continue;
-        }
-
-        let Some(username) = reset.get("UserName").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(user) = state
-            .db
-            .users()
-            .await?
-            .into_iter()
-            .find(|user| user.name.eq_ignore_ascii_case(username))
-        else {
-            continue;
-        };
-
-        state.db.set_user_password(user.id, &new_password).await?;
-        users_reset.push(user.name);
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    Ok(Json(serde_json::json!({
-        "Success": !users_reset.is_empty(),
-        "UsersReset": users_reset
-    })))
-}
-
-fn password_reset_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn password_reset_file_path(username: &str) -> PathBuf {
-    let username = username.trim();
-    let suffix = if username.is_empty() {
-        Uuid::new_v4().simple().to_string()
-    } else {
-        stable_entity_id("passwordreset", username)
-    };
-    password_reset_dir().join(format!("passwordreset{suffix}.json"))
-}
-
-fn is_password_reset_file(path: &FsPath) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("passwordreset") && name.ends_with(".json"))
-}
-
-fn generate_password_reset_pin() -> String {
-    let mut bytes = [0_u8; 4];
-    OsRng.fill_bytes(&mut bytes);
-    bytes
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-fn normalize_password_reset_pin(pin: &str) -> String {
-    pin.chars()
-        .filter(|character| *character != '-')
-        .flat_map(char::to_uppercase)
-        .collect()
 }
 
 async fn get_current_user(
