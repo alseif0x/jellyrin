@@ -11732,9 +11732,9 @@ async fn send_play_command(
 ) -> Result<StatusCode, ApiError> {
     let query = parse_send_play_command_query(raw_query.as_deref());
     let (auth_user, _) = require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
-    let target_session = state
-        .db
-        .device_session_by_id(&session_id)
+    let service = SessionService::new(&state.db);
+    let target_session = service
+        .device_by_id(&session_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device session not found"))?;
     ensure_user_access(&auth_user, target_session.user_id)?;
@@ -11778,9 +11778,8 @@ async fn send_play_command(
             .media_source_id
             .clone()
             .unwrap_or_else(|| item.id.simple().to_string());
-        state
-            .db
-            .upsert_active_playback_session(UpsertActivePlaybackSession {
+        service
+            .upsert_active_playback(UpsertActivePlaybackSession {
                 session_id: target_session.access_token.clone(),
                 user_id: target_session.user_id,
                 item_id: item.id,
@@ -11807,9 +11806,8 @@ async fn send_play_command(
             }),
         );
     } else {
-        state
-            .db
-            .clear_active_playback_session(&target_session.access_token)
+        service
+            .clear_active_playback(&target_session.access_token)
             .await?;
     }
     broadcast_sessions_message(&state.db, &target_session.access_token, &auth_user).await?;
@@ -11881,16 +11879,15 @@ async fn send_playstate_command(
 ) -> Result<StatusCode, ApiError> {
     let query = parse_send_playstate_command_query(raw_query.as_deref());
     let (auth_user, _) = require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
-    let target_session = state
-        .db
-        .device_session_by_id(&session_id)
+    let service = SessionService::new(&state.db);
+    let target_session = service
+        .device_by_id(&session_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device session not found"))?;
     ensure_user_access(&auth_user, target_session.user_id)?;
 
-    let current_playback = state
-        .db
-        .active_playback_sessions()
+    let current_playback = service
+        .active_playback()
         .await?
         .into_iter()
         .find(|playback| playback.session_id == target_session.access_token);
@@ -11898,9 +11895,8 @@ async fn send_playstate_command(
     let canonical_command = canonical_playstate_command(&command)?;
     match canonical_command {
         "Stop" => {
-            state
-                .db
-                .clear_active_playback_session(&target_session.access_token)
+            service
+                .clear_active_playback(&target_session.access_token)
                 .await?;
         }
         "Pause" | "Unpause" | "PlayPause" | "Seek" => {
@@ -11911,9 +11907,8 @@ async fn send_playstate_command(
                     "PlayPause" => !playback.is_paused,
                     _ => playback.is_paused,
                 };
-                state
-                    .db
-                    .upsert_active_playback_session(UpsertActivePlaybackSession {
+                service
+                    .upsert_active_playback(UpsertActivePlaybackSession {
                         session_id: target_session.access_token.clone(),
                         user_id: target_session.user_id,
                         item_id: playback.item.id,
@@ -11953,9 +11948,9 @@ async fn command_target_session(
     session_id: &str,
 ) -> Result<(User, DeviceSession), ApiError> {
     let (auth_user, _) = require_user(&state.db, headers, auth_query.api_key.as_deref()).await?;
-    let target_session = state
-        .db
-        .device_session_by_id(session_id)
+    let service = SessionService::new(&state.db);
+    let target_session = service
+        .device_by_id(session_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Device session not found"))?;
     ensure_user_access(&auth_user, target_session.user_id)?;
@@ -12180,10 +12175,11 @@ async fn apply_stream_index_command_side_effect(
     command: &str,
     arguments: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), ApiError> {
+    let service = SessionService::new(db);
     let stream_index = general_command_stream_index(command, arguments)
         .ok_or_else(|| ApiError::bad_request("Stream index is required"))?;
-    let Some(playback) = db
-        .active_playback_sessions()
+    let Some(playback) = service
+        .active_playback()
         .await?
         .into_iter()
         .find(|session| session.session_id == target_session.access_token)
@@ -12211,28 +12207,30 @@ async fn apply_stream_index_command_side_effect(
         _ => return Ok(()),
     };
 
-    db.upsert_playback_state(UpsertPlaybackState {
-        user_id: target_session.user_id,
-        item_id: playback.item.id,
-        media_source_id: playback.media_source_id.clone(),
-        audio_stream_index,
-        subtitle_stream_index,
-        position_ticks: playback.position_ticks,
-        is_paused: playback.is_paused,
-        played: false,
-    })
-    .await?;
-    db.upsert_active_playback_session(UpsertActivePlaybackSession {
-        session_id: target_session.access_token.clone(),
-        user_id: target_session.user_id,
-        item_id: playback.item.id,
-        media_source_id: playback.media_source_id,
-        audio_stream_index,
-        subtitle_stream_index,
-        position_ticks: playback.position_ticks,
-        is_paused: playback.is_paused,
-    })
-    .await?;
+    service
+        .upsert_playback_state(UpsertPlaybackState {
+            user_id: target_session.user_id,
+            item_id: playback.item.id,
+            media_source_id: playback.media_source_id.clone(),
+            audio_stream_index,
+            subtitle_stream_index,
+            position_ticks: playback.position_ticks,
+            is_paused: playback.is_paused,
+            played: false,
+        })
+        .await?;
+    service
+        .upsert_active_playback(UpsertActivePlaybackSession {
+            session_id: target_session.access_token.clone(),
+            user_id: target_session.user_id,
+            item_id: playback.item.id,
+            media_source_id: playback.media_source_id,
+            audio_stream_index,
+            subtitle_stream_index,
+            position_ticks: playback.position_ticks,
+            is_paused: playback.is_paused,
+        })
+        .await?;
     broadcast_sessions_message(db, &target_session.access_token, auth_user).await
 }
 
