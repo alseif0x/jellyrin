@@ -11582,6 +11582,7 @@ async fn report_playback(
     playback_active: bool,
 ) -> Result<StatusCode, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     if live_tv_channel_json_for_playable_item(&state.db, &payload.item_id)
         .await?
         .is_some()
@@ -11595,10 +11596,7 @@ async fn report_playback(
             {
                 stop_live_hls_session_by_id(play_session_id).await;
             }
-            state
-                .db
-                .clear_active_playback_session(&token.access_token)
-                .await?;
+            service.clear_active_playback(&token.access_token).await?;
         }
         broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
         return Ok(StatusCode::NO_CONTENT);
@@ -11611,7 +11609,7 @@ async fn report_playback(
         .or(payload.start_time_ticks)
         .unwrap_or_default();
     let position_ticks = normalize_playback_report_position_ticks(
-        &state.db,
+        &service,
         payload.play_method.as_deref(),
         payload.play_session_id.as_deref(),
         reported_position_ticks,
@@ -11620,8 +11618,7 @@ async fn report_playback(
     let playback_outcome =
         playback_report_outcome(item.runtime_ticks, position_ticks, playback_active);
     let is_paused = payload.is_paused.unwrap_or(false);
-    state
-        .db
+    service
         .upsert_playback_state(UpsertPlaybackState {
             user_id: user.id,
             item_id: item.id,
@@ -11634,9 +11631,8 @@ async fn report_playback(
         })
         .await?;
     if playback_active {
-        state
-            .db
-            .upsert_active_playback_session(UpsertActivePlaybackSession {
+        service
+            .upsert_active_playback(UpsertActivePlaybackSession {
                 session_id: token.access_token.clone(),
                 user_id: user.id,
                 item_id: item.id,
@@ -11648,10 +11644,7 @@ async fn report_playback(
             })
             .await?;
     } else {
-        state
-            .db
-            .clear_active_playback_session(&token.access_token)
-            .await?;
+        service.clear_active_playback(&token.access_token).await?;
     }
     broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -11694,7 +11687,7 @@ fn playback_position_reached_played_threshold(
 }
 
 async fn normalize_playback_report_position_ticks(
-    db: &Database,
+    service: &SessionService<'_>,
     play_method: Option<&str>,
     play_session_id: Option<&str>,
     position_ticks: i64,
@@ -11711,10 +11704,7 @@ async fn normalize_playback_report_position_ticks(
     if !play_method.eq_ignore_ascii_case("Transcode") {
         return Ok(position_ticks.max(0));
     }
-    let Some(session) = db
-        .transcode_session_by_play_session_id(play_session_id)
-        .await?
-    else {
+    let Some(session) = service.transcode_by_play_session(play_session_id).await? else {
         return Ok(position_ticks.max(0));
     };
     Ok(session

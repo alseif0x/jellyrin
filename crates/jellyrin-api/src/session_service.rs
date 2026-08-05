@@ -1,7 +1,7 @@
 use jellyrin_core::DeviceToken;
 use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, Database, DeviceSession,
-    TranscodeSession,
+    TranscodeSession, UpsertActivePlaybackSession, UpsertPlaybackState,
 };
 use serde_json::Value;
 
@@ -100,5 +100,23 @@ impl<'a> SessionService<'a> {
         self.db
             .update_transcode_session_status(play_session_id, status)
             .await
+    }
+
+    pub(crate) async fn upsert_playback_state(
+        &self,
+        state: UpsertPlaybackState,
+    ) -> anyhow::Result<()> {
+        self.db.upsert_playback_state(state).await
+    }
+
+    pub(crate) async fn upsert_active_playback(
+        &self,
+        session: UpsertActivePlaybackSession,
+    ) -> anyhow::Result<()> {
+        self.db.upsert_active_playback_session(session).await
+    }
+
+    pub(crate) async fn clear_active_playback(&self, session_id: &str) -> anyhow::Result<()> {
+        self.db.clear_active_playback_session(session_id).await
     }
 }
