@@ -33828,7 +33828,8 @@ async fn active_encodings(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let sessions = state.db.active_transcode_sessions().await?;
+    let service = SessionService::new(&state.db);
+    let sessions = service.active_transcodes().await?;
     let mut result: Vec<serde_json::Value> = sessions.iter().map(transcode_session_json).collect();
     // Include active live TV HLS sessions from the in-memory registry.
     let live_registry = live_hls_session_registry().lock().await;
@@ -33871,6 +33872,7 @@ async fn stop_active_encoding(
     Query(query): Query<StopEncodingQuery>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     let play_session_id = query
         .play_session_id
         .as_deref()
@@ -33892,9 +33894,8 @@ async fn stop_active_encoding(
         return Ok(StatusCode::OK);
     }
 
-    let session = state
-        .db
-        .transcode_session_by_play_session_id(play_session_id)
+    let session = service
+        .transcode_by_play_session(play_session_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Transcode session not found"))?;
     if session.user_id != user.id && !user.is_administrator {
@@ -33919,15 +33920,13 @@ async fn stop_active_encoding(
         .await
         .remove(play_session_id);
     if let Some(stop_sender) = stop_sender {
-        state
-            .db
-            .update_transcode_session_status(play_session_id, "stopping")
+        service
+            .update_transcode_status(play_session_id, "stopping")
             .await?;
         let _ = stop_sender.send(());
     } else if !already_terminal {
-        state
-            .db
-            .update_transcode_session_status(play_session_id, "stopped")
+        service
+            .update_transcode_status(play_session_id, "stopped")
             .await?;
         cleanup_hls_transcode_files(&session.output_path).await;
     } else {
