@@ -18,6 +18,7 @@ mod session_service;
 mod state;
 mod syncplay_types;
 mod system;
+mod task_service;
 mod user_configuration;
 mod user_service;
 mod users;
@@ -60,6 +61,7 @@ pub(crate) use system::{
     post_startup_remote_access, post_startup_user, ready, system_info, system_info_public,
     time_sync_utc_time, tmdb_client_configuration,
 };
+pub(crate) use task_service::TaskService;
 pub(crate) use user_configuration::{
     default_user_configuration, logout, update_user_configuration,
     update_user_configuration_for_path,
@@ -3879,7 +3881,9 @@ async fn maybe_run_due_xtream_media_sync(db: &Database) -> Result<bool, ApiError
         return Ok(false);
     }
     let triggers = xtream_media_sync_triggers_json(db).await?;
-    let last_result = db.last_task_result(XTREAM_MEDIA_SYNC_TASK_KEY).await?;
+    let last_result = TaskService::new(db)
+        .last_result(XTREAM_MEDIA_SYNC_TASK_KEY)
+        .await?;
     if !scheduled_task_due(&triggers, last_result.as_ref()) {
         return Ok(false);
     }
@@ -6173,9 +6177,8 @@ async fn cancel_package_installation(
     let (_user, session_id) =
         require_admin_session(&state.db, &headers, query.api_key.as_deref()).await?;
     let task_key = package_install_task_key(&package_id);
-    let _ = state
-        .db
-        .fail_current_task_run(&task_key, "Package installation cancelled.")
+    let _ = TaskService::new(&state.db)
+        .fail_current(&task_key, "Package installation cancelled.")
         .await?;
     broadcast_package_task_event(
         &session_id,
@@ -6202,11 +6205,11 @@ async fn package_installation_status(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let task_key = package_install_task_key(&package_id);
-    let run = state
-        .db
-        .current_task_run(&task_key)
+    let task_service = TaskService::new(&state.db);
+    let run = task_service
+        .current(&task_key)
         .await?
-        .or(state.db.last_task_result(&task_key).await?)
+        .or(task_service.last_result(&task_key).await?)
         .ok_or_else(|| ApiError::not_found("Package installation task not found"))?;
     Ok(Json(package_task_run_json(&run)))
 }
@@ -6239,7 +6242,9 @@ async fn update_package_install_task_progress(
         "Phase": progress.phase,
         "ProgressPercentage": progress.progress_percentage,
     });
-    db.update_task_run_progress(run_id, result.clone()).await?;
+    TaskService::new(db)
+        .update_progress(run_id, result.clone())
+        .await?;
     broadcast_package_task_event(
         session_id,
         "PackageInstall",
@@ -6280,7 +6285,9 @@ async fn update_and_broadcast_package_task_progress(
     run_id: Uuid,
     result: serde_json::Value,
 ) -> Result<(), ApiError> {
-    db.update_task_run_progress(run_id, result.clone()).await?;
+    TaskService::new(db)
+        .update_progress(run_id, result.clone())
+        .await?;
     broadcast_package_task_event(
         session_id,
         message_type,
@@ -6580,7 +6587,7 @@ async fn ensure_package_install_not_cancelled(
     task_key: &str,
     run_id: Uuid,
 ) -> Result<(), ApiError> {
-    let current = db.current_task_run(task_key).await?;
+    let current = TaskService::new(db).current(task_key).await?;
     if current.as_ref().is_some_and(|run| run.id == run_id) {
         Ok(())
     } else {
@@ -10613,8 +10620,8 @@ async fn start_scheduled_task(
         tokio::spawn(async move {
             match scan_all_library_items(&db).await {
                 Ok(scanned_count) => {
-                    let _ = db
-                        .complete_task_run(
+                    let _ = TaskService::new(&db)
+                        .complete(
                             run.id,
                             serde_json::json!({
                                 "ItemsScanned": scanned_count,
@@ -10624,7 +10631,7 @@ async fn start_scheduled_task(
                 }
                 Err(error) => {
                     let message = format!("{error:?}");
-                    let _ = db.fail_task_run(run.id, &message).await;
+                    let _ = TaskService::new(&db).fail(run.id, &message).await;
                 }
             }
             let _ = broadcast_scheduled_tasks_update(&db, &session_id).await;
@@ -10656,11 +10663,11 @@ async fn start_scheduled_task(
         tokio::spawn(async move {
             match refresh_channel_provider_cache(&db).await {
                 Ok(result) => {
-                    let _ = db.complete_task_run(run.id, result).await;
+                    let _ = TaskService::new(&db).complete(run.id, result).await;
                 }
                 Err(error) => {
                     let message = format!("{error:?}");
-                    let _ = db.fail_task_run(run.id, &message).await;
+                    let _ = TaskService::new(&db).fail(run.id, &message).await;
                 }
             }
             let _ = broadcast_scheduled_tasks_update(&db, &session_id).await;
@@ -10680,7 +10687,12 @@ async fn start_scheduled_task(
             Err(error) if format!("{error:#}").contains("task is already running") => {
                 return Ok(StatusCode::NO_CONTENT);
             }
-            Err(error) if state.db.current_task_run(&task_key).await?.is_some() => {
+            Err(error)
+                if TaskService::new(&state.db)
+                    .current(&task_key)
+                    .await?
+                    .is_some() =>
+            {
                 let _ = error;
                 return Ok(StatusCode::NO_CONTENT);
             }
@@ -10698,16 +10710,16 @@ async fn start_scheduled_task(
             .await;
             match result {
                 Ok(Some(value)) => {
-                    let _ = db.complete_task_run(run.id, value.value).await;
+                    let _ = TaskService::new(&db).complete(run.id, value.value).await;
                 }
                 Ok(None) => {
-                    let _ = db
-                        .fail_task_run(run.id, "Plugin runtime host is unavailable.")
+                    let _ = TaskService::new(&db)
+                        .fail(run.id, "Plugin runtime host is unavailable.")
                         .await;
                 }
                 Err(error) => {
                     let message = format!("{error:?}");
-                    let _ = db.fail_task_run(run.id, &message).await;
+                    let _ = TaskService::new(&db).fail(run.id, &message).await;
                 }
             }
             let _ = broadcast_scheduled_tasks_update(&db, &session_id).await;
@@ -10945,8 +10957,9 @@ async fn plugin_scheduled_task_json(
     let plugin_id = json_string_field(plugin, "Id").unwrap_or_default();
     let name = json_string_field(plugin, "Name").unwrap_or_else(|| plugin_id.clone());
     let task_key = plugin_scheduled_task_key(&plugin_id);
-    let current_run = db.current_task_run(&task_key).await?;
-    let last_result = db.last_task_result(&task_key).await?;
+    let task_service = TaskService::new(db);
+    let current_run = task_service.current(&task_key).await?;
+    let last_result = task_service.last_result(&task_key).await?;
     let triggers = scheduled_task_triggers_json(db, &task_key).await?;
     let state = if current_run.is_some() {
         "Running"
@@ -11192,8 +11205,9 @@ fn has_local_image_file(media_path: &str, image_type: &str) -> bool {
 }
 
 async fn library_scan_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
-    let current_run = db.current_task_run(LIBRARY_SCAN_TASK_KEY).await?;
-    let last_result = db.last_task_result(LIBRARY_SCAN_TASK_KEY).await?;
+    let task_service = TaskService::new(db);
+    let current_run = task_service.current(LIBRARY_SCAN_TASK_KEY).await?;
+    let last_result = task_service.last_result(LIBRARY_SCAN_TASK_KEY).await?;
     let triggers = scheduled_task_triggers_json(db, LIBRARY_SCAN_TASK_KEY).await?;
     let state = if current_run.is_some() {
         "Running"
@@ -11222,8 +11236,9 @@ fn is_library_scan_task(task_id: &str) -> bool {
 }
 
 async fn channel_refresh_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
-    let current_run = db.current_task_run(CHANNEL_REFRESH_TASK_KEY).await?;
-    let last_result = db.last_task_result(CHANNEL_REFRESH_TASK_KEY).await?;
+    let task_service = TaskService::new(db);
+    let current_run = task_service.current(CHANNEL_REFRESH_TASK_KEY).await?;
+    let last_result = task_service.last_result(CHANNEL_REFRESH_TASK_KEY).await?;
     let triggers = scheduled_task_triggers_json(db, CHANNEL_REFRESH_TASK_KEY).await?;
     let state = if current_run.is_some() {
         "Running"
@@ -11252,8 +11267,9 @@ fn is_channel_refresh_task(task_id: &str) -> bool {
 }
 
 async fn xtream_media_sync_task_json(db: &Database) -> Result<serde_json::Value, ApiError> {
-    let current_run = db.current_task_run(XTREAM_MEDIA_SYNC_TASK_KEY).await?;
-    let last_result = db.last_task_result(XTREAM_MEDIA_SYNC_TASK_KEY).await?;
+    let task_service = TaskService::new(db);
+    let current_run = task_service.current(XTREAM_MEDIA_SYNC_TASK_KEY).await?;
+    let last_result = task_service.last_result(XTREAM_MEDIA_SYNC_TASK_KEY).await?;
     let triggers = xtream_media_sync_triggers_json(db).await?;
     let state = if current_run.is_some() {
         "Running"
@@ -14636,11 +14652,11 @@ async fn start_xtream_media_sync_task(
         let result = sync_all_configured_xtream_media(&db).await;
         match result {
             Ok(result) => {
-                let _ = db.complete_task_run(run.id, result).await;
+                let _ = TaskService::new(&db).complete(run.id, result).await;
             }
             Err(error) => {
                 let message = format!("{error:?}");
-                let _ = db.fail_task_run(run.id, &message).await;
+                let _ = TaskService::new(&db).fail(run.id, &message).await;
             }
         }
         if let Some(session_id) = session_id.as_deref() {
