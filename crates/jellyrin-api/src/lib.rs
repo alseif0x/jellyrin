@@ -18928,8 +18928,9 @@ async fn delete_persisted_live_tv_recording(
     db: &Database,
     recording_id: &str,
 ) -> Result<StatusCode, ApiError> {
-    let mut config = db
-        .named_configuration("livetv")
+    let service = LiveTvService::new(db);
+    let mut config = service
+        .configuration()
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let mut recordings = config
@@ -18947,7 +18948,8 @@ async fn delete_persisted_live_tv_recording(
         return Err(ApiError::not_found("Live TV recording not found"));
     }
     config["Recordings"] = serde_json::json!(recordings);
-    db.update_named_configuration("livetv", live_tv_configuration_json(config))
+    service
+        .update_configuration(live_tv_configuration_json(config))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -19130,8 +19132,8 @@ async fn live_tv_timer_list(
     db: &Database,
     key: &'static str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = db
-        .named_configuration("livetv")
+    let config = LiveTvService::new(db)
+        .configuration()
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let items = live_tv_timer_items(&config, key);
@@ -19143,8 +19145,8 @@ async fn live_tv_timer_by_id(
     key: &'static str,
     timer_id: &str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = db
-        .named_configuration("livetv")
+    let config = LiveTvService::new(db)
+        .configuration()
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let timer = live_tv_timer_items(&config, key)
@@ -19168,8 +19170,9 @@ async fn upsert_live_tv_timer(
     if !payload.is_object() {
         return Err(ApiError::bad_request("Live TV timer must be an object"));
     }
-    let mut config = db
-        .named_configuration("livetv")
+    let service = LiveTvService::new(db);
+    let mut config = service
+        .configuration()
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let mut timer = normalize_live_tv_timer(payload, path_timer_id, key == "SeriesTimers");
@@ -19194,7 +19197,8 @@ async fn upsert_live_tv_timer(
         timers.push(timer.clone());
     }
     config[key] = serde_json::json!(timers);
-    db.update_named_configuration("livetv", live_tv_configuration_json(config))
+    service
+        .update_configuration(live_tv_configuration_json(config))
         .await?;
     Ok(Json(std::mem::take(&mut timer)))
 }
@@ -19204,8 +19208,9 @@ async fn delete_persisted_live_tv_timer(
     key: &'static str,
     timer_id: &str,
 ) -> Result<StatusCode, ApiError> {
-    let mut config = db
-        .named_configuration("livetv")
+    let service = LiveTvService::new(db);
+    let mut config = service
+        .configuration()
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let mut timers = config
@@ -19224,7 +19229,8 @@ async fn delete_persisted_live_tv_timer(
         return Err(ApiError::not_found("Live TV timer not found"));
     }
     config[key] = serde_json::json!(timers);
-    db.update_named_configuration("livetv", live_tv_configuration_json(config))
+    service
+        .update_configuration(live_tv_configuration_json(config))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
