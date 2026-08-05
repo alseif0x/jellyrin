@@ -16,6 +16,7 @@ mod state;
 mod syncplay_types;
 mod system;
 mod user_configuration;
+mod users;
 
 pub(crate) use api_keys::{api_keys, create_api_key, revoke_api_key};
 pub(crate) use auth::{
@@ -55,6 +56,10 @@ pub(crate) use system::{
 pub(crate) use user_configuration::{
     default_user_configuration, logout, update_user_configuration,
     update_user_configuration_for_path,
+};
+pub(crate) use users::{
+    create_user_by_name, delete_user, get_current_user, get_user_by_id, normalize_sync_play_access,
+    update_user, update_user_legacy, update_user_policy,
 };
 
 use jellyrin_xtream_provider as live_tv_xtream;
@@ -5200,195 +5205,6 @@ fn migration_i64_field(
     fields
         .iter()
         .find_map(|field| object.get(*field).and_then(serde_json::Value::as_i64))
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateUserByNameBody {
-    #[serde(alias = "Name")]
-    name: Option<String>,
-    #[serde(alias = "Password")]
-    password: Option<String>,
-}
-
-async fn create_user_by_name(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Json(payload): Json<CreateUserByNameBody>,
-) -> Result<Json<UserDto>, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    let name = payload
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| ApiError::bad_request("Name must not be empty"))?;
-    let user = state
-        .db
-        .create_user(name, payload.password.as_deref())
-        .await
-        .map_err(|_| ApiError::conflict("User could not be created"))?;
-    let server = state.db.server_state().await?;
-    Ok(Json(user_to_dto(&state.db, &user, server.server_id).await?))
-}
-
-async fn delete_user(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path(user_id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    state
-        .db
-        .user_by_id(user_id)
-        .await
-        .map_err(|_| ApiError::not_found("User not found"))?;
-    state
-        .db
-        .delete_user(user_id)
-        .await
-        .map_err(|_| ApiError::conflict("User could not be deleted"))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateUserQuery {
-    #[serde(flatten)]
-    auth: AuthQuery,
-    #[serde(alias = "UserId", alias = "userId", alias = "user_id")]
-    user_id: Option<String>,
-}
-
-async fn update_user(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<UpdateUserQuery>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    let user_id = query
-        .user_id
-        .as_deref()
-        .or_else(|| payload.get("Id").and_then(serde_json::Value::as_str))
-        .ok_or_else(|| ApiError::bad_request("User id is required"))?;
-    update_user_profile_from_payload(&state.db, resolve_user_id(user_id)?, payload).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn update_user_legacy(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path(user_id): Path<Uuid>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    update_user_profile_from_payload(&state.db, user_id, payload).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn update_user_policy(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path(user_id): Path<Uuid>,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    update_user_profile_from_payload(&state.db, user_id, serde_json::json!({ "Policy": payload }))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn update_user_profile_from_payload(
-    db: &Database,
-    user_id: Uuid,
-    payload: serde_json::Value,
-) -> Result<User, ApiError> {
-    let current = db
-        .users()
-        .await?
-        .into_iter()
-        .find(|user| user.id == user_id)
-        .ok_or_else(|| ApiError::not_found("User not found"))?;
-    let policy = payload.get("Policy");
-    let name = payload
-        .get("Name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(&current.name);
-    let is_administrator =
-        bool_value(policy, "IsAdministrator").unwrap_or(current.is_administrator);
-    let is_disabled = bool_value(policy, "IsDisabled").unwrap_or(current.is_disabled);
-    let sync_play_access = policy
-        .and_then(|policy| {
-            policy
-                .get("SyncPlayAccess")
-                .and_then(serde_json::Value::as_str)
-                .and_then(normalize_sync_play_access)
-        })
-        .unwrap_or(current.sync_play_access);
-    db.update_user_profile(
-        user_id,
-        name,
-        is_administrator,
-        is_disabled,
-        &sync_play_access,
-    )
-    .await
-    .map_err(ApiError::from)
-}
-
-fn bool_value(payload: Option<&serde_json::Value>, key: &str) -> Option<bool> {
-    payload
-        .and_then(|payload| payload.get(key))
-        .and_then(serde_json::Value::as_bool)
-}
-
-fn normalize_sync_play_access(value: &str) -> Option<String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "createandjoingroups" => Some("CreateAndJoinGroups".to_string()),
-        "joingroups" => Some("JoinGroups".to_string()),
-        "none" => Some("None".to_string()),
-        _ => None,
-    }
-}
-
-async fn get_current_user(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-) -> Result<Json<UserDto>, ApiError> {
-    let (user, _) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let server = state.db.server_state().await?;
-    Ok(Json(user_to_dto(&state.db, &user, server.server_id).await?))
-}
-
-async fn get_user_by_id(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Path(user_id): Path<Uuid>,
-) -> Result<Json<UserDto>, ApiError> {
-    let (user, _) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    if user.id != user_id && !user.is_administrator {
-        return Err(ApiError::forbidden("User access denied"));
-    }
-    let server = state.db.server_state().await?;
-    let requested_user = if user.id == user_id {
-        user
-    } else {
-        state
-            .db
-            .users()
-            .await?
-            .into_iter()
-            .find(|candidate| candidate.id == user_id)
-            .ok_or_else(|| ApiError::not_found("User not found"))?
-    };
-    Ok(Json(
-        user_to_dto(&state.db, &requested_user, server.server_id).await?,
-    ))
 }
 
 async fn ping() -> &'static str {
