@@ -5859,35 +5859,39 @@ async fn session_sessions(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    Ok(Json(session_list_json(&state.db, &user).await?))
+    let service = SessionService::new(&state.db);
+    Ok(Json(session_list_json(&service, &user).await?))
 }
 
-async fn session_list_json(db: &Database, user: &User) -> Result<Vec<serde_json::Value>, ApiError> {
+async fn session_list_json(
+    service: &SessionService<'_>,
+    user: &User,
+) -> Result<Vec<serde_json::Value>, ApiError> {
     let sessions = if user.is_administrator {
-        db.device_sessions().await?
+        service.devices().await?
     } else {
-        db.device_sessions_for_user(user.id).await?
+        service.devices_for_user(user.id).await?
     };
-    let active_playback = db
-        .active_playback_sessions()
+    let active_playback = service
+        .active_playback()
         .await?
         .into_iter()
         .map(|session| (session.session_id.clone(), session))
         .collect::<HashMap<_, _>>();
-    let active_viewing = db
-        .active_viewing_sessions()
+    let active_viewing = service
+        .active_viewing()
         .await?
         .into_iter()
         .map(|session| (session.session_id.clone(), session))
         .collect::<HashMap<_, _>>();
     let mut additional_users = HashMap::<String, Vec<ActiveSessionUser>>::new();
-    for session_user in db.active_session_users().await? {
+    for session_user in service.active_users().await? {
         additional_users
             .entry(session_user.session_id.clone())
             .or_default()
             .push(session_user);
     }
-    let server_id = db.server_state().await?.server_id.to_string();
+    let server_id = service.server_id().await?.to_string();
     Ok(sessions
         .iter()
         .map(|session| {
@@ -5911,9 +5915,9 @@ async fn devices(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    let items = state
-        .db
-        .device_sessions()
+    let service = SessionService::new(&state.db);
+    let items = service
+        .devices()
         .await?
         .iter()
         .map(device_to_json)
@@ -9042,8 +9046,9 @@ async fn device_info(
     Query(query): Query<DeviceOptionsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     let device = match trimmed_optional(query.id) {
-        Some(id) => state.db.device_session_by_id(&id).await?,
+        Some(id) => service.device_by_id(&id).await?,
         None => None,
     };
     Ok(Json(
@@ -9099,10 +9104,10 @@ async fn device_options(
     Query(query): Query<DeviceOptionsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     let custom_name = if let Some(id) = trimmed_optional(query.id) {
-        state
-            .db
-            .device_session_by_id(&id)
+        service
+            .device_by_id(&id)
             .await?
             .map(|session| session.device_name)
     } else {
@@ -9121,16 +9126,17 @@ async fn update_device_options(
     Json(payload): Json<DeviceOptionsUpdate>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     let Some(id) = trimmed_optional(query.id) else {
         return Err(ApiError::bad_request("Device id is required"));
     };
     let Some(custom_name) = trimmed_optional(payload.custom_name) else {
         return Err(ApiError::bad_request("CustomName is required"));
     };
-    if state.db.device_session_by_id(&id).await?.is_none() {
+    if service.device_by_id(&id).await?.is_none() {
         return Err(ApiError::not_found("Device not found"));
     }
-    state.db.update_device_name(&id, &custom_name).await?;
+    service.update_device_name(&id, &custom_name).await?;
     record_activity(
         &state.db,
         "Device options updated",
@@ -9161,13 +9167,14 @@ async fn delete_device(
     Query(query): Query<DeleteDeviceQuery>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     if let Some(id) = query
         .id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        state.db.revoke_device(id).await?;
+        service.revoke_device(id).await?;
         record_activity(
             &state.db,
             "Device deleted",
@@ -42543,12 +42550,13 @@ async fn broadcast_sessions_message(
     session_id: &str,
     user: &User,
 ) -> Result<(), ApiError> {
+    let service = SessionService::new(db);
     broadcast_session_message(
         session_id,
         serde_json::json!({
             "MessageId": Uuid::new_v4().to_string(),
             "MessageType": "Sessions",
-            "Data": session_list_json(db, user).await?
+            "Data": session_list_json(&service, user).await?
         }),
     );
     Ok(())
@@ -42559,9 +42567,10 @@ async fn broadcast_sessions_message_to_user_owned_sessions(
     user: &User,
     exclude_session_id: Option<&str>,
 ) -> Result<(), ApiError> {
-    let data = session_list_json(db, user).await?;
-    for session in db
-        .device_sessions()
+    let service = SessionService::new(db);
+    let data = session_list_json(&service, user).await?;
+    for session in service
+        .devices()
         .await?
         .into_iter()
         .filter(|session| session.user_id == user.id)
@@ -42614,6 +42623,7 @@ async fn handle_websocket(mut socket: WebSocket, state: AppState, user: User, se
         ))
         .await;
     let mut receiver = subscribe_playback_events();
+    let service = SessionService::new(&state.db);
     loop {
         tokio::select! {
             event = receiver.recv() => {
@@ -42636,7 +42646,7 @@ async fn handle_websocket(mut socket: WebSocket, state: AppState, user: User, se
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         if should_send_sessions_message(&text) {
-                            let sessions = match session_list_json(&state.db, &user).await {
+                            let sessions = match session_list_json(&service, &user).await {
                                 Ok(sessions) => sessions,
                                 Err(_) => break,
                             };
