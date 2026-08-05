@@ -1,6 +1,6 @@
 use crate::{
-    ApiError, AppState, AuthQuery, UserService, bearer_token, ensure_user_access, record_activity,
-    require_request_user, resolve_user_id, syncplay_remove_session,
+    ApiError, AppState, AuthQuery, SessionService, UserService, bearer_token, ensure_user_access,
+    record_activity, require_request_user, resolve_user_id, syncplay_remove_session,
 };
 use axum::{
     Json,
@@ -114,6 +114,7 @@ pub(crate) async fn logout(
         .or_else(|| query.api_key.clone())
         .ok_or_else(|| ApiError::unauthorized("Missing token"))?;
     let (user, _) = crate::require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     record_activity(
         &state.db,
         &format!("{} signed out", user.name),
@@ -123,6 +124,6 @@ pub(crate) async fn logout(
     )
     .await?;
     syncplay_remove_session(&token, "Leave").await;
-    state.db.revoke_token(&token).await?;
+    service.revoke_token(&token).await?;
     Ok(StatusCode::NO_CONTENT)
 }

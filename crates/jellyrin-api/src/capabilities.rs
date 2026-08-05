@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 
-use crate::{ApiError, AppState, AuthQuery, require_user};
+use crate::{ApiError, AppState, AuthQuery, SessionService, require_user};
 
 pub(crate) async fn update_session_capabilities(
     State(state): State<AppState>,
@@ -14,17 +14,16 @@ pub(crate) async fn update_session_capabilities(
     body: Option<Json<serde_json::Value>>,
 ) -> Result<StatusCode, ApiError> {
     let (_, token) = require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let service = SessionService::new(&state.db);
     let query = parse_session_capabilities_query(raw_query.as_deref());
     let capabilities = normalize_session_capabilities(body.map(|Json(value)| value), &query)?;
-    let update_result = state
-        .db
-        .update_device_capabilities(&token.access_token, capabilities.clone())
+    let update_result = service
+        .update_capabilities(&token.access_token, capabilities.clone())
         .await;
     if update_result.is_err() && token.client == "API Key" {
-        state.db.ensure_device_session(&token).await?;
-        state
-            .db
-            .update_device_capabilities(&token.access_token, capabilities)
+        service.ensure_device(&token).await?;
+        service
+            .update_capabilities(&token.access_token, capabilities)
             .await
             .map_err(|_| ApiError::not_found("Device session not found"))?;
     } else {

@@ -12,6 +12,7 @@ mod livetv_parsing;
 mod migration;
 mod password_reset;
 mod session;
+mod session_service;
 mod state;
 mod syncplay_types;
 mod system;
@@ -46,6 +47,7 @@ pub(crate) use migration::{
 };
 pub(crate) use password_reset::{forgot_password, forgot_password_pin};
 pub(crate) use session::session_to_json;
+pub(crate) use session_service::SessionService;
 pub use state::{AppState, SystemLifecycleCommand};
 use syncplay_types::{PlaybackEvent, SyncPlayGroup, SyncPlayParticipant};
 pub(crate) use system::{
