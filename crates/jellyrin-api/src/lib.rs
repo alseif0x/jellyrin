@@ -5,6 +5,7 @@ mod auth;
 mod auth_handlers;
 mod backup;
 mod capabilities;
+mod configuration_service;
 mod dlna;
 mod errors;
 mod file_watcher;
@@ -38,6 +39,7 @@ pub(crate) use auth_handlers::{
 };
 pub(crate) use backup::{backup_manifest, backups, create_backup, restore_backup};
 pub(crate) use capabilities::{parse_bool_query_value, update_session_capabilities};
+pub(crate) use configuration_service::ConfigurationService;
 pub use errors::ApiError;
 #[cfg(test)]
 pub(crate) use livetv_parsing::hdhomerun_bool_field;
@@ -3569,7 +3571,7 @@ pub async fn reconcile_live_tv_recordings_on_startup(
     db: &Database,
     log_dir: &std::path::Path,
 ) -> anyhow::Result<LiveTvRecordingStartupRecovery> {
-    let Some(mut config) = db.named_configuration("livetv").await? else {
+    let Some(mut config) = ConfigurationService::new(db).get("livetv").await? else {
         return Ok(LiveTvRecordingStartupRecovery::default());
     };
 
@@ -3660,7 +3662,8 @@ pub async fn reconcile_live_tv_recordings_on_startup(
     }
 
     if changed {
-        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+        ConfigurationService::new(db)
+            .set("livetv", live_tv_configuration_json(config))
             .await?;
     }
 
@@ -3696,7 +3699,7 @@ pub async fn reconcile_live_tv_recordings_on_startup(
 }
 
 pub async fn run_due_live_tv_timers(state: &AppState) -> anyhow::Result<LiveTvTimerSchedulerRun> {
-    let Some(mut config) = state.db.named_configuration("livetv").await? else {
+    let Some(mut config) = ConfigurationService::new(&state.db).get("livetv").await? else {
         return Ok(LiveTvTimerSchedulerRun::default());
     };
 
@@ -4105,7 +4108,9 @@ async fn backup_restore_snapshot_json(db: &Database) -> Result<serde_json::Value
         "SystemConfigurationPayloads": system_configuration_payloads_backup_json(
             db.system_configuration_payloads().await?
         ),
-        "NamedConfigurations": named_configurations_backup_json(db.named_configurations().await?),
+        "NamedConfigurations": named_configurations_backup_json(
+            ConfigurationService::new(db).all().await?,
+        ),
         "BrandingConfiguration": branding_backup_json(db.branding_config().await?),
         "Users": backup_users_json(db.users().await?),
         "VirtualFolders": backup_virtual_folders_json(db.virtual_folders().await?),
@@ -4220,7 +4225,7 @@ async fn restore_named_configurations_from_backup(
         let payload = configuration.get("Payload").cloned().ok_or_else(|| {
             ApiError::bad_request("Backup named configuration payload is missing")
         })?;
-        db.update_named_configuration(key, payload).await?;
+        ConfigurationService::new(db).set(key, payload).await?;
     }
     Ok(())
 }
@@ -10825,13 +10830,14 @@ async fn update_scheduled_task_trigger_config(
             "Scheduled task triggers must be an array",
         ));
     }
-    db.update_named_configuration(
-        &scheduled_task_trigger_config_key(task_key),
-        serde_json::json!({
-            "Triggers": triggers,
-        }),
-    )
-    .await?;
+    ConfigurationService::new(db)
+        .set(
+            &scheduled_task_trigger_config_key(task_key),
+            serde_json::json!({
+                "Triggers": triggers,
+            }),
+        )
+        .await?;
     Ok(())
 }
 
@@ -10840,7 +10846,7 @@ async fn scheduled_task_triggers_json(
     task_key: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let key = scheduled_task_trigger_config_key(task_key);
-    if let Some(config) = db.named_configuration(&key).await?
+    if let Some(config) = ConfigurationService::new(db).get(&key).await?
         && let Some(triggers) = config.get("Triggers").filter(|value| value.is_array())
     {
         return Ok(triggers.clone());
@@ -11300,7 +11306,7 @@ fn is_xtream_media_sync_task(task_id: &str) -> bool {
 
 async fn xtream_media_sync_triggers_json(db: &Database) -> Result<serde_json::Value, ApiError> {
     let key = scheduled_task_trigger_config_key(XTREAM_MEDIA_SYNC_TASK_KEY);
-    if let Some(config) = db.named_configuration(&key).await?
+    if let Some(config) = ConfigurationService::new(db).get(&key).await?
         && let Some(triggers) = config.get("Triggers").filter(|value| value.is_array())
     {
         return Ok(triggers.clone());
@@ -16784,7 +16790,7 @@ async fn stream_live_tv_recording(
 }
 
 async fn live_tv_tuner_host_by_id(db: &Database, tuner_host_id: &str) -> Option<serde_json::Value> {
-    let config = db.named_configuration("livetv").await.ok()??;
+    let config = ConfigurationService::new(db).get("livetv").await.ok()??;
     config
         .get("TunerHosts")
         .and_then(serde_json::Value::as_array)?
@@ -18191,7 +18197,7 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
 
     let now = OffsetDateTime::now_utc();
 
-    let config = match state.db.named_configuration("livetv").await {
+    let config = match ConfigurationService::new(&state.db).get("livetv").await {
         Ok(Some(c)) => c,
         Ok(None) => default_live_tv_configuration(),
         Err(_) => return,
@@ -18313,7 +18319,7 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
     }
 
     // Upsert all child timers into config["Timers"].
-    let mut config = match state.db.named_configuration("livetv").await {
+    let mut config = match ConfigurationService::new(&state.db).get("livetv").await {
         Ok(Some(c)) => c,
         Ok(None) => default_live_tv_configuration(),
         Err(_) => return,
@@ -18359,7 +18365,7 @@ async fn cascade_delete_series_timer_timers(db: &Database, series_timer_id: &str
         registry.keys().cloned().collect()
     };
 
-    let mut config = match db.named_configuration("livetv").await {
+    let mut config = match ConfigurationService::new(db).get("livetv").await {
         Ok(Some(c)) => c,
         Ok(None) => return,
         Err(_) => return,
@@ -18637,7 +18643,7 @@ async fn record_channel_to_file(
 
     // Persist InProgress status before opening the upstream connection.
     {
-        let mut config = match db.named_configuration("livetv").await {
+        let mut config = match ConfigurationService::new(&db).get("livetv").await {
             Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
             Err(err) => {
                 tracing::error!("failed to load livetv config for recording: {err}");
@@ -18797,7 +18803,7 @@ async fn record_channel_to_file(
     if file_exists_and_nonempty {
         // Completed with real bytes: update recording to Completed + set timer RecordingPath.
         tracing::info!(path = %recording_path.display(), bytes = bytes_written, "recording completed");
-        let mut config = match db.named_configuration("livetv").await {
+        let mut config = match ConfigurationService::new(&db).get("livetv").await {
             Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
             Err(_) => return,
         };
@@ -18829,7 +18835,7 @@ async fn record_channel_to_file(
         // Zero-byte file: delete it and the timer (paridad upstream: delete timer if !File.Exists).
         tracing::warn!(path = %recording_path.display(), "recording produced 0 bytes; removing");
         let _ = tokio::fs::remove_file(&recording_path).await;
-        let mut config = match db.named_configuration("livetv").await {
+        let mut config = match ConfigurationService::new(&db).get("livetv").await {
             Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
             Err(_) => return,
         };
@@ -18872,7 +18878,7 @@ async fn cleanup_failed_recording(
     let mut registry = live_tv_recording_registry().lock().await;
     registry.remove(timer_id);
     drop(registry);
-    let mut config = match db.named_configuration("livetv").await {
+    let mut config = match ConfigurationService::new(db).get("livetv").await {
         Ok(c) => c.unwrap_or_else(default_live_tv_configuration),
         Err(_) => return,
     };
@@ -33135,7 +33141,8 @@ async fn refresh_channel_provider_cache(db: &Database) -> Result<serde_json::Val
         .get("LastRefreshUtc")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    db.update_named_configuration("channels", normalized)
+    ConfigurationService::new(db)
+        .set("channels", normalized)
         .await?;
     Ok(serde_json::json!({
         "ProvidersRefreshed": provider_count,
