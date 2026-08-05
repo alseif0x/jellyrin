@@ -8,6 +8,7 @@ mod dlna;
 mod errors;
 mod file_watcher;
 mod livetv_parsing;
+mod migration;
 mod session;
 mod state;
 mod syncplay_types;
@@ -23,6 +24,9 @@ pub(crate) use auth::{
 #[cfg(test)]
 pub(crate) use auth::{parse_authorization_token, parse_media_browser_pairs};
 pub(crate) use backup::{backup_manifest, backups, create_backup, restore_backup};
+pub(crate) use migration::{
+    JellyfinMigrationBody, jellyfin_migration_dry_run, jellyfin_migration_import,
+};
 pub(crate) use capabilities::{parse_bool_query_value, update_session_capabilities};
 pub use errors::ApiError;
 #[cfg(test)]
@@ -4063,62 +4067,6 @@ async fn hls_transcode_dir_is_old_enough(path: &FsPath, older_than: Duration) ->
     SystemTime::now()
         .duration_since(modified_at)
         .is_ok_and(|age| age >= older_than.unsigned_abs())
-}
-
-#[derive(Debug, Deserialize)]
-struct JellyfinMigrationBody {
-    #[serde(alias = "SourceName")]
-    source_name: Option<String>,
-    #[serde(alias = "Data")]
-    data: serde_json::Value,
-}
-
-async fn jellyfin_migration_dry_run(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Json(payload): Json<JellyfinMigrationBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    let report = analyze_jellyfin_migration(&state.db, &payload).await?;
-    Ok(Json(report.json(None)))
-}
-
-async fn jellyfin_migration_import(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    Json(payload): Json<JellyfinMigrationBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
-    let backup_snapshot = backup_restore_snapshot_json(&state.db).await?;
-    let backup = state
-        .db
-        .create_backup_manifest(
-            COMPATIBLE_SERVER_VERSION,
-            "1",
-            serde_json::json!({
-                "Database": true,
-                "Metadata": true,
-                "Reason": "Pre-migration safety backup"
-            }),
-            Some(backup_snapshot),
-        )
-        .await?;
-    let mut report = apply_jellyfin_migration(&state.db, &payload).await?;
-    record_activity(
-        &state.db,
-        "Jellyfin migration imported",
-        Some(&format!(
-            "Jellyfin migration import completed after safety backup {}.",
-            backup.path
-        )),
-        "System",
-        Some(user.id),
-    )
-    .await?;
-    report.applied = true;
-    Ok(Json(report.json(Some(&backup.path))))
 }
 
 async fn backup_restore_snapshot_json(db: &Database) -> Result<serde_json::Value, ApiError> {
