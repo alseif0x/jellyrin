@@ -10,6 +10,7 @@ mod errors;
 mod file_watcher;
 mod livetv_parsing;
 mod livetv_service;
+mod media_service;
 mod migration;
 mod password_reset;
 mod session;
@@ -44,6 +45,7 @@ pub(crate) use livetv_parsing::{
     parse_live_tv_xmltv_programs,
 };
 pub(crate) use livetv_service::LiveTvService;
+pub(crate) use media_service::MediaService;
 pub(crate) use migration::{
     JellyfinMigrationBody, jellyfin_migration_dry_run, jellyfin_migration_import,
 };
@@ -11157,7 +11159,8 @@ async fn populate_image_tags_for_library(db: &Database) -> Result<(), ApiError> 
             if metadata.get("ImageTags").is_none() {
                 metadata["ImageTags"] = serde_json::json!({ "Primary": tag });
             }
-            db.update_media_item_metadata_json(&item.id, &metadata)
+            MediaService::new(db)
+                .update_metadata_json(&item.id, &metadata)
                 .await?;
             updated += 1;
         }
@@ -28950,9 +28953,8 @@ async fn upload_lyrics(
     let text = String::from_utf8(body.to_vec())
         .map_err(|_| ApiError::bad_request("Lyrics upload body must be UTF-8 text"))?;
     let lyrics = parse_lyrics_text(&text, &format, file_name)?;
-    state
-        .db
-        .update_media_item_lyrics(item.id, lyrics.clone())
+    MediaService::new(&state.db)
+        .update_lyrics(item.id, lyrics.clone())
         .await?;
     Ok(Json(lyrics))
 }
@@ -28965,7 +28967,7 @@ async fn delete_lyrics(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = lyrics_audio_item(&state.db, &item_id).await?;
-    state.db.delete_media_item_lyrics(item.id).await?;
+    MediaService::new(&state.db).delete_lyrics(item.id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -29377,15 +29379,16 @@ async fn persist_media_streams(
     item: &MediaItem,
     streams: Vec<serde_json::Value>,
 ) -> Result<(), ApiError> {
-    db.update_media_item_media_info(
-        item.id,
-        item.runtime_ticks,
-        item.bitrate,
-        item.width,
-        item.height,
-        streams,
-    )
-    .await?;
+    MediaService::new(db)
+        .update_media_info(
+            item.id,
+            item.runtime_ticks,
+            item.bitrate,
+            item.width,
+            item.height,
+            streams,
+        )
+        .await?;
     Ok(())
 }
 
@@ -30251,20 +30254,21 @@ async fn persist_trickplay_info(
     thumbnail_count: i64,
     bandwidth: i64,
 ) -> Result<TrickplayInfo, ApiError> {
-    db.upsert_trickplay_info(TrickplayInfo {
-        item_id,
-        width: i64::from(width),
-        height: i64::from(height),
-        tile_width: i64::from(settings.tile_width),
-        tile_height: i64::from(settings.tile_height),
-        thumbnail_count,
-        interval_ms: settings.interval_ms,
-        bandwidth: bandwidth.max(0),
-        created_at: OffsetDateTime::now_utc(),
-        updated_at: OffsetDateTime::now_utc(),
-    })
-    .await
-    .map_err(Into::into)
+    MediaService::new(db)
+        .upsert_trickplay(TrickplayInfo {
+            item_id,
+            width: i64::from(width),
+            height: i64::from(height),
+            tile_width: i64::from(settings.tile_width),
+            tile_height: i64::from(settings.tile_height),
+            thumbnail_count,
+            interval_ms: settings.interval_ms,
+            bandwidth: bandwidth.max(0),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        })
+        .await
+        .map_err(Into::into)
 }
 
 fn trickplay_duration_seconds(item: &MediaItem) -> f64 {
@@ -33803,7 +33807,9 @@ async fn delete_library_items(
     if item_ids.is_empty() {
         return Err(ApiError::bad_request("No item ids supplied"));
     }
-    let deleted = state.db.delete_media_items(item_ids, Some(user.id)).await?;
+    let deleted = MediaService::new(&state.db)
+        .delete_items(item_ids, Some(user.id))
+        .await?;
     if deleted == 0 {
         return Err(ApiError::not_found("Item not found"));
     }
@@ -38317,7 +38323,8 @@ async fn ensure_xtream_remote_media_info(
         || !media_info.media_streams.is_empty();
     if !probe_succeeded {
         set_xtream_remote_media_probe_metadata(metadata, &source_url, "Failed");
-        db.update_media_item_metadata(item.id, metadata.clone())
+        MediaService::new(db)
+            .update_metadata(item.id, metadata.clone())
             .await?;
         return Ok(item);
     }
@@ -38327,17 +38334,19 @@ async fn ensure_xtream_remote_media_info(
     } else {
         media_info.media_streams
     };
-    db.update_media_item_media_info(
-        item.id,
-        media_info.runtime_ticks.or(item.runtime_ticks),
-        media_info.bitrate.or(item.bitrate),
-        media_info.width.or(item.width),
-        media_info.height.or(item.height),
-        streams,
-    )
-    .await?;
+    MediaService::new(db)
+        .update_media_info(
+            item.id,
+            media_info.runtime_ticks.or(item.runtime_ticks),
+            media_info.bitrate.or(item.bitrate),
+            media_info.width.or(item.width),
+            media_info.height.or(item.height),
+            streams,
+        )
+        .await?;
     set_xtream_remote_media_probe_metadata(metadata, &source_url, "Complete");
-    db.update_media_item_metadata(item.id, metadata.clone())
+    MediaService::new(db)
+        .update_metadata(item.id, metadata.clone())
         .await?;
     Ok(db.media_item_by_id(item.id).await?)
 }
