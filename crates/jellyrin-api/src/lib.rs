@@ -14382,9 +14382,6 @@ updateSchedFields();
 </body></html>"#;
 
 pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError> {
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string());
     let manifest = serde_json::json!({
         "Guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "Name": "Xtream Codes Provider",
@@ -14411,45 +14408,21 @@ pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError>
         }
     });
 
-    // Preserve the existing status (so a user-disabled plugin stays disabled);
-    // default to Active for a fresh install. Always refresh the manifest so
-    // configuration schema changes propagate on upgrade.
     let existing_status = db
         .installed_plugin_json(BUILTIN_XTREAM_PLUGIN_ID)
         .await?
         .and_then(|plugin| json_string_field(&plugin, "Status"))
         .filter(|status| !status.is_empty())
         .unwrap_or_else(|| "Active".to_string());
-
-    sqlx::query(
-        r#"INSERT INTO installed_plugins (
-            plugin_id, name, version, runtime, target_abi, server_compatibility_json,
-            status, capabilities_json, permissions_json, configuration_state,
-            last_error, health_json, manifest_json, installed_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, '[]', 'Default', NULL, '{}', ?8, ?9, ?9)
-        ON CONFLICT(plugin_id) DO UPDATE SET
-            name = excluded.name,
-            version = excluded.version,
-            runtime = excluded.runtime,
-            capabilities_json = excluded.capabilities_json,
-            manifest_json = excluded.manifest_json,
-            status = excluded.status,
-            updated_at = excluded.updated_at"#,
-    )
-    .bind(BUILTIN_XTREAM_PLUGIN_ID)
-    .bind("Xtream Codes Provider")
-    .bind("1.0.0")
-    .bind("Builtin")
-    .bind("")
-    .bind(&existing_status)
-    .bind(serde_json::to_string(&serde_json::json!([
-        "LiveTvProvider",
-        "ScheduledTask"
-    ]))?)
-    .bind(serde_json::to_string(&manifest)?)
-    .bind(&now)
-    .execute(db.pool())
-    .await?;
+    PluginService::new(db)
+        .ensure_builtin(
+            BUILTIN_XTREAM_PLUGIN_ID,
+            "Xtream Codes Provider",
+            "1.0.0",
+            &manifest,
+            &["LiveTvProvider", "ScheduledTask"],
+        )
+        .await?;
 
     // Register in the live TV provider registry if active
     if existing_status.eq_ignore_ascii_case("Active") {
