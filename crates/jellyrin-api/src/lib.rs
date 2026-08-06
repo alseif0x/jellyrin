@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod activity_service;
 mod api_keys;
 mod auth;
 mod auth_handlers;
@@ -8,6 +9,7 @@ mod capabilities;
 mod configuration_service;
 mod dlna;
 mod errors;
+mod file_service;
 mod file_watcher;
 mod library_service;
 mod livetv_parsing;
@@ -21,11 +23,13 @@ mod session_service;
 mod state;
 mod syncplay_types;
 mod system;
+mod system_service;
 mod task_service;
 mod user_configuration;
 mod user_service;
 mod users;
 
+pub(crate) use activity_service::ActivityService;
 pub(crate) use api_keys::{api_keys, create_api_key, revoke_api_key};
 pub(crate) use auth::{
     bearer_token, client_auth_from_headers, ensure_user_access, require_admin,
@@ -43,6 +47,7 @@ pub(crate) use backup::{backup_manifest, backups, create_backup, restore_backup}
 pub(crate) use capabilities::{parse_bool_query_value, update_session_capabilities};
 pub(crate) use configuration_service::ConfigurationService;
 pub use errors::ApiError;
+pub(crate) use file_service::FileService;
 pub(crate) use library_service::LibraryService;
 #[cfg(test)]
 pub(crate) use livetv_parsing::hdhomerun_bool_field;
@@ -67,6 +72,7 @@ pub(crate) use system::{
     post_startup_remote_access, post_startup_user, ready, system_info, system_info_public,
     time_sync_utc_time, tmdb_client_configuration,
 };
+pub(crate) use system_service::SystemService;
 pub(crate) use task_service::TaskService;
 pub(crate) use user_configuration::{
     default_user_configuration, logout, update_user_configuration,
@@ -3832,7 +3838,10 @@ pub async fn spawn_file_watcher_with_consumer(
                 match change.change_type {
                     file_watcher::FileChangeType::Created
                     | file_watcher::FileChangeType::Modified => {
-                        match state.db.scan_single_file(&change.path).await {
+                        match FileService::new(&state.db)
+                            .scan_single_file(&change.path)
+                            .await
+                        {
                             Ok(true) => scanned += 1,
                             Ok(false) => {}
                             Err(error) => {
@@ -3846,7 +3855,7 @@ pub async fn spawn_file_watcher_with_consumer(
                     }
                     file_watcher::FileChangeType::Deleted => {
                         let path_str = change.path.to_string_lossy().to_string();
-                        match state.db.mark_media_item_missing_by_path(&path_str).await {
+                        match FileService::new(&state.db).mark_missing(&path_str).await {
                             Ok(true) => scanned += 1,
                             Ok(false) => {}
                             Err(error) => {
@@ -5885,7 +5894,8 @@ async fn record_activity(
     entry_type: &str,
     user_id: Option<Uuid>,
 ) -> Result<(), ApiError> {
-    db.add_activity_log_entry(name, overview, overview, entry_type, user_id)
+    ActivityService::new(db)
+        .record(name, overview, entry_type, user_id)
         .await?;
     Ok(())
 }
@@ -9736,7 +9746,9 @@ async fn update_named_configuration(
                 .get("EnableRemoteAccess")
                 .and_then(serde_json::Value::as_bool)
             {
-                state.db.set_remote_access(enable_remote_access).await?;
+                SystemService::new(&state.db)
+                    .set_remote_access(enable_remote_access)
+                    .await?;
             }
             (normalized, "Network configuration updated")
         }
