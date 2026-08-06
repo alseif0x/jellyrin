@@ -3551,7 +3551,8 @@ pub async fn reconcile_transcode_sessions_on_startup(db: &Database) -> anyhow::R
     let sessions = db.stale_transcode_sessions_on_startup().await?;
     let count = sessions.len();
     for session in sessions {
-        db.update_transcode_session_status(&session.play_session_id, "stopped")
+        SessionService::new(db)
+            .update_transcode_status(&session.play_session_id, "stopped")
             .await?;
         cleanup_hls_transcode_files(&session.output_path).await;
     }
@@ -4389,14 +4390,15 @@ async fn restore_users_from_backup(
             existing_by_name.insert(key, created.clone());
             created
         };
-        db.update_user_profile(
-            user.id,
-            &name,
-            is_administrator,
-            is_disabled,
-            &user.sync_play_access,
-        )
-        .await?;
+        UserService::new(db)
+            .update_profile(
+                user.id,
+                &name,
+                is_administrator,
+                is_disabled,
+                &user.sync_play_access,
+            )
+            .await?;
     }
     Ok(())
 }
@@ -4492,7 +4494,9 @@ async fn restore_media_metadata_from_backup(
             ApiError::bad_request("Backup media metadata entry is missing Metadata")
         })?;
         if let Some(item) = items_by_path.get(path) {
-            db.update_media_item_metadata(item.id, metadata).await?;
+            MediaService::new(db)
+                .update_metadata(item.id, metadata)
+                .await?;
         }
     }
     Ok(())
@@ -4895,14 +4899,15 @@ async fn import_jellyfin_users(
             existing_by_name.insert(key, created.clone());
             created
         };
-        db.update_user_profile(
-            user.id,
-            &name,
-            is_administrator,
-            is_disabled,
-            &sync_play_access,
-        )
-        .await?;
+        UserService::new(db)
+            .update_profile(
+                user.id,
+                &name,
+                is_administrator,
+                is_disabled,
+                &sync_play_access,
+            )
+            .await?;
         imported += 1;
     }
     Ok(imported)
@@ -5023,21 +5028,22 @@ async fn import_jellyfin_user_data(
         let Some(item) = items_by_path.get(&path) else {
             continue;
         };
-        db.upsert_playback_state(UpsertPlaybackState {
-            user_id: user.id,
-            item_id: item.id,
-            media_source_id: None,
-            audio_stream_index: None,
-            subtitle_stream_index: None,
-            position_ticks: migration_i64_field(
-                object,
-                &["PositionTicks", "PlaybackPositionTicks"],
-            )
-            .unwrap_or(0),
-            is_paused: false,
-            played: migration_bool_field(object, &["Played", "IsPlayed"]).unwrap_or(false),
-        })
-        .await?;
+        SessionService::new(db)
+            .upsert_playback_state(UpsertPlaybackState {
+                user_id: user.id,
+                item_id: item.id,
+                media_source_id: None,
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                position_ticks: migration_i64_field(
+                    object,
+                    &["PositionTicks", "PlaybackPositionTicks"],
+                )
+                .unwrap_or(0),
+                is_paused: false,
+                played: migration_bool_field(object, &["Played", "IsPlayed"]).unwrap_or(false),
+            })
+            .await?;
         if migration_bool_field(object, &["IsFavorite", "Favorite"]).unwrap_or(false) {
             db.set_item_favorite(user.id, item.id, true).await?;
         }
@@ -24760,21 +24766,22 @@ async fn update_item_user_data_inner(
         &["PlaybackPositionTicks", "playbackPositionTicks"],
     )
     .unwrap_or_else(|| current.as_ref().map_or(0, |state| state.position_ticks));
-    db.upsert_playback_state(UpsertPlaybackState {
-        user_id,
-        item_id: item.id,
-        media_source_id: current
-            .as_ref()
-            .and_then(|state| state.media_source_id.clone()),
-        audio_stream_index: current.as_ref().and_then(|state| state.audio_stream_index),
-        subtitle_stream_index: current
-            .as_ref()
-            .and_then(|state| state.subtitle_stream_index),
-        position_ticks,
-        is_paused: current.as_ref().is_some_and(|state| state.is_paused),
-        played,
-    })
-    .await?;
+    SessionService::new(db)
+        .upsert_playback_state(UpsertPlaybackState {
+            user_id,
+            item_id: item.id,
+            media_source_id: current
+                .as_ref()
+                .and_then(|state| state.media_source_id.clone()),
+            audio_stream_index: current.as_ref().and_then(|state| state.audio_stream_index),
+            subtitle_stream_index: current
+                .as_ref()
+                .and_then(|state| state.subtitle_stream_index),
+            position_ticks,
+            is_paused: current.as_ref().is_some_and(|state| state.is_paused),
+            played,
+        })
+        .await?;
     if let Some(is_favorite) = is_favorite {
         db.set_item_favorite(user_id, item.id, is_favorite).await?;
     }
