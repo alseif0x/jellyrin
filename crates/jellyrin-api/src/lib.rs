@@ -9,6 +9,7 @@ mod configuration_service;
 mod dlna;
 mod errors;
 mod file_watcher;
+mod library_service;
 mod livetv_parsing;
 mod livetv_service;
 mod media_service;
@@ -41,6 +42,7 @@ pub(crate) use backup::{backup_manifest, backups, create_backup, restore_backup}
 pub(crate) use capabilities::{parse_bool_query_value, update_session_capabilities};
 pub(crate) use configuration_service::ConfigurationService;
 pub use errors::ApiError;
+pub(crate) use library_service::LibraryService;
 #[cfg(test)]
 pub(crate) use livetv_parsing::hdhomerun_bool_field;
 pub(crate) use livetv_parsing::{
@@ -4113,7 +4115,9 @@ async fn backup_restore_snapshot_json(db: &Database) -> Result<serde_json::Value
         ),
         "BrandingConfiguration": branding_backup_json(db.branding_config().await?),
         "Users": backup_users_json(db.users().await?),
-        "VirtualFolders": backup_virtual_folders_json(db.virtual_folders().await?),
+        "VirtualFolders": backup_virtual_folders_json(
+            LibraryService::new(db).virtual_folders().await?,
+        ),
         "MediaMetadata": backup_media_metadata_json(db).await?,
         "Files": backup_files_decision_json(),
         "Plugins": backup_plugins_snapshot_json(db).await?
@@ -4438,7 +4442,8 @@ async fn restore_virtual_folders_from_backup(
             }
             restored_locations.push(location.to_string());
         }
-        db.upsert_virtual_folder(name, collection_type, restored_locations)
+        LibraryService::new(db)
+            .upsert_virtual_folder(name, collection_type, restored_locations)
             .await?;
     }
     Ok(())
@@ -4931,7 +4936,8 @@ async fn import_jellyfin_libraries(
                 )));
             }
         }
-        db.upsert_virtual_folder(&name, collection_type.as_deref(), locations)
+        LibraryService::new(db)
+            .upsert_virtual_folder(&name, collection_type.as_deref(), locations)
             .await?;
         imported += 1;
     }
@@ -11144,7 +11150,7 @@ fn supported_image_types_for_collection(collection_type: &str) -> Vec<&'static s
 }
 
 async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
-    let folders = db.virtual_folders().await?;
+    let folders = LibraryService::new(db).virtual_folders().await?;
     let mut scanned = 0usize;
     for folder in folders {
         scanned += db.scan_virtual_folder_items(folder.id).await?;
@@ -19767,7 +19773,10 @@ async fn delete_virtual_folder(
         auth_query.api_key.as_deref(),
     )
     .await?;
-    if state.db.delete_virtual_folder(&query.name).await? {
+    if LibraryService::new(&state.db)
+        .delete_virtual_folder(&query.name)
+        .await?
+    {
         dlna::notify_dlna_content_directory_changed(&state.db).await?;
         record_activity(
             &state.db,
@@ -20219,7 +20228,9 @@ async fn update_playlist(
     ensure_media_list_edit_access(&state.db, &user, &playlist).await?;
     let body = body.map(|Json(value)| value);
     if let Some(name) = list_name_from_request(raw_query.as_deref(), body.as_ref()) {
-        state.db.update_media_list_name(playlist.id, &name).await?;
+        LibraryService::new(&state.db)
+            .rename_media_list(playlist.id, &name)
+            .await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -23502,7 +23513,8 @@ async fn update_virtual_folder_metadata(
         &["ContentType", "CollectionType", "collectionType", "Type"],
     )
     .or(folder.collection_type);
-    db.upsert_virtual_folder(&final_name, content_type.as_deref(), folder.locations)
+    LibraryService::new(db)
+        .upsert_virtual_folder(&final_name, content_type.as_deref(), folder.locations)
         .await?;
     Ok(())
 }
