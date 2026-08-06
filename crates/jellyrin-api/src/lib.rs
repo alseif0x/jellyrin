@@ -15,6 +15,7 @@ mod livetv_service;
 mod media_service;
 mod migration;
 mod password_reset;
+mod plugin_service;
 mod session;
 mod session_service;
 mod state;
@@ -55,6 +56,7 @@ pub(crate) use migration::{
     JellyfinMigrationBody, jellyfin_migration_dry_run, jellyfin_migration_import,
 };
 pub(crate) use password_reset::{forgot_password, forgot_password_pin};
+pub(crate) use plugin_service::PluginService;
 pub(crate) use session::session_to_json;
 pub(crate) use session_service::SessionService;
 pub use state::{AppState, SystemLifecycleCommand};
@@ -6746,7 +6748,9 @@ async fn discover_installed_plugins_from_filesystem(state: &AppState) -> Result<
             if let Some(package) =
                 discovered_plugin_package_from_dir(&plugin_id, &version, version_dir.path()).await?
             {
-                state.db.upsert_discovered_plugin_package(package).await?;
+                PluginService::new(&state.db)
+                    .upsert_discovered_package(package)
+                    .await?;
             }
         }
     }
@@ -8557,21 +8561,22 @@ async fn activate_plugin_with_host_path(
         return Ok(false);
     };
 
-    db.upsert_plugin_runtime_instance(
-        PluginRuntimeInstanceUpsert {
-            plugin_id,
-            runtime: runtime_name.to_string(),
-            runtime_version: handshake_result.server_version,
-            status: "Active".to_string(),
-            process_id: None,
-            endpoint: Some(host_path.to_string_lossy().to_string()),
-            health: serde_json::to_value(health)?,
-            capabilities: loaded.capabilities,
-            last_error: None,
-        },
-        actor_user_id,
-    )
-    .await?;
+    PluginService::new(db)
+        .upsert_runtime_instance(
+            PluginRuntimeInstanceUpsert {
+                plugin_id,
+                runtime: runtime_name.to_string(),
+                runtime_version: handshake_result.server_version,
+                status: "Active".to_string(),
+                process_id: None,
+                endpoint: Some(host_path.to_string_lossy().to_string()),
+                health: serde_json::to_value(health)?,
+                capabilities: loaded.capabilities,
+                last_error: None,
+            },
+            actor_user_id,
+        )
+        .await?;
     let _ = client.shutdown().await;
     Ok(true)
 }
