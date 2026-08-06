@@ -4146,14 +4146,16 @@ async fn restore_backup_data(db: &Database, snapshot: &serde_json::Value) -> Res
         ApiError::bad_request("Backup manifest does not contain branding configuration")
     })?;
 
-    db.update_startup_config(startup_config_from_backup(startup)?)
+    let configuration = ConfigurationService::new(db);
+    configuration
+        .update_startup(startup_config_from_backup(startup)?)
         .await?;
-    db.update_system_configuration_payloads(system_configuration_payloads_from_backup(
-        system_payloads,
-    )?)
-    .await?;
+    configuration
+        .update_system(system_configuration_payloads_from_backup(system_payloads)?)
+        .await?;
     restore_named_configurations_from_backup(db, snapshot.get("NamedConfigurations")).await?;
-    db.update_branding_config(branding_from_backup(branding)?)
+    configuration
+        .update_branding(branding_from_backup(branding)?)
         .await?;
     restore_users_from_backup(db, snapshot.get("Users")).await?;
     restore_virtual_folders_from_backup(db, snapshot.get("VirtualFolders")).await?;

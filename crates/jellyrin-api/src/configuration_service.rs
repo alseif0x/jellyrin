@@ -1,4 +1,7 @@
-use jellyrin_db::{Database, NamedConfigurationPayload};
+use jellyrin_core::StartupConfig;
+use jellyrin_db::{
+    BrandingConfig, Database, NamedConfigurationPayload, SystemConfigurationPayloads,
+};
 use serde_json::Value;
 
 /// Persistence boundary for named application configuration.
@@ -21,5 +24,20 @@ impl<'a> ConfigurationService<'a> {
 
     pub(crate) async fn all(&self) -> anyhow::Result<Vec<NamedConfigurationPayload>> {
         self.db.named_configurations().await
+    }
+
+    pub(crate) async fn update_startup(&self, config: StartupConfig) -> anyhow::Result<()> {
+        self.db.update_startup_config(config).await
+    }
+
+    pub(crate) async fn update_system(
+        &self,
+        payloads: SystemConfigurationPayloads,
+    ) -> anyhow::Result<()> {
+        self.db.update_system_configuration_payloads(payloads).await
+    }
+
+    pub(crate) async fn update_branding(&self, config: BrandingConfig) -> anyhow::Result<()> {
+        self.db.update_branding_config(config).await
     }
 }
