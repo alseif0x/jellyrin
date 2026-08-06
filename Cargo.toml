@@ -4,10 +4,14 @@ members = [
     "crates/jellyrin-compat",
     "crates/jellyrin-core",
     "crates/jellyrin-db",
+    "crates/jellyrin-magstv-provider",
+    "crates/jellyrin-magstv-egress",
     "crates/jellyrin-plugin-host-dotnet",
     "crates/jellyrin-plugin-host-wasi",
     "crates/jellyrin-plugin-rpc",
     "crates/jellyrin-plugin-sdk",
+    "crates/jellyrin-persistence",
+    "crates/jellyrin-persistence-sqlite",
     "crates/jellyrin-server",
     "crates/jellyrin-transcode",
     "crates/jellyrin-xtream-provider",
@@ -22,6 +26,7 @@ rust-version = "1.93"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["macros", "ws"] }
 base64 = "0.22"
@@ -29,8 +34,9 @@ bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 http-body-util = "0.1"
 futures-util = "0.3"
+flate2 = "1.1"
 rand_core = { version = "0.6", features = ["getrandom"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.10"

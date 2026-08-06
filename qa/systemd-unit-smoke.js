@@ -32,6 +32,7 @@ async function main() {
       'JELLYRIN_WEB_DIR=/srv/jellyrin/web',
     ].every((needle) => envText.includes(needle))),
     check('env-sqlite-release-db', envText.includes('DATABASE_URL=sqlite:///var/lib/jellyrin/jellyrin.db?mode=rwc')),
+    check('env-database-engine', envText.includes('JELLYRIN_DATABASE_ENGINE=sqlite')),
   ];
 
   let verify = { code: 1, stdout: '', stderr: 'systemd-analyze not available' };

@@ -1,3 +1,13 @@
+mod config;
+mod factory;
+
+pub use config::{DatabaseConfig, DatabaseConfigError};
+pub use factory::{DatabaseFactoryError, connect_database};
+pub use jellyrin_persistence::{
+    NamedConfiguration as NamedConfigurationPayload,
+    SystemConfiguration as SystemConfigurationPayloads,
+};
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     ffi::OsStr,
@@ -16,19 +26,18 @@ use jellyrin_core::{
     DeviceToken, LIVE_TV_REMOTE_USER_AGENT, MediaItem, PlaybackState, ServerState, StartupConfig,
     User, VirtualFolder,
 };
-use serde_json::{Value, json};
-use sqlx::{
-    QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+use jellyrin_persistence::{
+    ConfigurationRepository, CredentialRepository, PasswordCredential, PersistenceBackend,
+    PersistenceCapabilities, PersistenceControl, PersistenceError, PersistenceHealth, SchemaStatus,
+    UserProfileUpdate, UserRecord as PersistenceUserRecord, UserRepository,
 };
+use jellyrin_persistence_sqlite::SqlitePersistence;
+use serde_json::{Value, json};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use uuid::Uuid;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
-const SQLITE_MAX_CONNECTIONS: u32 = 5;
-const CREDENTIAL_ACTIVITY_BUSY_TIMEOUT_MS: u64 = 100;
 const CREDENTIAL_ACTIVITY_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_SYNC_PLAY_ACCESS: &str = "CreateAndJoinGroups";
 const REMOTE_MEDIA_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -36,6 +45,7 @@ const REMOTE_MEDIA_PROBE_READ_TIMEOUT_US: &str = "2500000";
 
 #[derive(Clone)]
 pub struct Database {
+    sqlite: SqlitePersistence,
     pool: SqlitePool,
     credential_activity_pool: Option<SqlitePool>,
     credential_activity_touches: Arc<Mutex<HashMap<u64, Instant>>>,
@@ -48,6 +58,27 @@ pub struct MediaItemFilterSummary {
     pub tags: Vec<String>,
     pub containers: Vec<String>,
     pub media_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaItemSortField {
+    SortName,
+    DateCreated,
+    DateLastMediaAdded,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaItemPageQuery {
+    pub start_index: usize,
+    pub limit: usize,
+    pub sort_fields: Vec<MediaItemSortField>,
+    pub descending: bool,
+    pub media_type: Option<String>,
+    pub collection_type: Option<String>,
+    pub user_id: Option<Uuid>,
+    pub is_played: Option<bool>,
+    pub min_premiere_date: Option<String>,
+    pub max_premiere_date: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +145,51 @@ pub struct RemoteMediaItemUpsert {
     pub height: Option<i32>,
     pub media_streams: Vec<Value>,
     pub metadata: Value,
+}
+
+fn push_media_item_page_filters<'args>(
+    query: &mut QueryBuilder<'args, Sqlite>,
+    folder_ids: &[Uuid],
+    page: &MediaItemPageQuery,
+) {
+    query.push("WHERE mi.missing_since IS NULL AND mi.virtual_folder_id IN (");
+    let mut separated = query.separated(", ");
+    for folder_id in folder_ids {
+        separated.push_bind(folder_id.to_string());
+    }
+    separated.push_unseparated(")");
+
+    if let Some(media_type) = page.media_type.as_deref() {
+        query.push(" AND LOWER(mi.media_type) = ");
+        query.push_bind(media_type.to_ascii_lowercase());
+    }
+    if let Some(collection_type) = page.collection_type.as_deref() {
+        query.push(" AND LOWER(mi.collection_type) = ");
+        query.push_bind(collection_type.to_ascii_lowercase());
+    }
+    if let Some(is_played) = page.is_played {
+        query.push(" AND COALESCE(ps.played, 0) = ");
+        query.push_bind(is_played);
+    }
+
+    const PREMIERE_DATE_SQL: &str = "julianday(COALESCE(\
+         NULLIF(TRIM(CAST(json_extract(mi.metadata_json, '$.PremiereDate') AS TEXT)), ''), \
+         NULLIF(TRIM(CAST(json_extract(mi.metadata_json, '$.AirDate') AS TEXT)), ''), \
+         NULLIF(TRIM(CAST(json_extract(mi.metadata_json, '$.DateCreated') AS TEXT)), '')))";
+    if let Some(min_premiere_date) = page.min_premiere_date.as_deref() {
+        query.push(" AND ");
+        query.push(PREMIERE_DATE_SQL);
+        query.push(" >= julianday(");
+        query.push_bind(min_premiere_date.to_string());
+        query.push(")");
+    }
+    if let Some(max_premiere_date) = page.max_premiere_date.as_deref() {
+        query.push(" AND ");
+        query.push(PREMIERE_DATE_SQL);
+        query.push(" <= julianday(");
+        query.push_bind(max_premiere_date.to_string());
+        query.push(")");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -384,21 +460,6 @@ pub struct BrandingConfig {
     pub splashscreen_enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SystemConfigurationPayloads {
-    pub content_types: Value,
-    pub metadata_options: Value,
-    pub path_substitutions: Value,
-    pub plugin_repositories: Value,
-    pub server_options: Value,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct NamedConfigurationPayload {
-    pub key: String,
-    pub payload: Value,
-}
-
 #[derive(Debug, Clone)]
 pub struct InstallPluginPackage {
     pub plugin_id: String,
@@ -407,6 +468,18 @@ pub struct InstallPluginPackage {
     pub runtime: String,
     pub target_abi: String,
     pub package: Value,
+    pub manifest: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuiltinPluginUpsert {
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub runtime: String,
+    pub target_abi: String,
+    pub status: String,
+    pub capabilities: Vec<String>,
     pub manifest: Value,
 }
 
@@ -509,54 +582,17 @@ pub struct LiveTvPage<T> {
 
 impl Database {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
-        let mut options = database_url
-            .parse::<SqliteConnectOptions>()
-            .with_context(|| format!("failed to parse SQLite database URL at {database_url}"))?
-            .busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
-            .foreign_keys(true);
-        let enable_wal = should_enable_wal(database_url);
-        if enable_wal {
-            options = options.journal_mode(SqliteJournalMode::Wal);
-        }
-        let credential_activity_options = enable_wal.then(|| {
-            options
-                .clone()
-                .busy_timeout(std::time::Duration::from_millis(
-                    CREDENTIAL_ACTIVITY_BUSY_TIMEOUT_MS,
-                ))
-        });
+        let config = DatabaseConfig::from_url(database_url)?;
+        connect_database(&config).await.map_err(Into::into)
+    }
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(SQLITE_MAX_CONNECTIONS)
-            .after_connect(|connection, _metadata| {
-                Box::pin(async move { configure_sqlite_connection(connection).await })
-            })
-            .connect_with(options)
-            .await
-            .with_context(|| format!("failed to connect SQLite database at {database_url}"))?;
-
-        MIGRATOR
-            .run(&pool)
-            .await
-            .context("failed to run migrations")?;
-
-        let credential_activity_pool = if let Some(options) = credential_activity_options {
-            Some(
-                SqlitePoolOptions::new()
-                    .max_connections(1)
-                    .connect_with(options)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to connect SQLite credential activity pool at {database_url}"
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
+    async fn connect_sqlite(database_url: &str) -> anyhow::Result<Self> {
+        let sqlite = SqlitePersistence::connect(database_url).await?;
+        let pool = sqlite.pool().clone();
+        let credential_activity_pool = sqlite.credential_activity_pool().cloned();
 
         Ok(Self {
+            sqlite,
             pool,
             credential_activity_pool,
             credential_activity_touches: Arc::new(Mutex::new(HashMap::new())),
@@ -664,50 +700,14 @@ impl Database {
     pub async fn system_configuration_payloads(
         &self,
     ) -> anyhow::Result<SystemConfigurationPayloads> {
-        let row = sqlx::query_as::<_, SystemConfigurationPayloadsRow>(
-            r#"
-            SELECT content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json, server_options_json
-            FROM system_configuration_payloads
-            WHERE id = 1
-            "#,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(row) => row.try_into(),
-            None => Ok(SystemConfigurationPayloads::default()),
-        }
+        self.sqlite.system_configuration().await.map_err(Into::into)
     }
 
     pub async fn update_system_configuration_payloads(
         &self,
         payloads: SystemConfigurationPayloads,
     ) -> anyhow::Result<()> {
-        let now = format_time(OffsetDateTime::now_utc())?;
-        sqlx::query(
-            r#"
-            INSERT INTO system_configuration_payloads (
-                id, content_types_json, metadata_options_json, path_substitutions_json, plugin_repositories_json, server_options_json, updated_at
-            )
-            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(id) DO UPDATE SET
-                content_types_json = excluded.content_types_json,
-                metadata_options_json = excluded.metadata_options_json,
-                path_substitutions_json = excluded.path_substitutions_json,
-                plugin_repositories_json = excluded.plugin_repositories_json,
-                server_options_json = excluded.server_options_json,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(serde_json::to_string(&payloads.content_types)?)
-        .bind(serde_json::to_string(&payloads.metadata_options)?)
-        .bind(serde_json::to_string(&payloads.path_substitutions)?)
-        .bind(serde_json::to_string(&payloads.plugin_repositories)?)
-        .bind(serde_json::to_string(&payloads.server_options)?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        self.sqlite.update_system_configuration(payloads).await?;
         self.sync_plugin_platform_from_system_configuration()
             .await?;
         Ok(())
@@ -1567,6 +1567,41 @@ impl Database {
         Ok(Some(plugin))
     }
 
+    pub async fn upsert_builtin_plugin(&self, plugin: BuiltinPluginUpsert) -> anyhow::Result<()> {
+        let now = format_time(OffsetDateTime::now_utc())?;
+        sqlx::query(
+            r#"
+            INSERT INTO installed_plugins (
+                plugin_id, name, version, runtime, target_abi, server_compatibility_json,
+                status, capabilities_json, permissions_json, configuration_state,
+                last_error, health_json, manifest_json, installed_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?7, '[]', 'Default', NULL, '{}', ?8, ?9, ?9)
+            ON CONFLICT(plugin_id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                runtime = excluded.runtime,
+                target_abi = excluded.target_abi,
+                capabilities_json = excluded.capabilities_json,
+                manifest_json = excluded.manifest_json,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&plugin.plugin_id)
+        .bind(&plugin.name)
+        .bind(&plugin.version)
+        .bind(&plugin.runtime)
+        .bind(&plugin.target_abi)
+        .bind(&plugin.status)
+        .bind(serde_json::to_string(&plugin.capabilities)?)
+        .bind(serde_json::to_string(&plugin.manifest)?)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn installed_plugins_json(&self) -> anyhow::Result<Vec<Value>> {
         let rows = sqlx::query(
             r#"
@@ -2140,44 +2175,14 @@ impl Database {
     }
 
     pub async fn named_configuration(&self, key: &str) -> anyhow::Result<Option<Value>> {
-        let row = sqlx::query_as::<_, NamedConfigurationRow>(
-            r#"
-            SELECT payload_json
-            FROM named_configurations
-            WHERE key = ?1
-            "#,
-        )
-        .bind(normalize_configuration_key(key))
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| {
-            serde_json::from_str(&row.payload_json).context("invalid named configuration")
-        })
-        .transpose()
+        self.sqlite
+            .named_configuration(key)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn named_configurations(&self) -> anyhow::Result<Vec<NamedConfigurationPayload>> {
-        let rows = sqlx::query_as::<_, NamedConfigurationListRow>(
-            r#"
-            SELECT key, payload_json
-            FROM named_configurations
-            ORDER BY key
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                let payload = serde_json::from_str(&row.payload_json)
-                    .context("invalid named configuration")?;
-                Ok(NamedConfigurationPayload {
-                    key: row.key,
-                    payload,
-                })
-            })
-            .collect()
+        self.sqlite.named_configurations().await.map_err(Into::into)
     }
 
     pub async fn update_named_configuration(
@@ -2185,25 +2190,10 @@ impl Database {
         key: &str,
         payload: Value,
     ) -> anyhow::Result<()> {
-        let key = normalize_configuration_key(key);
-        anyhow::ensure!(!key.is_empty(), "configuration key must not be empty");
-
-        let now = format_time(OffsetDateTime::now_utc())?;
-        sqlx::query(
-            r#"
-            INSERT INTO named_configurations (key, payload_json, updated_at)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(key) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(key)
-        .bind(serde_json::to_string(&payload)?)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.sqlite
+            .update_named_configuration(key, payload)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn add_activity_log_entry(
@@ -2466,19 +2456,10 @@ impl Database {
     }
 
     pub async fn user_configuration(&self, user_id: Uuid) -> anyhow::Result<Option<Value>> {
-        let row = sqlx::query_as::<_, UserConfigurationRow>(
-            r#"
-            SELECT payload_json
-            FROM user_configurations
-            WHERE user_id = ?1
-            "#,
-        )
-        .bind(user_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| serde_json::from_str(&row.payload_json).context("invalid user configuration"))
-            .transpose()
+        self.sqlite
+            .user_configuration(user_id)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn update_user_configuration(
@@ -2487,25 +2468,10 @@ impl Database {
         payload: Value,
     ) -> anyhow::Result<()> {
         self.user_by_id(user_id).await?;
-        let now = format_time(OffsetDateTime::now_utc())?;
-        let payload_json = serde_json::to_string(&payload)?;
-        sqlx::query(
-            r#"
-            INSERT INTO user_configurations (
-                user_id, payload_json, created_at, updated_at
-            )
-            VALUES (?1, ?2, ?3, ?3)
-            ON CONFLICT(user_id) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(user_id.to_string())
-        .bind(payload_json)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        self.sqlite
+            .update_user_configuration(user_id, payload)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn complete_startup_wizard(&self) -> anyhow::Result<()> {
@@ -2523,35 +2489,18 @@ impl Database {
     }
 
     pub async fn first_user(&self) -> anyhow::Result<User> {
-        let row = sqlx::query_as::<_, UserRow>(
-            r#"
-            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
-            FROM users
-            ORDER BY created_at
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(row) => row.try_into(),
+        match self.sqlite.first_user().await? {
+            Some(user) => Ok(user_from_persistence(user)),
             None => self.create_placeholder_admin_user().await,
         }
     }
 
     pub async fn users(&self) -> anyhow::Result<Vec<User>> {
-        let rows = sqlx::query_as::<_, UserRow>(
-            r#"
-            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
-            FROM users
-            ORDER BY name COLLATE NOCASE
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter().map(TryInto::try_into).collect()
+        self.sqlite
+            .users()
+            .await
+            .map(|users| users.into_iter().map(user_from_persistence).collect())
+            .map_err(Into::into)
     }
 
     pub async fn upsert_admin_user(&self, name: &str, password: &str) -> anyhow::Result<User> {
@@ -2562,80 +2511,58 @@ impl Database {
         );
         anyhow::ensure!(!password.is_empty(), "admin password must not be empty");
 
-        let now = format_time(OffsetDateTime::now_utc())?;
+        let now = OffsetDateTime::now_utc();
         let existing = self.optional_user_by_name(trimmed_name).await?;
         let id = existing.as_ref().map_or_else(Uuid::new_v4, |user| user.id);
 
-        sqlx::query(
-            r#"
-            INSERT INTO users (id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at)
-            VALUES (?1, ?2, 1, 0, ?3, ?4, ?4)
-            ON CONFLICT(name) DO UPDATE SET
-                is_administrator = 1,
-                is_disabled = 0,
-                sync_play_access = excluded.sync_play_access,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(id.to_string())
-        .bind(trimmed_name)
-        .bind(DEFAULT_SYNC_PLAY_ACCESS)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        self.sqlite
+            .upsert_user_by_name(PersistenceUserRecord {
+                id,
+                name: trimmed_name.to_string(),
+                is_administrator: true,
+                is_disabled: false,
+                sync_play_access: DEFAULT_SYNC_PLAY_ACCESS.to_string(),
+                created_at: existing.as_ref().map_or(now, |user| user.created_at),
+                updated_at: now,
+            })
+            .await?;
 
         let password_hash = hash_password(password)?;
-        sqlx::query(
-            r#"
-            INSERT INTO user_passwords (user_id, algorithm, password_hash, updated_at)
-            VALUES (?1, 'argon2id', ?2, ?3)
-            ON CONFLICT(user_id) DO UPDATE SET
-                algorithm = excluded.algorithm,
-                password_hash = excluded.password_hash,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(id.to_string())
-        .bind(password_hash)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        self.sqlite
+            .upsert_credential(PasswordCredential {
+                user_id: id,
+                algorithm: "argon2id".to_string(),
+                password_hash,
+                updated_at: now,
+            })
+            .await?;
 
         self.user_by_id(id).await
     }
 
     pub async fn update_first_user(&self, name: String, password: &str) -> anyhow::Result<User> {
         let user = self.first_user().await?;
-        let now = format_time(OffsetDateTime::now_utc())?;
-        sqlx::query(
-            r#"
-            UPDATE users
-            SET name = ?1, is_administrator = 1, is_disabled = 0, updated_at = ?2
-            WHERE id = ?3
-            "#,
-        )
-        .bind(name.trim())
-        .bind(&now)
-        .bind(user.id.to_string())
-        .execute(&self.pool)
-        .await?;
+        let now = OffsetDateTime::now_utc();
+        self.sqlite
+            .update_user_profile(UserProfileUpdate {
+                id: user.id,
+                name: name.trim().to_string(),
+                is_administrator: true,
+                is_disabled: false,
+                sync_play_access: user.sync_play_access.clone(),
+                updated_at: now,
+            })
+            .await?;
 
         let password_hash = hash_password(password)?;
-        sqlx::query(
-            r#"
-            INSERT INTO user_passwords (user_id, algorithm, password_hash, updated_at)
-            VALUES (?1, 'argon2id', ?2, ?3)
-            ON CONFLICT(user_id) DO UPDATE SET
-                algorithm = excluded.algorithm,
-                password_hash = excluded.password_hash,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(user.id.to_string())
-        .bind(password_hash)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        self.sqlite
+            .upsert_credential(PasswordCredential {
+                user_id: user.id,
+                algorithm: "argon2id".to_string(),
+                password_hash,
+                updated_at: now,
+            })
+            .await?;
 
         self.user_by_id(user.id).await
     }
@@ -2643,20 +2570,19 @@ impl Database {
     pub async fn create_user(&self, name: &str, password: Option<&str>) -> anyhow::Result<User> {
         let trimmed_name = name.trim();
         anyhow::ensure!(!trimmed_name.is_empty(), "user name must not be empty");
-        let now = format_time(OffsetDateTime::now_utc())?;
+        let now = OffsetDateTime::now_utc();
         let user_id = Uuid::new_v4();
-        sqlx::query(
-            r#"
-            INSERT INTO users (id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at)
-            VALUES (?1, ?2, 0, 0, ?3, ?4, ?4)
-            "#,
-        )
-        .bind(user_id.to_string())
-        .bind(trimmed_name)
-        .bind(DEFAULT_SYNC_PLAY_ACCESS)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        self.sqlite
+            .insert_user(PersistenceUserRecord {
+                id: user_id,
+                name: trimmed_name.to_string(),
+                is_administrator: false,
+                is_disabled: false,
+                sync_play_access: DEFAULT_SYNC_PLAY_ACCESS.to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
 
         if let Some(password) = password.filter(|password| !password.is_empty()) {
             self.set_user_password(user_id, password).await?;
@@ -2668,61 +2594,42 @@ impl Database {
     pub async fn delete_user(&self, user_id: Uuid) -> anyhow::Result<()> {
         let user = self.user_by_id(user_id).await?;
         if user.is_administrator {
-            let admin_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM users WHERE is_administrator = 1 AND is_disabled = 0",
-            )
-            .fetch_one(&self.pool)
-            .await?;
+            let admin_count = self.sqlite.enabled_administrator_count().await?;
             anyhow::ensure!(
                 admin_count > 1,
                 "cannot delete the last enabled administrator"
             );
         }
 
-        sqlx::query("DELETE FROM users WHERE id = ?1")
-            .bind(user_id.to_string())
-            .execute(&self.pool)
-            .await?;
+        self.sqlite.delete_user(user_id).await?;
         Ok(())
     }
 
     pub async fn set_user_password(&self, user_id: Uuid, password: &str) -> anyhow::Result<()> {
         self.user_by_id(user_id).await?;
         let password_hash = hash_password(password)?;
-        sqlx::query(
-            r#"
-            INSERT INTO user_passwords (user_id, algorithm, password_hash, updated_at)
-            VALUES (?1, 'argon2id', ?2, ?3)
-            ON CONFLICT(user_id) DO UPDATE SET
-                algorithm = excluded.algorithm,
-                password_hash = excluded.password_hash,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(user_id.to_string())
-        .bind(password_hash)
-        .bind(format_time(OffsetDateTime::now_utc())?)
-        .execute(&self.pool)
-        .await?;
+        self.sqlite
+            .upsert_credential(PasswordCredential {
+                user_id,
+                algorithm: "argon2id".to_string(),
+                password_hash,
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .await?;
         Ok(())
     }
 
     pub async fn reset_user_password(&self, user_id: Uuid) -> anyhow::Result<()> {
         self.user_by_id(user_id).await?;
-        sqlx::query("DELETE FROM user_passwords WHERE user_id = ?1")
-            .bind(user_id.to_string())
-            .execute(&self.pool)
-            .await?;
+        self.sqlite.delete_credential(user_id).await?;
         Ok(())
     }
 
     pub async fn user_has_password(&self, user_id: Uuid) -> anyhow::Result<bool> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM user_passwords WHERE user_id = ?1")
-                .bind(user_id.to_string())
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(count > 0)
+        self.sqlite
+            .has_credential(user_id)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn update_user_profile(
@@ -2737,21 +2644,16 @@ impl Database {
         anyhow::ensure!(!trimmed_name.is_empty(), "user name must not be empty");
         self.user_by_id(user_id).await?;
 
-        sqlx::query(
-            r#"
-            UPDATE users
-            SET name = ?1, is_administrator = ?2, is_disabled = ?3, sync_play_access = ?4, updated_at = ?5
-            WHERE id = ?6
-            "#,
-        )
-        .bind(trimmed_name)
-        .bind(is_administrator)
-        .bind(is_disabled)
-        .bind(sync_play_access.trim())
-        .bind(format_time(OffsetDateTime::now_utc())?)
-        .bind(user_id.to_string())
-        .execute(&self.pool)
-        .await?;
+        self.sqlite
+            .update_user_profile(UserProfileUpdate {
+                id: user_id,
+                name: trimmed_name.to_string(),
+                is_administrator,
+                is_disabled,
+                sync_play_access: sync_play_access.trim().to_string(),
+                updated_at: OffsetDateTime::now_utc(),
+            })
+            .await?;
 
         self.user_by_id(user_id).await
     }
@@ -2768,19 +2670,13 @@ impl Database {
         let user = self.user_by_name(username).await?;
         anyhow::ensure!(!user.is_disabled, "user is disabled");
 
-        let password_row = sqlx::query_as::<_, PasswordRow>(
-            r#"
-            SELECT password_hash
-            FROM user_passwords
-            WHERE user_id = ?1
-            "#,
-        )
-        .bind(user.id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .context("password is not configured")?;
+        let credential = self
+            .sqlite
+            .credential(user.id)
+            .await?
+            .context("password is not configured")?;
 
-        verify_password(password, &password_row.password_hash)?;
+        verify_password(password, &credential.password_hash)?;
         let token = self
             .issue_device_token(&user, device_id, device_name, client, version)
             .await?;
@@ -2823,18 +2719,12 @@ impl Database {
 
     pub async fn verify_user_password(&self, user_id: Uuid, password: &str) -> anyhow::Result<()> {
         self.user_by_id(user_id).await?;
-        let password_hash: String = sqlx::query_scalar(
-            r#"
-            SELECT password_hash
-            FROM user_passwords
-            WHERE user_id = ?1
-            "#,
-        )
-        .bind(user_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .context("password is not configured")?;
-        verify_password(password, &password_hash)
+        let credential = self
+            .sqlite
+            .credential(user_id)
+            .await?
+            .context("password is not configured")?;
+        verify_password(password, &credential.password_hash)
     }
 
     pub async fn find_user_by_token(
@@ -4550,6 +4440,73 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// Return the episodes belonging to one metadata-backed series without materializing every
+    /// TV library row. Remote providers persist Jellyfin-compatible `SeriesId` values in each
+    /// episode's metadata, which makes this the hot path for Android TV's adjacent-item queries.
+    pub async fn media_items_by_series_id(
+        &self,
+        series_id: &str,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let normalized_id = series_id.trim().replace('-', "").to_ascii_lowercase();
+        if normalized_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND LOWER(collection_type) = 'tvshows'
+              AND REPLACE(
+                    LOWER(COALESCE(CAST(json_extract(metadata_json, '$.SeriesId') AS TEXT), '')),
+                    '-',
+                    ''
+                  ) = ?1
+            ORDER BY name COLLATE NOCASE
+            "#,
+        )
+        .bind(normalized_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// Return the episodes belonging to one metadata-backed season without materializing every
+    /// TV library row. Xtream persists Jellyfin-compatible `SeasonId` values on each episode.
+    pub async fn media_items_by_season_id(
+        &self,
+        season_id: &str,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let normalized_id = season_id.trim().replace('-', "").to_ascii_lowercase();
+        if normalized_id.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND LOWER(collection_type) = 'tvshows'
+              AND REPLACE(
+                    LOWER(COALESCE(CAST(json_extract(metadata_json, '$.SeasonId') AS TEXT), '')),
+                    '-',
+                    ''
+                  ) = ?1
+            ORDER BY name COLLATE NOCASE
+            "#,
+        )
+        .bind(normalized_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn media_items_by_name_search(
         &self,
         search_term: &str,
@@ -4610,6 +4567,126 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// Return one filtered media page without materializing the complete library.
+    ///
+    /// Large remote providers can expose more than 100k entries. Loading every row (and its
+    /// stream JSON) for a 25-item Jellyfin page causes multi-gigabyte transient allocations.
+    pub async fn media_items_page_for_virtual_folders(
+        &self,
+        folder_ids: &[Uuid],
+        page: &MediaItemPageQuery,
+    ) -> anyhow::Result<(Vec<MediaItem>, usize)> {
+        if folder_ids.is_empty() || page.limit == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        if page.is_played.is_some() && page.user_id.is_none() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM media_items AS mi ");
+        if let Some(user_id) = page.user_id.filter(|_| page.is_played.is_some()) {
+            count.push("LEFT JOIN playback_states AS ps ON ps.user_id = ");
+            count.push_bind(user_id.to_string());
+            count.push(" AND ps.item_id = mi.id ");
+        }
+        push_media_item_page_filters(&mut count, folder_ids, page);
+        let total = count
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await?;
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT mi.id, mi.virtual_folder_id, mi.name, mi.path, mi.media_type, \
+             mi.collection_type, mi.file_size, mi.runtime_ticks, mi.bitrate, mi.width, \
+             mi.height, mi.media_streams_json, mi.created_at, mi.updated_at \
+             FROM media_items AS mi ",
+        );
+        if let Some(user_id) = page.user_id.filter(|_| page.is_played.is_some()) {
+            query.push("LEFT JOIN playback_states AS ps ON ps.user_id = ");
+            query.push_bind(user_id.to_string());
+            query.push(" AND ps.item_id = mi.id ");
+        }
+        push_media_item_page_filters(&mut query, folder_ids, page);
+        query.push(" ORDER BY ");
+        let sort_fields = if page.sort_fields.is_empty() {
+            &[MediaItemSortField::SortName][..]
+        } else {
+            page.sort_fields.as_slice()
+        };
+        for (index, field) in sort_fields.iter().enumerate() {
+            if index > 0 {
+                query.push(", ");
+            }
+            query.push(match field {
+                MediaItemSortField::SortName => "mi.name COLLATE NOCASE",
+                MediaItemSortField::DateCreated => "mi.created_at",
+                MediaItemSortField::DateLastMediaAdded => "mi.updated_at",
+            });
+            if page.descending {
+                query.push(" DESC");
+            } else {
+                query.push(" ASC");
+            }
+        }
+        query.push(", mi.id ");
+        query.push(if page.descending { "DESC" } else { "ASC" });
+        query.push(" LIMIT ");
+        query.push_bind(i64::try_from(page.limit).unwrap_or(i64::MAX));
+        query.push(" OFFSET ");
+        query.push_bind(i64::try_from(page.start_index).unwrap_or(i64::MAX));
+
+        let rows = query
+            .build_query_as::<MediaItemRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        Ok((
+            rows.into_iter()
+                .map(TryInto::try_into)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            total.max(0) as usize,
+        ))
+    }
+
+    pub async fn media_items_by_ids(&self, item_ids: &[Uuid]) -> anyhow::Result<Vec<MediaItem>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let storage_ids = item_ids
+            .iter()
+            .flat_map(|item_id| [item_id.simple().to_string(), item_id.to_string()])
+            .collect::<HashSet<_>>();
+        let mut items: Vec<MediaItem> = Vec::new();
+        for chunk in storage_ids.iter().collect::<Vec<_>>().chunks(500) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT id, virtual_folder_id, name, path, media_type, collection_type, \
+                 file_size, runtime_ticks, bitrate, width, height, media_streams_json, \
+                 created_at, updated_at FROM media_items \
+                 WHERE missing_since IS NULL AND id IN (",
+            );
+            let mut separated = query.separated(", ");
+            for item_id in chunk {
+                separated.push_bind(*item_id);
+            }
+            separated.push_unseparated(")");
+            let rows = query
+                .build_query_as::<MediaItemRow>()
+                .fetch_all(&self.pool)
+                .await?;
+            items.extend(
+                rows.into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
+        items.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(items)
     }
 
     pub async fn media_item_counts_by_virtual_folder(
@@ -6097,21 +6174,9 @@ impl Database {
             updated_at: now,
         };
 
-        sqlx::query(
-            r#"
-            INSERT INTO users (id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-        )
-        .bind(user.id.to_string())
-        .bind(&user.name)
-        .bind(user.is_administrator)
-        .bind(user.is_disabled)
-        .bind(&user.sync_play_access)
-        .bind(format_time(user.created_at)?)
-        .bind(format_time(user.updated_at)?)
-        .execute(&self.pool)
-        .await?;
+        self.sqlite
+            .insert_user(persistence_user_from_core(&user))
+            .await?;
 
         Ok(user)
     }
@@ -6123,18 +6188,11 @@ impl Database {
     }
 
     async fn optional_user_by_name(&self, username: &str) -> anyhow::Result<Option<User>> {
-        let row = sqlx::query_as::<_, UserRow>(
-            r#"
-            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
-            FROM users
-            WHERE name = ?1
-            "#,
-        )
-        .bind(username)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(TryInto::try_into).transpose()
+        self.sqlite
+            .user_by_name(username)
+            .await
+            .map(|user| user.map(user_from_persistence))
+            .map_err(Into::into)
     }
 
     pub async fn user_by_id(&self, user_id: Uuid) -> anyhow::Result<User> {
@@ -6144,18 +6202,11 @@ impl Database {
     }
 
     pub async fn optional_user_by_id(&self, user_id: Uuid) -> anyhow::Result<Option<User>> {
-        let row = sqlx::query_as::<_, UserRow>(
-            r#"
-            SELECT id, name, is_administrator, is_disabled, sync_play_access, created_at, updated_at
-            FROM users
-            WHERE id = ?1
-            "#,
-        )
-        .bind(user_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(TryInto::try_into).transpose()
+        self.sqlite
+            .user_by_id(user_id)
+            .await
+            .map(|user| user.map(user_from_persistence))
+            .map_err(Into::into)
     }
 
     async fn activity_log_entry_by_rowid(&self, rowid: i64) -> anyhow::Result<ActivityLogEntry> {
@@ -6602,18 +6653,38 @@ impl Database {
     }
 }
 
-fn should_enable_wal(database_url: &str) -> bool {
-    !database_url.contains(":memory:")
+#[async_trait::async_trait]
+impl PersistenceControl for Database {
+    fn backend(&self) -> PersistenceBackend {
+        self.sqlite.backend()
+    }
+
+    fn capabilities(&self) -> PersistenceCapabilities {
+        self.sqlite.capabilities()
+    }
+
+    async fn health(&self) -> Result<PersistenceHealth, PersistenceError> {
+        self.sqlite.health().await
+    }
+
+    async fn schema_status(&self) -> Result<SchemaStatus, PersistenceError> {
+        self.sqlite.schema_status().await
+    }
 }
 
-async fn configure_sqlite_connection(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
-    sqlx::query("PRAGMA busy_timeout = 5000")
-        .execute(&mut *connection)
-        .await?;
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(&mut *connection)
-        .await?;
-    Ok(())
+/// Transitional classifier for callers that still receive `anyhow::Error` from the SQLite facade.
+/// Driver-specific inspection remains here until those methods return `PersistenceError` directly.
+pub fn is_retryable_persistence_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| match cause.downcast_ref::<sqlx::Error>() {
+            Some(sqlx::Error::PoolTimedOut) => true,
+            Some(sqlx::Error::Database(database_error)) => database_error
+                .code()
+                .and_then(|code| code.parse::<i64>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6)),
+            _ => false,
+        })
 }
 
 fn push_activity_log_join_and_filters(
@@ -6807,11 +6878,6 @@ struct MediaItemLyricsRow {
     updated_at: String,
 }
 
-#[derive(sqlx::FromRow)]
-struct UserConfigurationRow {
-    payload_json: String,
-}
-
 impl Default for BrandingConfig {
     fn default() -> Self {
         Self {
@@ -6820,52 +6886,6 @@ impl Default for BrandingConfig {
             splashscreen_enabled: true,
         }
     }
-}
-
-impl Default for SystemConfigurationPayloads {
-    fn default() -> Self {
-        Self {
-            content_types: Value::Array(Vec::new()),
-            metadata_options: Value::Array(Vec::new()),
-            path_substitutions: Value::Array(Vec::new()),
-            plugin_repositories: Value::Array(Vec::new()),
-            server_options: Value::Object(Default::default()),
-        }
-    }
-}
-
-impl TryFrom<SystemConfigurationPayloadsRow> for SystemConfigurationPayloads {
-    type Error = anyhow::Error;
-
-    fn try_from(row: SystemConfigurationPayloadsRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            content_types: array_payload(&row.content_types_json)?,
-            metadata_options: array_payload(&row.metadata_options_json)?,
-            path_substitutions: array_payload(&row.path_substitutions_json)?,
-            plugin_repositories: array_payload(&row.plugin_repositories_json)?,
-            server_options: object_payload(&row.server_options_json)?,
-        })
-    }
-}
-
-fn array_payload(raw: &str) -> anyhow::Result<Value> {
-    let value: Value = serde_json::from_str(raw).context("invalid system configuration payload")?;
-    match value {
-        Value::Array(_) => Ok(value),
-        _ => Ok(Value::Array(Vec::new())),
-    }
-}
-
-fn object_payload(raw: &str) -> anyhow::Result<Value> {
-    let value: Value = serde_json::from_str(raw).context("invalid system configuration payload")?;
-    match value {
-        Value::Object(_) => Ok(value),
-        _ => Ok(Value::Object(Default::default())),
-    }
-}
-
-fn normalize_configuration_key(key: &str) -> String {
-    key.trim().to_ascii_lowercase()
 }
 
 impl TryFrom<BrandingConfigRow> for BrandingConfig {
@@ -6887,38 +6907,6 @@ struct ServerStateRow {
     startup_wizard_completed: bool,
     created_at: String,
     updated_at: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct UserRow {
-    id: String,
-    name: String,
-    is_administrator: bool,
-    is_disabled: bool,
-    sync_play_access: String,
-    created_at: String,
-    updated_at: String,
-}
-
-impl TryFrom<UserRow> for User {
-    type Error = anyhow::Error;
-
-    fn try_from(row: UserRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: Uuid::parse_str(&row.id).context("invalid user id in database")?,
-            name: row.name,
-            is_administrator: row.is_administrator,
-            is_disabled: row.is_disabled,
-            sync_play_access: row.sync_play_access,
-            created_at: parse_time(&row.created_at)?,
-            updated_at: parse_time(&row.updated_at)?,
-        })
-    }
-}
-
-#[derive(sqlx::FromRow)]
-struct PasswordRow {
-    password_hash: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -6957,26 +6945,6 @@ struct QuickConnectSessionRow {
     created_at: String,
     updated_at: String,
     expires_at: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct SystemConfigurationPayloadsRow {
-    content_types_json: String,
-    metadata_options_json: String,
-    path_substitutions_json: String,
-    plugin_repositories_json: String,
-    server_options_json: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct NamedConfigurationRow {
-    payload_json: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct NamedConfigurationListRow {
-    key: String,
-    payload_json: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -7850,6 +7818,30 @@ fn format_time(value: OffsetDateTime) -> anyhow::Result<String> {
     value.format(&Rfc3339).context("failed to format timestamp")
 }
 
+fn user_from_persistence(user: PersistenceUserRecord) -> User {
+    User {
+        id: user.id,
+        name: user.name,
+        is_administrator: user.is_administrator,
+        is_disabled: user.is_disabled,
+        sync_play_access: user.sync_play_access,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+    }
+}
+
+fn persistence_user_from_core(user: &User) -> PersistenceUserRecord {
+    PersistenceUserRecord {
+        id: user.id,
+        name: user.name.clone(),
+        is_administrator: user.is_administrator,
+        is_disabled: user.is_disabled,
+        sync_play_access: user.sync_play_access.clone(),
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+    }
+}
+
 fn parse_time(value: &str) -> anyhow::Result<OffsetDateTime> {
     let trimmed = value.trim();
     if let Ok(parsed) = OffsetDateTime::parse(trimmed, &Rfc3339) {
@@ -8189,10 +8181,8 @@ fn parse_local_nfo_metadata(contents: &str) -> Value {
     // <banner>URL</banner>
     if let Some(banner) = nfo_first_text(contents, "banner") {
         let banner = banner.trim().to_string();
-        if !banner.is_empty() {
-            if banner.starts_with("http://") || banner.starts_with("https://") {
-                metadata.insert("ThumbImageUrl".to_string(), Value::String(banner));
-            }
+        if !banner.is_empty() && (banner.starts_with("http://") || banner.starts_with("https://")) {
+            metadata.insert("ThumbImageUrl".to_string(), Value::String(banner));
         }
     }
 
@@ -9459,11 +9449,13 @@ fn stable_plugin_model_id(kind: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityLogFilter, ActivityLogSortField, Database, InstallPluginPackage,
-        PluginRuntimeInstanceUpsert, SortDirection, SystemConfigurationPayloads,
-        UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
-        UpsertTranscodeSession, parse_ffprobe_media_info, parse_local_nfo_metadata,
+        ActivityLogFilter, ActivityLogSortField, BuiltinPluginUpsert, Database,
+        InstallPluginPackage, PluginRuntimeInstanceUpsert, SortDirection,
+        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertActiveViewingSession,
+        UpsertPlaybackState, UpsertTranscodeSession, parse_ffprobe_media_info,
+        parse_local_nfo_metadata,
     };
+    use jellyrin_persistence::{PersistenceBackend, PersistenceControl};
     use serde_json::json;
     use time::Duration;
     use uuid::Uuid;
@@ -9495,6 +9487,58 @@ mod tests {
         assert_eq!(first.server_id, second.server_id);
         assert_eq!(first.server_name, "Jellyrin");
         assert!(!first.startup_wizard_completed);
+    }
+
+    #[tokio::test]
+    async fn persistence_control_reports_sqlite_health_and_schema() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+
+        assert_eq!(
+            db.health().await.unwrap().backend,
+            PersistenceBackend::Sqlite
+        );
+        let schema = db.schema_status().await.unwrap();
+        assert!(schema.latest_applied_migration.is_some());
+        assert_eq!(schema.failed_migrations, 0);
+    }
+
+    #[tokio::test]
+    async fn builtin_plugin_upsert_keeps_sql_inside_the_adapter_facade() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "builtin-test-plugin";
+        let plugin = BuiltinPluginUpsert {
+            plugin_id: plugin_id.to_string(),
+            name: "Built-in Test".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: "Builtin".to_string(),
+            target_abi: String::new(),
+            status: "Active".to_string(),
+            capabilities: vec!["ScheduledTask".to_string()],
+            manifest: json!({"Name": "Built-in Test", "Version": "1.0.0"}),
+        };
+
+        db.upsert_builtin_plugin(plugin).await.unwrap();
+        let installed = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert_eq!(installed["Status"], "Active");
+        assert_eq!(installed["Capabilities"], json!(["ScheduledTask"]));
+        assert_eq!(installed["Manifest"]["Version"], "1.0.0");
+
+        db.upsert_builtin_plugin(BuiltinPluginUpsert {
+            plugin_id: plugin_id.to_string(),
+            name: "Built-in Test".to_string(),
+            version: "2.0.0".to_string(),
+            runtime: "Builtin".to_string(),
+            target_abi: String::new(),
+            status: "Disabled".to_string(),
+            capabilities: vec!["ScheduledTask".to_string(), "ImageProvider".to_string()],
+            manifest: json!({"Name": "Built-in Test", "Version": "2.0.0"}),
+        })
+        .await
+        .unwrap();
+        let installed = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert_eq!(installed["Version"], "2.0.0");
+        assert_eq!(installed["Status"], "Disabled");
+        assert_eq!(installed["Capabilities"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]

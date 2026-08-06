@@ -3,14 +3,16 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use clap::Parser;
 use jellyrin_api::{
-    AppState, SystemLifecycleCommand, cleanup_stale_hls_transcodes, ensure_builtin_xtream_plugin,
+    AppState, SystemLifecycleCommand, cleanup_stale_hls_transcodes, ensure_builtin_magstv_plugin,
+    ensure_builtin_opensubtitles_plugin, ensure_builtin_xtream_plugin,
     last_system_lifecycle_command, publish_system_lifecycle_command,
     reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup, router,
     spawn_dlna_ssdp_service, spawn_file_watcher_with_consumer,
     spawn_periodic_live_tv_timer_scheduler, spawn_periodic_transcode_cleanup,
     spawn_periodic_xtream_media_sync_scheduler, subscribe_system_lifecycle_commands,
 };
-use jellyrin_db::Database;
+use jellyrin_db::{Database, DatabaseConfig, connect_database};
+use jellyrin_persistence::PersistenceBackend;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
@@ -44,6 +46,14 @@ struct Args {
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
 
+    #[arg(
+        long = "database-engine",
+        visible_alias = "database-backend",
+        default_value = "sqlite",
+        env = "JELLYRIN_DATABASE_ENGINE"
+    )]
+    database_backend: PersistenceBackend,
+
     #[arg(long, env = "JELLYRIN_E2E_ADMIN_USER")]
     e2e_admin_user: Option<String>,
 
@@ -56,16 +66,10 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let args = Args::parse();
+    let database_config = resolve_database_config(&args)?;
     prepare_dirs(&args).await?;
 
-    let database_url = args.database_url.clone().unwrap_or_else(|| {
-        format!(
-            "sqlite://{}?mode=rwc",
-            args.data_dir.join("jellyrin.db").to_string_lossy()
-        )
-    });
-
-    let db = Database::connect(&database_url).await?;
+    let db = connect_database(&database_config).await?;
     bootstrap_e2e_admin(&db, &args).await?;
     match db.remove_invalid_xtream_primary_image_tags().await {
         Ok(removed) if removed > 0 => {
@@ -122,6 +126,12 @@ async fn main() -> anyhow::Result<()> {
     if let Err(error) = ensure_builtin_xtream_plugin(&state.db).await {
         tracing::warn!(?error, "failed to register builtin xtream plugin");
     }
+    if let Err(error) = ensure_builtin_magstv_plugin(&state.db).await {
+        tracing::warn!(?error, "failed to register builtin magstv plugin");
+    }
+    if let Err(error) = ensure_builtin_opensubtitles_plugin(&state.db).await {
+        tracing::warn!(?error, "failed to register builtin OpenSubtitles plugin");
+    }
     let _transcode_cleanup_task = spawn_periodic_transcode_cleanup(db);
     let _live_tv_timer_scheduler_task = spawn_periodic_live_tv_timer_scheduler(state.clone());
     let _xtream_media_sync_scheduler_task =
@@ -158,6 +168,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_database_config(args: &Args) -> anyhow::Result<DatabaseConfig> {
+    let database_url = match (&args.database_url, args.database_backend) {
+        (Some(database_url), _) => database_url.clone(),
+        (None, PersistenceBackend::Sqlite) => format!(
+            "sqlite://{}?mode=rwc",
+            args.data_dir.join("jellyrin.db").to_string_lossy()
+        ),
+        (None, PersistenceBackend::Postgres) => {
+            anyhow::bail!("DATABASE_URL or --database-url is required for the PostgreSQL backend")
+        }
+    };
+
+    DatabaseConfig::new(args.database_backend, database_url).map_err(Into::into)
 }
 
 fn init_tracing() {
@@ -233,5 +258,56 @@ async fn shutdown_signal() {
                 tracing::warn!(?command, "received system lifecycle command");
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use jellyrin_persistence::PersistenceBackend;
+
+    use super::{Args, resolve_database_config};
+
+    #[test]
+    fn sqlite_is_the_default_installation_backend() {
+        let args = Args::try_parse_from(["jellyrin", "--data-dir", "/tmp/jellyrin-data"]).unwrap();
+        let config = resolve_database_config(&args).unwrap();
+
+        assert_eq!(config.backend(), PersistenceBackend::Sqlite);
+        assert_eq!(
+            config.url(),
+            "sqlite:///tmp/jellyrin-data/jellyrin.db?mode=rwc"
+        );
+    }
+
+    #[test]
+    fn postgres_requires_an_explicit_url() {
+        let args = Args::try_parse_from(["jellyrin", "--database-engine", "postgresql"]).unwrap();
+
+        assert!(
+            resolve_database_config(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("DATABASE_URL")
+        );
+    }
+
+    #[test]
+    fn selected_backend_must_match_database_url() {
+        let args = Args::try_parse_from([
+            "jellyrin",
+            "--database-engine",
+            "sqlite",
+            "--database-url",
+            "postgresql://db.example/jellyrin",
+        ])
+        .unwrap();
+
+        assert!(
+            resolve_database_config(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
     }
 }

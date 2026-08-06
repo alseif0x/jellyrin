@@ -1,0 +1,20 @@
+[package]
+name = "jellyrin-persistence-sqlite"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+jellyrin-persistence = { path = "../jellyrin-persistence" }
+serde_json.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

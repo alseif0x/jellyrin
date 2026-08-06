@@ -1,0 +1,15 @@
+[package]
+name = "jellyrin-magstv-egress"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+
+[[bin]]
+name = "jellyrin-magstv-egress"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"

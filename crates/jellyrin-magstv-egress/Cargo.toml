@@ -1,0 +1,17 @@
+[package]
+name = "jellyrin-magstv-egress"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "jellyrin-magstv-egress"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url = "2.5"

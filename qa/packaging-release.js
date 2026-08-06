@@ -17,8 +17,7 @@ async function main() {
   const checklist = await read('ops/release-checklist.md');
   const readme = await read('README.md');
   const api = await read('crates/jellyrin-api/src/lib.rs');
-  const server = await read('crates/jellyrin-server/src/main.rs');
-  const db = await read('crates/jellyrin-db/src/lib.rs');
+  const sqliteAdapter = await read('crates/jellyrin-persistence-sqlite/src/lib.rs');
 
   const checks = [
     check('docker-release-build', dockerfile.includes('cargo build --release -p jellyrin-server') && dockerfile.includes('debian:bookworm-slim')),
@@ -34,8 +33,9 @@ async function main() {
     check('compose-dlna-host-network', dlnaCompose.includes('network_mode: host') && dlnaCompose.includes('ports: !reset []')),
     check('compose-dlna-ssdp-guidance', dlnaCompose.includes('multicast UDP 1900') && dlnaCompose.includes('advertised LOCATION')),
     check('config-dirs-env', env.includes('JELLYRIN_DATA_DIR=/var/lib/jellyrin') && env.includes('DATABASE_URL=sqlite:///var/lib/jellyrin/jellyrin.db?mode=rwc')),
+    check('config-database-engine-selector', env.includes('JELLYRIN_DATABASE_ENGINE=sqlite') && dockerfile.includes('JELLYRIN_DATABASE_ENGINE=sqlite')),
     check('server-health-routes', api.includes('route("/healthz", get(health))') && api.includes('route("/readyz", get(ready))')),
-    check('startup-migrations', db.includes('MIGRATOR') && db.includes('.run(&pool)')),
+    check('startup-migrations', sqliteAdapter.includes('MIGRATOR') && sqliteAdapter.includes('.run(&pool)')),
     check('release-checklist-fresh-upgrade-rollback', checklist.includes('## Fresh Install') && checklist.includes('## Upgrade') && checklist.includes('## Rollback')),
     check('readme-release-entrypoint', readme.includes('## Release Packaging') && readme.includes('npm run qa:packaging-release')),
   ];

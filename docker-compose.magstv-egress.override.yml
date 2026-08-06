@@ -1,0 +1,7 @@
+services:
+  jellyrin:
+    environment:
+      MAGSTV_EGRESS_PROXY: http://magstv-egress:18080
+    depends_on:
+      magstv-egress:
+        condition: service_healthy

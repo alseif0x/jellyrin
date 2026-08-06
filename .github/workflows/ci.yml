@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Temporary until the monolithic jellyrin-api test module is split under structural gate G7.
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_MIN_STACK: 67108864
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93 --profile minimal --component clippy,rustfmt
+
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.93
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check persistence boundaries
+        run: ./scripts/check-persistence-boundaries.sh
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        env:
+          CARGO_BUILD_JOBS: 1
+        run: cargo test --workspace --all-targets --no-fail-fast

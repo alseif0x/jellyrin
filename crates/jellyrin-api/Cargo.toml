@@ -12,9 +12,12 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+flate2.workspace = true
 jellyrin-compat = { path = "../jellyrin-compat" }
 jellyrin-core = { path = "../jellyrin-core" }
 jellyrin-db = { path = "../jellyrin-db" }
+jellyrin-magstv-provider = { path = "../jellyrin-magstv-provider" }
+jellyrin-persistence = { path = "../jellyrin-persistence" }
 jellyrin-plugin-rpc = { path = "../jellyrin-plugin-rpc" }
 jellyrin-transcode = { path = "../jellyrin-transcode" }
 jellyrin-xtream-provider = { path = "../jellyrin-xtream-provider" }
@@ -26,7 +29,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -38,6 +40,7 @@ uuid.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true
 serial_test.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tower.workspace = true

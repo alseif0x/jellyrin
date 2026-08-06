@@ -45,6 +45,7 @@ async function main() {
   checks.push(check('installed-binary-copied', await exists(layout.execStart)));
   checks.push(check('env-data-dir-rewritten', env.JELLYRIN_DATA_DIR === layout.data));
   checks.push(check('env-database-url-rewritten', env.DATABASE_URL === `sqlite://${path.join(layout.data, 'jellyrin.db')}?mode=rwc`));
+  checks.push(check('env-database-engine', env.JELLYRIN_DATABASE_ENGINE === 'sqlite'));
   checks.push(check('installed-runtime-healthz', result.health?.Status === 'Healthy'));
   checks.push(check('installed-runtime-readyz', result.ready?.Status === 'Ready'));
   checks.push(check('installed-runtime-public-info', publicInfoLooksCompatible(result.publicInfo)));

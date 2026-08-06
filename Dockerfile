@@ -24,6 +24,7 @@ ENV JELLYRIN_HOST=0.0.0.0 \
     JELLYRIN_CACHE_DIR=/var/cache/jellyrin \
     JELLYRIN_LOG_DIR=/var/log/jellyrin \
     JELLYRIN_WEB_DIR=/srv/jellyrin/web \
+    JELLYRIN_DATABASE_ENGINE=sqlite \
     RUST_LOG=jellyrin=info,tower_http=info
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${JELLYRIN_PORT}/healthz" || exit 1

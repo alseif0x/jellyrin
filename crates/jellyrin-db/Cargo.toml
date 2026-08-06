@@ -9,13 +9,17 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 argon2.workspace = true
+async-trait.workspace = true
 jellyrin-core = { path = "../jellyrin-core" }
+jellyrin-persistence = { path = "../jellyrin-persistence" }
+jellyrin-persistence-sqlite = { path = "../jellyrin-persistence-sqlite" }
 rand_core.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

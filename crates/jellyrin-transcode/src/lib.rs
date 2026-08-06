@@ -300,6 +300,12 @@ where
     while let Some(line) = lines.next_line().await? {
         if parse_ffmpeg_progress_line_has_snapshot(&mut progress, &line) {
             let _ = progress_tx.send(progress.clone());
+        } else if line.contains("Error")
+            || line.contains("error")
+            || line.contains("Invalid")
+            || line.contains("failed")
+        {
+            tracing::warn!(ffmpeg_stderr = %line, "HLS ffmpeg reported an error");
         }
     }
     Ok(())

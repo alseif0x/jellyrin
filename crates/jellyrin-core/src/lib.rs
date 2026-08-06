@@ -99,6 +99,12 @@ pub struct TranscodeStreamSelection {
     pub video_stream_index: Option<i64>,
     pub audio_stream_index: Option<i64>,
     pub subtitle_stream_index: Option<i64>,
+    /// Explicit ffmpeg input stream specifier (for example
+    /// `0:m:language:eng`) for sources whose audio PID order does not match
+    /// the Jellyfin stream indices, such as transport streams with duplicate
+    /// language PIDs. Takes precedence over `audio_stream_index`.
+    #[serde(default)]
+    pub audio_stream_specifier: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,7 +241,12 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     } else {
         args.push("-vn".to_string());
     }
-    push_selected_stream_map(&mut args, "a", request.selection.audio_stream_index, true);
+    if let Some(specifier) = request.selection.audio_stream_specifier.as_deref() {
+        args.push("-map".to_string());
+        args.push(format!("{specifier}?"));
+    } else {
+        push_selected_stream_map(&mut args, "a", request.selection.audio_stream_index, true);
+    }
     if should_burn_subtitle {
         args.push("-sn".to_string());
     } else if request
@@ -519,6 +530,7 @@ mod tests {
             "/tmp/jellyrin/transcodes/play-1/main.m3u8",
             "/tmp/jellyrin/transcodes/play-1/segment_%05d.ts",
             TranscodeStreamSelection {
+                audio_stream_specifier: None,
                 video_stream_index: Some(0),
                 audio_stream_index: Some(2),
                 subtitle_stream_index: Some(-1),
@@ -588,12 +600,37 @@ mod tests {
     }
 
     #[test]
+    fn hls_command_prefers_language_specifier_over_audio_index() {
+        let mut request = HlsTranscodeRequest::new(
+            "/media/Movie.ts",
+            "/tmp/jellyrin/transcodes/play-2/main.m3u8",
+            "/tmp/jellyrin/transcodes/play-2/segment_%05d.ts",
+            TranscodeStreamSelection {
+                audio_stream_specifier: Some("0:m:language:eng".to_string()),
+                video_stream_index: Some(0),
+                audio_stream_index: Some(2),
+                subtitle_stream_index: Some(-1),
+            },
+        );
+        request.include_video = true;
+        let command = build_hls_ffmpeg_command(&request);
+        let map_position = command
+            .args
+            .iter()
+            .position(|arg| arg == "0:m:language:eng?")
+            .expect("language specifier map present");
+        assert_eq!(command.args[map_position - 1], "-map");
+        assert!(!command.args.iter().any(|arg| arg == "0:2?"));
+    }
+
+    #[test]
     fn hls_ffmpeg_command_maps_default_streams_and_optional_subtitles() {
         let request = HlsTranscodeRequest::new(
             "/media/Movie.mkv",
             "/tmp/main.m3u8",
             "/tmp/segment_%05d.ts",
             TranscodeStreamSelection {
+                audio_stream_specifier: None,
                 video_stream_index: None,
                 audio_stream_index: None,
                 subtitle_stream_index: Some(3),
@@ -630,6 +667,7 @@ mod tests {
             "/tmp/main.m3u8",
             "/tmp/segment_%05d.ts",
             TranscodeStreamSelection {
+                audio_stream_specifier: None,
                 video_stream_index: Some(0),
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(3),
@@ -664,6 +702,7 @@ mod tests {
             "/tmp/audio/main.m3u8",
             "/tmp/audio/segment_%05d.ts",
             TranscodeStreamSelection {
+                audio_stream_specifier: None,
                 video_stream_index: None,
                 audio_stream_index: Some(1),
                 subtitle_stream_index: None,
@@ -693,6 +732,7 @@ mod tests {
             "/tmp/seek/segment_00042.m3u8",
             "/tmp/seek/segment_%05d.ts",
             TranscodeStreamSelection {
+                audio_stream_specifier: None,
                 video_stream_index: Some(0),
                 audio_stream_index: Some(1),
                 subtitle_stream_index: Some(-1),
@@ -733,6 +773,7 @@ mod tests {
             "/tmp/live/main.m3u8",
             "/tmp/live/segment_%05d.ts",
             TranscodeStreamSelection {
+                audio_stream_specifier: None,
                 video_stream_index: Some(0),
                 audio_stream_index: Some(0),
                 subtitle_stream_index: None,

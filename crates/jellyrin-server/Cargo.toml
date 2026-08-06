@@ -12,6 +12,7 @@ axum.workspace = true
 clap.workspace = true
 jellyrin-api = { path = "../jellyrin-api" }
 jellyrin-db = { path = "../jellyrin-db" }
+jellyrin-persistence = { path = "../jellyrin-persistence" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -13,11 +13,31 @@ Planning lives outside this repository:
 ## Development
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets --no-fail-fast
 cargo run -p jellyrin-server -- --web-dir /home/cdmonio/dev/jellyfin-web/dist
 ```
+
+### Database backend
+
+SQLite is the operational backend and remains the default for local and lightweight
+installations. Backend selection is explicit:
+
+```bash
+JELLYRIN_DATABASE_ENGINE=sqlite \
+DATABASE_URL='sqlite:///var/lib/jellyrin/jellyrin.db?mode=rwc' \
+cargo run -p jellyrin-server
+```
+
+`JELLYRIN_DATABASE_ENGINE` accepts `sqlite`, `postgres`, or `postgresql`, and Jellyrin validates
+that it matches `DATABASE_URL`. The PostgreSQL contract and selection path exist, but its storage
+adapter and migrations are not implemented yet; selecting it fails at startup instead of silently
+falling back to SQLite. Switching an existing installation will require the planned export/import
+cutover and a controlled restart—there is no live hot-swap or implicit fallback.
+
+Run `./scripts/check-persistence-boundaries.sh` locally to verify that API and contract crates do
+not acquire new SQLx or raw-pool dependencies.
 
 When Jellyfin is running on `8096` and Jellyrin is running on `8097`, run the
 local compatibility acceptance gate with:
@@ -43,6 +63,9 @@ Release artifacts live under `ops/` plus the root Docker files:
   when SSDP discovery must work from TVs or VLC on the LAN.
 - `ops/jellyrin.service` is the production systemd unit; copy
   `ops/jellyrin.env.example` to `/etc/jellyrin/jellyrin.env` before enabling it.
+- `ops/magstv-egress/` contains the optional isolated MX WireGuard sidecar for
+  the MAGSTV provider. Its VPN profile stays outside Git and is never entered
+  in the plugin UI.
 - `ops/release-checklist.md` covers fresh install, upgrade, smoke checks and
   rollback.
 
