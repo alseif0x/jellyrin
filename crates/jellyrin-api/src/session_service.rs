@@ -130,4 +130,24 @@ impl<'a> SessionService<'a> {
     pub(crate) async fn clear_active_viewing(&self, session_id: &str) -> anyhow::Result<()> {
         self.db.clear_active_viewing_session(session_id).await
     }
+
+    pub(crate) async fn set_item_favorite(
+        &self,
+        user_id: uuid::Uuid,
+        item_id: uuid::Uuid,
+        is_favorite: bool,
+    ) -> anyhow::Result<()> {
+        self.db
+            .set_item_favorite(user_id, item_id, is_favorite)
+            .await
+    }
+
+    pub(crate) async fn set_item_rating(
+        &self,
+        user_id: uuid::Uuid,
+        item_id: uuid::Uuid,
+        rating: Option<f64>,
+    ) -> anyhow::Result<()> {
+        self.db.set_item_rating(user_id, item_id, rating).await
+    }
 }

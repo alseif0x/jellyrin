@@ -5045,7 +5045,9 @@ async fn import_jellyfin_user_data(
             })
             .await?;
         if migration_bool_field(object, &["IsFavorite", "Favorite"]).unwrap_or(false) {
-            db.set_item_favorite(user.id, item.id, true).await?;
+            SessionService::new(db)
+                .set_item_favorite(user.id, item.id, true)
+                .await?;
         }
         imported += 1;
     }
@@ -5104,9 +5106,12 @@ async fn import_jellyfin_list_family(
             })
             .unwrap_or_default();
         if let Some(existing) = existing_by_name.get(&name.to_lowercase()) {
-            db.add_media_list_items(existing.id, item_ids).await?;
+            LibraryService::new(db)
+                .add_media_list_items(existing.id, item_ids)
+                .await?;
         } else {
-            db.create_media_list(kind, &name, collection_type, None, item_ids)
+            LibraryService::new(db)
+                .create_media_list(kind, &name, collection_type, None, item_ids)
                 .await?;
         }
         imported += 1;
@@ -11166,7 +11171,9 @@ async fn scan_all_library_items(db: &Database) -> Result<usize, ApiError> {
     let folders = LibraryService::new(db).virtual_folders().await?;
     let mut scanned = 0usize;
     for folder in folders {
-        scanned += db.scan_virtual_folder_items(folder.id).await?;
+        scanned += LibraryService::new(db)
+            .scan_virtual_folder(folder.id)
+            .await?;
     }
     if scanned > 0 {
         populate_image_tags_for_library(db).await?;
@@ -19701,11 +19708,12 @@ async fn add_virtual_folder(
         );
     }
 
-    let folder = state
-        .db
+    let folder = LibraryService::new(&state.db)
         .upsert_virtual_folder(&query.name, query.collection_type.as_deref(), locations)
         .await?;
-    state.db.scan_virtual_folder_items(folder.id).await?;
+    LibraryService::new(&state.db)
+        .scan_virtual_folder(folder.id)
+        .await?;
     refresh_tv_metadata_for_folder(&state, folder.id).await?;
     dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
@@ -19754,7 +19762,9 @@ async fn add_virtual_folder_path(
         .into_iter()
         .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
         .ok_or_else(|| ApiError::bad_request("Virtual folder not found"))?;
-    state.db.scan_virtual_folder_items(folder.id).await?;
+    LibraryService::new(&state.db)
+        .scan_virtual_folder(folder.id)
+        .await?;
     refresh_tv_metadata_for_folder(&state, folder.id).await?;
     dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
@@ -19886,11 +19896,12 @@ async fn update_virtual_folder_library_options(
         .collection_type
         .as_deref()
         .or(existing.collection_type.as_deref());
-    let folder = state
-        .db
+    let folder = LibraryService::new(&state.db)
         .upsert_virtual_folder(&existing.name, collection_type, locations)
         .await?;
-    state.db.scan_virtual_folder_items(folder.id).await?;
+    LibraryService::new(&state.db)
+        .scan_virtual_folder(folder.id)
+        .await?;
     refresh_tv_metadata_for_folder(&state, folder.id).await?;
     dlna::notify_dlna_content_directory_changed(&state.db).await?;
     record_activity(
@@ -19942,8 +19953,7 @@ async fn rename_virtual_folder(
     {
         return Err(ApiError::conflict("Virtual folder already exists"));
     }
-    if state
-        .db
+    if LibraryService::new(&state.db)
         .rename_virtual_folder(&query.name, &query.new_name)
         .await?
     {
@@ -20039,7 +20049,9 @@ async fn update_virtual_folder_path(
             .into_iter()
             .find(|folder| folder.name.eq_ignore_ascii_case(&payload.name))
             .ok_or_else(|| ApiError::not_found("Virtual folder not found"))?;
-        state.db.scan_virtual_folder_items(folder.id).await?;
+        LibraryService::new(&state.db)
+            .scan_virtual_folder(folder.id)
+            .await?;
         refresh_tv_metadata_for_folder(&state, folder.id).await?;
         dlna::notify_dlna_content_directory_changed(&state.db).await?;
         record_activity(
@@ -20136,8 +20148,7 @@ async fn create_collection(
     let name = list_name_from_request(raw_query.as_deref(), body.as_ref())
         .unwrap_or_else(|| "Collection".to_string());
     let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
-    let collection = state
-        .db
+    let collection = LibraryService::new(&state.db)
         .create_media_list("collection", &name, Some("boxsets"), None, item_ids)
         .await?;
     Ok(Json(list_created_json(&collection)))
@@ -20156,8 +20167,7 @@ async fn add_collection_items(
     ensure_media_list_kind(&state.db, collection_id, "collection").await?;
     let body = body.map(|Json(value)| value);
     let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
-    state
-        .db
+    LibraryService::new(&state.db)
         .add_media_list_items(collection_id, item_ids)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -20199,8 +20209,7 @@ async fn create_playlist(
     let name = list_name_from_request(raw_query.as_deref(), body.as_ref())
         .unwrap_or_else(|| "Playlist".to_string());
     let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
-    let playlist = state
-        .db
+    let playlist = LibraryService::new(&state.db)
         .create_media_list(
             "playlist",
             &name,
@@ -20291,7 +20300,9 @@ async fn add_playlist_items(
     ensure_media_list_edit_access(&state.db, &user, &playlist).await?;
     let body = body.map(|Json(value)| value);
     let item_ids = list_item_ids_from_request(raw_query.as_deref(), body.as_ref())?;
-    state.db.add_media_list_items(playlist.id, item_ids).await?;
+    LibraryService::new(&state.db)
+        .add_media_list_items(playlist.id, item_ids)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -23445,9 +23456,8 @@ async fn refresh_item(
     }
 
     let item = media_item_by_id(&state.db, &item_id).await?;
-    let scanned = state
-        .db
-        .scan_virtual_folder_items(item.virtual_folder_id)
+    let scanned = LibraryService::new(&state.db)
+        .scan_virtual_folder(item.virtual_folder_id)
         .await?;
     refresh_tv_metadata_for_folder(&state, item.virtual_folder_id).await?;
     state
@@ -23518,7 +23528,9 @@ async fn update_virtual_folder_metadata(
         .filter(|name| !name.is_empty());
     let final_name = requested_name.unwrap_or_else(|| folder.name.clone());
     if final_name != folder.name {
-        db.rename_virtual_folder(&folder.name, &final_name).await?;
+        LibraryService::new(db)
+            .rename_virtual_folder(&folder.name, &final_name)
+            .await?;
     }
 
     let content_type = json_string_any_field(
@@ -24783,10 +24795,14 @@ async fn update_item_user_data_inner(
         })
         .await?;
     if let Some(is_favorite) = is_favorite {
-        db.set_item_favorite(user_id, item.id, is_favorite).await?;
+        SessionService::new(db)
+            .set_item_favorite(user_id, item.id, is_favorite)
+            .await?;
     }
     if let Some(rating) = rating {
-        db.set_item_rating(user_id, item.id, Some(rating)).await?;
+        SessionService::new(db)
+            .set_item_rating(user_id, item.id, Some(rating))
+            .await?;
     }
     item_user_data_json(db, user_id, item_id).await.map(Json)
 }
@@ -24931,7 +24947,9 @@ async fn mark_authenticated_item_favorite(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
-    state.db.set_item_favorite(user.id, item.id, true).await?;
+    SessionService::new(&state.db)
+        .set_item_favorite(user.id, item.id, true)
+        .await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -24945,7 +24963,9 @@ async fn unmark_authenticated_item_favorite(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
-    state.db.set_item_favorite(user.id, item.id, false).await?;
+    SessionService::new(&state.db)
+        .set_item_favorite(user.id, item.id, false)
+        .await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -24981,8 +25001,7 @@ async fn user_item_favorite_inner(
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let item = media_item_by_id(&state.db, &item_id).await?;
-    state
-        .db
+    SessionService::new(&state.db)
         .set_item_favorite(requested_user_id, item.id, is_favorite)
         .await?;
     item_user_data_json(&state.db, requested_user_id, &item_id)
@@ -25009,7 +25028,9 @@ async fn update_authenticated_item_rating(
     let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
     let rating = rating_from_query(&query);
-    state.db.set_item_rating(user.id, item.id, rating).await?;
+    SessionService::new(&state.db)
+        .set_item_rating(user.id, item.id, rating)
+        .await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -25023,7 +25044,9 @@ async fn delete_authenticated_item_rating(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let item = media_item_by_id(&state.db, &item_id).await?;
-    state.db.set_item_rating(user.id, item.id, None).await?;
+    SessionService::new(&state.db)
+        .set_item_rating(user.id, item.id, None)
+        .await?;
     item_user_data_json(&state.db, user.id, &item_id)
         .await
         .map(Json)
@@ -25066,8 +25089,7 @@ async fn user_item_rating_inner(
     ensure_user_access(&auth_user, requested_user_id)?;
     let item = media_item_by_id(&state.db, &item_id).await?;
     let rating = set_rating.then(|| rating_from_query(&query)).flatten();
-    state
-        .db
+    SessionService::new(&state.db)
         .set_item_rating(requested_user_id, item.id, rating)
         .await?;
     item_user_data_json(&state.db, requested_user_id, &item_id)
