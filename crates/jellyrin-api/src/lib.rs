@@ -4386,7 +4386,7 @@ async fn restore_users_from_backup(
         let user = if let Some(existing) = existing_by_name.get(&key) {
             existing.clone()
         } else {
-            let created = db.create_user(&name, None).await?;
+            let created = UserService::new(db).create(&name, None).await?;
             existing_by_name.insert(key, created.clone());
             created
         };
@@ -4895,7 +4895,7 @@ async fn import_jellyfin_users(
         let user = if let Some(existing) = existing_by_name.get(&key) {
             existing.clone()
         } else {
-            let created = db.create_user(&name, None).await?;
+            let created = UserService::new(db).create(&name, None).await?;
             existing_by_name.insert(key, created.clone());
             created
         };
@@ -4983,7 +4983,9 @@ async fn import_jellyfin_media_metadata(
             .get("Metadata")
             .cloned()
             .unwrap_or_else(|| media.clone());
-        db.update_media_item_metadata(item.id, metadata).await?;
+        MediaService::new(db)
+            .update_metadata(item.id, metadata)
+            .await?;
         imported += 1;
     }
     Ok(imported)
@@ -5157,16 +5159,17 @@ async fn import_jellyfin_task_history(
             object,
             &["ErrorMessage", "Error", "Exception", "CancellationMessage"],
         );
-        db.import_task_run_history(
-            Some(id),
-            &task_key,
-            status,
-            started_at,
-            completed_at,
-            result,
-            error_message.as_deref(),
-        )
-        .await?;
+        TaskService::new(db)
+            .import_history(
+                Some(id),
+                &task_key,
+                status,
+                started_at,
+                completed_at,
+                result,
+                error_message.as_deref(),
+            )
+            .await?;
         imported += 1;
     }
     Ok(imported)
@@ -6064,15 +6067,18 @@ async fn install_package(
     let previous_plugin = state.db.installed_plugin_json(&plugin_id).await?;
     let operation = plugin_package_operation(previous_plugin.as_ref(), &version);
     let task_key = package_install_task_key(&plugin_id);
-    let run = state.db.start_task_run(&task_key).await.map_err(|error| {
-        if format!("{error:#}").contains("task is already running") {
-            ApiError::conflict(format!(
-                "Package installation is already running: {plugin_id}"
-            ))
-        } else {
-            error.into()
-        }
-    })?;
+    let run = TaskService::new(&state.db)
+        .start(&task_key)
+        .await
+        .map_err(|error| {
+            if format!("{error:#}").contains("task is already running") {
+                ApiError::conflict(format!(
+                    "Package installation is already running: {plugin_id}"
+                ))
+            } else {
+                error.into()
+            }
+        })?;
     update_package_install_task_progress(
         &state.db,
         &session_id,
@@ -10626,7 +10632,10 @@ async fn start_scheduled_task(
     }
     if is_library_scan_task(&task_id) {
         recover_stale_library_scan_runs(&state.db).await?;
-        let run = match state.db.start_task_run(LIBRARY_SCAN_TASK_KEY).await {
+        let run = match TaskService::new(&state.db)
+            .start(LIBRARY_SCAN_TASK_KEY)
+            .await
+        {
             Ok(run) => run,
             Err(error) if format!("{error:#}").contains("task is already running") => {
                 return Ok(StatusCode::NO_CONTENT);
@@ -10669,7 +10678,10 @@ async fn start_scheduled_task(
     }
     if is_channel_refresh_task(&task_id) {
         recover_stale_channel_refresh_runs(&state.db).await?;
-        let run = match state.db.start_task_run(CHANNEL_REFRESH_TASK_KEY).await {
+        let run = match TaskService::new(&state.db)
+            .start(CHANNEL_REFRESH_TASK_KEY)
+            .await
+        {
             Ok(run) => run,
             Err(error) if format!("{error:#}").contains("task is already running") => {
                 return Ok(StatusCode::NO_CONTENT);
@@ -10711,7 +10723,7 @@ async fn start_scheduled_task(
     if let Some(plugin) = plugin_for_scheduled_task(&state.db, &task_id).await? {
         let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
         let task_key = plugin_scheduled_task_key(&plugin_id);
-        let run = match state.db.start_task_run(&task_key).await {
+        let run = match TaskService::new(&state.db).start(&task_key).await {
             Ok(run) => run,
             Err(error) if format!("{error:#}").contains("task is already running") => {
                 return Ok(StatusCode::NO_CONTENT);
@@ -10892,32 +10904,35 @@ fn default_scheduled_task_triggers_json() -> serde_json::Value {
 }
 
 async fn recover_stale_library_scan_runs(db: &Database) -> Result<(), ApiError> {
-    db.fail_stale_task_runs(
-        LIBRARY_SCAN_TASK_KEY,
-        Duration::hours(STALE_TASK_HOURS),
-        "Task run expired before completion.",
-    )
-    .await?;
+    TaskService::new(db)
+        .fail_stale(
+            LIBRARY_SCAN_TASK_KEY,
+            Duration::hours(STALE_TASK_HOURS),
+            "Task run expired before completion.",
+        )
+        .await?;
     Ok(())
 }
 
 async fn recover_stale_channel_refresh_runs(db: &Database) -> Result<(), ApiError> {
-    db.fail_stale_task_runs(
-        CHANNEL_REFRESH_TASK_KEY,
-        Duration::hours(STALE_TASK_HOURS),
-        "Task run expired before completion.",
-    )
-    .await?;
+    TaskService::new(db)
+        .fail_stale(
+            CHANNEL_REFRESH_TASK_KEY,
+            Duration::hours(STALE_TASK_HOURS),
+            "Task run expired before completion.",
+        )
+        .await?;
     Ok(())
 }
 
 async fn recover_stale_xtream_media_sync_runs(db: &Database) -> Result<(), ApiError> {
-    db.fail_stale_task_runs(
-        XTREAM_MEDIA_SYNC_TASK_KEY,
-        Duration::hours(STALE_TASK_HOURS),
-        "Task run expired before completion.",
-    )
-    .await?;
+    TaskService::new(db)
+        .fail_stale(
+            XTREAM_MEDIA_SYNC_TASK_KEY,
+            Duration::hours(STALE_TASK_HOURS),
+            "Task run expired before completion.",
+        )
+        .await?;
     Ok(())
 }
 
@@ -14661,7 +14676,10 @@ async fn start_xtream_media_sync_task(
     db: Database,
     session_id: Option<String>,
 ) -> Result<(), ApiError> {
-    let run = match db.start_task_run(XTREAM_MEDIA_SYNC_TASK_KEY).await {
+    let run = match TaskService::new(&db)
+        .start(XTREAM_MEDIA_SYNC_TASK_KEY)
+        .await
+    {
         Ok(run) => run,
         Err(error) if format!("{error:#}").contains("task is already running") => {
             return Ok(());

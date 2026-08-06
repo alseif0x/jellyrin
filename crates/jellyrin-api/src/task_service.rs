@@ -43,4 +43,43 @@ impl<'a> TaskService<'a> {
     pub(crate) async fn last_result(&self, task_key: &str) -> anyhow::Result<Option<TaskRun>> {
         self.db.last_task_result(task_key).await
     }
+
+    pub(crate) async fn start(&self, task_key: &str) -> anyhow::Result<TaskRun> {
+        self.db.start_task_run(task_key).await
+    }
+
+    pub(crate) async fn fail_stale(
+        &self,
+        task_key: &str,
+        older_than: time::Duration,
+        error: &str,
+    ) -> anyhow::Result<usize> {
+        self.db
+            .fail_stale_task_runs(task_key, older_than, error)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn import_history(
+        &self,
+        id: Option<Uuid>,
+        task_key: &str,
+        status: &str,
+        started_at: time::OffsetDateTime,
+        completed_at: time::OffsetDateTime,
+        result: Value,
+        error: Option<&str>,
+    ) -> anyhow::Result<TaskRun> {
+        self.db
+            .import_task_run_history(
+                id,
+                task_key,
+                status,
+                started_at,
+                completed_at,
+                result,
+                error,
+            )
+            .await
+    }
 }
