@@ -7952,32 +7952,33 @@ impl SqliteDatabase {
         limit: usize,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let mut transaction = self.pool.begin().await?;
-        let (missing_names, total): (i64, i64) = sqlx::query_as(
+        let invalid_series: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(CASE WHEN NULLIF(trim(json_extract(metadata_json, '$.SeriesId')), '') IS NULL
+            SELECT EXISTS(SELECT 1 FROM media_items
+            WHERE missing_since IS NULL AND media_type = 'Video'
+              AND lower(collection_type) IN ('tvshows', 'tvshow', 'series')
+              AND (NULLIF(trim(json_extract(metadata_json, '$.SeriesId')), '') IS NULL
                                       OR length(trim(json_extract(metadata_json, '$.SeriesId'))) <> 32
                                       OR trim(json_extract(metadata_json, '$.SeriesId')) <> lower(trim(json_extract(metadata_json, '$.SeriesId')))
                                       OR trim(json_extract(metadata_json, '$.SeriesId')) GLOB '*[^0-9a-f]*'
-                                      OR NULLIF(trim(json_extract(metadata_json, '$.SeriesName')), '') IS NULL
-                                    THEN 1 ELSE 0 END), 0),
-                   COUNT(DISTINCT NULLIF(trim(json_extract(metadata_json, '$.SeriesId')), ''))
-            FROM media_items
-            WHERE missing_since IS NULL AND media_type = 'Video'
-              AND lower(collection_type) IN ('tvshows', 'tvshow', 'series')
+                                      OR NULLIF(trim(json_extract(metadata_json, '$.SeriesName')), '') IS NULL)
+            LIMIT 1)
             "#,
         )
         .fetch_one(&mut *transaction)
         .await?;
-        if missing_names != 0 {
+        if invalid_series != 0 {
             transaction.commit().await?;
             return Ok(None);
         }
-        let limit = i64::try_from(limit)?;
+        let requested_limit = limit;
+        let limit = i64::try_from(limit.max(1))?;
         let offset = i64::try_from(start_index)?;
-        let series = sqlx::query_as::<_, (String, String)>(
+        let mut series = sqlx::query_as::<_, (String, String, i64)>(
             r#"
             SELECT trim(json_extract(metadata_json, '$.SeriesId')) AS series_id,
-                   MIN(trim(json_extract(metadata_json, '$.SeriesName'))) AS series_name
+                   MIN(trim(json_extract(metadata_json, '$.SeriesName'))) AS series_name,
+                   COUNT(*) OVER () AS total_series
             FROM media_items
             WHERE missing_since IS NULL AND media_type = 'Video'
               AND lower(collection_type) IN ('tvshows', 'tvshow', 'series')
@@ -7990,13 +7991,27 @@ impl SqliteDatabase {
         .bind(offset)
         .fetch_all(&mut *transaction)
         .await?;
+        let total = if let Some((_, _, total)) = series.first() {
+            *total
+        } else if start_index == 0 {
+            0
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(DISTINCT trim(json_extract(metadata_json, '$.SeriesId'))) FROM media_items WHERE missing_since IS NULL AND media_type = 'Video' AND lower(collection_type) IN ('tvshows', 'tvshow', 'series')",
+            )
+            .fetch_one(&mut *transaction)
+            .await?
+        };
+        if requested_limit == 0 {
+            series.clear();
+        }
         let mut rows = Vec::new();
         if !series.is_empty() {
             let mut query = QueryBuilder::<Sqlite>::new(
                 "SELECT item.id, item.virtual_folder_id, item.name, item.path, item.media_type, item.collection_type, item.file_size, item.runtime_ticks, item.bitrate, item.width, item.height, item.media_streams_json, item.metadata_json, item.created_at, item.updated_at, CAST(NULL AS TEXT) AS playback_user_id, CAST(NULL AS TEXT) AS playback_item_id, CAST(NULL AS TEXT) AS playback_media_source_id, CAST(NULL AS INTEGER) AS playback_audio_stream_index, CAST(NULL AS INTEGER) AS playback_subtitle_stream_index, CAST(NULL AS INTEGER) AS playback_position_ticks, CAST(NULL AS INTEGER) AS playback_is_paused, CAST(NULL AS INTEGER) AS playback_played, CAST(NULL AS INTEGER) AS playback_is_favorite, CAST(NULL AS REAL) AS playback_rating, CAST(NULL AS TEXT) AS playback_updated_at FROM media_items AS item WHERE item.missing_since IS NULL AND item.media_type = 'Video' AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series') AND trim(json_extract(item.metadata_json, '$.SeriesId')) IN (",
             );
             let mut separated = query.separated(", ");
-            for (id, _) in &series {
+            for (id, _, _) in &series {
                 separated.push_bind(id);
             }
             separated.push_unseparated(") ORDER BY item.name COLLATE NOCASE, item.id");
@@ -8009,7 +8024,7 @@ impl SqliteDatabase {
         Ok(Some(TvSeriesCatalogPage {
             series: series
                 .into_iter()
-                .map(|(id, name)| TvSeriesCatalogKey { id, name })
+                .map(|(id, name, _)| TvSeriesCatalogKey { id, name })
                 .collect(),
             episodes: rows
                 .into_iter()

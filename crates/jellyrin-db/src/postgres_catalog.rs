@@ -1152,27 +1152,29 @@ impl PostgresDatabase {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await?;
-        let (missing_names, total): (i64, i64) = sqlx::query_as(
+        let invalid_series: bool = sqlx::query_scalar(
             r#"
-            SELECT COUNT(*) FILTER (WHERE NULLIF(btrim(metadata->>'SeriesId'), '') IS NULL
-                                      OR btrim(metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
-                                      OR NULLIF(btrim(metadata->>'SeriesName'), '') IS NULL),
-                   COUNT(DISTINCT NULLIF(btrim(metadata->>'SeriesId'), ''))
-            FROM media_items
+            SELECT EXISTS(SELECT 1 FROM media_items
             WHERE missing_since IS NULL AND media_type = 'Video'
               AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+              AND (NULLIF(btrim(metadata->>'SeriesId'), '') IS NULL
+                                      OR btrim(metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
+                                      OR NULLIF(btrim(metadata->>'SeriesName'), '') IS NULL)
+            LIMIT 1)
             "#,
         )
         .fetch_one(&mut *transaction)
         .await?;
-        if missing_names != 0 {
+        if invalid_series {
             transaction.commit().await?;
             return Ok(None);
         }
-        let series = sqlx::query_as::<_, (String, String)>(
+        let requested_limit = limit;
+        let mut series = sqlx::query_as::<_, (String, String, i64)>(
             r#"
             SELECT btrim(metadata->>'SeriesId') AS series_id,
-                   MIN(btrim(metadata->>'SeriesName')) AS series_name
+                   MIN(btrim(metadata->>'SeriesName')) AS series_name,
+                   COUNT(*) OVER () AS total_series
             FROM media_items
             WHERE missing_since IS NULL AND media_type = 'Video'
               AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
@@ -1181,10 +1183,24 @@ impl PostgresDatabase {
             LIMIT $1 OFFSET $2
             "#,
         )
-        .bind(i64::try_from(limit)?)
+        .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
         .fetch_all(&mut *transaction)
         .await?;
+        let total = if let Some((_, _, total)) = series.first() {
+            *total
+        } else if start_index == 0 {
+            0
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(DISTINCT btrim(metadata->>'SeriesId')) FROM media_items WHERE missing_since IS NULL AND media_type = 'Video' AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])",
+            )
+            .fetch_one(&mut *transaction)
+            .await?
+        };
+        if requested_limit == 0 {
+            series.clear();
+        }
         let rows = if series.is_empty() {
             Vec::new()
         } else {
@@ -1211,7 +1227,12 @@ impl PostgresDatabase {
                 ORDER BY lower(item.name), item.name, item.id
                 "#,
             )
-            .bind(series.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
+            .bind(
+                series
+                    .iter()
+                    .map(|(id, _, _)| id.clone())
+                    .collect::<Vec<_>>(),
+            )
             .fetch_all(&mut *transaction)
             .await?
         };
@@ -1219,7 +1240,7 @@ impl PostgresDatabase {
         Ok(Some(TvSeriesCatalogPage {
             series: series
                 .into_iter()
-                .map(|(id, name)| TvSeriesCatalogKey { id, name })
+                .map(|(id, name, _)| TvSeriesCatalogKey { id, name })
                 .collect(),
             episodes: rows
                 .into_iter()
