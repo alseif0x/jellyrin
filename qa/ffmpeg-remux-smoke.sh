@@ -28,6 +28,10 @@ ffmpeg -hide_banner -loglevel error -i "${fixture_root}/source.mp4" -c copy \
     "${fixture_root}/source.mkv"
 ffmpeg -hide_banner -loglevel error -i "${fixture_root}/source.mp4" -c copy \
     -bsf:v h264_mp4toannexb -f mpegts "${fixture_root}/source.ts"
+# CI and hardened operator shells can use umask 0077. The image runs as the dedicated
+# non-root Jellyrin user, so make the generated, non-sensitive fixtures explicitly readable.
+chmod 0644 "${fixture_root}/source.mp4" "${fixture_root}/source.mkv" \
+    "${fixture_root}/source.ts"
 
 for input_name in source.mp4 source.mkv source.ts; do
     fixture_id="${input_name//./-}"
