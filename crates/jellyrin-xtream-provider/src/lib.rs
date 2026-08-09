@@ -2361,6 +2361,10 @@ struct XtreamSeriesStageProgress {
     selected_series: usize,
     episode_count: usize,
     series_ids: HashSet<String>,
+    item_ids: HashSet<String>,
+    item_paths: HashSet<String>,
+    skipped_series: usize,
+    deduplicated_series: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2409,31 +2413,43 @@ where
             let Some(series_id) = json_string_field(&series_item, "series_id")
                 .or_else(|| live_tv_u64_field(&series_item, "series_id").map(|id| id.to_string()))
             else {
-                return Err(XtreamImportError::new(
-                    "series catalogue",
-                    XtreamFetchError::InvalidCatalog,
-                )
-                .into());
+                progress.skipped_series = progress.skipped_series.saturating_add(1);
+                continue;
             };
-            if !valid_xtream_identifier(&series_id)
-                || !progress.series_ids.insert(series_id.clone())
-            {
-                return Err(XtreamImportError::new(
-                    "series catalogue",
-                    XtreamFetchError::InvalidCatalog,
-                )
-                .into());
+            if !valid_xtream_identifier(&series_id) {
+                progress.skipped_series = progress.skipped_series.saturating_add(1);
+                continue;
+            }
+            if !progress.series_ids.insert(series_id.clone()) {
+                progress.deduplicated_series = progress.deduplicated_series.saturating_add(1);
+                continue;
             }
             progress.selected_series = progress.selected_series.saturating_add(1);
-            let info = fetch_series_info(client, username, password, &series_id)
-                .await
-                .map_err(|error| XtreamImportError::new("series details", error))?;
+            let info = match fetch_series_info(client, username, password, &series_id).await {
+                Ok(info) => info,
+                Err(
+                    XtreamFetchError::InvalidCatalog
+                    | XtreamFetchError::TooManyItems
+                    | XtreamFetchError::Http(reqwest::StatusCode::NOT_FOUND),
+                ) => {
+                    progress.skipped_series = progress.skipped_series.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(XtreamImportError::new("series details", error).into()),
+            };
             let selected_episode_count = series_episode_count(&info).min(episode_limit);
             if progress
                 .episode_count
                 .saturating_add(selected_episode_count)
                 > REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS
-                || !valid_series_episode_prefix(&info, selected_episode_count)
+            {
+                return Err(XtreamImportError::new(
+                    "series details",
+                    XtreamFetchError::TooManyItems,
+                )
+                .into());
+            }
+            if !valid_series_episode_prefix(&info, selected_episode_count)
                 || !xtream_episode_values(&info)
                     .into_iter()
                     .take(selected_episode_count)
@@ -2441,11 +2457,8 @@ where
                         valid_xtream_series_episode_source(client, username, password, episode)
                     })
             {
-                return Err(XtreamImportError::new(
-                    "series details",
-                    XtreamFetchError::InvalidCatalog,
-                )
-                .into());
+                progress.skipped_series = progress.skipped_series.saturating_add(1);
+                continue;
             }
             let items = parse_series_episodes(
                 tuner_id,
@@ -2454,13 +2467,21 @@ where
                 categories,
                 Some(selected_episode_count),
             );
-            if items.len() != selected_episode_count || !unique_remote_media_catalog(&items) {
-                return Err(XtreamImportError::new(
-                    "series details",
-                    XtreamFetchError::InvalidCatalog,
-                )
-                .into());
+            if items.len() != selected_episode_count
+                || !unique_remote_media_catalog(&items)
+                || items.iter().any(|item| {
+                    progress.item_ids.contains(&item.id) || progress.item_paths.contains(&item.path)
+                })
+            {
+                progress.skipped_series = progress.skipped_series.saturating_add(1);
+                continue;
             }
+            progress
+                .item_ids
+                .extend(items.iter().map(|item| item.id.clone()));
+            progress
+                .item_paths
+                .extend(items.iter().map(|item| item.path.clone()));
             progress.episode_count = progress
                 .episode_count
                 .saturating_add(append_staged_media_items(db, stage, "series", items).await?);
@@ -2476,7 +2497,10 @@ where
 async fn stage_xtream_media_from_payload<Database>(
     db: &Database,
     payload: &serde_json::Value,
-) -> Result<Option<(RemoteMediaCatalogStage, usize, usize)>, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<
+    Option<(RemoteMediaCatalogStage, usize, usize, usize, usize)>,
+    Box<dyn std::error::Error + Send + Sync>,
+>
 where
     Database: XtreamCatalogStore + Sync,
 {
@@ -2707,14 +2731,25 @@ where
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
             movie_count,
             series_progress.episode_count,
+            series_progress.skipped_series,
+            series_progress.deduplicated_series,
         ))
     }
     .await;
 
     match staged_result {
-        Ok((movie_count, series_episode_count)) => {
-            Ok(Some((stage, movie_count, series_episode_count)))
-        }
+        Ok((
+            movie_count,
+            series_episode_count,
+            skipped_series_count,
+            deduplicated_series_count,
+        )) => Ok(Some((
+            stage,
+            movie_count,
+            series_episode_count,
+            skipped_series_count,
+            deduplicated_series_count,
+        ))),
         Err(error) => {
             let _ = db.abort_remote_media_catalog_stage(&stage).await;
             Err(error)
@@ -2792,8 +2827,13 @@ where
         OffsetDateTime::now_utc() - time::Duration::hours(24),
     )
     .await?;
-    let Some((stage, movie_count, series_episode_count)) =
-        stage_xtream_media_from_payload(db, payload).await?
+    let Some((
+        stage,
+        movie_count,
+        series_episode_count,
+        skipped_series_count,
+        deduplicated_series_count,
+    )) = stage_xtream_media_from_payload(db, payload).await?
     else {
         return Ok(None);
     };
@@ -2804,6 +2844,8 @@ where
     Ok(Some(serde_json::json!({
         "MovieCount": movie_count,
         "SeriesEpisodeCount": series_episode_count,
+        "SkippedSeriesCount": skipped_series_count,
+        "DeduplicatedSeriesCount": deduplicated_series_count,
     })))
 }
 
@@ -2821,6 +2863,8 @@ where
     let mut skipped_tuners = 0usize;
     let mut movie_count = 0usize;
     let mut series_episode_count = 0usize;
+    let mut skipped_series_count = 0usize;
+    let mut deduplicated_series_count = 0usize;
     for tuner in tuners {
         match sync_xtream_media_from_payload(db, &tuner).await? {
             Some(result) => {
@@ -2833,6 +2877,14 @@ where
                     .get("SeriesEpisodeCount")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as usize;
+                skipped_series_count += result
+                    .get("SkippedSeriesCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                deduplicated_series_count += result
+                    .get("DeduplicatedSeriesCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
             }
             None => skipped_tuners += 1,
         }
@@ -2842,6 +2894,8 @@ where
         "TunersSkipped": skipped_tuners,
         "MovieCount": movie_count,
         "SeriesEpisodeCount": series_episode_count,
+        "SkippedSeriesCount": skipped_series_count,
+        "DeduplicatedSeriesCount": deduplicated_series_count,
     }))
 }
 
@@ -3082,7 +3136,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..8 {
+            for _ in 0..9 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 loop {
@@ -3123,10 +3177,14 @@ mod tests {
                     && request.contains("series_id=200")
                 {
                     br#"{"info":{"name":"Comedy Show"},"episodes":{"1":[{"id":"2001","title":"Comedy Episode","episode_num":1,"container_extension":"mp4"}]}}"#
+                } else if request.contains("action=get_series_info")
+                    && request.contains("series_id=300")
+                {
+                    br#"{"info":{"name":"Broken Show"}}"#
                 } else if request.contains("action=get_series")
                     && request.contains("category_id=20")
                 {
-                    br#"[{"series_id":"100","name":"Drama Show","category_id":"20"}]"#
+                    br#"[{"series_id":"100","name":"Drama Show","category_id":"20"},{"series_id":"100","name":"Drama Show duplicate","category_id":"20"},{"name":"Missing id","category_id":"20"},{"series_id":"300","name":"Broken Show","category_id":"20"}]"#
                 } else if request.contains("action=get_series")
                     && request.contains("category_id=21")
                 {
@@ -3370,6 +3428,8 @@ mod tests {
 
         assert_eq!(result["MovieCount"], 0);
         assert_eq!(result["SeriesEpisodeCount"], 2);
+        assert_eq!(result["SkippedSeriesCount"], 2);
+        assert_eq!(result["DeduplicatedSeriesCount"], 1);
         let appends = store.staged_appends.lock().unwrap();
         assert_eq!(
             appends
