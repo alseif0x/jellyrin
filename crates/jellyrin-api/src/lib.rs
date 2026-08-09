@@ -10043,8 +10043,9 @@ async fn update_package_repositories(
 ) -> Result<StatusCode, ApiError> {
     let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
     let mut current_payloads = state.db.system_configuration_payloads().await?;
+    let repositories = repository_infos_from_config(payload);
     current_payloads.plugin_repositories =
-        serde_json::Value::Array(repository_infos_from_config(payload));
+        serde_json::Value::Array(refresh_saved_package_repositories(repositories).await);
     state
         .db
         .update_system_configuration_payloads(current_payloads)
@@ -10058,6 +10059,48 @@ async fn update_package_repositories(
     )
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Hydrate enabled repositories as part of the save operation so the stock web UI cannot leave
+/// `/Packages` backed by an older embedded manifest. This deliberately uses the same bounded,
+/// non-redirecting and SSRF-filtered reader as the explicit refresh endpoint. A repository fetch
+/// failure remains compatible with Jellyfin's save contract: the repository is retained, marked
+/// failed, and the endpoint still returns 204.
+async fn refresh_saved_package_repositories(
+    repositories: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let refreshed_at_time = OffsetDateTime::now_utc();
+    let refreshed_at = format_time_for_json(refreshed_at_time);
+    let mut refreshed_repositories = Vec::with_capacity(repositories.len());
+
+    for mut repository in repositories {
+        if json_bool_field(&repository, "Enabled") == Some(false) {
+            refreshed_repositories.push(repository);
+            continue;
+        }
+
+        let url = json_string_field(&repository, "Url").unwrap_or_default();
+        match read_plugin_repository_manifest(&url).await {
+            Ok(manifest) => {
+                let packages = plugin_repository_manifest_packages(&manifest, &url);
+                repository["Packages"] = serde_json::Value::Array(packages);
+                repository["LastRefreshStatus"] = serde_json::json!("Succeeded");
+                repository["LastRefreshedAt"] = serde_json::json!(refreshed_at.clone());
+                repository["LastRefreshError"] = serde_json::Value::Null;
+                repository["LastRefreshPackageCount"] =
+                    serde_json::json!(repository["Packages"].as_array().map_or(0, Vec::len));
+                repository["LastRefreshCacheStatus"] = serde_json::json!("Refreshed");
+            }
+            Err(error) => {
+                repository["LastRefreshStatus"] = serde_json::json!("Failed");
+                repository["LastRefreshedAt"] = serde_json::json!(refreshed_at.clone());
+                repository["LastRefreshError"] = serde_json::json!(format!("{:#}", error.error));
+            }
+        }
+        refreshed_repositories.push(repository);
+    }
+
+    refreshed_repositories
 }
 
 async fn refresh_package_repositories(
@@ -72224,6 +72267,130 @@ done
         assert_eq!(error.status(), StatusCode::FORBIDDEN);
         assert!(!error.error.to_string().contains(blocked_url));
         assert!(!error.error.to_string().contains("169.254.169.254"));
+    }
+
+    #[tokio::test]
+    async fn saving_repository_refreshes_changed_local_manifest_immediately() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest_path = tmp.path().join("magstv-repository.json");
+        let manifest_url = reqwest::Url::from_file_path(&manifest_path)
+            .unwrap()
+            .to_string();
+        let manifest = |version: &str| {
+            json!([{
+                "Guid": "7a7a8541-29f8-4c35-99b1-66df55f8399e",
+                "Name": "Jellyrin MAGSTV",
+                "Runtime": "ExternalProcess",
+                "TargetAbi": "jellyrin-plugin-rpc-v1",
+                "Versions": [{
+                    "Version": version,
+                    "Runtime": "ExternalProcess",
+                    "TargetAbi": "jellyrin-plugin-rpc-v1",
+                    "SourceUrl": format!("https://repo.example/magstv-{version}.zip"),
+                    "Checksum": format!("sha256:{}", "0".repeat(64))
+                }]
+            }])
+        };
+        tokio::fs::write(&manifest_path, manifest("0.1.0").to_string())
+            .await
+            .unwrap();
+        let repository_payload = json!([{
+            "Name": "MAGSTV staging",
+            "Url": manifest_url,
+            "Enabled": true
+        }]);
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let save = |endpoint: &'static str, payload: serde_json::Value| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(endpoint)
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+        };
+        let response = save("/Repositories", repository_payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Packages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let packages: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(packages[0]["Versions"][0]["Version"], "0.1.0");
+
+        tokio::fs::write(&manifest_path, manifest("0.1.1").to_string())
+            .await
+            .unwrap();
+        let response = save("/Package/Repositories", repository_payload)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/Packages")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let packages: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(packages.as_array().unwrap().len(), 1);
+        assert_eq!(packages[0]["Versions"][0]["Version"], "0.1.1");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Repositories")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let repositories: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(repositories[0]["LastRefreshStatus"], "Succeeded");
+        assert_eq!(repositories[0]["LastRefreshPackageCount"], 1);
+        assert_eq!(
+            repositories[0]["Packages"][0]["Versions"][0]["Version"],
+            "0.1.1"
+        );
     }
 
     #[tokio::test]
