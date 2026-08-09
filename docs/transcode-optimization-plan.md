@@ -235,7 +235,7 @@ unit endurecido está activo con `CPUQuota=150%`, `MemoryHigh=1536M`,
 capabilities vacías; `systemd-analyze security` informa exposición 4,2/10
 (`OK`). El keyring fuente es `root:root` `0400` dentro de un directorio `0700`
 y PID 1 entrega una copia inmutable mediante `LoadCredential`; la copia antigua
-legible por el grupo fue retirada después del reinicio correcto. `/healthz` y
+legible por el grupo fue retirada después del reinicio correcto. `/health` y
 `/readyz` responden 200 localmente y por el proxy TLS, el certificado vence el
 2026-11-07, el timer/hook de renovación está activo y el dry-run de Certbot pasó.
 Los dos server blocks registran access por path y fijan su error log en `crit`;
@@ -248,12 +248,15 @@ reales. `pg_stat_statements` está realmente precargado, su extensión está
 instalada en la base `jellyrin` y registra 49 statements. Xtream quedó
 configurado y su catálogo contiene 757 canales; esto acredita configuración e
 indexación, pero no sustituye la reproducción E2E con clientes reales.
-El release vigente del núcleo se desplegó el 2026-08-09 con SHA-256
-`8f402cf9b65d1846c78a72dcae37aaa6100cb1ee0aa3b8313406d901ae78fcbe`;
-el binario anterior (`6cb82ccd717e6aa4780a0355ece8a8d60c37d0864b4c7e4cc244c10351166c39`)
-se conserva como `/usr/local/bin/jellyrin-server.pre-20260809T105422Z` para
-rollback. El reinicio cerró el host externo sin timeout y health/ready local y
-HTTPS quedaron verdes, sin warnings posteriores ni errores de caché read-only.
+El release vigente del núcleo se desplegó el 2026-08-09 desde el commit local
+`bde4922` con SHA-256
+`123c2d6ff616947f535c7c7e41ca80340d1cce11e29acc6220872bc2c24424b0`;
+el binario anterior (`8f402cf9b65d1846c78a72dcae37aaa6100cb1ee0aa3b8313406d901ae78fcbe`)
+se conserva como `/usr/local/bin/jellyrin-server.pre-20260809T115000Z` para
+rollback. El reinicio cerró el runtime sin timeout y `/health`/`/readyz` local y
+HTTPS quedaron verdes. Esta revisión añade refresco inmediato y acotado del
+catálogo al guardar un repositorio habilitado, conservando la respuesta 204
+compatible incluso si el origen falla y registrando el fallo en su estado.
 
 La migración 106 se ejecutó realmente en PostgreSQL 16.14 y aceptó filas legacy
 y opacas válidas; sus tests SQLite rechazan mixed/neither y preservan filas en
@@ -278,8 +281,10 @@ La UI fue corregida para solicitar únicamente las credenciales de cuenta; no
 presenta settings operativos como si fueran secretos configurables. Sus
 prerrequisitos de runtime/egress, instalación autenticada y E2E siguen
 pendientes y no se consideran cubiertos por el smoke de la página.
-El ZIP 0.1.1 y su índice están preparados en `/srv/jellyrin/plugin-repository`,
-pero Jellyrin todavía no lo ha instalado ni refrescado. Egress, secretos
+El ZIP 0.1.1 y su índice están preparados en `/srv/jellyrin/plugin-repository`.
+El core desplegado ya refresca ese índice al volver a guardar el repositorio,
+pero Jellyrin todavía no ha instalado 0.1.1 ni se ha ejecutado ese guardado
+autenticado. Egress, secretos
 operativos del proveedor y el E2E real siguen pendientes. Este artefacto local
 no debe publicarse como release ni presentarse como rollout completado.
 
@@ -292,13 +297,13 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | --- | --- | --- | --- |
 | Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 142/0/2 más doctest sobre PG real donde corresponde; aislamiento API/worker real; migrador 27/27; esquema y proyección hasta migración 109 probados en PG16.14; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements registrados; checks locked y clippy DB/API estrictos verdes tras el delta | E2E, carga de handlers, cutover y contratos restantes antes de otro backend |
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first con un solo fallback encode en `enabled` para VOD/seek/Live, perfiles, cupo agregado y por carril, process groups, SIGTERM/SIGKILL, admisión/reserva HLS, cuota, deadline seek, limpieza confinada al root, observación efectiva y telemetría CPU/RSS/fps/speed acotada | Workspace 641/0/5, API 344/0/3, transcode 39/39 y core 17/17; clippy estricto y smokes systemd/performance/security verdes | Clientes/fuentes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen en staging |
-| MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c` | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado | Pin público aún viejo; 0.1.1 sin instalar/refrescar en Jellyrin; egress, secretos operativos, E2E real y publicación pendientes |
+| MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado | Pin público aún viejo; falta volver a guardar el repositorio e instalar 0.1.1; egress, secretos operativos, E2E real y publicación pendientes |
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD y escritura/backfill/rotación transaccionales | Xtream 20/20 post-XOR/ImageUrl, migrador 27/27 y clippy estricto; migración 106 y round-trip byte-exact reales en PG; configuración real e indexación de 757 canales | Reimport legacy y escaneo DB/logs/argv donde aplique; reproducción E2E y matriz de clientes reales |
 | Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET` y obtiene count+página en un snapshot; Counts agregado/proyectado sin transportar catálogo; existencia/lookup por UUID puntuales; Search/Hints acotado a 100 con scope metadata exacto; tipos efectivos compartidos y prefiltrado sargable con metadata inline para similares, soundtrack, instant mix y remote search; resolución, episodios, temporadas, similares, Ancestors y updates/refresh de Series limitados al dominio TV; refresh TV agrupado O(TV) en vez de O(series×catálogo); fallbacks semánticos conservados, batching amplio y DLNA/sidecars acotados por carpeta | Workspace 641/0/5; Counts conformance SQLite/PG real y API 513 items; Resume SQLite con 513 filas/offset 500 y PostgreSQL real 1/1, además del handler API; contrato de tipos efectivos y point contract SQLite/PG real; Ancestors/owners con 512 películas; Search/Hints y candidatos Series validados en ambos drivers; regresión TV cross-folder y extras; benchmark aislado PG16.14 10k/100k/500k: Movie page p95 current→candidate 1.193→0.963 ms, 9.777→6.544 ms y 11.098→6.587 ms | Predicados metadata cross-domain complejos, resume complejo/sin límite, distribución/handlers E2E representativos, baseline productiva y carga concurrente de handlers |
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 con backfill transaccional único; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; check locked y clippy DB/API `-D warnings` verdes | Filtros complejos por Person/Genre/Studio/Tag/rating/premiere, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
-| Supply chain | Pins, generación SBOM, scanners y excepciones gobernadas configurados; runner RustSec standalone; Jellyfin Web 10.11.11 con backport oficial y verificado de Swiper 12.1.2, build sin opcionales Node-only | QA supply-chain 38/38, packaging 46/46 y build Web real: 2.317 ficheros/60 MiB/0 symlinks; E2E Web aislado 1/1; imagen AArch64 staging real y bundle Syft verificado en `plans/generated/supply-chain-arm64-20260809`; RustSec/Trivy real retenido en `plans/generated/vulnerability-arm64-20260809` | Gate rojo: `rsa` lock-only y 72 CVE de imagen únicas HIGH/CRITICAL (11 críticas); revisar contra Debian, reducir/actualizar runtime, repetir por arquitectura, firma y provenance |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential` y cgroup software-only endurecido | Migración y arranque verdes; health/ready local+HTTPS; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements; smokes systemd/performance/security, `nginx -t`, Certbot dry-run y restore drill verdes; backup post-Xtream `20260809T103116Z`; Xtream configurado con 757 canales; repositorio MAGSTV 0.1.1 preparado | E2E de reproducción Xtream y clientes/FFmpeg; instalar/refrescar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; pin público compatible pendiente |
+| Supply chain | Pins, generación SBOM, scanners y excepciones gobernadas configurados; runner RustSec standalone; runtime sin `curl`; Jellyfin Web 10.11.11 con backport oficial y verificado de Swiper 12.1.2, build sin opcionales Node-only | QA supply-chain 38/38, packaging 46/46 y build Web real: 2.317 ficheros/60 MiB/0 symlinks; E2E Web aislado 1/1; imagen Docker AArch64 exacta `bde4922`, healthcheck y revisión OCI completa; bundle Syft verificado en `plans/generated/supply-chain-arm64-bde4922`; RustSec/Trivy real retenido en `plans/generated/vulnerability-arm64-bde4922` | Gate rojo: `rsa` lock-only y 65 CVE de imagen únicas HIGH/CRITICAL (11 críticas); construir un FFmpeg mínimo de remux, revisar VEX Debian, repetir por arquitectura, firma y provenance |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential` y cgroup software-only endurecido | Núcleo `bde4922` desplegado, SHA-256 `123c2d6f...24424b0`; migración y arranque verdes; `/health`/`/readyz` local+HTTPS; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements; smokes systemd/performance/security, `nginx -t`, Certbot dry-run y restore drill verdes; backup post-Xtream `20260809T103116Z`; Xtream configurado con 757 canales; repositorio MAGSTV 0.1.1 preparado | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; pin público compatible pendiente |
 
 ### Trabajo restante y gates de salida
 
@@ -330,7 +335,9 @@ rollout probado:
    adaptación `ExternalProcess` local es `8ce47b4` y la versión 0.1.1 queda en
    `9596f1c`. Contra SDK/RPC local pasa 91 aprobadas, 0 fallidas y 4 ignoradas,
    con clippy/fmt/diff verdes. El ZIP AArch64 0.1.1 está validado y el repositorio
-   staging preparado, pero Jellyrin aún no lo ha instalado/refrescado. Repetir
+   staging preparado. El core `bde4922` desplegado refresca el catálogo de forma
+   inmediata al guardar el repositorio habilitado; falta ejecutar ese guardado
+   con una sesión administradora e instalar 0.1.1. Repetir
    la matriz contra el core publicado compatible y, después de publicar
    Jellyrin, fijar el commit SDK/RPC exacto en el plugin; el pin público actual
    sigue viejo. La
@@ -365,12 +372,14 @@ rollout probado:
    no bloquea un rollout exclusivamente MAGSTV, que ya usa `live_tv_*`, pero sí
    bloquea afirmar esa escala para bibliotecas generales.
 5. **Supply chain real — AArch64 ejecutado, promoción bloqueada:** Podman rootless
-   construyó la imagen AArch64 staging con las bases/snapshot/FFmpeg fijados y
+   construyó la imagen Docker AArch64 exacta de `bde4922`, con revisión OCI
+   completa, healthcheck, sin `curl` y con las bases/snapshot/FFmpeg fijados, y
    Syft generó SPDX/CycloneDX para imagen y fuente; todos los `SHA256SUMS`
    verifican. RustSec bloquea por `rsa 0.9.10`/RUSTSEC-2023-0071 y Trivy 0.70.0,
-   con base descargada el 2026-08-09, bloquea 72 CVE únicas HIGH/CRITICAL en
-   paquetes Debian (191 ocurrencias al contar bibliotecas compartidas), incluidas
-   11 críticas. Los avisos `unsound` de
+   con base descargada el 2026-08-09, bloquea 65 CVE únicas HIGH/CRITICAL en
+   paquetes Debian (179 ocurrencias al contar bibliotecas compartidas), incluidas
+   11 críticas. Frente a la imagen anterior son 7 CVE únicas y 12 ocurrencias
+   menos, pero el gate sigue rojo. Los avisos `unsound` de
    `anyhow 1.0.102` y `event-listener 5.4.1` se remediaron en `Cargo.lock` con
    1.0.103 y 5.4.2. `rsa` solo llega al lock mediante el backend opcional
    `sqlx-mysql`: `cargo tree -i rsa` queda vacío tanto para producción como para
@@ -385,7 +394,11 @@ rollout probado:
    al binario Bookworm porque MiniZip no se construye, mientras FFmpeg
    CVE-2026-58049 sigue sin fix incluso en Trixie; no se aceptarán findings en
    bloque ni se cambiará de distribución a ciegas. Después hay que actualizar o
-   minimizar el runtime, repetir AArch64, construir/analizar AMD64 y solo con
+   minimizar el runtime. La siguiente intervención con impacto material es un
+   build reproducible y mínimo de FFmpeg orientado a direct/remux, porque el
+   paquete Debian completo introduce gran parte de la superficie multimedia y
+   gráfica que Jellyrin no necesita. Después se debe repetir AArch64,
+   construir/analizar AMD64 y solo con
    gates verdes firmar el digest y adjuntar provenance. El QA 38/38 solo
    acredita política y pins, no sustituye estos resultados reales. El Jellyfin
    Web endurecido se construyó localmente y su gate Playwright aislado pasó
@@ -416,7 +429,8 @@ rollout probado:
    rol migrator, migrar SQLite legacy, comprobar digests, arrancar con el rol
    runtime y mantener rollback. Después se publican commits/releases separados
    y se actualiza el pin del repositorio MAGSTV al commit público de Jellyrin;
-   este árbol aún no se ha confirmado ni enviado.
+   los commits locales `757033a` y `bde4922` del core y los cinco commits locales
+   del plugin aún no se han enviado a `origin`.
 
 Redis no está en esta lista: el resultado medido fue **no-go** para este nodo y
 permanece apagado. Sólo vuelve a evaluación si aparece coordinación multinodo o
@@ -1312,16 +1326,19 @@ generaron evidencia con checksums. Tras actualizar `anyhow` y `event-listener` a
 parcheadas, bloquea solo por RUSTSEC-2023-0071 sobre `rsa 0.9.10`, presente en
 el lock por SQLx/MySQL opcional pero ausente de los árboles productivo y
 `--all-features`; no se añadió ninguna excepción automática. Trivy bloqueó
-además 72 CVE únicas HIGH/CRITICAL de la imagen Debian, 11 de ellas críticas;
-la evidencia conserva 191 ocurrencias al contar cada paquete binario afectado.
+además 65 CVE únicas HIGH/CRITICAL de la imagen Debian, 11 de ellas críticas;
+la evidencia `vulnerability-arm64-bde4922` conserva 179 ocurrencias al contar
+cada paquete binario afectado. Eliminar `curl` redujo el resultado anterior en
+7 CVE únicas y 12 ocurrencias, pero no vuelve promovible la imagen.
 Algunas requieren ajuste con el estado autoritativo de Debian —por ejemplo
 zlib/MiniZip no aplicable en Bookworm—, pero otras, incluido FFmpeg
 CVE-2026-58049, siguen sin versión corregida. Este servidor usa Podman rootless
 mediante CLI/socket compatible con Docker y ya ejecutó build, Syft, RustSec y
 Trivy para AArch64. AMD64, remediación y repetición con exit code cero continúan
 siendo gates obligatorios de CI/release, junto con la matriz de reproducción.
-La imagen se etiqueta como staging no promovible porque el árbol aún no tiene
-un commit que represente exactamente sus fuentes.
+La imagen se etiqueta como staging no promovible: sí corresponde exactamente a
+`bde492224aada73b78582d83e3d514b0dd642a40`, pero los gates RustSec/Trivy y la
+matriz AMD64 siguen abiertos.
 
 ## 10. Fase 6 — Aceleración hardware futura
 
@@ -1450,7 +1467,7 @@ objetivo ni deben activarse con el no-go vigente.
   arrancar o actualizar Jellyrin.
 
 Usar una red interna para datos y publicar únicamente Jellyrin detrás de HTTPS.
-`/healthz` comprueba que el proceso responde; `/readyz` verifica PostgreSQL y el
+`/health` comprueba que el proceso responde; `/readyz` verifica PostgreSQL y el
 historial/checksum de esquema. FFmpeg/ffprobe se validan una vez antes de abrir
 el listener y un fallo aborta startup, no se refleja como una sonda dinámica de
 readiness. Redis está apagado y no participa en health/readiness.
@@ -2238,7 +2255,9 @@ warnings` está verde. Packaging 46/46, supply-chain 38/38, systemd runtime
 16/16, además de sintaxis Node y diff-check, también están verdes. La matriz
 MAGSTV 0.1.1 aplicada localmente pasa 91/0/4 ignoradas contra SDK/RPC local,
 clippy, fmt y diff-check; el ZIP AArch64 validado y su repositorio staging no
-equivalen a instalación: Jellyrin todavía no lo ha instalado/refrescado. El
+equivalen a instalación. El core `bde4922` ya está desplegado y refresca el
+catálogo al guardar el repositorio, pero todavía falta ese guardado autenticado
+y la instalación de 0.1.1. El
 E2E con cuentas/clientes reales sigue fuera de este cierre, aunque la plataforma
 base de staging ya está desplegada y saludable. Los smokes de
 systemd/performance/security pasaron; `pg_stat_statements` está precargado e
@@ -2385,7 +2404,8 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
   local con 91 pruebas aprobadas, 0 fallidas y 4 ignoradas, además de
   clippy/fmt/diff verdes. Integra `origin/main` `2700d7f` por `43551fe`, la
   adaptación `ExternalProcess` local `8ce47b4` y 0.1.1 `9596f1c`, pero el pin
-  público sigue viejo y Jellyrin aún no ha instalado/refrescado el ZIP 0.1.1.
+  público sigue viejo. El core `bde4922` desplegado ya refresca el repositorio
+  al guardarlo, pero aún falta guardar e instalar el ZIP 0.1.1.
   El vault AEAD, readiness,
   backfill, rotación y escritura/configuración atómica están implementados y
   cubiertos en DB local. Xtream está configurado en staging y ha indexado 757
@@ -2433,8 +2453,10 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
   RTL y vista doble, sin respuestas fallidas ni errores de página.
 - [~] AArch64 staging ya se construyó realmente con Podman rootless; Syft generó
   SBOM SPDX/CycloneDX de imagen/fuente y todos los `SHA256SUMS` verifican.
-  RustSec bloquea RUSTSEC-2023-0071 lock-only y Trivy bloquea 72 CVE únicas
-  HIGH/CRITICAL de imagen (11 críticas). Falta revisar/remediar contra Debian,
+  La imagen exacta de `bde4922` no contiene `curl`, conserva healthcheck y label
+  VCS completo. RustSec bloquea RUSTSEC-2023-0071 lock-only y Trivy bloquea 65
+  CVE únicas HIGH/CRITICAL de imagen (11 críticas). Falta construir un FFmpeg
+  mínimo de remux, revisar/remediar los findings restantes contra Debian,
   repetir con exit code cero, construir y escanear AMD64 y evitar cualquier
   excepción sin owner/ticket/expiración reales antes de promover.
 - [ ] Firmar el digest promovido, adjuntar provenance y comprobar pull y
