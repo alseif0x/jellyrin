@@ -138,6 +138,14 @@ histórica y no debe confundirse con este estado vigente.
   watchdog, coalescing de progreso y cleanup. En encode, el presupuesto de
   hilos limita encoder y grafos de filtros simples/complejos; remux, copy y
   audio-only no reciben flags de filtros de vídeo.
+- El candidato de runtime ya compila FFmpeg 8.1.2 desde el tarball oficial
+  fijado por SHA-256 con `--disable-everything`: no contiene encoders y su único
+  decoder es AAC, necesario para recuperar el sample rate desde MPEG-TS antes
+  de muxar HLS con stream copy. El corpus MP4/MKV/MPEG-TS pasa probe y remux HLS
+  real. El clasificador incorpora ahora intención tipada no serializable del
+  builder y validación CLI fail-closed: aliases globales, stream specifiers,
+  filtros, codec implícito o comandos no construidos por el core se cargan como
+  encode y quedan bloqueados en `remux-only`.
 - Cada FFmpeg/ffprobe se ejecuta en su propio process group Unix. El stop normal
   envía `SIGTERM` al grupo, concede una gracia acotada, escala a `SIGKILL` y
   siempre espera/recolecta el hijo; drop, timeout y wrappers con descendientes
@@ -172,7 +180,9 @@ histórica y no debe confundirse con este estado vigente.
   `ExternalProcess` local `8ce47b4` y fija 0.1.1 en `9596f1c`; el pin público
   todavía apunta a la revisión anterior. Los prerrequisitos, la instalación y
   refresh del artefacto, egress, secretos operativos y el E2E real siguen siendo
-  gates.
+  gates. La clave de referencia no asociada a la cuenta ya se generó en el env
+  root-only de staging; faltan todavía el perfil WireGuard de salida MX y los
+  metadatos/secretos legítimos que no pueden inventarse desde el core.
 - Xtream integrado persiste nuevas publicaciones Live TV con
   `ProviderReference` y VOD/episodios con `RemoteSourceRef`, sin URL. Resuelve la
   fuente JIT y entrega a FFmpeg/ffprobe un relay loopback opaco. Un
@@ -210,18 +220,23 @@ histórica y no debe confundirse con este estado vigente.
   un registro gobernado de excepciones actualmente vacío. La imagen AArch64 se
   construyó realmente con Podman rootless; Syft generó y verificó los cuatro SBOM
   de imagen/fuente y Trivy/RustSec conservaron evidencia real. El gate queda rojo:
-  no basta con que la automatización esté correctamente configurada.
+  no basta con que la automatización esté correctamente configurada. El delta
+  actual añade FFmpeg al SBOM de imagen como componente CPE, un intento Trivy
+  separado para el binario estático, allowlist exacto de decoder, y un smoke
+  CI de probe/remux. Trivy 0.70 no demuestra inventario de ese componente
+  genérico, por lo que el gate detecta el reporte vacío y falla cerrado hasta
+  integrar un matcher FFmpeg validado; falta ejecutar el resto contra la imagen final.
 
 ### Evidencia vigente y alcance
 
-El cierre local del workspace está completo sobre el árbol actual: 641 pruebas
+El cierre local del workspace está completo sobre el árbol actual: 646 pruebas
 aprobadas, 0 fallidas y 5 ignoradas. Los contratos dirigidos de catálogo,
 Search/Hints, sync y telemetría también se ejecutaron contra PostgreSQL 16.14 real.
-Por paquete, la API pasa 344 pruebas, 0 fallidas y 3 ignoradas;
+Por paquete, la API pasa 346 pruebas, 0 fallidas y 3 ignoradas;
 `jellyrin-db`, 142/0/2 más su doctest; `jellyrin-plugin-sdk`, 12/12;
-`jellyrin-plugin-rpc`, 15/15; `jellyrin-transcode`, 39/39;
+`jellyrin-plugin-rpc`, 15/15; `jellyrin-transcode`, 40/40;
 `jellyrin-server`, 7/7; y
-`jellyrin-core`, 17/17. `cargo clippy --workspace --all-targets --locked --
+`jellyrin-core`, 18/18. `cargo clippy --workspace --all-targets --locked --
 -D warnings` también termina limpio. Siguen verdes packaging 46/46,
 política supply-chain 38/38, runtime systemd 13/13, unidades systemd 14/14,
 performance/recovery 37/37, seguridad 16/16, `git diff --check` y sintaxis Node;
@@ -296,13 +311,13 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Área | Código local | Evidencia ejecutada | Fuera de este cierre |
 | --- | --- | --- | --- |
 | Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 142/0/2 más doctest sobre PG real donde corresponde; aislamiento API/worker real; migrador 27/27; esquema y proyección hasta migración 109 probados en PG16.14; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements registrados; checks locked y clippy DB/API estrictos verdes tras el delta | E2E, carga de handlers, cutover y contratos restantes antes de otro backend |
-| FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first con un solo fallback encode en `enabled` para VOD/seek/Live, perfiles, cupo agregado y por carril, process groups, SIGTERM/SIGKILL, admisión/reserva HLS, cuota, deadline seek, limpieza confinada al root, observación efectiva y telemetría CPU/RSS/fps/speed acotada | Workspace 641/0/5, API 344/0/3, transcode 39/39 y core 17/17; clippy estricto y smokes systemd/performance/security verdes | Clientes/fuentes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen en staging |
-| MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado | Pin público aún viejo; falta volver a guardar el repositorio e instalar 0.1.1; egress, secretos operativos, E2E real y publicación pendientes |
+| FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; candidato FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC | Corpus real MP4/MKV/MPEG-TS probe+HLS copy verde; aliases, specifiers, filtros, codec implícito y comandos no confiables cubiertos; validadores de capacidades exactas añadidos | Imagen final del commit, E2E Xtream/clientes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen en staging |
+| MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado; clave de referencia root-only generada | Pin público aún viejo; falta guardar el repositorio e instalar 0.1.1; perfil WireGuard MX, metadatos/secretos legítimos restantes, E2E real y publicación pendientes |
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD y escritura/backfill/rotación transaccionales | Xtream 20/20 post-XOR/ImageUrl, migrador 27/27 y clippy estricto; migración 106 y round-trip byte-exact reales en PG; configuración real e indexación de 757 canales | Reimport legacy y escaneo DB/logs/argv donde aplique; reproducción E2E y matriz de clientes reales |
-| Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET` y obtiene count+página en un snapshot; Counts agregado/proyectado sin transportar catálogo; existencia/lookup por UUID puntuales; Search/Hints acotado a 100 con scope metadata exacto; tipos efectivos compartidos y prefiltrado sargable con metadata inline para similares, soundtrack, instant mix y remote search; resolución, episodios, temporadas, similares, Ancestors y updates/refresh de Series limitados al dominio TV; refresh TV agrupado O(TV) en vez de O(series×catálogo); fallbacks semánticos conservados, batching amplio y DLNA/sidecars acotados por carpeta | Workspace 641/0/5; Counts conformance SQLite/PG real y API 513 items; Resume SQLite con 513 filas/offset 500 y PostgreSQL real 1/1, además del handler API; contrato de tipos efectivos y point contract SQLite/PG real; Ancestors/owners con 512 películas; Search/Hints y candidatos Series validados en ambos drivers; regresión TV cross-folder y extras; benchmark aislado PG16.14 10k/100k/500k: Movie page p95 current→candidate 1.193→0.963 ms, 9.777→6.544 ms y 11.098→6.587 ms | Predicados metadata cross-domain complejos, resume complejo/sin límite, distribución/handlers E2E representativos, baseline productiva y carga concurrente de handlers |
+| Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET` y obtiene count+página en un snapshot; Counts agregado/proyectado sin transportar catálogo; existencia/lookup por UUID puntuales; Search/Hints acotado a 100 con scope metadata exacto; tipos efectivos compartidos y prefiltrado sargable con metadata inline para similares, soundtrack, instant mix y remote search; resolución, episodios, temporadas, similares, Ancestors y updates/refresh de Series limitados al dominio TV; refresh TV agrupado O(TV) en vez de O(series×catálogo); fallbacks semánticos conservados, batching amplio y DLNA/sidecars acotados por carpeta | Workspace 646/0/5; Counts conformance SQLite/PG real y API 513 items; Resume SQLite con 513 filas/offset 500 y PostgreSQL real 1/1, además del handler API; contrato de tipos efectivos y point contract SQLite/PG real; Ancestors/owners con 512 películas; Search/Hints y candidatos Series validados en ambos drivers; regresión TV cross-folder y extras; benchmark aislado PG16.14 10k/100k/500k: Movie page p95 current→candidate 1.193→0.963 ms, 9.777→6.544 ms y 11.098→6.587 ms | Predicados metadata cross-domain complejos, resume complejo/sin límite, distribución/handlers E2E representativos, baseline productiva y carga concurrente de handlers |
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 con backfill transaccional único; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; check locked y clippy DB/API `-D warnings` verdes | Filtros complejos por Person/Genre/Studio/Tag/rating/premiere, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
-| Supply chain | Pins, generación SBOM, scanners y excepciones gobernadas configurados; runner RustSec standalone; runtime sin `curl`; Jellyfin Web 10.11.11 con backport oficial y verificado de Swiper 12.1.2, build sin opcionales Node-only | QA supply-chain 38/38, packaging 46/46 y build Web real: 2.317 ficheros/60 MiB/0 symlinks; E2E Web aislado 1/1; imagen Docker AArch64 exacta `bde4922`, healthcheck y revisión OCI completa; bundle Syft verificado en `plans/generated/supply-chain-arm64-bde4922`; RustSec/Trivy real retenido en `plans/generated/vulnerability-arm64-bde4922` | Gate rojo: `rsa` lock-only y 65 CVE de imagen únicas HIGH/CRITICAL (11 críticas); construir un FFmpeg mínimo de remux, revisar VEX Debian, repetir por arquitectura, firma y provenance |
+| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime sin `curl`; FFmpeg fuente reproducible con CPE integrado en SBOM, inventario fail-closed y corpus CI; Jellyfin Web endurecido | QA supply-chain 39/39; FFmpeg builder AArch64 y corpus real verdes; Trivy genérico no demuestra inventario y ya no puede dar verde falso; evidencia histórica `bde4922` conservada | Añadir matcher FFmpeg validado, construir/analizar imagen final, resolver `rsa` lock-only/findings reales, repetir AMD64 y solo entonces firma/provenance |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential` y cgroup software-only endurecido | Núcleo `bde4922` desplegado, SHA-256 `123c2d6f...24424b0`; migración y arranque verdes; `/health`/`/readyz` local+HTTPS; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements; smokes systemd/performance/security, `nginx -t`, Certbot dry-run y restore drill verdes; backup post-Xtream `20260809T103116Z`; Xtream configurado con 757 canales; repositorio MAGSTV 0.1.1 preparado | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; pin público compatible pendiente |
 
 ### Trabajo restante y gates de salida
@@ -397,9 +412,13 @@ rollout probado:
    minimizar el runtime. La siguiente intervención con impacto material es un
    build reproducible y mínimo de FFmpeg orientado a direct/remux, porque el
    paquete Debian completo introduce gran parte de la superficie multimedia y
-   gráfica que Jellyrin no necesita. Después se debe repetir AArch64,
+   gráfica que Jellyrin no necesita. Ese build 8.1.2 ya está implementado y su
+   corpus aislado pasa; además se corrigió el verde falso del binario estático:
+   se añade CPE y el gate falla si Trivy no demuestra que lo inventarió. Trivy
+   0.70 todavía no lo demuestra, por lo que falta integrar un matcher válido y construir la imagen final del
+   commit y repetir el gate AArch64 para cuantificar el delta real. Después se debe
    construir/analizar AMD64 y solo con
-   gates verdes firmar el digest y adjuntar provenance. El QA 38/38 solo
+   gates verdes firmar el digest y adjuntar provenance. El QA 39/39 solo
    acredita política y pins, no sustituye estos resultados reales. El Jellyfin
    Web endurecido se construyó localmente y su gate Playwright aislado pasó
    1/1 sobre PostgreSQL 16 real: wizard y login, foto servida por descarga,
@@ -1306,14 +1325,20 @@ Al iniciar Jellyrin, el comportamiento implementado es:
 1. Ejecutar un probe corto de `ffmpeg -version` y capacidades necesarias.
 2. Abortar el arranque antes del bind si el runtime obligatorio no está
    disponible; `/readyz` no vuelve a sondear FFmpeg dinámicamente.
-3. Registrar versión y encoders sin imprimir configuración sensible.
-4. Verificar H.264/AAC, muxer HLS y protocolos esperados.
+3. Registrar versión y modo sin imprimir configuración sensible.
+4. Verificar en runtime el manifest finito enumerable de protocolos, demuxers,
+   muxers, bitstream filters y el decoder AAC. FFmpeg 8 ya no enumera parsers
+   por CLI, por lo que el gate reproducible los extrae y valida desde
+   `-buildconf`; el artefacto de release rechaza cualquier encoder u otro decoder.
 5. Mantener el resultado en memoria; no ejecutar detección por petición.
 
-**Supply chain implementada y ejecutada en AArch64, promoción bloqueada:** la imagen fija sus
-bases por digest, usa un snapshot Debian fechado, instala una versión exacta de
-FFmpeg y verifica `ffmpeg`/`ffprobe`. El release genera SBOM SPDX/CycloneDX y un
-bundle con checksums. cargo-audit se obtiene por versión y SHA, consulta una
+**Supply chain ejecutada históricamente en AArch64; nuevo candidato pendiente de scan final:** la
+imagen fija sus bases por digest, usa un snapshot Debian fechado, compila el tarball oficial
+FFmpeg 8.1.2 fijado por SHA-256 y verifica `ffmpeg`/`ffprobe`. El release genera SBOM SPDX/CycloneDX y un
+bundle con checksums. FFmpeg queda integrado como componente CPE en el SBOM de imagen y se envía
+también desde su CycloneDX explícito a Trivy; el gate falla cerrado si el reporte no demuestra que
+el componente fue inventariado. CI ejecuta probe y stream-copy HLS sobre MP4, Matroska y
+MPEG-TS dentro de la imagen final. cargo-audit se obtiene por versión y SHA, consulta una
 revisión exacta de RustSec sin fetch durante el audit y bloquea vulnerabilidades
 y avisos `unsound`. Trivy se fija por versión y SHA para amd64/arm64 y bloquea
 hallazgos `HIGH`/`CRITICAL`, incluidos los que aún no tienen fix; su base se

@@ -465,8 +465,21 @@ impl HlsTranscodeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FfmpegCommandSpec {
-    pub program: String,
-    pub args: Vec<String>,
+    program: String,
+    args: Vec<String>,
+    #[serde(skip)]
+    workload: Option<FfmpegWorkload>,
+}
+
+/// Workload intent assigned by a trusted FFmpeg command builder.
+///
+/// An absent intent is deliberately untrusted: callers that assemble arbitrary arguments cannot
+/// opt themselves into the cheap remux lane merely by choosing a convenient FFmpeg spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FfmpegWorkload {
+    Remux,
+    AudioEncode,
+    VideoEncode,
 }
 
 impl FfmpegCommandSpec {
@@ -474,7 +487,25 @@ impl FfmpegCommandSpec {
         Self {
             program: program.into(),
             args,
+            workload: None,
         }
+    }
+
+    fn with_workload(mut self, workload: FfmpegWorkload) -> Self {
+        self.workload = Some(workload);
+        self
+    }
+
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn workload(&self) -> Option<FfmpegWorkload> {
+        self.workload
     }
 }
 
@@ -778,7 +809,20 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     args.push("pipe:2".to_string());
     args.push(request.output_playlist_path.clone());
 
-    FfmpegCommandSpec::new("ffmpeg", args)
+    let workload = if request.include_video && video_mode == HlsStreamMode::Encode {
+        FfmpegWorkload::VideoEncode
+    } else if request.audio_mode == HlsStreamMode::Encode
+        || request
+            .selection
+            .subtitle_stream_index
+            .is_some_and(|index| index >= 0)
+    {
+        FfmpegWorkload::AudioEncode
+    } else {
+        FfmpegWorkload::Remux
+    };
+
+    FfmpegCommandSpec::new("ffmpeg", args).with_workload(workload)
 }
 
 pub fn build_hls_ffmpeg_command_from_stdin(request: &HlsTranscodeRequest) -> FfmpegCommandSpec {
@@ -980,11 +1024,22 @@ pub fn format_time_for_json(value: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AacProfile, FfmpegProgress, H264Preset, H264Profile, HlsEncodingConfig, HlsStreamMode,
-        HlsTranscodeRequest, MediaItem, TranscodeStreamSelection, build_hls_ffmpeg_command,
-        build_hls_ffmpeg_command_from_stdin, effective_media_item_type, is_tv_extra_media_item,
-        parse_ffmpeg_progress, tv_episode_path_info,
+        AacProfile, FfmpegCommandSpec, FfmpegProgress, FfmpegWorkload, H264Preset, H264Profile,
+        HlsEncodingConfig, HlsStreamMode, HlsTranscodeRequest, MediaItem, TranscodeStreamSelection,
+        build_hls_ffmpeg_command, build_hls_ffmpeg_command_from_stdin, effective_media_item_type,
+        is_tv_extra_media_item, parse_ffmpeg_progress, tv_episode_path_info,
     };
+
+    #[test]
+    fn ffmpeg_workload_intent_never_crosses_a_serialization_boundary() {
+        let command =
+            FfmpegCommandSpec::new("ffmpeg", vec!["-c:v".to_string(), "copy".to_string()])
+                .with_workload(FfmpegWorkload::Remux);
+        let encoded = serde_json::to_value(&command).unwrap();
+        assert!(encoded.get("workload").is_none());
+        let decoded: FfmpegCommandSpec = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.workload, None);
+    }
 
     #[test]
     fn hls_encoding_config_parses_preset_and_thread_values_together() {

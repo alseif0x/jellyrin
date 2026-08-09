@@ -5359,8 +5359,103 @@ pub async fn validate_ffmpeg_runtime() -> anyhow::Result<()> {
         anyhow::bail!("ffmpeg must provide the HLS muxer");
     }
 
+    validate_ffmpeg_component_listing(
+        "-protocols",
+        "protocol",
+        &[
+            "file", "pipe", "http", "https", "tcp", "tls", "udp", "crypto",
+        ],
+    )
+    .await?;
+    validate_ffmpeg_component_listing(
+        "-demuxers",
+        "demuxer",
+        &[
+            "mpegts", "mov", "matroska", "avi", "asf", "mp3", "flac", "aac", "ac3", "eac3", "ogg",
+            "wav", "flv", "hls",
+        ],
+    )
+    .await?;
+    validate_ffmpeg_component_listing(
+        "-muxers",
+        "muxer",
+        &["adts", "hls", "latm", "mov", "mp4", "mpegts", "webvtt"],
+    )
+    .await?;
+    validate_ffmpeg_component_listing("-decoders", "decoder", &["aac"]).await?;
+    validate_ffmpeg_component_listing(
+        "-bsfs",
+        "bitstream filter",
+        &[
+            "h264_mp4toannexb",
+            "hevc_mp4toannexb",
+            "extract_extradata",
+            "aac_adtstoasc",
+            "vp9_superframe",
+            "vvc_mp4toannexb",
+        ],
+    )
+    .await?;
+
     tracing::info!(?mode, "validated configured FFmpeg runtime capabilities");
     Ok(())
+}
+
+async fn validate_ffmpeg_component_listing(
+    listing_flag: &str,
+    component_kind: &str,
+    required: &[&str],
+) -> anyhow::Result<()> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-hide_banner", listing_flag])
+        .stdin(Stdio::null());
+    let output = run_startup_command_output(
+        command,
+        StdDuration::from_secs(10),
+        "ffmpeg capability listing timed out",
+    )
+    .await?;
+    if !output.status.success() {
+        anyhow::bail!("ffmpeg {component_kind} capability listing failed");
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let available = ffmpeg_listing_components(listing_flag, &listing);
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|component| !available.contains(*component))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "ffmpeg is missing required {component_kind} capabilities: {}",
+            missing.join(",")
+        );
+    }
+    Ok(())
+}
+
+fn ffmpeg_listing_components<'a>(listing_flag: &str, listing: &'a str) -> HashSet<&'a str> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            match listing_flag {
+                "-demuxers" | "-muxers" | "-decoders" | "-encoders" => columns.get(1).copied(),
+                "-protocols" | "-parsers" | "-bsfs" if columns.len() == 1 => {
+                    columns.first().copied()
+                }
+                _ => None,
+            }
+        })
+        .flat_map(|token| token.split(','))
+        .filter(|token| {
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .collect()
 }
 
 /// Materializes the immutable FFmpeg process and encoder configuration before
@@ -54819,15 +54914,15 @@ mod tests {
         default_live_tv_configuration, default_subtitle_stream_index, default_user_configuration,
         direct_play_profile_matches, encoding_configuration_json,
         enrich_media_streams_with_context, ensure_package_install_not_cancelled,
-        external_id_infos_for_item_type, ffmpeg_job_allowed_for_mode, filter_package_list,
-        format_time_for_json, generate_missing_hls_segment, get_valid_filename,
-        hdhomerun_bool_field, hls_effective_start_position_ticks, hls_on_demand_generation_lock,
-        hls_segment_ticks, hls_transcode_dedupe_key, hls_transcode_session_input_path,
-        internal_remote_relay_target, is_live_tv_channel_id, json_string_field, json_value_i64,
-        last_system_lifecycle_command, live_hls_session_registry, live_tv_channel_is_remote,
-        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
-        live_tv_m3u_channels_from_payload, live_tv_recording_name,
-        live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
+        external_id_infos_for_item_type, ffmpeg_job_allowed_for_mode, ffmpeg_listing_components,
+        filter_package_list, format_time_for_json, generate_missing_hls_segment,
+        get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
+        hls_on_demand_generation_lock, hls_segment_ticks, hls_transcode_dedupe_key,
+        hls_transcode_session_input_path, internal_remote_relay_target, is_live_tv_channel_id,
+        json_string_field, json_value_i64, last_system_lifecycle_command,
+        live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
+        live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_m3u_channels_from_payload,
+        live_tv_recording_name, live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
         metadata_editor_parental_rating_options, normalize_media_stream,
         package_infos_from_repositories, package_install_task_key, paged_media_items,
@@ -73465,44 +73560,54 @@ done
         request.hls_omit_endlist = true;
         request.hls_temp_file = true;
         let command = build_hls_ffmpeg_command(&request);
-        assert_eq!(command.program, "ffmpeg");
+        assert_eq!(command.program(), "ffmpeg");
         // -i must point to the HTTP URL directly (no file path wrapping).
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| pair == ["-i", "http://192.168.1.100:5004/auto/v4.1"]),
             "command must include -i <hdhr_url>: {:?}",
-            command.args
+            command.args()
         );
         // -hls_playlist_type event is required for a live (non-ending) playlist.
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| pair == ["-hls_playlist_type", "event"]),
             "command must include -hls_playlist_type event: {:?}",
-            command.args
+            command.args()
         );
         // Rolling mode removes old segments only after retaining a client-delay threshold.
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| pair == ["-hls_list_size", "20"]),
             "command must bound live playlist size: {:?}",
-            command.args
+            command.args()
         );
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| { pair == ["-hls_flags", "delete_segments+omit_endlist+temp_file",] })
         );
-        assert!(command.args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
-        assert!(command.args.windows(2).any(|pair| pair == ["-c:a", "copy"]));
-        assert!(!command.args.iter().any(|arg| arg == "libx264"));
-        assert!(!command.args.iter().any(|arg| arg == "aac"));
+        assert!(
+            command
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["-c:v", "copy"])
+        );
+        assert!(
+            command
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["-c:a", "copy"])
+        );
+        assert!(!command.args().iter().any(|arg| arg == "libx264"));
+        assert!(!command.args().iter().any(|arg| arg == "aac"));
         assert_eq!(
             classify_transcode_command(&command),
             TranscodeJobKind::Remux
@@ -73512,25 +73617,25 @@ done
         );
         // No -ss seek flag for a live stream (start_position_ticks is 0 by default).
         assert!(
-            !command.args.iter().any(|arg| arg == "-ss"),
+            !command.args().iter().any(|arg| arg == "-ss"),
             "command must not include -ss for live: {:?}",
-            command.args
+            command.args()
         );
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| pair == ["-map", "0:v:0?"]),
             "live command must map the first video stream by type: {:?}",
-            command.args
+            command.args()
         );
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| pair == ["-map", "0:a:0?"]),
             "live command must map the first audio stream by type: {:?}",
-            command.args
+            command.args()
         );
     }
 
@@ -73559,8 +73664,8 @@ done
             classify_transcode_command(&fallback),
             TranscodeJobKind::VideoEncode
         );
-        assert!(fallback.args.iter().any(|arg| arg == "libx264"));
-        assert!(fallback.args.iter().any(|arg| arg == "aac"));
+        assert!(fallback.args().iter().any(|arg| arg == "libx264"));
+        assert!(fallback.args().iter().any(|arg| arg == "aac"));
     }
 
     #[test]
@@ -73617,8 +73722,13 @@ done
             classify_transcode_command(&fallback),
             TranscodeJobKind::AudioEncode
         );
-        assert!(fallback.args.iter().any(|arg| arg == "-vn"));
-        assert!(fallback.args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+        assert!(fallback.args().iter().any(|arg| arg == "-vn"));
+        assert!(
+            fallback
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["-c:a", "aac"])
+        );
     }
 
     #[test]
@@ -93114,11 +93224,11 @@ done
             ["-profile:a", "aac_low"],
             ["-ac", "2"],
         ] {
-            assert!(command.args.windows(2).any(|actual| actual == pair));
+            assert!(command.args().windows(2).any(|actual| actual == pair));
         }
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| { pair[0] == "-vf" && pair[1].contains("fps=30") })
         );
@@ -93383,17 +93493,17 @@ done
         let command = build_hls_ffmpeg_command(&request);
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| pair == ["-b:v", "2000000"])
         );
         assert!(
             command
-                .args
+                .args()
                 .windows(2)
                 .any(|pair| pair == ["-b:a", "128000"])
         );
-        assert!(command.args.windows(2).any(|pair| {
+        assert!(command.args().windows(2).any(|pair| {
             pair[0] == "-vf" && pair[1].contains("min(1280,iw)") && pair[1].contains("min(720,ih)")
         }));
     }
@@ -93485,6 +93595,25 @@ done
             .delivery,
             DeliveryMode::Unsupported
         );
+    }
+
+    #[test]
+    fn ffmpeg_capability_listing_reads_names_without_accepting_descriptions() {
+        let listed = ffmpeg_listing_components(
+            "-demuxers",
+            " D   mov,mp4,m4a QuickTime / MOV\n D   mpegts MPEG-TS\n D. = Demuxing supported\n",
+        );
+        for expected in ["mov", "mp4", "m4a", "mpegts"] {
+            assert!(listed.contains(expected), "missing {expected}");
+        }
+        assert!(!listed.contains("QuickTime"));
+        assert!(!listed.contains("MPEG-TS"));
+
+        let protocols = ffmpeg_listing_components(
+            "-protocols",
+            "Supported file protocols:\nInput:\n  https\n  file\nOutput:\n  file\n",
+        );
+        assert_eq!(protocols, HashSet::from(["https", "file"]));
     }
 
     #[test]

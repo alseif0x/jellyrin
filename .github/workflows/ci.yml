@@ -117,13 +117,15 @@ jobs:
             --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
             --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
             --build-arg "DEBIAN_SNAPSHOT=${DEBIAN_SNAPSHOT}" \
-            --build-arg "FFMPEG_PACKAGE_VERSION=${FFMPEG_PACKAGE_VERSION}" \
+            --build-arg "FFMPEG_SOURCE_SHA256=${FFMPEG_SOURCE_SHA256}" \
             --build-arg "FFMPEG_UPSTREAM_VERSION=${FFMPEG_UPSTREAM_VERSION}" \
             --build-arg "VCS_REF=${GITHUB_SHA}" \
             --tag jellyrin:ci \
             .
       - name: Generate and verify image/source SBOM bundle
         run: ops/generate-sbom.sh jellyrin:ci supply-chain-artifacts
+      - name: Verify minimal FFmpeg probe and remux corpus
+        run: qa/ffmpeg-remux-smoke.sh jellyrin:ci
       - name: Scan Rust dependencies and release image
         run: ops/scan-vulnerabilities.sh jellyrin:ci vulnerability-artifacts
       - name: Upload verified supply-chain bundle

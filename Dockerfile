@@ -1,25 +1,20 @@
 ARG RUST_IMAGE=rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382
 ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
-FROM ${RUST_IMAGE} AS builder
+FROM ${RUNTIME_IMAGE} AS ffmpeg-builder
 
-ARG CARGO_BUILD_JOBS=2
-WORKDIR /src
-COPY . .
-RUN CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --locked --release -p jellyrin-server -p jellyrin-migrate
-
-FROM ${RUNTIME_IMAGE}
-
-ARG RUNTIME_IMAGE
 ARG DEBIAN_SNAPSHOT=20260808T000000Z
-ARG FFMPEG_PACKAGE_VERSION=7:5.1.9-0+deb12u1
-ARG FFMPEG_UPSTREAM_VERSION=5.1.9
-ARG VCS_REF=unknown
+ARG FFMPEG_UPSTREAM_VERSION=8.1.2
+ARG FFMPEG_SOURCE_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+ARG FFMPEG_BUILD_JOBS=2
 
-# A dated, signed Debian snapshot fixes FFmpeg and its complete dependency closure. The top-level
-# package is pinned separately so a bad lock update fails instead of silently selecting a new build.
-# The fixed 10001 runtime identity lets a root-owned host keyring grant group-read access without
-# making the secret world-readable.
+# Build the current upstream release without the very large optional desktop, hardware and codec
+# dependency closure pulled in by Debian's general-purpose ffmpeg package. Jellyrin's production
+# default is remux-only, so the image contains only the network, container and parser surface used
+# by the finite Jellyrin media contract. It contains no encoder, device or filter plugin. The AAC
+# decoder is the sole decoder: MPEG-TS does not carry the sample rate in its container metadata, so
+# FFmpeg must inspect an AAC frame before a stream-copy HLS mux can write a valid header.
+# External TLS and zlib are the only optional libraries enabled deliberately.
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
     && printf '%s\n' \
       'Types: deb' \
@@ -37,10 +32,94 @@ RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
       'Check-Valid-Until: no' \
       > /etc/apt/sources.list.d/jellyrin-snapshot.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install -y --no-install-recommends ca-certificates "ffmpeg=${FFMPEG_PACKAGE_VERSION}" \
-    && test "$(dpkg-query -W ffmpeg | awk '{print $2}')" = "${FFMPEG_PACKAGE_VERSION}" \
-    && ffmpeg -version | head -n 1 | grep -F "ffmpeg version ${FFMPEG_UPSTREAM_VERSION}" \
-    && ffprobe -version | head -n 1 | grep -F "ffprobe version ${FFMPEG_UPSTREAM_VERSION}" \
+    && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl libssl-dev pkg-config xz-utils zlib1g-dev
+
+RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --fail \
+      --silent --show-error --location \
+      "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz" \
+      --output /tmp/ffmpeg.tar.xz \
+    && printf '%s  %s\n' "${FFMPEG_SOURCE_SHA256}" /tmp/ffmpeg.tar.xz \
+      | sha256sum --check --strict \
+    && mkdir /tmp/ffmpeg-source \
+    && tar --extract --xz --file /tmp/ffmpeg.tar.xz --directory /tmp/ffmpeg-source \
+      --strip-components=1
+
+RUN cd /tmp/ffmpeg-source \
+    && export SOURCE_DATE_EPOCH=1781668800 \
+    && ./configure \
+      --prefix=/opt/jellyrin-ffmpeg \
+      --disable-autodetect \
+      --disable-everything \
+      --disable-debug \
+      --disable-doc \
+      --disable-avdevice \
+      --disable-indevs \
+      --disable-outdevs \
+      --disable-sdl2 \
+      --disable-xlib \
+      --enable-ffmpeg \
+      --enable-ffprobe \
+      --enable-avcodec \
+      --enable-avformat \
+      --enable-avutil \
+      --enable-network \
+      --enable-openssl \
+      --enable-zlib \
+      --enable-protocol=file,pipe,http,https,tcp,tls,udp,crypto \
+      --enable-demuxer=mpegts,mov,matroska,avi,asf,mp3,flac,aac,ogg,wav,flv,mpeg,hls \
+      --enable-muxer=hls,mpegts,mov,mp4 \
+      --enable-decoder=aac \
+      --enable-parser=h264,hevc,mpeg4video,mpegvideo,aac,aac_latm,ac3,dca,mpegaudio,opus,vorbis,av1 \
+      --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata,aac_adtstoasc \
+      --cpu=generic \
+      --enable-pic \
+      --extra-cflags='-O2 -pipe -fstack-protector-strong -D_FORTIFY_SOURCE=2' \
+      --extra-ldflags='-Wl,-z,relro,-z,now' \
+    && make -j"${FFMPEG_BUILD_JOBS}" \
+    && make install \
+    && strip /opt/jellyrin-ffmpeg/bin/ffmpeg /opt/jellyrin-ffmpeg/bin/ffprobe \
+    && /opt/jellyrin-ffmpeg/bin/ffmpeg -version | head -n 1 \
+      | grep -F "ffmpeg version ${FFMPEG_UPSTREAM_VERSION}" \
+    && /opt/jellyrin-ffmpeg/bin/ffprobe -version | head -n 1 \
+      | grep -F "ffprobe version ${FFMPEG_UPSTREAM_VERSION}"
+
+FROM ${RUST_IMAGE} AS builder
+
+ARG CARGO_BUILD_JOBS=2
+WORKDIR /src
+COPY . .
+RUN CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --locked --release -p jellyrin-server -p jellyrin-migrate
+
+FROM ${RUNTIME_IMAGE}
+
+ARG RUNTIME_IMAGE
+ARG DEBIAN_SNAPSHOT=20260808T000000Z
+ARG FFMPEG_UPSTREAM_VERSION=8.1.2
+ARG FFMPEG_SOURCE_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+ARG VCS_REF=unknown
+
+# A dated, signed Debian snapshot fixes the small TLS/runtime dependency closure. FFmpeg itself is
+# built from the checksum-pinned upstream source stage above. The fixed 10001 runtime identity lets
+# a root-owned host keyring grant group-read access without making the secret world-readable.
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
+    && printf '%s\n' \
+      'Types: deb' \
+      "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" \
+      'Suites: bookworm bookworm-updates' \
+      'Components: main' \
+      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+      'Check-Valid-Until: no' \
+      '' \
+      'Types: deb' \
+      "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" \
+      'Suites: bookworm-security' \
+      'Components: main' \
+      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+      'Check-Valid-Until: no' \
+      > /etc/apt/sources.list.d/jellyrin-snapshot.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 zlib1g \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 jellyrin \
     && useradd --uid 10001 --gid jellyrin --home-dir /var/lib/jellyrin --no-create-home --shell /usr/sbin/nologin jellyrin \
@@ -48,12 +127,22 @@ RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
 
 COPY --from=builder /src/target/release/jellyrin-server /usr/local/bin/jellyrin-server
 COPY --from=builder /src/target/release/jellyrin-migrate /usr/local/bin/jellyrin-migrate
+COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
+
+RUN ffmpeg -version | head -n 1 | grep -F "ffmpeg version ${FFMPEG_UPSTREAM_VERSION}" \
+    && ffprobe -version | head -n 1 | grep -F "ffprobe version ${FFMPEG_UPSTREAM_VERSION}" \
+    && ! (ldd /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+      | awk '/=>/ { print $1 }' \
+      | grep -Ev '^(libc|libm|libpthread|libdl|libssl|libcrypto|libz)\.so' \
+      | grep -q .)
 
 LABEL org.opencontainers.image.source="https://github.com/alseif0x/jellyrin" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.base.name="${RUNTIME_IMAGE}" \
       io.jellyrin.debian-snapshot="${DEBIAN_SNAPSHOT}" \
-      io.jellyrin.ffmpeg-package="${FFMPEG_PACKAGE_VERSION}"
+      io.jellyrin.ffmpeg-version="${FFMPEG_UPSTREAM_VERSION}" \
+      io.jellyrin.ffmpeg-source-sha256="${FFMPEG_SOURCE_SHA256}"
 
 USER jellyrin
 EXPOSE 8096

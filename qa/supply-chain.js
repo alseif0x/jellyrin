@@ -26,6 +26,7 @@ async function main() {
     jellyfinWebBuilder,
     deploymentPreflight,
     nginx,
+    ffmpegSmoke,
   ] = await Promise.all([
     read('ops/supply-chain.lock.env'),
     read('Dockerfile'),
@@ -46,8 +47,10 @@ async function main() {
     read('ops/build-jellyfin-web.sh'),
     read('ops/deployment-preflight.sh'),
     read('ops/nginx-jellyrin.test.kode.live.conf.example'),
+    read('qa/ffmpeg-remux-smoke.sh'),
   ]);
   const lock = parseLock(lockText);
+  const runtimeDockerfile = dockerfile.slice(dockerfile.lastIndexOf('FROM ${RUNTIME_IMAGE}'));
   const vulnerabilityExceptions = JSON.parse(vulnerabilityExceptionsText);
   const exceptionErrors = validateVulnerabilityExceptions(vulnerabilityExceptions);
   const exceptionValidatorSelfTest = validateExceptionValidator();
@@ -57,8 +60,8 @@ async function main() {
     'POSTGRES_IMAGE',
     'REDIS_IMAGE',
     'DEBIAN_SNAPSHOT',
-    'FFMPEG_PACKAGE_VERSION',
     'FFMPEG_UPSTREAM_VERSION',
+    'FFMPEG_SOURCE_SHA256',
     'SYFT_VERSION',
     'SYFT_LINUX_AMD64_SHA256',
     'SYFT_LINUX_ARM64_SHA256',
@@ -98,9 +101,9 @@ async function main() {
     ),
     check('lock-debian-snapshot', /^\d{8}T\d{6}Z$/.test(lock.DEBIAN_SNAPSHOT || '')),
     check(
-      'lock-ffmpeg-versions',
-      /^\d+:[0-9][A-Za-z0-9.+~:-]+$/.test(lock.FFMPEG_PACKAGE_VERSION || '') &&
-        /^\d+\.\d+(?:\.\d+)+$/.test(lock.FFMPEG_UPSTREAM_VERSION || ''),
+      'lock-ffmpeg-source',
+      /^\d+\.\d+(?:\.\d+)+$/.test(lock.FFMPEG_UPSTREAM_VERSION || '') &&
+        /^[a-f0-9]{64}$/.test(lock.FFMPEG_SOURCE_SHA256 || ''),
     ),
     check(
       'lock-syft-checksums',
@@ -206,15 +209,19 @@ async function main() {
     ),
     check(
       'docker-ffmpeg-pin-and-verification',
-      dockerfile.includes(`ARG FFMPEG_PACKAGE_VERSION=${lock.FFMPEG_PACKAGE_VERSION}`) &&
+      dockerfile.includes(`ARG FFMPEG_SOURCE_SHA256=${lock.FFMPEG_SOURCE_SHA256}`) &&
         dockerfile.includes(`ARG FFMPEG_UPSTREAM_VERSION=${lock.FFMPEG_UPSTREAM_VERSION}`) &&
-        dockerfile.includes('"ffmpeg=${FFMPEG_PACKAGE_VERSION}"') &&
-        dockerfile.includes("dpkg-query -W ffmpeg | awk '{print $2}'") &&
+        dockerfile.includes('https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz') &&
+        dockerfile.includes("sha256sum --check --strict") &&
+        dockerfile.includes('--disable-everything') &&
+        dockerfile.includes('--enable-muxer=hls,mpegts,mov,mp4') &&
+        dockerfile.includes('COPY --from=ffmpeg-builder') &&
+        !runtimeDockerfile.includes('apt-get install -y --no-install-recommends ffmpeg') &&
         dockerfile.includes('ffprobe -version'),
     ),
     check(
       'docker-runtime-excludes-general-http-client',
-      !/apt-get install[^\n]*\bcurl\b/.test(dockerfile) &&
+      !/apt-get install[^\n]*\bcurl\b/.test(runtimeDockerfile) &&
         dockerfile.includes('CMD ["/usr/local/bin/jellyrin-server", "--healthcheck"]') &&
         !dockerfile.includes('CMD curl'),
     ),
@@ -223,9 +230,8 @@ async function main() {
       compose.includes(`RUST_IMAGE: \${RUST_IMAGE:-${lock.RUST_IMAGE}}`) &&
         compose.includes(`RUNTIME_IMAGE: \${RUNTIME_IMAGE:-${lock.RUNTIME_IMAGE}}`) &&
         compose.includes(`DEBIAN_SNAPSHOT: \${DEBIAN_SNAPSHOT:-${lock.DEBIAN_SNAPSHOT}}`) &&
-        compose.includes(
-          `FFMPEG_PACKAGE_VERSION: \${FFMPEG_PACKAGE_VERSION:-${lock.FFMPEG_PACKAGE_VERSION}}`,
-        ),
+        compose.includes(`FFMPEG_UPSTREAM_VERSION: \${FFMPEG_UPSTREAM_VERSION:-${lock.FFMPEG_UPSTREAM_VERSION}}`) &&
+        compose.includes(`FFMPEG_SOURCE_SHA256: \${FFMPEG_SOURCE_SHA256:-${lock.FFMPEG_SOURCE_SHA256}}`),
     ),
     check(
       'compose-infrastructure-lock-defaults',
@@ -236,7 +242,8 @@ async function main() {
       'compose-example-matches-lock',
       imageKeys.every((key) => composeEnv.includes(`${key}=${lock[key]}`)) &&
         composeEnv.includes(`DEBIAN_SNAPSHOT=${lock.DEBIAN_SNAPSHOT}`) &&
-        composeEnv.includes(`FFMPEG_PACKAGE_VERSION=${lock.FFMPEG_PACKAGE_VERSION}`),
+        composeEnv.includes(`FFMPEG_UPSTREAM_VERSION=${lock.FFMPEG_UPSTREAM_VERSION}`) &&
+        composeEnv.includes(`FFMPEG_SOURCE_SHA256=${lock.FFMPEG_SOURCE_SHA256}`),
     ),
     check(
       'ci-actions-are-commit-pinned',
@@ -307,7 +314,21 @@ async function main() {
         !vulnerabilityScanner.includes('--ignore-unfixed') &&
         vulnerabilityScanner.includes('trivy-version.txt') &&
         vulnerabilityScanner.includes('trivy-image.json') &&
+        vulnerabilityScanner.includes('trivy-ffmpeg.json') &&
+        vulnerabilityScanner.includes('ffmpeg-source.cyclonedx.json') &&
+        vulnerabilityScanner.includes('cpe:2.3:a:ffmpeg:ffmpeg:') &&
+        vulnerabilityScanner.includes('"${trivy_bin}" sbom') &&
+        vulnerabilityScanner.includes('Trivy did not prove that the FFmpeg component was inventoried; failing closed') &&
         vulnerabilityScanner.includes('scan-status.json'),
+    ),
+    check(
+      'ci-runs-minimal-ffmpeg-corpus',
+      workflow.includes('qa/ffmpeg-remux-smoke.sh jellyrin:ci') &&
+        ffmpegSmoke.includes('source.mp4 source.mkv source.ts') &&
+        ffmpegSmoke.includes('-show_format -show_streams -of json') &&
+        ffmpegSmoke.includes('-c copy -f hls') &&
+        ffmpegSmoke.includes('[[ -z "${encoder_names}" ]]') &&
+        ffmpegSmoke.includes('[[ "${decoder_names}" == "aac" ]]'),
     ),
     check(
       'ci-runs-and-retains-vulnerability-gate',
@@ -330,15 +351,24 @@ async function main() {
     check(
       'sbom-covers-image-and-rust-source',
       generator.includes('jellyrin-image.spdx.json') &&
-        generator.includes('jellyrin-image.cyclonedx.json') &&
+      generator.includes('jellyrin-image.cyclonedx.json') &&
         generator.includes('jellyrin-source.spdx.json') &&
-        generator.includes('jellyrin-source.cyclonedx.json'),
+        generator.includes('jellyrin-source.cyclonedx.json') &&
+        generator.includes('cpe:2.3:a:ffmpeg:ffmpeg:') &&
+        generator.includes('SPDXRef-Package-FFmpeg'),
     ),
     check(
       'sbom-output-is-verified',
-      generator.includes('FFmpeg package drift') &&
+        generator.includes('FFmpeg source digest drift') &&
+        generator.includes('general-purpose Debian ffmpeg package is present') &&
+        generator.includes('remux-only image decoder allowlist drift') &&
+        generator.includes('ffmpeg-source.spdx.json') &&
+        generator.includes('ffmpeg-source.cyclonedx.json') &&
+        generator.includes("grep -o -- '--enable-parser=[^[:space:]]*'") &&
+        generator.includes('ffmpeg-parsers.txt') &&
+        generator.includes('remux-only image parser allowlist drift') &&
         generator.includes('release image has no immutable VCS revision label') &&
-        generator.includes("select(.name == \"ffmpeg\")") &&
+        generator.includes('.name == "ffmpeg" and .versionInfo == $version') &&
         generator.includes('> SHA256SUMS') &&
         generator.includes('sha256sum --check --strict SHA256SUMS') &&
         generator.includes('sha256sum --check --strict binaries.sha256'),

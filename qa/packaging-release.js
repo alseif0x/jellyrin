@@ -11,6 +11,7 @@ const generatedDir = path.join(plansDir, 'generated');
 
 async function main() {
   const dockerfile = await read('Dockerfile');
+  const runtimeDockerfile = dockerfile.slice(dockerfile.lastIndexOf('FROM ${RUNTIME_IMAGE}'));
   const dockerignore = await read('.dockerignore');
   const supplyChainLock = await read('ops/supply-chain.lock.env');
   const sbomGenerator = await read('ops/generate-sbom.sh');
@@ -47,7 +48,7 @@ async function main() {
     check('docker-safe-ffmpeg-default', dockerfile.includes('JELLYRIN_FFMPEG_MODE=remux-only')),
     check('docker-bounded-build-jobs', dockerfile.includes('ARG CARGO_BUILD_JOBS=2') && dockerfile.includes('CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build')),
     check('docker-locked-base-images', dockerfile.includes('RUST_IMAGE=rust:1.93.0-bookworm@sha256:') && dockerfile.includes('RUNTIME_IMAGE=debian:bookworm-slim@sha256:')),
-    check('docker-locked-ffmpeg-snapshot', dockerfile.includes('ARG DEBIAN_SNAPSHOT=') && dockerfile.includes('ARG FFMPEG_PACKAGE_VERSION=') && dockerfile.includes('snapshot.debian.org') && dockerfile.includes("dpkg-query -W ffmpeg | awk '{print $2}'")),
+    check('docker-locked-ffmpeg-source', dockerfile.includes('ARG DEBIAN_SNAPSHOT=') && dockerfile.includes('ARG FFMPEG_SOURCE_SHA256=') && dockerfile.includes('https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz') && dockerfile.includes('sha256sum --check --strict') && dockerfile.includes('--disable-everything') && dockerfile.includes('COPY --from=ffmpeg-builder')),
     check(
       'docker-build-context-excludes-secrets',
       dockerignore.includes('**/.env') && dockerignore.includes('ops/*.env') && dockerignore.includes('*.pem') && dockerignore.includes('*.key'),
@@ -56,7 +57,7 @@ async function main() {
       'docker-healthcheck-without-runtime-http-client',
       dockerfile.includes('CMD ["/usr/local/bin/jellyrin-server", "--healthcheck"]') &&
         dockerfile.includes('HEALTHCHECK') &&
-        !/apt-get install[^\n]*\bcurl\b/.test(dockerfile) &&
+        !/apt-get install[^\n]*\bcurl\b/.test(runtimeDockerfile) &&
         server.includes('run_container_healthcheck()') &&
         server.includes('GET /healthz HTTP/1.1') &&
         server.includes('TcpStream::connect_timeout'),

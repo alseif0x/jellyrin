@@ -514,7 +514,9 @@ pub async fn try_import_media_from_payload(
     if !movie_streams.iter().all(|stream| {
         let stream_id = json_string_field(stream, "stream_id")
             .or_else(|| live_tv_u64_field(stream, "stream_id").map(|id| id.to_string()));
-        let extension = xtream_extension(stream, "container_extension", "mp4");
+        let Some(extension) = xtream_extension(stream, "container_extension", "mp4") else {
+            return false;
+        };
         direct_source_matches_reconstructed(
             stream,
             stream_id.as_deref().and_then(|stream_id| {
@@ -624,7 +626,10 @@ pub async fn try_import_media_from_payload(
             .all(|(_, episode)| {
                 let episode_id = json_string_field(episode, "id")
                     .or_else(|| live_tv_u64_field(episode, "id").map(|id| id.to_string()));
-                let extension = xtream_extension(episode, "container_extension", "mp4");
+                let Some(extension) = xtream_extension(episode, "container_extension", "mp4")
+                else {
+                    return false;
+                };
                 let reconstructed = episode_id.as_deref().and_then(|episode_id| {
                     series_url(
                         &client.base_url,
@@ -1463,7 +1468,7 @@ fn parse_vod_streams(
                 return None;
             }
             let name = json_string_field(stream, "name").unwrap_or_else(|| stream_id.clone());
-            let extension = xtream_extension(stream, "container_extension", "mp4");
+            let extension = xtream_extension(stream, "container_extension", "mp4")?;
             let remote_source_ref =
                 XtreamRemoteSourceRef::new(tuner_id, "vod", &stream_id, &extension)?;
             let category_id = json_string_field(stream, "category_id").or_else(|| {
@@ -1598,7 +1603,9 @@ fn parse_series_episodes(
         let title = json_string_field(episode, "title")
             .or_else(|| json_string_field(episode, "name"))
             .unwrap_or_else(|| format!("Episode {episode_number}"));
-        let extension = xtream_extension(episode, "container_extension", "mp4");
+        let Some(extension) = xtream_extension(episode, "container_extension", "mp4") else {
+            continue;
+        };
         let Some(remote_source_ref) =
             XtreamRemoteSourceRef::new(tuner_id, "series-episode", &episode_id, &extension)
         else {
@@ -1797,22 +1804,47 @@ fn default_remote_video_streams() -> Vec<serde_json::Value> {
     ]
 }
 
-fn xtream_extension(value: &serde_json::Value, key: &str, default_value: &str) -> String {
-    json_string_field(value, key)
-        .and_then(|value| sanitized_xtream_extension(&value))
-        .unwrap_or_else(|| default_value.to_string())
+fn xtream_extension(value: &serde_json::Value, key: &str, default_value: &str) -> Option<String> {
+    match json_string_field(value, key) {
+        Some(value) => sanitized_xtream_extension(&value),
+        None => sanitized_xtream_extension(default_value),
+    }
 }
 
 fn sanitized_xtream_extension(value: &str) -> Option<String> {
-    let extension = value
-        .trim()
-        .trim_start_matches('.')
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .take(32)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    (!extension.is_empty()).then_some(extension)
+    let extension = value.trim().strip_prefix('.').unwrap_or(value.trim());
+    if extension.is_empty()
+        || extension.len() > 32
+        || !extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let extension = extension.to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "ts" | "m2ts"
+            | "mts"
+            | "mp4"
+            | "m4v"
+            | "mov"
+            | "mkv"
+            | "webm"
+            | "avi"
+            | "asf"
+            | "wmv"
+            | "flv"
+            | "mpg"
+            | "mpeg"
+            | "mp3"
+            | "flac"
+            | "aac"
+            | "ogg"
+            | "oga"
+            | "wav"
+    )
+    .then_some(extension)
 }
 
 fn xtream_scoped_catalog_key(tuner_id: &str, legacy_key: &str) -> String {
@@ -2346,6 +2378,17 @@ mod tests {
             items[0].metadata["PrimaryImageUrl"],
             "https://images.test/movie.png"
         );
+    }
+
+    #[test]
+    fn xtream_extensions_are_limited_to_the_ffmpeg_media_contract() {
+        assert_eq!(sanitized_xtream_extension(".MKV"), Some("mkv".to_string()));
+        assert_eq!(sanitized_xtream_extension("m3u8"), None);
+        assert_eq!(sanitized_xtream_extension("exe"), None);
+        assert_eq!(sanitized_xtream_extension("custom-container"), None);
+        assert_eq!(sanitized_xtream_extension("m@p4"), None);
+        assert_eq!(sanitized_xtream_extension("m.p4"), None);
+        assert_eq!(sanitized_xtream_extension("m-p4"), None);
     }
 
     #[test]

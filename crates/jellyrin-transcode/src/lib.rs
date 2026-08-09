@@ -8,7 +8,8 @@ use std::{
 };
 
 use jellyrin_core::{
-    DEFAULT_HLS_SEGMENT_PATTERN, FfmpegCommandSpec, FfmpegProgress, parse_ffmpeg_progress_line,
+    DEFAULT_HLS_SEGMENT_PATTERN, FfmpegCommandSpec, FfmpegProgress, FfmpegWorkload,
+    parse_ffmpeg_progress_line,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -976,18 +977,173 @@ impl TranscodeJobPermit {
 }
 
 pub fn classify_transcode_command(command: &FfmpegCommandSpec) -> TranscodeJobKind {
-    if codec_is_encoded(&command.args, "-c:v") {
-        TranscodeJobKind::VideoEncode
-    } else if codec_is_encoded(&command.args, "-c:a") {
-        TranscodeJobKind::AudioEncode
-    } else {
-        TranscodeJobKind::Remux
+    let Some(declared) = command.workload() else {
+        // FfmpegCommandSpec is public and may be constructed by future providers. Only the core
+        // builder is trusted to declare a cheap workload; arbitrary CLI is fail-closed.
+        return TranscodeJobKind::VideoEncode;
+    };
+    let declared = match declared {
+        FfmpegWorkload::Remux => TranscodeJobKind::Remux,
+        FfmpegWorkload::AudioEncode => TranscodeJobKind::AudioEncode,
+        FfmpegWorkload::VideoEncode => TranscodeJobKind::VideoEncode,
+    };
+    max_job_kind(declared, classify_ffmpeg_args(command.args()))
+}
+
+fn classify_ffmpeg_args(args: &[String]) -> TranscodeJobKind {
+    let mut saw_codec_directive = false;
+    let mut observed = TranscodeJobKind::Remux;
+    let mut global_copy = false;
+    let mut video_copy = false;
+    let mut audio_copy = false;
+    let mut subtitle_copy = false;
+    let mut mapped_video = false;
+    let mut mapped_audio = false;
+    let mut mapped_subtitle = false;
+    let mut mapped_unknown = false;
+
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(kind) = filter_job_kind(arg) {
+            observed = max_job_kind(observed, kind);
+        }
+        let Some(target) = codec_target(arg) else {
+            if arg.eq_ignore_ascii_case("-map") {
+                match args
+                    .get(index + 1)
+                    .and_then(|value| mapped_stream_target(value))
+                {
+                    Some(CodecTarget::Video) => mapped_video = true,
+                    Some(CodecTarget::Audio) => mapped_audio = true,
+                    Some(CodecTarget::Subtitle) => mapped_subtitle = true,
+                    Some(CodecTarget::Unknown) | None => mapped_unknown = true,
+                }
+            }
+            continue;
+        };
+        saw_codec_directive = true;
+        let Some(codec) = args.get(index + 1) else {
+            return TranscodeJobKind::VideoEncode;
+        };
+        if codec_is_copy_or_disabled(codec) {
+            match target {
+                CodecTarget::Video => video_copy = true,
+                CodecTarget::Audio => audio_copy = true,
+                CodecTarget::Subtitle => subtitle_copy = true,
+                CodecTarget::Unknown if !arg.contains(':') => global_copy = true,
+                CodecTarget::Unknown => {}
+            }
+        } else {
+            let kind = match target {
+                CodecTarget::Audio | CodecTarget::Subtitle => TranscodeJobKind::AudioEncode,
+                CodecTarget::Video | CodecTarget::Unknown => TranscodeJobKind::VideoEncode,
+            };
+            observed = max_job_kind(observed, kind);
+        }
+    }
+
+    if !saw_codec_directive {
+        // FFmpeg selects encoders implicitly when no codec is specified.
+        return TranscodeJobKind::VideoEncode;
+    }
+    if observed != TranscodeJobKind::Remux || global_copy {
+        return observed;
+    }
+    if mapped_unknown || mapped_video && !video_copy {
+        return TranscodeJobKind::VideoEncode;
+    }
+    if mapped_audio && !audio_copy || mapped_subtitle && !subtitle_copy {
+        return TranscodeJobKind::AudioEncode;
+    }
+    if !mapped_video && !mapped_audio && !mapped_subtitle {
+        return TranscodeJobKind::VideoEncode;
+    }
+    TranscodeJobKind::Remux
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodecTarget {
+    Video,
+    Audio,
+    Subtitle,
+    Unknown,
+}
+
+fn codec_target(option: &str) -> Option<CodecTarget> {
+    let lower = option.trim().to_ascii_lowercase();
+    let mut parts = lower.split(':');
+    let base = parts.next()?;
+    let stream_type = parts.next();
+    match base {
+        "-vcodec" => Some(CodecTarget::Video),
+        "-acodec" => Some(CodecTarget::Audio),
+        "-scodec" => Some(CodecTarget::Subtitle),
+        "-c" | "-codec" => Some(match stream_type {
+            Some("v") => CodecTarget::Video,
+            Some("a") => CodecTarget::Audio,
+            Some("s") => CodecTarget::Subtitle,
+            _ => CodecTarget::Unknown,
+        }),
+        _ => None,
     }
 }
 
-fn codec_is_encoded(args: &[String], flag: &str) -> bool {
-    args.windows(2)
-        .any(|pair| pair[0] == flag && !matches!(pair[1].as_str(), "copy" | "none"))
+fn mapped_stream_target(value: &str) -> Option<CodecTarget> {
+    let value = value.trim().trim_end_matches('?');
+    if value.starts_with('[') || !value.starts_with("0:") {
+        return Some(CodecTarget::Unknown);
+    }
+    match value.split(':').nth(1) {
+        Some("v") => Some(CodecTarget::Video),
+        Some("a") => Some(CodecTarget::Audio),
+        Some("s") => Some(CodecTarget::Subtitle),
+        Some(_) => Some(CodecTarget::Unknown),
+        None => None,
+    }
+}
+
+fn filter_job_kind(option: &str) -> Option<TranscodeJobKind> {
+    let lower = option.trim().to_ascii_lowercase();
+    if matches!(lower.as_str(), "-af" | "-filter:a")
+        || lower.starts_with("-filter:a:")
+        || lower.starts_with("-filter_script:a")
+    {
+        Some(TranscodeJobKind::AudioEncode)
+    } else if matches!(lower.as_str(), "-vf" | "-filter:v")
+        || lower.starts_with("-filter:v:")
+        || matches!(
+            lower.as_str(),
+            "-filter"
+                | "-filter_complex"
+                | "-filter_script"
+                | "-filter_complex_script"
+                | "-lavfi"
+                | "-target"
+        )
+        || lower.starts_with("-filter:")
+        || lower.starts_with("-filter_script:")
+        || lower.starts_with("-filter_complex:")
+        || lower.starts_with("-filter_complex_script:")
+    {
+        Some(TranscodeJobKind::VideoEncode)
+    } else {
+        None
+    }
+}
+
+fn max_job_kind(left: TranscodeJobKind, right: TranscodeJobKind) -> TranscodeJobKind {
+    match (left, right) {
+        (TranscodeJobKind::VideoEncode, _) | (_, TranscodeJobKind::VideoEncode) => {
+            TranscodeJobKind::VideoEncode
+        }
+        (TranscodeJobKind::AudioEncode, _) | (_, TranscodeJobKind::AudioEncode) => {
+            TranscodeJobKind::AudioEncode
+        }
+        _ => TranscodeJobKind::Remux,
+    }
+}
+
+fn codec_is_copy_or_disabled(codec: &str) -> bool {
+    matches!(codec.trim().to_ascii_lowercase().as_str(), "copy" | "none")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1402,9 +1558,9 @@ fn spawn_transcode_process_with_stdin_mode(
     command: &FfmpegCommandSpec,
     pipe_stdin: bool,
 ) -> io::Result<(TranscodeProcess, Option<ChildStdin>)> {
-    let mut child_command = Command::new(&command.program);
+    let mut child_command = Command::new(command.program());
     child_command
-        .args(&command.args)
+        .args(command.args())
         .stdin(if pipe_stdin {
             Stdio::piped()
         } else {
@@ -1884,11 +2040,11 @@ mod tests {
         DEFAULT_FFMPEG_NICE, FFMPEG_STDERR_MAX_LINE_BYTES, HLS_MASTER_PLAYLIST_NAME,
         HLS_MEDIA_PLAYLIST_NAME, HlsSegment, HlsTranscodeLayout, HlsVariantInfo,
         TranscodeCoordinator, TranscodeDiskQuota, TranscodeDiskQuotaConfig,
-        TranscodeDiskQuotaError, TranscodeJobKind, TranscodeLimits, classify_transcode_command,
-        consume_ffmpeg_stderr_chunk, ffmpeg_nice_from_value, read_ffmpeg_progress,
-        render_hls_master_playlist, render_hls_media_playlist, run_bounded_command_output,
-        spawn_transcode_process, spawn_transcode_process_with_stdin, transcode_disk_usage_bytes,
-        wait_for_hls_readiness,
+        TranscodeDiskQuotaError, TranscodeJobKind, TranscodeLimits, classify_ffmpeg_args,
+        classify_transcode_command, consume_ffmpeg_stderr_chunk, ffmpeg_nice_from_value,
+        read_ffmpeg_progress, render_hls_master_playlist, render_hls_media_playlist,
+        run_bounded_command_output, spawn_transcode_process, spawn_transcode_process_with_stdin,
+        transcode_disk_usage_bytes, wait_for_hls_readiness,
     };
 
     #[cfg(target_os = "linux")]
@@ -2785,28 +2941,95 @@ mod tests {
 
     #[test]
     fn command_classification_separates_video_audio_and_remux() {
-        let video = FfmpegCommandSpec::new(
-            "ffmpeg",
-            vec!["-c:v".into(), "libx264".into(), "-c:a".into(), "aac".into()],
-        );
-        let audio = FfmpegCommandSpec::new(
-            "ffmpeg",
-            vec!["-c:v".into(), "copy".into(), "-c:a".into(), "aac".into()],
-        );
-        let remux = FfmpegCommandSpec::new(
-            "ffmpeg",
-            vec!["-c:v".into(), "copy".into(), "-c:a".into(), "copy".into()],
-        );
-
         assert_eq!(
-            classify_transcode_command(&video),
+            classify_ffmpeg_args(&strings(&[
+                "-map", "0:v", "-map", "0:a", "-c:v", "libx264", "-c:a", "aac",
+            ])),
             TranscodeJobKind::VideoEncode
         );
         assert_eq!(
-            classify_transcode_command(&audio),
+            classify_ffmpeg_args(&strings(&[
+                "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac",
+            ])),
             TranscodeJobKind::AudioEncode
         );
-        assert_eq!(classify_transcode_command(&remux), TranscodeJobKind::Remux);
+        assert_eq!(
+            classify_ffmpeg_args(&strings(&[
+                "-map",
+                "0:a",
+                "-filter:a:0",
+                "volume=0.5",
+                "-c:a",
+                "copy",
+            ])),
+            TranscodeJobKind::AudioEncode
+        );
+        assert_eq!(
+            classify_ffmpeg_args(&strings(&[
+                "-map", "0:v", "-map", "0:a", "-map", "0:s", "-codec:v", "COPY", "-acodec", "copy",
+                "-c:s", "webvtt",
+            ])),
+            TranscodeJobKind::AudioEncode
+        );
+        assert_eq!(
+            classify_ffmpeg_args(&strings(&[
+                "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "copy",
+            ])),
+            TranscodeJobKind::Remux
+        );
+    }
+
+    #[test]
+    fn command_classification_fails_closed_for_aliases_filters_and_untrusted_specs() {
+        let adversarial = [
+            vec!["-c", "libx264"],
+            vec!["-codec", "libx264"],
+            vec!["-c:v:0", "libx264"],
+            vec!["-codec:v:0", "libx264"],
+            vec!["-c:0", "libx264"],
+            vec!["-vcodec:0", "libx264"],
+            vec!["-vf", "scale=640:360", "-c:v", "copy"],
+            vec!["-filter_complex", "[0:v]scale=640:360[v]", "-c:v", "copy"],
+            vec!["-filter_script:v", "/tmp/filter", "-c:v", "copy"],
+            vec!["-filter_complex_script", "/tmp/filter", "-c:v", "copy"],
+            vec!["-target", "pal-dvd", "-c:v", "copy"],
+        ];
+        for args in adversarial {
+            assert_eq!(
+                classify_ffmpeg_args(&args.into_iter().map(str::to_string).collect::<Vec<_>>()),
+                TranscodeJobKind::VideoEncode
+            );
+        }
+
+        assert_eq!(
+            classify_ffmpeg_args(&strings(&["output.mp4"])),
+            TranscodeJobKind::VideoEncode
+        );
+        assert_eq!(
+            classify_ffmpeg_args(&strings(&[
+                "-map",
+                "0:v",
+                "-map",
+                "0:a",
+                "-c:a",
+                "copy",
+                "output.mp4",
+            ])),
+            TranscodeJobKind::VideoEncode
+        );
+
+        let untrusted = FfmpegCommandSpec::new(
+            "ffmpeg",
+            vec!["-c:v".into(), "copy".into(), "-c:a".into(), "copy".into()],
+        );
+        assert_eq!(
+            classify_transcode_command(&untrusted),
+            TranscodeJobKind::VideoEncode
+        );
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
     }
 
     #[tokio::test]

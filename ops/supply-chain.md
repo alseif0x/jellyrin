@@ -2,8 +2,10 @@
 
 `ops/supply-chain.lock.env` is the reviewed, public lock for container inputs. It fixes the Rust
 builder, Debian runtime, PostgreSQL and the dormant Redis scaffold by tag plus OCI manifest digest.
-The runtime apt sources use a dated Debian snapshot, and the top-level FFmpeg package is pinned and
-checked at build time. `cargo build --locked` makes Cargo refuse dependency-lock drift.
+The runtime apt sources use a dated Debian snapshot. FFmpeg is compiled in a separate stage from
+the official versioned source archive after verifying its locked SHA-256; the runtime receives only
+the two stripped binaries and their small TLS/zlib closure. `cargo build --locked` makes Cargo
+refuse dependency-lock drift.
 Jellyfin Web is independently pinned to version `10.11.11`, its immutable
 upstream commit and the SHA-256 of that commit archive. On top of that unchanged
 base, the official minimal PR #7617 commit patch and its SHA-256 are pinned to
@@ -11,9 +13,19 @@ move Swiper from `11.2.8` to the first corrected release, `12.1.2`. Generated
 browser assets remain outside version control.
 
 The current manifest digests were resolved from Docker Hub and the returned manifest bytes were
-independently SHA-256 checked on 2026-08-08. FFmpeg `7:5.1.9-0+deb12u1` was present in both amd64 and
-arm64 `bookworm-security` indexes at snapshot `20260808T000000Z`. These facts describe the current
-lock; they are not permission to update only one duplicate reference.
+independently SHA-256 checked on 2026-08-08. The official FFmpeg 8.1.2 archive is locked by SHA-256
+`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`; it is compiled with
+`--disable-everything` and an explicit remux/probe capability set, without encoders and with AAC
+as its sole decoder. MPEG-TS requires inspection of an AAC frame to recover the sample rate before
+the HLS stream-copy muxer can write a valid header; Jellyrin still rejects every encode command in
+`remux-only` mode.
+The input contract covers the allowlisted Xtream extensions plus MAGSTV MPEG-TS. HTTP(S), local
+file/pipe, UDP and encrypted-HLS (`crypto`) input are retained deliberately; outputs are restricted
+to HLS/MPEG-TS plus the MOV/MP4 muxer required by FFmpeg's HLS implementation at link time. Xtream rejects an
+explicit container extension outside the same finite contract instead of silently admitting a
+format absent from the runtime image.
+These facts describe the current lock; they are not permission to update only one duplicate
+reference.
 
 ## Build and verify a release candidate
 
@@ -51,7 +63,7 @@ docker build --pull \
   --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
   --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
   --build-arg "DEBIAN_SNAPSHOT=${DEBIAN_SNAPSHOT}" \
-  --build-arg "FFMPEG_PACKAGE_VERSION=${FFMPEG_PACKAGE_VERSION}" \
+  --build-arg "FFMPEG_SOURCE_SHA256=${FFMPEG_SOURCE_SHA256}" \
   --build-arg "FFMPEG_UPSTREAM_VERSION=${FFMPEG_UPSTREAM_VERSION}" \
   --build-arg "VCS_REF=$(git rev-parse HEAD)" \
   --tag jellyrin:release \
@@ -63,8 +75,11 @@ ops/scan-vulnerabilities.sh jellyrin:release vulnerability-artifacts
 ```
 
 The bundle contains SPDX JSON and CycloneDX JSON for the runtime image and Cargo dependency
-manifests, the exact dpkg inventory and FFmpeg/ffprobe versions, image inspection metadata, both
-release binaries, the public lock and checksums. The generator downloads Syft only after selecting
+manifests, the exact dpkg inventory, FFmpeg source digest, build configuration, capability listings
+and FFmpeg/ffprobe versions, image inspection metadata, both release binaries, the public lock and
+checksums. It rejects a Debian `ffmpeg` package, every encoder, or any decoder other than AAC in the
+remux-only image. The
+generator downloads Syft only after selecting
 the lock's amd64/arm64 checksum and refuses to overwrite an existing output directory.
 
 The vulnerability bundle contains the exact cargo-audit version, pinned RustSec database commit,
@@ -112,7 +127,7 @@ pinning a distinct migration image would complicate the mandatory pre-start sche
 removing any Debian package from the server runtime. Splitting it is therefore a packaging option,
 not a demonstrated CVE reduction.
 
-### Evaluated FFmpeg alternative (not adopted)
+### Evaluated packaged FFmpeg alternative (not adopted)
 
 The official `jellyfin-ffmpeg7` `7.1.4-3-bookworm` release was evaluated on 2026-08-09. Its GitHub
 release assets report SHA-256
@@ -134,7 +149,12 @@ of lower residual risk. Do not adopt it until all of the following are retained 
   amd64 and arm64;
 - the normal image scan with no unreviewed HIGH/CRITICAL findings or invented exceptions.
 
-Until those gates exist, the dated Debian FFmpeg package remains the conservative runtime choice.
+Jellyrin therefore does not adopt that package. The release candidate instead builds the locked
+FFmpeg 8.1.2 source with the finite capability set above, links only its small TLS/zlib closure,
+records FFmpeg as a CPE-addressable component in the image SBOM, submits that component to Trivy,
+and runs MP4/Matroska/MPEG-TS probe plus stream-copy HLS smoke tests inside the final image. Trivy
+0.70 does not currently prove inventory for this generic native component, so the gate detects an
+empty/unmatched report and fails closed; promotion requires a validated FFmpeg-aware matcher.
 
 CI performs the same native-platform build and verification after the Rust/PostgreSQL gates, then
 uploads `jellyrin-supply-chain-<commit>` for 90 days. Tag pushes matching `v*` also run this workflow.
@@ -143,7 +163,7 @@ platform, then retain both bundles beside the release.
 
 ## Vulnerability gate
 
-The release gate has deliberately different database semantics for the two scanners:
+The release gate has deliberately different database semantics for the scanners:
 
 - cargo-audit checks `Cargo.lock` against the exact `RUSTSEC_ADVISORY_DB_REVISION` in the public
   lock, without fetching inside the audit. Known vulnerabilities and RustSec `unsound` advisories
@@ -230,15 +250,16 @@ resolve_docker_hub_ref redis:7.2.14-bookworm
 ```
 
 Before accepting a result, fetch the manifest by digest and confirm that `sha256sum` of the raw
-response equals that digest. Check the proposed FFmpeg version for both release architectures:
+response equals that digest. Check the proposed FFmpeg release archive independently against its
+reviewed SHA-256. If detached signature verification is added later, pin and validate the exact
+signing-key fingerprint rather than treating an unverified signature file as evidence:
 
 ```bash
-for architecture in amd64 arm64; do
-  curl -fsSL \
-    "https://snapshot.debian.org/archive/debian-security/20260808T000000Z/dists/bookworm-security/main/binary-${architecture}/Packages.xz" \
-    | xzcat \
-    | awk 'BEGIN{RS="";FS="\n"} $1=="Package: ffmpeg" {for(i=1;i<=NF;i++) if($i ~ /^Version: /) print $i}'
-done
+curl --proto '=https' --tlsv1.2 --fail --location \
+  "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz" \
+  --output ffmpeg-source.tar.xz
+printf '%s  %s\n' "${FFMPEG_SOURCE_SHA256}" ffmpeg-source.tar.xz \
+  | sha256sum --check --strict
 ```
 
 For a Syft or Trivy update, obtain the release checksum file from the official project, verify the

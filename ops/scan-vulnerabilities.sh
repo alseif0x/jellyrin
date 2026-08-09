@@ -127,6 +127,22 @@ grep -Fq "Version: ${TRIVY_VERSION}" "${output_dir}/trivy-version-before-scan.tx
 
 trivy_ignore="${output_dir}/trivy-ignore.generated.yaml"
 node "${script_dir}/render-vulnerability-ignores.js" trivy-yaml > "${trivy_ignore}"
+jq -n \
+    --arg version "${FFMPEG_UPSTREAM_VERSION}" \
+    --arg sha256 "${FFMPEG_SOURCE_SHA256}" \
+    '{
+      bomFormat: "CycloneDX",
+      specVersion: "1.6",
+      version: 1,
+      components: [{
+        type: "application",
+        name: "ffmpeg",
+        version: $version,
+        purl: ("pkg:generic/ffmpeg@" + $version),
+        cpe: ("cpe:2.3:a:ffmpeg:ffmpeg:" + $version + ":*:*:*:*:*:*:*"),
+        hashes: [{alg: "SHA-256", content: $sha256}]
+      }]
+    }' > "${output_dir}/ffmpeg-source.cyclonedx.json"
 set +e
 "${trivy_bin}" image \
     --cache-dir "${trivy_cache}" \
@@ -142,11 +158,35 @@ set +e
     "${image_ref}" \
     2> "${output_dir}/trivy.stderr.txt"
 trivy_status=$?
+"${trivy_bin}" sbom \
+    --cache-dir "${trivy_cache}" \
+    --scanners vuln \
+    --severity HIGH,CRITICAL \
+    --ignorefile "${trivy_ignore}" \
+    --show-suppressed \
+    --exit-code 1 \
+    --format json \
+    --output "${output_dir}/trivy-ffmpeg.json" \
+    "${output_dir}/ffmpeg-source.cyclonedx.json" \
+    2> "${output_dir}/trivy-ffmpeg.stderr.txt"
+trivy_ffmpeg_status=$?
 set -e
 "${trivy_bin}" --cache-dir "${trivy_cache}" --version > "${output_dir}/trivy-version.txt"
 if ! jq -e . "${output_dir}/trivy-image.json" >/dev/null; then
     echo "Trivy did not produce valid JSON" >&2
     trivy_status=99
+fi
+if ! jq -e . "${output_dir}/trivy-ffmpeg.json" >/dev/null; then
+    echo "Trivy did not produce valid FFmpeg SBOM JSON" >&2
+    trivy_ffmpeg_status=99
+elif ! jq -e '
+    [.Results[]? | select(
+      ((.Target // "") | ascii_downcase | contains("ffmpeg"))
+      or ([.Vulnerabilities[]?.PkgName // ""] | map(ascii_downcase) | any(. == "ffmpeg"))
+    )] | length > 0
+  ' "${output_dir}/trivy-ffmpeg.json" >/dev/null; then
+    echo "Trivy did not prove that the FFmpeg component was inventoried; failing closed" >&2
+    trivy_ffmpeg_status=98
 fi
 
 cp "${lock_file}" "${output_dir}/supply-chain.lock.env"
@@ -157,13 +197,15 @@ jq -n \
     --arg scanned_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson rustsec_exit_code "${rustsec_status}" \
     --argjson trivy_exit_code "${trivy_status}" \
+    --argjson trivy_ffmpeg_exit_code "${trivy_ffmpeg_status}" \
     '{
       image_ref: $image_ref,
       rustsec_advisory_db_revision: $rustsec_revision,
       scanned_at: $scanned_at,
       rustsec_exit_code: $rustsec_exit_code,
       trivy_exit_code: $trivy_exit_code,
-      passed: ($rustsec_exit_code == 0 and $trivy_exit_code == 0)
+      trivy_ffmpeg_exit_code: $trivy_ffmpeg_exit_code,
+      passed: ($rustsec_exit_code == 0 and $trivy_exit_code == 0 and $trivy_ffmpeg_exit_code == 0)
     }' > "${output_dir}/scan-status.json"
 
 (
@@ -172,10 +214,13 @@ jq -n \
         cargo-audit-version.txt \
         cargo-audit.json \
         cargo-audit.stderr.txt \
+        ffmpeg-source.cyclonedx.json \
         rustsec-advisory-db-revision.txt \
         scan-status.json \
         supply-chain.lock.env \
         trivy-ignore.generated.yaml \
+        trivy-ffmpeg.json \
+        trivy-ffmpeg.stderr.txt \
         trivy-image.json \
         trivy-version-before-scan.txt \
         trivy-version.txt \
@@ -185,8 +230,8 @@ jq -n \
     sha256sum --check --strict SHA256SUMS
 )
 
-if (( rustsec_status != 0 || trivy_status != 0 )); then
-    echo "vulnerability gate failed (RustSec=${rustsec_status}, Trivy=${trivy_status}); evidence: ${output_dir}" >&2
+if (( rustsec_status != 0 || trivy_status != 0 || trivy_ffmpeg_status != 0 )); then
+    echo "vulnerability gate failed (RustSec=${rustsec_status}, Trivy-image=${trivy_status}, Trivy-FFmpeg=${trivy_ffmpeg_status}); evidence: ${output_dir}" >&2
     exit 1
 fi
 
