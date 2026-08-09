@@ -9,7 +9,8 @@
   Docker, verify its `SHA256SUMS`, and retain the standalone evidence. The full
   Docker gate below remains mandatory for release.
 - On a Docker-capable release host, require a passing `ops/scan-vulnerabilities.sh` run and retain
-  `cargo-audit.json`, `trivy-image.json`, `trivy-ffmpeg.json`, `scan-status.json` and its verified
+  `cargo-audit.json`, `trivy-image.json`, `nvd-ffmpeg.json`,
+  `ffmpeg-security-baseline.txt`, `scan-status.json` and its verified
   `SHA256SUMS`. A local policy-only QA pass is not vulnerability scan evidence.
 - Run `qa/ffmpeg-remux-smoke.sh` against the exact release image; retain a passing MP4, Matroska and
   MPEG-TS probe/stream-copy result before promotion.

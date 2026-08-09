@@ -648,7 +648,7 @@ fn trimmed_filter_value(value: &Option<String>) -> Option<String> {
 }
 
 fn push_activity_log_join_and_filters(
-    query: &mut QueryBuilder<'_, Postgres>,
+    query: &mut QueryBuilder<Postgres>,
     filter: &ActivityLogFilter,
 ) {
     if filter
@@ -720,7 +720,7 @@ fn push_activity_log_join_and_filters(
 }
 
 fn push_activity_log_text_filter(
-    query: &mut QueryBuilder<'_, Postgres>,
+    query: &mut QueryBuilder<Postgres>,
     first: &mut bool,
     column: &'static str,
     value: &Option<String>,
@@ -735,7 +735,7 @@ fn push_activity_log_text_filter(
         .push_bind(format!("%{value}%"));
 }
 
-fn push_activity_log_where(query: &mut QueryBuilder<'_, Postgres>, first: &mut bool) {
+fn push_activity_log_where(query: &mut QueryBuilder<Postgres>, first: &mut bool) {
     if *first {
         query.push(" WHERE ");
         *first = false;
@@ -745,7 +745,7 @@ fn push_activity_log_where(query: &mut QueryBuilder<'_, Postgres>, first: &mut b
 }
 
 fn push_activity_log_order_by(
-    query: &mut QueryBuilder<'_, Postgres>,
+    query: &mut QueryBuilder<Postgres>,
     sort: &[(ActivityLogSortField, SortDirection)],
 ) {
     let fallback = [(ActivityLogSortField::DateCreated, SortDirection::Descending)];

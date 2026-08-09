@@ -1,11 +1,13 @@
-ARG RUST_IMAGE=rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382
-ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+ARG RUST_IMAGE=docker.io/library/rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f
+ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
 FROM ${RUNTIME_IMAGE} AS ffmpeg-builder
 
 ARG DEBIAN_SNAPSHOT=20260808T000000Z
-ARG FFMPEG_UPSTREAM_VERSION=8.1.2
-ARG FFMPEG_SOURCE_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+ARG FFMPEG_SOURCE_REVISION=1e0279143db99d7324b17f9784b3229122269b38
+ARG FFMPEG_SOURCE_VERSION=8.2-dev-git-1e0279143db9
+ARG FFMPEG_NVD_BASELINE_VERSION=8.1.2
+ARG FFMPEG_SOURCE_SHA256=2eb566ff9b41802220974bf9457da9bdbda078b1f56d1f008525b7b7cd71ca40
 ARG FFMPEG_BUILD_JOBS=2
 
 # Build the current upstream release without the very large optional desktop, hardware and codec
@@ -33,17 +35,31 @@ RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
       > /etc/apt/sources.list.d/jellyrin-snapshot.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates curl libssl-dev pkg-config xz-utils zlib1g-dev
+      build-essential ca-certificates curl git libssl-dev pkg-config zlib1g-dev
 
+COPY ops/ffmpeg-security-baseline.txt /tmp/ffmpeg-security-baseline.txt
 RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --fail \
       --silent --show-error --location \
-      "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz" \
-      --output /tmp/ffmpeg.tar.xz \
-    && printf '%s  %s\n' "${FFMPEG_SOURCE_SHA256}" /tmp/ffmpeg.tar.xz \
+      "https://code.ffmpeg.org/FFmpeg/FFmpeg/archive/${FFMPEG_SOURCE_REVISION}.tar.gz" \
+      --output /tmp/ffmpeg.tar.gz \
+    && printf '%s  %s\n' "${FFMPEG_SOURCE_SHA256}" /tmp/ffmpeg.tar.gz \
       | sha256sum --check --strict \
     && mkdir /tmp/ffmpeg-source \
-    && tar --extract --xz --file /tmp/ffmpeg.tar.xz --directory /tmp/ffmpeg-source \
-      --strip-components=1
+    && tar --extract --gzip --file /tmp/ffmpeg.tar.gz --directory /tmp/ffmpeg-source \
+      --strip-components=1 \
+    && printf '%s\n' "${FFMPEG_SOURCE_VERSION}" > /tmp/ffmpeg-source/VERSION \
+    && git -C /tmp/ffmpeg-source init --quiet \
+    && while read -r cve fix_commit patch_sha256; do \
+      case "${cve}" in \#*|'') continue ;; esac; \
+      patch_file="/tmp/${cve}.patch"; \
+      curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --fail \
+        --silent --show-error --location \
+        "https://code.ffmpeg.org/FFmpeg/FFmpeg/commit/${fix_commit}.patch" \
+        --output "${patch_file}"; \
+      printf '%s  %s\n' "${patch_sha256}" "${patch_file}" | sha256sum --check --strict; \
+      git -C /tmp/ffmpeg-source apply --reverse --check "${patch_file}"; \
+    done < /tmp/ffmpeg-security-baseline.txt \
+    && rm -rf /tmp/ffmpeg-source/.git
 
 RUN cd /tmp/ffmpeg-source \
     && export SOURCE_DATE_EPOCH=1781668800 \
@@ -80,9 +96,9 @@ RUN cd /tmp/ffmpeg-source \
     && make install \
     && strip /opt/jellyrin-ffmpeg/bin/ffmpeg /opt/jellyrin-ffmpeg/bin/ffprobe \
     && /opt/jellyrin-ffmpeg/bin/ffmpeg -version | head -n 1 \
-      | grep -F "ffmpeg version ${FFMPEG_UPSTREAM_VERSION}" \
+      | grep -F "ffmpeg version ${FFMPEG_SOURCE_VERSION}" \
     && /opt/jellyrin-ffmpeg/bin/ffprobe -version | head -n 1 \
-      | grep -F "ffprobe version ${FFMPEG_UPSTREAM_VERSION}"
+      | grep -F "ffprobe version ${FFMPEG_SOURCE_VERSION}"
 
 FROM ${RUST_IMAGE} AS builder
 
@@ -95,8 +111,10 @@ FROM ${RUNTIME_IMAGE}
 
 ARG RUNTIME_IMAGE
 ARG DEBIAN_SNAPSHOT=20260808T000000Z
-ARG FFMPEG_UPSTREAM_VERSION=8.1.2
-ARG FFMPEG_SOURCE_SHA256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+ARG FFMPEG_SOURCE_REVISION=1e0279143db99d7324b17f9784b3229122269b38
+ARG FFMPEG_SOURCE_VERSION=8.2-dev-git-1e0279143db9
+ARG FFMPEG_NVD_BASELINE_VERSION=8.1.2
+ARG FFMPEG_SOURCE_SHA256=2eb566ff9b41802220974bf9457da9bdbda078b1f56d1f008525b7b7cd71ca40
 ARG VCS_REF=unknown
 
 # A dated, signed Debian snapshot fixes the small TLS/runtime dependency closure. FFmpeg itself is
@@ -130,8 +148,8 @@ COPY --from=builder /src/target/release/jellyrin-migrate /usr/local/bin/jellyrin
 COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
 
-RUN ffmpeg -version | head -n 1 | grep -F "ffmpeg version ${FFMPEG_UPSTREAM_VERSION}" \
-    && ffprobe -version | head -n 1 | grep -F "ffprobe version ${FFMPEG_UPSTREAM_VERSION}" \
+RUN ffmpeg -version | head -n 1 | grep -F "ffmpeg version ${FFMPEG_SOURCE_VERSION}" \
+    && ffprobe -version | head -n 1 | grep -F "ffprobe version ${FFMPEG_SOURCE_VERSION}" \
     && ! (ldd /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
       | awk '/=>/ { print $1 }' \
       | grep -Ev '^(libc|libm|libpthread|libdl|libssl|libcrypto|libz)\.so' \
@@ -141,7 +159,9 @@ LABEL org.opencontainers.image.source="https://github.com/alseif0x/jellyrin" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.base.name="${RUNTIME_IMAGE}" \
       io.jellyrin.debian-snapshot="${DEBIAN_SNAPSHOT}" \
-      io.jellyrin.ffmpeg-version="${FFMPEG_UPSTREAM_VERSION}" \
+      io.jellyrin.ffmpeg-version="${FFMPEG_SOURCE_VERSION}" \
+      io.jellyrin.ffmpeg-source-revision="${FFMPEG_SOURCE_REVISION}" \
+      io.jellyrin.ffmpeg-nvd-baseline-version="${FFMPEG_NVD_BASELINE_VERSION}" \
       io.jellyrin.ffmpeg-source-sha256="${FFMPEG_SOURCE_SHA256}"
 
 USER jellyrin

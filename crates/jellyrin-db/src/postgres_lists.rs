@@ -674,7 +674,7 @@ mod tests {
                 .await
                 .expect("failed to connect PostgreSQL list-test admin pool");
             let schema = format!("jellyrin_lists_test_{}", Uuid::new_v4().simple());
-            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
                 .execute(&admin_pool)
                 .await
                 .expect("failed to create isolated PostgreSQL list-test schema");
@@ -699,7 +699,7 @@ mod tests {
             };
             if let Err(error) = database.migrate().await {
                 database.close().await;
-                sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
                     .execute(&admin_pool)
                     .await
                     .expect("failed to clean list schema after migration failure");
@@ -715,10 +715,13 @@ mod tests {
 
         async fn cleanup(self) {
             self.database.close().await;
-            sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-                .execute(&self.admin_pool)
-                .await
-                .expect("failed to drop isolated PostgreSQL list-test schema");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA {} CASCADE",
+                self.schema
+            )))
+            .execute(&self.admin_pool)
+            .await
+            .expect("failed to drop isolated PostgreSQL list-test schema");
             self.admin_pool.close().await;
         }
     }

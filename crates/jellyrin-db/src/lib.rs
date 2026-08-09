@@ -1540,7 +1540,7 @@ const SQLITE_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
 END"#;
 
 #[cfg(any(test, feature = "sqlite"))]
-fn push_sqlite_catalog_from(builder: &mut QueryBuilder<'_, Sqlite>, query: &MediaItemCatalogQuery) {
+fn push_sqlite_catalog_from(builder: &mut QueryBuilder<Sqlite>, query: &MediaItemCatalogQuery) {
     builder.push(
         " FROM media_items AS item \
          LEFT JOIN playback_states AS playback \
@@ -1557,7 +1557,7 @@ fn push_sqlite_catalog_from(builder: &mut QueryBuilder<'_, Sqlite>, query: &Medi
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_sqlite_catalog_filters(
-    builder: &mut QueryBuilder<'_, Sqlite>,
+    builder: &mut QueryBuilder<Sqlite>,
     query: &MediaItemCatalogQuery,
 ) -> anyhow::Result<()> {
     builder.push(" WHERE item.missing_since IS NULL");
@@ -1746,7 +1746,7 @@ fn push_sqlite_catalog_filters(
 }
 
 #[cfg(any(test, feature = "sqlite"))]
-fn push_sqlite_search_hint_metadata_filter(builder: &mut QueryBuilder<'_, Sqlite>, pattern: &str) {
+fn push_sqlite_search_hint_metadata_filter(builder: &mut QueryBuilder<Sqlite>, pattern: &str) {
     builder
         .push(
             " OR EXISTS (\
@@ -1784,10 +1784,7 @@ fn push_sqlite_search_hint_metadata_filter(builder: &mut QueryBuilder<'_, Sqlite
 }
 
 #[cfg(any(test, feature = "sqlite"))]
-fn push_sqlite_catalog_order(
-    builder: &mut QueryBuilder<'_, Sqlite>,
-    query: &MediaItemCatalogQuery,
-) {
+fn push_sqlite_catalog_order(builder: &mut QueryBuilder<Sqlite>, query: &MediaItemCatalogQuery) {
     builder.push(" ORDER BY ");
     let sort = if query.sort.is_empty() {
         &[(
@@ -1819,7 +1816,7 @@ fn push_sqlite_catalog_order(
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_sqlite_in_strings(
-    builder: &mut QueryBuilder<'_, Sqlite>,
+    builder: &mut QueryBuilder<Sqlite>,
     expression: &str,
     values: BTreeSet<String>,
     negate: bool,
@@ -1837,11 +1834,7 @@ fn push_sqlite_in_strings(
 }
 
 #[cfg(any(test, feature = "sqlite"))]
-fn push_sqlite_ci_in_filter(
-    builder: &mut QueryBuilder<'_, Sqlite>,
-    column: &str,
-    values: &[String],
-) {
+fn push_sqlite_ci_in_filter(builder: &mut QueryBuilder<Sqlite>, column: &str, values: &[String]) {
     push_sqlite_in_strings(
         builder,
         &format!("lower({column})"),
@@ -1854,7 +1847,7 @@ fn push_sqlite_ci_in_filter(
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_sqlite_stream_language_filter(
-    builder: &mut QueryBuilder<'_, Sqlite>,
+    builder: &mut QueryBuilder<Sqlite>,
     stream_type: &str,
     languages: &[String],
 ) {
@@ -1882,7 +1875,7 @@ fn push_sqlite_stream_language_filter(
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_sqlite_optional_i64_bound(
-    builder: &mut QueryBuilder<'_, Sqlite>,
+    builder: &mut QueryBuilder<Sqlite>,
     column: &str,
     value: Option<i64>,
     operator: &str,
@@ -1900,7 +1893,7 @@ fn push_sqlite_optional_i64_bound(
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_sqlite_optional_time_bound(
-    builder: &mut QueryBuilder<'_, Sqlite>,
+    builder: &mut QueryBuilder<Sqlite>,
     column: &str,
     value: Option<OffsetDateTime>,
     operator: &str,
@@ -3422,7 +3415,11 @@ impl SqliteDatabase {
             "plugin_repositories",
         ] {
             let sql = format!("DELETE FROM {table}");
-            sqlx::query(&sql).execute(&mut *tx).await?;
+            // `table` comes exclusively from the static allowlist above; no snapshot value is
+            // interpolated into this administrative statement.
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .execute(&mut *tx)
+                .await?;
         }
 
         for item in plugin_snapshot_items(snapshot, "Repositories")? {
@@ -4538,7 +4535,12 @@ impl SqliteDatabase {
             "plugin_runtime_instances",
         ] {
             let sql = format!("DELETE FROM {table} WHERE plugin_id = ?1 COLLATE NOCASE");
-            sqlx::query(&sql).bind(normalized).execute(&mut *tx).await?;
+            // `table` comes exclusively from the static allowlist above; the plugin id remains a
+            // bind parameter and is never interpolated into SQL.
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(normalized)
+                .execute(&mut *tx)
+                .await?;
         }
         sqlx::query(
             r#"
@@ -10394,7 +10396,7 @@ async fn configure_sqlite_connection(connection: &mut SqliteConnection) -> Resul
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_join_and_filters(
-    query: &mut QueryBuilder<'_, Sqlite>,
+    query: &mut QueryBuilder<Sqlite>,
     filter: &ActivityLogFilter,
 ) -> anyhow::Result<()> {
     if filter
@@ -10474,7 +10476,7 @@ fn push_activity_log_join_and_filters(
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_filter_clause(
-    query: &mut QueryBuilder<'_, Sqlite>,
+    query: &mut QueryBuilder<Sqlite>,
     first_filter: &mut bool,
     column: &'static str,
     value: &Option<String>,
@@ -10490,7 +10492,7 @@ fn push_activity_log_filter_clause(
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_exact_clause(
-    query: &mut QueryBuilder<'_, Sqlite>,
+    query: &mut QueryBuilder<Sqlite>,
     first_filter: &mut bool,
     column: &'static str,
     value: &Option<String>,
@@ -10505,7 +10507,7 @@ fn push_activity_log_exact_clause(
 }
 
 #[cfg(any(test, feature = "sqlite"))]
-fn push_activity_log_where(query: &mut QueryBuilder<'_, Sqlite>, first_filter: &mut bool) {
+fn push_activity_log_where(query: &mut QueryBuilder<Sqlite>, first_filter: &mut bool) {
     if *first_filter {
         query.push(" WHERE ");
         *first_filter = false;
@@ -10516,7 +10518,7 @@ fn push_activity_log_where(query: &mut QueryBuilder<'_, Sqlite>, first_filter: &
 
 #[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_order_by(
-    query: &mut QueryBuilder<'_, Sqlite>,
+    query: &mut QueryBuilder<Sqlite>,
     sort: &[(ActivityLogSortField, SortDirection)],
 ) {
     query.push(" ORDER BY ");
@@ -13248,7 +13250,7 @@ fn plugin_runtime_instance_id(plugin_id: &str, runtime: &str) -> String {
 }
 
 #[cfg(any(test, feature = "sqlite"))]
-fn live_tv_channel_select_builder() -> QueryBuilder<'static, Sqlite> {
+fn live_tv_channel_select_builder() -> QueryBuilder<Sqlite> {
     QueryBuilder::new(
         r#"
         SELECT c.channel_id, c.tuner_id, c.remote_id, c.category_id,
@@ -13263,10 +13265,7 @@ fn live_tv_channel_select_builder() -> QueryBuilder<'static, Sqlite> {
 }
 
 #[cfg(any(test, feature = "sqlite"))]
-fn append_live_tv_channel_filters(
-    builder: &mut QueryBuilder<'_, Sqlite>,
-    query: &LiveTvChannelQuery,
-) {
+fn append_live_tv_channel_filters(builder: &mut QueryBuilder<Sqlite>, query: &LiveTvChannelQuery) {
     let category_ids = query
         .category_ids
         .iter()

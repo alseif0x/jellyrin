@@ -3,7 +3,7 @@
 `ops/supply-chain.lock.env` is the reviewed, public lock for container inputs. It fixes the Rust
 builder, Debian runtime, PostgreSQL and the dormant Redis scaffold by tag plus OCI manifest digest.
 The runtime apt sources use a dated Debian snapshot. FFmpeg is compiled in a separate stage from
-the official versioned source archive after verifying its locked SHA-256; the runtime receives only
+an official commit-addressed source archive after verifying its locked SHA-256; the runtime receives only
 the two stripped binaries and their small TLS/zlib closure. `cargo build --locked` makes Cargo
 refuse dependency-lock drift.
 Jellyfin Web is independently pinned to version `10.11.11`, its immutable
@@ -13,8 +13,9 @@ move Swiper from `11.2.8` to the first corrected release, `12.1.2`. Generated
 browser assets remain outside version control.
 
 The current manifest digests were resolved from Docker Hub and the returned manifest bytes were
-independently SHA-256 checked on 2026-08-08. The official FFmpeg 8.1.2 archive is locked by SHA-256
-`464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`; it is compiled with
+independently SHA-256 checked on 2026-08-08. FFmpeg revision
+`1e0279143db99d7324b17f9784b3229122269b38` is locked by archive SHA-256
+`2eb566ff9b41802220974bf9457da9bdbda078b1f56d1f008525b7b7cd71ca40`; it is compiled with
 `--disable-everything` and an explicit remux/probe capability set, without encoders and with AAC
 as its sole decoder. MPEG-TS requires inspection of an AAC frame to recover the sample rate before
 the HLS stream-copy muxer can write a valid header; Jellyrin still rejects every encode command in
@@ -63,8 +64,10 @@ docker build --pull \
   --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
   --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
   --build-arg "DEBIAN_SNAPSHOT=${DEBIAN_SNAPSHOT}" \
+  --build-arg "FFMPEG_SOURCE_REVISION=${FFMPEG_SOURCE_REVISION}" \
+  --build-arg "FFMPEG_SOURCE_VERSION=${FFMPEG_SOURCE_VERSION}" \
+  --build-arg "FFMPEG_NVD_BASELINE_VERSION=${FFMPEG_NVD_BASELINE_VERSION}" \
   --build-arg "FFMPEG_SOURCE_SHA256=${FFMPEG_SOURCE_SHA256}" \
-  --build-arg "FFMPEG_UPSTREAM_VERSION=${FFMPEG_UPSTREAM_VERSION}" \
   --build-arg "VCS_REF=$(git rev-parse HEAD)" \
   --tag jellyrin:release \
   .
@@ -83,8 +86,8 @@ generator downloads Syft only after selecting
 the lock's amd64/arm64 checksum and refuses to overwrite an existing output directory.
 
 The vulnerability bundle contains the exact cargo-audit version, pinned RustSec database commit,
-Trivy versions and database metadata, machine-readable Rust and image findings, the generated
-ignore policy, scanner exit codes and checksums. The runner downloads the cargo-audit crate and
+Trivy versions and database metadata, machine-readable Rust and image findings, the current NVD
+FFmpeg result set, verified fix baseline, generated ignore policy, scanner exit codes and checksums. The runner downloads the cargo-audit crate and
 Trivy archive into an isolated temporary directory and verifies both before execution. It does not
 assume either scanner is installed globally and does not modify the developer's Cargo tools.
 
@@ -100,14 +103,10 @@ image gate. It retains `Cargo.lock`, scanner output and stderr, the exact adviso
 the rendered ignore list, status JSON and checksums. It refuses to overwrite an existing evidence
 directory. This is real RustSec evidence, but it does not replace the Docker-dependent Trivy scan.
 
-The current standalone result remains red only for `RUSTSEC-2023-0071` on `rsa 0.9.10`. That crate
-is retained by Cargo's lock resolution through SQLx's optional MySQL backend, while both the
-production tree and `cargo tree --workspace --all-features --target all -i rsa` are empty and no
-workspace manifest enables SQLx's `mysql` feature. The advisory declares no patched release. Do
-not silently ignore it or upgrade SQLx as a side effect: either keep the gate red, approve a
-time-bounded reviewed `crate:rsa@0.9.10` exception for the unreachable backend, or first analyze a
-backend-specific SQLx dependency layout that removes it from the lock without weakening PostgreSQL
-and SQLite conformance. No such exception is currently present.
+SQLx 0.9 and Rust 1.94 remove `rsa 0.9.10` from `Cargo.lock`. SQLx's optional MySQL crate may remain
+as lock metadata, but its now-optional RSA dependency is neither locked nor compiled.
+`cargo tree --locked -i rsa` must report that the package is absent; no exception is used. PostgreSQL
+and the explicit legacy SQLite feature remain covered by the all-features workspace and schema jobs.
 
 ## Runtime surface decisions
 
@@ -149,12 +148,14 @@ of lower residual risk. Do not adopt it until all of the following are retained 
   amd64 and arm64;
 - the normal image scan with no unreviewed HIGH/CRITICAL findings or invented exceptions.
 
-Jellyrin therefore does not adopt that package. The release candidate instead builds the locked
-FFmpeg 8.1.2 source with the finite capability set above, links only its small TLS/zlib closure,
-records FFmpeg as a CPE-addressable component in the image SBOM, submits that component to Trivy,
-and runs MP4/Matroska/MPEG-TS probe plus stream-copy HLS smoke tests inside the final image. Trivy
-0.70 does not currently prove inventory for this generic native component, so the gate detects an
-empty/unmatched report and fails closed; promotion requires a validated FFmpeg-aware matcher.
+Jellyrin therefore does not adopt that package. The release candidate builds the locked official
+FFmpeg revision with the finite capability set above, links only its small TLS/zlib closure and runs
+MP4/Matroska/MPEG-TS probe plus stream-copy HLS smoke tests inside the final image. During the build,
+every entry in `ops/ffmpeg-security-baseline.txt` is downloaded from the official FFmpeg forge,
+checksum-verified and reverse-applied as a check: success proves that the pinned source already
+contains the fix. The current baseline covers the 16 HIGH findings associated by NVD with stable
+8.1.2. The scanner queries NVD's exact vulnerable CPE and fails closed if any current
+HIGH/CRITICAL ID is not mapped. NVD supplies the data; Jellyrin is not endorsed or certified by NVD.
 
 CI performs the same native-platform build and verification after the Rust/PostgreSQL gates, then
 uploads `jellyrin-supply-chain-<commit>` for 90 days. Tag pushes matching `v*` also run this workflow.
@@ -177,6 +178,10 @@ The release gate has deliberately different database semantics for the scanners:
   security verdict is time-dependent even though the Trivy executable is checksum-pinned. The
   evidence bundle records the scan timestamp and Trivy database metadata needed to reproduce and
   explain that verdict; it must not be described as a permanently reproducible result.
+- NVD is queried at scan time for the exact `FFMPEG_NVD_BASELINE_VERSION` CPE with rejected records
+  excluded. Every HIGH/CRITICAL ID must exist in the reviewed FFmpeg baseline. The immutable source
+  build then proves the mapped official patches are present; a feed outage, incomplete response or
+  newly unmapped finding fails the gate.
 
 CI runs the gate for pull requests, pushes, release tags and every Monday. PR, push and tag runs
 still wait for all Rust/PostgreSQL prerequisites to pass; the Monday run uses an explicit
@@ -243,7 +248,7 @@ resolve_docker_hub_ref() {
   printf '%s@%s\n' "${image_ref}" "${digest}"
 }
 
-resolve_docker_hub_ref rust:1.93.0-bookworm
+resolve_docker_hub_ref rust:1.94.0-bookworm
 resolve_docker_hub_ref debian:bookworm-slim
 resolve_docker_hub_ref postgres:17.10-bookworm
 resolve_docker_hub_ref redis:7.2.14-bookworm
@@ -256,9 +261,9 @@ signing-key fingerprint rather than treating an unverified signature file as evi
 
 ```bash
 curl --proto '=https' --tlsv1.2 --fail --location \
-  "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz" \
-  --output ffmpeg-source.tar.xz
-printf '%s  %s\n' "${FFMPEG_SOURCE_SHA256}" ffmpeg-source.tar.xz \
+  "https://code.ffmpeg.org/FFmpeg/FFmpeg/archive/${FFMPEG_SOURCE_REVISION}.tar.gz" \
+  --output ffmpeg-source.tar.gz
+printf '%s  %s\n' "${FFMPEG_SOURCE_SHA256}" ffmpeg-source.tar.gz \
   | sha256sum --check --strict
 ```
 

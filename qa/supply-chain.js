@@ -27,6 +27,7 @@ async function main() {
     deploymentPreflight,
     nginx,
     ffmpegSmoke,
+    ffmpegSecurityBaseline,
   ] = await Promise.all([
     read('ops/supply-chain.lock.env'),
     read('Dockerfile'),
@@ -48,7 +49,9 @@ async function main() {
     read('ops/deployment-preflight.sh'),
     read('ops/nginx-jellyrin.test.kode.live.conf.example'),
     read('qa/ffmpeg-remux-smoke.sh'),
+    read('ops/ffmpeg-security-baseline.txt'),
   ]);
+  const cargoLock = await read('Cargo.lock');
   const lock = parseLock(lockText);
   const runtimeDockerfile = dockerfile.slice(dockerfile.lastIndexOf('FROM ${RUNTIME_IMAGE}'));
   const vulnerabilityExceptions = JSON.parse(vulnerabilityExceptionsText);
@@ -60,7 +63,9 @@ async function main() {
     'POSTGRES_IMAGE',
     'REDIS_IMAGE',
     'DEBIAN_SNAPSHOT',
-    'FFMPEG_UPSTREAM_VERSION',
+    'FFMPEG_SOURCE_REVISION',
+    'FFMPEG_SOURCE_VERSION',
+    'FFMPEG_NVD_BASELINE_VERSION',
     'FFMPEG_SOURCE_SHA256',
     'SYFT_VERSION',
     'SYFT_LINUX_AMD64_SHA256',
@@ -102,7 +107,9 @@ async function main() {
     check('lock-debian-snapshot', /^\d{8}T\d{6}Z$/.test(lock.DEBIAN_SNAPSHOT || '')),
     check(
       'lock-ffmpeg-source',
-      /^\d+\.\d+(?:\.\d+)+$/.test(lock.FFMPEG_UPSTREAM_VERSION || '') &&
+      /^[a-f0-9]{40}$/.test(lock.FFMPEG_SOURCE_REVISION || '') &&
+        /^\d+\.\d+-dev-git-[a-f0-9]{12}$/.test(lock.FFMPEG_SOURCE_VERSION || '') &&
+        /^\d+\.\d+\.\d+$/.test(lock.FFMPEG_NVD_BASELINE_VERSION || '') &&
         /^[a-f0-9]{64}$/.test(lock.FFMPEG_SOURCE_SHA256 || ''),
     ),
     check(
@@ -210,8 +217,12 @@ async function main() {
     check(
       'docker-ffmpeg-pin-and-verification',
       dockerfile.includes(`ARG FFMPEG_SOURCE_SHA256=${lock.FFMPEG_SOURCE_SHA256}`) &&
-        dockerfile.includes(`ARG FFMPEG_UPSTREAM_VERSION=${lock.FFMPEG_UPSTREAM_VERSION}`) &&
-        dockerfile.includes('https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz') &&
+        dockerfile.includes(`ARG FFMPEG_SOURCE_REVISION=${lock.FFMPEG_SOURCE_REVISION}`) &&
+        dockerfile.includes(`ARG FFMPEG_SOURCE_VERSION=${lock.FFMPEG_SOURCE_VERSION}`) &&
+        dockerfile.includes(`ARG FFMPEG_NVD_BASELINE_VERSION=${lock.FFMPEG_NVD_BASELINE_VERSION}`) &&
+        dockerfile.includes('code.ffmpeg.org/FFmpeg/FFmpeg/archive/${FFMPEG_SOURCE_REVISION}.tar.gz') &&
+        dockerfile.includes('code.ffmpeg.org/FFmpeg/FFmpeg/commit/${fix_commit}.patch') &&
+        dockerfile.includes('git -C /tmp/ffmpeg-source apply --reverse --check') &&
         dockerfile.includes("sha256sum --check --strict") &&
         dockerfile.includes('--disable-everything') &&
         dockerfile.includes('--enable-muxer=hls,mpegts,mov,mp4') &&
@@ -230,7 +241,9 @@ async function main() {
       compose.includes(`RUST_IMAGE: \${RUST_IMAGE:-${lock.RUST_IMAGE}}`) &&
         compose.includes(`RUNTIME_IMAGE: \${RUNTIME_IMAGE:-${lock.RUNTIME_IMAGE}}`) &&
         compose.includes(`DEBIAN_SNAPSHOT: \${DEBIAN_SNAPSHOT:-${lock.DEBIAN_SNAPSHOT}}`) &&
-        compose.includes(`FFMPEG_UPSTREAM_VERSION: \${FFMPEG_UPSTREAM_VERSION:-${lock.FFMPEG_UPSTREAM_VERSION}}`) &&
+        compose.includes(`FFMPEG_SOURCE_REVISION: \${FFMPEG_SOURCE_REVISION:-${lock.FFMPEG_SOURCE_REVISION}}`) &&
+        compose.includes(`FFMPEG_SOURCE_VERSION: \${FFMPEG_SOURCE_VERSION:-${lock.FFMPEG_SOURCE_VERSION}}`) &&
+        compose.includes(`FFMPEG_NVD_BASELINE_VERSION: \${FFMPEG_NVD_BASELINE_VERSION:-${lock.FFMPEG_NVD_BASELINE_VERSION}}`) &&
         compose.includes(`FFMPEG_SOURCE_SHA256: \${FFMPEG_SOURCE_SHA256:-${lock.FFMPEG_SOURCE_SHA256}}`),
     ),
     check(
@@ -242,7 +255,9 @@ async function main() {
       'compose-example-matches-lock',
       imageKeys.every((key) => composeEnv.includes(`${key}=${lock[key]}`)) &&
         composeEnv.includes(`DEBIAN_SNAPSHOT=${lock.DEBIAN_SNAPSHOT}`) &&
-        composeEnv.includes(`FFMPEG_UPSTREAM_VERSION=${lock.FFMPEG_UPSTREAM_VERSION}`) &&
+        composeEnv.includes(`FFMPEG_SOURCE_REVISION=${lock.FFMPEG_SOURCE_REVISION}`) &&
+        composeEnv.includes(`FFMPEG_SOURCE_VERSION=${lock.FFMPEG_SOURCE_VERSION}`) &&
+        composeEnv.includes(`FFMPEG_NVD_BASELINE_VERSION=${lock.FFMPEG_NVD_BASELINE_VERSION}`) &&
         composeEnv.includes(`FFMPEG_SOURCE_SHA256=${lock.FFMPEG_SOURCE_SHA256}`),
     ),
     check(
@@ -259,7 +274,21 @@ async function main() {
       'ci-rust-toolchain-is-explicit',
       rustToolchainUses.length > 0 &&
         rustToolchainSteps.length === rustToolchainUses.length &&
-        rustToolchainSteps.every((step) => /^\s{10}toolchain:\s*1\.93\.0\s*$/m.test(step)),
+        rustToolchainSteps.every((step) => /^\s{10}toolchain:\s*1\.94\.0\s*$/m.test(step)),
+    ),
+    check(
+      'rust-lock-excludes-rsa',
+      cargoLock.includes('name = "sqlx"\nversion = "0.9.0"') &&
+        !cargoLock.includes('name = "rsa"\n'),
+    ),
+    check(
+      'ci-rust-commands-are-locked-and-cover-all-features',
+      workflow.includes('cargo check --locked -p jellyrin-server') &&
+        workflow.includes('cargo check --locked --workspace --all-targets --all-features') &&
+        workflow.includes('cargo clippy --locked --workspace --all-targets --all-features -- -D warnings') &&
+        workflow.includes('cargo test --locked --workspace --all-targets --all-features') &&
+        workflow.includes('cargo test --locked -p jellyrin-db --all-features') &&
+        workflow.includes('cargo test --locked -p jellyrin-migrate --all-features'),
     ),
     check('ci-postgres-image-matches-lock', workflow.includes(`image: ${lock.POSTGRES_IMAGE}`)),
     check(
@@ -302,7 +331,7 @@ async function main() {
         !rustsecRunner.includes('required_command in cargo curl docker'),
     ),
     check(
-      'trivy-image-policy-is-strict-and-evidenced',
+      'vulnerability-policy-is-strict-and-evidenced',
       vulnerabilityScanner.includes(
         'aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-${trivy_arch}.tar.gz',
       ) &&
@@ -314,11 +343,12 @@ async function main() {
         !vulnerabilityScanner.includes('--ignore-unfixed') &&
         vulnerabilityScanner.includes('trivy-version.txt') &&
         vulnerabilityScanner.includes('trivy-image.json') &&
-        vulnerabilityScanner.includes('trivy-ffmpeg.json') &&
-        vulnerabilityScanner.includes('ffmpeg-source.cyclonedx.json') &&
-        vulnerabilityScanner.includes('cpe:2.3:a:ffmpeg:ffmpeg:') &&
-        vulnerabilityScanner.includes('"${trivy_bin}" sbom') &&
-        vulnerabilityScanner.includes('Trivy did not prove that the FFmpeg component was inventoried; failing closed') &&
+        vulnerabilityScanner.includes('services.nvd.nist.gov/rest/json/cves/2.0') &&
+        vulnerabilityScanner.includes('FFMPEG_NVD_BASELINE_VERSION') &&
+        vulnerabilityScanner.includes('nvd-ffmpeg-high-critical.txt') &&
+        vulnerabilityScanner.includes('nvd-ffmpeg-unmapped.txt') &&
+        vulnerabilityScanner.includes('NVD reports unmapped HIGH/CRITICAL FFmpeg vulnerabilities') &&
+        ffmpegSecurityBaseline.split(/\r?\n/).filter((line) => line.startsWith('CVE-')).length === 16 &&
         vulnerabilityScanner.includes('scan-status.json'),
     ),
     check(

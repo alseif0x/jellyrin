@@ -8,7 +8,8 @@ exceptions_file="${script_dir}/vulnerability-exceptions.json"
 image_ref="${1:-jellyrin:local}"
 output_dir="${2:-${repo_root}/vulnerability-artifacts}"
 
-for required_file in "${lock_file}" "${exceptions_file}" "${repo_root}/Cargo.lock"; do
+ffmpeg_baseline_file="${script_dir}/ffmpeg-security-baseline.txt"
+for required_file in "${lock_file}" "${exceptions_file}" "${ffmpeg_baseline_file}" "${repo_root}/Cargo.lock"; do
     if [[ ! -f "${required_file}" ]]; then
         echo "missing vulnerability scan input: ${required_file}" >&2
         exit 1
@@ -24,7 +25,7 @@ set -a
 source "${lock_file}"
 set +a
 
-for required_command in cargo curl docker git jq node sha256sum tar; do
+for required_command in cargo comm curl docker git jq node sha256sum sort tar; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
         echo "required vulnerability scan command is unavailable: ${required_command}" >&2
         exit 1
@@ -127,22 +128,6 @@ grep -Fq "Version: ${TRIVY_VERSION}" "${output_dir}/trivy-version-before-scan.tx
 
 trivy_ignore="${output_dir}/trivy-ignore.generated.yaml"
 node "${script_dir}/render-vulnerability-ignores.js" trivy-yaml > "${trivy_ignore}"
-jq -n \
-    --arg version "${FFMPEG_UPSTREAM_VERSION}" \
-    --arg sha256 "${FFMPEG_SOURCE_SHA256}" \
-    '{
-      bomFormat: "CycloneDX",
-      specVersion: "1.6",
-      version: 1,
-      components: [{
-        type: "application",
-        name: "ffmpeg",
-        version: $version,
-        purl: ("pkg:generic/ffmpeg@" + $version),
-        cpe: ("cpe:2.3:a:ffmpeg:ffmpeg:" + $version + ":*:*:*:*:*:*:*"),
-        hashes: [{alg: "SHA-256", content: $sha256}]
-      }]
-    }' > "${output_dir}/ffmpeg-source.cyclonedx.json"
 set +e
 "${trivy_bin}" image \
     --cache-dir "${trivy_cache}" \
@@ -158,35 +143,74 @@ set +e
     "${image_ref}" \
     2> "${output_dir}/trivy.stderr.txt"
 trivy_status=$?
-"${trivy_bin}" sbom \
-    --cache-dir "${trivy_cache}" \
-    --scanners vuln \
-    --severity HIGH,CRITICAL \
-    --ignorefile "${trivy_ignore}" \
-    --show-suppressed \
-    --exit-code 1 \
-    --format json \
-    --output "${output_dir}/trivy-ffmpeg.json" \
-    "${output_dir}/ffmpeg-source.cyclonedx.json" \
-    2> "${output_dir}/trivy-ffmpeg.stderr.txt"
-trivy_ffmpeg_status=$?
 set -e
 "${trivy_bin}" --cache-dir "${trivy_cache}" --version > "${output_dir}/trivy-version.txt"
 if ! jq -e . "${output_dir}/trivy-image.json" >/dev/null; then
     echo "Trivy did not produce valid JSON" >&2
     trivy_status=99
 fi
-if ! jq -e . "${output_dir}/trivy-ffmpeg.json" >/dev/null; then
-    echo "Trivy did not produce valid FFmpeg SBOM JSON" >&2
-    trivy_ffmpeg_status=99
-elif ! jq -e '
-    [.Results[]? | select(
-      ((.Target // "") | ascii_downcase | contains("ffmpeg"))
-      or ([.Vulnerabilities[]?.PkgName // ""] | map(ascii_downcase) | any(. == "ffmpeg"))
-    )] | length > 0
-  ' "${output_dir}/trivy-ffmpeg.json" >/dev/null; then
-    echo "Trivy did not prove that the FFmpeg component was inventoried; failing closed" >&2
-    trivy_ffmpeg_status=98
+
+# Trivy does not reliably inventory a source-built, stripped FFmpeg binary. Query NVD using the
+# exact stable CPE instead, then require every current HIGH/CRITICAL CVE to map to a checksum-pinned
+# upstream fix whose presence the Docker build verifies in reverse. This feed is provided by NVD;
+# Jellyrin is not endorsed or certified by NVD.
+cp "${ffmpeg_baseline_file}" "${output_dir}/ffmpeg-security-baseline.txt"
+awk '!/^#/ && NF { print $1 }' "${ffmpeg_baseline_file}" | LC_ALL=C sort -u \
+    > "${temp_root}/ffmpeg-baseline-cves.txt"
+ffmpeg_baseline_entries="$(awk '!/^#/ && NF { count++ } END { print count + 0 }' "${ffmpeg_baseline_file}")"
+if ! awk '
+    /^#/ || NF == 0 { next }
+    NF != 3 || $1 !~ /^CVE-[0-9]{4}-[0-9]{4,}$/ || $2 !~ /^[0-9a-f]{40}$/ || $3 !~ /^[0-9a-f]{64}$/ { exit 1 }
+  ' "${ffmpeg_baseline_file}" ||
+   [[ "${ffmpeg_baseline_entries}" -ne 16 ]] ||
+   [[ "$(wc -l < "${temp_root}/ffmpeg-baseline-cves.txt")" -ne 16 ]]; then
+    echo "invalid or duplicate FFmpeg security baseline" >&2
+    exit 1
+fi
+
+nvd_cpe="cpe:2.3:a:ffmpeg:ffmpeg:${FFMPEG_NVD_BASELINE_VERSION}:*:*:*:*:*:*:*"
+: > "${output_dir}/nvd-ffmpeg.json"
+: > "${output_dir}/nvd-ffmpeg.stderr.txt"
+set +e
+curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --fail \
+    --silent --show-error --location --get \
+    --data-urlencode "cpeName=${nvd_cpe}" \
+    --data-urlencode "isVulnerable" \
+    --data-urlencode "noRejected" \
+    'https://services.nvd.nist.gov/rest/json/cves/2.0' \
+    --output "${output_dir}/nvd-ffmpeg.json" \
+    2> "${output_dir}/nvd-ffmpeg.stderr.txt"
+nvd_ffmpeg_status=$?
+set -e
+if (( nvd_ffmpeg_status == 0 )) && ! jq -e \
+    --arg cpe "${nvd_cpe}" \
+    '.format == "NVD_CVE" and .version == "2.0" and .startIndex == 0
+      and .totalResults == (.vulnerabilities | length)' \
+    "${output_dir}/nvd-ffmpeg.json" >/dev/null; then
+    echo "NVD returned an invalid or incomplete FFmpeg result set" >&2
+    nvd_ffmpeg_status=99
+fi
+if (( nvd_ffmpeg_status == 0 )); then
+    jq -r '
+      [.vulnerabilities[]?.cve
+       | select(.vulnStatus != "Rejected")
+       | . as $cve
+       | [(.metrics.cvssMetricV40[]?.cvssData.baseSeverity),
+          (.metrics.cvssMetricV31[]?.cvssData.baseSeverity),
+          (.metrics.cvssMetricV30[]?.cvssData.baseSeverity),
+          (.metrics.cvssMetricV2[]?.baseSeverity)] as $severities
+       | select(any($severities[]?; . == "HIGH" or . == "CRITICAL"))
+       | $cve.id] | unique[]' "${output_dir}/nvd-ffmpeg.json" \
+       | LC_ALL=C sort -u > "${output_dir}/nvd-ffmpeg-high-critical.txt"
+    comm -23 "${output_dir}/nvd-ffmpeg-high-critical.txt" \
+        "${temp_root}/ffmpeg-baseline-cves.txt" > "${output_dir}/nvd-ffmpeg-unmapped.txt"
+    if [[ -s "${output_dir}/nvd-ffmpeg-unmapped.txt" ]]; then
+        echo "NVD reports unmapped HIGH/CRITICAL FFmpeg vulnerabilities" >&2
+        nvd_ffmpeg_status=1
+    fi
+else
+    : > "${output_dir}/nvd-ffmpeg-high-critical.txt"
+    : > "${output_dir}/nvd-ffmpeg-unmapped.txt"
 fi
 
 cp "${lock_file}" "${output_dir}/supply-chain.lock.env"
@@ -197,15 +221,15 @@ jq -n \
     --arg scanned_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson rustsec_exit_code "${rustsec_status}" \
     --argjson trivy_exit_code "${trivy_status}" \
-    --argjson trivy_ffmpeg_exit_code "${trivy_ffmpeg_status}" \
+    --argjson nvd_ffmpeg_exit_code "${nvd_ffmpeg_status}" \
     '{
       image_ref: $image_ref,
       rustsec_advisory_db_revision: $rustsec_revision,
       scanned_at: $scanned_at,
       rustsec_exit_code: $rustsec_exit_code,
       trivy_exit_code: $trivy_exit_code,
-      trivy_ffmpeg_exit_code: $trivy_ffmpeg_exit_code,
-      passed: ($rustsec_exit_code == 0 and $trivy_exit_code == 0 and $trivy_ffmpeg_exit_code == 0)
+      nvd_ffmpeg_exit_code: $nvd_ffmpeg_exit_code,
+      passed: ($rustsec_exit_code == 0 and $trivy_exit_code == 0 and $nvd_ffmpeg_exit_code == 0)
     }' > "${output_dir}/scan-status.json"
 
 (
@@ -214,13 +238,15 @@ jq -n \
         cargo-audit-version.txt \
         cargo-audit.json \
         cargo-audit.stderr.txt \
-        ffmpeg-source.cyclonedx.json \
+        ffmpeg-security-baseline.txt \
+        nvd-ffmpeg-high-critical.txt \
+        nvd-ffmpeg-unmapped.txt \
+        nvd-ffmpeg.json \
+        nvd-ffmpeg.stderr.txt \
         rustsec-advisory-db-revision.txt \
         scan-status.json \
         supply-chain.lock.env \
         trivy-ignore.generated.yaml \
-        trivy-ffmpeg.json \
-        trivy-ffmpeg.stderr.txt \
         trivy-image.json \
         trivy-version-before-scan.txt \
         trivy-version.txt \
@@ -230,8 +256,8 @@ jq -n \
     sha256sum --check --strict SHA256SUMS
 )
 
-if (( rustsec_status != 0 || trivy_status != 0 || trivy_ffmpeg_status != 0 )); then
-    echo "vulnerability gate failed (RustSec=${rustsec_status}, Trivy-image=${trivy_status}, Trivy-FFmpeg=${trivy_ffmpeg_status}); evidence: ${output_dir}" >&2
+if (( rustsec_status != 0 || trivy_status != 0 || nvd_ffmpeg_status != 0 )); then
+    echo "vulnerability gate failed (RustSec=${rustsec_status}, Trivy-image=${trivy_status}, NVD-FFmpeg=${nvd_ffmpeg_status}); evidence: ${output_dir}" >&2
     exit 1
 fi
 

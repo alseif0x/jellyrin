@@ -407,7 +407,7 @@ fn normalize_live_tv_category_id(category_id: Option<&str>) -> Option<&str> {
     category_id.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn live_tv_channel_select_builder() -> QueryBuilder<'static, Postgres> {
+fn live_tv_channel_select_builder() -> QueryBuilder<Postgres> {
     QueryBuilder::new(
         r#"
         SELECT c.channel_id,
@@ -430,7 +430,7 @@ fn live_tv_channel_select_builder() -> QueryBuilder<'static, Postgres> {
     )
 }
 
-fn live_tv_channel_count_builder() -> QueryBuilder<'static, Postgres> {
+fn live_tv_channel_count_builder() -> QueryBuilder<Postgres> {
     QueryBuilder::new(
         r#"
         SELECT count(*)
@@ -443,7 +443,7 @@ fn live_tv_channel_count_builder() -> QueryBuilder<'static, Postgres> {
 }
 
 fn append_live_tv_channel_filters(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     query: &LiveTvChannelQuery,
 ) {
     let category_ids = query

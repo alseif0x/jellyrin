@@ -175,7 +175,11 @@ impl PostgresDatabase {
             "plugin_repositories",
         ] {
             let statement = format!("DELETE FROM {table}");
-            sqlx::query(&statement).execute(&mut *transaction).await?;
+            // `table` comes exclusively from the static allowlist above; no snapshot value is
+            // interpolated into this administrative statement.
+            sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+                .execute(&mut *transaction)
+                .await?;
         }
 
         for item in plugin_snapshot_items(snapshot, "Repositories")? {
@@ -503,7 +507,7 @@ mod tests {
                 .expect("failed to commit pg_trgm preparation");
 
             let schema = format!("jellyrin_plugin_test_{}", Uuid::new_v4().simple());
-            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
                 .execute(&administration_pool)
                 .await
                 .expect("failed to create isolated PostgreSQL plugin-test schema");
@@ -558,10 +562,13 @@ mod tests {
 
         async fn cleanup(self) {
             self.database.close().await;
-            sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-                .execute(&self.administration_pool)
-                .await
-                .expect("failed to remove isolated PostgreSQL plugin-test schema");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA {} CASCADE",
+                self.schema
+            )))
+            .execute(&self.administration_pool)
+            .await
+            .expect("failed to remove isolated PostgreSQL plugin-test schema");
             self.administration_pool.close().await;
         }
     }
@@ -744,9 +751,9 @@ mod tests {
             assert!(diagnostic.contains(second_id));
             assert!(diagnostic.contains("no rows were discarded automatically"));
 
-            let collision_count: i64 = sqlx::query_scalar(&format!(
+            let collision_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT count(*) FROM {table} WHERE lower(plugin_id) = lower($1)"
-            ))
+            )))
             .bind(first_id)
             .fetch_one(&database.pool)
             .await
@@ -791,9 +798,9 @@ mod tests {
                     .await
                     .is_err()
             );
-            let remaining: i64 = sqlx::query_scalar(&format!(
+            let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT count(*) FROM {table} WHERE lower(plugin_id) = lower($1)"
-            ))
+            )))
             .bind(first_id)
             .fetch_one(&database.pool)
             .await

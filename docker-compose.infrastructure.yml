@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f}
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f}
     restart: unless-stopped
     environment:
       POSTGRES_DB: jellyrin
@@ -62,7 +62,7 @@ services:
       - jellyrin-backend
 
   redis:
-    image: ${REDIS_IMAGE:-redis:7.2.14-bookworm@sha256:f0707c78ea880b293ccdeb410c9c0a8ccae93fe7128799b751333a698b0a39a7}
+    image: ${REDIS_IMAGE:-docker.io/library/redis:7.2.14-bookworm@sha256:f0707c78ea880b293ccdeb410c9c0a8ccae93fe7128799b751333a698b0a39a7}
     profiles: ["cache", "distributed-cache"]
     restart: unless-stopped
     environment:

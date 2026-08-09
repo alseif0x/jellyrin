@@ -2505,10 +2505,7 @@ const POSTGRES_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
     ELSE 'baseitem'
 END"#;
 
-fn push_postgres_catalog_from(
-    builder: &mut QueryBuilder<'_, Postgres>,
-    query: &MediaItemCatalogQuery,
-) {
+fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &MediaItemCatalogQuery) {
     builder.push(
         " FROM media_items AS item \
          LEFT JOIN playback_states AS playback \
@@ -2522,7 +2519,7 @@ fn push_postgres_catalog_from(
 }
 
 fn push_postgres_catalog_filters(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     query: &MediaItemCatalogQuery,
 ) {
     builder.push(" WHERE item.missing_since IS NULL");
@@ -2710,10 +2707,7 @@ fn push_postgres_catalog_filters(
     }
 }
 
-fn push_postgres_search_hint_metadata_filter(
-    builder: &mut QueryBuilder<'_, Postgres>,
-    pattern: &str,
-) {
+fn push_postgres_search_hint_metadata_filter(builder: &mut QueryBuilder<Postgres>, pattern: &str) {
     builder
         .push(
             " OR EXISTS (\
@@ -2751,7 +2745,7 @@ fn push_postgres_search_hint_metadata_filter(
 }
 
 fn push_postgres_catalog_order(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     query: &MediaItemCatalogQuery,
 ) {
     builder.push(" ORDER BY ");
@@ -2784,7 +2778,7 @@ fn push_postgres_catalog_order(
 }
 
 fn push_postgres_ci_any_filter(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     column: &str,
     values: &[String],
     negate: bool,
@@ -2806,7 +2800,7 @@ fn push_postgres_ci_any_filter(
 }
 
 fn push_postgres_stream_language_filter(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     stream_type: &str,
     languages: &[String],
 ) {
@@ -2829,7 +2823,7 @@ fn push_postgres_stream_language_filter(
 }
 
 fn push_postgres_optional_i64_bound(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     column: &str,
     value: Option<i64>,
     operator: &str,
@@ -2846,7 +2840,7 @@ fn push_postgres_optional_i64_bound(
 }
 
 fn push_postgres_optional_time_bound(
-    builder: &mut QueryBuilder<'_, Postgres>,
+    builder: &mut QueryBuilder<Postgres>,
     column: &str,
     value: Option<OffsetDateTime>,
     operator: &str,
@@ -3314,7 +3308,7 @@ mod tests {
                 .await
                 .expect("failed to connect PostgreSQL catalog-test admin pool");
             let schema = format!("jellyrin_catalog_test_{}", Uuid::new_v4().simple());
-            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
                 .execute(&admin_pool)
                 .await
                 .expect("failed to create isolated PostgreSQL test schema");
@@ -3339,7 +3333,7 @@ mod tests {
             };
             if let Err(error) = database.migrate().await {
                 database.close().await;
-                sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
                     .execute(&admin_pool)
                     .await
                     .expect("failed to clean schema after migration failure");
@@ -3355,10 +3349,13 @@ mod tests {
 
         async fn cleanup(self) {
             self.database.close().await;
-            sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-                .execute(&self.admin_pool)
-                .await
-                .expect("failed to drop isolated PostgreSQL test schema");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA {} CASCADE",
+                self.schema
+            )))
+            .execute(&self.admin_pool)
+            .await
+            .expect("failed to drop isolated PostgreSQL test schema");
             self.admin_pool.close().await;
         }
     }
@@ -3573,10 +3570,10 @@ mod tests {
                 "jellyrin_snapshot_stage_query_builder",
                 "jellyrin_snapshot_stage_copy",
             ] {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "CREATE TEMPORARY TABLE {table} \
                      {SNAPSHOT_STAGE_TABLE_DEFINITION} ON COMMIT DROP"
-                ))
+                )))
                 .execute(&mut *transaction)
                 .await?;
             }

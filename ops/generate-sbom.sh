@@ -74,10 +74,24 @@ if [[ "${image_ffmpeg_source_sha256}" != "${FFMPEG_SOURCE_SHA256}" ]]; then
     exit 1
 fi
 printf '%s\n' "${image_ffmpeg_source_sha256}" > "${output_dir}/ffmpeg-source-sha256.txt"
+image_ffmpeg_source_revision="$(
+    docker image inspect --format '{{index .Config.Labels "io.jellyrin.ffmpeg-source-revision"}}' "${image_ref}"
+)"
+image_ffmpeg_nvd_baseline="$(
+    docker image inspect --format '{{index .Config.Labels "io.jellyrin.ffmpeg-nvd-baseline-version"}}' "${image_ref}"
+)"
+if [[ "${image_ffmpeg_source_revision}" != "${FFMPEG_SOURCE_REVISION}" ]] ||
+   [[ "${image_ffmpeg_nvd_baseline}" != "${FFMPEG_NVD_BASELINE_VERSION}" ]]; then
+    echo "FFmpeg provenance label drift" >&2
+    exit 1
+fi
+printf '%s\n' "${image_ffmpeg_source_revision}" > "${output_dir}/ffmpeg-source-revision.txt"
+printf '%s\n' "${image_ffmpeg_nvd_baseline}" > "${output_dir}/ffmpeg-nvd-baseline-version.txt"
+cp "${script_dir}/ffmpeg-security-baseline.txt" "${output_dir}/ffmpeg-security-baseline.txt"
 docker run --rm --entrypoint ffmpeg "${image_ref}" -version > "${output_dir}/ffmpeg-version.txt" 2>&1
 docker run --rm --entrypoint ffprobe "${image_ref}" -version > "${output_dir}/ffprobe-version.txt" 2>&1
-grep -Fq "ffmpeg version ${FFMPEG_UPSTREAM_VERSION}" "${output_dir}/ffmpeg-version.txt"
-grep -Fq "ffprobe version ${FFMPEG_UPSTREAM_VERSION}" "${output_dir}/ffprobe-version.txt"
+grep -Fq "ffmpeg version ${FFMPEG_SOURCE_VERSION}" "${output_dir}/ffmpeg-version.txt"
+grep -Fq "ffprobe version ${FFMPEG_SOURCE_VERSION}" "${output_dir}/ffprobe-version.txt"
 docker run --rm --entrypoint ffmpeg "${image_ref}" -hide_banner -buildconf \
     > "${output_dir}/ffmpeg-build-configuration.txt" 2>&1
 for listing in protocols demuxers muxers bsfs encoders decoders; do
@@ -151,10 +165,12 @@ done < <(find "${repo_root}/crates" -name Cargo.toml -type f -print0)
 
 # Syft cannot infer an upstream package identity from a stripped native binary. Record the
 # checksum-pinned FFmpeg source as an explicit SBOM component instead of pretending it is a dpkg.
-ffmpeg_source_url="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_UPSTREAM_VERSION}.tar.xz"
+ffmpeg_source_url="https://code.ffmpeg.org/FFmpeg/FFmpeg/archive/${FFMPEG_SOURCE_REVISION}.tar.gz"
 sbom_created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 jq -n \
-    --arg version "${FFMPEG_UPSTREAM_VERSION}" \
+    --arg version "${FFMPEG_SOURCE_VERSION}" \
+    --arg nvd_baseline "${FFMPEG_NVD_BASELINE_VERSION}" \
+    --arg revision "${FFMPEG_SOURCE_REVISION}" \
     --arg sha256 "${FFMPEG_SOURCE_SHA256}" \
     --arg source_url "${ffmpeg_source_url}" \
     --arg created_at "${sbom_created_at}" \
@@ -182,8 +198,9 @@ jq -n \
         }, {
           referenceCategory: "SECURITY",
           referenceType: "cpe23Type",
-          referenceLocator: ("cpe:2.3:a:ffmpeg:ffmpeg:" + $version + ":*:*:*:*:*:*:*")
+          referenceLocator: ("cpe:2.3:a:ffmpeg:ffmpeg:" + $nvd_baseline + ":*:*:*:*:*:*:*")
         }]
+        ,comment: ("Pinned upstream revision " + $revision + "; security fixes verified by ops/ffmpeg-security-baseline.txt")
       }],
       relationships: [{
         spdxElementId: "SPDXRef-DOCUMENT",
@@ -192,7 +209,9 @@ jq -n \
       }]
     }' > "${output_dir}/ffmpeg-source.spdx.json"
 jq -n \
-    --arg version "${FFMPEG_UPSTREAM_VERSION}" \
+    --arg version "${FFMPEG_SOURCE_VERSION}" \
+    --arg nvd_baseline "${FFMPEG_NVD_BASELINE_VERSION}" \
+    --arg revision "${FFMPEG_SOURCE_REVISION}" \
     --arg sha256 "${FFMPEG_SOURCE_SHA256}" \
     --arg source_url "${ffmpeg_source_url}" \
     --arg created_at "${sbom_created_at}" \
@@ -207,7 +226,8 @@ jq -n \
         name: "ffmpeg",
         version: $version,
         purl: ("pkg:generic/ffmpeg@" + $version),
-        cpe: ("cpe:2.3:a:ffmpeg:ffmpeg:" + $version + ":*:*:*:*:*:*:*"),
+        cpe: ("cpe:2.3:a:ffmpeg:ffmpeg:" + $nvd_baseline + ":*:*:*:*:*:*:*"),
+        properties: [{name: "io.jellyrin.ffmpeg.source-revision", value: $revision}],
         hashes: [{alg: "SHA-256", content: $sha256}],
         externalReferences: [{type: "distribution", url: $source_url}]
       }]
@@ -237,19 +257,19 @@ jq -e '.spdxVersion == "SPDX-2.3" and (.packages | length > 0)' \
     "${output_dir}/jellyrin-image.spdx.json" >/dev/null
 jq -e '.bomFormat == "CycloneDX" and (.components | length > 0)' \
     "${output_dir}/jellyrin-image.cyclonedx.json" >/dev/null
-jq -e --arg version "${FFMPEG_UPSTREAM_VERSION}" \
+jq -e --arg version "${FFMPEG_SOURCE_VERSION}" \
     '[.packages[] | select(.name == "ffmpeg" and .versionInfo == $version)] | length == 1' \
     "${output_dir}/ffmpeg-source.spdx.json" >/dev/null
-jq -e --arg version "${FFMPEG_UPSTREAM_VERSION}" \
+jq -e --arg version "${FFMPEG_SOURCE_VERSION}" \
     '[.components[] | select(.name == "ffmpeg" and .version == $version)] | length == 1' \
     "${output_dir}/ffmpeg-source.cyclonedx.json" >/dev/null
-jq -e --arg version "${FFMPEG_UPSTREAM_VERSION}" \
+jq -e --arg version "${FFMPEG_SOURCE_VERSION}" \
     '([.packages[] | select(.name == "ffmpeg" and .versionInfo == $version)
       | select(any(.externalRefs[]?; .referenceType == "cpe23Type"))] | length == 1)
       and ([.packages[] | select((.name | ascii_downcase) == "ffmpeg")] | length == 1)
       and ([.relationships[] | select(.relatedSpdxElement == "SPDXRef-Package-FFmpeg")] | length == 1)' \
     "${output_dir}/jellyrin-image.spdx.json" >/dev/null
-jq -e --arg version "${FFMPEG_UPSTREAM_VERSION}" \
+jq -e --arg version "${FFMPEG_SOURCE_VERSION}" \
     '([.components[] | select(.name == "ffmpeg" and .version == $version and (.cpe | startswith("cpe:2.3:a:ffmpeg:ffmpeg:")))] | length == 1)
       and ([.components[] | select((.name | ascii_downcase) == "ffmpeg")] | length == 1)' \
     "${output_dir}/jellyrin-image.cyclonedx.json" >/dev/null
@@ -281,6 +301,9 @@ cp "${lock_file}" "${output_dir}/supply-chain.lock.env"
         ffmpeg-muxers.txt \
         ffmpeg-parsers.txt \
         ffmpeg-protocols.txt \
+        ffmpeg-nvd-baseline-version.txt \
+        ffmpeg-security-baseline.txt \
+        ffmpeg-source-revision.txt \
         ffmpeg-source-sha256.txt \
         ffmpeg-source.cyclonedx.json \
         ffmpeg-source.spdx.json \

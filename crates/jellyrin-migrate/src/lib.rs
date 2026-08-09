@@ -416,9 +416,10 @@ async fn validate_provider_secret_references(
         ("named_configurations", "key", "payload_json"),
     ] {
         let query = format!("SELECT {identity_column}, {configuration_column} FROM {table}");
-        let configurations = sqlx::query_as::<_, (String, String)>(&query)
-            .fetch_all(&mut *source)
-            .await?;
+        let configurations =
+            sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(query.as_str()))
+                .fetch_all(&mut *source)
+                .await?;
         for (_identity, configuration) in configurations {
             let configuration = serde_json::from_str::<serde_json::Value>(&configuration)
                 .with_context(|| {
@@ -452,7 +453,7 @@ async fn validate_case_insensitive_plugin_ids(source: &mut SqliteConnection) -> 
     let mut canonical_ids = HashMap::<String, (&str, String)>::new();
     for table in CASE_INSENSITIVE_PLUGIN_ID_TABLES {
         let query = format!("SELECT plugin_id FROM {table}");
-        let plugin_ids = sqlx::query_scalar::<_, String>(&query)
+        let plugin_ids = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(query.as_str()))
             .fetch_all(&mut *source)
             .await?;
         let mut normalized_ids = HashMap::with_capacity(plugin_ids.len());
@@ -708,7 +709,7 @@ async fn ensure_local_migration_table(target: &PgPool) -> anyhow::Result<()> {
     let schema: String = sqlx::query_scalar("SELECT quote_ident(current_schema())")
         .fetch_one(target)
         .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         CREATE TABLE IF NOT EXISTS {schema}._sqlx_migrations (
             version bigint PRIMARY KEY,
@@ -719,7 +720,7 @@ async fn ensure_local_migration_table(target: &PgPool) -> anyhow::Result<()> {
             execution_time bigint NOT NULL
         )
         "#
-    ))
+    )))
     .execute(target)
     .await
     .context("failed to create migration history in the target schema")?;
@@ -733,14 +734,14 @@ async fn validate_durable_item_references(source: &mut SqliteConnection) -> anyh
         UNION ALL SELECT item_id FROM media_item_lyrics
         UNION ALL SELECT item_id FROM activity_log_entries WHERE item_id IS NOT NULL
     "#;
-    let missing: i64 = sqlx::query_scalar(&format!(
+    let missing: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         r#"
         SELECT COUNT(*)
         FROM ({REFERENCES}) AS durable_references
         LEFT JOIN media_items ON media_items.id = durable_references.item_id
         WHERE media_items.id IS NULL
         "#
-    ))
+    )))
     .fetch_one(&mut *source)
     .await?;
     anyhow::ensure!(
@@ -749,7 +750,9 @@ async fn validate_durable_item_references(source: &mut SqliteConnection) -> anyh
     );
 
     let reference_query = format!("SELECT item_id FROM ({REFERENCES}) AS durable_references");
-    let mut references = sqlx::query_scalar::<_, String>(&reference_query).fetch(&mut *source);
+    let mut references =
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(reference_query.as_str()))
+            .fetch(&mut *source);
     let mut reference_count = 0_usize;
     while let Some(raw) = references.try_next().await? {
         parse_uuid(&raw).context("invalid durable media item reference")?;
@@ -764,9 +767,11 @@ async fn ensure_target_application_tables_are_empty(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<()> {
     for table in target_application_tables() {
-        let has_rows: bool = sqlx::query_scalar(&format!("SELECT EXISTS (SELECT 1 FROM {table})"))
-            .fetch_one(&mut **transaction)
-            .await?;
+        let has_rows: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {table})"
+        )))
+        .fetch_one(&mut **transaction)
+        .await?;
         anyhow::ensure!(
             !has_rows,
             "PostgreSQL application table {table} is not empty; refusing to merge or overwrite"
@@ -798,7 +803,7 @@ async fn lock_target_application_tables(
         .execute(&mut **transaction)
         .await
         .context("failed to configure PostgreSQL application table lock timeout")?;
-    if let Err(error) = sqlx::query(&target_application_lock_sql())
+    if let Err(error) = sqlx::query(sqlx::AssertSqlSafe(target_application_lock_sql()))
         .execute(&mut **transaction)
         .await
     {
@@ -832,7 +837,7 @@ async fn migrate_table(
         "SELECT {source_columns} FROM {} ORDER BY {}",
         table.source, table.order_by
     );
-    let mut stream = sqlx::query(&select).fetch(&mut *source);
+    let mut stream = sqlx::query(sqlx::AssertSqlSafe(select.as_str())).fetch(&mut *source);
     let mut batch = Vec::with_capacity(MIGRATION_BATCH_ROWS);
     let mut digest = NormalizedTableDigest::new(table.target);
     let mut source_rows = 0_u64;
@@ -895,7 +900,7 @@ async fn target_table_digest(
         .collect::<Vec<_>>()
         .join(", ");
     let select = format!("SELECT {target_columns} FROM {}", table.target);
-    let mut stream = sqlx::query(&select).fetch(&mut **transaction);
+    let mut stream = sqlx::query(sqlx::AssertSqlSafe(select.as_str())).fetch(&mut **transaction);
     let mut digest = NormalizedTableDigest::new(table.target);
     while let Some(row) = stream.try_next().await? {
         let mut values = Vec::with_capacity(table.columns.len());
@@ -1034,9 +1039,12 @@ async fn omitted_table_reports(
 ) -> anyhow::Result<Vec<OmittedTableReport>> {
     let mut reports = Vec::with_capacity(OMITTED_TABLES.len() + TARGET_ONLY_OMITTED_TABLES.len());
     for table in OMITTED_TABLES {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {}", table.table))
-            .fetch_one(&mut *source)
-            .await?;
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {}",
+            table.table
+        )))
+        .fetch_one(&mut *source)
+        .await?;
         reports.push(OmittedTableReport {
             table: table.table,
             source_rows: count.max(0) as u64,
@@ -1261,10 +1269,12 @@ mod tests {
     async fn source_preflight_rejects_case_insensitive_plugin_id_collisions() {
         let mut source = SqliteConnection::connect("sqlite::memory:").await.unwrap();
         for table in CASE_INSENSITIVE_PLUGIN_ID_TABLES {
-            sqlx::query(&format!("CREATE TABLE {table} (plugin_id TEXT NOT NULL)"))
-                .execute(&mut source)
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE {table} (plugin_id TEXT NOT NULL)"
+            )))
+            .execute(&mut source)
+            .await
+            .unwrap();
         }
         sqlx::query("INSERT INTO plugin_manifests (plugin_id) VALUES ('CAFÉ'), ('café')")
             .execute(&mut source)
@@ -1284,10 +1294,12 @@ mod tests {
     async fn source_preflight_rejects_plugin_id_casing_inconsistent_across_tables() {
         let mut source = SqliteConnection::connect("sqlite::memory:").await.unwrap();
         for table in CASE_INSENSITIVE_PLUGIN_ID_TABLES {
-            sqlx::query(&format!("CREATE TABLE {table} (plugin_id TEXT NOT NULL)"))
-                .execute(&mut source)
-                .await
-                .unwrap();
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE TABLE {table} (plugin_id TEXT NOT NULL)"
+            )))
+            .execute(&mut source)
+            .await
+            .unwrap();
         }
         sqlx::query("INSERT INTO installed_plugins (plugin_id) VALUES ('Plugin-ID')")
             .execute(&mut source)
@@ -1492,13 +1504,13 @@ mod tests {
         assert!(
             POSTGRES_MIGRATOR
                 .iter()
-                .all(|migration| !migration.sql.is_empty())
+                .all(|migration| !migration.sql.as_ref().is_empty())
         );
         let projection_migration = POSTGRES_MIGRATOR
             .iter()
             .find(|migration| migration.version == 202_608_080_109)
             .expect("media item facet projection marker migration must be embedded");
-        let sql = projection_migration.sql.to_ascii_lowercase();
+        let sql = projection_migration.sql.as_ref().to_ascii_lowercase();
         assert!(sql.contains("create table jellyrin_derived_projection_versions"));
         assert!(!sql.contains("insert into jellyrin_derived_projection_versions"));
     }
@@ -1509,7 +1521,7 @@ mod tests {
             .iter()
             .find(|migration| migration.version == 202_608_080_106)
             .expect("live TV source invariant migration must be embedded");
-        let sql = migration.sql.to_ascii_lowercase();
+        let sql = migration.sql.as_ref().to_ascii_lowercase();
         assert!(sql.contains("mixed_row_count"));
         assert!(sql.contains("live_tv_channels_opaque_reference_excludes_stream_url"));
         assert!(sql.contains("not valid"));
@@ -1524,7 +1536,7 @@ mod tests {
             .iter()
             .find(|migration| migration.version == 202_608_080_100)
             .expect("runtime privilege migration must be embedded");
-        let sql = migration.sql.to_ascii_lowercase();
+        let sql = migration.sql.as_ref().to_ascii_lowercase();
         assert!(sql.contains("pg_catalog.pg_roles"));
         assert!(sql.contains("rolname = 'jellyrin_runtime'"));
         assert!(
@@ -1544,7 +1556,7 @@ mod tests {
         assert!(
             SQLITE_MIGRATOR
                 .iter()
-                .all(|migration| !migration.sql.is_empty())
+                .all(|migration| !migration.sql.as_ref().is_empty())
         );
     }
 
@@ -1733,7 +1745,7 @@ mod tests {
             .await
             .unwrap();
         let schema = format!("jellyrin_migrate_test_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
             .execute(&admin_pool)
             .await
             .unwrap();
@@ -2029,7 +2041,7 @@ mod tests {
         })
         .await;
 
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(&admin_pool)
             .await
             .unwrap();

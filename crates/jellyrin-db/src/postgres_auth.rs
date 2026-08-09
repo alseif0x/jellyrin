@@ -1176,7 +1176,7 @@ mod tests {
                 .expect("failed to commit pg_trgm preparation");
 
             let schema = format!("jellyrin_auth_test_{}", Uuid::new_v4().simple());
-            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
                 .execute(&administration_pool)
                 .await
                 .expect("failed to create isolated PostgreSQL auth-test schema");
@@ -1212,10 +1212,13 @@ mod tests {
 
         async fn cleanup(self) {
             self.database.close().await;
-            sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
-                .execute(&self.administration_pool)
-                .await
-                .expect("failed to remove isolated PostgreSQL auth-test schema");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP SCHEMA {} CASCADE",
+                self.schema
+            )))
+            .execute(&self.administration_pool)
+            .await
+            .expect("failed to remove isolated PostgreSQL auth-test schema");
             self.administration_pool.close().await;
         }
     }
