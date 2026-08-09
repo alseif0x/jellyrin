@@ -1,4 +1,5 @@
 mod report;
+mod runtime_hygiene;
 mod spec;
 mod value;
 
@@ -23,6 +24,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub use report::{
     FailureReport, ProviderUrlRetentionCounts, ProviderUrlRetentionReport, SchemaReport,
+};
+pub use runtime_hygiene::{
+    RuntimeHygieneAuditOptions, RuntimeHygieneCounts, RuntimeHygieneReport, audit_runtime_hygiene,
 };
 use spec::{
     ColumnKind, MIGRATED_TABLES, OMITTED_TABLES, TARGET_INFRASTRUCTURE_TABLES,

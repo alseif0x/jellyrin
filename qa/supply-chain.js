@@ -28,6 +28,7 @@ async function main() {
     nginx,
     ffmpegSmoke,
     runtimeSmoke,
+    runtimeHygieneAudit,
     ffmpegSecurityBaseline,
   ] = await Promise.all([
     read('ops/supply-chain.lock.env'),
@@ -51,6 +52,7 @@ async function main() {
     read('ops/nginx-jellyrin.test.kode.live.conf.example'),
     read('qa/ffmpeg-remux-smoke.sh'),
     read('qa/runtime-container-smoke.sh'),
+    read('ops/audit-runtime-hygiene.sh'),
     read('ops/ffmpeg-security-baseline.txt'),
   ]);
   const cargoLock = await read('Cargo.lock');
@@ -319,6 +321,16 @@ async function main() {
       'ci-runs-provider-url-retention-gate',
       workflow.includes('jellyrin-migrate -- audit-source-hygiene') &&
         workflow.includes('JELLYRIN_TEST_POSTGRES_URL'),
+    ),
+    check(
+      'runtime-hygiene-audit-is-counts-only-and-fail-closed',
+      runtimeHygieneAudit.includes('audit-runtime-hygiene') &&
+        runtimeHygieneAudit.includes('--relay-port') &&
+        runtimeHygieneAudit.includes('journalctl') &&
+        runtimeHygieneAudit.includes('cgroup.procs') &&
+        runtimeHygieneAudit.includes('status=3') &&
+        workflow.includes('node qa/runtime-hygiene-smoke.js') &&
+        checklist.includes('ops/audit-runtime-hygiene.sh'),
     ),
     check(
       'vulnerability-exceptions-are-governed',

@@ -1170,6 +1170,7 @@ dependencies = [
  "clap",
  "futures-util",
  "jellyrin-db",
+ "libc",
  "serde",
  "serde_json",
  "serial_test",
@@ -1179,6 +1180,7 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use jellyrin_migrate::{
-    FailureReport, MigrationOptions, ProviderUrlAuditOptions, apply_schema,
-    audit_provider_url_retention, execute,
+    FailureReport, MigrationOptions, ProviderUrlAuditOptions, RuntimeHygieneAuditOptions,
+    apply_schema, audit_provider_url_retention, audit_runtime_hygiene, execute,
 };
 use serde::Serialize;
 
@@ -31,6 +31,9 @@ enum Command {
     /// Count credential-bearing legacy provider locations without printing their contents.
     #[command(alias = "audit-provider-urls")]
     AuditSourceHygiene(AuditSourceHygieneArgs),
+
+    /// Scan logs and process argv snapshots without printing credential-bearing contents.
+    AuditRuntimeHygiene(AuditRuntimeHygieneArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -78,6 +81,25 @@ struct AuditSourceHygieneArgs {
     report: Option<PathBuf>,
 }
 
+#[derive(Debug, ClapArgs)]
+struct AuditRuntimeHygieneArgs {
+    /// Regular log file to scan. Repeat for every required source; symlinks are rejected.
+    #[arg(long = "log", value_name = "PATH")]
+    logs: Vec<PathBuf>,
+
+    /// Regular NUL-delimited /proc/<pid>/cmdline snapshot. Repeat for each process.
+    #[arg(long = "argv", value_name = "PATH")]
+    argv: Vec<PathBuf>,
+
+    /// Exact Jellyrin loopback relay port. Required whenever --argv is supplied.
+    #[arg(long, value_name = "PORT")]
+    relay_port: Option<u16>,
+
+    /// Also write the counts-only JSON report to this path.
+    #[arg(long, value_name = "JSON_PATH")]
+    report: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -105,6 +127,29 @@ async fn main() {
             {
                 Ok(report) => {
                     let exit_code = provider_url_audit_exit_code(&report);
+                    match emit_success(&report, args.report).await {
+                        Ok(()) if exit_code == 0 => Ok(()),
+                        Ok(()) => std::process::exit(exit_code),
+                        Err(error) => {
+                            emit_failure(&redact_error(&error));
+                            std::process::exit(3);
+                        }
+                    }
+                }
+                Err(error) => {
+                    emit_failure(&redact_error(&error.to_string()));
+                    std::process::exit(3);
+                }
+            }
+        }
+        Command::AuditRuntimeHygiene(args) => {
+            match audit_runtime_hygiene(RuntimeHygieneAuditOptions {
+                log_files: args.logs,
+                argv_files: args.argv,
+                relay_port: args.relay_port,
+            }) {
+                Ok(report) => {
+                    let exit_code = report.exit_code();
                     match emit_success(&report, args.report).await {
                         Ok(()) if exit_code == 0 => Ok(()),
                         Ok(()) => std::process::exit(exit_code),
@@ -192,6 +237,23 @@ mod tests {
         assert!(matches!(
             data.command,
             Command::Data(DataArgs { dry_run: true, .. })
+        ));
+
+        let runtime_audit = Args::try_parse_from([
+            "jellyrin-migrate",
+            "audit-runtime-hygiene",
+            "--log",
+            "/var/log/jellyrin/server.log",
+            "--argv",
+            "/proc/123/cmdline",
+            "--relay-port",
+            "8096",
+        ])
+        .unwrap();
+        assert!(matches!(
+            runtime_audit.command,
+            Command::AuditRuntimeHygiene(AuditRuntimeHygieneArgs { logs, argv, .. })
+                if logs.len() == 1 && argv.len() == 1
         ));
 
         let schema = Args::try_parse_from([

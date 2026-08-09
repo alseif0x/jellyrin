@@ -91,6 +91,28 @@ snapshot and emits counts only—never IDs, metadata or URLs. Exit status is `0`
 when clean, `2` for findings and `3` if the scan cannot complete. Re-import on
 findings; do not redact rows in place.
 
+The database report is necessary but does not cover transient process arguments
+or logs. With ingress closed at the recorded rollout boundary and a controlled
+FFmpeg/ffprobe playback still active, run as root:
+
+```bash
+ops/audit-runtime-hygiene.sh \
+  --since 2026-08-09T00:00:00Z \
+  --relay-port 8096 \
+  --report /root/jellyrin-runtime-hygiene.json
+```
+
+The wrapper snapshots the unit journal and every current cgroup `cmdline`, then
+scans those plus regular Jellyrin and path-only Nginx logs. Symlinks, unreadable
+or changing sources, an incomplete NUL-delimited argv, oversized input, a failed
+journal/cgroup snapshot, or no process make the audit incomplete. HTTP(S) in a
+FFmpeg/ffprobe argument is rejected except for the exact `http` loopback relay,
+configured port, fixed internal path and 43-character opaque token. Userinfo,
+sensitive query keys and Xtream credential paths are rejected everywhere. The
+report contains only counts and timestamps; exit codes are again `0` clean, `2`
+findings and `3` incomplete. A point-in-time cgroup scan does not prove the past,
+so it must be paired with the complete journal/log window.
+
 ## Driver implementations
 
 PostgreSQL already has `live_tv_channels_source_or_provider_reference`, which

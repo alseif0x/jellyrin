@@ -56,6 +56,8 @@ jobs:
         with:
           toolchain: 1.94.0
       - run: cargo test --locked --workspace --all-targets --all-features
+      - name: Verify counts-only runtime hygiene gate
+        run: node qa/runtime-hygiene-smoke.js
 
   postgres-schema:
     name: PostgreSQL schema
