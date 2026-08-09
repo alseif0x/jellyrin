@@ -18970,8 +18970,8 @@ const XTREAM_CONFIG_HTML: &str = r#"<!DOCTYPE html>
     </div>
     <div class="fg">
       <label for="slimit">Series Limit</label>
-      <input type="number" id="slimit" value="250" min="1">
-      <div class="hint">Max series to import (each series is fetched individually)</div>
+      <input type="number" id="slimit" value="0" min="0">
+      <div class="hint">0 = import all series (details are fetched incrementally)</div>
     </div>
   </div>
   <div class="btns">
@@ -19169,7 +19169,7 @@ async function doTest(){
     if(cfg){
       document.getElementById('limit').value=cfg.ChannelLimit||0;
       document.getElementById('mlimit').value=cfg.MovieLimit||0;
-      document.getElementById('slimit').value=cfg.SeriesLimit||250;
+      document.getElementById('slimit').value=cfg.SeriesLimit||0;
       // Restore each saved selection independently (LiveCategoryIds with legacy fallback).
       var savedLive=cfg.LiveCategoryIds&&cfg.LiveCategoryIds.length?cfg.LiveCategoryIds:cfg.CategoryIds;
       if(savedLive&&savedLive.length){
@@ -19218,7 +19218,7 @@ async function doSave(){
       pass=document.getElementById('pass').value,
       lim=+document.getElementById('limit').value||0,
       mlim=+document.getElementById('mlimit').value||0,
-      slim=+document.getElementById('slimit').value||250;
+      slim=+document.getElementById('slimit').value||0;
   var btn=document.getElementById('bSave');btn.disabled=true;btn.innerHTML='<span class="sp"></span> Saving...';
   // Snapshot the schedule NOW, before any await — the config POST is slow
   // (it imports live channels synchronously) and the DOM could change meanwhile.
@@ -19255,7 +19255,7 @@ async function doSave(){
       document.getElementById('pass').value=c.Password||'';
       document.getElementById('limit').value=c.ChannelLimit||0;
       document.getElementById('mlimit').value=c.MovieLimit||0;
-      document.getElementById('slimit').value=c.SeriesLimit||250;
+      document.getElementById('slimit').value=c.SeriesLimit||0;
       var sl=c.LiveCategoryIds&&c.LiveCategoryIds.length?c.LiveCategoryIds:c.CategoryIds;
       if(sl&&sl.length)sl.forEach(function(id){sLive.add(id)});
       if(c.VodCategoryIds&&c.VodCategoryIds.length)c.VodCategoryIds.forEach(function(id){sVod.add(id)});
@@ -19333,7 +19333,7 @@ pub async fn ensure_builtin_xtream_plugin(db: &Database) -> Result<(), ApiError>
             "SeriesCategoryIds": [],
             "ChannelLimit": 0,
             "MovieLimit": 0,
-            "SeriesLimit": 250
+            "SeriesLimit": 0
         }
     });
 

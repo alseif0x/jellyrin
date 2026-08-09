@@ -782,6 +782,46 @@ pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
         reason: "catalog synchronization execution state is not needed for cutover",
     },
     OmittedTableSpec {
+        table: "remote_media_catalog_stages",
+        strategy: "omit_ephemeral",
+        reason: "unfinished provider catalogue staging session",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_libraries",
+        strategy: "omit_ephemeral",
+        reason: "unfinished provider catalogue staging manifest",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_items",
+        strategy: "omit_ephemeral",
+        reason: "unpublished provider catalogue rows",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_facets",
+        strategy: "omit_ephemeral",
+        reason: "unpublished derived catalogue facets",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_facet_aliases",
+        strategy: "omit_ephemeral",
+        reason: "unpublished derived catalogue facet aliases",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_genre_selectors",
+        strategy: "omit_ephemeral",
+        reason: "unpublished derived catalogue genre selectors",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_filter_selectors",
+        strategy: "omit_ephemeral",
+        reason: "unpublished derived catalogue filter selectors",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_upcoming_dates",
+        strategy: "omit_ephemeral",
+        reason: "unpublished derived catalogue upcoming dates",
+    },
+    OmittedTableSpec {
         table: "package_catalog_cache",
         strategy: "rebuild",
         reason: "remote package cache",

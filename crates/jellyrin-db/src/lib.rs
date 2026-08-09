@@ -771,6 +771,121 @@ pub struct RemoteMediaLibrarySnapshot {
     pub items: Vec<RemoteMediaItemUpsert>,
 }
 
+/// Maximum number of provider-owned media items accepted by one durable stage append.
+///
+/// Keeping this public lets producers bound their buffers to the same contract enforced by both
+/// database adapters. An empty append is rejected as a caller error.
+pub const REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS: usize = 1_000;
+/// Maximum retained item count for each movies/series library in one durable stage.
+pub const REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS: usize = 1_000_000;
+
+/// Opaque handle for one durable, not-yet-visible remote media catalogue generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMediaCatalogStage {
+    id: String,
+}
+
+impl RemoteMediaCatalogStage {
+    fn new(id: Uuid) -> Self {
+        Self { id: id.to_string() }
+    }
+
+    /// Reconstruct an opaque handle received from a trusted scheduling boundary.
+    pub fn try_from_id(id: impl AsRef<str>) -> anyhow::Result<Self> {
+        let id =
+            Uuid::parse_str(id.as_ref()).context("invalid remote media catalogue stage handle")?;
+        Ok(Self::new(id))
+    }
+
+    /// Stable opaque identifier suitable for diagnostics that do not include provider secrets.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn parsed_id(&self) -> anyhow::Result<Uuid> {
+        Uuid::parse_str(&self.id).context("invalid remote media catalogue stage handle")
+    }
+}
+
+/// One named library slot belonging to a durable remote media catalogue stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMediaLibraryStageSpec {
+    pub key: String,
+    pub library_name: String,
+    pub collection_type: String,
+    pub source_location: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRemoteMediaLibraryStageSpec {
+    key: String,
+    position: i16,
+    library_name: String,
+    collection_type: String,
+    source_location: String,
+}
+
+fn prepare_remote_media_library_stage_specs(
+    specs: Vec<RemoteMediaLibraryStageSpec>,
+) -> anyhow::Result<Vec<PreparedRemoteMediaLibraryStageSpec>> {
+    anyhow::ensure!(
+        specs.len() == 2,
+        "remote media catalogue stage requires exactly two libraries"
+    );
+    let mut prepared = Vec::with_capacity(2);
+    let mut keys = HashSet::with_capacity(2);
+    let mut names = HashSet::with_capacity(2);
+    for spec in specs {
+        let position = match spec.key.as_str() {
+            "movies" => 0,
+            "series" => 1,
+            _ => {
+                anyhow::bail!("remote media catalogue stage keys must be exactly movies and series")
+            }
+        };
+        anyhow::ensure!(
+            keys.insert(spec.key.clone()),
+            "remote media catalogue stage contains duplicate library keys"
+        );
+        let library_name = spec.library_name.trim().to_owned();
+        anyhow::ensure!(
+            !library_name.is_empty(),
+            "remote media catalogue stage library name must not be empty"
+        );
+        anyhow::ensure!(
+            names.insert(library_name.to_ascii_lowercase()),
+            "remote media catalogue stage contains duplicate library names"
+        );
+        prepared.push(PreparedRemoteMediaLibraryStageSpec {
+            key: spec.key,
+            position,
+            library_name,
+            collection_type: spec.collection_type.trim().to_owned(),
+            source_location: spec.source_location.trim().to_owned(),
+        });
+    }
+    anyhow::ensure!(
+        keys.contains("movies") && keys.contains("series"),
+        "remote media catalogue stage requires movies and series libraries"
+    );
+    prepared.sort_unstable_by_key(|spec| spec.position);
+    Ok(prepared)
+}
+
+fn validate_remote_media_catalog_stage_append(
+    items: &[RemoteMediaItemUpsert],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !items.is_empty(),
+        "remote media catalogue stage append must not be empty"
+    );
+    anyhow::ensure!(
+        items.len() <= REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
+        "remote media catalogue stage append exceeds its item limit"
+    );
+    Ok(())
+}
+
 #[cfg(any(test, feature = "sqlite"))]
 struct PreparedSqliteRemoteMediaItem {
     id: String,
@@ -807,30 +922,37 @@ impl TryFrom<RemoteMediaLibrarySnapshot> for PreparedSqliteRemoteMediaLibrarySna
         let items = snapshot
             .items
             .into_iter()
-            .map(|item| {
-                let raw_id = item.id.trim();
-                Ok(PreparedSqliteRemoteMediaItem {
-                    id: Uuid::parse_str(raw_id)
-                        .with_context(|| format!("invalid remote media item id: {raw_id}"))?
-                        .to_string(),
-                    name: item.name.trim().to_owned(),
-                    path: item.path.trim().to_owned(),
-                    media_type: item.media_type.trim().to_owned(),
-                    collection_type: item.collection_type.trim().to_owned(),
-                    runtime_ticks: item.runtime_ticks,
-                    bitrate: item.bitrate,
-                    width: item.width,
-                    height: item.height,
-                    media_streams_json: serde_json::to_string(&item.media_streams)?,
-                    metadata_json: serde_json::to_string(&item.metadata)?,
-                })
-            })
+            .map(PreparedSqliteRemoteMediaItem::try_from)
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             library_name,
             collection_type: snapshot.collection_type.trim().to_owned(),
             source_location: snapshot.source_location.trim().to_owned(),
             items,
+        })
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl TryFrom<RemoteMediaItemUpsert> for PreparedSqliteRemoteMediaItem {
+    type Error = anyhow::Error;
+
+    fn try_from(item: RemoteMediaItemUpsert) -> Result<Self, Self::Error> {
+        let raw_id = item.id.trim();
+        Ok(Self {
+            id: Uuid::parse_str(raw_id)
+                .with_context(|| format!("invalid remote media item id: {raw_id}"))?
+                .to_string(),
+            name: item.name.trim().to_owned(),
+            path: item.path.trim().to_owned(),
+            media_type: item.media_type.trim().to_owned(),
+            collection_type: item.collection_type.trim().to_owned(),
+            runtime_ticks: item.runtime_ticks,
+            bitrate: item.bitrate,
+            width: item.width,
+            height: item.height,
+            media_streams_json: serde_json::to_string(&item.media_streams)?,
+            metadata_json: serde_json::to_string(&item.metadata)?,
         })
     }
 }
@@ -1578,6 +1700,43 @@ pub trait XtreamCatalogStore: DatabaseBackend {
         snapshots: Vec<RemoteMediaLibrarySnapshot>,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<VirtualFolder>>> + Send;
 
+    fn begin_remote_media_catalog_stage(
+        &self,
+        _libraries: Vec<RemoteMediaLibraryStageSpec>,
+    ) -> impl std::future::Future<Output = anyhow::Result<RemoteMediaCatalogStage>> + Send {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
+    fn append_remote_media_catalog_stage<'a>(
+        &'a self,
+        _stage: &'a RemoteMediaCatalogStage,
+        _library_key: &'a str,
+        _items: Vec<RemoteMediaItemUpsert>,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
+    fn publish_remote_media_catalog_stage<'a>(
+        &'a self,
+        _stage: &'a RemoteMediaCatalogStage,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<VirtualFolder>>> + Send + 'a {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
+    fn abort_remote_media_catalog_stage<'a>(
+        &'a self,
+        _stage: &'a RemoteMediaCatalogStage,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
+    fn cleanup_abandoned_remote_media_catalog_stages(
+        &self,
+        _older_than: OffsetDateTime,
+    ) -> impl std::future::Future<Output = anyhow::Result<u64>> + Send {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
     fn live_tv_tuner_configurations_by_provider(
         &self,
         provider_type: &str,
@@ -1592,6 +1751,45 @@ macro_rules! impl_xtream_catalog_store {
                 snapshots: Vec<RemoteMediaLibrarySnapshot>,
             ) -> impl std::future::Future<Output = anyhow::Result<Vec<VirtualFolder>>> + Send {
                 <$database>::replace_remote_media_library_snapshots(self, snapshots)
+            }
+
+            fn begin_remote_media_catalog_stage(
+                &self,
+                libraries: Vec<RemoteMediaLibraryStageSpec>,
+            ) -> impl std::future::Future<Output = anyhow::Result<RemoteMediaCatalogStage>> + Send
+            {
+                <$database>::begin_remote_media_catalog_stage(self, libraries)
+            }
+
+            fn append_remote_media_catalog_stage<'a>(
+                &'a self,
+                stage: &'a RemoteMediaCatalogStage,
+                library_key: &'a str,
+                items: Vec<RemoteMediaItemUpsert>,
+            ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+                <$database>::append_remote_media_catalog_stage(self, stage, library_key, items)
+            }
+
+            fn publish_remote_media_catalog_stage<'a>(
+                &'a self,
+                stage: &'a RemoteMediaCatalogStage,
+            ) -> impl std::future::Future<Output = anyhow::Result<Vec<VirtualFolder>>> + Send + 'a
+            {
+                <$database>::publish_remote_media_catalog_stage(self, stage)
+            }
+
+            fn abort_remote_media_catalog_stage<'a>(
+                &'a self,
+                stage: &'a RemoteMediaCatalogStage,
+            ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+                <$database>::abort_remote_media_catalog_stage(self, stage)
+            }
+
+            fn cleanup_abandoned_remote_media_catalog_stages(
+                &self,
+                older_than: OffsetDateTime,
+            ) -> impl std::future::Future<Output = anyhow::Result<u64>> + Send {
+                <$database>::cleanup_abandoned_remote_media_catalog_stages(self, older_than)
             }
 
             fn live_tv_tuner_configurations_by_provider(
@@ -8343,6 +8541,583 @@ impl SqliteDatabase {
         replace_sqlite_media_item_facets(tx, item_id, metadata).await
     }
 
+    pub async fn begin_remote_media_catalog_stage(
+        &self,
+        libraries: Vec<RemoteMediaLibraryStageSpec>,
+    ) -> anyhow::Result<RemoteMediaCatalogStage> {
+        let libraries = prepare_remote_media_library_stage_specs(libraries)?;
+        let stage = RemoteMediaCatalogStage::new(Uuid::new_v4());
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO remote_media_catalog_stages (
+                id, status, extractor_version, created_at, updated_at
+            )
+            VALUES (?1, 'open', ?2, ?3, ?3)
+            "#,
+        )
+        .bind(stage.id())
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        for library in libraries {
+            sqlx::query(
+                r#"
+                INSERT INTO remote_media_catalog_stage_libraries (
+                    stage_id, library_key, position, library_name,
+                    collection_type, source_location
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )
+            .bind(stage.id())
+            .bind(library.key)
+            .bind(library.position)
+            .bind(library.library_name)
+            .bind(library.collection_type)
+            .bind(library.source_location)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(stage)
+    }
+
+    pub async fn append_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+        library_key: &str,
+        items: Vec<RemoteMediaItemUpsert>,
+    ) -> anyhow::Result<()> {
+        validate_remote_media_catalog_stage_append(&items)?;
+        anyhow::ensure!(
+            matches!(library_key, "movies" | "series"),
+            "remote media catalogue stage library key must be movies or series"
+        );
+        stage.parsed_id()?;
+        let prepared = items
+            .into_iter()
+            .map(PreparedSqliteRemoteMediaItem::try_from)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query(
+            "UPDATE remote_media_catalog_stages SET updated_at = updated_at WHERE id = ?1",
+        )
+        .bind(stage.id())
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            locked.rows_affected() == 1,
+            "remote media catalogue stage not found"
+        );
+        let (status, extractor_version) = sqlx::query_as::<_, (String, i32)>(
+            "SELECT status, extractor_version FROM remote_media_catalog_stages WHERE id = ?1",
+        )
+        .bind(stage.id())
+        .fetch_one(&mut *tx)
+        .await?;
+        anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
+        anyhow::ensure!(
+            extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
+            "remote media catalogue stage extractor version is stale"
+        );
+        let appended_count = i64::try_from(prepared.len())
+            .context("remote media catalogue stage append count overflow")?;
+        let count_update = sqlx::query(
+            r#"
+            UPDATE remote_media_catalog_stage_libraries
+            SET item_count = item_count + ?3
+            WHERE stage_id = ?1 AND library_key = ?2
+              AND item_count + ?3 <= ?4
+            "#,
+        )
+        .bind(stage.id())
+        .bind(library_key)
+        .bind(appended_count)
+        .bind(
+            i64::try_from(REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS)
+                .context("remote media catalogue stage library limit overflow")?,
+        )
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            count_update.rows_affected() == 1,
+            "remote media catalogue stage library was not found or exceeded its item limit"
+        );
+
+        for item in &prepared {
+            sqlx::query(
+                r#"
+                INSERT INTO remote_media_catalog_stage_items (
+                    stage_id, library_key, id, name, path, media_type, collection_type,
+                    runtime_ticks, bitrate, width, height, media_streams_json, metadata_json
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+            )
+            .bind(stage.id())
+            .bind(library_key)
+            .bind(&item.id)
+            .bind(&item.name)
+            .bind(&item.path)
+            .bind(&item.media_type)
+            .bind(&item.collection_type)
+            .bind(item.runtime_ticks)
+            .bind(item.bitrate)
+            .bind(item.width)
+            .bind(item.height)
+            .bind(&item.media_streams_json)
+            .bind(&item.metadata_json)
+            .execute(&mut *tx)
+            .await?;
+
+            let metadata = serde_json::from_str::<Value>(&item.metadata_json)
+                .with_context(|| format!("invalid metadata JSON for media item {}", item.id))?;
+            let facets = extract_media_item_facets(&metadata);
+            for facet in &facets {
+                let position = i64::from(facet.position);
+                sqlx::query(
+                    r#"
+                    INSERT INTO remote_media_catalog_stage_facets (
+                        stage_id, item_id, facet_kind, normalized_value, display_value,
+                        stable_id, position, payload_json
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#,
+                )
+                .bind(stage.id())
+                .bind(&item.id)
+                .bind(facet.kind.as_str())
+                .bind(&facet.normalized_value)
+                .bind(&facet.display_value)
+                .bind(&facet.stable_id)
+                .bind(position)
+                .bind(serde_json::to_string(&facet.payload)?)
+                .execute(&mut *tx)
+                .await?;
+                for alias in &facet.aliases {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO remote_media_catalog_stage_facet_aliases (
+                            stage_id, item_id, facet_kind, normalized_value, entity_id
+                        )
+                        VALUES (?1, ?2, ?3, ?4, ?5)
+                        "#,
+                    )
+                    .bind(stage.id())
+                    .bind(&item.id)
+                    .bind(facet.kind.as_str())
+                    .bind(&facet.normalized_value)
+                    .bind(alias)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            for selector in extract_media_item_genre_selectors(&metadata) {
+                sqlx::query(
+                    "INSERT INTO remote_media_catalog_stage_genre_selectors \
+                     (stage_id, item_id, selector) VALUES (?1, ?2, ?3)",
+                )
+                .bind(stage.id())
+                .bind(&item.id)
+                .bind(selector)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for (kind, selector) in extract_media_item_filter_selectors(&metadata) {
+                sqlx::query(
+                    "INSERT INTO remote_media_catalog_stage_filter_selectors \
+                     (stage_id, item_id, selector_kind, selector) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .bind(stage.id())
+                .bind(&item.id)
+                .bind(kind.as_str())
+                .bind(selector)
+                .execute(&mut *tx)
+                .await?;
+            }
+            if let Some((unix_seconds, nanosecond)) = upcoming_media_item_premiere_parts(&metadata)
+            {
+                sqlx::query(
+                    "INSERT INTO remote_media_catalog_stage_upcoming_dates \
+                     (stage_id, item_id, unix_seconds, nanosecond) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .bind(stage.id())
+                .bind(&item.id)
+                .bind(unix_seconds)
+                .bind(nanosecond)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        sqlx::query("UPDATE remote_media_catalog_stages SET updated_at = ?1 WHERE id = ?2")
+            .bind(now)
+            .bind(stage.id())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn abort_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+    ) -> anyhow::Result<()> {
+        stage.parsed_id()?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query(
+            "UPDATE remote_media_catalog_stages SET updated_at = updated_at WHERE id = ?1",
+        )
+        .bind(stage.id())
+        .execute(&mut *tx)
+        .await?;
+        if locked.rows_affected() == 1 {
+            let (status, _extractor_version) = sqlx::query_as::<_, (String, i32)>(
+                "SELECT status, extractor_version \
+                 FROM remote_media_catalog_stages WHERE id = ?1",
+            )
+            .bind(stage.id())
+            .fetch_one(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                status != "publishing",
+                "remote media catalogue stage is publishing"
+            );
+            sqlx::query(
+                "UPDATE remote_media_catalog_stages SET status = 'aborted', updated_at = ?1 \
+                 WHERE id = ?2",
+            )
+            .bind(now)
+            .bind(stage.id())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM remote_media_catalog_stages WHERE id = ?1")
+                .bind(stage.id())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn cleanup_abandoned_remote_media_catalog_stages(
+        &self,
+        older_than: OffsetDateTime,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM remote_media_catalog_stages \
+             WHERE status IN ('open', 'aborted') AND updated_at < ?1",
+        )
+        .bind(format_time(older_than)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn publish_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+    ) -> anyhow::Result<Vec<VirtualFolder>> {
+        stage.parsed_id()?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query(
+            "UPDATE remote_media_catalog_stages \
+             SET status = 'publishing', updated_at = ?1 \
+             WHERE id = ?2 AND status = 'open' AND extractor_version = ?3",
+        )
+        .bind(&now)
+        .bind(stage.id())
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .execute(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            locked.rows_affected() == 1,
+            "remote media catalogue stage was not open or its extractor version is stale"
+        );
+        let rows = sqlx::query_as::<_, (String, i16, String, String, String, i64)>(
+            r#"
+            SELECT library_key, position, library_name, collection_type, source_location,
+                   item_count
+            FROM remote_media_catalog_stage_libraries
+            WHERE stage_id = ?1
+            ORDER BY position
+            "#,
+        )
+        .bind(stage.id())
+        .fetch_all(&mut *tx)
+        .await?;
+        let expected_counts = rows
+            .iter()
+            .map(|(key, _, _, _, _, item_count)| (key.clone(), *item_count))
+            .collect::<HashMap<_, _>>();
+        let libraries = prepare_remote_media_library_stage_specs(
+            rows.into_iter()
+                .map(
+                    |(key, _position, library_name, collection_type, source_location, _count)| {
+                        RemoteMediaLibraryStageSpec {
+                            key,
+                            library_name,
+                            collection_type,
+                            source_location,
+                        }
+                    },
+                )
+                .collect(),
+        )?;
+
+        let mut folders = Vec::with_capacity(2);
+        for library in libraries {
+            let item_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM remote_media_catalog_stage_items \
+                 WHERE stage_id = ?1 AND library_key = ?2",
+            )
+            .bind(stage.id())
+            .bind(&library.key)
+            .fetch_one(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                item_count
+                    == *expected_counts
+                        .get(&library.key)
+                        .context("remote media catalogue stage library count is missing")?,
+                "remote media catalogue stage item count mismatch"
+            );
+
+            let existing_folder_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM virtual_folders WHERE name = ?1 COLLATE NOCASE",
+            )
+            .bind(&library.library_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let folder_id = existing_folder_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            let locations_json =
+                serde_json::to_string(&normalized_locations(vec![library.source_location]))?;
+            sqlx::query(
+                r#"
+                INSERT INTO virtual_folders (
+                    id, name, collection_type, locations_json, created_at, updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                ON CONFLICT(name) DO UPDATE SET
+                    collection_type = excluded.collection_type,
+                    locations_json = excluded.locations_json,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(&folder_id)
+            .bind(&library.library_name)
+            .bind((!library.collection_type.is_empty()).then_some(library.collection_type.as_str()))
+            .bind(locations_json)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+
+            let sync_run_id = Uuid::new_v4().to_string();
+            sqlx::query(
+                r#"
+                INSERT INTO catalog_sync_runs (
+                    id, virtual_folder_id, generation_id, status, item_count, started_at
+                )
+                VALUES (?1, ?2, ?3, 'running', ?4, ?5)
+                "#,
+            )
+            .bind(&sync_run_id)
+            .bind(&folder_id)
+            .bind(Uuid::new_v4().to_string())
+            .bind(item_count)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+
+            let external_conflicts = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)
+                FROM media_items AS current
+                JOIN remote_media_catalog_stage_items AS staged
+                  ON current.id = staged.id OR current.path = staged.path
+                WHERE staged.stage_id = ?1 AND staged.library_key = ?2
+                  AND current.virtual_folder_id <> ?3
+                "#,
+            )
+            .bind(stage.id())
+            .bind(&library.key)
+            .bind(&folder_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                external_conflicts == 0,
+                "remote snapshot contains ids or paths owned by another virtual folder"
+            );
+
+            sqlx::query(
+                r#"
+                UPDATE media_items AS current
+                SET path = CASE
+                        WHEN current.missing_since IS NULL
+                        THEN 'jellyrin-tombstone://sqlite/' || current.id
+                        ELSE current.path
+                    END,
+                    missing_since = COALESCE(current.missing_since, ?1),
+                    updated_at = CASE
+                        WHEN current.missing_since IS NULL THEN ?1
+                        ELSE current.updated_at
+                    END
+                WHERE current.virtual_folder_id = ?2
+                  AND (
+                        NOT EXISTS (
+                            SELECT 1
+                            FROM remote_media_catalog_stage_items AS staged
+                            WHERE staged.stage_id = ?3 AND staged.library_key = ?4
+                              AND staged.id = current.id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM remote_media_catalog_stage_items AS staged
+                            WHERE staged.stage_id = ?3 AND staged.library_key = ?4
+                              AND staged.path = current.path AND staged.id <> current.id
+                        )
+                  )
+                "#,
+            )
+            .bind(&now)
+            .bind(&folder_id)
+            .bind(stage.id())
+            .bind(&library.key)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO media_items (
+                    id, virtual_folder_id, name, path, media_type, collection_type,
+                    created_at, updated_at, last_seen_at, missing_since, file_size, modified_at,
+                    runtime_ticks, bitrate, width, height, media_streams_json, metadata_json
+                )
+                SELECT staged.id, ?1, staged.name, staged.path, staged.media_type,
+                       staged.collection_type, ?2, ?2, ?2, NULL, NULL, NULL,
+                       staged.runtime_ticks, staged.bitrate, staged.width, staged.height,
+                       staged.media_streams_json, staged.metadata_json
+                FROM remote_media_catalog_stage_items AS staged
+                WHERE staged.stage_id = ?3 AND staged.library_key = ?4
+                ON CONFLICT(id) DO UPDATE SET
+                    virtual_folder_id = excluded.virtual_folder_id,
+                    name = excluded.name,
+                    path = excluded.path,
+                    media_type = excluded.media_type,
+                    collection_type = excluded.collection_type,
+                    updated_at = excluded.updated_at,
+                    last_seen_at = excluded.last_seen_at,
+                    missing_since = NULL,
+                    file_size = NULL,
+                    modified_at = NULL,
+                    runtime_ticks = excluded.runtime_ticks,
+                    bitrate = excluded.bitrate,
+                    width = excluded.width,
+                    height = excluded.height,
+                    media_streams_json = excluded.media_streams_json,
+                    metadata_json = excluded.metadata_json
+                WHERE media_items.missing_since IS NOT NULL
+                   OR media_items.virtual_folder_id IS NOT excluded.virtual_folder_id
+                   OR media_items.name IS NOT excluded.name
+                   OR media_items.path IS NOT excluded.path
+                   OR media_items.media_type IS NOT excluded.media_type
+                   OR media_items.collection_type IS NOT excluded.collection_type
+                   OR media_items.runtime_ticks IS NOT excluded.runtime_ticks
+                   OR media_items.bitrate IS NOT excluded.bitrate
+                   OR media_items.width IS NOT excluded.width
+                   OR media_items.height IS NOT excluded.height
+                   OR media_items.media_streams_json IS NOT excluded.media_streams_json
+                   OR media_items.metadata_json IS NOT excluded.metadata_json
+                "#,
+            )
+            .bind(&folder_id)
+            .bind(&now)
+            .bind(stage.id())
+            .bind(&library.key)
+            .execute(&mut *tx)
+            .await?;
+
+            let mut last_item_id = None::<String>;
+            loop {
+                let rows = if let Some(last_item_id) = last_item_id.as_deref() {
+                    sqlx::query_as::<_, (String, String)>(
+                        "SELECT id, metadata_json \
+                         FROM remote_media_catalog_stage_items \
+                         WHERE stage_id = ?1 AND library_key = ?2 AND id > ?3 \
+                         ORDER BY id LIMIT ?4",
+                    )
+                    .bind(stage.id())
+                    .bind(&library.key)
+                    .bind(last_item_id)
+                    .bind(FACET_REBUILD_BATCH_SIZE)
+                    .fetch_all(&mut *tx)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, (String, String)>(
+                        "SELECT id, metadata_json \
+                         FROM remote_media_catalog_stage_items \
+                         WHERE stage_id = ?1 AND library_key = ?2 \
+                         ORDER BY id LIMIT ?3",
+                    )
+                    .bind(stage.id())
+                    .bind(&library.key)
+                    .bind(FACET_REBUILD_BATCH_SIZE)
+                    .fetch_all(&mut *tx)
+                    .await?
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                for (item_id, metadata_json) in &rows {
+                    let metadata =
+                        serde_json::from_str::<Value>(metadata_json).with_context(|| {
+                            format!("invalid metadata JSON for media item {item_id}")
+                        })?;
+                    Self::replace_media_item_facets_in_transaction(&mut tx, item_id, &metadata)
+                        .await?;
+                }
+                last_item_id = rows.last().map(|(item_id, _)| item_id.clone());
+            }
+
+            sqlx::query(
+                "UPDATE catalog_sync_runs SET status = 'completed', completed_at = ?1 \
+                 WHERE id = ?2",
+            )
+            .bind(&now)
+            .bind(&sync_run_id)
+            .execute(&mut *tx)
+            .await?;
+            let row = sqlx::query_as::<_, VirtualFolderRow>(
+                r#"
+                SELECT id, name, collection_type, locations_json, created_at, updated_at
+                FROM virtual_folders
+                WHERE id = ?1
+                "#,
+            )
+            .bind(folder_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            folders.push(row.try_into()?);
+        }
+
+        sqlx::query("DELETE FROM remote_media_catalog_stages WHERE id = ?1")
+            .bind(stage.id())
+            .execute(&mut *tx)
+            .await?;
+        let commit_observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogSyncCommit, DatabasePoolRole::Api);
+        let commit_result = tx.commit().await.map_err(anyhow::Error::from);
+        commit_observation.finish_result(&commit_result, |_| 0);
+        commit_result?;
+        Ok(folders)
+    }
+
     pub async fn replace_remote_media_library_snapshot(
         &self,
         library_name: &str,
@@ -13785,13 +14560,14 @@ mod tests {
         MEDIA_ITEM_FACET_PROJECTION_VERSION, MediaItemCatalogQuery, MediaItemCatalogSearchScope,
         MediaItemFacetCandidateQuery, MediaItemFacetKind, MediaItemFavoriteFilter,
         PluginRuntimeInstanceUpsert, ProviderSecretReference, ProviderSecretVault,
-        RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, ResumeItemsPageQuery, SortDirection,
-        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertActiveViewingSession,
-        UpsertPlaybackState, UpsertTranscodeSession, parse_ffprobe_media_info,
-        parse_local_nfo_metadata,
+        REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS, RemoteMediaItemUpsert,
+        RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, ResumeItemsPageQuery,
+        SortDirection, SystemConfigurationPayloads, UpsertActivePlaybackSession,
+        UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
+        parse_ffprobe_media_info, parse_local_nfo_metadata,
     };
     use serde_json::{Value, json};
-    use time::Duration;
+    use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use uuid::Uuid;
 
     #[test]
@@ -16350,6 +17126,392 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(completed_generations, 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_durable_remote_media_stage_is_invisible_and_publishes_all_projections() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let stage = db
+            .begin_remote_media_catalog_stage(vec![
+                RemoteMediaLibraryStageSpec {
+                    key: "movies".to_string(),
+                    library_name: "Staged Movies".to_string(),
+                    collection_type: "movies".to_string(),
+                    source_location: "xtream://staged/movies".to_string(),
+                },
+                RemoteMediaLibraryStageSpec {
+                    key: "series".to_string(),
+                    library_name: "Staged Series".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    source_location: "xtream://staged/series".to_string(),
+                },
+            ])
+            .await
+            .unwrap();
+        let movie_id = Uuid::new_v4();
+        let episode_id = Uuid::new_v4();
+        let item =
+            |id: Uuid, path: &str, collection_type: &str, metadata: Value| RemoteMediaItemUpsert {
+                id: id.to_string(),
+                name: id.to_string(),
+                path: path.to_string(),
+                media_type: "Video".to_string(),
+                collection_type: collection_type.to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata,
+            };
+        db.append_remote_media_catalog_stage(
+            &stage,
+            "movies",
+            vec![item(
+                movie_id,
+                "xtream://staged/movies/movie.mp4",
+                "movies",
+                json!({
+                    "Genres": ["Drama"],
+                    "People": [{"Name": "Jane Doe", "Id": "person-id"}],
+                    "Studios": ["Studio One"],
+                    "Tags": ["Featured"],
+                    "PremiereDate": "2030-01-01T00:00:00Z"
+                }),
+            )],
+        )
+        .await
+        .unwrap();
+        db.append_remote_media_catalog_stage(
+            &stage,
+            "series",
+            vec![item(
+                episode_id,
+                "xtream://staged/series/show/season-1/episode-1.mp4",
+                "tvshows",
+                json!({"SeriesName": "Show"}),
+            )],
+        )
+        .await
+        .unwrap();
+
+        assert!(db.media_items().await.unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM remote_media_catalog_stage_items WHERE stage_id = ?1"
+            )
+            .bind(stage.id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            2
+        );
+
+        let folders = db.publish_remote_media_catalog_stage(&stage).await.unwrap();
+        assert_eq!(
+            folders
+                .iter()
+                .map(|folder| folder.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Staged Movies", "Staged Series"]
+        );
+        assert_eq!(db.media_items().await.unwrap().len(), 2);
+        for count in [
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_facets WHERE item_id = ?1",
+            )
+            .bind(movie_id.to_string())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_facet_aliases WHERE item_id = ?1",
+            )
+            .bind(movie_id.to_string())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_genre_selectors WHERE item_id = ?1",
+            )
+            .bind(movie_id.to_string())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_filter_selectors WHERE item_id = ?1",
+            )
+            .bind(movie_id.to_string())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_upcoming_dates WHERE item_id = ?1",
+            )
+            .bind(movie_id.to_string())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        ] {
+            assert!(count > 0);
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM remote_media_catalog_stages WHERE id = ?1"
+            )
+            .bind(stage.id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_durable_remote_media_stage_rolls_back_late_publish_failure_and_retries() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let stage = db
+            .begin_remote_media_catalog_stage(vec![
+                RemoteMediaLibraryStageSpec {
+                    key: "series".to_string(),
+                    library_name: "Retry Series".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    source_location: "xtream://retry/series".to_string(),
+                },
+                RemoteMediaLibraryStageSpec {
+                    key: "movies".to_string(),
+                    library_name: "Retry Movies".to_string(),
+                    collection_type: "movies".to_string(),
+                    source_location: "xtream://retry/movies".to_string(),
+                },
+            ])
+            .await
+            .unwrap();
+        let item = |path: &str, collection_type: &str| RemoteMediaItemUpsert {
+            id: Uuid::new_v4().to_string(),
+            name: path.to_string(),
+            path: path.to_string(),
+            media_type: "Video".to_string(),
+            collection_type: collection_type.to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({}),
+        };
+        db.append_remote_media_catalog_stage(
+            &stage,
+            "movies",
+            vec![item("xtream://retry/movies/movie.mp4", "movies")],
+        )
+        .await
+        .unwrap();
+        db.append_remote_media_catalog_stage(
+            &stage,
+            "series",
+            vec![item("xtream://retry/series/episode.mp4", "tvshows")],
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_staged_series_publish
+            BEFORE INSERT ON media_items
+            WHEN NEW.path LIKE 'xtream://retry/series/%'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced late stage failure');
+            END
+            "#,
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(db.publish_remote_media_catalog_stage(&stage).await.is_err());
+        assert!(db.media_items().await.unwrap().is_empty());
+        assert!(db.virtual_folders().await.unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM remote_media_catalog_stages WHERE id = ?1"
+            )
+            .bind(stage.id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            "open"
+        );
+        sqlx::query("DROP TRIGGER fail_staged_series_publish")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.publish_remote_media_catalog_stage(&stage).await.unwrap();
+        assert_eq!(db.media_items().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_durable_remote_media_stage_rejects_duplicates_and_cleans_orphans() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let specs = || {
+            vec![
+                RemoteMediaLibraryStageSpec {
+                    key: "movies".to_string(),
+                    library_name: format!("Cleanup Movies {}", Uuid::new_v4()),
+                    collection_type: "movies".to_string(),
+                    source_location: "xtream://cleanup/movies".to_string(),
+                },
+                RemoteMediaLibraryStageSpec {
+                    key: "series".to_string(),
+                    library_name: format!("Cleanup Series {}", Uuid::new_v4()),
+                    collection_type: "tvshows".to_string(),
+                    source_location: "xtream://cleanup/series".to_string(),
+                },
+            ]
+        };
+        let stage = db.begin_remote_media_catalog_stage(specs()).await.unwrap();
+        let id = Uuid::new_v4();
+        let item = |id: Uuid, path: &str| RemoteMediaItemUpsert {
+            id: id.to_string(),
+            name: path.to_string(),
+            path: path.to_string(),
+            media_type: "Video".to_string(),
+            collection_type: "movies".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({"Genres": ["Drama"]}),
+        };
+        let oversized = (0..=REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS)
+            .map(|index| {
+                item(
+                    Uuid::new_v4(),
+                    &format!("xtream://cleanup/oversized-{index}.mp4"),
+                )
+            })
+            .collect();
+        assert!(
+            db.append_remote_media_catalog_stage(&stage, "series", oversized)
+                .await
+                .is_err()
+        );
+        db.append_remote_media_catalog_stage(
+            &stage,
+            "movies",
+            vec![item(id, "xtream://cleanup/shared.mp4")],
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.append_remote_media_catalog_stage(
+                &stage,
+                "series",
+                vec![item(id, "xtream://cleanup/other.mp4")],
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            db.append_remote_media_catalog_stage(
+                &stage,
+                "series",
+                vec![item(Uuid::new_v4(), "xtream://cleanup/shared.mp4")],
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            db.append_remote_media_catalog_stage(&stage, "series", Vec::new())
+                .await
+                .is_err()
+        );
+
+        let large_stage = db.begin_remote_media_catalog_stage(specs()).await.unwrap();
+        sqlx::query(
+            "UPDATE remote_media_catalog_stage_libraries SET item_count = 100000 \
+             WHERE stage_id = ?1 AND library_key = 'movies'",
+        )
+        .bind(large_stage.id())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.append_remote_media_catalog_stage(
+            &large_stage,
+            "movies",
+            vec![item(
+                Uuid::new_v4(),
+                "xtream://cleanup/above-legacy-cap.mp4",
+            )],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT item_count FROM remote_media_catalog_stage_libraries \
+                 WHERE stage_id = ?1 AND library_key = 'movies'"
+            )
+            .bind(large_stage.id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            100_001
+        );
+        sqlx::query(
+            "UPDATE remote_media_catalog_stage_libraries SET item_count = 1000000 \
+             WHERE stage_id = ?1 AND library_key = 'movies'",
+        )
+        .bind(large_stage.id())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            db.append_remote_media_catalog_stage(
+                &large_stage,
+                "movies",
+                vec![item(Uuid::new_v4(), "xtream://cleanup/over-hard-cap.mp4",)],
+            )
+            .await
+            .is_err()
+        );
+        db.abort_remote_media_catalog_stage(&large_stage)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE remote_media_catalog_stages SET updated_at = '2000-01-01T00:00:00Z' \
+             WHERE id = ?1",
+        )
+        .bind(stage.id())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let publishing = db.begin_remote_media_catalog_stage(specs()).await.unwrap();
+        sqlx::query(
+            "UPDATE remote_media_catalog_stages \
+             SET status = 'publishing', updated_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+        )
+        .bind(publishing.id())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let cutoff = OffsetDateTime::parse("2020-01-01T00:00:00Z", &Rfc3339).unwrap();
+        assert_eq!(
+            db.cleanup_abandoned_remote_media_catalog_stages(cutoff)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM remote_media_catalog_stages WHERE id = ?1"
+            )
+            .bind(publishing.id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

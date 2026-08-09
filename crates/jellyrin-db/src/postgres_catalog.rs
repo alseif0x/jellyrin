@@ -19,11 +19,13 @@ use super::{
     MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetCandidateQuery,
     MediaItemFacetKind, MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary,
     MediaItemForImageTag, MediaItemMetadata, MediaItemQueryFilterValues, PostgresDatabase,
-    RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, SortDirection, catalog_sync_duration_millis,
-    extract_media_item_facets, extract_media_item_filter_selectors,
+    REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, RemoteMediaCatalogStage, RemoteMediaItemUpsert,
+    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection,
+    catalog_sync_duration_millis, extract_media_item_facets, extract_media_item_filter_selectors,
     extract_media_item_genre_selectors, is_upcoming_media_item_entry, nonnegative_count,
-    normalized_facet_query_values, retain_entries_with_effective_types,
-    telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
+    normalized_facet_query_values, prepare_remote_media_library_stage_specs,
+    retain_entries_with_effective_types, telemetry::DatabaseOperation,
+    upcoming_media_item_premiere_parts, validate_remote_media_catalog_stage_append,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -1688,6 +1690,649 @@ impl PostgresDatabase {
         Ok(())
     }
 
+    pub async fn begin_remote_media_catalog_stage(
+        &self,
+        libraries: Vec<RemoteMediaLibraryStageSpec>,
+    ) -> anyhow::Result<RemoteMediaCatalogStage> {
+        let libraries = prepare_remote_media_library_stage_specs(libraries)?;
+        let stage = RemoteMediaCatalogStage::new(Uuid::new_v4());
+        let stage_id = stage.parsed_id()?;
+        let mut tx = self.worker_pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO remote_media_catalog_stages (
+                id, status, extractor_version, created_at, updated_at
+            )
+            VALUES ($1, 'open', $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .bind(stage_id)
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .execute(&mut *tx)
+        .await?;
+        for library in libraries {
+            sqlx::query(
+                r#"
+                INSERT INTO remote_media_catalog_stage_libraries (
+                    stage_id, library_key, position, library_name,
+                    collection_type, source_location
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                "#,
+            )
+            .bind(stage_id)
+            .bind(library.key)
+            .bind(library.position)
+            .bind(library.library_name)
+            .bind(library.collection_type)
+            .bind(library.source_location)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(stage)
+    }
+
+    pub async fn append_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+        library_key: &str,
+        items: Vec<RemoteMediaItemUpsert>,
+    ) -> anyhow::Result<()> {
+        validate_remote_media_catalog_stage_append(&items)?;
+        anyhow::ensure!(
+            matches!(library_key, "movies" | "series"),
+            "remote media catalogue stage library key must be movies or series"
+        );
+        let stage_id = stage.parsed_id()?;
+        let prepared = items
+            .into_iter()
+            .map(PreparedRemoteMediaItem::try_from)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut tx = self.worker_pool.begin().await?;
+        let (status, extractor_version) = sqlx::query_as::<_, (String, i32)>(
+            "SELECT status, extractor_version \
+             FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
+        )
+        .bind(stage_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("remote media catalogue stage not found")?;
+        anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
+        anyhow::ensure!(
+            extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
+            "remote media catalogue stage extractor version is stale"
+        );
+        let appended_count = i64::try_from(prepared.len())
+            .context("remote media catalogue stage append count overflow")?;
+        let staged_item_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            UPDATE remote_media_catalog_stage_libraries
+            SET item_count = item_count + $3
+            WHERE stage_id = $1 AND library_key = $2
+              AND item_count + $3 <= $4
+            RETURNING item_count
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .bind(appended_count)
+        .bind(
+            i64::try_from(REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS)
+                .context("remote media catalogue stage library limit overflow")?,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            staged_item_count.is_some(),
+            "remote media catalogue stage library was not found or exceeded its item limit"
+        );
+
+        let mut item_query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO remote_media_catalog_stage_items (\
+             stage_id, library_key, id, name, path, media_type, collection_type, \
+             runtime_ticks, bitrate, width, height, media_streams, metadata) ",
+        );
+        item_query.push_values(&prepared, |mut values, item| {
+            values
+                .push_bind(stage_id)
+                .push_bind(library_key)
+                .push_bind(item.id)
+                .push_bind(&item.name)
+                .push_bind(&item.path)
+                .push_bind(&item.media_type)
+                .push_bind(&item.collection_type)
+                .push_bind(item.runtime_ticks)
+                .push_bind(item.bitrate)
+                .push_bind(item.width)
+                .push_bind(item.height)
+                .push_bind(&item.media_streams)
+                .push_bind(&item.metadata);
+        });
+        item_query.build().execute(&mut *tx).await?;
+
+        let mut facets = Vec::new();
+        for item in &prepared {
+            for facet in extract_media_item_facets(&item.metadata) {
+                let position =
+                    i32::try_from(facet.position).context("media item facet position overflow")?;
+                facets.push((item.id, facet, position));
+            }
+        }
+        for chunk in facets.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO remote_media_catalog_stage_facets (\
+                 stage_id, item_id, facet_kind, normalized_value, display_value, stable_id, \
+                 position, payload) ",
+            );
+            query.push_values(chunk, |mut values, (item_id, facet, position)| {
+                values
+                    .push_bind(stage_id)
+                    .push_bind(*item_id)
+                    .push_bind(facet.kind.as_str())
+                    .push_bind(&facet.normalized_value)
+                    .push_bind(&facet.display_value)
+                    .push_bind(&facet.stable_id)
+                    .push_bind(*position)
+                    .push_bind(&facet.payload);
+            });
+            query.build().execute(&mut *tx).await?;
+        }
+        let aliases = facets
+            .iter()
+            .flat_map(|(item_id, facet, _)| {
+                facet.aliases.iter().map(move |alias| {
+                    (
+                        *item_id,
+                        facet.kind,
+                        facet.normalized_value.as_str(),
+                        alias.as_str(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for chunk in aliases.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO remote_media_catalog_stage_facet_aliases (\
+                 stage_id, item_id, facet_kind, normalized_value, entity_id) ",
+            );
+            query.push_values(
+                chunk,
+                |mut values, (item_id, kind, normalized_value, entity_id)| {
+                    values
+                        .push_bind(stage_id)
+                        .push_bind(*item_id)
+                        .push_bind(kind.as_str())
+                        .push_bind(*normalized_value)
+                        .push_bind(*entity_id);
+                },
+            );
+            query.build().execute(&mut *tx).await?;
+        }
+
+        let genre_selectors = prepared
+            .iter()
+            .flat_map(|item| {
+                extract_media_item_genre_selectors(&item.metadata)
+                    .into_iter()
+                    .map(move |selector| (item.id, selector))
+            })
+            .collect::<Vec<_>>();
+        for chunk in genre_selectors.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO remote_media_catalog_stage_genre_selectors \
+                 (stage_id, item_id, selector) ",
+            );
+            query.push_values(chunk, |mut values, (item_id, selector)| {
+                values
+                    .push_bind(stage_id)
+                    .push_bind(*item_id)
+                    .push_bind(selector);
+            });
+            query.build().execute(&mut *tx).await?;
+        }
+
+        let filter_selectors = prepared
+            .iter()
+            .flat_map(|item| {
+                extract_media_item_filter_selectors(&item.metadata)
+                    .into_iter()
+                    .map(move |(kind, selector)| (item.id, kind, selector))
+            })
+            .collect::<Vec<_>>();
+        for chunk in filter_selectors.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO remote_media_catalog_stage_filter_selectors \
+                 (stage_id, item_id, selector_kind, selector) ",
+            );
+            query.push_values(chunk, |mut values, (item_id, kind, selector)| {
+                values
+                    .push_bind(stage_id)
+                    .push_bind(*item_id)
+                    .push_bind(kind.as_str())
+                    .push_bind(selector);
+            });
+            query.build().execute(&mut *tx).await?;
+        }
+
+        let upcoming_dates = prepared
+            .iter()
+            .filter_map(|item| {
+                upcoming_media_item_premiere_parts(&item.metadata)
+                    .map(|(unix_seconds, nanosecond)| (item.id, unix_seconds, nanosecond))
+            })
+            .collect::<Vec<_>>();
+        for chunk in upcoming_dates.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO remote_media_catalog_stage_upcoming_dates \
+                 (stage_id, item_id, unix_seconds, nanosecond) ",
+            );
+            query.push_values(chunk, |mut values, (item_id, unix_seconds, nanosecond)| {
+                values
+                    .push_bind(stage_id)
+                    .push_bind(*item_id)
+                    .push_bind(*unix_seconds)
+                    .push_bind(*nanosecond);
+            });
+            query.build().execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "UPDATE remote_media_catalog_stages SET updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+        )
+        .bind(stage_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn abort_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+    ) -> anyhow::Result<()> {
+        let stage_id = stage.parsed_id()?;
+        let mut tx = self.worker_pool.begin().await?;
+        let stage_state = sqlx::query_as::<_, (String, i32)>(
+            "SELECT status, extractor_version \
+             FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
+        )
+        .bind(stage_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((status, _extractor_version)) = stage_state {
+            anyhow::ensure!(
+                status != "publishing",
+                "remote media catalogue stage is publishing"
+            );
+            sqlx::query(
+                "UPDATE remote_media_catalog_stages \
+                 SET status = 'aborted', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+            )
+            .bind(stage_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM remote_media_catalog_stages WHERE id = $1")
+                .bind(stage_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn cleanup_abandoned_remote_media_catalog_stages(
+        &self,
+        older_than: OffsetDateTime,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM remote_media_catalog_stages
+            WHERE status IN ('open', 'aborted') AND updated_at < $1
+            "#,
+        )
+        .bind(older_than)
+        .execute(&self.worker_pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn publish_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+    ) -> anyhow::Result<Vec<VirtualFolder>> {
+        let stage_id = stage.parsed_id()?;
+        let mut tx = self.worker_pool.begin().await?;
+        let (status, extractor_version) = sqlx::query_as::<_, (String, i32)>(
+            "SELECT status, extractor_version \
+             FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
+        )
+        .bind(stage_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .context("remote media catalogue stage not found")?;
+        anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
+        anyhow::ensure!(
+            extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
+            "remote media catalogue stage extractor version is stale"
+        );
+        let rows = sqlx::query_as::<_, (String, i16, String, String, String, i64)>(
+            r#"
+            SELECT library_key, position, library_name, collection_type, source_location,
+                   item_count
+            FROM remote_media_catalog_stage_libraries
+            WHERE stage_id = $1
+            ORDER BY position
+            "#,
+        )
+        .bind(stage_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let expected_counts = rows
+            .iter()
+            .map(|(key, _, _, _, _, item_count)| (key.clone(), *item_count))
+            .collect::<HashMap<_, _>>();
+        let libraries = prepare_remote_media_library_stage_specs(
+            rows.into_iter()
+                .map(
+                    |(key, _position, library_name, collection_type, source_location, _count)| {
+                        RemoteMediaLibraryStageSpec {
+                            key,
+                            library_name,
+                            collection_type,
+                            source_location,
+                        }
+                    },
+                )
+                .collect(),
+        )?;
+        sqlx::query(
+            "UPDATE remote_media_catalog_stages \
+             SET status = 'publishing', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+        )
+        .bind(stage_id)
+        .execute(&mut *tx)
+        .await?;
+
+        let mut lock_names = libraries
+            .iter()
+            .map(|library| library.library_name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        lock_names.sort_unstable();
+        for lock_name in lock_names {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(lock_name)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let mut folders = Vec::with_capacity(2);
+        for library in libraries {
+            let item_count = Self::load_durable_remote_media_stage_library_in_transaction(
+                &mut tx,
+                stage_id,
+                &library.key,
+            )
+            .await?;
+            anyhow::ensure!(
+                i64::try_from(item_count).context("remote snapshot item count overflow")?
+                    == *expected_counts
+                        .get(&library.key)
+                        .context("remote media catalogue stage library count is missing")?,
+                "remote media catalogue stage item count mismatch"
+            );
+            let folder_row = sqlx::query_as::<_, PostgresVirtualFolderRow>(
+                r#"
+                INSERT INTO virtual_folders (
+                    id, name, collection_type, locations, created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT ((lower(name))) DO UPDATE SET
+                    collection_type = excluded.collection_type,
+                    locations = excluded.locations,
+                    updated_at = excluded.updated_at
+                RETURNING id, name, collection_type, locations, created_at, updated_at
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(&library.library_name)
+            .bind(trimmed_optional_str(Some(&library.collection_type)))
+            .bind(serde_json::to_value(normalized_locations(vec![
+                library.source_location,
+            ]))?)
+            .fetch_one(&mut *tx)
+            .await?;
+            let sync_run_id = Uuid::new_v4();
+            sqlx::query(
+                r#"
+                INSERT INTO catalog_sync_runs (
+                    id, virtual_folder_id, generation_id, status, item_count, started_at
+                )
+                VALUES ($1, $2, $3, 'running', $4, CURRENT_TIMESTAMP)
+                "#,
+            )
+            .bind(sync_run_id)
+            .bind(folder_row.id)
+            .bind(Uuid::new_v4())
+            .bind(i64::try_from(item_count).context("remote snapshot item count overflow")?)
+            .execute(&mut *tx)
+            .await?;
+            folders.push(
+                self.publish_prepared_remote_media_library_stage_in_transaction(
+                    &mut tx,
+                    folder_row,
+                    sync_run_id,
+                )
+                .await?,
+            );
+        }
+        sqlx::query("DELETE FROM remote_media_catalog_stages WHERE id = $1")
+            .bind(stage_id)
+            .execute(&mut *tx)
+            .await?;
+        let commit_observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogSyncCommit,
+            DatabasePoolRole::Worker,
+        );
+        let commit_result = tx.commit().await.map_err(anyhow::Error::from);
+        commit_observation.finish_result(&commit_result, |_| 0);
+        commit_result?;
+        Ok(folders)
+    }
+
+    async fn load_durable_remote_media_stage_library_in_transaction(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        stage_id: Uuid,
+        library_key: &str,
+    ) -> anyhow::Result<u64> {
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_remote_snapshot_stage (
+                id uuid PRIMARY KEY,
+                name text NOT NULL,
+                path text NOT NULL UNIQUE,
+                media_type text NOT NULL,
+                collection_type text,
+                runtime_ticks bigint,
+                bitrate bigint,
+                width integer,
+                height integer,
+                media_streams jsonb NOT NULL,
+                metadata jsonb NOT NULL
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_facet_stage (
+                item_id uuid NOT NULL,
+                facet_kind text NOT NULL,
+                normalized_value text NOT NULL,
+                display_value text NOT NULL,
+                stable_id text NOT NULL,
+                position integer NOT NULL,
+                payload jsonb NOT NULL,
+                PRIMARY KEY (item_id, facet_kind, normalized_value)
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_facet_alias_stage (
+                item_id uuid NOT NULL,
+                facet_kind text NOT NULL,
+                normalized_value text NOT NULL,
+                entity_id text NOT NULL,
+                PRIMARY KEY (item_id, facet_kind, normalized_value, entity_id)
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_genre_selector_stage (
+                item_id uuid NOT NULL,
+                selector text NOT NULL,
+                PRIMARY KEY (item_id, selector)
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_filter_selector_stage (
+                item_id uuid NOT NULL,
+                selector_kind text NOT NULL,
+                selector text NOT NULL,
+                PRIMARY KEY (item_id, selector_kind, selector)
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_upcoming_date_stage (
+                item_id uuid PRIMARY KEY,
+                unix_seconds bigint NOT NULL,
+                nanosecond integer NOT NULL
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "TRUNCATE jellyrin_remote_snapshot_stage, \
+             jellyrin_media_item_facet_alias_stage, jellyrin_media_item_facet_stage, \
+             jellyrin_media_item_genre_selector_stage, \
+             jellyrin_media_item_filter_selector_stage, \
+             jellyrin_media_item_upcoming_date_stage",
+        )
+        .execute(&mut **tx)
+        .await?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO jellyrin_remote_snapshot_stage (
+                id, name, path, media_type, collection_type, runtime_ticks, bitrate,
+                width, height, media_streams, metadata
+            )
+            SELECT id, name, path, media_type, collection_type, runtime_ticks, bitrate,
+                   width, height, media_streams, metadata
+            FROM remote_media_catalog_stage_items
+            WHERE stage_id = $1 AND library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_media_item_facet_stage (
+                item_id, facet_kind, normalized_value, display_value, stable_id, position, payload
+            )
+            SELECT facet.item_id, facet.facet_kind, facet.normalized_value,
+                   facet.display_value, facet.stable_id, facet.position, facet.payload
+            FROM remote_media_catalog_stage_facets AS facet
+            JOIN remote_media_catalog_stage_items AS item
+              ON item.stage_id = facet.stage_id AND item.id = facet.item_id
+            WHERE facet.stage_id = $1 AND item.library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_media_item_facet_alias_stage (
+                item_id, facet_kind, normalized_value, entity_id
+            )
+            SELECT alias.item_id, alias.facet_kind, alias.normalized_value, alias.entity_id
+            FROM remote_media_catalog_stage_facet_aliases AS alias
+            JOIN remote_media_catalog_stage_items AS item
+              ON item.stage_id = alias.stage_id AND item.id = alias.item_id
+            WHERE alias.stage_id = $1 AND item.library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_media_item_genre_selector_stage (item_id, selector)
+            SELECT selector.item_id, selector.selector
+            FROM remote_media_catalog_stage_genre_selectors AS selector
+            JOIN remote_media_catalog_stage_items AS item
+              ON item.stage_id = selector.stage_id AND item.id = selector.item_id
+            WHERE selector.stage_id = $1 AND item.library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_media_item_filter_selector_stage (
+                item_id, selector_kind, selector
+            )
+            SELECT selector.item_id, selector.selector_kind, selector.selector
+            FROM remote_media_catalog_stage_filter_selectors AS selector
+            JOIN remote_media_catalog_stage_items AS item
+              ON item.stage_id = selector.stage_id AND item.id = selector.item_id
+            WHERE selector.stage_id = $1 AND item.library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_media_item_upcoming_date_stage (
+                item_id, unix_seconds, nanosecond
+            )
+            SELECT upcoming.item_id, upcoming.unix_seconds, upcoming.nanosecond
+            FROM remote_media_catalog_stage_upcoming_dates AS upcoming
+            JOIN remote_media_catalog_stage_items AS item
+              ON item.stage_id = upcoming.stage_id AND item.id = upcoming.item_id
+            WHERE upcoming.stage_id = $1 AND item.library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        Ok(inserted.rows_affected())
+    }
+
     /// Atomically publishes a complete remote library snapshot.
     ///
     /// A transaction-local staging table lets PostgreSQL retain unchanged rows (and therefore
@@ -2089,6 +2734,18 @@ impl PostgresDatabase {
             u64::try_from(prepared.len()).unwrap_or(u64::MAX)
         });
         stage_result?;
+
+        self.publish_prepared_remote_media_library_stage_in_transaction(tx, folder_row, sync_run_id)
+            .await
+    }
+
+    async fn publish_prepared_remote_media_library_stage_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        folder_row: PostgresVirtualFolderRow,
+        sync_run_id: Uuid,
+    ) -> anyhow::Result<VirtualFolder> {
+        let folder_id = folder_row.id;
 
         let external_conflicts: i64 = sqlx::query_scalar(
             r#"
@@ -4468,6 +5125,177 @@ mod tests {
                 .await?,
                 2
             );
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_durable_remote_media_stage_publishes_atomically_with_projections() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let specs = || {
+                vec![
+                    RemoteMediaLibraryStageSpec {
+                        key: "movies".to_string(),
+                        library_name: "Durable Movies".to_string(),
+                        collection_type: "movies".to_string(),
+                        source_location: "xtream://durable/movies".to_string(),
+                    },
+                    RemoteMediaLibraryStageSpec {
+                        key: "series".to_string(),
+                        library_name: "Durable Series".to_string(),
+                        collection_type: "tvshows".to_string(),
+                        source_location: "xtream://durable/series".to_string(),
+                    },
+                ]
+            };
+            let external_id = Uuid::new_v4();
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "External Owner",
+                    "movies",
+                    "provider://external",
+                    vec![remote_item(
+                        external_id,
+                        "External",
+                        "provider://external/item.mp4",
+                        "Video",
+                        "movies",
+                        json!({}),
+                    )],
+                )
+                .await?;
+
+            let failed_stage = test
+                .database
+                .begin_remote_media_catalog_stage(specs())
+                .await?;
+            let uncommitted_id = Uuid::new_v4();
+            test.database
+                .append_remote_media_catalog_stage(
+                    &failed_stage,
+                    "movies",
+                    vec![remote_item(
+                        uncommitted_id,
+                        "Uncommitted",
+                        "xtream://durable/movies/uncommitted.mp4",
+                        "Video",
+                        "movies",
+                        json!({}),
+                    )],
+                )
+                .await?;
+            test.database
+                .append_remote_media_catalog_stage(
+                    &failed_stage,
+                    "series",
+                    vec![remote_item(
+                        external_id,
+                        "Late Conflict",
+                        "xtream://durable/series/conflict.mp4",
+                        "Video",
+                        "tvshows",
+                        json!({}),
+                    )],
+                )
+                .await?;
+            assert!(
+                test.database
+                    .publish_remote_media_catalog_stage(&failed_stage)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                test.database
+                    .media_item_by_id(uncommitted_id)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM remote_media_catalog_stages WHERE id = $1",
+                )
+                .bind(failed_stage.parsed_id()?)
+                .fetch_one(&test.database.worker_pool)
+                .await?,
+                "open"
+            );
+            test.database
+                .abort_remote_media_catalog_stage(&failed_stage)
+                .await?;
+
+            let stage = test
+                .database
+                .begin_remote_media_catalog_stage(specs())
+                .await?;
+            let movie_id = Uuid::new_v4();
+            let episode_id = Uuid::new_v4();
+            test.database
+                .append_remote_media_catalog_stage(
+                    &stage,
+                    "movies",
+                    vec![remote_item(
+                        movie_id,
+                        "Projected Movie",
+                        "xtream://durable/movies/projected.mp4",
+                        "Video",
+                        "movies",
+                        json!({
+                            "Genres": ["Drama"],
+                            "People": [{"Name": "Jane Doe", "Id": "person-id"}],
+                            "Studios": ["Studio One"],
+                            "Tags": ["Featured"],
+                            "PremiereDate": "2030-01-01T00:00:00Z"
+                        }),
+                    )],
+                )
+                .await?;
+            test.database
+                .append_remote_media_catalog_stage(
+                    &stage,
+                    "series",
+                    vec![remote_item(
+                        episode_id,
+                        "Episode",
+                        "xtream://durable/series/show/season-1/episode-1.mp4",
+                        "Video",
+                        "tvshows",
+                        json!({"SeriesName": "Show"}),
+                    )],
+                )
+                .await?;
+            assert!(test.database.media_item_by_id(movie_id).await.is_err());
+            let folders = test
+                .database
+                .publish_remote_media_catalog_stage(&stage)
+                .await?;
+            assert_eq!(folders.len(), 2);
+            assert_eq!(
+                test.database.media_item_by_id(movie_id).await?.name,
+                "Projected Movie"
+            );
+            assert_eq!(
+                test.database.media_item_by_id(episode_id).await?.name,
+                "Episode"
+            );
+            for query in [
+                "SELECT COUNT(*) FROM media_item_facets WHERE item_id = $1",
+                "SELECT COUNT(*) FROM media_item_facet_aliases WHERE item_id = $1",
+                "SELECT COUNT(*) FROM media_item_genre_selectors WHERE item_id = $1",
+                "SELECT COUNT(*) FROM media_item_filter_selectors WHERE item_id = $1",
+                "SELECT COUNT(*) FROM media_item_upcoming_dates WHERE item_id = $1",
+            ] {
+                let count = sqlx::query_scalar::<_, i64>(query)
+                    .bind(movie_id)
+                    .fetch_one(&test.database.pool)
+                    .await?;
+                assert!(count > 0);
+            }
             anyhow::Ok(())
         }
         .await;
