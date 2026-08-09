@@ -540,6 +540,14 @@ pub fn upcoming_media_item_premiere_date(metadata: &Value) -> Option<OffsetDateT
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
 }
 
+pub(crate) fn upcoming_media_item_premiere_parts(metadata: &Value) -> Option<(i64, i32)> {
+    let date = upcoming_media_item_premiere_date(metadata)?;
+    Some((
+        date.unix_timestamp(),
+        i32::try_from(date.nanosecond()).ok()?,
+    ))
+}
+
 fn is_upcoming_media_item_entry(entry: &MediaItemCatalogEntry, now: OffsetDateTime) -> bool {
     effective_media_item_type(&entry.item) == "Episode"
         && upcoming_media_item_premiere_date(&entry.metadata).is_some_and(|date| date > now)
@@ -2051,6 +2059,10 @@ async fn replace_sqlite_media_item_facets(
     item_id: &str,
     metadata: &Value,
 ) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_upcoming_dates WHERE item_id = ?1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM media_item_genre_selectors WHERE item_id = ?1")
         .bind(item_id)
         .execute(&mut **tx)
@@ -2099,6 +2111,17 @@ async fn replace_sqlite_media_item_facets(
             .bind(selector)
             .execute(&mut **tx)
             .await?;
+    }
+    if let Some((unix_seconds, nanosecond)) = upcoming_media_item_premiere_parts(metadata) {
+        sqlx::query(
+            "INSERT INTO media_item_upcoming_dates \
+             (item_id, unix_seconds, nanosecond) VALUES (?1, ?2, ?3)",
+        )
+        .bind(item_id)
+        .bind(unix_seconds)
+        .bind(nanosecond)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -7702,11 +7725,19 @@ impl SqliteDatabase {
                        CAST(NULL AS REAL) AS playback_rating,
                        CAST(NULL AS TEXT) AS playback_updated_at
                 FROM media_items AS item
+                JOIN media_item_upcoming_dates AS upcoming
+                  ON upcoming.item_id = item.id
                 WHERE item.missing_since IS NULL
                   AND item.media_type = 'Video'
                   AND item.collection_type = 'tvshows'
+                  AND (
+                       upcoming.unix_seconds > ?1
+                       OR (upcoming.unix_seconds = ?1 AND upcoming.nanosecond > ?2)
+                  )
                 "#,
             )
+            .bind(now.unix_timestamp())
+            .bind(i32::try_from(now.nanosecond()).context("current nanosecond overflow")?)
             .fetch(&self.pool);
             let mut candidates = Vec::new();
             while let Some(row) = rows.try_next().await? {
@@ -8183,6 +8214,9 @@ impl SqliteDatabase {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM media_item_genre_selectors")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM media_item_upcoming_dates")
             .execute(&mut *tx)
             .await?;
         let mut last_item_id = None::<String>;
@@ -13699,6 +13733,49 @@ mod tests {
     use time::Duration;
     use uuid::Uuid;
 
+    #[test]
+    fn upcoming_date_projection_preserves_strict_precedence_offsets_and_nanoseconds() {
+        let metadata = json!({"PremiereDate": "2000-01-01T01:00:00.123456789+01:00"});
+        let parsed = super::upcoming_media_item_premiere_date(&metadata).unwrap();
+        assert_eq!(
+            super::upcoming_media_item_premiere_parts(&metadata),
+            Some((parsed.unix_timestamp(), 123_456_789))
+        );
+
+        assert!(
+            super::upcoming_media_item_premiere_parts(&json!({
+                "PremiereDate": "invalid",
+                "AirDate": "2035-02-03T04:05:06Z"
+            }))
+            .is_none()
+        );
+        assert!(
+            super::upcoming_media_item_premiere_parts(&json!({
+                "PremiereDate": null,
+                "AirDate": "2035-02-03T04:05:06Z"
+            }))
+            .is_none()
+        );
+        assert!(
+            super::upcoming_media_item_premiere_parts(&json!({
+                "premieredate": "2035-02-03T04:05:06Z"
+            }))
+            .is_none()
+        );
+        assert!(
+            super::upcoming_media_item_premiere_parts(&json!({
+                "PremiereDate": "2035-02-03"
+            }))
+            .is_none()
+        );
+        assert!(
+            super::upcoming_media_item_premiere_parts(&json!({
+                "AirDate": "2035-02-03T04:05:06Z"
+            }))
+            .is_some()
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_runtime_settings_enable_busy_timeout_and_foreign_keys() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -18068,7 +18145,8 @@ mod tests {
                             },
                             { "Name": "Legacy Person", "Id": "IMPORTED-PERSON" }
                         ],
-                        "Tags": [format!("Tag {index:03}")]
+                        "Tags": [format!("Tag {index:03}")],
+                        "PremiereDate": "2035-02-03T04:05:06.123456789Z"
                     })
                 } else {
                     json!({ "Tags": [format!("Tag {index:03}")] })
@@ -18096,6 +18174,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tags.len(), 501, "rebuild must cross the 500-row batch");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_upcoming_dates WHERE item_id IN (?1, ?2)",
+            )
+            .bind(item_ids[500].simple().to_string())
+            .bind(item_ids[500].to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1
+        );
         let genres = db
             .media_item_facet_values(MediaItemFacetKind::Genre, &[folder.id])
             .await
@@ -18189,6 +18278,18 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_upcoming_dates WHERE item_id IN (?1, ?2)",
+            )
+            .bind(item_ids[500].simple().to_string())
+            .bind(item_ids[500].to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            0,
+            "metadata update must remove a stale Upcoming date"
+        );
         assert!(
             db.media_item_facet_by_entity_id(MediaItemFacetKind::Person, "imported-person")
                 .await
@@ -18204,9 +18305,15 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            db.update_media_item_metadata(item_ids[500], json!({ "Tags": ["ROLLBACK"] }))
-                .await
-                .is_err()
+            db.update_media_item_metadata(
+                item_ids[500],
+                json!({
+                    "Tags": ["ROLLBACK"],
+                    "PremiereDate": "2040-01-01T00:00:00Z"
+                })
+            )
+            .await
+            .is_err()
         );
         let payload: String =
             sqlx::query_scalar("SELECT metadata_json FROM media_items WHERE id IN (?1, ?2)")
@@ -18218,6 +18325,18 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&payload).unwrap()["Tags"][0],
             "Current Tag"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_upcoming_dates WHERE item_id IN (?1, ?2)",
+            )
+            .bind(item_ids[500].simple().to_string())
+            .bind(item_ids[500].to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            0,
+            "failed metadata update must roll back its derived Upcoming date"
         );
         sqlx::query("DROP TRIGGER fail_facet_update")
             .execute(&db.pool)
@@ -18279,11 +18398,17 @@ mod tests {
                 .unwrap();
         let alias_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM media_item_facet_aliases WHERE item_id = ?1")
+                .bind(&storage_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let upcoming_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_item_upcoming_dates WHERE item_id = ?1")
                 .bind(storage_id)
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!((facet_count, alias_count), (0, 0));
+        assert_eq!((facet_count, alias_count, upcoming_count), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -18309,7 +18434,10 @@ mod tests {
                 width: None,
                 height: None,
                 media_streams: Vec::new(),
-                metadata: json!({ "Genres": ["Rebuilt Genre"] }),
+                metadata: json!({
+                    "Genres": ["Rebuilt Genre"],
+                    "PremiereDate": "2035-02-03T04:05:06.123456789Z"
+                }),
             }],
         )
         .await
@@ -18318,8 +18446,12 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
+        sqlx::query("DELETE FROM media_item_upcoming_dates")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         sqlx::query(
-            "UPDATE jellyrin_derived_projection_versions SET extractor_version = 1 \
+            "UPDATE jellyrin_derived_projection_versions SET extractor_version = 2 \
              WHERE projection_name = ?1",
         )
         .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
@@ -18339,6 +18471,16 @@ mod tests {
             .unwrap();
         assert_eq!(page.total_record_count, 1);
         assert_eq!(page.items[0].item.id, item_id);
+        let upcoming_date = sqlx::query_as::<_, (i64, i32)>(
+            "SELECT unix_seconds, nanosecond FROM media_item_upcoming_dates \
+             WHERE item_id IN (?1, ?2)",
+        )
+        .bind(item_id.simple().to_string())
+        .bind(item_id.to_string())
+        .fetch_one(&rebuilt.pool)
+        .await
+        .unwrap();
+        assert_eq!(upcoming_date.1, 123_456_789);
         assert_eq!(
             sqlx::query_scalar::<_, i32>(
                 "SELECT extractor_version FROM jellyrin_derived_projection_versions \

@@ -22,7 +22,7 @@ use super::{
     RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, SortDirection, catalog_sync_duration_millis,
     extract_media_item_facets, extract_media_item_genre_selectors, is_upcoming_media_item_entry,
     nonnegative_count, normalized_facet_query_values, retain_entries_with_effective_types,
-    telemetry::DatabaseOperation,
+    telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -30,7 +30,7 @@ const FACET_STAGE_INSERT_CHUNK_SIZE: usize = 2_000;
 const FACET_REBUILD_BATCH_SIZE: i64 = 500;
 
 pub const MEDIA_ITEM_FACET_PROJECTION_NAME: &str = "media_item_facets";
-pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 2;
+pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaItemFacetProjectionMode {
@@ -89,7 +89,7 @@ pub async fn ensure_media_item_facet_projection(
         .context("failed to configure media item facet projection lock timeout")?;
     sqlx::query(
         "LOCK TABLE media_items, media_item_facets, media_item_facet_aliases, \
-         media_item_genre_selectors \
+         media_item_genre_selectors, media_item_upcoming_dates \
          IN SHARE ROW EXCLUSIVE MODE",
     )
     .execute(&mut **tx)
@@ -99,6 +99,9 @@ pub async fn ensure_media_item_facet_projection(
         .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM media_item_genre_selectors")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM media_item_upcoming_dates")
         .execute(&mut **tx)
         .await?;
 
@@ -200,6 +203,29 @@ pub async fn ensure_media_item_facet_projection(
             query.push_values(selector_chunk, |mut values, (item_id, selector)| {
                 values.push_bind(*item_id).push_bind(selector);
             });
+            query.build().execute(&mut **tx).await?;
+        }
+        let upcoming_dates = rows
+            .iter()
+            .filter_map(|(item_id, metadata)| {
+                upcoming_media_item_premiere_parts(metadata)
+                    .map(|(unix_seconds, nanosecond)| (*item_id, unix_seconds, nanosecond))
+            })
+            .collect::<Vec<_>>();
+        for date_chunk in upcoming_dates.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO media_item_upcoming_dates \
+                 (item_id, unix_seconds, nanosecond) ",
+            );
+            query.push_values(
+                date_chunk,
+                |mut values, (item_id, unix_seconds, nanosecond)| {
+                    values
+                        .push_bind(*item_id)
+                        .push_bind(*unix_seconds)
+                        .push_bind(*nanosecond);
+                },
+            );
             query.build().execute(&mut **tx).await?;
         }
         last_item_id = rows.last().map(|(item_id, _)| *item_id);
@@ -1145,6 +1171,9 @@ impl PostgresDatabase {
             DatabasePoolRole::Api,
         );
         let result: anyhow::Result<Vec<MediaItemCatalogEntry>> = async {
+            // OFFSET 0 intentionally keeps the lateral lookup as an optimizer barrier. Without
+            // it PostgreSQL flattens the join and chooses a hash join that scans every visible TV
+            // row; the range index must drive bounded primary-key lookups instead.
             let mut rows = sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
                 r#"
                 SELECT item.id, item.virtual_folder_id, item.name, item.path,
@@ -1162,12 +1191,21 @@ impl PostgresDatabase {
                        NULL::boolean AS playback_is_favorite,
                        NULL::double precision AS playback_rating,
                        NULL::timestamptz AS playback_updated_at
-                FROM media_items AS item
-                WHERE item.missing_since IS NULL
-                  AND item.media_type = 'Video'
-                  AND item.collection_type = 'tvshows'
+                FROM media_item_upcoming_dates AS upcoming
+                CROSS JOIN LATERAL (
+                    SELECT candidate.*
+                    FROM media_items AS candidate
+                    WHERE candidate.id = upcoming.item_id
+                      AND candidate.missing_since IS NULL
+                      AND candidate.media_type = 'Video'
+                      AND candidate.collection_type = 'tvshows'
+                    OFFSET 0
+                ) AS item
+                WHERE (upcoming.unix_seconds, upcoming.nanosecond) > ($1, $2)
                 "#,
             )
+            .bind(now.unix_timestamp())
+            .bind(i32::try_from(now.nanosecond()).context("current nanosecond overflow")?)
             .fetch(&self.pool);
             let mut candidates = Vec::new();
             while let Some(row) = rows.try_next().await? {
@@ -1839,6 +1877,17 @@ impl PostgresDatabase {
             )
             .execute(&mut **tx)
             .await?;
+            sqlx::query(
+                r#"
+                CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_upcoming_date_stage (
+                    item_id uuid PRIMARY KEY,
+                    unix_seconds bigint NOT NULL,
+                    nanosecond integer NOT NULL
+                ) ON COMMIT DROP
+                "#,
+            )
+            .execute(&mut **tx)
+            .await?;
             sqlx::query("TRUNCATE jellyrin_media_item_facet_stage")
                 .execute(&mut **tx)
                 .await?;
@@ -1846,6 +1895,9 @@ impl PostgresDatabase {
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("TRUNCATE jellyrin_media_item_genre_selector_stage")
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("TRUNCATE jellyrin_media_item_upcoming_date_stage")
                 .execute(&mut **tx)
                 .await?;
 
@@ -1943,6 +1995,29 @@ impl PostgresDatabase {
                     query.push_values(selector_chunk, |mut values, (item_id, selector)| {
                         values.push_bind(*item_id).push_bind(selector);
                     });
+                    query.build().execute(&mut **tx).await?;
+                }
+                let upcoming_dates = chunk
+                    .iter()
+                    .filter_map(|item| {
+                        upcoming_media_item_premiere_parts(&item.metadata)
+                            .map(|(unix_seconds, nanosecond)| (item.id, unix_seconds, nanosecond))
+                    })
+                    .collect::<Vec<_>>();
+                for date_chunk in upcoming_dates.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+                    let mut query = QueryBuilder::<Postgres>::new(
+                        "INSERT INTO jellyrin_media_item_upcoming_date_stage \
+                         (item_id, unix_seconds, nanosecond) ",
+                    );
+                    query.push_values(
+                        date_chunk,
+                        |mut values, (item_id, unix_seconds, nanosecond)| {
+                            values
+                                .push_bind(*item_id)
+                                .push_bind(*unix_seconds)
+                                .push_bind(*nanosecond);
+                        },
+                    );
                     query.build().execute(&mut **tx).await?;
                 }
             }
@@ -2173,6 +2248,37 @@ impl PostgresDatabase {
             SELECT item_id, selector
             FROM jellyrin_media_item_genre_selector_stage
             ON CONFLICT (item_id, selector) DO NOTHING
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM media_item_upcoming_dates AS current
+            USING jellyrin_remote_snapshot_stage AS item_stage
+            WHERE current.item_id = item_stage.id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM jellyrin_media_item_upcoming_date_stage AS staged
+                  WHERE staged.item_id = current.item_id
+              )
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_upcoming_dates (item_id, unix_seconds, nanosecond)
+            SELECT item_id, unix_seconds, nanosecond
+            FROM jellyrin_media_item_upcoming_date_stage
+            ON CONFLICT (item_id) DO UPDATE SET
+                unix_seconds = excluded.unix_seconds,
+                nanosecond = excluded.nanosecond
+            WHERE ROW(
+                media_item_upcoming_dates.unix_seconds,
+                media_item_upcoming_dates.nanosecond
+            ) IS DISTINCT FROM ROW(excluded.unix_seconds, excluded.nanosecond)
             "#,
         )
         .execute(&mut **tx)
@@ -3355,6 +3461,10 @@ pub(super) async fn replace_postgres_media_item_facets(
     item_id: Uuid,
     metadata: &Value,
 ) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_upcoming_dates WHERE item_id = $1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM media_item_genre_selectors WHERE item_id = $1")
         .bind(item_id)
         .execute(&mut **tx)
@@ -3403,6 +3513,17 @@ pub(super) async fn replace_postgres_media_item_facets(
             .bind(selector)
             .execute(&mut **tx)
             .await?;
+    }
+    if let Some((unix_seconds, nanosecond)) = upcoming_media_item_premiere_parts(metadata) {
+        sqlx::query(
+            "INSERT INTO media_item_upcoming_dates \
+             (item_id, unix_seconds, nanosecond) VALUES ($1, $2, $3)",
+        )
+        .bind(item_id)
+        .bind(unix_seconds)
+        .bind(nanosecond)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -5532,7 +5653,8 @@ mod tests {
                                 "Artists": ["Track Artist"],
                                 "AlbumArtists": ["Album Artist"],
                                 "People": [{ "Name": "Jane Doe", "Id": "IMPORTED-PERSON" }],
-                                "Tags": [format!("Tag {index:03}")]
+                                "Tags": [format!("Tag {index:03}")],
+                                "PremiereDate": "2035-02-03T04:05:06.123456789Z"
                             })
                         } else {
                             json!({ "Tags": [format!("Tag {index:03}")] })
@@ -5588,6 +5710,13 @@ mod tests {
                 "Album Artist"
             );
 
+            let upcoming_xmin_before: String = sqlx::query_scalar(
+                "SELECT xmin::text FROM media_item_upcoming_dates WHERE item_id = $1",
+            )
+            .bind(item_ids[500])
+            .fetch_one(&test.database.pool)
+            .await?;
+
             let xmin_before: String = sqlx::query_scalar(
                 "SELECT xmin::text FROM media_item_facets WHERE item_id = $1 AND facet_kind = 'person'",
             )
@@ -5609,9 +5738,23 @@ mod tests {
             .fetch_one(&test.database.pool)
             .await?;
             assert_eq!(xmin_before, xmin_after, "no-op snapshot rewrote facet row");
+            let upcoming_xmin_after: String = sqlx::query_scalar(
+                "SELECT xmin::text FROM media_item_upcoming_dates WHERE item_id = $1",
+            )
+            .bind(item_ids[500])
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(
+                upcoming_xmin_before, upcoming_xmin_after,
+                "no-op snapshot rewrote Upcoming date row"
+            );
 
             let facet_count_before: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM media_item_facets")
+                    .fetch_one(&test.database.pool)
+                    .await?;
+            let upcoming_count_before: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM media_item_upcoming_dates")
                     .fetch_one(&test.database.pool)
                     .await?;
             let marker_before_failed_rebuild =
@@ -5658,6 +5801,13 @@ mod tests {
                     .await?,
                 facet_count_before,
                 "failed rebuild must restore the previous facet projection"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_item_upcoming_dates")
+                    .fetch_one(&test.database.pool)
+                    .await?,
+                upcoming_count_before,
+                "failed rebuild must restore the previous Upcoming date projection"
             );
             assert_eq!(
                 sqlx::query_as::<_, (i32, OffsetDateTime, i64, i64, i64, String)>(

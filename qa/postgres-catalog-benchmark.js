@@ -38,6 +38,7 @@ async function main() {
       psql(connection, sampleSql(size, repetitions, false));
       const currentPlan = explain(connection, moviePageSql(size));
       const currentGenrePlans = genrePlans(connection);
+      const currentUpcomingPlans = upcomingPlans(connection);
       psql(connection, candidateIndexSql());
       psql(connection, sampleSql(size, repetitions, true));
       const candidatePlan = explain(connection, moviePageSql(size));
@@ -62,6 +63,12 @@ async function main() {
           order: 'alternating-exists-in-and-in-exists',
           p95: genreMetricSummary(byScenario, 'current'),
           plans: currentGenrePlans,
+        },
+        upcomingDateProjection: {
+          visibleTvRows: visibleTvRows(size),
+          futureTvRows: futureTvRows(size),
+          p95: upcomingMetricSummary(byScenario),
+          plans: currentUpcomingPlans,
         },
       });
       psql(connection, `DROP INDEX IF EXISTS ${ident(schema)}.media_items_visible_collection_name_page_idx;`);
@@ -128,7 +135,9 @@ function setupSql() {
       id uuid PRIMARY KEY,
       virtual_folder_id uuid NOT NULL,
       name text NOT NULL,
+      media_type text NOT NULL,
       collection_type text NOT NULL,
+      metadata jsonb NOT NULL,
       created_at timestamptz NOT NULL,
       updated_at timestamptz NOT NULL,
       missing_since timestamptz
@@ -145,6 +154,11 @@ function setupSql() {
       item_id uuid NOT NULL REFERENCES ${ident(schema)}.media_items(id) ON DELETE CASCADE,
       selector text NOT NULL,
       PRIMARY KEY (item_id, selector)
+    );
+    CREATE TABLE ${ident(schema)}.media_item_upcoming_dates (
+      item_id uuid PRIMARY KEY REFERENCES ${ident(schema)}.media_items(id) ON DELETE CASCADE,
+      unix_seconds bigint NOT NULL,
+      nanosecond integer NOT NULL
     );
     CREATE TABLE ${ident(schema)}.samples (
       dataset_size integer NOT NULL,
@@ -165,18 +179,21 @@ function setupSql() {
       WHERE missing_since IS NULL;
     CREATE INDEX media_item_genre_selectors_lookup_idx
       ON ${ident(schema)}.media_item_genre_selectors (selector, item_id);
+    CREATE INDEX media_item_upcoming_dates_range_idx
+      ON ${ident(schema)}.media_item_upcoming_dates (unix_seconds, nanosecond, item_id);
   `;
 }
 
 function seedSql(size) {
   return `
     TRUNCATE ${ident(schema)}.media_items, ${ident(schema)}.playback_states,
-      ${ident(schema)}.media_item_genre_selectors;
+      ${ident(schema)}.media_item_genre_selectors, ${ident(schema)}.media_item_upcoming_dates;
     DELETE FROM ${ident(schema)}.samples WHERE dataset_size = ${size};
     BEGIN;
     SET LOCAL synchronous_commit = off;
     INSERT INTO ${ident(schema)}.media_items (
-      id, virtual_folder_id, name, collection_type, created_at, updated_at, missing_since
+      id, virtual_folder_id, name, media_type, collection_type, metadata,
+      created_at, updated_at, missing_since
     )
     SELECT
       md5('item-' || value)::uuid,
@@ -191,7 +208,15 @@ function seedSql(size) {
         ELSE '00000000-0000-0000-0000-000000000008'::uuid
       END,
       'Catalog Item ' || lpad(value::text, 9, '0'),
+      'Video',
       CASE value % 3 WHEN 0 THEN 'movies' WHEN 1 THEN 'tvshows' ELSE 'music' END,
+      jsonb_build_object(
+        'PremiereDate',
+        CASE WHEN value % 100 = 1
+          THEN '2033-05-18T03:33:20.000000001Z'
+          ELSE '2001-09-09T01:46:40Z'
+        END
+      ),
       now() - make_interval(secs => value % 31536000),
       now() - make_interval(secs => value % 2592000),
       CASE WHEN value % 100 = 0 THEN now() ELSE NULL END
@@ -215,10 +240,19 @@ function seedSql(size) {
     SELECT md5('item-' || value)::uuid, 'genre-rare'
     FROM generate_series(1, ${size}) AS value
     WHERE value % 1000 = 1;
+    INSERT INTO ${ident(schema)}.media_item_upcoming_dates (
+      item_id, unix_seconds, nanosecond
+    )
+    SELECT
+      md5('item-' || value)::uuid,
+      CASE WHEN value % 100 = 1 THEN 2000000000 ELSE 1000000000 END,
+      CASE WHEN value % 100 = 1 THEN 1 ELSE 0 END
+    FROM generate_series(1, ${size}) AS value;
     COMMIT;
     ANALYZE ${ident(schema)}.media_items;
     ANALYZE ${ident(schema)}.playback_states;
     ANALYZE ${ident(schema)}.media_item_genre_selectors;
+    ANALYZE ${ident(schema)}.media_item_upcoming_dates;
   `;
 }
 
@@ -270,10 +304,21 @@ function sampleSql(size, sampleRepetitions, candidate) {
           genreBenchmarkPairSql(size, suffix, 'common', 'page'),
           genreBenchmarkPairSql(size, suffix, 'rare', 'count'),
           genreBenchmarkPairSql(size, suffix, 'common', 'count'),
+          upcomingBenchmarkSql(size, 'scan'),
+          upcomingBenchmarkSql(size, 'projection'),
         ].join('\n')}
       END LOOP;
     END $benchmark$;
   `;
+}
+
+function upcomingBenchmarkSql(size, shape) {
+  const query = upcomingQuerySql(shape).replace(/^SELECT /, 'PERFORM ');
+  return `
+    started := clock_timestamp();
+    ${query};
+    INSERT INTO ${ident(schema)}.samples VALUES
+      (${size}, 'upcoming_${shape}', extract(epoch FROM clock_timestamp() - started) * 1000);`;
 }
 
 function genreBenchmarkPairSql(size, suffix, selector, operation) {
@@ -340,6 +385,44 @@ function genrePlans(connection) {
       ),
     ),
   );
+}
+
+function upcomingQuerySql(shape) {
+  if (shape === 'projection') {
+    return `SELECT item.id, item.metadata
+      FROM ${ident(schema)}.media_item_upcoming_dates AS upcoming
+      CROSS JOIN LATERAL (
+        SELECT candidate.id, candidate.metadata
+        FROM ${ident(schema)}.media_items AS candidate
+        WHERE candidate.id = upcoming.item_id
+          AND candidate.missing_since IS NULL
+          AND candidate.media_type = 'Video'
+          AND candidate.collection_type = 'tvshows'
+        OFFSET 0
+      ) AS item
+      WHERE (upcoming.unix_seconds, upcoming.nanosecond) > (1700000000, 0)`;
+  }
+  return `SELECT item.id, item.metadata FROM ${ident(schema)}.media_items AS item
+    WHERE item.missing_since IS NULL
+      AND item.media_type = 'Video'
+      AND item.collection_type = 'tvshows'`;
+}
+
+function upcomingPlans(connection) {
+  return {
+    scan: summarizePlan(explain(connection, upcomingQuerySql('scan'))),
+    projection: summarizePlan(explain(connection, upcomingQuerySql('projection'))),
+  };
+}
+
+function upcomingMetricSummary(metrics) {
+  const scan = metrics.upcoming_scan?.p95Ms ?? null;
+  const projection = metrics.upcoming_projection?.p95Ms ?? null;
+  return {
+    scanMs: scan,
+    projectionMs: projection,
+    speedup: ratio(scan, projection),
+  };
 }
 
 function genreMetricSummary(metrics, suffix) {
@@ -410,6 +493,16 @@ function parseSizes(raw) {
 function boundedInteger(raw, fallback, minimum, maximum) {
   const parsed = raw === undefined ? fallback : Number.parseInt(raw, 10);
   return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+function visibleTvRows(size) {
+  const tvRows = Math.floor((size - 1) / 3) + 1;
+  const missingTvRows = size < 100 ? 0 : Math.floor((size - 100) / 300) + 1;
+  return tvRows - missingTvRows;
+}
+
+function futureTvRows(size) {
+  return Math.floor((size - 1) / 300) + 1;
 }
 
 function ident(value) {
