@@ -138,6 +138,7 @@ pub(crate) enum DatabaseOperation {
     CatalogCounts,
     CatalogEffectiveTypeCandidates,
     CatalogNextUpCandidates,
+    CatalogUpcomingCandidates,
     CatalogFolderItems,
     CatalogFolderCounts,
     CatalogFilterSummary,
@@ -156,7 +157,7 @@ pub(crate) enum DatabaseOperation {
 }
 
 impl DatabaseOperation {
-    const ALL: [Self; 24] = [
+    const ALL: [Self; 25] = [
         Self::AuthUserByToken,
         Self::AuthUserByApiKey,
         Self::CatalogNameSearch,
@@ -166,6 +167,7 @@ impl DatabaseOperation {
         Self::CatalogCounts,
         Self::CatalogEffectiveTypeCandidates,
         Self::CatalogNextUpCandidates,
+        Self::CatalogUpcomingCandidates,
         Self::CatalogFolderItems,
         Self::CatalogFolderCounts,
         Self::CatalogFilterSummary,
@@ -195,6 +197,7 @@ impl DatabaseOperation {
             Self::CatalogCounts => "catalog.counts",
             Self::CatalogEffectiveTypeCandidates => "catalog.effective_type_candidates",
             Self::CatalogNextUpCandidates => "catalog.next_up_candidates",
+            Self::CatalogUpcomingCandidates => "catalog.upcoming_candidates",
             Self::CatalogFolderItems => "catalog.folder_items",
             Self::CatalogFolderCounts => "catalog.folder_counts",
             Self::CatalogFilterSummary => "catalog.filter_summary",

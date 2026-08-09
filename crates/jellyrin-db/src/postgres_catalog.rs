@@ -20,8 +20,9 @@ use super::{
     MediaItemFacetKind, MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary,
     MediaItemForImageTag, MediaItemMetadata, MediaItemQueryFilterValues, PostgresDatabase,
     RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, SortDirection, catalog_sync_duration_millis,
-    extract_media_item_facets, nonnegative_count, normalized_facet_query_values,
-    retain_entries_with_effective_types, telemetry::DatabaseOperation,
+    extract_media_item_facets, is_upcoming_media_item_entry, nonnegative_count,
+    normalized_facet_query_values, retain_entries_with_effective_types,
+    telemetry::DatabaseOperation,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -1103,6 +1104,55 @@ impl PostgresDatabase {
             .fetch_all(&self.pool)
             .await?;
             rows.into_iter().map(TryInto::try_into).collect()
+        }
+        .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    pub async fn tv_upcoming_candidates(
+        &self,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogUpcomingCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result: anyhow::Result<Vec<MediaItemCatalogEntry>> = async {
+            let mut rows = sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
+                r#"
+                SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                       item.media_type, item.collection_type, item.file_size,
+                       item.runtime_ticks, item.bitrate, item.width, item.height,
+                       item.media_streams, item.metadata, item.created_at, item.updated_at,
+                       NULL::uuid AS playback_user_id,
+                       NULL::uuid AS playback_item_id,
+                       NULL::text AS playback_media_source_id,
+                       NULL::bigint AS playback_audio_stream_index,
+                       NULL::bigint AS playback_subtitle_stream_index,
+                       NULL::bigint AS playback_position_ticks,
+                       NULL::boolean AS playback_is_paused,
+                       NULL::boolean AS playback_played,
+                       NULL::boolean AS playback_is_favorite,
+                       NULL::double precision AS playback_rating,
+                       NULL::timestamptz AS playback_updated_at
+                FROM media_items AS item
+                WHERE item.missing_since IS NULL
+                  AND item.media_type = 'Video'
+                  AND item.collection_type = 'tvshows'
+                "#,
+            )
+            .fetch(&self.pool);
+            let mut candidates = Vec::new();
+            while let Some(row) = rows.try_next().await? {
+                let entry = MediaItemCatalogEntry::try_from(row)?;
+                if is_upcoming_media_item_entry(&entry, now) {
+                    candidates.push(entry);
+                }
+            }
+            Ok(candidates)
         }
         .await;
         observation.finish_result(&result, |items| {
@@ -4519,6 +4569,97 @@ mod tests {
             assert_eq!(candidates[0].item.id, unplayed_id);
             assert_eq!(candidates[0].metadata["SeriesName"], "SQL Show");
             assert!(candidates[0].playback_state.is_none());
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_upcoming_candidates_scope_tv_videos_and_include_metadata() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let now = OffsetDateTime::UNIX_EPOCH;
+            let dated_id = Uuid::new_v4();
+            let undated_id = Uuid::new_v4();
+            let audio_id = Uuid::new_v4();
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Upcoming Shows",
+                    "tvshows",
+                    "provider://upcoming",
+                    vec![
+                        remote_item(
+                            dated_id,
+                            "Example Show S01E01",
+                            "provider://upcoming/Example Show/Season 01/Example Show S01E01.mp4",
+                            "Video",
+                            "tvshows",
+                            json!({"AirDate": "2035-02-03T04:05:06Z"}),
+                        ),
+                        remote_item(
+                            undated_id,
+                            "Example Show S01E02",
+                            "provider://upcoming/Example Show/Season 01/Example Show S01E02.mp4",
+                            "Video",
+                            "tvshows",
+                            json!({"SeriesName": "Example Show"}),
+                        ),
+                        remote_item(
+                            audio_id,
+                            "Example Show Theme",
+                            "provider://upcoming/Example Show Theme.flac",
+                            "Audio",
+                            "tvshows",
+                            json!({"PremiereDate": "2035-02-03T04:05:06Z"}),
+                        ),
+                    ],
+                )
+                .await?;
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Unrelated Movies",
+                    "movies",
+                    "provider://movies",
+                    vec![remote_item(
+                        Uuid::new_v4(),
+                        "Future Movie",
+                        "provider://movies/future.mp4",
+                        "Video",
+                        "movies",
+                        json!({"PremiereDate": "2035-02-03T04:05:06Z"}),
+                    )],
+                )
+                .await?;
+
+            let candidates = test.database.tv_upcoming_candidates(now).await?;
+            let mut candidate_ids = candidates
+                .iter()
+                .map(|candidate| candidate.item.id)
+                .collect::<Vec<_>>();
+            candidate_ids.sort_unstable();
+            let mut expected_ids = vec![dated_id];
+            expected_ids.sort_unstable();
+            assert_eq!(candidate_ids, expected_ids);
+            let dated = candidates
+                .iter()
+                .find(|candidate| candidate.item.id == dated_id)
+                .context("missing dated Upcoming candidate")?;
+            assert_eq!(dated.metadata["AirDate"], "2035-02-03T04:05:06Z");
+            assert!(dated.playback_state.is_none());
+            let telemetry = test.database.telemetry_diagnostics();
+            let operation = telemetry
+                .operations
+                .iter()
+                .find(|operation| operation.name == "catalog.upcoming_candidates")
+                .context("missing Upcoming telemetry")?;
+            assert_eq!(
+                (operation.calls, operation.succeeded, operation.rows.total),
+                (1, 1, 1)
+            );
             anyhow::Ok(())
         }
         .await;

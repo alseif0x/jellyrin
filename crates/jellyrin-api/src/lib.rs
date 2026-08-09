@@ -142,6 +142,7 @@ use jellyrin_db::{
     UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
     UpsertTranscodeSession, probe_remote_media_info_admitted,
     provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
+    upcoming_media_item_premiere_date,
 };
 
 #[cfg(not(test))]
@@ -30111,6 +30112,31 @@ fn is_common_next_up_query(query: &ItemsQuery) -> bool {
         && csv_values_lowercase(&query.include_item_types).is_some_and(|types| types == ["episode"])
 }
 
+/// Keep the SQL-prefiltered Upcoming path restricted to fields that do not participate in item
+/// selection. Date precedence/parsing, effective episode classification, total calculation and
+/// final ordering intentionally remain in Rust below.
+fn is_common_upcoming_query(query: &ItemsQuery) -> bool {
+    let expected = ItemsQuery {
+        user_id: query.user_id.clone(),
+        include_item_types: query.include_item_types.clone(),
+        start_index: query.start_index,
+        limit: query.limit,
+        sort_by: query.sort_by.clone(),
+        sort_order: query.sort_order.clone(),
+        fields: query.fields.clone(),
+        _image_type_limit: query._image_type_limit.clone(),
+        _enable_images: query._enable_images.clone(),
+        _enable_user_data: query._enable_user_data.clone(),
+        _collapse_box_set_items: query._collapse_box_set_items.clone(),
+        _image_types: query._image_types.clone(),
+        _enable_image_types: query._enable_image_types.clone(),
+        _enable_total_record_count: query._enable_total_record_count.clone(),
+        ..ItemsQuery::default()
+    };
+    query == &expected
+        && csv_values_lowercase(&query.include_item_types).is_some_and(|types| types == ["episode"])
+}
+
 async fn shows_upcoming(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -30132,36 +30158,53 @@ async fn shows_upcoming(
     }
 
     let now = OffsetDateTime::now_utc();
-    let candidates = filtered_media_items(
-        state.db.media_items_by_collection_type("tvshows").await?,
-        &query,
-        Some(requested_user_id),
-        &state.db,
-    )
-    .await?;
-    let metadata_by_id = media_metadata_by_item_id(
-        &state.db,
-        candidates.iter().map(|episode| episode.id).collect(),
-    )
-    .await?;
+    let use_sql_candidates = is_common_upcoming_query(&query);
+    let mut prefetched_metadata = HashMap::new();
+    let candidates = if use_sql_candidates {
+        let candidates = MediaCatalogStore::tv_upcoming_candidates(&state.db, now).await?;
+        let mut items = Vec::with_capacity(candidates.len());
+        prefetched_metadata.reserve(candidates.len());
+        for candidate in candidates {
+            prefetched_metadata.insert(candidate.item.id, candidate.metadata);
+            items.push(candidate.item);
+        }
+        items
+    } else {
+        filtered_media_items(
+            state.db.media_items_by_collection_type("tvshows").await?,
+            &query,
+            Some(requested_user_id),
+            &state.db,
+        )
+        .await?
+    };
+    let metadata_by_id = if use_sql_candidates {
+        prefetched_metadata
+    } else {
+        media_metadata_by_item_id(
+            &state.db,
+            candidates.iter().map(|episode| episode.id).collect(),
+        )
+        .await?
+    };
     let mut upcoming = candidates
         .into_iter()
         .filter(is_tv_episode)
         .filter(|episode| {
             metadata_by_id
                 .get(&episode.id)
-                .and_then(metadata_premiere_date)
+                .and_then(upcoming_media_item_premiere_date)
                 .is_some_and(|premiere_date| premiere_date > now)
         })
         .collect::<Vec<_>>();
     upcoming.sort_by(|left, right| {
         let left_date = metadata_by_id
             .get(&left.id)
-            .and_then(metadata_premiere_date)
+            .and_then(upcoming_media_item_premiere_date)
             .unwrap_or(left.created_at);
         let right_date = metadata_by_id
             .get(&right.id)
-            .and_then(metadata_premiere_date)
+            .and_then(upcoming_media_item_premiere_date)
             .unwrap_or(right.created_at);
         left_date
             .cmp(&right_date)
@@ -51642,15 +51685,6 @@ fn compare_tv_episodes_with_metadata(
                 .cmp(&right.name.to_ascii_lowercase())
         })
         .then_with(|| left.id.cmp(&right.id))
-}
-
-fn metadata_premiere_date(metadata: &serde_json::Value) -> Option<OffsetDateTime> {
-    metadata
-        .get("PremiereDate")
-        .or_else(|| metadata.get("AirDate"))
-        .or_else(|| metadata.get("DateCreated"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
 }
 
 #[derive(Debug, Deserialize)]
@@ -84705,7 +84739,7 @@ done
         assert_eq!(episodes.len(), 4);
         let first = episodes
             .iter()
-            .find(|episode| episode.name.contains("S01E01"))
+            .find(|episode| episode.name.contains("Example Show S01E01"))
             .unwrap();
         let second = episodes
             .iter()
@@ -84714,6 +84748,10 @@ done
         let third = episodes
             .iter()
             .find(|episode| episode.name.contains("S01E03"))
+            .unwrap();
+        let other = episodes
+            .iter()
+            .find(|episode| episode.name.contains("Other Show S01E01"))
             .unwrap();
         db.upsert_playback_state(UpsertPlaybackState {
             user_id: user.id,
@@ -84727,16 +84765,46 @@ done
         })
         .await
         .unwrap();
-        db.update_media_item_metadata(
-            third.id,
-            json!({
-                "PremiereDate": super::format_time_for_json(
-                    time::OffsetDateTime::now_utc() + time::Duration::days(7)
-                )
-            }),
-        )
-        .await
-        .unwrap();
+        let upcoming_reference = time::OffsetDateTime::now_utc();
+        for (item_id, metadata) in [
+            (
+                first.id,
+                json!({
+                    "PremiereDate": super::format_time_for_json(
+                        upcoming_reference + time::Duration::days(21)
+                    )
+                }),
+            ),
+            (
+                second.id,
+                json!({
+                    "AirDate": super::format_time_for_json(
+                        upcoming_reference + time::Duration::days(7)
+                    )
+                }),
+            ),
+            (
+                third.id,
+                json!({
+                    "DateCreated": super::format_time_for_json(
+                        upcoming_reference + time::Duration::days(14)
+                    )
+                }),
+            ),
+            (
+                other.id,
+                json!({
+                    "PremiereDate": "not-an-rfc3339-date",
+                    "AirDate": super::format_time_for_json(
+                        upcoming_reference + time::Duration::days(1)
+                    )
+                }),
+            ),
+        ] {
+            db.update_media_item_metadata(item_id, metadata)
+                .await
+                .unwrap();
+        }
 
         let app = router(AppState {
             db,
@@ -84946,7 +85014,10 @@ done
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri(format!("/Shows/Upcoming?UserId={}", user.id))
+                    .uri(format!(
+                        "/Shows/Upcoming?UserId={}&StartIndex=1&Limit=1",
+                        user.id
+                    ))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
@@ -84956,7 +85027,9 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let upcoming: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(upcoming["TotalRecordCount"], 1);
+        assert_eq!(upcoming["TotalRecordCount"], 3);
+        assert_eq!(upcoming["StartIndex"], 1);
+        assert_eq!(upcoming["Items"].as_array().unwrap().len(), 1);
         assert_eq!(upcoming["Items"][0]["Id"], third.id.simple().to_string());
         assert_eq!(upcoming["Items"][0]["Type"], "Episode");
         assert_eq!(upcoming["Items"][0]["IndexNumber"], 3);
@@ -88306,6 +88379,30 @@ done
         let mut other_type = common;
         other_type.include_item_types.push("Movie".to_string());
         assert!(!super::is_common_next_up_query(&other_type));
+    }
+
+    #[test]
+    fn upcoming_sql_candidate_gate_is_conservative() {
+        let common = super::parse_items_query(Some(
+            "UserId=00000000000000000000000000000001&StartIndex=1&Limit=20&IncludeItemTypes=Episode&Fields=Overview",
+        ));
+        assert!(super::is_common_upcoming_query(&common));
+
+        let mut searched = common.clone();
+        searched.search_term = Some("show".to_string());
+        assert!(!super::is_common_upcoming_query(&searched));
+
+        let mut filtered = common.clone();
+        filtered.filters.push("IsUnplayed".to_string());
+        assert!(!super::is_common_upcoming_query(&filtered));
+
+        let mut scoped = common.clone();
+        scoped.parent_id = Some(Uuid::new_v4().simple().to_string());
+        assert!(!super::is_common_upcoming_query(&scoped));
+
+        let mut other_type = common;
+        other_type.include_item_types.push("Movie".to_string());
+        assert!(!super::is_common_upcoming_query(&other_type));
     }
 
     #[test]

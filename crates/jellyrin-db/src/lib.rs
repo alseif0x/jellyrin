@@ -501,6 +501,25 @@ pub struct MediaItemCatalogEntry {
     pub playback_state: Option<PlaybackState>,
 }
 
+/// Resolve the date used by Jellyfin's Upcoming view without accepting looser SQL date coercions.
+///
+/// Key precedence is significant: once an earlier key exists, an invalid/non-string value does
+/// not fall through to a later key. Keeping this parser shared by the repositories and API avoids
+/// adapter-specific behaviour for legacy metadata.
+pub fn upcoming_media_item_premiere_date(metadata: &Value) -> Option<OffsetDateTime> {
+    metadata
+        .get("PremiereDate")
+        .or_else(|| metadata.get("AirDate"))
+        .or_else(|| metadata.get("DateCreated"))
+        .and_then(Value::as_str)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+}
+
+fn is_upcoming_media_item_entry(entry: &MediaItemCatalogEntry, now: OffsetDateTime) -> bool {
+    effective_media_item_type(&entry.item) == "Episode"
+        && upcoming_media_item_premiere_date(&entry.metadata).is_some_and(|date| date > now)
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct EffectiveTypeCandidateScope {
     pub(crate) all_raw_media_types: bool,
@@ -1222,6 +1241,14 @@ pub trait MediaCatalogStore: DatabaseBackend {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
 
+    /// Visible TV video candidates carrying inline metadata for the common `/Shows/Upcoming`
+    /// request. A shared Rust predicate retains effective episode classification and strict
+    /// RFC3339 date semantics; the API retains exact total calculation and final ordering.
+    fn tv_upcoming_candidates(
+        &self,
+        now: OffsetDateTime,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
+
     fn media_item_facet_values<'a>(
         &'a self,
         kind: MediaItemFacetKind,
@@ -1317,6 +1344,14 @@ impl MediaCatalogStore for PostgresDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         PostgresDatabase::tv_next_up_candidates(self, user_id)
+    }
+
+    fn tv_upcoming_candidates(
+        &self,
+        now: OffsetDateTime,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        PostgresDatabase::tv_upcoming_candidates(self, now)
     }
 
     fn media_item_facet_values<'a>(
@@ -1433,6 +1468,14 @@ impl MediaCatalogStore for SqliteDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         SqliteDatabase::tv_next_up_candidates(self, user_id)
+    }
+
+    fn tv_upcoming_candidates(
+        &self,
+        now: OffsetDateTime,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        SqliteDatabase::tv_upcoming_candidates(self, now)
     }
 
     fn media_item_facet_values<'a>(
@@ -7550,6 +7593,56 @@ impl SqliteDatabase {
             .fetch_all(&self.pool)
             .await?;
             rows.into_iter().map(TryInto::try_into).collect()
+        }
+        .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    pub async fn tv_upcoming_candidates(
+        &self,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogUpcomingCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result: anyhow::Result<Vec<MediaItemCatalogEntry>> = async {
+            let mut rows = sqlx::query_as::<_, MediaItemCatalogRow>(
+                r#"
+                SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                       item.media_type, item.collection_type, item.file_size,
+                       item.runtime_ticks, item.bitrate, item.width, item.height,
+                       item.media_streams_json, item.metadata_json,
+                       item.created_at, item.updated_at,
+                       CAST(NULL AS TEXT) AS playback_user_id,
+                       CAST(NULL AS TEXT) AS playback_item_id,
+                       CAST(NULL AS TEXT) AS playback_media_source_id,
+                       CAST(NULL AS INTEGER) AS playback_audio_stream_index,
+                       CAST(NULL AS INTEGER) AS playback_subtitle_stream_index,
+                       CAST(NULL AS INTEGER) AS playback_position_ticks,
+                       CAST(NULL AS INTEGER) AS playback_is_paused,
+                       CAST(NULL AS INTEGER) AS playback_played,
+                       CAST(NULL AS INTEGER) AS playback_is_favorite,
+                       CAST(NULL AS REAL) AS playback_rating,
+                       CAST(NULL AS TEXT) AS playback_updated_at
+                FROM media_items AS item
+                WHERE item.missing_since IS NULL
+                  AND item.media_type = 'Video'
+                  AND item.collection_type = 'tvshows'
+                "#,
+            )
+            .fetch(&self.pool);
+            let mut candidates = Vec::new();
+            while let Some(row) = rows.try_next().await? {
+                let entry = MediaItemCatalogEntry::try_from(row)?;
+                if is_upcoming_media_item_entry(&entry, now) {
+                    candidates.push(entry);
+                }
+            }
+            Ok(candidates)
         }
         .await;
         observation.finish_result(&result, |items| {
@@ -15192,6 +15285,158 @@ mod tests {
         assert_eq!(candidates[0].item.id, unplayed_id);
         assert_eq!(candidates[0].metadata["SeriesName"], "SQL Show");
         assert!(candidates[0].playback_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_upcoming_candidates_scope_tv_videos_and_include_metadata() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let now = time::OffsetDateTime::parse(
+            "2000-01-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let premiere_id = Uuid::new_v4();
+        let air_id = Uuid::new_v4();
+        let created_id = Uuid::new_v4();
+        let undated_id = Uuid::new_v4();
+        let invalid_precedence_id = Uuid::new_v4();
+        let equal_id = Uuid::new_v4();
+        let extra_id = Uuid::new_v4();
+        let audio_id = Uuid::new_v4();
+        let item =
+            |id: Uuid, name: &str, path: &str, media_type: &str, metadata: serde_json::Value| {
+                RemoteMediaItemUpsert {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    path: format!("provider://upcoming/{path}"),
+                    media_type: media_type.to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata,
+                }
+            };
+        db.replace_remote_media_library_snapshot(
+            "Upcoming Shows",
+            "tvshows",
+            "provider://upcoming",
+            vec![
+                item(
+                    premiere_id,
+                    "Example Show S01E01",
+                    "Example Show/Season 01/Example Show S01E01.mp4",
+                    "Video",
+                    json!({"PremiereDate": "2000-01-01T02:00:00Z"}),
+                ),
+                item(
+                    air_id,
+                    "Example Show S01E02",
+                    "Example Show/Season 01/Example Show S01E02.mp4",
+                    "Video",
+                    json!({"AirDate": "2000-01-01T01:00:00Z"}),
+                ),
+                item(
+                    created_id,
+                    "Example Show S01E03",
+                    "Example Show/Season 01/Example Show S01E03.mp4",
+                    "Video",
+                    json!({"DateCreated": "2000-01-01T03:00:00Z"}),
+                ),
+                item(
+                    undated_id,
+                    "Example Show S01E04",
+                    "Example Show/Season 01/Example Show S01E04.mp4",
+                    "Video",
+                    json!({"SeriesName": "Example Show"}),
+                ),
+                item(
+                    invalid_precedence_id,
+                    "Example Show S01E05",
+                    "Example Show/Season 01/Example Show S01E05.mp4",
+                    "Video",
+                    json!({
+                        "PremiereDate": "invalid",
+                        "AirDate": "2000-01-01T04:00:00Z"
+                    }),
+                ),
+                item(
+                    equal_id,
+                    "Example Show S01E06",
+                    "Example Show/Season 01/Example Show S01E06.mp4",
+                    "Video",
+                    json!({"PremiereDate": "2000-01-01T00:00:00Z"}),
+                ),
+                item(
+                    extra_id,
+                    "Behind the Scenes",
+                    "Example Show/Season 01/extras/Behind the Scenes.mp4",
+                    "Video",
+                    json!({"PremiereDate": "2000-01-01T05:00:00Z"}),
+                ),
+                item(
+                    audio_id,
+                    "Example Show Theme",
+                    "Example Show Theme.flac",
+                    "Audio",
+                    json!({"PremiereDate": "2000-01-01T05:00:00Z"}),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        db.replace_remote_media_library_snapshot(
+            "Unrelated Movies",
+            "movies",
+            "provider://movies",
+            vec![RemoteMediaItemUpsert {
+                id: Uuid::new_v4().to_string(),
+                name: "Future Movie".to_string(),
+                path: "provider://movies/future.mp4".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({"PremiereDate": "2000-01-01T05:00:00Z"}),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let candidates = db.tv_upcoming_candidates(now).await.unwrap();
+        let candidate_ids = candidates
+            .iter()
+            .map(|candidate| candidate.item.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            candidate_ids,
+            HashSet::from([premiere_id, air_id, created_id])
+        );
+        let air = candidates
+            .iter()
+            .find(|candidate| candidate.item.id == air_id)
+            .unwrap();
+        assert_eq!(air.metadata["AirDate"], "2000-01-01T01:00:00Z");
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.playback_state.is_none())
+        );
+        let telemetry = db.telemetry_diagnostics();
+        let operation = telemetry
+            .operations
+            .iter()
+            .find(|operation| operation.name == "catalog.upcoming_candidates")
+            .unwrap();
+        assert_eq!(
+            (operation.calls, operation.succeeded, operation.rows.total),
+            (1, 1, 3)
+        );
     }
 
     #[tokio::test]
