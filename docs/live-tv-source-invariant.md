@@ -72,6 +72,25 @@ project's secret-retention procedure before deciding whether it can be kept.
 The migrations repeat the preflight so a missed gate fails closed. Their errors
 contain counts and remediation instructions, never source URLs or metadata.
 
+## Post-reindex retention audit
+
+After re-importing provider catalogues and before opening ingress, run the
+counts-only audit with the PostgreSQL runtime/read-only credential:
+
+```bash
+DATABASE_URL='postgresql://...' jellyrin-migrate audit-source-hygiene \
+  --report /root/jellyrin-source-hygiene.json
+```
+
+During a SQLite cutover, add `--source /path/to/read-only-snapshot.db`. The
+command checks every media row including tombstones for `RemoteSourceUrl`,
+`RemoteMediaProbe.SourceUrl` and malformed probe objects. It also rejects a
+non-empty `stream_url` for Xtream or `plugin:*` tuners while allowing a genuine
+legacy M3U tuner. It uses a bounded PostgreSQL `REPEATABLE READ`, `READ ONLY`
+snapshot and emits counts only—never IDs, metadata or URLs. Exit status is `0`
+when clean, `2` for findings and `3` if the scan cannot complete. Re-import on
+findings; do not redact rows in place.
+
 ## Driver implementations
 
 PostgreSQL already has `live_tv_channels_source_or_provider_reference`, which

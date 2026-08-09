@@ -21,7 +21,9 @@ use sqlx::{
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-pub use report::{FailureReport, SchemaReport};
+pub use report::{
+    FailureReport, ProviderUrlRetentionCounts, ProviderUrlRetentionReport, SchemaReport,
+};
 use spec::{
     ColumnKind, MIGRATED_TABLES, OMITTED_TABLES, TARGET_INFRASTRUCTURE_TABLES,
     TARGET_ONLY_OMITTED_TABLES, TableSpec,
@@ -49,6 +51,68 @@ pub struct MigrationOptions {
     pub source: std::path::PathBuf,
     pub target_url: String,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderUrlAuditOptions {
+    pub source: Option<std::path::PathBuf>,
+    pub target_url: String,
+}
+
+/// Fail-closed rollout audit for credential-bearing legacy provider locations.
+///
+/// The report contains counts only. Neither SQL nor errors select URL values or metadata, so the
+/// command is safe to retain as deployment evidence. A non-zero count is an error: re-import the
+/// affected provider catalogue before promotion instead of redacting durable rows in place.
+pub async fn audit_provider_url_retention(
+    options: ProviderUrlAuditOptions,
+) -> anyhow::Result<ProviderUrlRetentionReport> {
+    let started = OffsetDateTime::now_utc();
+    let timer = Instant::now();
+    let target = open_postgres(&options.target_url).await?;
+    let mut snapshot = target
+        .begin()
+        .await
+        .context("failed to start provider URL audit")?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *snapshot)
+        .await
+        .context("failed to make provider URL audit read-only")?;
+    sqlx::query("SET LOCAL statement_timeout = '10s'")
+        .execute(&mut *snapshot)
+        .await
+        .context("failed to bound provider URL audit statements")?;
+    let postgres = postgres_provider_url_retention_counts(&mut snapshot).await?;
+    snapshot
+        .rollback()
+        .await
+        .context("failed to close provider URL audit snapshot")?;
+    let sqlite = if let Some(source) = options.source {
+        validate_source_path(&source)?;
+        let mut connection = open_read_only_sqlite(&source).await?;
+        Some(sqlite_provider_url_retention_counts(&mut connection).await?)
+    } else {
+        None
+    };
+    let finished = OffsetDateTime::now_utc();
+    let clean = postgres.is_clean()
+        && sqlite
+            .as_ref()
+            .is_none_or(ProviderUrlRetentionCounts::is_clean);
+    Ok(ProviderUrlRetentionReport {
+        report_version: 1,
+        tool_version: env!("CARGO_PKG_VERSION"),
+        status: if clean {
+            "provider_url_retention_clean"
+        } else {
+            "provider_url_retention_findings"
+        },
+        postgres,
+        sqlite,
+        started_at: started.format(&Rfc3339)?,
+        finished_at: finished.format(&Rfc3339)?,
+        duration_ms: timer.elapsed().as_millis(),
+    })
 }
 
 pub async fn apply_schema(target_url: &str) -> anyhow::Result<SchemaReport> {
@@ -262,6 +326,154 @@ async fn open_postgres(target_url: &str) -> anyhow::Result<PgPool> {
         .connect_with(options)
         .await
         .context("failed to connect to PostgreSQL target")
+}
+
+async fn postgres_provider_url_retention_counts(
+    target: &mut Transaction<'_, Postgres>,
+) -> anyhow::Result<ProviderUrlRetentionCounts> {
+    let (remote_source_url_rows, remote_probe_source_url_rows, invalid_remote_probe_rows): (
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        r#"
+            SELECT
+                count(*) FILTER (WHERE EXISTS (
+                    SELECT 1 FROM jsonb_object_keys(metadata) AS key
+                    WHERE lower(key) = lower('RemoteSourceUrl')
+                )),
+                count(*) FILTER (
+                    WHERE EXISTS (
+                        SELECT 1 FROM jsonb_each(metadata) AS probe(key, value)
+                        WHERE lower(probe.key) = lower('RemoteMediaProbe')
+                          AND jsonb_typeof(probe.value) = 'object'
+                          AND EXISTS (
+                              SELECT 1 FROM jsonb_object_keys(probe.value) AS nested_key
+                              WHERE lower(nested_key) = lower('SourceUrl')
+                          )
+                    )
+                ),
+                count(*) FILTER (
+                    WHERE EXISTS (
+                        SELECT 1 FROM jsonb_each(metadata) AS probe(key, value)
+                        WHERE lower(probe.key) = lower('RemoteMediaProbe')
+                          AND jsonb_typeof(probe.value) <> 'object'
+                    )
+                )
+            FROM media_items
+            "#,
+    )
+    .fetch_one(&mut **target)
+    .await
+    .context("failed to audit PostgreSQL media provider URL retention")?;
+    let live_tv_stream_url_rows: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)
+        FROM live_tv_channels AS channel
+        JOIN live_tv_tuners AS tuner USING (tuner_id)
+        WHERE NULLIF(btrim(channel.stream_url), '') IS NOT NULL
+          AND (
+              lower(tuner.provider_type) = 'xtream'
+              OR lower(tuner.provider_type) LIKE 'plugin:%'
+          )
+        "#,
+    )
+    .fetch_one(&mut **target)
+    .await
+    .context("failed to audit PostgreSQL Live TV provider URL retention")?;
+    provider_url_retention_counts(
+        remote_source_url_rows,
+        remote_probe_source_url_rows,
+        invalid_remote_probe_rows,
+        live_tv_stream_url_rows,
+    )
+}
+
+async fn sqlite_provider_url_retention_counts(
+    source: &mut SqliteConnection,
+) -> anyhow::Result<ProviderUrlRetentionCounts> {
+    let (remote_source_url_rows, remote_probe_source_url_rows, invalid_remote_probe_rows): (
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        r#"
+            SELECT
+                coalesce(sum(CASE
+                    WHEN json_valid(metadata_json)
+                     AND EXISTS (
+                         SELECT 1 FROM json_each(metadata_json)
+                         WHERE lower(key) = lower('RemoteSourceUrl')
+                     )
+                    THEN 1 ELSE 0 END
+                ), 0),
+                coalesce(sum(CASE
+                    WHEN json_valid(metadata_json)
+                     AND EXISTS (
+                         SELECT 1 FROM json_each(metadata_json) AS probe
+                         WHERE lower(probe.key) = lower('RemoteMediaProbe')
+                           AND probe.type = 'object'
+                           AND EXISTS (
+                               SELECT 1 FROM json_each(probe.value)
+                               WHERE lower(key) = lower('SourceUrl')
+                           )
+                     )
+                    THEN 1 ELSE 0 END
+                ), 0),
+                coalesce(sum(CASE
+                    WHEN json_valid(metadata_json)
+                     AND EXISTS (
+                         SELECT 1 FROM json_each(metadata_json) AS probe
+                         WHERE lower(probe.key) = lower('RemoteMediaProbe')
+                           AND probe.type <> 'object'
+                     )
+                    THEN 1 ELSE 0 END
+                ), 0)
+            FROM media_items
+            "#,
+    )
+    .fetch_one(&mut *source)
+    .await
+    .context("failed to audit SQLite media provider URL retention")?;
+    let live_tv_stream_url_rows: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)
+        FROM live_tv_channels AS channel
+        JOIN live_tv_tuners AS tuner USING (tuner_id)
+        WHERE NULLIF(trim(channel.stream_url), '') IS NOT NULL
+          AND (
+              lower(tuner.provider_type) = 'xtream'
+              OR lower(tuner.provider_type) LIKE 'plugin:%'
+          )
+        "#,
+    )
+    .fetch_one(&mut *source)
+    .await
+    .context("failed to audit SQLite Live TV provider URL retention")?;
+    provider_url_retention_counts(
+        remote_source_url_rows,
+        remote_probe_source_url_rows,
+        invalid_remote_probe_rows,
+        live_tv_stream_url_rows,
+    )
+}
+
+fn provider_url_retention_counts(
+    remote_source_url_rows: i64,
+    remote_probe_source_url_rows: i64,
+    invalid_remote_probe_rows: i64,
+    live_tv_stream_url_rows: i64,
+) -> anyhow::Result<ProviderUrlRetentionCounts> {
+    Ok(ProviderUrlRetentionCounts {
+        remote_source_url_rows: u64::try_from(remote_source_url_rows)
+            .context("negative RemoteSourceUrl count")?,
+        remote_probe_source_url_rows: u64::try_from(remote_probe_source_url_rows)
+            .context("negative RemoteMediaProbe.SourceUrl count")?,
+        invalid_remote_probe_rows: u64::try_from(invalid_remote_probe_rows)
+            .context("negative malformed RemoteMediaProbe count")?,
+        live_tv_stream_url_rows: u64::try_from(live_tv_stream_url_rows)
+            .context("negative live_tv stream_url count")?,
+    })
 }
 
 #[derive(Debug)]
@@ -1146,6 +1358,85 @@ mod tests {
     };
     use uuid::Uuid;
 
+    #[tokio::test]
+    async fn sqlite_provider_url_audit_is_counts_only_and_provider_aware() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE media_items (metadata_json TEXT NOT NULL)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE live_tv_tuners (tuner_id TEXT PRIMARY KEY, provider_type TEXT NOT NULL)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE live_tv_channels (tuner_id TEXT NOT NULL, stream_url TEXT NOT NULL)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO media_items(metadata_json) VALUES ('{}')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO live_tv_tuners VALUES ('m3u', 'm3u')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO live_tv_channels VALUES ('m3u', 'https://legacy.invalid/live.m3u8')",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let clean = sqlite_provider_url_retention_counts(&mut connection)
+            .await
+            .unwrap();
+        assert!(clean.is_clean());
+
+        for metadata in [
+            r#"{"remotesourceurl":null}"#,
+            r#"{"RemoteMediaProbe":{"sourceurl":"canary://must-not-be-reported"}}"#,
+            r#"{"RemoteMediaProbe":"malformed-canary"}"#,
+        ] {
+            sqlx::query("INSERT INTO media_items(metadata_json) VALUES (?1)")
+                .bind(metadata)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO live_tv_tuners VALUES ('xtream', 'XTREAM')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO live_tv_tuners VALUES ('plugin', 'plugin:magstv')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO live_tv_channels VALUES ('xtream', 'canary://user/password')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO live_tv_channels VALUES ('plugin', 'canary://token')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sqlite_provider_url_retention_counts(&mut connection)
+                .await
+                .unwrap(),
+            ProviderUrlRetentionCounts {
+                remote_source_url_rows: 1,
+                remote_probe_source_url_rows: 1,
+                invalid_remote_probe_rows: 1,
+                live_tv_stream_url_rows: 2,
+            }
+        );
+    }
+
     #[test]
     fn source_path_requires_an_existing_regular_file() {
         let directory = tempfile::tempdir().unwrap();
@@ -1734,6 +2025,112 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(postgres_migrate)]
+    async fn postgres_provider_url_audit_reports_counts_without_canaries_when_configured() {
+        let Ok(base_url) = std::env::var("JELLYRIN_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let admin_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(PgConnectOptions::from_str(&base_url).unwrap())
+            .await
+            .unwrap();
+        let schema = format!("jellyrin_url_audit_test_{}", Uuid::new_v4().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin_pool)
+            .await
+            .unwrap();
+        let target_url = scoped_postgres_url(&base_url, &schema);
+        let result: anyhow::Result<()> = async {
+            apply_schema(&target_url).await?;
+            let clean = audit_provider_url_retention(ProviderUrlAuditOptions {
+                source: None,
+                target_url: target_url.clone(),
+            })
+            .await?;
+            assert!(clean.is_clean());
+
+            let target = open_postgres(&target_url).await?;
+            let folder_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO virtual_folders (id, name, collection_type, locations, created_at, updated_at) VALUES ($1, 'Audit', 'movies', '[\"/audit\"]'::jsonb, now(), now())",
+            )
+            .bind(folder_id)
+            .execute(&target)
+            .await?;
+            for (path, metadata) in [
+                ("/audit/remote", serde_json::json!({"remotesourceurl": null})),
+                (
+                    "/audit/probe",
+                    serde_json::json!({"RemoteMediaProbe": {"sourceurl": "https://user-canary:password-canary@provider.invalid/movie"}}),
+                ),
+                (
+                    "/audit/malformed",
+                    serde_json::json!({"RemoteMediaProbe": "token-canary"}),
+                ),
+            ] {
+                sqlx::query(
+                    "INSERT INTO media_items (id, virtual_folder_id, name, path, media_type, collection_type, media_streams, metadata, created_at, updated_at) VALUES ($1, $2, 'Audit', $3, 'Video', 'movies', '[]'::jsonb, $4, now(), now())",
+                )
+                .bind(Uuid::new_v4())
+                .bind(folder_id)
+                .bind(path)
+                .bind(metadata)
+                .execute(&target)
+                .await?;
+            }
+            for (tuner_id, provider_type, stream_url) in [
+                ("m3u", "m3u", "https://legacy.invalid/list.m3u8"),
+                ("xtream", "xtream", "https://provider.invalid/live/user-canary/password-canary/1"),
+                ("plugin", "plugin:magstv", "https://provider.invalid/token-canary"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO live_tv_tuners (tuner_id, provider_type, name, enabled, configuration, created_at, updated_at) VALUES ($1, $2, $1, true, '{}'::jsonb, now(), now())",
+                )
+                .bind(tuner_id)
+                .bind(provider_type)
+                .execute(&target)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO live_tv_channels (channel_id, tuner_id, remote_id, name, sort_name, stream_url, enabled, metadata, created_at, updated_at) VALUES ($1, $1, $1, $1, $1, $2, true, '{}'::jsonb, now(), now())",
+                )
+                .bind(tuner_id)
+                .bind(stream_url)
+                .execute(&target)
+                .await?;
+            }
+            let findings = audit_provider_url_retention(ProviderUrlAuditOptions {
+                source: None,
+                target_url: target_url.clone(),
+            })
+            .await?;
+            assert!(!findings.is_clean());
+            assert_eq!(
+                findings.postgres,
+                ProviderUrlRetentionCounts {
+                    remote_source_url_rows: 1,
+                    remote_probe_source_url_rows: 1,
+                    invalid_remote_probe_rows: 1,
+                    live_tv_stream_url_rows: 2,
+                }
+            );
+            let encoded = serde_json::to_string(&findings)?;
+            for canary in ["user-canary", "password-canary", "token-canary", "provider.invalid"] {
+                assert!(!encoded.contains(canary));
+            }
+            Ok(())
+        }
+        .await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin_pool)
+            .await
+            .unwrap();
+        admin_pool.close().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres_migrate)]
     async fn migrates_durable_fixture_and_rolls_back_dry_run_when_postgres_is_configured() {
         let Ok(base_url) = std::env::var("JELLYRIN_TEST_POSTGRES_URL") else {
             return;

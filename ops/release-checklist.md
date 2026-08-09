@@ -85,6 +85,9 @@
 - Import controlled Xtream and MAGSTV catalogues. Verify database rows, logs,
   diagnostics and FFmpeg/ffprobe argv contain provider references/relay URLs and
   no authenticated upstream URL, username, password, token or grant canary.
+- Run `jellyrin-migrate audit-source-hygiene --report <root-only-json>` with the
+  runtime PostgreSQL URL after reindex. Require exit `0`; retain its counts-only
+  report. Exit `2` requires reimport and exit `3` means the audit is incomplete.
 - Exercise Jellyfin Web slideshow/comics, catalogue browse/filter/search, direct
   proxy, stream-copy remux, seek, disconnect, Live TV and one incompatible sample.
   Keep `remux-only`: the incompatible sample must fail closed rather than encode.

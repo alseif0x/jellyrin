@@ -83,6 +83,10 @@ jobs:
           toolchain: 1.94.0
       - run: cargo test --locked -p jellyrin-db --all-features -- --test-threads=4
       - run: cargo test --locked -p jellyrin-migrate --all-features -- --test-threads=2
+      - name: Verify counts-only provider URL retention gate
+        run: |
+          cargo run --locked -p jellyrin-migrate -- schema --target "$JELLYRIN_TEST_POSTGRES_URL"
+          cargo run --locked -p jellyrin-migrate -- audit-source-hygiene --target "$JELLYRIN_TEST_POSTGRES_URL"
 
   supply-chain:
     name: Locked image and SBOM

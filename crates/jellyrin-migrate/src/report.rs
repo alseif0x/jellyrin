@@ -72,3 +72,43 @@ pub struct SchemaReport {
     pub finished_at: String,
     pub duration_ms: u128,
 }
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ProviderUrlRetentionCounts {
+    pub remote_source_url_rows: u64,
+    pub remote_probe_source_url_rows: u64,
+    pub invalid_remote_probe_rows: u64,
+    pub live_tv_stream_url_rows: u64,
+}
+
+impl ProviderUrlRetentionCounts {
+    pub fn is_clean(&self) -> bool {
+        self.remote_source_url_rows == 0
+            && self.remote_probe_source_url_rows == 0
+            && self.invalid_remote_probe_rows == 0
+            && self.live_tv_stream_url_rows == 0
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderUrlRetentionReport {
+    pub report_version: u32,
+    pub tool_version: &'static str,
+    pub status: &'static str,
+    pub postgres: ProviderUrlRetentionCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<ProviderUrlRetentionCounts>,
+    pub started_at: String,
+    pub finished_at: String,
+    pub duration_ms: u128,
+}
+
+impl ProviderUrlRetentionReport {
+    pub fn is_clean(&self) -> bool {
+        self.postgres.is_clean()
+            && self
+                .sqlite
+                .as_ref()
+                .is_none_or(ProviderUrlRetentionCounts::is_clean)
+    }
+}

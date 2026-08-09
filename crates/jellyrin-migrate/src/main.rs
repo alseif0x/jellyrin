@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use jellyrin_migrate::{FailureReport, MigrationOptions, apply_schema, execute};
+use jellyrin_migrate::{
+    FailureReport, MigrationOptions, ProviderUrlAuditOptions, apply_schema,
+    audit_provider_url_retention, execute,
+};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
@@ -24,6 +27,10 @@ enum Command {
     /// Migrate durable SQLite data into an already-migrated PostgreSQL schema.
     #[command(alias = "migrate", alias = "migrate-data")]
     Data(DataArgs),
+
+    /// Count credential-bearing legacy provider locations without printing their contents.
+    #[command(alias = "audit-provider-urls")]
+    AuditSourceHygiene(AuditSourceHygieneArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -56,6 +63,21 @@ struct DataArgs {
     report: Option<PathBuf>,
 }
 
+#[derive(Debug, ClapArgs)]
+struct AuditSourceHygieneArgs {
+    /// Optional read-only SQLite snapshot to audit before cutover.
+    #[arg(long, value_name = "SQLITE_DB")]
+    source: Option<PathBuf>,
+
+    /// PostgreSQL connection URL. Prefer DATABASE_URL to avoid shell history.
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true, value_name = "URL")]
+    target: String,
+
+    /// Also write the counts-only JSON report to this path.
+    #[arg(long, value_name = "JSON_PATH")]
+    report: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -74,12 +96,40 @@ async fn main() {
             Ok(report) => emit_success(&report, args.report).await,
             Err(error) => Err(redact_error(&error.to_string())),
         },
+        Command::AuditSourceHygiene(args) => {
+            match audit_provider_url_retention(ProviderUrlAuditOptions {
+                source: args.source,
+                target_url: args.target,
+            })
+            .await
+            {
+                Ok(report) => {
+                    let exit_code = provider_url_audit_exit_code(&report);
+                    match emit_success(&report, args.report).await {
+                        Ok(()) if exit_code == 0 => Ok(()),
+                        Ok(()) => std::process::exit(exit_code),
+                        Err(error) => {
+                            emit_failure(&redact_error(&error));
+                            std::process::exit(3);
+                        }
+                    }
+                }
+                Err(error) => {
+                    emit_failure(&redact_error(&error.to_string()));
+                    std::process::exit(3);
+                }
+            }
+        }
     };
 
     if let Err(error) = result {
         emit_failure(&error);
         std::process::exit(1);
     }
+}
+
+fn provider_url_audit_exit_code(report: &jellyrin_migrate::ProviderUrlRetentionReport) -> i32 {
+    if report.is_clean() { 0 } else { 2 }
 }
 
 async fn emit_success<T: Serialize>(report: &T, path: Option<PathBuf>) -> Result<(), String> {
@@ -152,6 +202,23 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(schema.command, Command::Schema(_)));
+
+        let audit = Args::try_parse_from([
+            "jellyrin-migrate",
+            "audit-source-hygiene",
+            "--target",
+            "postgresql://localhost/jellyrin",
+            "--source",
+            "/tmp/source.db",
+        ])
+        .unwrap();
+        assert!(matches!(
+            audit.command,
+            Command::AuditSourceHygiene(AuditSourceHygieneArgs {
+                source: Some(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -177,5 +244,28 @@ mod tests {
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("abc"));
         assert_eq!(redacted, "connect [REDACTED] [REDACTED] [REDACTED]");
+    }
+
+    #[test]
+    fn provider_url_audit_uses_findings_exit_code_two() {
+        use jellyrin_migrate::{ProviderUrlRetentionCounts, ProviderUrlRetentionReport};
+
+        let report = |remote_source_url_rows| ProviderUrlRetentionReport {
+            report_version: 1,
+            tool_version: "test",
+            status: "test",
+            postgres: ProviderUrlRetentionCounts {
+                remote_source_url_rows,
+                remote_probe_source_url_rows: 0,
+                invalid_remote_probe_rows: 0,
+                live_tv_stream_url_rows: 0,
+            },
+            sqlite: None,
+            started_at: "start".to_string(),
+            finished_at: "finish".to_string(),
+            duration_ms: 0,
+        };
+        assert_eq!(provider_url_audit_exit_code(&report(0)), 0);
+        assert_eq!(provider_url_audit_exit_code(&report(1)), 2);
     }
 }

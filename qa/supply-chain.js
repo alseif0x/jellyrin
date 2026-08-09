@@ -316,6 +316,11 @@ async function main() {
         workflow.includes('POSTGRES_RUNTIME_PASSWORD: ci-compose-runtime'),
     ),
     check(
+      'ci-runs-provider-url-retention-gate',
+      workflow.includes('jellyrin-migrate -- audit-source-hygiene') &&
+        workflow.includes('JELLYRIN_TEST_POSTGRES_URL'),
+    ),
+    check(
       'vulnerability-exceptions-are-governed',
       exceptionErrors.length === 0,
       exceptionErrors.join('; '),

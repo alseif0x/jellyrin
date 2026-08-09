@@ -58,7 +58,7 @@ histórica y no debe confundirse con este estado vigente.
   duraderas con preflight, dry-run, UUID estables y digest origen/destino. El
   delta post-vault incorpora `provider_secrets` y sus bytes
   BLOB↔`bytea`, porque las configuraciones protegidas referencian su
-  `secret_id`. El cierre local pasa 27/27 pruebas y clippy estricto; cubre bytes
+  `secret_id`. El cierre local pasa 30/30 pruebas y clippy estricto; cubre bytes
   no UTF-8, digest tipado y preflight de referencias plugin/tuner/Live TV. Los
   catálogos reconstruibles, cachés, sesiones activas, historial operacional de
   sync y transcodes se recrean. El fixture completo ya pasó contra PostgreSQL
@@ -317,7 +317,7 @@ siguen rojos y bloquean promoción.
 
 La migración 106 se ejecutó realmente en PostgreSQL 16.14 y aceptó filas legacy
 y opacas válidas; sus tests SQLite rechazan mixed/neither y preservan filas en
-preflight. El migrador pasa 27/27 pruebas locales —24 de librería y 3 de
+preflight. El migrador pasa 30/30 pruebas locales —26 de librería y 4 de
 binario— y clippy estricto tras incorporar `provider_secrets`, el tipo `Bytes`
 y clasificar `catalog_sync_runs` como historial operacional omitido. El fixture
 incluye NUL, `0xff` y bytes no UTF-8, con igualdad exacta de nonce/ciphertext;
@@ -352,14 +352,14 @@ se marcará completo solo después de su validación y rollout correspondiente.
 
 | Área | Código local | Evidencia ejecutada | Fuera de este cierre |
 | --- | --- | --- | --- |
-| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 144/0/2 más doctest sobre PG real donde corresponde; aislamiento API/worker real; migrador 27/27; esquema y proyección hasta migración 109 probados en PG16.14; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements registrados; checks locked y clippy DB/API estrictos verdes tras el delta | E2E, carga de handlers, cutover y contratos restantes antes de otro backend |
+| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 144/0/2 más doctest sobre PG real donde corresponde; aislamiento API/worker real; migrador 30/30; esquema y proyección hasta migración 109 probados en PG16.14; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements registrados; checks locked y clippy DB/API estrictos verdes tras el delta | E2E, carga de handlers, cutover y contratos restantes antes de otro backend |
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC | Imagen AArch64 final `a852c5b81213`, 157.058.151 bytes, id `922ac235...96ef5f`; corpus real MP4/MKV/MPEG-TS probe+HLS copy verde como usuario no-root; aliases, specifiers, filtros, codec implícito y comandos no confiables cubiertos; validadores de capacidades exactas añadidos | E2E Xtream/clientes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen en staging; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado; clave de referencia root-only generada | Pin público aún viejo; falta guardar el repositorio e instalar 0.1.1; perfil WireGuard MX, metadatos/secretos legítimos restantes, E2E real y publicación pendientes |
-| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD y escritura/backfill/rotación transaccionales | Xtream 20/20 post-XOR/ImageUrl, migrador 27/27 y clippy estricto; migración 106 y round-trip byte-exact reales en PG; configuración real e indexación de 757 canales | Reimport legacy y escaneo DB/logs/argv donde aplique; reproducción E2E y matriz de clientes reales |
+| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD y escritura/backfill/rotación transaccionales; auditoría DB counts-only fail-closed | Xtream 20/20 post-XOR/ImageUrl; auditoría PostgreSQL real y SQLite cubre claves legacy, probes malformados, tombstones y stream URL solo para Xtream/plugins sin exponer canarios; migración 106 y round-trip byte-exact reales en PG; 757 canales staging | Ejecutar audit tras reimport real, añadir scanner logs/argv, reproducción E2E y matriz de clientes |
 | Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET`; Counts agregado/proyectado; lookups UUID puntuales; Search/Hints acotado; tipos efectivos compartidos y candidatos por dominio; Upcoming común transmite filas TV y retiene solo episodios futuros con metadata inline; refresh TV O(N); fallbacks conservadores | Workspace base 646/0/5; Upcoming añade conformance SQLite/PG real y gate/API, con parser/precedencia RFC3339 compartidos; Counts, Resume, tipos efectivos, Ancestors, Search/Hints y Series validados; benchmark PG16.14 10k/100k/500k: Movie page p95 1.193→0.963 ms, 9.777→6.544 ms y 11.098→6.587 ms | Llevar filtro de fecha Upcoming a columnas normalizadas para evitar el scan TV, predicados metadata complejos, resume complejo/sin límite, E2E/carga representativa |
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 con backfill transaccional único; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; check locked y clippy DB/API `-D warnings` verdes | Filtros complejos por Person/Genre/Studio/Tag/rating/premiere, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
-| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 44/44; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
+| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 45/45; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `8026d7f60615` desplegado; servidor SHA-256 `95f70e1c...3b6f`; FFmpeg/ffprobe `8.2-dev-git-1e0279143db9`; migración 109 current, capacidades y arranque verdes; `/healthz`/`/readyz` local+HTTPS, 0 reinicios y sin hijos FFmpeg; rollback `pre-8026d7f-20260809T144300Z`; Xtream conserva 757 canales | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; el cambio distroless afecta al contenedor, no exige reemplazar estos binarios bare-metal |
 
 ### Trabajo restante y gates de salida
@@ -494,7 +494,7 @@ rollout probado:
    se añade CPE y el gate falla si Trivy no demuestra que lo inventarió. Trivy
    0.70 todavía no lo demuestra, por lo que falta integrar un matcher válido.
    Después se debe construir/analizar AMD64 y solo con
-   gates verdes firmar el digest y adjuntar provenance. El QA 44/44 solo
+   gates verdes firmar el digest y adjuntar provenance. El QA 45/45 solo
    acredita política y pins, no sustituye estos resultados reales. El Jellyfin
    Web endurecido se construyó localmente y su gate Playwright aislado pasó
    1/1 sobre PostgreSQL 16 real: wizard y login, foto servida por descarga,
@@ -2055,7 +2055,7 @@ Una SQLite pre-vault con credenciales plaintext sigue el camino compatible: se
 migran sus configuraciones y, al arrancar PostgreSQL con keyring, el backfill
 crea los envelopes. Una SQLite vault-enabled migra envelopes y referencias; no
 puede perderlos silenciosamente. El soporte de `Bytes` BLOB↔`bytea` pasa las
-27/27 pruebas, incluido el fixture PostgreSQL real con digest tipado, bytes no
+30/30 pruebas, incluido el fixture PostgreSQL real con digest tipado, bytes no
 UTF-8 y las referencias plugin/tuner/Live TV.
 
 #### Preflight
@@ -2231,7 +2231,7 @@ la consulta: usarlo en staging o con extremo cuidado para escrituras.
 
 **Estado actual:** `jellyrin-db` pasa 142/0/2 más su doctest, usando
 PostgreSQL real para selectors/manager, baseline, todos los repositorios,
-catálogo paginado/no-op y vault AEAD con atomicidad. El migrador pasa 27/27,
+catálogo paginado/no-op y vault AEAD con atomicidad. El migrador pasa 30/30,
 incluido el round-trip byte-exact BLOB→`bytea`; Xtream pasa 20/20. El workspace
 completo pasa 641 pruebas, 0 fallidas y 5 ignoradas, y su clippy estricto con
 todos los targets está verde. El benchmark grande con distribución
@@ -2333,7 +2333,7 @@ Automatizar pruebas de:
 **Estado del cierre local vigente:** el workspace pasa 641 pruebas, 0 fallidas y 5
 ignoradas con PostgreSQL real. El desglose relevante es API 344/0/3, DB 142/0/2
 más doctest, SDK 12/12, RPC 15/15, transcode 39/39, server 7/7 y core 17/17. El migrador
-pasa 27/27 con round-trip byte-exact BLOB→`bytea`, y Xtream pasa 20/20
+pasa 30/30 con round-trip byte-exact BLOB→`bytea`, y Xtream pasa 20/20
 post-XOR/ImageUrl. `cargo clippy --workspace --all-targets --locked -- -D
 warnings` está verde. Packaging 46/46, supply-chain 38/38, systemd runtime
 13/13, systemd unit 14/14, performance/recovery 37/37 y security-hardening
@@ -2424,7 +2424,7 @@ inicial; estos criterios no deben leerse como una declaración de rollout.
   PostgreSQL real: 142/0/2 más su doctest.
 - [~] El migrador preserva y valida todo dato irremplazable; los catálogos marcados
   como reconstruibles se reindexan correctamente. `provider_secrets` y su
-  mapping BLOB↔`bytea` pasan 27/27 con PostgreSQL real, referencias, digest y
+  mapping BLOB↔`bytea` pasan 30/30 con PostgreSQL real, referencias, digest y
   comparación byte-exacta. Queda el ensayo de cutover/reindex con un snapshot
   representativo.
 - [x] Una sincronización fallida no vacía ni cambia la generación visible.
@@ -2518,7 +2518,7 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
 - [x] Imágenes base, snapshot Debian, FFmpeg, Syft, cargo-audit, RustSec, Trivy
   y GitHub Actions tienen pins públicos e inmutables adecuados a cada entrada;
   las descargas de herramientas verifican SHA-256 antes de ejecutarse.
-- [x] El QA local 44/44 valida pins, runtime distroless, Compose, contrato de CI y el registro único de
+- [x] El QA local 45/45 valida pins, runtime distroless, Compose, auditoría URL, contrato de CI y el registro único de
   excepciones; no hay excepciones activas y cualquier futura aceptación exige
   componente/purl, owner, ticket, motivo y caducidad máxima de 30 días.
 - [x] RustSec puede ejecutarse como gate real independiente sin Docker usando
@@ -2592,7 +2592,7 @@ reales del proveedor.
    migración 109. Quedan predicados complejos y `EXPLAIN`/p95 de handlers
    representativos. COPY ya fue medido a 100k/500k y descartado por una mejora
    de solo 1,046x/1,030x.
-5. `[~]` `jellyrin-migrate` pasa 27/27 en PostgreSQL real; `provider_secrets`
+5. `[~]` `jellyrin-migrate` pasa 30/30 en PostgreSQL real; `provider_secrets`
    durable y Bytes BLOB↔`bytea` están validados byte a byte. El restore drill
    del estado actual de staging pasó con 49 tablas; falta repetirlo tras la
    importación del snapshot representativo y replicar la evidencia off-host.
