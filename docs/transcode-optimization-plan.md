@@ -23,8 +23,9 @@ histórica y no debe confundirse con este estado vigente.
   CVE únicas/22 ocurrencias. El candidato posterior reemplaza solo la etapa
   productiva por `cc-debian13:nonroot` fijado por digest: inventaría 13 paquetes,
   ejecuta FFmpeg/ffprobe durante el build, pasa el corpus real y da 0 hallazgos
-  HIGH/CRITICAL en Trivy. Falta fijarlo en un commit, repetir el bundle completo
-  contra esa revisión exacta y validar AMD64. `8026d7f` sigue sano en staging,
+  HIGH/CRITICAL en Trivy. El commit exacto `6a15aec579b8` ya repitió corpus,
+  SBOM, RustSec, NVD y Trivy con todos los gates en cero. Falta validar AMD64.
+  `8026d7f` sigue sano en staging,
   pero continúa expresamente no promovible como release.
 
 - La costura de selección de persistencia ya tiene `DatabaseDriver` con
@@ -354,7 +355,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET` y obtiene count+página en un snapshot; Counts agregado/proyectado sin transportar catálogo; existencia/lookup por UUID puntuales; Search/Hints acotado a 100 con scope metadata exacto; tipos efectivos compartidos y prefiltrado sargable con metadata inline para similares, soundtrack, instant mix y remote search; resolución, episodios, temporadas, similares, Ancestors y updates/refresh de Series limitados al dominio TV; refresh TV agrupado O(TV) en vez de O(series×catálogo); fallbacks semánticos conservados, batching amplio y DLNA/sidecars acotados por carpeta | Workspace 646/0/5; Counts conformance SQLite/PG real y API 513 items; Resume SQLite con 513 filas/offset 500 y PostgreSQL real 1/1, además del handler API; contrato de tipos efectivos y point contract SQLite/PG real; Ancestors/owners con 512 películas; Search/Hints y candidatos Series validados en ambos drivers; regresión TV cross-folder y extras; benchmark aislado PG16.14 10k/100k/500k: Movie page p95 current→candidate 1.193→0.963 ms, 9.777→6.544 ms y 11.098→6.587 ms | Predicados metadata cross-domain complejos, resume complejo/sin límite, distribución/handlers E2E representativos, baseline productiva y carga concurrente de handlers |
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 con backfill transaccional único; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; check locked y clippy DB/API `-D warnings` verdes | Filtros complejos por Person/Genre/Studio/Tag/rating/premiere, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
-| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 41/41; candidato AArch64 distroless con 13 paquetes, FFmpeg/ffprobe y corpus verdes, SBOM verificado y Trivy HIGH/CRITICAL=0; consulta NVD actual: 18 CVE, 16 HIGH/CRITICAL y 0 sin mapear; el bundle exacto anterior `8026d7f` dio RustSec=0 y NVD=0 | Commit y bundle completos exactos del candidato, repetir AMD64 y solo entonces firma/provenance |
+| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 41/41; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; consulta NVD: 18 CVE, 16 HIGH/CRITICAL y 0 sin mapear | Repetir AMD64 y solo entonces firma/provenance |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `8026d7f60615` desplegado; servidor SHA-256 `95f70e1c...3b6f`; FFmpeg/ffprobe `8.2-dev-git-1e0279143db9`; migración 109 current, capacidades y arranque verdes; `/healthz`/`/readyz` local+HTTPS, 0 reinicios y sin hijos FFmpeg; rollback `pre-8026d7f-20260809T144300Z`; Xtream conserva 757 canales | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; el cambio distroless afecta al contenedor, no exige reemplazar estos binarios bare-metal |
 
 ### Trabajo restante y gates de salida
@@ -423,7 +424,7 @@ rollout probado:
    Esto
    no bloquea un rollout exclusivamente MAGSTV, que ya usa `live_tv_*`, pero sí
    bloquea afirmar esa escala para bibliotecas generales.
-5. **Supply chain real — runtime distroless AArch64 validado; falta evidencia exacta:** Rust
+5. **Supply chain real — runtime distroless AArch64 exacto validado:** Rust
    1.94/SQLx 0.9 eliminan `rsa` del lock sin excepción. La etapa FFmpeg AArch64
    del candidato ya compila desde la revisión oficial `1e027914...`; verificó
    el archivo fuente y los 16 patches oficiales por SHA-256, y NVD devolvió 16
@@ -437,9 +438,15 @@ rollout probado:
    Debian solo como helper de build. El candidato final ejecuta FFmpeg y
    ffprobe dentro de distroless durante el build, pasa el corpus MP4/MKV/MPEG-TS
    como no-root y genera un SBOM verificable de 13 paquetes OS más Jellyrin.
-   Trivy 0.70.0 detecta Debian 13.6 y devuelve 0 HIGH/CRITICAL. Falta crear el
-   commit, reconstruir y conservar SBOM/vulnerability bundles contra ese commit
-   exacto y repetir todo en AMD64. Como evidencia histórica adicional,
+   Trivy 0.70.0 detecta Debian 13.6 y devuelve 0 HIGH/CRITICAL. La imagen exacta
+   de `6a15aec579b8992373c72ae9f57b3503ef3751dd` tiene id
+   `3f1f0b7f...0b84`, pesa 87.663.302 bytes y conserva la revisión OCI completa.
+   RustSec, Trivy y NVD-FFmpeg terminan todos con exit code cero. Los bundles
+   están en `/home/ubuntu/plans/generated/supply-chain-arm64-6a15aec`
+   (`SHA256SUMS` `4b130aca...f37dc`) y
+   `/home/ubuntu/plans/generated/vulnerability-arm64-6a15aec`
+   (`SHA256SUMS` `feb500de...8771`). Falta repetir todo en AMD64. Como evidencia
+   histórica adicional,
    Podman rootless
    construyó la imagen AArch64 exacta de `a852c5b81213b444da5ab5d0008defd7628a5934`,
    con revisión OCI completa, sin `curl`, FFmpeg 8.1.2 mínimo fijado y 157.058.151
