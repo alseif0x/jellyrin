@@ -53,13 +53,14 @@ async function main() {
   ]);
   const cargoLock = await read('Cargo.lock');
   const lock = parseLock(lockText);
-  const runtimeDockerfile = dockerfile.slice(dockerfile.lastIndexOf('FROM ${RUNTIME_IMAGE}'));
+  const runtimeDockerfile = dockerfile.slice(dockerfile.lastIndexOf('FROM runtime-smoke'));
   const vulnerabilityExceptions = JSON.parse(vulnerabilityExceptionsText);
   const exceptionErrors = validateVulnerabilityExceptions(vulnerabilityExceptions);
   const exceptionValidatorSelfTest = validateExceptionValidator();
   const requiredKeys = [
     'RUST_IMAGE',
     'RUNTIME_IMAGE',
+    'DISTROLESS_IMAGE',
     'POSTGRES_IMAGE',
     'REDIS_IMAGE',
     'DEBIAN_SNAPSHOT',
@@ -86,7 +87,7 @@ async function main() {
     'JELLYFIN_WEB_SWIPER_PATCH_COMMIT',
     'JELLYFIN_WEB_SWIPER_PATCH_SHA256',
   ];
-  const imageKeys = ['RUST_IMAGE', 'RUNTIME_IMAGE', 'POSTGRES_IMAGE', 'REDIS_IMAGE'];
+  const imageKeys = ['RUST_IMAGE', 'RUNTIME_IMAGE', 'DISTROLESS_IMAGE', 'POSTGRES_IMAGE', 'REDIS_IMAGE'];
   const actionReferences = [...workflow.matchAll(/uses:\s*[^@\s]+@([^\s#]+)/g)].map(
     (match) => match[1],
   );
@@ -196,7 +197,9 @@ async function main() {
       'docker-base-images-match-lock',
       dockerfile.includes(`ARG RUST_IMAGE=${lock.RUST_IMAGE}`) &&
         dockerfile.includes(`ARG RUNTIME_IMAGE=${lock.RUNTIME_IMAGE}`) &&
-        dockerfile.includes('org.opencontainers.image.base.name="${RUNTIME_IMAGE}"'),
+        dockerfile.includes(`ARG DISTROLESS_IMAGE=${lock.DISTROLESS_IMAGE}`) &&
+        dockerfile.includes('FROM ${DISTROLESS_IMAGE} AS runtime-smoke') &&
+        dockerfile.includes('org.opencontainers.image.base.name="${DISTROLESS_IMAGE}"'),
     ),
     check(
       'docker-cargo-lock-enforced',
@@ -227,6 +230,7 @@ async function main() {
         dockerfile.includes('--disable-everything') &&
         dockerfile.includes('--enable-muxer=hls,mpegts,mov,mp4') &&
         dockerfile.includes('COPY --from=ffmpeg-builder') &&
+        dockerfile.includes('RUN ["/usr/local/bin/ffmpeg", "-version"]') &&
         !runtimeDockerfile.includes('apt-get install -y --no-install-recommends ffmpeg') &&
         dockerfile.includes('ffprobe -version'),
     ),
@@ -240,6 +244,7 @@ async function main() {
       'compose-build-lock-defaults',
       compose.includes(`RUST_IMAGE: \${RUST_IMAGE:-${lock.RUST_IMAGE}}`) &&
         compose.includes(`RUNTIME_IMAGE: \${RUNTIME_IMAGE:-${lock.RUNTIME_IMAGE}}`) &&
+        compose.includes(`DISTROLESS_IMAGE: \${DISTROLESS_IMAGE:-${lock.DISTROLESS_IMAGE}}`) &&
         compose.includes(`DEBIAN_SNAPSHOT: \${DEBIAN_SNAPSHOT:-${lock.DEBIAN_SNAPSHOT}}`) &&
         compose.includes(`FFMPEG_SOURCE_REVISION: \${FFMPEG_SOURCE_REVISION:-${lock.FFMPEG_SOURCE_REVISION}}`) &&
         compose.includes(`FFMPEG_SOURCE_VERSION: \${FFMPEG_SOURCE_VERSION:-${lock.FFMPEG_SOURCE_VERSION}}`) &&
@@ -390,7 +395,8 @@ async function main() {
     check(
       'sbom-output-is-verified',
         generator.includes('FFmpeg source digest drift') &&
-        generator.includes('general-purpose Debian ffmpeg package is present') &&
+        generator.includes('general-purpose packaged FFmpeg is present') &&
+        generator.includes('distroless runtime package surface drifted above its reviewed bound') &&
         generator.includes('remux-only image decoder allowlist drift') &&
         generator.includes('ffmpeg-source.spdx.json') &&
         generator.includes('ffmpeg-source.cyclonedx.json') &&

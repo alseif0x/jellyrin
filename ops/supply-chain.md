@@ -1,10 +1,11 @@
 # Supply-chain lock, SBOM and vulnerability policy
 
 `ops/supply-chain.lock.env` is the reviewed, public lock for container inputs. It fixes the Rust
-builder, Debian runtime, PostgreSQL and the dormant Redis scaffold by tag plus OCI manifest digest.
-The runtime apt sources use a dated Debian snapshot. FFmpeg is compiled in a separate stage from
-an official commit-addressed source archive after verifying its locked SHA-256; the runtime receives only
-the two stripped binaries and their small TLS/zlib closure. `cargo build --locked` makes Cargo
+builder, Debian build helper, distroless production runtime, PostgreSQL and the dormant Redis
+scaffold by tag plus OCI manifest digest. Build-stage apt sources use a dated Debian snapshot.
+FFmpeg is compiled in a separate stage from an official commit-addressed source archive after
+verifying its locked SHA-256; the runtime receives only the two stripped binaries. Their required
+glibc, TLS and zlib closure comes from the pinned distroless base. `cargo build --locked` makes Cargo
 refuse dependency-lock drift.
 Jellyfin Web is independently pinned to version `10.11.11`, its immutable
 upstream commit and the SHA-256 of that commit archive. On top of that unchanged
@@ -63,6 +64,7 @@ set +a
 docker build --pull \
   --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
   --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
+  --build-arg "DISTROLESS_IMAGE=${DISTROLESS_IMAGE}" \
   --build-arg "DEBIAN_SNAPSHOT=${DEBIAN_SNAPSHOT}" \
   --build-arg "FFMPEG_SOURCE_REVISION=${FFMPEG_SOURCE_REVISION}" \
   --build-arg "FFMPEG_SOURCE_VERSION=${FFMPEG_SOURCE_VERSION}" \
@@ -78,10 +80,10 @@ ops/scan-vulnerabilities.sh jellyrin:release vulnerability-artifacts
 ```
 
 The bundle contains SPDX JSON and CycloneDX JSON for the runtime image and Cargo dependency
-manifests, the exact dpkg inventory, FFmpeg source digest, build configuration, capability listings
+manifests, the exact Syft package inventory, FFmpeg source digest, build configuration, capability listings
 and FFmpeg/ffprobe versions, image inspection metadata, both release binaries, the public lock and
-checksums. It rejects a Debian `ffmpeg` package, every encoder, or any decoder other than AAC in the
-remux-only image. The
+checksums. It rejects a packaged `ffmpeg`, every encoder, any decoder other than AAC, or growth of
+the reviewed distroless package surface above 25 entries in the remux-only image. The
 generator downloads Syft only after selecting
 the lock's amd64/arm64 checksum and refuses to overwrite an existing output directory.
 
@@ -109,6 +111,13 @@ as lock metadata, but its now-optional RSA dependency is neither locked nor comp
 and the explicit legacy SQLite feature remain covered by the all-features workspace and schema jobs.
 
 ## Runtime surface decisions
+
+The production image is based on the pinned `cc-debian13:nonroot` distroless manifest and contains
+no shell or package manager. The Docker build executes both media binaries in an intermediate
+distroless stage, so a missing shared-library closure fails the build. The final image inherits
+that tested filesystem, adds only Jellyrin-owned empty directories and runs as numeric UID/GID
+`10001:10001`. A 2026-08-09 AArch64 scan inventories 13 OS packages and reports zero
+HIGH/CRITICAL findings; this result must be reproduced for every exact release image and for AMD64.
 
 The release image does not install `curl`. Its OCI healthcheck invokes
 `jellyrin-server --healthcheck`, a localhost-only HTTP probe with fixed connect, read and write

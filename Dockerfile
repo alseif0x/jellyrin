@@ -1,5 +1,6 @@
 ARG RUST_IMAGE=docker.io/library/rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+ARG DISTROLESS_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
 
 FROM ${RUNTIME_IMAGE} AS ffmpeg-builder
 
@@ -104,11 +105,38 @@ FROM ${RUST_IMAGE} AS builder
 
 ARG CARGO_BUILD_JOBS=2
 WORKDIR /src
-COPY . .
+# Keep documentation, deployment and security-policy edits from invalidating the expensive Rust
+# layer. The workspace build needs only the locked root manifests and crate sources.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 RUN CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --locked --release -p jellyrin-server -p jellyrin-migrate
 
-FROM ${RUNTIME_IMAGE}
+FROM ${RUNTIME_IMAGE} AS runtime-layout
 
+# Prepare only Jellyrin-owned empty directories. No Debian package or dpkg database from this
+# helper stage is copied into the final distroless runtime.
+RUN install -d -o 10001 -g 10001 \
+      /jellyrin-root/var/lib/jellyrin/plugins/packages \
+      /jellyrin-root/var/cache/jellyrin/transcodes \
+      /jellyrin-root/var/log/jellyrin \
+      /jellyrin-root/etc/jellyrin \
+      /jellyrin-root/srv/jellyrin/web
+
+FROM ${DISTROLESS_IMAGE} AS runtime-smoke
+
+COPY --from=builder /src/target/release/jellyrin-server /usr/local/bin/jellyrin-server
+COPY --from=builder /src/target/release/jellyrin-migrate /usr/local/bin/jellyrin-migrate
+COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
+
+# Exec-form RUN works without a shell and proves the distroless glibc/OpenSSL/zlib closure can
+# load both media binaries. Exact versions and capabilities were already verified in the builder.
+RUN ["/usr/local/bin/ffmpeg", "-version"]
+RUN ["/usr/local/bin/ffprobe", "-version"]
+
+FROM runtime-smoke
+
+ARG DISTROLESS_IMAGE
 ARG RUNTIME_IMAGE
 ARG DEBIAN_SNAPSHOT=20260808T000000Z
 ARG FFMPEG_SOURCE_REVISION=1e0279143db99d7324b17f9784b3229122269b38
@@ -117,54 +145,19 @@ ARG FFMPEG_NVD_BASELINE_VERSION=8.1.2
 ARG FFMPEG_SOURCE_SHA256=2eb566ff9b41802220974bf9457da9bdbda078b1f56d1f008525b7b7cd71ca40
 ARG VCS_REF=unknown
 
-# A dated, signed Debian snapshot fixes the small TLS/runtime dependency closure. FFmpeg itself is
-# built from the checksum-pinned upstream source stage above. The fixed 10001 runtime identity lets
-# a root-owned host keyring grant group-read access without making the secret world-readable.
-RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
-    && printf '%s\n' \
-      'Types: deb' \
-      "URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/" \
-      'Suites: bookworm bookworm-updates' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      'Check-Valid-Until: no' \
-      '' \
-      'Types: deb' \
-      "URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/" \
-      'Suites: bookworm-security' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      'Check-Valid-Until: no' \
-      > /etc/apt/sources.list.d/jellyrin-snapshot.sources \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 zlib1g \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 jellyrin \
-    && useradd --uid 10001 --gid jellyrin --home-dir /var/lib/jellyrin --no-create-home --shell /usr/sbin/nologin jellyrin \
-    && install -d -o jellyrin -g jellyrin /var/lib/jellyrin /var/lib/jellyrin/plugins/packages /var/cache/jellyrin /var/cache/jellyrin/transcodes /var/log/jellyrin /etc/jellyrin /srv/jellyrin/web
-
-COPY --from=builder /src/target/release/jellyrin-server /usr/local/bin/jellyrin-server
-COPY --from=builder /src/target/release/jellyrin-migrate /usr/local/bin/jellyrin-migrate
-COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
-
-RUN ffmpeg -version | head -n 1 | grep -F "ffmpeg version ${FFMPEG_SOURCE_VERSION}" \
-    && ffprobe -version | head -n 1 | grep -F "ffprobe version ${FFMPEG_SOURCE_VERSION}" \
-    && ! (ldd /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
-      | awk '/=>/ { print $1 }' \
-      | grep -Ev '^(libc|libm|libpthread|libdl|libssl|libcrypto|libz)\.so' \
-      | grep -q .)
+COPY --from=runtime-layout --chown=10001:10001 /jellyrin-root/ /
 
 LABEL org.opencontainers.image.source="https://github.com/alseif0x/jellyrin" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.base.name="${RUNTIME_IMAGE}" \
-      io.jellyrin.debian-snapshot="${DEBIAN_SNAPSHOT}" \
+      org.opencontainers.image.base.name="${DISTROLESS_IMAGE}" \
+      io.jellyrin.build-base.name="${RUNTIME_IMAGE}" \
+      io.jellyrin.build-debian-snapshot="${DEBIAN_SNAPSHOT}" \
       io.jellyrin.ffmpeg-version="${FFMPEG_SOURCE_VERSION}" \
       io.jellyrin.ffmpeg-source-revision="${FFMPEG_SOURCE_REVISION}" \
       io.jellyrin.ffmpeg-nvd-baseline-version="${FFMPEG_NVD_BASELINE_VERSION}" \
       io.jellyrin.ffmpeg-source-sha256="${FFMPEG_SOURCE_SHA256}"
 
-USER jellyrin
+USER 10001:10001
 EXPOSE 8096
 VOLUME ["/var/lib/jellyrin", "/var/cache/jellyrin", "/var/log/jellyrin", "/etc/jellyrin", "/srv/jellyrin/web"]
 ENV JELLYRIN_HOST=0.0.0.0 \

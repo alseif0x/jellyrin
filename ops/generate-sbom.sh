@@ -126,14 +126,6 @@ if [[ "${actual_decoders}" != "aac" ]]; then
     echo "remux-only image decoder allowlist drift: ${actual_decoders:-<none>}" >&2
     exit 1
 fi
-if docker run --rm --entrypoint dpkg-query "${image_ref}" -W ffmpeg >/dev/null 2>&1; then
-    echo "general-purpose Debian ffmpeg package is present in the remux-only image" >&2
-    exit 1
-fi
-docker run --rm --entrypoint dpkg-query "${image_ref}" \
-    -W -f='${binary:Package}\t${Version}\n' \
-    | LC_ALL=C sort > "${output_dir}/runtime-packages.txt"
-
 image_revision="$(
     docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${image_ref}"
 )"
@@ -147,6 +139,18 @@ printf '%s\n' "${image_revision}" > "${output_dir}/source-revision.txt"
     --output "spdx-json=${output_dir}/jellyrin-image.spdx.json"
 "${syft_root}/syft" scan "docker:${image_ref}" \
     --output "cyclonedx-json=${output_dir}/jellyrin-image.cyclonedx.json"
+jq -r '.packages[]? | select(.name != null and .versionInfo != null)
+    | [.name, .versionInfo] | @tsv' "${output_dir}/jellyrin-image.spdx.json" \
+    | LC_ALL=C sort -u > "${output_dir}/runtime-packages.txt"
+if awk -F '\t' 'tolower($1) == "ffmpeg" { found=1 } END { exit !found }' \
+    "${output_dir}/runtime-packages.txt"; then
+    echo "general-purpose packaged FFmpeg is present in the remux-only image" >&2
+    exit 1
+fi
+if [[ "$(wc -l < "${output_dir}/runtime-packages.txt")" -gt 25 ]]; then
+    echo "distroless runtime package surface drifted above its reviewed bound" >&2
+    exit 1
+fi
 
 # Scan Cargo manifests separately so statically linked Rust dependencies are represented even when
 # an image scanner cannot recover their package metadata from optimized native binaries.

@@ -120,7 +120,11 @@
 - For a release candidate, build from the locked inputs and run
   `ops/generate-sbom.sh jellyrin:release supply-chain-artifacts`; verify
   `SHA256SUMS`, `jellyrin-image.spdx.json`, `jellyrin-image.cyclonedx.json` and
-  both source SBOMs before promotion.
+  both source SBOMs before promotion. Confirm the runtime inventory remains at
+  or below the reviewed 25-entry bound and contains no packaged `ffmpeg`.
+- Confirm the exact production image uses the digest-pinned distroless base,
+  runs as `10001:10001`, has no shell/package manager, and still executes both
+  FFmpeg binaries plus the complete remux corpus.
 - Run `ops/scan-vulnerabilities.sh jellyrin:release vulnerability-artifacts`; require both scanner
   exit codes to be zero and verify its `SHA256SUMS`. Review suppressed findings as well as active
   findings; every suppression must still be valid in `ops/vulnerability-exceptions.json`.

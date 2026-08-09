@@ -116,6 +116,7 @@ jobs:
           docker build --pull \
             --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
             --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
+            --build-arg "DISTROLESS_IMAGE=${DISTROLESS_IMAGE}" \
             --build-arg "DEBIAN_SNAPSHOT=${DEBIAN_SNAPSHOT}" \
             --build-arg "FFMPEG_SOURCE_REVISION=${FFMPEG_SOURCE_REVISION}" \
             --build-arg "FFMPEG_SOURCE_VERSION=${FFMPEG_SOURCE_VERSION}" \
