@@ -340,9 +340,9 @@ instalada en la base `jellyrin` y registra 49 statements. Xtream quedó
 configurado y su catálogo contiene 757 canales; esto acredita configuración e
 indexación, pero no sustituye la reproducción E2E con clientes reales.
 El candidato vigente del núcleo se desplegó en staging el 2026-08-09 desde el
-commit `954369c`, precedido por `d82fb29` y `353ddc1` para el catálogo Series.
+commit `33d16bb`, precedido por `d82fb29`, `353ddc1` y `954369c` para el catálogo Series.
 El servidor tiene SHA-256
-`2bbc6c46bc780b55c1959c44a70da12412633f0c37aef4610f5fd5f8ba37f2be`; el
+`ca53d430e7cf73959283626802f642a46307667eecb839f6f3d9e8d22bb3641c`; el
 esquema PostgreSQL está en 115 y el migrador embebe 19 migraciones.
 FFmpeg/ffprobe 8.1.2 mínimos quedaron en `/usr/local/bin` con hashes
 `324bf6b508e04659b0d833461c1cdb6f7b54e764ab27ff61a523c37c2c560268` y
@@ -394,14 +394,14 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Área | Código local | Evidencia ejecutada | Fuera de este cierre |
 | --- | --- | --- | --- |
 | Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 150/0/2 más doctests y staging durable sobre PostgreSQL 17.10 real; migrador 36/36; esquema 115 aplicado en staging; proyecciones 108–112 e índices Series 114/115 verificados; checks y clippy DB/API/migrador estrictos verdes | E2E de reproducción/carga de handlers, cutover y contratos restantes antes de otro backend |
-| FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC | Imagen AArch64 final `a852c5b81213`, 157.058.151 bytes, id `922ac235...96ef5f`; corpus real MP4/MKV/MPEG-TS probe+HLS copy verde como usuario no-root; aliases, specifiers, filtros, codec implícito y comandos no confiables cubiertos; validadores de capacidades exactas añadidos | E2E Xtream/clientes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen en staging; repetir AMD64 |
+| FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC | Corpus aislado verde; VOD Xtream real H.264/AAC/MKV eligió DirectProxy, siguió un 302 revalidado, sirvió Range 206/65.536 bytes con 0 procesos FFmpeg y ~40,7 ms CPU de servicio | Live TV y matriz de clientes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado; clave de referencia root-only generada | Pin público aún viejo; falta guardar el repositorio e instalar 0.1.1; perfil WireGuard MX, metadatos/secretos legítimos restantes, E2E real y publicación pendientes |
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series incremental a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; reintentos acotados para detalles transitorios | Xtream 26/26; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales | Audits post-import, reproducción y matriz de clientes reales |
 | Catálogo general | Pushdown SQL acotado con total exacto, playback join y ParentId; Series pagina claves canónicas por driver con fallback legacy e índices 114/115 | API 348/0/3, DB 150/0/2, migrador 36/36 y Clippy estrictos; PostgreSQL real: 22.194 series, páginas 20/20/14 en ~1,07 s, total exacto, `Limit=0`, memoria pico de servicio ~16 MiB | Proyección materializada si una biblioteca heterogénea o una serie extrema supera el gate; E2E visual/reproducción |
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109, selector exacto GenreIds 110, fecha Upcoming 111 y selector exacto Person/Studio/Tag 112; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL 17.10 real con >500 seleccionados; Genre/Person/Studio/Tag por nombre raw y representaciones exactas legacy, OR interno/AND entre clases, paginación y parent recursivo; cap independiente de 64 antes de cualquier fallback; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; benchmark 112 a 10k/100k/500k reduce filas 9.900/99.000/495.000→24/247/1.234 y mejora p95 SQL 1,360x/1,528x/1,306x con PK lookup; API 347/0/3, DB 150/0/2 y migrador 36/36 | Ratings/premiere y shapes no equivalentes, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 46/46; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `954369c`; servidor SHA-256 `2bbc6c46...7f2be`; esquema 115; `/healthz`/`readyz` local y health HTTPS verdes, 0 reinicios; backups pre-114/pre-115; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios | E2E de reproducción Xtream y clientes/FFmpeg; instalar/validar MAGSTV, resolver egress/secretos operativos y ejecutar su E2E real |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `33d16bb`; servidor SHA-256 `ca53d430...3641c`; esquema 115; health/ready local y health HTTPS verdes, 0 reinicios; backups pre-114/pre-115/pre-33d16bb; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios; DirectProxy VOD real verde | E2E Live TV y clientes; instalar/validar MAGSTV, resolver egress/secretos operativos y ejecutar su E2E real |
 
 ### Trabajo restante y gates de salida
 
@@ -427,7 +427,8 @@ rollout probado:
    desplegados: con `SeriesLimit=0`, el sync real publicó 39.093 películas y
    455.520 episodios agrupados en 22.194 series; omitió 3 detalles remotos
    persistentemente transitorios sin invalidar el resto de la generación.
-   Falta probar reproducción y clientes reales.
+   DirectProxy VOD real ya conserva H.264/AAC sin FFmpeg y sirve rangos a través
+   de la redirección CDN validada. Faltan Live TV y clientes reales.
    Después se buscarán
    `RemoteSourceUrl`, `RemoteMediaProbe.SourceUrl` y
    `live_tv_channels.stream_url`; cualquier catálogo afectado se reimporta y se
@@ -585,7 +586,9 @@ rollout probado:
    agrupado y la página de Series a SQL: páginas inicial, siguiente y final de
    20/20/14 elementos mantienen el total exacto en unos 1,07 segundos y el
    servicio ronda 16 MiB al navegar. La matriz sintética 10k/100k/500k ya se
-   ejecutó; falta completar carga concurrente y handlers E2E de reproducción,
+   ejecutó. DirectProxy VOD real ya respondió 206 a una lectura acotada de
+   65.536 bytes a través de la redirección CDN, sin lanzar FFmpeg y con unos
+   40,7 ms de CPU del servicio; faltan carga concurrente, Live TV y clientes,
    completar los prerrequisitos e importar MAGSTV con una cuenta
    controlada, la matriz Jellyfin Web/TV/DLNA y reproducción direct/remux. Ninguna
    credencial real se incorpora a fixtures o logs. El backend queda en
@@ -2621,15 +2624,18 @@ inicial; estos criterios no deben leerse como una declaración de rollout.
 ### 15.2 Reproducción
 
 **Estado general `[~]`:** las decisiones, límites y cleanup tienen cobertura
-offline, pero la aceptación definitiva exige fuentes MAGSTV reales, clientes
-Jellyfin usados en producción y medidas de CPU/`speed` en este host.
+offline. DirectProxy VOD ya está acreditado con una fuente Xtream real y medidas
+del host; la aceptación definitiva exige Live TV/MAGSTV reales, clientes
+Jellyfin usados en producción y medidas sostenidas de CPU/`speed`.
 
 Las condiciones de profile/level/bit depth/frame rate/channels y sus razones ya
 están implementadas. Process groups, `SIGTERM` con gracia, escalado a `SIGKILL`
 y reap también están implementados; lo pendiente aquí es validarlos bajo carga
 y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
 
-- Un VOD remoto compatible usa direct proxy y no crea proceso FFmpeg.
+- `[x]` Un VOD Xtream remoto compatible usa direct proxy, revalida cada salto
+  CDN, conserva `Range` y no crea proceso FFmpeg: 206/65.536 bytes, ~40,7 ms de
+  CPU y pico de servicio menor de 10 MiB en el probe desplegado.
 - Un contenedor incompatible con H.264/AAC compatible usa remux y no contiene
   encoder de vídeo en el comando.
 - Audio incompatible con vídeo compatible usa `-c:v copy`.
