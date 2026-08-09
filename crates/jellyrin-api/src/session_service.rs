@@ -1,9 +1,11 @@
 use jellyrin_core::DeviceToken;
 use jellyrin_db::{
-    ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, Database, DeviceSession,
+    ActivePlaybackSession, ActiveSessionUser, ActiveViewingSession, DeviceSession,
     TranscodeSession, UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
 };
 use serde_json::Value;
+
+use crate::Database;
 
 /// Persistence boundary for device/session state used by route handlers.
 pub(crate) struct SessionService<'a> {

@@ -1,0 +1,6 @@
+[jellyrin-backup]
+host=/var/run/postgresql
+port=5432
+dbname=jellyrin
+user=jellyrin-backup
+sslmode=disable

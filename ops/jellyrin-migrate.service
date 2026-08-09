@@ -1,0 +1,35 @@
+[Unit]
+Description=Apply Jellyrin PostgreSQL schema migrations
+Documentation=https://github.com/alseif0x/jellyrin
+After=network-online.target
+Wants=network-online.target
+Before=jellyrin.service
+
+[Service]
+Type=oneshot
+# A transient OS identity prevents the long-running Jellyrin process from reading this
+# process's environment through /proc while migrations are running.
+DynamicUser=true
+EnvironmentFile=/etc/jellyrin-migrate.env
+ExecStart=/usr/local/bin/jellyrin-migrate schema
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

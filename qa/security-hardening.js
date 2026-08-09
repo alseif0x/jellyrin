@@ -10,12 +10,17 @@ const generatedDir = path.join(plansDir, 'generated');
 
 async function main() {
   const api = await fs.readFile(path.join(repoRoot, 'crates/jellyrin-api/src/lib.rs'), 'utf8');
+  const backup = await fs.readFile(path.join(repoRoot, 'crates/jellyrin-api/src/backup.rs'), 'utf8');
+  const migration = await fs.readFile(
+    path.join(repoRoot, 'crates/jellyrin-api/src/migration.rs'),
+    'utf8',
+  );
   const core = await fs.readFile(path.join(repoRoot, 'crates/jellyrin-core/src/lib.rs'), 'utf8');
   const transcode = await fs.readFile(path.join(repoRoot, 'crates/jellyrin-transcode/src/lib.rs'), 'utf8');
 
   const checks = [
-    check('admin-auth-backup', api.includes('async fn backups') && api.includes('require_admin(&state.db, &headers, query.api_key.as_deref()).await?')),
-    check('admin-auth-migration', api.includes('async fn jellyfin_migration_import') && api.includes('let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?')),
+    check('admin-auth-backup', backup.includes('async fn backups') && backup.includes('require_admin(&state.db, &headers, query.api_key.as_deref()).await?')),
+    check('admin-auth-migration', migration.includes('async fn jellyfin_migration_import') && migration.includes('let user = require_admin(&state.db, &headers, query.api_key.as_deref()).await?')),
     check('admin-auth-logs', api.includes('async fn system_logs') && api.includes('async fn system_log_file') && occurrences(api, 'require_admin(&state.db, &headers, auth_query.api_key.as_deref()).await?') >= 3),
     check('startup-auth-exception-scoped', api.includes('require_user_or_startup_incomplete') && api.includes('require_admin_or_startup_incomplete')),
     check('traversal-log-file-name', api.includes('fn safe_log_file_path') && api.includes("name.contains('/')") && api.includes("name.contains('\\\\')")),

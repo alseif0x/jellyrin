@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use jellyrin_db::Database;
+use crate::Database;
 
 /// Persistence boundary for filesystem watcher updates.
 pub(crate) struct FileService<'a> {

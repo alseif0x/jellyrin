@@ -11,8 +11,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
+    AUTH_FAILURE_MAX_ENTRIES, AUTH_FAILURE_PRUNE_INTERVAL, AUTH_FAILURE_RETENTION_SECONDS,
     AUTH_FAILURES, AUTH_LOCKOUT_FAILURE_LIMIT, AUTH_LOCKOUT_SECONDS, ApiError, AppState,
-    AuthFailureState, AuthQuery, UserService, authentication_result_to_dto,
+    AuthFailureRegistry, AuthFailureState, AuthQuery, UserService, authentication_result_to_dto,
     client_auth_from_headers, ensure_user_access, record_activity, require_user, resolve_user_id,
 };
 
@@ -201,25 +202,14 @@ fn auth_lockout_key(kind: &str, value: &str) -> String {
 async fn ensure_auth_not_locked(key: &str) -> Result<(), ApiError> {
     let now = epoch_seconds();
     let mut failures = AUTH_FAILURES
-        .get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        .get_or_init(|| tokio::sync::Mutex::new(AuthFailureRegistry::default()))
         .lock()
         .await;
-    if let Some(state) = failures.get(key)
-        && state
-            .locked_until_epoch
-            .is_some_and(|locked_until| locked_until > now)
-    {
+    if auth_attempt_is_limited(&mut failures, key, now, AUTH_FAILURE_MAX_ENTRIES) {
         return Err(ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             error: anyhow::anyhow!("Too many failed login attempts"),
         });
-    }
-    if failures
-        .get(key)
-        .and_then(|state| state.locked_until_epoch)
-        .is_some()
-    {
-        failures.remove(key);
     }
     Ok(())
 }
@@ -227,23 +217,99 @@ async fn ensure_auth_not_locked(key: &str) -> Result<(), ApiError> {
 async fn record_auth_failure(key: &str) {
     let now = epoch_seconds();
     let mut failures = AUTH_FAILURES
-        .get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+        .get_or_init(|| tokio::sync::Mutex::new(AuthFailureRegistry::default()))
         .lock()
         .await;
-    let entry = failures.entry(key.to_string()).or_insert(AuthFailureState {
-        failures: 0,
-        locked_until_epoch: None,
-    });
-    entry.failures = entry.failures.saturating_add(1);
-    if entry.failures >= AUTH_LOCKOUT_FAILURE_LIMIT {
-        entry.locked_until_epoch = Some(now.saturating_add(AUTH_LOCKOUT_SECONDS));
-    }
+    record_auth_failure_in_registry(&mut failures, key, now, AUTH_FAILURE_MAX_ENTRIES);
 }
 
 async fn clear_auth_failure(key: &str) {
     if let Some(failures) = AUTH_FAILURES.get() {
-        failures.lock().await.remove(key);
+        failures.lock().await.entries.remove(key);
     }
+}
+
+fn auth_failure_expired(state: &AuthFailureState, now: u64) -> bool {
+    match state.locked_until_epoch {
+        Some(locked_until) => locked_until <= now,
+        None => {
+            state
+                .last_failure_epoch
+                .saturating_add(AUTH_FAILURE_RETENTION_SECONDS)
+                <= now
+        }
+    }
+}
+
+fn prune_auth_failures(registry: &mut AuthFailureRegistry, now: u64) {
+    registry
+        .entries
+        .retain(|_, state| !auth_failure_expired(state, now));
+    registry.operations_since_prune = 0;
+}
+
+fn maintain_auth_failure_registry(registry: &mut AuthFailureRegistry, now: u64, force: bool) {
+    registry.operations_since_prune = registry.operations_since_prune.saturating_add(1);
+    if force || registry.operations_since_prune >= AUTH_FAILURE_PRUNE_INTERVAL {
+        prune_auth_failures(registry, now);
+    }
+}
+
+fn remove_expired_auth_failure(registry: &mut AuthFailureRegistry, key: &str, now: u64) {
+    if registry
+        .entries
+        .get(key)
+        .is_some_and(|state| auth_failure_expired(state, now))
+    {
+        registry.entries.remove(key);
+    }
+}
+
+fn auth_attempt_is_limited(
+    registry: &mut AuthFailureRegistry,
+    key: &str,
+    now: u64,
+    max_entries: usize,
+) -> bool {
+    remove_expired_auth_failure(registry, key, now);
+    let missing_at_capacity =
+        !registry.entries.contains_key(key) && registry.entries.len() >= max_entries;
+    maintain_auth_failure_registry(registry, now, missing_at_capacity);
+    registry
+        .entries
+        .get(key)
+        .and_then(|state| state.locked_until_epoch)
+        .is_some_and(|locked_until| locked_until > now)
+        || (!registry.entries.contains_key(key) && registry.entries.len() >= max_entries)
+}
+
+fn record_auth_failure_in_registry(
+    registry: &mut AuthFailureRegistry,
+    key: &str,
+    now: u64,
+    max_entries: usize,
+) -> bool {
+    remove_expired_auth_failure(registry, key, now);
+    let missing_at_capacity =
+        !registry.entries.contains_key(key) && registry.entries.len() >= max_entries;
+    maintain_auth_failure_registry(registry, now, missing_at_capacity);
+    if !registry.entries.contains_key(key) && registry.entries.len() >= max_entries {
+        return false;
+    }
+    let entry = registry
+        .entries
+        .entry(key.to_string())
+        .or_insert(AuthFailureState {
+            failures: 0,
+            locked_until_epoch: None,
+            last_failure_epoch: now,
+        });
+    entry.failures = entry.failures.saturating_add(1);
+    entry.last_failure_epoch = now;
+    if entry.failures >= AUTH_LOCKOUT_FAILURE_LIMIT {
+        entry.locked_until_epoch = Some(now.saturating_add(AUTH_LOCKOUT_SECONDS));
+    }
+    true
 }
 
 fn epoch_seconds() -> u64 {
@@ -251,4 +317,81 @@ fn epoch_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_failure_registry_prunes_expired_entries() {
+        let now = 10_000;
+        let mut registry = AuthFailureRegistry::default();
+        registry.entries.insert(
+            "recent".to_string(),
+            AuthFailureState {
+                failures: 1,
+                locked_until_epoch: None,
+                last_failure_epoch: now - AUTH_FAILURE_RETENTION_SECONDS + 1,
+            },
+        );
+        registry.entries.insert(
+            "stale".to_string(),
+            AuthFailureState {
+                failures: 1,
+                locked_until_epoch: None,
+                last_failure_epoch: now - AUTH_FAILURE_RETENTION_SECONDS,
+            },
+        );
+        registry.entries.insert(
+            "locked".to_string(),
+            AuthFailureState {
+                failures: AUTH_LOCKOUT_FAILURE_LIMIT,
+                locked_until_epoch: Some(now + 1),
+                last_failure_epoch: now,
+            },
+        );
+        registry.entries.insert(
+            "expired-lock".to_string(),
+            AuthFailureState {
+                failures: AUTH_LOCKOUT_FAILURE_LIMIT,
+                locked_until_epoch: Some(now),
+                last_failure_epoch: now - AUTH_LOCKOUT_SECONDS,
+            },
+        );
+
+        prune_auth_failures(&mut registry, now);
+
+        assert_eq!(registry.entries.len(), 2);
+        assert!(registry.entries.contains_key("recent"));
+        assert!(registry.entries.contains_key("locked"));
+    }
+
+    #[test]
+    fn auth_failure_registry_reuses_entries_and_enforces_capacity() {
+        let now = 20_000;
+        let mut registry = AuthFailureRegistry::default();
+
+        assert!(record_auth_failure_in_registry(&mut registry, "a", now, 2));
+        assert!(record_auth_failure_in_registry(&mut registry, "b", now, 2));
+        assert!(!record_auth_failure_in_registry(&mut registry, "c", now, 2));
+        assert_eq!(registry.entries.len(), 2);
+
+        assert!(record_auth_failure_in_registry(
+            &mut registry,
+            "a",
+            now + 1,
+            2
+        ));
+        assert_eq!(registry.entries["a"].failures, 2);
+        assert!(auth_attempt_is_limited(&mut registry, "c", now + 1, 2));
+
+        assert!(!auth_attempt_is_limited(
+            &mut registry,
+            "c",
+            now + AUTH_FAILURE_RETENTION_SECONDS + 1,
+            2
+        ));
+        assert!(registry.entries.is_empty());
+    }
 }

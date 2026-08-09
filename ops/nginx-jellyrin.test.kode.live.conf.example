@@ -1,0 +1,56 @@
+# This file is included inside nginx's `http` context. It deliberately logs `$uri` only:
+# Jellyfin clients commonly put `api_key` in the query string.
+log_format jellyrin_path_only
+    '$remote_addr - $remote_user [$time_local] '
+    '"$request_method $uri $server_protocol" $status $body_bytes_sent '
+    '"$http_user_agent"';
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name jellyrin.test.kode.live;
+
+    access_log /var/log/nginx/jellyrin.access.log jellyrin_path_only;
+    # Nginx error messages can contain the complete request line, including api_key.
+    error_log /var/log/nginx/jellyrin.error.log crit;
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+
+    # Preserve query parameters for clients that still send api_key on HTTP. Access logs remain
+    # path-only because the log format above uses $uri rather than $request_uri or $args.
+    location / {
+        return 308 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name jellyrin.test.kode.live;
+
+    # Replace these examples with the certificate paths managed on the target host.
+    ssl_certificate /etc/letsencrypt/live/jellyrin.test.kode.live/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/jellyrin.test.kode.live/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    access_log /var/log/nginx/jellyrin.access.log jellyrin_path_only;
+    error_log /var/log/nginx/jellyrin.error.log crit;
+
+    location / {
+        proxy_pass http://127.0.0.1:8096;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}

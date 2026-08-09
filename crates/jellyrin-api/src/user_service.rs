@@ -1,7 +1,8 @@
 use jellyrin_core::{DeviceToken, User};
-use jellyrin_db::Database;
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::Database;
 
 /// User-domain persistence boundary used by HTTP handlers.
 ///

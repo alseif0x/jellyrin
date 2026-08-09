@@ -1,7 +1,15 @@
+#[cfg(any(test, feature = "sqlite"))]
+use futures_util::TryStreamExt;
+#[cfg(any(test, feature = "sqlite"))]
+use std::collections::HashMap;
+#[cfg(any(test, feature = "sqlite"))]
+use std::sync::Arc;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Duration as StdDuration,
 };
 
 use anyhow::Context;
@@ -10,25 +18,126 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng},
 };
 use jellyrin_core::{
-    DeviceToken, MediaItem, PlaybackState, ServerState, StartupConfig, User, VirtualFolder,
+    DeviceToken, MediaItem, PlaybackState, ServerState, User, VirtualFolder,
+    effective_media_item_type,
+};
+#[cfg(any(test, feature = "sqlite"))]
+use jellyrin_core::{StartupConfig, tv_episode_path_info};
+use jellyrin_transcode::{
+    BoundedCommandOutputError, BoundedCommandOutputOptions, TranscodeJobPermit,
+    acquire_multimedia_probe, run_bounded_command_output,
 };
 use serde_json::{Value, json};
+#[cfg(any(test, feature = "sqlite"))]
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
-use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+#[cfg(any(test, feature = "sqlite"))]
+use time::Duration;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use uuid::Uuid;
 
+mod driver;
+mod facets;
+mod ffprobe_telemetry;
+mod manager;
+mod postgres;
+mod postgres_auth;
+mod postgres_catalog;
+mod postgres_devices;
+mod postgres_lists;
+mod postgres_livetv;
+mod postgres_misc;
+mod postgres_plugins;
+mod postgres_provider_secrets;
+mod postgres_scan;
+mod postgres_sessions;
+mod provider_secrets;
+mod telemetry;
+pub use driver::{DatabaseBackend, DatabaseDriver};
+pub use facets::{
+    ExtractedMediaItemFacet, MediaItemFacetCandidateQuery, MediaItemFacetKind, MediaItemFacetValue,
+    extract_media_item_facets,
+};
+use ffprobe_telemetry::{FfprobeOutcome, ffprobe_telemetry};
+pub use ffprobe_telemetry::{FfprobeTelemetrySnapshot, ffprobe_telemetry_snapshot};
+pub use manager::{DatabaseConfig, DatabaseManager};
+pub use postgres::{PostgresDatabase, PostgresSettings};
+pub use postgres_catalog::{
+    MEDIA_ITEM_FACET_PROJECTION_NAME, MEDIA_ITEM_FACET_PROJECTION_VERSION,
+    MediaItemFacetProjectionMode, MediaItemFacetProjectionReport,
+    ensure_media_item_facet_projection,
+};
+pub use provider_secrets::{
+    PROVIDER_SECRET_REFERENCE_FIELD, ProviderCredentials, ProviderSecretEnvelope,
+    ProviderSecretReference, ProviderSecretVault, provider_secret_namespace_for_configuration,
+};
+use provider_secrets::{
+    collect_provider_secret_reference_identities, configuration_has_provider_secret_input_field,
+    configuration_has_provider_secret_material, configuration_has_provider_secret_reference_field,
+    configuration_references_provider_secret, inherit_provider_secret_reference,
+    inherit_provider_secret_reference_for_configuration, new_provider_secret_id,
+    normalize_provider_type, provider_credentials_from_configuration,
+    redacted_provider_configuration, resolved_provider_configuration,
+    set_provider_secret_reference,
+};
+pub use telemetry::{
+    DATABASE_DURATION_BUCKET_COUNT, DATABASE_DURATION_BUCKET_UPPER_MICROSECONDS,
+    DatabaseAcquireDiagnostics, DatabaseDurationHistogramDiagnostics,
+    DatabaseErrorClassDiagnostics, DatabaseOperationDiagnostics, DatabasePoolRole,
+    DatabaseRowDiagnostics, DatabaseTelemetryCoverage, DatabaseTelemetryDiagnostics,
+};
+#[cfg(any(test, feature = "sqlite"))]
+use telemetry::{DatabaseOperation, DatabaseTelemetry};
+
+/// The supported production adapter. Repository traits provide extension seams; this alias stays
+/// concrete until another backend has a complete native implementation and conformance suite.
+pub type ProductionDatabase = PostgresDatabase;
+
+#[cfg(test)]
+pub type Database = SqliteDatabase;
+#[cfg(not(test))]
+pub type Database = ProductionDatabase;
+
+#[cfg(any(test, feature = "sqlite"))]
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+#[cfg(any(test, feature = "sqlite"))]
 const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+#[cfg(any(test, feature = "sqlite"))]
 const SQLITE_MAX_CONNECTIONS: u32 = 5;
+#[cfg(any(test, feature = "sqlite"))]
+const FACET_REBUILD_BATCH_SIZE: i64 = 500;
 const DEFAULT_SYNC_PLAY_ACCESS: &str = "CreateAndJoinGroups";
+const DEFAULT_FFPROBE_TIMEOUT_SECONDS: u64 = 15;
+const MAX_FFPROBE_TIMEOUT_SECONDS: u64 = 120;
+const FFPROBE_STDOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const FFPROBE_STDERR_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
-pub struct Database {
+#[cfg(any(test, feature = "sqlite"))]
+pub struct SqliteDatabase {
     pool: SqlitePool,
+    provider_secret_vault: Option<ProviderSecretVault>,
+    telemetry: Arc<DatabaseTelemetry>,
+}
+
+impl DatabaseBackend for PostgresDatabase {
+    const DRIVER: DatabaseDriver = DatabaseDriver::PostgreSql;
+
+    fn telemetry_diagnostics(&self) -> DatabaseTelemetryDiagnostics {
+        PostgresDatabase::telemetry_diagnostics(self)
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl DatabaseBackend for SqliteDatabase {
+    const DRIVER: DatabaseDriver = DatabaseDriver::Sqlite;
+
+    fn telemetry_diagnostics(&self) -> DatabaseTelemetryDiagnostics {
+        SqliteDatabase::telemetry_diagnostics(self)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +146,98 @@ pub struct MediaItemFilterSummary {
     pub tags: Vec<String>,
     pub containers: Vec<String>,
     pub media_types: Vec<String>,
+}
+
+/// Dialect-neutral distinct values exposed by Jellyfin's item-filter endpoints.
+///
+/// Values are de-duplicated case-insensitively and returned in normalized-value order while
+/// preserving a deterministic display spelling. `staff_names` deliberately contains names only;
+/// the API owns the synthetic Person response shape and identifier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaItemQueryFilterValues {
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+    pub official_ratings: Vec<String>,
+    pub years: Vec<String>,
+    pub containers: Vec<String>,
+    pub media_types: Vec<String>,
+    pub video_types: Vec<String>,
+    pub series_statuses: Vec<String>,
+    pub staff_names: Vec<String>,
+    pub artists: Vec<String>,
+    pub albums: Vec<String>,
+    pub studios: Vec<String>,
+    pub audio_languages: Vec<String>,
+    pub subtitle_languages: Vec<String>,
+    pub has_subtitles: bool,
+    pub has_trailer: bool,
+}
+
+/// Bounded resume-list request shared by the native database adapters.
+///
+/// The policy values are supplied by the API because they live in Jellyfin's server
+/// configuration.  Applying them before `LIMIT/OFFSET` is important: filtering a small raw
+/// playback page afterwards can return short or empty pages even when later resumable rows exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeItemsPageQuery {
+    pub start_index: usize,
+    pub limit: usize,
+    pub min_pct: i64,
+    pub max_pct: i64,
+    pub min_duration_ticks: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeItemsPage {
+    pub items: Vec<(MediaItem, PlaybackState)>,
+    pub total_record_count: usize,
+    pub start_index: usize,
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+pub(crate) fn push_media_item_query_filter_value(
+    values: &mut MediaItemQueryFilterValues,
+    field: &str,
+    display_value: String,
+) {
+    match field {
+        "genres" => values.genres.push(display_value),
+        "tags" => values.tags.push(display_value),
+        "official_ratings" => values.official_ratings.push(display_value),
+        "years" => values.years.push(display_value),
+        "containers" => values.containers.push(display_value),
+        "media_types" => values.media_types.push(display_value),
+        "video_types" => values.video_types.push(display_value),
+        "series_statuses" => values.series_statuses.push(display_value),
+        "staff_names" => values.staff_names.push(display_value),
+        "artists" => values.artists.push(display_value),
+        "albums" => values.albums.push(display_value),
+        "studios" => values.studios.push(display_value),
+        "audio_languages" => values.audio_languages.push(display_value),
+        "subtitle_languages" => values.subtitle_languages.push(display_value),
+        "__has_subtitles" => values.has_subtitles = true,
+        "__has_trailer" => values.has_trailer = true,
+        _ => {}
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn sqlite_media_item_query_filter_value_count(values: &MediaItemQueryFilterValues) -> u64 {
+    let count = values.genres.len()
+        + values.tags.len()
+        + values.official_ratings.len()
+        + values.years.len()
+        + values.containers.len()
+        + values.media_types.len()
+        + values.video_types.len()
+        + values.series_statuses.len()
+        + values.staff_names.len()
+        + values.artists.len()
+        + values.albums.len()
+        + values.studios.len()
+        + values.audio_languages.len()
+        + values.subtitle_languages.len();
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +250,80 @@ pub struct TaskRun {
     pub result_json: Option<Value>,
     pub error_message: Option<String>,
     pub updated_at: OffsetDateTime,
+}
+
+/// A credential-free snapshot of one SQLx connection pool.
+///
+/// These values are intentionally limited to bounded resource counts. Connection strings,
+/// statements and per-request identifiers never cross the database boundary through this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabasePoolDiagnostics {
+    pub max_connections: u32,
+    pub size: u32,
+    pub idle: u32,
+    pub in_use: u32,
+}
+
+/// Driver-neutral runtime diagnostics for the database adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseRuntimeDiagnostics {
+    pub driver: DatabaseDriver,
+    pub api_pool: DatabasePoolDiagnostics,
+    pub worker_pool: Option<DatabasePoolDiagnostics>,
+}
+
+/// Safe details about the most recently started catalogue synchronization.
+///
+/// Provider, folder and generation identifiers are deliberately omitted, as is the raw error
+/// message: provider failures can contain upstream URLs or credential-shaped values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSyncRunDiagnostics {
+    pub status: String,
+    pub item_count: u64,
+    pub started_at: OffsetDateTime,
+    pub completed_at: Option<OffsetDateTime>,
+    pub duration_millis: Option<u64>,
+}
+
+/// Aggregate catalogue synchronization state suitable for administrative diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogSyncDiagnostics {
+    pub total: u64,
+    pub running: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub last_run: Option<CatalogSyncRunDiagnostics>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CatalogSyncCountsRow {
+    total: i64,
+    running: i64,
+    completed: i64,
+    failed: i64,
+}
+
+fn nonnegative_count(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(u64::MAX)
+}
+
+fn database_pool_diagnostics<DB: sqlx::Database>(pool: &sqlx::Pool<DB>) -> DatabasePoolDiagnostics {
+    let size = pool.size();
+    let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX).min(size);
+    DatabasePoolDiagnostics {
+        max_connections: pool.options().get_max_connections(),
+        size,
+        idle,
+        in_use: size.saturating_sub(idle),
+    }
+}
+
+fn catalog_sync_duration_millis(
+    started_at: OffsetDateTime,
+    completed_at: Option<OffsetDateTime>,
+) -> Option<u64> {
+    let duration = completed_at? - started_at;
+    Some(u64::try_from(duration.whole_milliseconds().max(0)).unwrap_or(u64::MAX))
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +365,316 @@ pub struct MediaItemMetadata {
     pub payload: Value,
 }
 
+/// Maximum number of catalog rows returned by one database round trip.
+///
+/// Callers may request a larger page, but both database adapters clamp it to this value. The
+/// exact count is still computed over the complete filtered result set.
+pub const MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaItemCatalogSortField {
+    SortName,
+    DateCreated,
+    DateLastMediaAdded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaItemFavoriteFilter {
+    /// Match the persisted `is_favorite` flag. A missing playback row behaves as `false`, matching
+    /// Jellyfin's user-data semantics.
+    Favorite(bool),
+    /// Match either a favorite flag or a positive user rating.
+    FavoriteOrLiked,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MediaItemCatalogSearchScope {
+    /// Search only the persisted item name.
+    #[default]
+    Name,
+    /// Search every scalar metadata value, but never JSON object keys.
+    AllMetadataScalars,
+    /// Match Jellyfin search hints exactly: album, album artist, series and artist values.
+    SearchHintFields,
+}
+
+/// SQL-pushdown surface for the `/Items` catalog hot path.
+///
+/// String lists are matched case-insensitively and empty lists do not filter. `item_types` use the
+/// public Jellyfin names (`Movie`, `Episode`, `Video`, `Audio`, `Photo`, `Book`, `MusicVideo`, and
+/// `BaseItem`). Search is always applied to the item name; `search_scope` controls the additional
+/// metadata values inspected by the dialect-native query.
+#[derive(Debug, Clone)]
+pub struct MediaItemCatalogQuery {
+    pub start_index: usize,
+    pub limit: usize,
+    pub ids: Vec<Uuid>,
+    pub virtual_folder_ids: Vec<Uuid>,
+    pub include_item_types: Vec<String>,
+    pub exclude_item_types: Vec<String>,
+    pub collection_types: Vec<String>,
+    pub media_types: Vec<String>,
+    pub containers: Vec<String>,
+    pub video_types: Vec<String>,
+    pub audio_languages: Vec<String>,
+    pub subtitle_languages: Vec<String>,
+    pub location_types: Vec<String>,
+    pub exclude_location_types: Vec<String>,
+    pub search_term: Option<String>,
+    pub search_scope: MediaItemCatalogSearchScope,
+    pub has_subtitles: Option<bool>,
+    pub is_hd: Option<bool>,
+    pub is_4k: Option<bool>,
+    pub min_width: Option<i64>,
+    pub max_width: Option<i64>,
+    pub min_height: Option<i64>,
+    pub max_height: Option<i64>,
+    pub is_missing: Option<bool>,
+    pub is_unaired: Option<bool>,
+    pub is_folder: Option<bool>,
+    pub min_date_created: Option<OffsetDateTime>,
+    pub max_date_created: Option<OffsetDateTime>,
+    pub min_date_last_saved: Option<OffsetDateTime>,
+    pub max_date_last_saved: Option<OffsetDateTime>,
+    pub name_starts_with: Option<String>,
+    pub name_starts_with_or_greater: Option<String>,
+    pub name_less_than: Option<String>,
+    pub user_id: Option<Uuid>,
+    pub is_played: Option<bool>,
+    pub favorite: Option<MediaItemFavoriteFilter>,
+    pub is_resumable: bool,
+    pub sort: Vec<(MediaItemCatalogSortField, SortDirection)>,
+}
+
+impl Default for MediaItemCatalogQuery {
+    fn default() -> Self {
+        Self {
+            start_index: 0,
+            limit: 100,
+            ids: Vec::new(),
+            virtual_folder_ids: Vec::new(),
+            include_item_types: Vec::new(),
+            exclude_item_types: Vec::new(),
+            collection_types: Vec::new(),
+            media_types: Vec::new(),
+            containers: Vec::new(),
+            video_types: Vec::new(),
+            audio_languages: Vec::new(),
+            subtitle_languages: Vec::new(),
+            location_types: Vec::new(),
+            exclude_location_types: Vec::new(),
+            search_term: None,
+            search_scope: MediaItemCatalogSearchScope::Name,
+            has_subtitles: None,
+            is_hd: None,
+            is_4k: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
+            is_missing: None,
+            is_unaired: None,
+            is_folder: None,
+            min_date_created: None,
+            max_date_created: None,
+            min_date_last_saved: None,
+            max_date_last_saved: None,
+            name_starts_with: None,
+            name_starts_with_or_greater: None,
+            name_less_than: None,
+            user_id: None,
+            is_played: None,
+            favorite: None,
+            is_resumable: false,
+            sort: vec![(
+                MediaItemCatalogSortField::SortName,
+                SortDirection::Ascending,
+            )],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaItemCatalogEntry {
+    pub item: MediaItem,
+    pub metadata: Value,
+    pub playback_state: Option<PlaybackState>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EffectiveTypeCandidateScope {
+    pub(crate) all_raw_media_types: bool,
+    pub(crate) all_video: bool,
+    pub(crate) video_collection_types: BTreeSet<&'static str>,
+    pub(crate) raw_media_types: BTreeSet<&'static str>,
+}
+
+impl EffectiveTypeCandidateScope {
+    pub(crate) fn from_effective_types(item_types: &[String]) -> Self {
+        let mut scope = Self::default();
+        for item_type in item_types {
+            match item_type.trim().to_ascii_lowercase().as_str() {
+                "movie" => {
+                    scope.video_collection_types.insert("movies");
+                }
+                "musicvideo" => {
+                    scope.video_collection_types.insert("musicvideos");
+                    scope.video_collection_types.insert("musicvideo");
+                }
+                "episode" => {
+                    scope.video_collection_types.insert("tvshows");
+                    scope.video_collection_types.insert("tvshow");
+                    scope.video_collection_types.insert("series");
+                }
+                "video" => scope.all_video = true,
+                "audio" => {
+                    scope.raw_media_types.insert("Audio");
+                }
+                "photo" => {
+                    scope.raw_media_types.insert("Photo");
+                }
+                "book" => {
+                    scope.raw_media_types.insert("Book");
+                }
+                "baseitem" => scope.all_raw_media_types = true,
+                _ => {}
+            }
+        }
+        scope
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.all_raw_media_types
+            && !self.all_video
+            && self.video_collection_types.is_empty()
+            && self.raw_media_types.is_empty()
+    }
+}
+
+pub(crate) fn retain_entries_with_effective_types(
+    entries: Vec<MediaItemCatalogEntry>,
+    item_types: &[String],
+) -> Vec<MediaItemCatalogEntry> {
+    let requested = item_types
+        .iter()
+        .map(|item_type| item_type.trim().to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            requested.contains(&effective_media_item_type(&entry.item).to_ascii_lowercase())
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaItemCatalogPage {
+    pub items: Vec<MediaItemCatalogEntry>,
+    pub total_record_count: usize,
+    pub start_index: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaItemCatalogCounts {
+    pub movie_count: u64,
+    pub series_count: u64,
+    pub episode_count: u64,
+    pub artist_count: u64,
+    pub trailer_count: u64,
+    pub song_count: u64,
+    pub album_count: u64,
+    pub music_video_count: u64,
+    pub book_count: u64,
+    pub item_count: u64,
+}
+
+#[derive(Default)]
+struct CatalogMetadataCountAccumulator {
+    albums: BTreeSet<String>,
+    artists: BTreeSet<String>,
+    trailers: u64,
+}
+
+impl CatalogMetadataCountAccumulator {
+    fn add_album(&mut self, raw: Option<&str>) -> anyhow::Result<()> {
+        if let Some(value) = parse_catalog_count_json(raw)? {
+            collect_catalog_count_metadata_value(&value, &mut self.albums);
+        }
+        Ok(())
+    }
+
+    fn add_artist(&mut self, raw: Option<&str>) -> anyhow::Result<()> {
+        if let Some(value) = parse_catalog_count_json(raw)? {
+            collect_catalog_count_metadata_value(&value, &mut self.artists);
+        }
+        Ok(())
+    }
+
+    fn add_trailers(&mut self, raw: Option<&str>) -> anyhow::Result<()> {
+        if let Some(value) = parse_catalog_count_json(raw)? {
+            self.trailers = self
+                .trailers
+                .checked_add(count_catalog_trailer_values(&value)?)
+                .context("trailer count overflow")?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_catalog_count_json(raw: Option<&str>) -> anyhow::Result<Option<Value>> {
+    raw.map(serde_json::from_str)
+        .transpose()
+        .context("invalid projected catalog metadata JSON")
+}
+
+fn collect_catalog_count_metadata_value(value: &Value, values: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_catalog_count_metadata_value(item, values);
+            }
+        }
+        Value::String(value) => insert_catalog_count_metadata_value(value, values),
+        Value::Number(value) => {
+            insert_catalog_count_metadata_value(&value.to_string(), values);
+        }
+        Value::Object(object) => {
+            if let Some(name) = object.get("Name").and_then(Value::as_str) {
+                insert_catalog_count_metadata_value(name, values);
+            }
+        }
+        Value::Bool(_) | Value::Null => {}
+    }
+}
+
+fn insert_catalog_count_metadata_value(value: &str, values: &mut BTreeSet<String>) {
+    let value = value.trim();
+    if !value.is_empty() {
+        values.insert(value.to_ascii_lowercase());
+    }
+}
+
+fn count_catalog_trailer_values(value: &Value) -> anyhow::Result<u64> {
+    match value {
+        Value::Array(values) => values.iter().try_fold(0u64, |count, value| {
+            count
+                .checked_add(count_catalog_trailer_values(value)?)
+                .context("trailer count overflow")
+        }),
+        Value::String(url) => Ok(u64::from(!url.trim().is_empty())),
+        Value::Object(object) => Ok(u64::from(
+            object
+                .get("Url")
+                .or_else(|| object.get("url"))
+                .or_else(|| object.get("Path"))
+                .or_else(|| object.get("path"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty()),
+        )),
+        Value::Number(_) | Value::Bool(_) | Value::Null => Ok(0),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteMediaItemUpsert {
     pub id: String,
@@ -103,6 +688,83 @@ pub struct RemoteMediaItemUpsert {
     pub height: Option<i32>,
     pub media_streams: Vec<Value>,
     pub metadata: Value,
+}
+
+/// One complete provider-owned media library ready to be published.
+///
+/// A provider that exposes related libraries (for example Xtream movies and series) submits them
+/// together through [`XtreamCatalogStore`]. The database adapter is then responsible for making
+/// the complete batch visible in one transaction, including intentionally empty libraries.
+#[derive(Debug, Clone)]
+pub struct RemoteMediaLibrarySnapshot {
+    pub library_name: String,
+    pub collection_type: String,
+    pub source_location: String,
+    pub items: Vec<RemoteMediaItemUpsert>,
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+struct PreparedSqliteRemoteMediaItem {
+    id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: String,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    media_streams_json: String,
+    metadata_json: String,
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+struct PreparedSqliteRemoteMediaLibrarySnapshot {
+    library_name: String,
+    collection_type: String,
+    source_location: String,
+    items: Vec<PreparedSqliteRemoteMediaItem>,
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl TryFrom<RemoteMediaLibrarySnapshot> for PreparedSqliteRemoteMediaLibrarySnapshot {
+    type Error = anyhow::Error;
+
+    fn try_from(snapshot: RemoteMediaLibrarySnapshot) -> Result<Self, Self::Error> {
+        let library_name = snapshot.library_name.trim().to_owned();
+        anyhow::ensure!(
+            !library_name.is_empty(),
+            "virtual folder name must not be empty"
+        );
+        let items = snapshot
+            .items
+            .into_iter()
+            .map(|item| {
+                let raw_id = item.id.trim();
+                Ok(PreparedSqliteRemoteMediaItem {
+                    id: Uuid::parse_str(raw_id)
+                        .with_context(|| format!("invalid remote media item id: {raw_id}"))?
+                        .to_string(),
+                    name: item.name.trim().to_owned(),
+                    path: item.path.trim().to_owned(),
+                    media_type: item.media_type.trim().to_owned(),
+                    collection_type: item.collection_type.trim().to_owned(),
+                    runtime_ticks: item.runtime_ticks,
+                    bitrate: item.bitrate,
+                    width: item.width,
+                    height: item.height,
+                    media_streams_json: serde_json::to_string(&item.media_streams)?,
+                    metadata_json: serde_json::to_string(&item.metadata)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            library_name,
+            collection_type: snapshot.collection_type.trim().to_owned(),
+            source_location: snapshot.source_location.trim().to_owned(),
+            items,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +888,7 @@ pub struct UpsertPlaybackState {
     pub played: bool,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(Debug, Clone, Default)]
 struct ExistingUserItemData {
     audio_stream_index: Option<i64>,
@@ -496,16 +1159,874 @@ pub struct LiveTvPage<T> {
     pub start_index: usize,
 }
 
-impl Database {
+/// Dialect-neutral catalog contract with dialect-native implementations.
+///
+/// This is deliberately a narrow domain repository, not a generic query/connection abstraction.
+/// A future driver must implement the paging/count/user-data semantics natively and pass the same
+/// conformance tests before it can become a production backend.
+pub trait MediaCatalogStore: DatabaseBackend {
+    /// Whether an exact catalog id identifies a currently visible media item.
+    fn media_item_exists(
+        &self,
+        item_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send + '_;
+
+    /// Exact visible item lookup that keeps absence distinct from database failure.
+    fn media_item_by_id_visible(
+        &self,
+        item_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItem>>> + Send + '_;
+
+    fn media_item_catalog_page<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemCatalogPage>> + Send + 'a;
+
+    fn media_item_catalog_counts<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemCatalogCounts>> + Send + 'a;
+
+    fn media_item_query_filter_values<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemQueryFilterValues>> + Send + 'a;
+
+    fn playback_states_for_items<'a>(
+        &'a self,
+        user_id: Uuid,
+        item_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<PlaybackState>>> + Send + 'a;
+
+    /// Exact visible catalogue candidates for the requested public Jellyfin item types, with
+    /// metadata loaded inline and without an artificial page limit. Type matching uses the same
+    /// effective-type rules as `media_item_catalog_page`; an empty type list returns no rows.
+    fn media_items_with_metadata_by_effective_types<'a>(
+        &'a self,
+        item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a;
+
+    /// Visible TV episode candidates with metadata, used to resolve synthetic Jellyfin Series
+    /// identifiers without materializing unrelated library domains.
+    fn tv_series_lookup_candidates(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
+
+    /// Visible TV candidates whose user-data row is either absent or unplayed.
+    ///
+    /// This is the SQL-prefiltered input for Jellyfin's common `/Shows/NextUp` request. The API
+    /// intentionally retains episode classification and one-per-series selection because those
+    /// rules include path-derived compatibility semantics.
+    fn tv_next_up_candidates(
+        &self,
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
+
+    fn media_item_facet_values<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a;
+
+    fn media_item_facet_by_entity_id<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        entity_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItemFacetValue>>> + Send + 'a;
+
+    fn media_item_facet_by_normalized_value<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        value: &'a str,
+        virtual_folder_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItemFacetValue>>> + Send + 'a;
+
+    fn media_item_ids_for_facets<'a>(
+        &'a self,
+        query: &'a MediaItemFacetCandidateQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Uuid>>> + Send + 'a;
+
+    fn rebuild_media_item_facets(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + '_;
+}
+
+impl MediaCatalogStore for PostgresDatabase {
+    fn media_item_exists(
+        &self,
+        item_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send + '_ {
+        PostgresDatabase::media_item_exists(self, item_id)
+    }
+
+    fn media_item_by_id_visible(
+        &self,
+        item_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItem>>> + Send + '_ {
+        PostgresDatabase::media_item_by_id_visible(self, item_id)
+    }
+
+    fn media_item_catalog_page<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemCatalogPage>> + Send + 'a {
+        PostgresDatabase::media_item_catalog_page(self, query)
+    }
+
+    fn media_item_catalog_counts<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemCatalogCounts>> + Send + 'a {
+        PostgresDatabase::media_item_catalog_counts(self, query)
+    }
+
+    fn media_item_query_filter_values<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemQueryFilterValues>> + Send + 'a
+    {
+        PostgresDatabase::media_item_query_filter_values(self, query)
+    }
+
+    fn playback_states_for_items<'a>(
+        &'a self,
+        user_id: Uuid,
+        item_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<PlaybackState>>> + Send + 'a {
+        PostgresDatabase::playback_states_for_items(self, user_id, item_ids)
+    }
+
+    fn media_items_with_metadata_by_effective_types<'a>(
+        &'a self,
+        item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a
+    {
+        PostgresDatabase::media_items_with_metadata_by_effective_types(self, item_types)
+    }
+
+    fn tv_series_lookup_candidates(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        PostgresDatabase::tv_series_lookup_candidates(self)
+    }
+
+    fn tv_next_up_candidates(
+        &self,
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        PostgresDatabase::tv_next_up_candidates(self, user_id)
+    }
+
+    fn media_item_facet_values<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
+    {
+        PostgresDatabase::media_item_facet_values(self, kind, virtual_folder_ids)
+    }
+
+    fn media_item_facet_by_entity_id<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        entity_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItemFacetValue>>> + Send + 'a
+    {
+        PostgresDatabase::media_item_facet_by_entity_id(self, kind, entity_id)
+    }
+
+    fn media_item_facet_by_normalized_value<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        value: &'a str,
+        virtual_folder_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItemFacetValue>>> + Send + 'a
+    {
+        PostgresDatabase::media_item_facet_by_normalized_value(
+            self,
+            kind,
+            value,
+            virtual_folder_ids,
+        )
+    }
+
+    fn media_item_ids_for_facets<'a>(
+        &'a self,
+        query: &'a MediaItemFacetCandidateQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Uuid>>> + Send + 'a {
+        PostgresDatabase::media_item_ids_for_facets(self, query)
+    }
+
+    fn rebuild_media_item_facets(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + '_ {
+        PostgresDatabase::rebuild_media_item_facets(self)
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl MediaCatalogStore for SqliteDatabase {
+    fn media_item_exists(
+        &self,
+        item_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send + '_ {
+        SqliteDatabase::media_item_exists(self, item_id)
+    }
+
+    fn media_item_by_id_visible(
+        &self,
+        item_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItem>>> + Send + '_ {
+        SqliteDatabase::media_item_by_id_visible(self, item_id)
+    }
+
+    fn media_item_catalog_page<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemCatalogPage>> + Send + 'a {
+        SqliteDatabase::media_item_catalog_page(self, query)
+    }
+
+    fn media_item_catalog_counts<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemCatalogCounts>> + Send + 'a {
+        SqliteDatabase::media_item_catalog_counts(self, query)
+    }
+
+    fn media_item_query_filter_values<'a>(
+        &'a self,
+        query: &'a MediaItemCatalogQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<MediaItemQueryFilterValues>> + Send + 'a
+    {
+        SqliteDatabase::media_item_query_filter_values(self, query)
+    }
+
+    fn playback_states_for_items<'a>(
+        &'a self,
+        user_id: Uuid,
+        item_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<PlaybackState>>> + Send + 'a {
+        SqliteDatabase::playback_states_for_items(self, user_id, item_ids)
+    }
+
+    fn media_items_with_metadata_by_effective_types<'a>(
+        &'a self,
+        item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a
+    {
+        SqliteDatabase::media_items_with_metadata_by_effective_types(self, item_types)
+    }
+
+    fn tv_series_lookup_candidates(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        SqliteDatabase::tv_series_lookup_candidates(self)
+    }
+
+    fn tv_next_up_candidates(
+        &self,
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        SqliteDatabase::tv_next_up_candidates(self, user_id)
+    }
+
+    fn media_item_facet_values<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
+    {
+        SqliteDatabase::media_item_facet_values(self, kind, virtual_folder_ids)
+    }
+
+    fn media_item_facet_by_entity_id<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        entity_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItemFacetValue>>> + Send + 'a
+    {
+        SqliteDatabase::media_item_facet_by_entity_id(self, kind, entity_id)
+    }
+
+    fn media_item_facet_by_normalized_value<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        value: &'a str,
+        virtual_folder_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<MediaItemFacetValue>>> + Send + 'a
+    {
+        SqliteDatabase::media_item_facet_by_normalized_value(self, kind, value, virtual_folder_ids)
+    }
+
+    fn media_item_ids_for_facets<'a>(
+        &'a self,
+        query: &'a MediaItemFacetCandidateQuery,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Uuid>>> + Send + 'a {
+        SqliteDatabase::media_item_ids_for_facets(self, query)
+    }
+
+    fn rebuild_media_item_facets(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + '_ {
+        SqliteDatabase::rebuild_media_item_facets(self)
+    }
+}
+
+/// Narrow persistence contract used by the external Xtream indexer. Keeping this trait in the
+/// database boundary lets API unit tests exercise the legacy SQLite source while the production
+/// runtime remains unconditionally PostgreSQL.
+pub trait XtreamCatalogStore: DatabaseBackend {
+    fn replace_remote_media_library_snapshots(
+        &self,
+        snapshots: Vec<RemoteMediaLibrarySnapshot>,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<VirtualFolder>>> + Send;
+
+    fn live_tv_tuner_configurations_by_provider(
+        &self,
+        provider_type: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Value>>> + Send;
+}
+
+macro_rules! impl_xtream_catalog_store {
+    ($database:ty) => {
+        impl XtreamCatalogStore for $database {
+            fn replace_remote_media_library_snapshots(
+                &self,
+                snapshots: Vec<RemoteMediaLibrarySnapshot>,
+            ) -> impl std::future::Future<Output = anyhow::Result<Vec<VirtualFolder>>> + Send {
+                <$database>::replace_remote_media_library_snapshots(self, snapshots)
+            }
+
+            fn live_tv_tuner_configurations_by_provider(
+                &self,
+                provider_type: &str,
+            ) -> impl std::future::Future<Output = anyhow::Result<Vec<Value>>> + Send {
+                <$database>::live_tv_tuner_configurations_by_provider(self, provider_type)
+            }
+        }
+    };
+}
+
+impl_xtream_catalog_store!(PostgresDatabase);
+#[cfg(any(test, feature = "sqlite"))]
+impl_xtream_catalog_store!(SqliteDatabase);
+
+#[cfg(any(test, feature = "sqlite"))]
+const SQLITE_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
+    WHEN item.media_type = 'Video' AND item.collection_type = 'movies' THEN 'movie'
+    WHEN item.media_type = 'Video'
+         AND item.collection_type IN ('musicvideos', 'musicvideo') THEN 'musicvideo'
+    WHEN item.media_type = 'Video'
+         AND item.collection_type IN ('tvshows', 'tvshow', 'series')
+         AND (('/' || lower(item.path) || '/') LIKE '%/extras/%'
+              OR ('/' || lower(item.path) || '/') LIKE '%/featurettes/%'
+              OR ('/' || lower(item.path) || '/') LIKE '%/special features/%'
+              OR ('/' || lower(item.path) || '/') LIKE '%/behind the scenes/%'
+              OR ('/' || lower(item.path) || '/') LIKE '%/deleted scenes/%'
+              OR ('/' || lower(item.path) || '/') LIKE '%/interviews/%'
+              OR ('/' || lower(item.path) || '/') LIKE '%/trailers/%') THEN 'video'
+    WHEN item.media_type = 'Video'
+         AND item.collection_type IN ('tvshows', 'tvshow', 'series') THEN 'episode'
+    WHEN item.media_type = 'Video' THEN 'video'
+    WHEN item.media_type = 'Audio' THEN 'audio'
+    WHEN item.media_type = 'Photo' THEN 'photo'
+    WHEN item.media_type = 'Book' THEN 'book'
+    ELSE 'baseitem'
+END"#;
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_catalog_from(builder: &mut QueryBuilder<'_, Sqlite>, query: &MediaItemCatalogQuery) {
+    builder.push(
+        " FROM media_items AS item \
+         LEFT JOIN playback_states AS playback \
+           ON playback.item_id = item.id AND ",
+    );
+    if let Some(user_id) = query.user_id {
+        builder
+            .push("playback.user_id = ")
+            .push_bind(user_id.to_string());
+    } else {
+        builder.push("0");
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_catalog_filters(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    query: &MediaItemCatalogQuery,
+) -> anyhow::Result<()> {
+    builder.push(" WHERE item.missing_since IS NULL");
+
+    if !query.ids.is_empty() {
+        let ids = query
+            .ids
+            .iter()
+            .flat_map(|id| [id.to_string(), id.simple().to_string()])
+            .collect::<BTreeSet<_>>();
+        push_sqlite_in_strings(builder, "item.id", ids, false);
+    }
+    if !query.virtual_folder_ids.is_empty() {
+        let folder_ids = query
+            .virtual_folder_ids
+            .iter()
+            .flat_map(|id| [id.to_string(), id.simple().to_string()])
+            .collect::<BTreeSet<_>>();
+        push_sqlite_in_strings(builder, "item.virtual_folder_id", folder_ids, false);
+    }
+
+    let include_item_types = sqlite_normalized_catalog_values(&query.include_item_types);
+    if !include_item_types.is_empty() {
+        push_sqlite_in_strings(
+            builder,
+            &format!("({SQLITE_MEDIA_ITEM_TYPE_SQL})"),
+            include_item_types.into_iter().collect(),
+            false,
+        );
+    }
+    let exclude_item_types = sqlite_normalized_catalog_values(&query.exclude_item_types);
+    if !exclude_item_types.is_empty() {
+        push_sqlite_in_strings(
+            builder,
+            &format!("({SQLITE_MEDIA_ITEM_TYPE_SQL})"),
+            exclude_item_types.into_iter().collect(),
+            true,
+        );
+    }
+
+    push_sqlite_ci_in_filter(builder, "item.collection_type", &query.collection_types);
+    push_sqlite_ci_in_filter(builder, "item.media_type", &query.media_types);
+
+    let containers = sqlite_normalized_catalog_values(&query.containers);
+    if !containers.is_empty() {
+        builder.push(" AND (");
+        for (index, container) in containers.iter().enumerate() {
+            if index > 0 {
+                builder.push(" OR ");
+            }
+            builder
+                .push("lower(item.path) LIKE ")
+                .push_bind(format!("%.{}", sqlite_escape_catalog_like_value(container)))
+                .push(" ESCAPE '\\'");
+        }
+        builder.push(")");
+    }
+
+    let video_types = sqlite_normalized_catalog_values(&query.video_types);
+    if !video_types.is_empty() {
+        push_sqlite_in_strings(
+            builder,
+            "(CASE WHEN item.media_type = 'Video' THEN 'videofile' ELSE 'unknown' END)",
+            video_types.into_iter().collect(),
+            false,
+        );
+    }
+
+    push_sqlite_stream_language_filter(
+        builder,
+        "Audio",
+        &sqlite_normalized_catalog_values(&query.audio_languages),
+    );
+    push_sqlite_stream_language_filter(
+        builder,
+        "Subtitle",
+        &sqlite_normalized_catalog_values(&query.subtitle_languages),
+    );
+    if let Some(has_subtitles) = query.has_subtitles {
+        builder
+            .push(
+                " AND EXISTS (SELECT 1 FROM json_each(item.media_streams_json) AS stream \
+                   WHERE lower(json_extract(stream.value, '$.Type')) = 'subtitle') = ",
+            )
+            .push_bind(has_subtitles);
+    }
+
+    if sqlite_catalog_static_filters_are_impossible(query) {
+        builder.push(" AND 0");
+    }
+
+    if let Some(search_term) = sqlite_normalized_catalog_scalar(query.search_term.as_deref()) {
+        let pattern = format!("%{}%", sqlite_escape_catalog_like_value(&search_term));
+        builder
+            .push(" AND (lower(item.name) LIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\'");
+        match query.search_scope {
+            MediaItemCatalogSearchScope::Name => {}
+            MediaItemCatalogSearchScope::AllMetadataScalars => {
+                builder
+                    .push(
+                        " OR EXISTS (SELECT 1 FROM json_tree(item.metadata_json) AS metadata_scalar \
+                           WHERE metadata_scalar.type IN ('text', 'integer', 'real') \
+                             AND lower(CAST(metadata_scalar.atom AS TEXT)) LIKE ",
+                    )
+                    .push_bind(pattern)
+                    .push(" ESCAPE '\\')");
+            }
+            MediaItemCatalogSearchScope::SearchHintFields => {
+                push_sqlite_search_hint_metadata_filter(builder, &pattern);
+            }
+        }
+        builder.push(")");
+    }
+
+    if let Some(is_hd) = query.is_hd {
+        builder
+            .push(" AND COALESCE(item.height >= 720, 0) = ")
+            .push_bind(is_hd);
+    }
+    if let Some(is_4k) = query.is_4k {
+        builder
+            .push(" AND COALESCE(item.width >= 3840 OR item.height >= 2160, 0) = ")
+            .push_bind(is_4k);
+    }
+    push_sqlite_optional_i64_bound(builder, "item.width", query.min_width, ">=");
+    push_sqlite_optional_i64_bound(builder, "item.width", query.max_width, "<=");
+    push_sqlite_optional_i64_bound(builder, "item.height", query.min_height, ">=");
+    push_sqlite_optional_i64_bound(builder, "item.height", query.max_height, "<=");
+
+    push_sqlite_optional_time_bound(builder, "item.created_at", query.min_date_created, ">=")?;
+    push_sqlite_optional_time_bound(builder, "item.created_at", query.max_date_created, "<=")?;
+    push_sqlite_optional_time_bound(builder, "item.updated_at", query.min_date_last_saved, ">=")?;
+    push_sqlite_optional_time_bound(builder, "item.updated_at", query.max_date_last_saved, "<=")?;
+
+    if let Some(prefix) = sqlite_normalized_catalog_scalar(query.name_starts_with.as_deref()) {
+        builder
+            .push(" AND lower(item.name) LIKE ")
+            .push_bind(format!("{}%", sqlite_escape_catalog_like_value(&prefix)))
+            .push(" ESCAPE '\\'");
+    }
+    if let Some(lower_bound) =
+        sqlite_normalized_catalog_scalar(query.name_starts_with_or_greater.as_deref())
+    {
+        builder
+            .push(" AND lower(item.name) >= ")
+            .push_bind(lower_bound);
+    }
+    if let Some(upper_bound) = sqlite_normalized_catalog_scalar(query.name_less_than.as_deref()) {
+        builder
+            .push(" AND lower(item.name) < ")
+            .push_bind(upper_bound);
+    }
+
+    if query.is_played.is_some() || query.favorite.is_some() || query.is_resumable {
+        if query.user_id.is_none() {
+            builder.push(" AND 0");
+        } else {
+            if let Some(is_played) = query.is_played {
+                builder
+                    .push(" AND COALESCE(playback.played, 0) = ")
+                    .push_bind(is_played);
+            }
+            if let Some(favorite) = query.favorite {
+                match favorite {
+                    MediaItemFavoriteFilter::Favorite(expected) => {
+                        builder
+                            .push(" AND COALESCE(playback.is_favorite, 0) = ")
+                            .push_bind(expected);
+                    }
+                    MediaItemFavoriteFilter::FavoriteOrLiked => {
+                        builder.push(
+                            " AND (COALESCE(playback.is_favorite, 0) \
+                               OR COALESCE(playback.rating > 0, 0))",
+                        );
+                    }
+                }
+            }
+            if query.is_resumable {
+                builder.push(" AND playback.position_ticks > 0 AND playback.played = 0");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_search_hint_metadata_filter(builder: &mut QueryBuilder<'_, Sqlite>, pattern: &str) {
+    builder
+        .push(
+            " OR EXISTS (\
+           WITH RECURSIVE hint_values(value, value_type) AS (\
+             SELECT hint_field.value, hint_field.type \
+             FROM json_each(item.metadata_json) AS hint_field \
+             WHERE hint_field.key IN (\
+               'Album', 'AlbumName', 'AlbumArtist', 'AlbumArtists', \
+               'SeriesName', 'Series', 'Artists'\
+             ) \
+             UNION ALL \
+             SELECT array_value.value, array_value.type \
+             FROM hint_values \
+             JOIN json_each(\
+               CASE WHEN hint_values.value_type = 'array' THEN hint_values.value ELSE '[]' END\
+             ) AS array_value \
+             WHERE hint_values.value_type = 'array'\
+           ) \
+           SELECT 1 FROM hint_values \
+           WHERE (hint_values.value_type IN ('text', 'integer', 'real') \
+                  AND lower(CAST(hint_values.value AS TEXT)) LIKE ",
+        )
+        .push_bind(pattern.to_owned())
+        .push(
+            " ESCAPE '\\') \
+              OR (hint_values.value_type = 'object' \
+                  AND json_type(hint_values.value, '$.Name') = 'text' \
+                  AND lower(json_extract(hint_values.value, '$.Name')) LIKE ",
+        )
+        .push_bind(pattern.to_owned())
+        .push(
+            " ESCAPE '\\')\
+         )",
+        );
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_catalog_order(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    query: &MediaItemCatalogQuery,
+) {
+    builder.push(" ORDER BY ");
+    let sort = if query.sort.is_empty() {
+        &[(
+            MediaItemCatalogSortField::SortName,
+            SortDirection::Ascending,
+        )][..]
+    } else {
+        query.sort.as_slice()
+    };
+    for (index, (field, direction)) in sort.iter().take(3).enumerate() {
+        if index > 0 {
+            builder.push(", ");
+        }
+        builder.push(match field {
+            MediaItemCatalogSortField::SortName => "lower(item.name)",
+            MediaItemCatalogSortField::DateCreated => "item.created_at",
+            MediaItemCatalogSortField::DateLastMediaAdded => "item.updated_at",
+        });
+        builder.push(match direction {
+            SortDirection::Ascending => " ASC",
+            SortDirection::Descending => " DESC",
+        });
+    }
+    builder.push(match sort.last().map(|(_, direction)| direction) {
+        Some(SortDirection::Descending) => ", item.id DESC",
+        Some(SortDirection::Ascending) | None => ", item.id ASC",
+    });
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_in_strings(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    expression: &str,
+    values: BTreeSet<String>,
+    negate: bool,
+) {
+    if values.is_empty() {
+        return;
+    }
+    builder.push(if negate { " AND NOT (" } else { " AND " });
+    builder.push(expression).push(" IN (");
+    let mut separated = builder.separated(", ");
+    for value in values {
+        separated.push_bind(value);
+    }
+    separated.push_unseparated(if negate { "))" } else { ")" });
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_ci_in_filter(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    column: &str,
+    values: &[String],
+) {
+    push_sqlite_in_strings(
+        builder,
+        &format!("lower({column})"),
+        sqlite_normalized_catalog_values(values)
+            .into_iter()
+            .collect(),
+        false,
+    );
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_stream_language_filter(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    stream_type: &str,
+    languages: &[String],
+) {
+    if languages.is_empty() {
+        return;
+    }
+    builder
+        .push(
+            " AND EXISTS (SELECT 1 FROM json_each(item.media_streams_json) AS stream \
+               WHERE lower(json_extract(stream.value, '$.Type')) = lower(",
+        )
+        .push_bind(stream_type.to_owned())
+        .push(
+            ") AND CASE lower(trim(json_extract(stream.value, '$.Language'))) \
+                 WHEN 'fre' THEN 'fra' WHEN 'ger' THEN 'deu' \
+                 ELSE lower(trim(json_extract(stream.value, '$.Language'))) END IN (",
+        );
+    let mut separated = builder.separated(", ");
+    for language in languages {
+        separated.push_bind(language.to_owned());
+    }
+    separated
+        .push_unseparated(") AND lower(trim(json_extract(stream.value, '$.Language'))) <> 'und')");
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_optional_i64_bound(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    column: &str,
+    value: Option<i64>,
+    operator: &str,
+) {
+    if let Some(value) = value {
+        builder
+            .push(" AND ")
+            .push(column)
+            .push(" ")
+            .push(operator)
+            .push(" ")
+            .push_bind(value);
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_optional_time_bound(
+    builder: &mut QueryBuilder<'_, Sqlite>,
+    column: &str,
+    value: Option<OffsetDateTime>,
+    operator: &str,
+) -> anyhow::Result<()> {
+    if let Some(value) = value {
+        builder
+            .push(" AND ")
+            .push(column)
+            .push(" ")
+            .push(operator)
+            .push(" ")
+            .push_bind(format_time(value)?);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn sqlite_normalized_catalog_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn sqlite_normalized_catalog_scalar(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn sqlite_escape_catalog_like_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn sqlite_catalog_static_filters_are_impossible(query: &MediaItemCatalogQuery) -> bool {
+    let location_types = sqlite_normalized_catalog_values(&query.location_types);
+    let exclude_location_types = sqlite_normalized_catalog_values(&query.exclude_location_types);
+    (!location_types.is_empty() && !location_types.iter().any(|value| value == "filesystem"))
+        || exclude_location_types
+            .iter()
+            .any(|value| value == "filesystem")
+        || query.is_missing == Some(true)
+        || query.is_unaired == Some(true)
+        || query.is_folder == Some(true)
+}
+
+fn normalized_facet_query_values(values: &[String]) -> Vec<String> {
+    let mut values = values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+async fn replace_sqlite_media_item_facets(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    item_id: &str,
+    metadata: &Value,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_facets WHERE item_id = ?1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
+    for facet in extract_media_item_facets(metadata) {
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_facets (
+                item_id, facet_kind, normalized_value, display_value,
+                stable_id, position, payload_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(item_id)
+        .bind(facet.kind.as_str())
+        .bind(&facet.normalized_value)
+        .bind(&facet.display_value)
+        .bind(&facet.stable_id)
+        .bind(i64::from(facet.position))
+        .bind(serde_json::to_string(&facet.payload)?)
+        .execute(&mut **tx)
+        .await?;
+        for alias in facet.aliases {
+            sqlx::query(
+                r#"
+                INSERT INTO media_item_facet_aliases (
+                    item_id, facet_kind, normalized_value, entity_id
+                ) VALUES (?1, ?2, ?3, ?4)
+                "#,
+            )
+            .bind(item_id)
+            .bind(facet.kind.as_str())
+            .bind(&facet.normalized_value)
+            .bind(alias)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+impl SqliteDatabase {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
-        let mut options = database_url
+        let options = database_url
             .parse::<SqliteConnectOptions>()
             .with_context(|| format!("failed to parse SQLite database URL at {database_url}"))?
             .busy_timeout(std::time::Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
             .foreign_keys(true);
-        if should_enable_wal(database_url) {
-            options = options.journal_mode(SqliteJournalMode::Wal);
-        }
+        // SQLite is now restricted to legacy migration and tests. Keep its
+        // rollback journal until the pinned SQLx line can ship a bundled
+        // SQLite containing the upstream WAL-reset fix; production uses
+        // PostgreSQL and does not pay this compatibility tradeoff.
 
         let pool = SqlitePoolOptions::new()
             .max_connections(SQLITE_MAX_CONNECTIONS)
@@ -521,11 +2042,754 @@ impl Database {
             .await
             .context("failed to run migrations")?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            // In-memory SQLite exists exclusively as the fast conformance/test harness, including
+            // when jellyrin-db is compiled as another crate's dev-dependency (where cfg(test) is
+            // not propagated). Persistent legacy databases never receive an implicit key.
+            provider_secret_vault: database_url
+                .trim()
+                .eq_ignore_ascii_case("sqlite::memory:")
+                .then(ProviderSecretVault::for_legacy_test_harness),
+            telemetry: Arc::new(DatabaseTelemetry::default()),
+        })
+    }
+
+    pub fn with_provider_secret_vault(mut self, vault: ProviderSecretVault) -> Self {
+        self.provider_secret_vault = Some(vault);
+        self
+    }
+
+    #[cfg(test)]
+    // Test-only harness for crypto/idempotence checks. Production callers must use a writer that
+    // persists the envelope and its configuration reference in one transaction.
+    pub(crate) async fn protect_provider_configuration(
+        &self,
+        provider_type: &str,
+        configuration: Value,
+    ) -> anyhow::Result<Value> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let protected = self
+            .protect_provider_configuration_with_policy(
+                &mut transaction,
+                provider_type,
+                configuration,
+                false,
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(protected)
+    }
+
+    async fn protect_provider_configuration_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        provider_type: &str,
+        configuration: Value,
+    ) -> anyhow::Result<Value> {
+        self.protect_provider_configuration_with_policy(
+            connection,
+            provider_type,
+            configuration,
+            true,
+        )
+        .await
+    }
+
+    async fn protect_provider_configuration_with_policy(
+        &self,
+        connection: &mut SqliteConnection,
+        provider_type: &str,
+        configuration: Value,
+        reuse_existing_secret: bool,
+    ) -> anyhow::Result<Value> {
+        let existing_reference = ProviderSecretReference::from_configuration(&configuration);
+        let submitted = provider_credentials_from_configuration(&configuration)?;
+        let has_reference_field = configuration_has_provider_secret_reference_field(&configuration);
+        anyhow::ensure!(
+            !has_reference_field || existing_reference.is_some(),
+            "provider secret reference is invalid"
+        );
+        if submitted.is_none() && !has_reference_field {
+            return Ok(configuration);
+        }
+        let provider_type = normalize_provider_type(provider_type)?;
+        let reference = match (submitted, existing_reference) {
+            (None, None) => return Ok(configuration),
+            (None, Some(reference)) => {
+                let (current, _) = self
+                    .provider_secret_in_connection(connection, &reference)
+                    .await?;
+                current
+            }
+            (Some((username, password)), existing_reference) => {
+                let previous = match existing_reference.as_ref() {
+                    Some(reference) => Some(
+                        self.provider_secret_in_connection(connection, reference)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                let username = username
+                    .or_else(|| {
+                        previous
+                            .as_ref()
+                            .map(|(_, value)| value.protected_username_copy())
+                    })
+                    .context("provider username is required")?;
+                let password = password
+                    .or_else(|| {
+                        previous
+                            .as_ref()
+                            .map(|(_, value)| value.protected_password_copy())
+                    })
+                    .context("provider password is required")?;
+                let credentials = ProviderCredentials::from_protected_parts(username, password)?;
+                match previous.as_ref() {
+                    Some((current_reference, previous_credentials))
+                        if previous_credentials == &credentials =>
+                    {
+                        current_reference.clone()
+                    }
+                    _ => {
+                        self.upsert_provider_secret_in_connection(
+                            connection,
+                            &provider_type,
+                            if reuse_existing_secret {
+                                existing_reference.as_ref().map(|value| value.id.as_str())
+                            } else {
+                                None
+                            },
+                            &credentials,
+                        )
+                        .await?
+                    }
+                }
+            }
+        };
+        anyhow::ensure!(
+            reference.provider_type.eq_ignore_ascii_case(&provider_type),
+            "provider secret reference belongs to a different provider"
+        );
+        redacted_provider_configuration(configuration, &reference)
+    }
+
+    async fn protect_live_tv_named_configuration_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        mut configuration: Value,
+        existing: Option<&Value>,
+    ) -> anyhow::Result<Value> {
+        let Some(hosts) = configuration
+            .get_mut("TunerHosts")
+            .and_then(Value::as_array_mut)
+        else {
+            return Ok(configuration);
+        };
+        let existing_hosts = existing
+            .and_then(|value| value.get("TunerHosts"))
+            .and_then(Value::as_array);
+        for host in hosts {
+            let provider_type = host
+                .get("Type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let host_id = host.get("Id").and_then(Value::as_str);
+            let existing_host = host_id.and_then(|host_id| {
+                existing_hosts?.iter().find(|candidate| {
+                    candidate
+                        .get("Id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.eq_ignore_ascii_case(host_id))
+                })
+            });
+            let is_xtream = provider_type.eq_ignore_ascii_case("xtream");
+            let is_plugin = provider_type.eq_ignore_ascii_case("plugin")
+                || provider_type
+                    .split_once(':')
+                    .is_some_and(|(kind, _)| kind.eq_ignore_ascii_case("plugin"));
+            anyhow::ensure!(
+                !configuration_has_provider_secret_input_field(host) || is_xtream || is_plugin,
+                "Live TV core credentials require an explicit xtream or plugin provider type"
+            );
+            if !is_xtream && !is_plugin {
+                continue;
+            }
+            inherit_provider_secret_reference_for_configuration(
+                host,
+                existing_host,
+                &provider_type,
+            )?;
+            let has_core_secret = configuration_has_provider_secret_material(host);
+            if !has_core_secret {
+                continue;
+            }
+            let secret_namespace =
+                provider_secret_namespace_for_configuration(&provider_type, host)?;
+            *host = self
+                .protect_provider_configuration_in_connection(
+                    connection,
+                    &secret_namespace,
+                    host.clone(),
+                )
+                .await?;
+        }
+        Ok(configuration)
+    }
+
+    pub async fn resolve_provider_configuration(
+        &self,
+        configuration: &Value,
+    ) -> anyhow::Result<Value> {
+        let Some(reference) = ProviderSecretReference::from_configuration(configuration) else {
+            return Ok(configuration.clone());
+        };
+        let (current_reference, credentials) = self.provider_secret(&reference).await?;
+        resolved_provider_configuration(configuration.clone(), &current_reference, &credentials)
+    }
+
+    /// Resolves a vault reference directly for just-in-time use without constructing a JSON value
+    /// containing plaintext credentials.
+    pub async fn provider_credentials_for_configuration(
+        &self,
+        configuration: &Value,
+    ) -> anyhow::Result<Option<(ProviderSecretReference, ProviderCredentials)>> {
+        let Some(reference) = ProviderSecretReference::from_configuration(configuration) else {
+            return Ok(None);
+        };
+        self.provider_secret(&reference).await.map(Some)
+    }
+
+    pub async fn provider_secret_count(&self) -> anyhow::Result<i64> {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM provider_secrets")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Deletes vault envelopes that are not referenced by any persisted provider configuration.
+    ///
+    /// `BEGIN IMMEDIATE` serialises this complete scan with SQLite writers. Invalid JSON or an
+    /// invalid nested reference aborts the transaction, so reconciliation always fails closed.
+    pub async fn reconcile_orphaned_provider_secrets(&self) -> anyhow::Result<usize> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let configurations = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT configuration_json FROM live_tv_tuners
+            UNION ALL
+            SELECT configuration_json FROM plugin_configurations
+            UNION ALL
+            SELECT payload_json FROM named_configurations
+            "#,
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut references = HashSet::new();
+        for configuration in configurations {
+            let configuration = serde_json::from_str::<Value>(&configuration)
+                .context("invalid persisted configuration during provider secret reconciliation")?;
+            collect_provider_secret_reference_identities(&configuration, &mut references)?;
+        }
+
+        let envelopes = sqlx::query("SELECT secret_id, provider_type FROM provider_secrets")
+            .fetch_all(&mut *transaction)
+            .await?;
+        let mut deleted = 0usize;
+        for envelope in envelopes {
+            let secret_id = envelope.get::<String, _>("secret_id");
+            let provider_type = envelope.get::<String, _>("provider_type");
+            if references.contains(&(secret_id.clone(), provider_type.to_ascii_lowercase())) {
+                continue;
+            }
+            deleted += sqlx::query(
+                "DELETE FROM provider_secrets WHERE secret_id = ?1 AND provider_type = ?2 COLLATE NOCASE",
+            )
+            .bind(secret_id)
+            .bind(provider_type)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected() as usize;
+        }
+        transaction.commit().await?;
+        Ok(deleted)
+    }
+
+    pub async fn validate_provider_secret_readiness(&self) -> anyhow::Result<()> {
+        if self.provider_secret_vault.is_none() && self.provider_secret_count().await? > 0 {
+            anyhow::bail!(
+                "provider secrets exist but no provider secret key was configured; set JELLYRIN_PROVIDER_SECRET_KEY or JELLYRIN_PROVIDER_SECRET_KEY_FILE"
+            );
+        }
+        Ok(())
+    }
+
+    /// Fails before a write path invokes an external provider if encryption is unavailable.
+    pub fn validate_provider_secret_write_readiness(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.provider_secret_vault.is_some(),
+            "provider credentials cannot be stored without JELLYRIN_PROVIDER_SECRET_KEY or JELLYRIN_PROVIDER_SECRET_KEY_FILE"
+        );
+        Ok(())
+    }
+
+    pub async fn rotate_provider_secrets_to_active_key(&self) -> anyhow::Result<usize> {
+        let Some(vault) = self.provider_secret_vault.as_ref() else {
+            self.validate_provider_secret_readiness().await?;
+            return Ok(0);
+        };
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows = sqlx::query(
+            "SELECT secret_id, provider_type, revision FROM provider_secrets WHERE key_id <> ?1 ORDER BY secret_id",
+        )
+        .bind(vault.active_key_id())
+        .fetch_all(&mut *transaction)
+        .await?;
+        let mut rotated = 0usize;
+        for row in rows {
+            let reference = ProviderSecretReference {
+                id: row.get("secret_id"),
+                provider_type: row.get("provider_type"),
+                revision: row.get("revision"),
+            };
+            let (_, credentials) = self
+                .provider_secret_in_connection(&mut transaction, &reference)
+                .await?;
+            self.upsert_provider_secret_in_connection(
+                &mut transaction,
+                &reference.provider_type,
+                Some(&reference.id),
+                &credentials,
+            )
+            .await?;
+            rotated += 1;
+        }
+        transaction.commit().await?;
+        Ok(rotated)
+    }
+
+    pub async fn backfill_legacy_provider_secrets(&self) -> anyhow::Result<usize> {
+        // BEGIN IMMEDIATE serializes SQLite writers before any source configuration is read.
+        // Envelopes and all redacted references therefore commit or roll back as one unit.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let plugin_configuration = sqlx::query_scalar::<_, String>(
+            "SELECT configuration_json FROM plugin_configurations WHERE plugin_id = ?1 COLLATE NOCASE",
+        )
+        .bind("jellyrin-xtream-provider")
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|configuration| {
+            serde_json::from_str::<Value>(&configuration)
+                .context("invalid plugin configuration payload")
+        })
+        .transpose()?;
+        let tuner_rows =
+            sqlx::query("SELECT tuner_id, provider_type, configuration_json FROM live_tv_tuners")
+                .fetch_all(&mut *transaction)
+                .await?;
+        let tuner_configurations = tuner_rows
+            .into_iter()
+            .map(|row| {
+                let configuration = serde_json::from_str::<Value>(
+                    row.get::<String, _>("configuration_json").as_str(),
+                )
+                .context("invalid live TV tuner configuration json")?;
+                Ok((
+                    row.get::<String, _>("tuner_id"),
+                    row.get::<String, _>("provider_type"),
+                    configuration,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let named_configuration = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM named_configurations WHERE key = 'livetv'",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|payload| {
+            serde_json::from_str::<Value>(&payload).context("invalid named configuration")
+        })
+        .transpose()?;
+
+        let builtin_tuner_configuration = tuner_configurations
+            .iter()
+            .find(|(tuner_id, _, _)| tuner_id.eq_ignore_ascii_case("xtream-plugin"))
+            .map(|(_, _, configuration)| configuration);
+        let named_builtin_configuration = named_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.get("TunerHosts"))
+            .and_then(Value::as_array)
+            .and_then(|hosts| {
+                hosts.iter().find(|host| {
+                    host.get("Id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id.eq_ignore_ascii_case("xtream-plugin"))
+                })
+            });
+        let canonical_seed = [
+            plugin_configuration.as_ref(),
+            builtin_tuner_configuration,
+            named_builtin_configuration,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|configuration| configuration_has_provider_secret_material(configuration))
+        .cloned();
+        let canonical = if let Some(seed) = canonical_seed {
+            let canonical_credentials = self
+                .configuration_credentials_in_connection(&mut transaction, &seed)
+                .await?
+                .context("builtin Xtream credentials are incomplete")?;
+            for configuration in [
+                plugin_configuration.as_ref(),
+                builtin_tuner_configuration,
+                named_builtin_configuration,
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|configuration| configuration_has_provider_secret_material(configuration))
+            {
+                let credentials = self
+                    .configuration_credentials_in_connection(&mut transaction, configuration)
+                    .await?
+                    .context("builtin Xtream credentials are incomplete")?;
+                anyhow::ensure!(
+                    credentials == canonical_credentials,
+                    "conflicting legacy Xtream credentials; provider secret backfill was not applied"
+                );
+            }
+            Some(
+                self.protect_provider_configuration_in_connection(&mut transaction, "xtream", seed)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let canonical_reference = canonical
+            .as_ref()
+            .and_then(ProviderSecretReference::from_configuration);
+
+        let plugin_rewrite = if let (Some(original), Some(reference)) =
+            (plugin_configuration.as_ref(), canonical_reference.as_ref())
+        {
+            let mut candidate = original.clone();
+            set_provider_secret_reference(&mut candidate, reference)?;
+            let protected = self
+                .protect_provider_configuration_in_connection(&mut transaction, "xtream", candidate)
+                .await?;
+            (protected != *original).then_some(protected)
+        } else {
+            None
+        };
+
+        let mut tuner_rewrites = Vec::new();
+        for (tuner_id, provider_type, configuration) in &tuner_configurations {
+            let mut candidate = configuration.clone();
+            if tuner_id.eq_ignore_ascii_case("xtream-plugin")
+                && let Some(reference) = canonical_reference.as_ref()
+            {
+                set_provider_secret_reference(&mut candidate, reference)?;
+            }
+            let secret_namespace = if configuration_has_provider_secret_material(&candidate) {
+                provider_secret_namespace_for_configuration(provider_type, &candidate)?
+            } else {
+                provider_type.clone()
+            };
+            let protected = self
+                .protect_provider_configuration_in_connection(
+                    &mut transaction,
+                    &secret_namespace,
+                    candidate,
+                )
+                .await?;
+            if protected != *configuration {
+                tuner_rewrites.push((tuner_id.clone(), protected));
+            }
+        }
+
+        let named_rewrite = if let Some(original) = named_configuration.as_ref() {
+            let mut candidate = original.clone();
+            if let Some(reference) = canonical_reference.as_ref()
+                && let Some(host) = candidate
+                    .get_mut("TunerHosts")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|hosts| {
+                        hosts.iter_mut().find(|host| {
+                            host.get("Id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| id.eq_ignore_ascii_case("xtream-plugin"))
+                        })
+                    })
+            {
+                set_provider_secret_reference(host, reference)?;
+            }
+            let protected = self
+                .protect_live_tv_named_configuration_in_connection(
+                    &mut transaction,
+                    candidate,
+                    Some(original),
+                )
+                .await?;
+            (protected != *original).then_some(protected)
+        } else {
+            None
+        };
+
+        let rewritten = usize::from(plugin_rewrite.is_some())
+            + tuner_rewrites.len()
+            + usize::from(named_rewrite.is_some());
+        if rewritten > 0 {
+            let now = format_time(OffsetDateTime::now_utc())?;
+            if let Some(protected) = plugin_rewrite {
+                sqlx::query(
+                    "UPDATE plugin_configurations SET configuration_json = ?1, updated_at = ?2 WHERE plugin_id = ?3 COLLATE NOCASE",
+                )
+                .bind(serde_json::to_string(&protected)?)
+                .bind(&now)
+                .bind("jellyrin-xtream-provider")
+                .execute(&mut *transaction)
+                .await?;
+            }
+            for (tuner_id, protected) in tuner_rewrites {
+                sqlx::query(
+                    "UPDATE live_tv_tuners SET configuration_json = ?1, updated_at = ?2 WHERE tuner_id = ?3",
+                )
+                .bind(serde_json::to_string(&protected)?)
+                .bind(&now)
+                .bind(tuner_id)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            if let Some(protected) = named_rewrite {
+                sqlx::query(
+                    "UPDATE named_configurations SET payload_json = ?1, updated_at = ?2 WHERE key = 'livetv'",
+                )
+                .bind(serde_json::to_string(&protected)?)
+                .bind(&now)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+
+        transaction.commit().await?;
+
+        self.validate_provider_secret_readiness().await?;
+        Ok(rewritten)
+    }
+
+    async fn configuration_credentials_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        configuration: &Value,
+    ) -> anyhow::Result<Option<ProviderCredentials>> {
+        if let Some(reference) = ProviderSecretReference::from_configuration(configuration) {
+            let (_, credentials) = self
+                .provider_secret_in_connection(connection, &reference)
+                .await?;
+            return Ok(Some(credentials));
+        }
+        let Some((username, password)) = provider_credentials_from_configuration(configuration)?
+        else {
+            return Ok(None);
+        };
+        match (username, password) {
+            (Some(username), Some(password)) => Ok(Some(
+                ProviderCredentials::from_protected_parts(username, password)?,
+            )),
+            _ => anyhow::bail!("provider credentials are incomplete"),
+        }
+    }
+
+    pub async fn rotate_provider_secret(
+        &self,
+        reference: &ProviderSecretReference,
+    ) -> anyhow::Result<ProviderSecretReference> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (_, credentials) = self
+            .provider_secret_in_connection(&mut transaction, reference)
+            .await?;
+        let current = self
+            .upsert_provider_secret_in_connection(
+                &mut transaction,
+                &reference.provider_type,
+                Some(&reference.id),
+                &credentials,
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(current)
+    }
+
+    async fn upsert_provider_secret_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        provider_type: &str,
+        secret_id: Option<&str>,
+        credentials: &ProviderCredentials,
+    ) -> anyhow::Result<ProviderSecretReference> {
+        let vault = self.provider_secret_vault.as_ref().context(
+            "provider credentials cannot be stored without JELLYRIN_PROVIDER_SECRET_KEY or JELLYRIN_PROVIDER_SECRET_KEY_FILE",
+        )?;
+        let secret_id = secret_id
+            .map(str::to_owned)
+            .unwrap_or_else(new_provider_secret_id);
+        let envelope = vault.seal(&secret_id, provider_type, credentials)?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let revision = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO provider_secrets (
+                secret_id, provider_type, envelope_version, key_id, nonce, ciphertext,
+                revision, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)
+            ON CONFLICT(secret_id) DO UPDATE SET
+                envelope_version = excluded.envelope_version,
+                key_id = excluded.key_id,
+                nonce = excluded.nonce,
+                ciphertext = excluded.ciphertext,
+                revision = provider_secrets.revision + 1,
+                updated_at = excluded.updated_at
+            WHERE lower(provider_secrets.provider_type) = lower(excluded.provider_type)
+            RETURNING revision
+            "#,
+        )
+        .bind(&secret_id)
+        .bind(provider_type)
+        .bind(i64::from(envelope.version))
+        .bind(&envelope.key_id)
+        .bind(envelope.nonce.as_slice())
+        .bind(&envelope.ciphertext)
+        .bind(&now)
+        .fetch_optional(connection)
+        .await?
+        .context("provider secret id belongs to a different provider")?;
+        Ok(ProviderSecretReference {
+            id: secret_id,
+            provider_type: provider_type.to_owned(),
+            revision,
+        })
+    }
+
+    async fn provider_secret(
+        &self,
+        reference: &ProviderSecretReference,
+    ) -> anyhow::Result<(ProviderSecretReference, ProviderCredentials)> {
+        let mut connection = self.pool.acquire().await?;
+        self.provider_secret_in_connection(&mut connection, reference)
+            .await
+    }
+
+    async fn provider_secret_in_connection(
+        &self,
+        connection: &mut SqliteConnection,
+        reference: &ProviderSecretReference,
+    ) -> anyhow::Result<(ProviderSecretReference, ProviderCredentials)> {
+        let vault = self.provider_secret_vault.as_ref().context(
+            "provider credentials cannot be resolved without JELLYRIN_PROVIDER_SECRET_KEY or JELLYRIN_PROVIDER_SECRET_KEY_FILE",
+        )?;
+        let row = sqlx::query(
+            r#"
+            SELECT provider_type, envelope_version, key_id, nonce, ciphertext, revision
+            FROM provider_secrets
+            WHERE secret_id = ?1 AND provider_type = ?2 COLLATE NOCASE
+            "#,
+        )
+        .bind(&reference.id)
+        .bind(&reference.provider_type)
+        .fetch_optional(connection)
+        .await?
+        .context("provider secret reference is unavailable")?;
+        let nonce = row.get::<Vec<u8>, _>("nonce");
+        let nonce: [u8; 12] = nonce
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("provider secret envelope is invalid"))?;
+        let provider_type = row.get::<String, _>("provider_type");
+        let revision = row.get::<i64, _>("revision");
+        let envelope = ProviderSecretEnvelope {
+            version: u16::try_from(row.get::<i64, _>("envelope_version"))?,
+            key_id: row.get("key_id"),
+            nonce,
+            ciphertext: row.get("ciphertext"),
+        };
+        let credentials = vault.open(&reference.id, &provider_type, &envelope)?;
+        Ok((
+            ProviderSecretReference {
+                id: reference.id.clone(),
+                provider_type,
+                revision,
+            },
+            credentials,
+        ))
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub async fn health(&self) -> anyhow::Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn schema_health(&self) -> anyhow::Result<()> {
+        self.health().await
+    }
+
+    pub fn runtime_diagnostics(&self) -> DatabaseRuntimeDiagnostics {
+        DatabaseRuntimeDiagnostics {
+            driver: DatabaseDriver::Sqlite,
+            api_pool: database_pool_diagnostics(&self.pool),
+            // SQLite is a legacy/test adapter and intentionally has no independent worker pool.
+            worker_pool: None,
+        }
+    }
+
+    pub fn telemetry_diagnostics(&self) -> DatabaseTelemetryDiagnostics {
+        self.telemetry.snapshot(false)
+    }
+
+    pub async fn catalog_sync_diagnostics(&self) -> anyhow::Result<CatalogSyncDiagnostics> {
+        let counts = sqlx::query_as::<_, CatalogSyncCountsRow>(
+            r#"
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
+                   COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed,
+                   COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed
+            FROM catalog_sync_runs
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let last_run = sqlx::query_as::<_, (String, i64, String, Option<String>)>(
+            r#"
+            SELECT status, item_count, started_at, completed_at
+            FROM catalog_sync_runs
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|(status, item_count, started_at, completed_at)| {
+            let started_at = parse_time(&started_at)?;
+            let completed_at = completed_at.as_deref().map(parse_time).transpose()?;
+            Ok::<_, anyhow::Error>(CatalogSyncRunDiagnostics {
+                status,
+                item_count: nonnegative_count(item_count),
+                started_at,
+                completed_at,
+                duration_millis: catalog_sync_duration_millis(started_at, completed_at),
+            })
+        })
+        .transpose()?;
+        Ok(CatalogSyncDiagnostics {
+            total: nonnegative_count(counts.total),
+            running: nonnegative_count(counts.running),
+            completed: nonnegative_count(counts.completed),
+            failed: nonnegative_count(counts.failed),
+            last_run,
+        })
     }
 
     pub async fn server_state(&self) -> anyhow::Result<ServerState> {
@@ -798,12 +3062,44 @@ impl Database {
 
     pub async fn replace_live_tv_tuner_snapshot(
         &self,
-        tuner: LiveTvTunerUpsert,
+        mut tuner: LiveTvTunerUpsert,
         categories: Vec<LiveTvCategoryUpsert>,
         channels: Vec<LiveTvChannelUpsert>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Value> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing_configuration = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT configuration_json
+            FROM live_tv_tuners
+            WHERE enabled = 1 AND tuner_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(tuner.tuner_id.trim())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|configuration| {
+            serde_json::from_str::<Value>(&configuration)
+                .context("invalid persisted Live TV tuner configuration")
+        })
+        .transpose()?;
+        inherit_provider_secret_reference_for_configuration(
+            &mut tuner.configuration,
+            existing_configuration.as_ref(),
+            &tuner.provider_type,
+        )?;
+        let secret_namespace = if configuration_has_provider_secret_material(&tuner.configuration) {
+            provider_secret_namespace_for_configuration(&tuner.provider_type, &tuner.configuration)?
+        } else {
+            tuner.provider_type.clone()
+        };
+        tuner.configuration = self
+            .protect_provider_configuration_in_connection(
+                &mut tx,
+                &secret_namespace,
+                tuner.configuration,
+            )
+            .await?;
         let now = format_time(OffsetDateTime::now_utc())?;
-        let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             r#"
@@ -886,7 +3182,7 @@ impl Database {
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(tuner.configuration)
     }
 
     pub async fn live_tv_channel_page(
@@ -979,20 +3275,108 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
+        let configurations = rows
+            .into_iter()
             .map(|row| {
                 let configuration_json = row.get::<String, _>("configuration_json");
                 serde_json::from_str(&configuration_json)
                     .context("invalid live TV tuner configuration json")
             })
-            .collect()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut resolved = Vec::with_capacity(configurations.len());
+        for configuration in configurations {
+            resolved.push(self.resolve_provider_configuration(&configuration).await?);
+        }
+        Ok(resolved)
+    }
+
+    pub async fn live_tv_tuner_configuration_by_id(
+        &self,
+        tuner_id: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let row = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT configuration_json
+            FROM live_tv_tuners
+            WHERE enabled = 1 AND tuner_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(tuner_id.trim())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|configuration| {
+            serde_json::from_str(&configuration)
+                .context("invalid persisted Live TV tuner configuration")
+        })
+        .transpose()
     }
 
     pub async fn delete_live_tv_tuner_state(&self, tuner_id: &str) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let deleted_configuration = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT configuration_json
+            FROM live_tv_tuners
+            WHERE tuner_id = ?1 COLLATE NOCASE
+            "#,
+        )
+        .bind(tuner_id.trim())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|configuration| {
+            serde_json::from_str::<Value>(&configuration)
+                .context("invalid persisted Live TV tuner configuration")
+        })
+        .transpose()?;
+
         sqlx::query("DELETE FROM live_tv_tuners WHERE tuner_id = ?1 COLLATE NOCASE")
             .bind(tuner_id.trim())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+
+        if let Some(reference) = deleted_configuration
+            .as_ref()
+            .and_then(ProviderSecretReference::from_configuration)
+        {
+            let configurations = sqlx::query_scalar::<_, String>(
+                r#"
+                SELECT configuration_json FROM live_tv_tuners
+                UNION ALL
+                SELECT configuration_json FROM plugin_configurations
+                UNION ALL
+                SELECT payload_json FROM named_configurations
+                "#,
+            )
+            .fetch_all(&mut *transaction)
+            .await?;
+            // Invalid unrelated configuration must fail closed for GC without preventing the
+            // requested tuner deletion. A future repair can collect the retained envelope.
+            let mut still_referenced = false;
+            for configuration in configurations {
+                let Ok(configuration) = serde_json::from_str::<Value>(&configuration) else {
+                    still_referenced = true;
+                    break;
+                };
+                if configuration_references_provider_secret(&configuration, &reference) {
+                    still_referenced = true;
+                    break;
+                }
+            }
+            if !still_referenced {
+                sqlx::query(
+                    r#"
+                    DELETE FROM provider_secrets
+                    WHERE secret_id = ?1 AND provider_type = ?2 COLLATE NOCASE
+                    "#,
+                )
+                .bind(&reference.id)
+                .bind(&reference.provider_type)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1007,7 +3391,24 @@ impl Database {
         );
 
         let now = format_time(OffsetDateTime::now_utc())?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut restored_plugin_configurations = Vec::new();
+        for item in plugin_snapshot_items(snapshot, "PluginConfigurations")? {
+            let plugin_id = plugin_snapshot_string(item, "PluginId")?;
+            let mut configuration = plugin_snapshot_value(item, "Configuration")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if plugin_id.eq_ignore_ascii_case("jellyrin-xtream-provider") {
+                configuration = self
+                    .protect_provider_configuration_in_connection(&mut tx, "xtream", configuration)
+                    .await?;
+            }
+            restored_plugin_configurations.push((
+                plugin_id,
+                serde_json::to_string(&configuration)?,
+                plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()),
+            ));
+        }
         for table in [
             "plugin_audit_log",
             "plugin_host_events",
@@ -1187,13 +3588,13 @@ impl Database {
             .await?;
         }
 
-        for item in plugin_snapshot_items(snapshot, "PluginConfigurations")? {
+        for (plugin_id, configuration, updated_at) in restored_plugin_configurations {
             sqlx::query(
                 "INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at) VALUES (?1, ?2, ?3)",
             )
-            .bind(plugin_snapshot_string(item, "PluginId")?)
-            .bind(plugin_snapshot_json_string(item, "Configuration", json!({}))?)
-            .bind(plugin_snapshot_optional_string(item, "UpdatedAt").unwrap_or_else(|| now.clone()))
+            .bind(plugin_id)
+            .bind(configuration)
+            .bind(updated_at)
             .execute(&mut *tx)
             .await?;
         }
@@ -1480,6 +3881,57 @@ impl Database {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn ensure_builtin_plugin(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        version: &str,
+        manifest: &Value,
+        capabilities: &[&str],
+    ) -> anyhow::Result<bool> {
+        let existing_status = self
+            .installed_plugin_json(plugin_id)
+            .await?
+            .and_then(|plugin| {
+                plugin
+                    .get("Status")
+                    .and_then(Value::as_str)
+                    .filter(|status| !status.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "Active".to_string());
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO installed_plugins (
+                plugin_id, name, version, runtime, target_abi, server_compatibility_json,
+                status, capabilities_json, permissions_json, configuration_state,
+                last_error, health_json, manifest_json, installed_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, 'Builtin', '', '{}', ?4, ?5, '[]',
+                    'Default', NULL, '{}', ?6, ?7, ?7)
+            ON CONFLICT(plugin_id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                runtime = excluded.runtime,
+                capabilities_json = excluded.capabilities_json,
+                manifest_json = excluded.manifest_json,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(plugin_id)
+        .bind(name)
+        .bind(version)
+        .bind(existing_status)
+        .bind(serde_json::to_string(capabilities)?)
+        .bind(serde_json::to_string(manifest)?)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn installed_plugin_json(&self, plugin_id: &str) -> anyhow::Result<Option<Value>> {
@@ -1780,13 +4232,49 @@ impl Database {
     pub async fn update_plugin_configuration_json(
         &self,
         plugin_id: &str,
-        configuration: Value,
+        mut configuration: Value,
     ) -> anyhow::Result<bool> {
-        // Check if plugin exists in either plugin_manifests or installed_plugins
-        let has_manifest = self.installed_plugin_manifest(plugin_id).await?.is_some();
-        let has_installed = self.installed_plugin_json(plugin_id).await?.is_some();
-        if !has_manifest && !has_installed {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM plugin_manifests WHERE plugin_id = ?1 COLLATE NOCASE
+                UNION ALL
+                SELECT 1 FROM installed_plugins WHERE plugin_id = ?1 COLLATE NOCASE
+            )
+            "#,
+        )
+        .bind(plugin_id.trim())
+        .fetch_one(&mut *transaction)
+        .await?
+            != 0;
+        if !exists {
+            transaction.rollback().await?;
             return Ok(false);
+        }
+        if plugin_id
+            .trim()
+            .eq_ignore_ascii_case("jellyrin-xtream-provider")
+        {
+            let existing = sqlx::query_scalar::<_, String>(
+                "SELECT configuration_json FROM plugin_configurations WHERE plugin_id = ?1 COLLATE NOCASE",
+            )
+            .bind(plugin_id.trim())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(|configuration| {
+                serde_json::from_str::<Value>(&configuration)
+                    .context("invalid plugin configuration payload")
+            })
+            .transpose()?;
+            inherit_provider_secret_reference(&mut configuration, existing.as_ref());
+            configuration = self
+                .protect_provider_configuration_in_connection(
+                    &mut transaction,
+                    "xtream",
+                    configuration,
+                )
+                .await?;
         }
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
@@ -1801,8 +4289,9 @@ impl Database {
         .bind(plugin_id.trim())
         .bind(serde_json::to_string(&configuration)?)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(true)
     }
 
@@ -2120,10 +4609,31 @@ impl Database {
     pub async fn update_named_configuration(
         &self,
         key: &str,
-        payload: Value,
+        mut payload: Value,
     ) -> anyhow::Result<()> {
         let key = normalize_configuration_key(key);
         anyhow::ensure!(!key.is_empty(), "configuration key must not be empty");
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        if key == "livetv" {
+            let existing = sqlx::query_scalar::<_, String>(
+                "SELECT payload_json FROM named_configurations WHERE key = ?1",
+            )
+            .bind(&key)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(|payload| {
+                serde_json::from_str::<Value>(&payload).context("invalid named configuration")
+            })
+            .transpose()?;
+            payload = self
+                .protect_live_tv_named_configuration_in_connection(
+                    &mut transaction,
+                    payload,
+                    existing.as_ref(),
+                )
+                .await?;
+        }
 
         let now = format_time(OffsetDateTime::now_utc())?;
         sqlx::query(
@@ -2138,8 +4648,9 @@ impl Database {
         .bind(key)
         .bind(serde_json::to_string(&payload)?)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -2775,6 +5286,15 @@ impl Database {
     }
 
     pub async fn user_by_token(&self, token: &str) -> anyhow::Result<(User, DeviceToken)> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::AuthUserByToken, DatabasePoolRole::Api);
+        let result = self.user_by_token_unobserved(token).await;
+        observation.finish_result(&result, |_| 1);
+        result
+    }
+
+    async fn user_by_token_unobserved(&self, token: &str) -> anyhow::Result<(User, DeviceToken)> {
         let token_row = sqlx::query_as::<_, DeviceTokenRow>(
             r#"
             SELECT access_token, user_id, device_id, device_name, client, version
@@ -2794,6 +5314,18 @@ impl Database {
     }
 
     pub async fn user_by_api_key(&self, api_key: &str) -> anyhow::Result<(User, DeviceToken)> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::AuthUserByApiKey, DatabasePoolRole::Api);
+        let result = self.user_by_api_key_unobserved(api_key).await;
+        observation.finish_result(&result, |_| 1);
+        result
+    }
+
+    async fn user_by_api_key_unobserved(
+        &self,
+        api_key: &str,
+    ) -> anyhow::Result<(User, DeviceToken)> {
         let row = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             SELECT access_token, user_id, name
@@ -3983,13 +6515,34 @@ impl Database {
         progress_percent: Option<f64>,
         position_ticks: i64,
     ) -> anyhow::Result<()> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::TranscodeProgressWrite,
+            DatabasePoolRole::Api,
+        );
+        let result = self
+            .update_transcode_session_progress_unobserved(
+                play_session_id,
+                progress_percent,
+                position_ticks,
+            )
+            .await;
+        observation.finish_result(&result, |rows| *rows);
+        result.map(|_| ())
+    }
+
+    async fn update_transcode_session_progress_unobserved(
+        &self,
+        play_session_id: &str,
+        progress_percent: Option<f64>,
+        position_ticks: i64,
+    ) -> anyhow::Result<u64> {
         let play_session_id = play_session_id.trim();
         anyhow::ensure!(
             !play_session_id.is_empty(),
             "play session id must not be empty"
         );
         let now = format_time(OffsetDateTime::now_utc())?;
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE transcode_sessions
             SET progress_percent = COALESCE(?1, progress_percent),
@@ -4004,7 +6557,7 @@ impl Database {
         .bind(play_session_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 
     pub async fn start_task_run(&self, task_key: &str) -> anyhow::Result<TaskRun> {
@@ -4477,6 +7030,24 @@ impl Database {
         collection_types: &[&str],
         limit: usize,
     ) -> anyhow::Result<Vec<MediaItem>> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogNameSearch, DatabasePoolRole::Api);
+        let result = self
+            .media_items_by_name_search_unobserved(search_term, collection_types, limit)
+            .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    async fn media_items_by_name_search_unobserved(
+        &self,
+        search_term: &str,
+        collection_types: &[&str],
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaItem>> {
         let search_term = search_term.trim();
         if search_term.is_empty() || collection_types.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -4505,7 +7076,590 @@ impl Database {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// SQLite test/transition equivalent of the native PostgreSQL catalog repository.
+    pub async fn media_item_catalog_page(
+        &self,
+        query: &MediaItemCatalogQuery,
+    ) -> anyhow::Result<MediaItemCatalogPage> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogPage, DatabasePoolRole::Api);
+        let result = self.media_item_catalog_page_unobserved(query).await;
+        observation.finish_result(&result, |page| {
+            u64::try_from(page.items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    async fn media_item_catalog_page_unobserved(
+        &self,
+        query: &MediaItemCatalogQuery,
+    ) -> anyhow::Result<MediaItemCatalogPage> {
+        let mut transaction = self.pool.begin().await?;
+
+        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) ");
+        push_sqlite_catalog_from(&mut count, query);
+        push_sqlite_catalog_filters(&mut count, query)?;
+        let total_record_count = count
+            .build_query_scalar::<i64>()
+            .fetch_one(&mut *transaction)
+            .await?;
+        let total_record_count =
+            usize::try_from(total_record_count).context("media catalog count exceeded usize")?;
+
+        let effective_limit = query.limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+        if effective_limit == 0 {
+            transaction.commit().await?;
+            return Ok(MediaItemCatalogPage {
+                items: Vec::new(),
+                total_record_count,
+                start_index: query.start_index,
+            });
+        }
+
+        let mut page = QueryBuilder::<Sqlite>::new(
+            r#"SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                      item.media_type, item.collection_type, item.file_size,
+                      item.runtime_ticks, item.bitrate, item.width, item.height,
+                      item.media_streams_json, item.metadata_json,
+                      item.created_at, item.updated_at,
+                      playback.user_id AS playback_user_id,
+                      playback.item_id AS playback_item_id,
+                      playback.media_source_id AS playback_media_source_id,
+                      playback.audio_stream_index AS playback_audio_stream_index,
+                      playback.subtitle_stream_index AS playback_subtitle_stream_index,
+                      playback.position_ticks AS playback_position_ticks,
+                      playback.is_paused AS playback_is_paused,
+                      playback.played AS playback_played,
+                      playback.is_favorite AS playback_is_favorite,
+                      playback.rating AS playback_rating,
+                      playback.updated_at AS playback_updated_at "#,
+        );
+        push_sqlite_catalog_from(&mut page, query);
+        push_sqlite_catalog_filters(&mut page, query)?;
+        push_sqlite_catalog_order(&mut page, query);
+        page.push(" LIMIT ")
+            .push_bind(i64::try_from(effective_limit)?);
+        page.push(" OFFSET ")
+            .push_bind(i64::try_from(query.start_index)?);
+
+        let rows = page
+            .build_query_as::<MediaItemCatalogRow>()
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+
+        Ok(MediaItemCatalogPage {
+            items: rows
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            total_record_count,
+            start_index: query.start_index,
+        })
+    }
+
+    pub async fn media_item_catalog_counts(
+        &self,
+        query: &MediaItemCatalogQuery,
+    ) -> anyhow::Result<MediaItemCatalogCounts> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogCounts, DatabasePoolRole::Api);
+        let result = self.media_item_catalog_counts_unobserved(query).await;
+        observation.finish_result(&result, |counts| counts.item_count);
+        result
+    }
+
+    async fn media_item_catalog_counts_unobserved(
+        &self,
+        query: &MediaItemCatalogQuery,
+    ) -> anyhow::Result<MediaItemCatalogCounts> {
+        let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
+        let transaction_result = self.pool.begin().await;
+        acquire.finish_result(&transaction_result);
+        let mut transaction = transaction_result?;
+
+        let mut aggregate = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) AS item_count, ");
+        aggregate
+            .push("COALESCE(SUM(CASE WHEN (")
+            .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+            .push(") = 'movie' THEN 1 ELSE 0 END), 0) AS movie_count, COALESCE(SUM(CASE WHEN (")
+            .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+            .push(") = 'episode' THEN 1 ELSE 0 END), 0) AS episode_count, COALESCE(SUM(CASE WHEN (")
+            .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+            .push(") = 'audio' THEN 1 ELSE 0 END), 0) AS song_count, COALESCE(SUM(CASE WHEN (")
+            .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+            .push(") = 'musicvideo' THEN 1 ELSE 0 END), 0) AS music_video_count, COALESCE(SUM(CASE WHEN (")
+            .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+            .push(") = 'book' THEN 1 ELSE 0 END), 0) AS book_count ");
+        push_sqlite_catalog_from(&mut aggregate, query);
+        push_sqlite_catalog_filters(&mut aggregate, query)?;
+        let row = aggregate
+            .build_query_as::<SqliteCatalogAggregateRow>()
+            .fetch_one(&mut *transaction)
+            .await?;
+
+        let mut projection = QueryBuilder::<Sqlite>::new("SELECT item.name, item.path, ");
+        projection.push(SQLITE_MEDIA_ITEM_TYPE_SQL).push(
+            " AS item_type, item.metadata_json -> '$.Album' AS album, \
+                   item.metadata_json -> '$.AlbumName' AS album_name, \
+                   item.metadata_json -> '$.Artists' AS artists, \
+                   item.metadata_json -> '$.AlbumArtists' AS album_artists, \
+                   item.metadata_json -> '$.RemoteTrailers' AS remote_trailers, \
+                   item.metadata_json -> '$.Trailers' AS trailers ",
+        );
+        push_sqlite_catalog_from(&mut projection, query);
+        push_sqlite_catalog_filters(&mut projection, query)?;
+        projection
+            .push(" AND ((")
+            .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+            .push(
+                ") = 'episode' OR json_type(item.metadata_json, '$.Album') IS NOT NULL \
+                   OR json_type(item.metadata_json, '$.AlbumName') IS NOT NULL \
+                   OR json_type(item.metadata_json, '$.Artists') IS NOT NULL \
+                   OR json_type(item.metadata_json, '$.AlbumArtists') IS NOT NULL \
+                   OR json_type(item.metadata_json, '$.RemoteTrailers') IS NOT NULL \
+                   OR json_type(item.metadata_json, '$.Trailers') IS NOT NULL)",
+            );
+        let mut series_names = BTreeSet::new();
+        let mut metadata_counts = CatalogMetadataCountAccumulator::default();
+        {
+            let mut rows = projection
+                .build_query_as::<SqliteCatalogCountProjectionRow>()
+                .fetch(&mut *transaction);
+            while let Some(projected) = rows.try_next().await? {
+                if projected.item_type == "episode" {
+                    series_names.insert(
+                        tv_episode_path_info(&projected.name, &projected.path)
+                            .series_name
+                            .to_ascii_lowercase(),
+                    );
+                }
+                metadata_counts.add_album(projected.album.as_deref())?;
+                metadata_counts.add_album(projected.album_name.as_deref())?;
+                metadata_counts.add_artist(projected.artists.as_deref())?;
+                metadata_counts.add_artist(projected.album_artists.as_deref())?;
+                metadata_counts.add_trailers(projected.remote_trailers.as_deref())?;
+                metadata_counts.add_trailers(projected.trailers.as_deref())?;
+            }
+        }
+        transaction.commit().await?;
+
+        Ok(MediaItemCatalogCounts {
+            movie_count: sqlite_nonnegative_catalog_count(row.movie_count, "movie")?,
+            series_count: u64::try_from(series_names.len()).context("series count exceeded u64")?,
+            episode_count: sqlite_nonnegative_catalog_count(row.episode_count, "episode")?,
+            artist_count: u64::try_from(metadata_counts.artists.len())
+                .context("artist count exceeded u64")?,
+            trailer_count: metadata_counts.trailers,
+            song_count: sqlite_nonnegative_catalog_count(row.song_count, "song")?,
+            album_count: u64::try_from(metadata_counts.albums.len())
+                .context("album count exceeded u64")?,
+            music_video_count: sqlite_nonnegative_catalog_count(
+                row.music_video_count,
+                "music video",
+            )?,
+            book_count: sqlite_nonnegative_catalog_count(row.book_count, "book")?,
+            item_count: sqlite_nonnegative_catalog_count(row.item_count, "item")?,
+        })
+    }
+
+    pub async fn media_item_query_filter_values(
+        &self,
+        query: &MediaItemCatalogQuery,
+    ) -> anyhow::Result<MediaItemQueryFilterValues> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogFilterSummary,
+            DatabasePoolRole::Api,
+        );
+        let result = self.media_item_query_filter_values_unobserved(query).await;
+        observation.finish_result(&result, |values| {
+            sqlite_media_item_query_filter_value_count(values)
+        });
+        result
+    }
+
+    async fn media_item_query_filter_values_unobserved(
+        &self,
+        query: &MediaItemCatalogQuery,
+    ) -> anyhow::Result<MediaItemQueryFilterValues> {
+        let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
+        let transaction_result = self.pool.begin().await;
+        acquire.finish_result(&transaction_result);
+        let mut transaction = transaction_result?;
+        let mut metadata = QueryBuilder::<Sqlite>::new(
+            "WITH RECURSIVE selected_items AS (\
+             SELECT item.id, item.name, item.metadata_json ",
+        );
+        push_sqlite_catalog_from(&mut metadata, query);
+        push_sqlite_catalog_filters(&mut metadata, query)?;
+        metadata.push(
+            "), raw_values(field, item_sort, item_id, key_priority, value_position, value, value_type) AS (",
+        );
+        let metadata_specs = [
+            ("genres", "Genres", 0_i64),
+            ("tags", "Tags", 0),
+            ("official_ratings", "OfficialRating", 0),
+            ("official_ratings", "OfficialRatings", 1),
+            ("years", "ProductionYear", 0),
+            ("years", "Years", 1),
+            ("series_statuses", "SeriesStatus", 0),
+            ("staff_names", "People", 0),
+            ("staff_names", "SeriesPeople", 1),
+            ("artists", "Artists", 0),
+            ("artists", "AlbumArtists", 1),
+            ("albums", "Album", 0),
+            ("albums", "AlbumName", 1),
+            ("studios", "Studios", 0),
+        ];
+        for (index, (field, key, priority)) in metadata_specs.into_iter().enumerate() {
+            if index > 0 {
+                metadata.push(" UNION ALL ");
+            }
+            let json_path = format!("$.{key}");
+            metadata
+                .push("SELECT ")
+                .push_bind(field)
+                .push(", lower(item.name), item.id, ")
+                .push_bind(priority)
+                .push(", '0000000000', json_extract(item.metadata_json, ")
+                .push_bind(json_path.clone())
+                .push("), json_type(item.metadata_json, ")
+                .push_bind(json_path)
+                .push(") FROM selected_items AS item");
+        }
+        metadata.push(
+            " UNION ALL \
+             SELECT '__trailer', lower(item.name), item.id, 0, '0000000000', \
+                    trailer_field.value, trailer_field.type \
+             FROM selected_items AS item \
+             JOIN json_each(item.metadata_json) AS trailer_field \
+               ON lower(trailer_field.key) IN ('remotetrailers', 'trailers')\
+             ), expanded(field, item_sort, item_id, key_priority, value_position, value, value_type) AS (\
+             SELECT field, item_sort, item_id, key_priority, value_position, value, value_type \
+             FROM raw_values WHERE value_type IS NOT NULL \
+             UNION ALL \
+             SELECT expanded.field, expanded.item_sort, expanded.item_id, \
+                    expanded.key_priority, \
+                    expanded.value_position || '.' || printf('%010d', child.key), \
+                    child.value, child.type \
+             FROM expanded \
+             JOIN json_each(CASE WHEN expanded.value_type = 'array' \
+                                 THEN expanded.value ELSE '[]' END) AS child \
+             WHERE expanded.value_type = 'array'\
+             ), candidates AS (\
+             SELECT field, item_sort, item_id, key_priority, value_position, \
+                    trim(CASE \
+                      WHEN value_type IN ('text', 'integer', 'real') THEN CAST(value AS TEXT) \
+                      WHEN value_type = 'object' AND json_type(value, '$.Name') = 'text' \
+                        THEN json_extract(value, '$.Name') \
+                    END) AS display_value \
+             FROM expanded WHERE field <> '__trailer'\
+             ), ranked AS (\
+             SELECT field, display_value, \
+                    ROW_NUMBER() OVER (\
+                      PARTITION BY field, CASE WHEN field = 'media_types' \
+                        THEN display_value ELSE lower(display_value) END \
+                      ORDER BY item_sort, item_id, key_priority, value_position\
+                    ) AS value_rank \
+             FROM candidates WHERE display_value IS NOT NULL AND display_value <> ''\
+             ) \
+             SELECT field, display_value FROM ranked WHERE value_rank = 1 \
+             UNION ALL \
+             SELECT '__has_trailer', '1' WHERE EXISTS (\
+               SELECT 1 FROM expanded \
+               WHERE field = '__trailer' AND (\
+                 (value_type = 'text' AND trim(CAST(value AS TEXT)) <> '') OR \
+                 (value_type = 'object' AND CASE \
+                   WHEN json_type(value, '$.Url') IS NOT NULL THEN \
+                     json_type(value, '$.Url') = 'text' \
+                       AND trim(json_extract(value, '$.Url')) <> '' \
+                   WHEN json_type(value, '$.url') IS NOT NULL THEN \
+                     json_type(value, '$.url') = 'text' \
+                       AND trim(json_extract(value, '$.url')) <> '' \
+                   WHEN json_type(value, '$.Path') IS NOT NULL THEN \
+                     json_type(value, '$.Path') = 'text' \
+                       AND trim(json_extract(value, '$.Path')) <> '' \
+                   WHEN json_type(value, '$.path') IS NOT NULL THEN \
+                     json_type(value, '$.path') = 'text' \
+                       AND trim(json_extract(value, '$.path')) <> '' \
+                   ELSE 0 END)\
+               )\
+             ) \
+             ORDER BY field, display_value COLLATE NOCASE",
+        );
+
+        let metadata_rows = metadata
+            .build_query_as::<(String, String)>()
+            .fetch_all(&mut *transaction)
+            .await?;
+
+        let mut scalar = QueryBuilder::<Sqlite>::new(
+            "WITH RECURSIVE selected_items AS (\
+             SELECT item.id, item.name, item.path, item.media_type, item.media_streams_json ",
+        );
+        push_sqlite_catalog_from(&mut scalar, query);
+        push_sqlite_catalog_filters(&mut scalar, query)?;
+        scalar.push(
+            "), filenames(item_sort, item_id, filename) AS (\
+             SELECT lower(name), id, path FROM selected_items \
+             UNION ALL \
+             SELECT item_sort, item_id, substr(filename, instr(filename, '/') + 1) \
+             FROM filenames WHERE instr(filename, '/') > 0\
+             ), extensions(item_sort, item_id, filename, suffix, dot_count) AS (\
+             SELECT item_sort, item_id, filename, filename, 0 \
+             FROM filenames WHERE instr(filename, '/') = 0 \
+             UNION ALL \
+             SELECT item_sort, item_id, filename, \
+                    substr(suffix, instr(suffix, '.') + 1), dot_count + 1 \
+             FROM extensions WHERE instr(suffix, '.') > 0\
+             ), stream_values AS (\
+             SELECT lower(item.name) AS item_sort, item.id AS item_id, stream.key AS position, \
+                    lower(json_extract(stream.value, '$.Type')) AS stream_type, \
+                    json_type(stream.value, '$.Type') AS stream_type_type, \
+                    json_type(stream.value, '$.Language') AS language_type, \
+                    CASE lower(trim(json_extract(stream.value, '$.Language'))) \
+                      WHEN 'fre' THEN 'fra' WHEN 'ger' THEN 'deu' \
+                      ELSE trim(json_extract(stream.value, '$.Language')) \
+                    END AS display_language \
+             FROM selected_items AS item \
+             JOIN json_each(item.media_streams_json) AS stream\
+             ), raw_values(field, item_sort, item_id, position, display_value) AS (\
+             SELECT 'containers', item_sort, item_id, 0, lower(suffix) \
+             FROM extensions \
+             WHERE instr(suffix, '.') = 0 AND dot_count > 0 \
+               AND filename NOT IN ('.', '..') \
+               AND NOT (substr(filename, 1, 1) = '.' AND instr(substr(filename, 2), '.') = 0) \
+             UNION ALL \
+             SELECT 'media_types', lower(name), id, 0, media_type FROM selected_items \
+             UNION ALL \
+             SELECT 'video_types', lower(name), id, 0, 'VideoFile' FROM selected_items \
+             WHERE lower(media_type) = 'video' \
+             UNION ALL \
+             SELECT 'audio_languages', item_sort, item_id, position, display_language \
+             FROM stream_values WHERE stream_type_type = 'text' AND language_type = 'text' \
+               AND stream_type = 'audio' \
+             UNION ALL \
+             SELECT 'subtitle_languages', item_sort, item_id, position, display_language \
+             FROM stream_values WHERE stream_type_type = 'text' AND language_type = 'text' \
+               AND stream_type = 'subtitle'\
+             ), ranked AS (\
+             SELECT field, display_value, \
+                    ROW_NUMBER() OVER (\
+                      PARTITION BY field, CASE WHEN field = 'media_types' \
+                        THEN display_value ELSE lower(display_value) END \
+                      ORDER BY item_sort, item_id, position\
+                    ) AS value_rank \
+             FROM raw_values \
+             WHERE display_value IS NOT NULL \
+               AND (field NOT IN ('audio_languages', 'subtitle_languages') \
+                    OR (trim(display_value) <> '' AND lower(trim(display_value)) <> 'und'))\
+             ) \
+             SELECT field, display_value FROM ranked WHERE value_rank = 1 \
+             UNION ALL \
+             SELECT '__has_subtitles', '1' WHERE EXISTS (\
+               SELECT 1 FROM stream_values \
+               WHERE stream_type_type = 'text' AND stream_type = 'subtitle'\
+             ) \
+             ORDER BY field, display_value COLLATE NOCASE",
+        );
+        let scalar_rows = scalar
+            .build_query_as::<(String, String)>()
+            .fetch_all(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+
+        let mut values = MediaItemQueryFilterValues::default();
+        for (field, display_value) in metadata_rows.into_iter().chain(scalar_rows) {
+            push_media_item_query_filter_value(&mut values, &field, display_value);
+        }
+        Ok(values)
+    }
+
+    pub async fn tv_series_lookup_candidates(&self) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let rows = sqlx::query_as::<_, MediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams_json, item.metadata_json,
+                   item.created_at, item.updated_at,
+                   CAST(NULL AS TEXT) AS playback_user_id,
+                   CAST(NULL AS TEXT) AS playback_item_id,
+                   CAST(NULL AS TEXT) AS playback_media_source_id,
+                   CAST(NULL AS INTEGER) AS playback_audio_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_subtitle_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_position_ticks,
+                   CAST(NULL AS INTEGER) AS playback_is_paused,
+                   CAST(NULL AS INTEGER) AS playback_played,
+                   CAST(NULL AS INTEGER) AS playback_is_favorite,
+                   CAST(NULL AS REAL) AS playback_rating,
+                   CAST(NULL AS TEXT) AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+            ORDER BY item.name COLLATE NOCASE
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn tv_next_up_candidates(
+        &self,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogNextUpCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result: anyhow::Result<Vec<MediaItemCatalogEntry>> = async {
+            let rows = sqlx::query_as::<_, MediaItemCatalogRow>(
+                r#"
+                SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                       item.media_type, item.collection_type, item.file_size,
+                       item.runtime_ticks, item.bitrate, item.width, item.height,
+                       item.media_streams_json, item.metadata_json,
+                       item.created_at, item.updated_at,
+                       playback.user_id AS playback_user_id,
+                       playback.item_id AS playback_item_id,
+                       playback.media_source_id AS playback_media_source_id,
+                       playback.audio_stream_index AS playback_audio_stream_index,
+                       playback.subtitle_stream_index AS playback_subtitle_stream_index,
+                       playback.position_ticks AS playback_position_ticks,
+                       playback.is_paused AS playback_is_paused,
+                       playback.played AS playback_played,
+                       playback.is_favorite AS playback_is_favorite,
+                       playback.rating AS playback_rating,
+                       playback.updated_at AS playback_updated_at
+                FROM media_items AS item
+                LEFT JOIN playback_states AS playback
+                  ON playback.item_id = item.id AND playback.user_id = ?1
+                WHERE item.missing_since IS NULL
+                  AND item.media_type = 'Video'
+                  AND item.collection_type = 'tvshows'
+                  AND COALESCE(playback.played, 0) = 0
+                "#,
+            )
+            .bind(user_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter().map(TryInto::try_into).collect()
+        }
+        .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    pub async fn media_items_with_metadata_by_effective_types(
+        &self,
+        item_types: &[String],
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogEffectiveTypeCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result = self
+            .media_items_with_metadata_by_effective_types_unobserved(item_types)
+            .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    async fn media_items_with_metadata_by_effective_types_unobserved(
+        &self,
+        item_types: &[String],
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let scope = EffectiveTypeCandidateScope::from_effective_types(item_types);
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams_json, item.metadata_json,
+                   item.created_at, item.updated_at,
+                   CAST(NULL AS TEXT) AS playback_user_id,
+                   CAST(NULL AS TEXT) AS playback_item_id,
+                   CAST(NULL AS TEXT) AS playback_media_source_id,
+                   CAST(NULL AS INTEGER) AS playback_audio_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_subtitle_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_position_ticks,
+                   CAST(NULL AS INTEGER) AS playback_is_paused,
+                   CAST(NULL AS INTEGER) AS playback_played,
+                   CAST(NULL AS INTEGER) AS playback_is_favorite,
+                   CAST(NULL AS REAL) AS playback_rating,
+                   CAST(NULL AS TEXT) AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+            "#,
+        );
+
+        if !scope.all_raw_media_types {
+            query.push(" AND (");
+            let mut has_predicate = false;
+            if scope.all_video {
+                query.push("item.media_type = 'Video'");
+                has_predicate = true;
+            } else if !scope.video_collection_types.is_empty() {
+                query.push("(item.media_type = 'Video' AND item.collection_type IN (");
+                {
+                    let mut separated = query.separated(", ");
+                    for collection_type in &scope.video_collection_types {
+                        separated.push_bind(*collection_type);
+                    }
+                }
+                query.push("))");
+                has_predicate = true;
+            }
+            for media_type in &scope.raw_media_types {
+                if has_predicate {
+                    query.push(" OR ");
+                }
+                query.push("item.media_type = ").push_bind(*media_type);
+                has_predicate = true;
+            }
+            debug_assert!(has_predicate);
+            query.push(")");
+        }
+
+        let entries = query
+            .build_query_as::<MediaItemCatalogRow>()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(retain_entries_with_effective_types(entries, item_types))
+    }
+
     pub async fn media_items_for_virtual_folders(
+        &self,
+        folder_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogFolderItems, DatabasePoolRole::Api);
+        let result = self
+            .media_items_for_virtual_folders_unobserved(folder_ids)
+            .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    async fn media_items_for_virtual_folders_unobserved(
         &self,
         folder_ids: &[Uuid],
     ) -> anyhow::Result<Vec<MediaItem>> {
@@ -4534,6 +7688,20 @@ impl Database {
     }
 
     pub async fn media_item_counts_by_virtual_folder(
+        &self,
+    ) -> anyhow::Result<HashMap<Uuid, usize>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogFolderCounts,
+            DatabasePoolRole::Api,
+        );
+        let result = self.media_item_counts_by_virtual_folder_unobserved().await;
+        observation.finish_result(&result, |counts| {
+            u64::try_from(counts.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    async fn media_item_counts_by_virtual_folder_unobserved(
         &self,
     ) -> anyhow::Result<HashMap<Uuid, usize>> {
         let rows = sqlx::query(
@@ -4637,6 +7805,255 @@ impl Database {
         Ok(values.into_iter().collect())
     }
 
+    pub async fn media_item_facet_values(
+        &self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT normalized_value, display_value, stable_id, payload_json
+            FROM (
+                SELECT facet.normalized_value, facet.display_value, facet.stable_id,
+                       facet.payload_json,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY facet.normalized_value
+                           ORDER BY item.created_at, facet.position, facet.item_id
+                       ) AS facet_rank
+                FROM media_item_facets AS facet
+                JOIN media_items AS item ON item.id = facet.item_id
+                WHERE item.missing_since IS NULL AND facet.facet_kind =
+            "#,
+        );
+        query.push_bind(kind.as_str());
+        if !virtual_folder_ids.is_empty() {
+            query.push(" AND item.virtual_folder_id IN (");
+            let mut separated = query.separated(", ");
+            for folder_id in virtual_folder_ids {
+                separated.push_bind(folder_id.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        query.push(
+            ") AS ranked WHERE facet_rank = 1 ORDER BY normalized_value, display_value, stable_id",
+        );
+        let rows = query
+            .build_query_as::<(String, String, String, String)>()
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(
+                |(normalized_value, display_value, stable_id, payload_json)| -> anyhow::Result<_> {
+                    Ok(MediaItemFacetValue {
+                        normalized_value,
+                        display_value,
+                        stable_id,
+                        payload: serde_json::from_str(&payload_json)
+                            .context("invalid media item facet payload JSON")?,
+                    })
+                },
+            )
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    pub async fn media_item_facet_by_entity_id(
+        &self,
+        kind: MediaItemFacetKind,
+        entity_id: &str,
+    ) -> anyhow::Result<Option<MediaItemFacetValue>> {
+        let row = sqlx::query_as::<_, (String, String, String, String)>(
+            r#"
+            SELECT facet.normalized_value, facet.display_value, facet.stable_id, facet.payload_json
+            FROM media_item_facets AS facet
+            JOIN media_item_facet_aliases AS alias
+              ON alias.item_id = facet.item_id
+             AND alias.facet_kind = facet.facet_kind
+             AND alias.normalized_value = facet.normalized_value
+            JOIN media_items AS item ON item.id = facet.item_id
+            WHERE item.missing_since IS NULL
+              AND facet.facet_kind = ?1
+              AND alias.entity_id = ?2
+            ORDER BY item.created_at, facet.position, facet.item_id
+            LIMIT 1
+            "#,
+        )
+        .bind(kind.as_str())
+        .bind(entity_id.trim().to_ascii_lowercase())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(
+            |(normalized_value, display_value, stable_id, payload_json)| -> anyhow::Result<_> {
+                Ok(MediaItemFacetValue {
+                    normalized_value,
+                    display_value,
+                    stable_id,
+                    payload: serde_json::from_str(&payload_json)
+                        .context("invalid media item facet payload JSON")?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub async fn media_item_facet_by_normalized_value(
+        &self,
+        kind: MediaItemFacetKind,
+        value: &str,
+        virtual_folder_ids: &[Uuid],
+    ) -> anyhow::Result<Option<MediaItemFacetValue>> {
+        let normalized_value = value.trim().to_ascii_lowercase();
+        if normalized_value.is_empty() {
+            return Ok(None);
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT facet.normalized_value, facet.display_value, facet.stable_id, facet.payload_json
+            FROM media_item_facets AS facet
+            JOIN media_items AS item ON item.id = facet.item_id
+            WHERE item.missing_since IS NULL
+              AND facet.facet_kind =
+            "#,
+        );
+        query.push_bind(kind.as_str());
+        query
+            .push(" AND facet.normalized_value = ")
+            .push_bind(normalized_value);
+        if !virtual_folder_ids.is_empty() {
+            query.push(" AND item.virtual_folder_id IN (");
+            let mut separated = query.separated(", ");
+            for folder_id in virtual_folder_ids {
+                separated.push_bind(folder_id.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        query.push(" ORDER BY item.created_at, facet.position, facet.item_id LIMIT 1");
+        query
+            .build_query_as::<(String, String, String, String)>()
+            .fetch_optional(&self.pool)
+            .await?
+            .map(
+                |(normalized_value, display_value, stable_id, payload_json)| {
+                    Ok(MediaItemFacetValue {
+                        normalized_value,
+                        display_value,
+                        stable_id,
+                        payload: serde_json::from_str(&payload_json)
+                            .context("invalid media item facet payload JSON")?,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub async fn media_item_ids_for_facets(
+        &self,
+        query_spec: &MediaItemFacetCandidateQuery,
+    ) -> anyhow::Result<Vec<Uuid>> {
+        let normalized_values = normalized_facet_query_values(&query_spec.normalized_values);
+        let entity_ids = normalized_facet_query_values(&query_spec.entity_ids);
+        let mut query = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT DISTINCT facet.item_id
+            FROM media_item_facets AS facet
+            JOIN media_items AS item ON item.id = facet.item_id
+            LEFT JOIN media_item_facet_aliases AS alias
+              ON alias.item_id = facet.item_id
+             AND alias.facet_kind = facet.facet_kind
+             AND alias.normalized_value = facet.normalized_value
+            WHERE item.missing_since IS NULL
+            "#,
+        );
+        if let Some(kind) = query_spec.kind {
+            query
+                .push(" AND facet.facet_kind = ")
+                .push_bind(kind.as_str());
+        }
+        if !query_spec.virtual_folder_ids.is_empty() {
+            query.push(" AND item.virtual_folder_id IN (");
+            let mut separated = query.separated(", ");
+            for folder_id in &query_spec.virtual_folder_ids {
+                separated.push_bind(folder_id.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        if !normalized_values.is_empty() || !entity_ids.is_empty() {
+            query.push(" AND (");
+            if !normalized_values.is_empty() {
+                query.push("facet.normalized_value IN (");
+                let mut separated = query.separated(", ");
+                for value in &normalized_values {
+                    separated.push_bind(value);
+                }
+                separated.push_unseparated(")");
+            }
+            if !normalized_values.is_empty() && !entity_ids.is_empty() {
+                query.push(" OR ");
+            }
+            if !entity_ids.is_empty() {
+                query.push("alias.entity_id IN (");
+                let mut separated = query.separated(", ");
+                for entity_id in &entity_ids {
+                    separated.push_bind(entity_id);
+                }
+                separated.push_unseparated(")");
+            }
+            query.push(")");
+        }
+        query.push(" ORDER BY facet.item_id");
+        query
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|id| Uuid::parse_str(&id).context("invalid media item facet owner id"))
+            .collect()
+    }
+
+    pub async fn rebuild_media_item_facets(&self) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM media_item_facets")
+            .execute(&mut *tx)
+            .await?;
+        let mut last_item_id = None::<String>;
+        loop {
+            let rows = if let Some(last_item_id) = last_item_id.as_deref() {
+                sqlx::query_as::<_, (String, String)>(
+                    "SELECT id, metadata_json FROM media_items WHERE id > ?1 ORDER BY id LIMIT ?2",
+                )
+                .bind(last_item_id)
+                .bind(FACET_REBUILD_BATCH_SIZE)
+                .fetch_all(&mut *tx)
+                .await?
+            } else {
+                sqlx::query_as::<_, (String, String)>(
+                    "SELECT id, metadata_json FROM media_items ORDER BY id LIMIT ?1",
+                )
+                .bind(FACET_REBUILD_BATCH_SIZE)
+                .fetch_all(&mut *tx)
+                .await?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            for (item_id, metadata_json) in &rows {
+                let metadata = serde_json::from_str::<Value>(metadata_json)
+                    .with_context(|| format!("invalid metadata JSON for media item {item_id}"))?;
+                replace_sqlite_media_item_facets(&mut tx, item_id, &metadata).await?;
+            }
+            last_item_id = rows.last().map(|(item_id, _)| item_id.clone());
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn replace_media_item_facets_in_transaction(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        item_id: &str,
+        metadata: &Value,
+    ) -> anyhow::Result<()> {
+        replace_sqlite_media_item_facets(tx, item_id, metadata).await
+    }
+
     pub async fn replace_remote_media_library_snapshot(
         &self,
         library_name: &str,
@@ -4644,27 +8061,261 @@ impl Database {
         source_location: &str,
         items: Vec<RemoteMediaItemUpsert>,
     ) -> anyhow::Result<VirtualFolder> {
-        let folder = self
-            .upsert_virtual_folder(
-                library_name,
-                Some(collection_type),
-                vec![source_location.to_string()],
-            )
-            .await?;
-        let now = format_time(OffsetDateTime::now_utc())?;
-        let folder_id = folder.id.to_string();
+        self.replace_remote_media_library_snapshots(vec![RemoteMediaLibrarySnapshot {
+            library_name: library_name.to_owned(),
+            collection_type: collection_type.to_owned(),
+            source_location: source_location.to_owned(),
+            items,
+        }])
+        .await?
+        .pop()
+        .context("remote media snapshot did not return its virtual folder")
+    }
+
+    /// SQLite conformance harness for the production PostgreSQL batch contract.
+    ///
+    /// SQLite is not a production driver, but retaining the same atomic/tombstone semantics makes
+    /// provider tests capable of detecting a movie/series half-publication without PostgreSQL.
+    pub async fn replace_remote_media_library_snapshots(
+        &self,
+        snapshots: Vec<RemoteMediaLibrarySnapshot>,
+    ) -> anyhow::Result<Vec<VirtualFolder>> {
+        let received_rows = snapshots.iter().fold(0u64, |total, snapshot| {
+            total.saturating_add(u64::try_from(snapshot.items.len()).unwrap_or(u64::MAX))
+        });
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogSyncPublish, DatabasePoolRole::Api);
+        let result = self
+            .replace_remote_media_library_snapshots_unobserved(snapshots)
+            .await;
+        observation.finish_result(&result, |_| received_rows);
+        result
+    }
+
+    async fn replace_remote_media_library_snapshots_unobserved(
+        &self,
+        snapshots: Vec<RemoteMediaLibrarySnapshot>,
+    ) -> anyhow::Result<Vec<VirtualFolder>> {
+        if snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prepared = snapshots
+            .into_iter()
+            .map(PreparedSqliteRemoteMediaLibrarySnapshot::try_from)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut names = prepared
+            .iter()
+            .map(|snapshot| snapshot.library_name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        anyhow::ensure!(
+            !names.windows(2).any(|names| names[0] == names[1]),
+            "remote snapshot batch contains duplicate virtual folder names"
+        );
+
         let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_remote_snapshot_stage (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                media_type TEXT NOT NULL,
+                collection_type TEXT,
+                runtime_ticks INTEGER,
+                bitrate INTEGER,
+                width INTEGER,
+                height INTEGER,
+                media_streams_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        let mut folders = Vec::with_capacity(prepared.len());
+        for snapshot in prepared {
+            folders.push(
+                self.replace_remote_media_library_snapshot_in_transaction(&mut tx, snapshot)
+                    .await?,
+            );
+        }
+        let commit_observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogSyncCommit, DatabasePoolRole::Api);
+        let commit_result = tx.commit().await.map_err(anyhow::Error::from);
+        commit_observation.finish_result(&commit_result, |_| 0);
+        commit_result?;
+        Ok(folders)
+    }
 
-        sqlx::query("DELETE FROM media_items WHERE virtual_folder_id = ?1")
-            .bind(&folder_id)
-            .execute(&mut *tx)
-            .await?;
+    async fn replace_remote_media_library_snapshot_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        snapshot: PreparedSqliteRemoteMediaLibrarySnapshot,
+    ) -> anyhow::Result<VirtualFolder> {
+        let PreparedSqliteRemoteMediaLibrarySnapshot {
+            library_name,
+            collection_type,
+            source_location,
+            items,
+        } = snapshot;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let existing_folder_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM virtual_folders WHERE name = ?1 COLLATE NOCASE",
+        )
+        .bind(&library_name)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let folder_id = existing_folder_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let locations_json = serde_json::to_string(&normalized_locations(vec![source_location]))?;
 
-        for item in items {
-            let metadata_json = serde_json::to_string(&item.metadata)?;
-            let media_streams_json = serde_json::to_string(&item.media_streams)?;
-            sqlx::query(
-                r#"
+        sqlx::query(
+            r#"
+            INSERT INTO virtual_folders (
+                id, name, collection_type, locations_json, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(name) DO UPDATE SET
+                collection_type = excluded.collection_type,
+                locations_json = excluded.locations_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&folder_id)
+        .bind(&library_name)
+        .bind((!collection_type.is_empty()).then_some(collection_type.as_str()))
+        .bind(locations_json)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
+
+        let sync_run_id = Uuid::new_v4().to_string();
+        let generation_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO catalog_sync_runs (
+                id, virtual_folder_id, generation_id, status, item_count, started_at
+            )
+            VALUES (?1, ?2, ?3, 'running', ?4, ?5)
+            "#,
+        )
+        .bind(&sync_run_id)
+        .bind(&folder_id)
+        .bind(generation_id)
+        .bind(i64::try_from(items.len()).context("remote snapshot item count overflow")?)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
+
+        let stage_observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogSyncStage, DatabasePoolRole::Api);
+        let stage_result: anyhow::Result<u64> = async {
+            sqlx::query("DELETE FROM jellyrin_remote_snapshot_stage")
+                .execute(&mut **tx)
+                .await?;
+            let mut staged_rows = 0u64;
+            for item in &items {
+                let result = sqlx::query(
+                    r#"
+                INSERT INTO jellyrin_remote_snapshot_stage (
+                    id, name, path, media_type, collection_type, runtime_ticks, bitrate,
+                    width, height, media_streams_json, metadata_json
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    "#,
+                )
+                .bind(&item.id)
+                .bind(&item.name)
+                .bind(&item.path)
+                .bind(&item.media_type)
+                .bind(&item.collection_type)
+                .bind(item.runtime_ticks)
+                .bind(item.bitrate)
+                .bind(item.width)
+                .bind(item.height)
+                .bind(&item.media_streams_json)
+                .bind(&item.metadata_json)
+                .execute(&mut **tx)
+                .await?;
+                staged_rows = staged_rows.saturating_add(result.rows_affected());
+            }
+            Ok(staged_rows)
+        }
+        .await;
+        stage_observation.finish_result(&stage_result, |rows| *rows);
+        stage_result?;
+
+        let external_conflicts = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM media_items AS current
+            JOIN jellyrin_remote_snapshot_stage AS staged
+              ON current.id = staged.id OR current.path = staged.path
+            WHERE current.virtual_folder_id <> ?1
+            "#,
+        )
+        .bind(&folder_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        anyhow::ensure!(
+            external_conflicts == 0,
+            "remote snapshot contains ids or paths owned by another virtual folder"
+        );
+
+        // SQLite's historical schema has a full UNIQUE(path) constraint rather than PostgreSQL's
+        // partial visible-path index. Moving hidden rows to an internal stable path preserves the
+        // row and all dependent state while allowing path reuse and atomic path swaps.
+        let tombstone_observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogSyncTombstone,
+            DatabasePoolRole::Api,
+        );
+        let tombstone_result = sqlx::query(
+            r#"
+            UPDATE media_items AS current
+            SET path = CASE
+                    WHEN current.missing_since IS NULL
+                    THEN 'jellyrin-tombstone://sqlite/' || current.id
+                    ELSE current.path
+                END,
+                missing_since = COALESCE(current.missing_since, ?1),
+                updated_at = CASE
+                    WHEN current.missing_since IS NULL THEN ?1
+                    ELSE current.updated_at
+                END
+            WHERE current.virtual_folder_id = ?2
+              AND (
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM jellyrin_remote_snapshot_stage AS staged
+                        WHERE staged.id = current.id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM jellyrin_remote_snapshot_stage AS staged
+                        WHERE staged.path = current.path AND staged.id <> current.id
+                    )
+              )
+            "#,
+        )
+        .bind(&now)
+        .bind(&folder_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(anyhow::Error::from);
+        tombstone_observation.finish_result(&tombstone_result, |result| result.rows_affected());
+        tombstone_result?;
+
+        let merge_observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogSyncMerge, DatabasePoolRole::Api);
+        let merge_result: anyhow::Result<u64> = async {
+            let mut merged_rows = 0u64;
+            for item in &items {
+                let result = sqlx::query(
+                    r#"
                 INSERT INTO media_items (
                     id, virtual_folder_id, name, path, media_type, collection_type,
                     created_at, updated_at, last_seen_at, missing_since, file_size, modified_at,
@@ -4672,27 +8323,89 @@ impl Database {
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, NULL, NULL, NULL,
                     ?8, ?9, ?10, ?11, ?12, ?13)
-                "#,
-            )
-            .bind(item.id.trim())
-            .bind(&folder_id)
-            .bind(item.name.trim())
-            .bind(item.path.trim())
-            .bind(item.media_type.trim())
-            .bind(item.collection_type.trim())
-            .bind(&now)
-            .bind(item.runtime_ticks)
-            .bind(item.bitrate)
-            .bind(item.width)
-            .bind(item.height)
-            .bind(media_streams_json)
-            .bind(metadata_json)
-            .execute(&mut *tx)
-            .await?;
+                ON CONFLICT(id) DO UPDATE SET
+                    virtual_folder_id = excluded.virtual_folder_id,
+                    name = excluded.name,
+                    path = excluded.path,
+                    media_type = excluded.media_type,
+                    collection_type = excluded.collection_type,
+                    updated_at = excluded.updated_at,
+                    last_seen_at = excluded.last_seen_at,
+                    missing_since = NULL,
+                    file_size = NULL,
+                    modified_at = NULL,
+                    runtime_ticks = excluded.runtime_ticks,
+                    bitrate = excluded.bitrate,
+                    width = excluded.width,
+                    height = excluded.height,
+                    media_streams_json = excluded.media_streams_json,
+                    metadata_json = excluded.metadata_json
+                WHERE media_items.missing_since IS NOT NULL
+                   OR media_items.virtual_folder_id IS NOT excluded.virtual_folder_id
+                   OR media_items.name IS NOT excluded.name
+                   OR media_items.path IS NOT excluded.path
+                   OR media_items.media_type IS NOT excluded.media_type
+                   OR media_items.collection_type IS NOT excluded.collection_type
+                   OR media_items.runtime_ticks IS NOT excluded.runtime_ticks
+                   OR media_items.bitrate IS NOT excluded.bitrate
+                   OR media_items.width IS NOT excluded.width
+                   OR media_items.height IS NOT excluded.height
+                   OR media_items.media_streams_json IS NOT excluded.media_streams_json
+                   OR media_items.metadata_json IS NOT excluded.metadata_json
+                    "#,
+                )
+                .bind(&item.id)
+                .bind(&folder_id)
+                .bind(&item.name)
+                .bind(&item.path)
+                .bind(&item.media_type)
+                .bind(&item.collection_type)
+                .bind(&now)
+                .bind(item.runtime_ticks)
+                .bind(item.bitrate)
+                .bind(item.width)
+                .bind(item.height)
+                .bind(&item.media_streams_json)
+                .bind(&item.metadata_json)
+                .execute(&mut **tx)
+                .await?;
+                merged_rows = merged_rows.saturating_add(result.rows_affected());
+            }
+            Ok(merged_rows)
+        }
+        .await;
+        merge_observation.finish_result(&merge_result, |rows| *rows);
+        merge_result?;
+
+        for item in &items {
+            let metadata = serde_json::from_str::<Value>(&item.metadata_json)
+                .with_context(|| format!("invalid metadata JSON for media item {}", item.id))?;
+            Self::replace_media_item_facets_in_transaction(tx, &item.id, &metadata).await?;
         }
 
-        tx.commit().await?;
-        Ok(folder)
+        sqlx::query(
+            r#"
+            UPDATE catalog_sync_runs
+            SET status = 'completed', completed_at = ?1
+            WHERE id = ?2
+            "#,
+        )
+        .bind(&now)
+        .bind(&sync_run_id)
+        .execute(&mut **tx)
+        .await?;
+
+        let row = sqlx::query_as::<_, VirtualFolderRow>(
+            r#"
+            SELECT id, name, collection_type, locations_json, created_at, updated_at
+            FROM virtual_folders
+            WHERE id = ?1
+            "#,
+        )
+        .bind(folder_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        row.try_into()
     }
 
     pub async fn media_item_by_id(&self, item_id: Uuid) -> anyhow::Result<MediaItem> {
@@ -4711,6 +8424,57 @@ impl Database {
         .await?;
 
         row.try_into()
+    }
+
+    pub async fn media_item_exists(&self, item_id: Uuid) -> anyhow::Result<bool> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogItemExists, DatabasePoolRole::Api);
+        let result = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM media_items
+                WHERE id IN (?1, ?2) AND missing_since IS NULL
+            )
+            "#,
+        )
+        .bind(item_id.simple().to_string())
+        .bind(item_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(anyhow::Error::from);
+        observation.finish_result(&result, |exists| u64::from(*exists));
+        result
+    }
+
+    pub async fn media_item_by_id_visible(
+        &self,
+        item_id: Uuid,
+    ) -> anyhow::Result<Option<MediaItem>> {
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogItemById, DatabasePoolRole::Api);
+        let result = async {
+            let row = sqlx::query_as::<_, MediaItemRow>(
+                r#"
+                SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                       file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                       created_at, updated_at
+                FROM media_items
+                WHERE id IN (?1, ?2) AND missing_since IS NULL
+                ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END
+                LIMIT 1
+                "#,
+            )
+            .bind(item_id.simple().to_string())
+            .bind(item_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+            row.map(TryInto::try_into).transpose()
+        }
+        .await;
+        observation.finish_result(&result, |item| u64::from(item.is_some()));
+        result
     }
 
     pub async fn delete_media_items(
@@ -4979,6 +8743,7 @@ impl Database {
     ) -> anyhow::Result<()> {
         let item_id = self.media_item_storage_id(item_id).await?;
         let metadata_json = serde_json::to_string(&metadata)?;
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             UPDATE media_items
@@ -4986,12 +8751,14 @@ impl Database {
             WHERE id = ?1
         "#,
         )
-        .bind(item_id)
+        .bind(&item_id)
         .bind(metadata_json)
         .bind(format_time(OffsetDateTime::now_utc())?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        Self::replace_media_item_facets_in_transaction(&mut tx, &item_id, &metadata).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5002,6 +8769,7 @@ impl Database {
         metadata: &Value,
     ) -> anyhow::Result<()> {
         let metadata_json = serde_json::to_string(metadata)?;
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             UPDATE media_items
@@ -5012,9 +8780,11 @@ impl Database {
         .bind(item_id)
         .bind(metadata_json)
         .bind(format_time(OffsetDateTime::now_utc())?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        Self::replace_media_item_facets_in_transaction(&mut tx, item_id, metadata).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5052,6 +8822,23 @@ impl Database {
     }
 
     pub async fn media_item_metadata_by_item_ids(
+        &self,
+        item_ids: &HashSet<Uuid>,
+    ) -> anyhow::Result<Vec<MediaItemMetadata>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogMetadataByIds,
+            DatabasePoolRole::Api,
+        );
+        let result = self
+            .media_item_metadata_by_item_ids_unobserved(item_ids)
+            .await;
+        observation.finish_result(&result, |metadata| {
+            u64::try_from(metadata.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    async fn media_item_metadata_by_item_ids_unobserved(
         &self,
         item_ids: &HashSet<Uuid>,
     ) -> anyhow::Result<Vec<MediaItemMetadata>> {
@@ -5152,6 +8939,64 @@ impl Database {
         .await?;
 
         row.try_into()
+    }
+
+    pub async fn media_list_item_counts(
+        &self,
+        list_ids: &[Uuid],
+    ) -> anyhow::Result<HashMap<Uuid, usize>> {
+        if list_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT list_item.list_id, COUNT(*) AS item_count \
+             FROM media_list_items AS list_item \
+             INNER JOIN media_items AS item ON item.id = list_item.item_id \
+             WHERE item.missing_since IS NULL AND list_item.list_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for list_id in list_ids {
+            separated.push_bind(list_id.to_string());
+        }
+        separated.push_unseparated(") GROUP BY list_item.list_id");
+
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let mut counts = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let list_id: String = row.try_get("list_id")?;
+            let item_count: i64 = row.try_get("item_count")?;
+            counts.insert(Uuid::parse_str(&list_id)?, item_count.max(0) as usize);
+        }
+        Ok(counts)
+    }
+
+    pub async fn media_list_ids_with_user_permission(
+        &self,
+        user_id: Uuid,
+        list_ids: &[Uuid],
+    ) -> anyhow::Result<HashSet<Uuid>> {
+        if list_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT list_id FROM media_list_user_permissions \
+             WHERE user_id = ",
+        );
+        query
+            .push_bind(user_id.to_string())
+            .push(" AND list_id IN (");
+        let mut separated = query.separated(", ");
+        for list_id in list_ids {
+            separated.push_bind(list_id.to_string());
+        }
+        separated.push_unseparated(")");
+        let rows = query.build().fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                let list_id: String = row.try_get("list_id")?;
+                Ok(Uuid::parse_str(&list_id)?)
+            })
+            .collect()
     }
 
     pub async fn update_media_list_name(
@@ -5661,6 +9506,51 @@ impl Database {
         row.map(TryInto::try_into).transpose()
     }
 
+    /// Fetches user data for a set of catalog items without issuing one query per item.
+    pub async fn playback_states_for_items(
+        &self,
+        user_id: Uuid,
+        item_ids: &[Uuid],
+    ) -> anyhow::Result<Vec<PlaybackState>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let storage_ids = item_ids
+            .iter()
+            .flat_map(|item_id| [item_id.to_string(), item_id.simple().to_string()])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut states = Vec::new();
+        // Leave ample room below SQLite's conservative 999-variable limit for the user id.
+        for chunk in storage_ids.chunks(400) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "SELECT user_id, item_id, media_source_id, audio_stream_index, \
+                 subtitle_stream_index, position_ticks, is_paused, played, \
+                 is_favorite, rating, updated_at \
+                 FROM playback_states WHERE user_id = ",
+            );
+            query
+                .push_bind(user_id.to_string())
+                .push(" AND item_id IN (");
+            let mut separated = query.separated(", ");
+            for item_id in chunk {
+                separated.push_bind(item_id);
+            }
+            separated.push_unseparated(")");
+            let rows = query
+                .build_query_as::<PlaybackStateRow>()
+                .fetch_all(&self.pool)
+                .await?;
+            states.extend(
+                rows.into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
+        Ok(states)
+    }
+
     pub async fn playback_states_for_user(
         &self,
         user_id: Uuid,
@@ -5713,6 +9603,99 @@ impl Database {
         .await?;
 
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// Returns one policy-filtered resume page without materializing every playback row.
+    ///
+    /// Count and page share a SQLite read transaction so `TotalRecordCount` describes the same
+    /// snapshot as the returned items.
+    pub async fn resume_items_page_for_user(
+        &self,
+        user_id: Uuid,
+        query: ResumeItemsPageQuery,
+    ) -> anyhow::Result<ResumeItemsPage> {
+        let mut transaction = self.pool.begin().await?;
+        let total_record_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM playback_states
+            INNER JOIN media_items ON media_items.id = playback_states.item_id
+            WHERE playback_states.user_id = ?1
+              AND media_items.missing_since IS NULL
+              AND playback_states.position_ticks > 0
+              AND playback_states.played = 0
+              AND (
+                    media_items.runtime_ticks IS NULL
+                 OR media_items.runtime_ticks <= 0
+                 OR (
+                        media_items.runtime_ticks >= ?2
+                    AND playback_states.position_ticks * 100.0
+                          / media_items.runtime_ticks >= ?3
+                    AND playback_states.position_ticks * 100.0
+                          / media_items.runtime_ticks < ?4
+                 )
+              )
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(query.min_duration_ticks.max(0))
+        .bind(query.min_pct.clamp(0, 100))
+        .bind(query.max_pct.clamp(query.min_pct.clamp(0, 100), 100))
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let rows = sqlx::query_as::<_, ResumeItemRow>(
+            r#"
+            SELECT
+                media_items.id, media_items.virtual_folder_id, media_items.name, media_items.path,
+                media_items.media_type, media_items.collection_type, media_items.file_size,
+                media_items.runtime_ticks, media_items.bitrate, media_items.width, media_items.height,
+                media_items.media_streams_json, media_items.created_at, media_items.updated_at,
+                playback_states.user_id, playback_states.item_id, playback_states.media_source_id,
+                playback_states.audio_stream_index, playback_states.subtitle_stream_index,
+                playback_states.position_ticks, playback_states.is_paused, playback_states.played,
+                playback_states.is_favorite, playback_states.rating,
+                playback_states.updated_at AS playback_updated_at
+            FROM playback_states
+            INNER JOIN media_items ON media_items.id = playback_states.item_id
+            WHERE playback_states.user_id = ?1
+              AND media_items.missing_since IS NULL
+              AND playback_states.position_ticks > 0
+              AND playback_states.played = 0
+              AND (
+                    media_items.runtime_ticks IS NULL
+                 OR media_items.runtime_ticks <= 0
+                 OR (
+                        media_items.runtime_ticks >= ?2
+                    AND playback_states.position_ticks * 100.0
+                          / media_items.runtime_ticks >= ?3
+                    AND playback_states.position_ticks * 100.0
+                          / media_items.runtime_ticks < ?4
+                 )
+              )
+            ORDER BY playback_states.updated_at DESC
+            LIMIT ?5 OFFSET ?6
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(query.min_duration_ticks.max(0))
+        .bind(query.min_pct.clamp(0, 100))
+        .bind(query.max_pct.clamp(query.min_pct.clamp(0, 100), 100))
+        .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
+        .bind(i64::try_from(query.start_index).unwrap_or(i64::MAX))
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        Ok(ResumeItemsPage {
+            items: rows
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<anyhow::Result<_>>()?,
+            total_record_count: usize::try_from(total_record_count)
+                .context("resume item count does not fit usize")?,
+            start_index: query.start_index,
+        })
     }
 
     pub async fn scan_virtual_folder_items(&self, folder_id: Uuid) -> anyhow::Result<usize> {
@@ -6398,10 +10381,7 @@ impl Database {
     }
 }
 
-fn should_enable_wal(database_url: &str) -> bool {
-    !database_url.contains(":memory:")
-}
-
+#[cfg(any(test, feature = "sqlite"))]
 async fn configure_sqlite_connection(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     sqlx::query("PRAGMA busy_timeout = 5000")
         .execute(&mut *connection)
@@ -6412,6 +10392,7 @@ async fn configure_sqlite_connection(connection: &mut SqliteConnection) -> Resul
     Ok(())
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_join_and_filters(
     query: &mut QueryBuilder<'_, Sqlite>,
     filter: &ActivityLogFilter,
@@ -6491,6 +10472,7 @@ fn push_activity_log_join_and_filters(
     Ok(())
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_filter_clause(
     query: &mut QueryBuilder<'_, Sqlite>,
     first_filter: &mut bool,
@@ -6506,6 +10488,7 @@ fn push_activity_log_filter_clause(
     query.push_bind(format!("%{value}%"));
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_exact_clause(
     query: &mut QueryBuilder<'_, Sqlite>,
     first_filter: &mut bool,
@@ -6521,6 +10504,7 @@ fn push_activity_log_exact_clause(
     query.push_bind(value);
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_where(query: &mut QueryBuilder<'_, Sqlite>, first_filter: &mut bool) {
     if *first_filter {
         query.push(" WHERE ");
@@ -6530,6 +10514,7 @@ fn push_activity_log_where(query: &mut QueryBuilder<'_, Sqlite>, first_filter: &
     }
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn push_activity_log_order_by(
     query: &mut QueryBuilder<'_, Sqlite>,
     sort: &[(ActivityLogSortField, SortDirection)],
@@ -6554,6 +10539,7 @@ fn push_activity_log_order_by(
     query.push(order_parts.join(", "));
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn activity_log_sort_column(field: ActivityLogSortField) -> &'static str {
     match field {
         ActivityLogSortField::Name => "activity_log_entries.name COLLATE NOCASE",
@@ -6566,6 +10552,7 @@ fn activity_log_sort_column(field: ActivityLogSortField) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn trimmed_filter_value(value: &Option<String>) -> Option<String> {
     value
         .as_deref()
@@ -6574,6 +10561,7 @@ fn trimmed_filter_value(value: &Option<String>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct StartupConfigRow {
     ui_culture: String,
@@ -6591,6 +10579,7 @@ struct BrandingConfigRow {
     splashscreen_enabled: bool,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct DisplayPreferencesRow {
     payload_json: String,
@@ -6603,6 +10592,7 @@ struct MediaItemLyricsRow {
     updated_at: String,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct UserConfigurationRow {
     payload_json: String,
@@ -6712,6 +10702,7 @@ impl TryFrom<UserRow> for User {
     }
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct PasswordRow {
     password_hash: String,
@@ -6764,17 +10755,20 @@ struct SystemConfigurationPayloadsRow {
     server_options_json: String,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct NamedConfigurationRow {
     payload_json: String,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct NamedConfigurationListRow {
     key: String,
     payload_json: String,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct ApiKeyRow {
     access_token: String,
@@ -6828,6 +10822,66 @@ struct MediaItemRow {
     media_streams_json: String,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct MediaItemCatalogRow {
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    media_streams_json: String,
+    metadata_json: String,
+    created_at: String,
+    updated_at: String,
+    playback_user_id: Option<String>,
+    playback_item_id: Option<String>,
+    playback_media_source_id: Option<String>,
+    playback_audio_stream_index: Option<i64>,
+    playback_subtitle_stream_index: Option<i64>,
+    playback_position_ticks: Option<i64>,
+    playback_is_paused: Option<bool>,
+    playback_played: Option<bool>,
+    playback_is_favorite: Option<bool>,
+    playback_rating: Option<f64>,
+    playback_updated_at: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+#[cfg(any(test, feature = "sqlite"))]
+struct SqliteCatalogAggregateRow {
+    item_count: i64,
+    movie_count: i64,
+    episode_count: i64,
+    song_count: i64,
+    music_video_count: i64,
+    book_count: i64,
+}
+
+#[derive(sqlx::FromRow)]
+#[cfg(any(test, feature = "sqlite"))]
+struct SqliteCatalogCountProjectionRow {
+    name: String,
+    path: String,
+    item_type: String,
+    album: Option<String>,
+    album_name: Option<String>,
+    artists: Option<String>,
+    album_artists: Option<String>,
+    remote_trailers: Option<String>,
+    trailers: Option<String>,
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn sqlite_nonnegative_catalog_count(value: i64, label: &str) -> anyhow::Result<u64> {
+    u64::try_from(value).with_context(|| format!("{label} catalog count was negative"))
 }
 
 #[derive(sqlx::FromRow)]
@@ -6914,17 +10968,20 @@ struct MediaListUserPermissionRow {
     updated_at: String,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct MediaItemIdRow {
     id: String,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct MediaItemVersionRow {
     primary_item_id: String,
     alternate_item_id: String,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(sqlx::FromRow)]
 struct MediaItemPathRow {
     id: String,
@@ -7154,6 +11211,70 @@ impl TryFrom<MediaItemRow> for MediaItem {
             media_streams: parse_media_streams_json(&row.media_streams_json)?,
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
+        })
+    }
+}
+
+impl TryFrom<MediaItemCatalogRow> for MediaItemCatalogEntry {
+    type Error = anyhow::Error;
+
+    fn try_from(row: MediaItemCatalogRow) -> Result<Self, Self::Error> {
+        let playback_state = if let Some(user_id) = row.playback_user_id.as_deref() {
+            Some(PlaybackState {
+                user_id: Uuid::parse_str(user_id)
+                    .context("invalid catalog playback user id in database")?,
+                item_id: Uuid::parse_str(
+                    row.playback_item_id
+                        .as_deref()
+                        .context("catalog playback row is missing item id")?,
+                )
+                .context("invalid catalog playback item id in database")?,
+                media_source_id: row.playback_media_source_id,
+                audio_stream_index: row.playback_audio_stream_index,
+                subtitle_stream_index: row.playback_subtitle_stream_index,
+                position_ticks: row
+                    .playback_position_ticks
+                    .context("catalog playback row is missing position ticks")?,
+                is_paused: row
+                    .playback_is_paused
+                    .context("catalog playback row is missing paused flag")?,
+                played: row
+                    .playback_played
+                    .context("catalog playback row is missing played flag")?,
+                is_favorite: row
+                    .playback_is_favorite
+                    .context("catalog playback row is missing favorite flag")?,
+                rating: row.playback_rating,
+                updated_at: parse_time(
+                    row.playback_updated_at
+                        .as_deref()
+                        .context("catalog playback row is missing updated timestamp")?,
+                )?,
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            item: MediaItem {
+                id: Uuid::parse_str(&row.id).context("invalid catalog media item id")?,
+                virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                    .context("invalid catalog virtual folder id")?,
+                name: row.name,
+                path: row.path,
+                media_type: row.media_type,
+                collection_type: row.collection_type,
+                file_size: row.file_size,
+                runtime_ticks: row.runtime_ticks,
+                bitrate: row.bitrate,
+                width: row.width,
+                height: row.height,
+                media_streams: parse_media_streams_json(&row.media_streams_json)?,
+                created_at: parse_time(&row.created_at)?,
+                updated_at: parse_time(&row.updated_at)?,
+            },
+            metadata: serde_json::from_str(&row.metadata_json)
+                .context("invalid catalog media item metadata json")?,
+            playback_state,
         })
     }
 }
@@ -7663,6 +11784,7 @@ fn parse_media_streams_json(value: &str) -> anyhow::Result<Vec<Value>> {
     serde_json::from_str(value).context("invalid media streams json in database")
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn dedupe_uuids(values: Vec<Uuid>) -> Vec<Uuid> {
     let mut seen = HashSet::new();
     values
@@ -7671,6 +11793,7 @@ fn dedupe_uuids(values: Vec<Uuid>) -> Vec<Uuid> {
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn is_unique_constraint_error(error: &sqlx::Error) -> bool {
     error
         .as_database_error()
@@ -7693,27 +11816,124 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<()> {
 }
 
 async fn probe_media_info(path: &Path, media_type: &str) -> MediaInfo {
-    probe_media_info_input(path.as_os_str(), media_type, &[]).await
+    probe_media_info_input(path.as_os_str(), media_type, &[], None).await
 }
 
 pub async fn probe_remote_media_info(url: &str, media_type: &str) -> MediaInfo {
-    const REMOTE_PROBE_TIMEOUT_US: &str = "15000000";
-    probe_media_info_input(url, media_type, &["-rw_timeout", REMOTE_PROBE_TIMEOUT_US]).await
+    probe_remote_media_info_with_permit(url, media_type, None).await
+}
+
+pub async fn probe_remote_media_info_admitted(
+    url: &str,
+    media_type: &str,
+    permit: TranscodeJobPermit,
+) -> MediaInfo {
+    probe_remote_media_info_with_permit(url, media_type, Some(permit)).await
+}
+
+pub fn record_ffprobe_capacity_unavailable() {
+    ffprobe_telemetry()
+        .start()
+        .finish(FfprobeOutcome::CapacityUnavailable);
+}
+
+async fn probe_remote_media_info_with_permit(
+    url: &str,
+    media_type: &str,
+    permit: Option<TranscodeJobPermit>,
+) -> MediaInfo {
+    let remote_read_timeout_us = configured_ffprobe_timeout()
+        .as_micros()
+        .min(u128::from(u64::MAX))
+        .to_string();
+    probe_media_info_input(
+        url,
+        media_type,
+        &["-rw_timeout", remote_read_timeout_us.as_str()],
+        permit,
+    )
+    .await
+}
+
+pub fn configured_ffprobe_timeout_seconds() -> u64 {
+    configured_ffprobe_timeout().as_secs()
+}
+
+pub fn configured_ffprobe_nice() -> Option<i32> {
+    jellyrin_transcode::configured_ffmpeg_nice()
+}
+
+fn configured_ffprobe_timeout() -> StdDuration {
+    static TIMEOUT: OnceLock<StdDuration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        StdDuration::from_secs(ffprobe_timeout_seconds_from_value(
+            std::env::var("JELLYRIN_FFPROBE_TIMEOUT_SECONDS")
+                .ok()
+                .as_deref(),
+        ))
+    })
+}
+
+fn ffprobe_timeout_seconds_from_value(value: Option<&str>) -> u64 {
+    value
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=MAX_FFPROBE_TIMEOUT_SECONDS).contains(value))
+        .unwrap_or(DEFAULT_FFPROBE_TIMEOUT_SECONDS)
+}
+
+async fn run_ffprobe_command(
+    command: Command,
+    timeout: StdDuration,
+) -> Result<Vec<u8>, FfprobeOutcome> {
+    let output = run_bounded_command_output(
+        command,
+        BoundedCommandOutputOptions::new(
+            timeout,
+            FFPROBE_STDOUT_MAX_BYTES,
+            FFPROBE_STDERR_MAX_BYTES,
+        ),
+    )
+    .await
+    .map_err(|error| match error {
+        BoundedCommandOutputError::TimedOut => FfprobeOutcome::TimedOut,
+        BoundedCommandOutputError::OutputLimitExceeded { .. } => FfprobeOutcome::OutputLimited,
+        BoundedCommandOutputError::Io(_) => FfprobeOutcome::IoFailed,
+    })?;
+    output
+        .status
+        .success()
+        .then_some(output.stdout)
+        .ok_or(FfprobeOutcome::NonZeroExit)
 }
 
 async fn probe_media_info_input(
     input: impl AsRef<OsStr>,
     media_type: &str,
     input_args: &[&str],
+    admitted_permit: Option<TranscodeJobPermit>,
 ) -> MediaInfo {
     if !matches!(media_type, "Video" | "Audio") {
         return MediaInfo::default();
     }
+    let attempt = ffprobe_telemetry().start();
+    let _probe_permit = match admitted_permit {
+        Some(permit) => permit,
+        None => match acquire_multimedia_probe().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                attempt.finish(FfprobeOutcome::CapacityUnavailable);
+                return MediaInfo::default();
+            }
+        },
+    };
 
     let mut command = Command::new("ffprobe");
     command
         .arg("-v")
         .arg("error")
+        .arg("-threads")
+        .arg("1")
         .arg("-print_format")
         .arg("json")
         .arg("-show_format")
@@ -7723,17 +11943,23 @@ async fn probe_media_info_input(
         command.arg(arg);
     }
     command.arg(input);
-
-    let Ok(output) = command.output().await else {
-        return MediaInfo::default();
+    let output = match run_ffprobe_command(command, configured_ffprobe_timeout()).await {
+        Ok(output) => output,
+        Err(outcome) => {
+            attempt.finish(outcome);
+            return MediaInfo::default();
+        }
     };
-    if !output.status.success() {
-        return MediaInfo::default();
+    match serde_json::from_slice::<Value>(&output) {
+        Ok(value) => {
+            attempt.finish(FfprobeOutcome::Succeeded);
+            parse_ffprobe_media_info(&value)
+        }
+        Err(_) => {
+            attempt.finish(FfprobeOutcome::InvalidJson);
+            MediaInfo::default()
+        }
     }
-
-    serde_json::from_slice::<Value>(&output.stdout)
-        .map(|value| parse_ffprobe_media_info(&value))
-        .unwrap_or_default()
 }
 
 fn parse_ffprobe_media_info(value: &Value) -> MediaInfo {
@@ -8588,6 +12814,7 @@ fn media_type_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn normalized_locations(locations: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for location in locations {
@@ -8599,6 +12826,7 @@ fn normalized_locations(locations: Vec<String>) -> Vec<String> {
     normalized
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -8606,6 +12834,7 @@ fn trimmed_optional_str(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(Debug, Clone)]
 struct PluginRepositoryModel {
     id: String,
@@ -8615,6 +12844,7 @@ struct PluginRepositoryModel {
     payload: Value,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 #[derive(Debug, Clone)]
 struct PackageCatalogModel {
     id: String,
@@ -8627,6 +12857,7 @@ struct PackageCatalogModel {
     payload: Value,
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_repository_models_from_config(value: &Value) -> Vec<PluginRepositoryModel> {
     let Some(repositories) = value.as_array() else {
         return Vec::new();
@@ -8653,6 +12884,7 @@ fn plugin_repository_models_from_config(value: &Value) -> Vec<PluginRepositoryMo
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn package_catalog_models_from_repositories(
     repositories: &[PluginRepositoryModel],
 ) -> Vec<PackageCatalogModel> {
@@ -8708,6 +12940,7 @@ fn package_catalog_models_from_repositories(
     packages
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_repositories_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
@@ -8732,6 +12965,7 @@ async fn plugin_repositories_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<V
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn package_catalog_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
@@ -8759,6 +12993,7 @@ async fn package_catalog_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn package_installations_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
@@ -8789,6 +13024,7 @@ async fn package_installations_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn installed_plugins_backup_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
@@ -8819,6 +13055,7 @@ async fn installed_plugins_backup_snapshot(pool: &SqlitePool) -> anyhow::Result<
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_manifests_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         "SELECT plugin_id, manifest_json, updated_at FROM plugin_manifests ORDER BY plugin_id COLLATE NOCASE",
@@ -8838,6 +13075,7 @@ async fn plugin_manifests_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Valu
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_configurations_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         "SELECT plugin_id, configuration_json, updated_at FROM plugin_configurations ORDER BY plugin_id COLLATE NOCASE",
@@ -8858,6 +13096,7 @@ async fn plugin_configurations_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_permissions_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         "SELECT plugin_id, permissions_json, updated_at FROM plugin_permissions ORDER BY plugin_id COLLATE NOCASE",
@@ -8877,6 +13116,7 @@ async fn plugin_permissions_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Va
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_runtime_instances_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
@@ -8909,6 +13149,7 @@ async fn plugin_runtime_instances_snapshot(pool: &SqlitePool) -> anyhow::Result<
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_host_events_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
@@ -8937,6 +13178,7 @@ async fn plugin_host_events_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Va
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_audit_log_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Value>> {
     let rows = sqlx::query(
         r#"
@@ -8964,6 +13206,7 @@ async fn plugin_audit_log_snapshot(pool: &SqlitePool) -> anyhow::Result<Vec<Valu
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_row_to_json(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Value> {
     let server_compatibility: Value =
         serde_json::from_str(row.get::<&str, _>("server_compatibility_json"))
@@ -8995,6 +13238,7 @@ fn plugin_row_to_json(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Value> {
     }))
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_runtime_instance_id(plugin_id: &str, runtime: &str) -> String {
     format!(
         "{}:{}",
@@ -9003,6 +13247,7 @@ fn plugin_runtime_instance_id(plugin_id: &str, runtime: &str) -> String {
     )
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn live_tv_channel_select_builder() -> QueryBuilder<'static, Sqlite> {
     QueryBuilder::new(
         r#"
@@ -9017,6 +13262,7 @@ fn live_tv_channel_select_builder() -> QueryBuilder<'static, Sqlite> {
     )
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn append_live_tv_channel_filters(
     builder: &mut QueryBuilder<'_, Sqlite>,
     query: &LiveTvChannelQuery,
@@ -9043,6 +13289,7 @@ fn append_live_tv_channel_filters(
     }
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn live_tv_channel_record_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> anyhow::Result<LiveTvChannelRecord> {
@@ -9064,6 +13311,7 @@ fn live_tv_channel_record_from_row(
     })
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn enrich_plugin_runtime_state(pool: &SqlitePool, plugin: &mut Value) -> anyhow::Result<()> {
     let Some(plugin_id) = plugin.get("Id").and_then(Value::as_str).map(str::to_string) else {
         return Ok(());
@@ -9075,6 +13323,7 @@ async fn enrich_plugin_runtime_state(pool: &SqlitePool, plugin: &mut Value) -> a
     Ok(())
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_runtime_instances_for_plugin(
     pool: &SqlitePool,
     plugin_id: &str,
@@ -9113,6 +13362,7 @@ async fn plugin_runtime_instances_for_plugin(
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 async fn plugin_host_events_for_plugin(
     pool: &SqlitePool,
     plugin_id: &str,
@@ -9150,6 +13400,7 @@ async fn plugin_host_events_for_plugin(
         .collect()
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_snapshot_items<'a>(snapshot: &'a Value, section: &str) -> anyhow::Result<&'a Vec<Value>> {
     snapshot
         .get(section)
@@ -9158,6 +13409,7 @@ fn plugin_snapshot_items<'a>(snapshot: &'a Value, section: &str) -> anyhow::Resu
         .with_context(|| format!("plugin snapshot section {section}.Items must be an array"))
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_snapshot_value<'a>(item: &'a Value, field: &str) -> Option<&'a Value> {
     item.as_object()?
         .iter()
@@ -9165,11 +13417,13 @@ fn plugin_snapshot_value<'a>(item: &'a Value, field: &str) -> Option<&'a Value> 
         .map(|(_, value)| value)
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_snapshot_string(item: &Value, field: &str) -> anyhow::Result<String> {
     plugin_snapshot_optional_string(item, field)
         .with_context(|| format!("plugin snapshot item is missing {field}"))
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_snapshot_optional_string(item: &Value, field: &str) -> Option<String> {
     plugin_snapshot_value(item, field)
         .and_then(Value::as_str)
@@ -9178,10 +13432,12 @@ fn plugin_snapshot_optional_string(item: &Value, field: &str) -> Option<String> 
         .map(ToOwned::to_owned)
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_snapshot_bool(item: &Value, field: &str) -> Option<bool> {
     plugin_snapshot_value(item, field).and_then(Value::as_bool)
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn plugin_snapshot_json_string(
     item: &Value,
     field: &str,
@@ -9191,6 +13447,7 @@ fn plugin_snapshot_json_string(
         .context("plugin snapshot JSON serialization failed")
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn json_string_case_insensitive(value: &Value, field: &str) -> Option<String> {
     value
         .as_object()?
@@ -9202,6 +13459,7 @@ fn json_string_case_insensitive(value: &Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn json_array_case_insensitive<'a>(value: &'a Value, field: &str) -> Option<&'a Vec<Value>> {
     value
         .as_object()?
@@ -9210,6 +13468,7 @@ fn json_array_case_insensitive<'a>(value: &'a Value, field: &str) -> Option<&'a 
         .and_then(|(_, value)| value.as_array())
 }
 
+#[cfg(any(test, feature = "sqlite"))]
 fn stable_plugin_model_id(kind: &str, value: &str) -> String {
     let normalized = value
         .trim()
@@ -9226,13 +13485,20 @@ fn stable_plugin_model_id(kind: &str, value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::{
-        ActivityLogFilter, ActivityLogSortField, Database, InstallPluginPackage,
-        PluginRuntimeInstanceUpsert, SortDirection, SystemConfigurationPayloads,
-        UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
-        UpsertTranscodeSession, parse_ffprobe_media_info, parse_local_nfo_metadata,
+        ActivityLogFilter, ActivityLogSortField, Database, DatabaseDriver, DatabasePoolRole,
+        InstallPluginPackage, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE,
+        MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemFacetCandidateQuery,
+        MediaItemFacetKind, MediaItemFavoriteFilter, PluginRuntimeInstanceUpsert,
+        ProviderSecretReference, ProviderSecretVault, RemoteMediaItemUpsert,
+        RemoteMediaLibrarySnapshot, ResumeItemsPageQuery, SortDirection,
+        SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertActiveViewingSession,
+        UpsertPlaybackState, UpsertTranscodeSession, parse_ffprobe_media_info,
+        parse_local_nfo_metadata,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use time::Duration;
     use uuid::Uuid;
 
@@ -9251,6 +13517,2319 @@ mod tests {
 
         assert_eq!(busy_timeout, 5_000);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_diagnostics_report_pool_and_redacted_catalog_sync_summary() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let runtime = db.runtime_diagnostics();
+        assert_eq!(runtime.driver, DatabaseDriver::Sqlite);
+        assert_eq!(
+            runtime.api_pool.max_connections,
+            super::SQLITE_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            runtime.api_pool.idle + runtime.api_pool.in_use,
+            runtime.api_pool.size
+        );
+        assert_eq!(runtime.worker_pool, None);
+
+        let cloned = db.clone();
+        assert!(std::sync::Arc::ptr_eq(&db.telemetry, &cloned.telemetry));
+        let telemetry = db.telemetry_diagnostics();
+        assert_eq!(
+            telemetry.coverage,
+            crate::DatabaseTelemetryCoverage::SelectedHotPaths
+        );
+        assert_eq!(telemetry.api_acquire.attempts, 0);
+        assert!(telemetry.worker_acquire.is_none());
+        assert!(telemetry.operations.is_empty());
+
+        let empty = db.catalog_sync_diagnostics().await.unwrap();
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.last_run, None);
+
+        let folder = db
+            .upsert_virtual_folder("Diagnostics", Some("movies"), vec!["/diagnostics".into()])
+            .await
+            .unwrap();
+        for (id, generation, status, count, started, completed, error) in [
+            (
+                "sync-running",
+                "generation-running",
+                "running",
+                10_i64,
+                "2026-08-09T00:00:00Z",
+                None,
+                None,
+            ),
+            (
+                "sync-completed",
+                "generation-completed",
+                "completed",
+                20_i64,
+                "2026-08-09T00:01:00Z",
+                Some("2026-08-09T00:01:01Z"),
+                None,
+            ),
+            (
+                "sync-failed",
+                "generation-failed",
+                "failed",
+                30_i64,
+                "2026-08-09T00:02:00Z",
+                Some("2026-08-09T00:02:01.500Z"),
+                Some("https://user:secret@provider.invalid/live?token=secret"),
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO catalog_sync_runs (
+                    id, virtual_folder_id, generation_id, status, item_count,
+                    started_at, completed_at, error_message
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "#,
+            )
+            .bind(id)
+            .bind(folder.id.to_string())
+            .bind(generation)
+            .bind(status)
+            .bind(count)
+            .bind(started)
+            .bind(completed)
+            .bind(error)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let diagnostics = db.catalog_sync_diagnostics().await.unwrap();
+        assert_eq!(diagnostics.total, 3);
+        assert_eq!(diagnostics.running, 1);
+        assert_eq!(diagnostics.completed, 1);
+        assert_eq!(diagnostics.failed, 1);
+        let last = diagnostics.last_run.as_ref().unwrap();
+        assert_eq!(last.status, "failed");
+        assert_eq!(last.item_count, 30);
+        assert_eq!(last.duration_millis, Some(1_500));
+        let debug = format!("{diagnostics:?}");
+        assert!(!debug.contains("secret"));
+        assert!(!debug.contains("provider.invalid"));
+        assert!(!debug.contains("generation-failed"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_telemetry_records_rows_failures_and_sync_phases_without_sensitive_data() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db.first_user().await.unwrap();
+        let (_, device_token) = db
+            .issue_device_token_for_user(user.id, "telemetry-device", "Telemetry", "Test", "1")
+            .await
+            .unwrap();
+        db.user_by_token(&device_token.access_token).await.unwrap();
+        assert!(db.user_by_token("invalid-sensitive-token").await.is_err());
+
+        let api_key = db
+            .issue_api_key_for_user(user.id, "telemetry-key")
+            .await
+            .unwrap();
+        db.user_by_api_key(&api_key).await.unwrap();
+        assert!(
+            db.user_by_api_key("invalid-sensitive-api-key")
+                .await
+                .is_err()
+        );
+
+        let item_id = Uuid::new_v4();
+        let folders = db
+            .replace_remote_media_library_snapshots(vec![RemoteMediaLibrarySnapshot {
+                library_name: "Telemetry Catalog".to_string(),
+                collection_type: "movies".to_string(),
+                source_location: "provider://sensitive-source".to_string(),
+                items: vec![RemoteMediaItemUpsert {
+                    id: item_id.to_string(),
+                    name: "Telemetry Movie".to_string(),
+                    path: "provider://sensitive-source/movie.mkv".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({"PrivateMarker": "must-not-leak"}),
+                }],
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.media_items_by_name_search("Telemetry", &["movies"], 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.media_item_catalog_page(&MediaItemCatalogQuery::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.media_items_for_virtual_folders(&[folders[0].id])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.media_item_counts_by_virtual_folder()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.media_item_metadata_by_item_ids(&std::collections::HashSet::from([item_id]))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        db.update_transcode_session_progress("unknown-session", Some(1.0), 1)
+            .await
+            .unwrap();
+        assert!(
+            db.update_transcode_session_progress("", Some(1.0), 1)
+                .await
+                .is_err()
+        );
+
+        sqlx::query("DROP TABLE media_items")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.media_item_counts_by_virtual_folder().await.is_err());
+
+        let telemetry = db.telemetry_diagnostics();
+        let operation = |name: &str| {
+            telemetry
+                .operations
+                .iter()
+                .find(|operation| {
+                    operation.name == name && operation.pool == super::DatabasePoolRole::Api
+                })
+                .unwrap_or_else(|| panic!("missing telemetry operation {name}"))
+        };
+        for (name, rows) in [
+            ("catalog.name_search", 1),
+            ("catalog.page", 1),
+            ("catalog.folder_items", 1),
+            ("catalog.metadata_by_ids", 1),
+            ("catalog_sync.publish", 1),
+            ("catalog_sync.stage", 1),
+            ("catalog_sync.merge", 1),
+        ] {
+            let metric = operation(name);
+            assert_eq!(metric.calls, 1, "{name}");
+            assert_eq!(metric.succeeded, 1, "{name}");
+            assert_eq!(metric.rows.total, rows, "{name}");
+        }
+        let token_metric = operation("auth.user_by_token");
+        assert_eq!(
+            (
+                token_metric.calls,
+                token_metric.succeeded,
+                token_metric.errors
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(token_metric.rows.total, 1);
+        let api_key_metric = operation("auth.user_by_api_key");
+        assert_eq!(
+            (
+                api_key_metric.calls,
+                api_key_metric.succeeded,
+                api_key_metric.errors
+            ),
+            (2, 1, 1)
+        );
+        assert_eq!(api_key_metric.rows.total, 1);
+        let counts = operation("catalog.folder_counts");
+        assert_eq!((counts.calls, counts.succeeded, counts.errors), (2, 1, 1));
+        assert_eq!(counts.rows.total, 1);
+        assert_eq!(counts.errors_by_class.database, 1);
+        let progress = operation("transcode.progress_write");
+        assert_eq!(
+            (progress.calls, progress.succeeded, progress.errors),
+            (2, 1, 1)
+        );
+        assert_eq!(progress.rows.total, 0);
+        assert_eq!(operation("catalog_sync.tombstone").rows.total, 0);
+        assert_eq!(operation("catalog_sync.commit").succeeded, 1);
+
+        let debug = format!("{telemetry:?}");
+        let item_id_string = item_id.to_string();
+        for sensitive in [
+            device_token.access_token.as_str(),
+            api_key.as_str(),
+            "invalid-sensitive-token",
+            "invalid-sensitive-api-key",
+            "provider://sensitive-source",
+            "must-not-leak",
+            item_id_string.as_str(),
+        ] {
+            assert!(!debug.contains(sensitive));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_xtream_configs_backfill_to_one_secret_and_rotation_changes_revision() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let raw = json!({
+            "Id": "xtream-plugin",
+            "Type": "xtream",
+            "Url": "https://provider.invalid",
+            "Username": "vault-user",
+            "Password": "vault-password"
+        });
+        let now = "2026-08-08T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind("jellyrin-xtream-provider")
+        .bind(raw.to_string())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO live_tv_tuners (
+                tuner_id, provider_type, name, source_url, enabled, configuration_json,
+                last_sync_at, created_at, updated_at
+            ) VALUES (?1, 'xtream', 'Xtream', NULL, 1, ?2, NULL, ?3, ?3)
+            "#,
+        )
+        .bind("xtream-plugin")
+        .bind(raw.to_string())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO named_configurations (key, payload_json, updated_at) VALUES ('livetv', ?1, ?2)",
+        )
+        .bind(json!({ "TunerHosts": [raw] }).to_string())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(db.backfill_legacy_provider_secrets().await.unwrap(), 3);
+        assert_eq!(db.provider_secret_count().await.unwrap(), 1);
+        let ciphertext =
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT ciphertext FROM provider_secrets LIMIT 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            !ciphertext
+                .windows(b"vault-user".len())
+                .any(|window| window == b"vault-user")
+        );
+        assert!(
+            !ciphertext
+                .windows(b"vault-password".len())
+                .any(|window| window == b"vault-password")
+        );
+
+        let plugin = db
+            .plugin_configuration_json("jellyrin-xtream-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let tuner = db
+            .live_tv_tuner_configuration_by_id("xtream-plugin")
+            .await
+            .unwrap()
+            .unwrap();
+        let named = db.named_configuration("livetv").await.unwrap().unwrap();
+        let named_tuner = &named["TunerHosts"][0];
+        for persisted in [&plugin, &tuner, named_tuner] {
+            let serialized = persisted.to_string();
+            assert!(!serialized.contains("vault-user"));
+            assert!(!serialized.contains("vault-password"));
+            assert!(persisted.get("Username").is_none());
+            assert!(persisted.get("Password").is_none());
+        }
+        let plugin_reference = ProviderSecretReference::from_configuration(&plugin).unwrap();
+        assert_eq!(
+            ProviderSecretReference::from_configuration(&tuner)
+                .unwrap()
+                .id,
+            plugin_reference.id
+        );
+        assert_eq!(
+            ProviderSecretReference::from_configuration(named_tuner)
+                .unwrap()
+                .id,
+            plugin_reference.id
+        );
+        assert_eq!(db.backfill_legacy_provider_secrets().await.unwrap(), 0);
+
+        let resolved = db.resolve_provider_configuration(&plugin).await.unwrap();
+        let revision_before = resolved["JellyrinConfigurationRevision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let protected_again = db
+            .protect_provider_configuration("xtream", resolved)
+            .await
+            .unwrap();
+        let no_op_reference =
+            ProviderSecretReference::from_configuration(&protected_again).unwrap();
+        assert_eq!(no_op_reference.revision, plugin_reference.revision);
+
+        let rotated_vault = ProviderSecretVault::new("test-v2", vec![0x6b; 32])
+            .unwrap()
+            .with_decryption_key("test-v1", vec![0x5a; 32])
+            .unwrap();
+        let rotated_db = db.clone().with_provider_secret_vault(rotated_vault);
+        assert_eq!(
+            rotated_db
+                .rotate_provider_secrets_to_active_key()
+                .await
+                .unwrap(),
+            1
+        );
+        let resolved_after = rotated_db
+            .resolve_provider_configuration(&plugin)
+            .await
+            .unwrap();
+        assert_ne!(
+            resolved_after["JellyrinConfigurationRevision"]
+                .as_str()
+                .unwrap(),
+            revision_before
+        );
+        assert_eq!(resolved_after["Username"], "vault-user");
+        assert_eq!(resolved_after["Password"], "vault-password");
+    }
+
+    #[tokio::test]
+    async fn provider_secret_rolls_back_when_plugin_configuration_write_fails() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let now = "2026-08-08T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO plugin_manifests (plugin_id, manifest_json, updated_at) VALUES (?1, '{}', ?2)",
+        )
+        .bind("jellyrin-xtream-provider")
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at) VALUES (?1, '{}', ?2)",
+        )
+        .bind("jellyrin-xtream-provider")
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_xtream_configuration
+            BEFORE UPDATE OF configuration_json ON plugin_configurations
+            WHEN NEW.plugin_id = 'jellyrin-xtream-provider'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced configuration failure');
+            END
+            "#,
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let result = db
+            .update_plugin_configuration_json(
+                "jellyrin-xtream-provider",
+                json!({
+                    "Url": "https://provider.invalid",
+                    "Username": "atomic-user",
+                    "Password": "atomic-password"
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(db.provider_secret_count().await.unwrap(), 0);
+        assert_eq!(
+            db.plugin_configuration_json("jellyrin-xtream-provider")
+                .await
+                .unwrap(),
+            Some(json!({}))
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_plugin_writer_is_idempotent_and_updates_in_place() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let now = "2026-08-08T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO plugin_manifests (plugin_id, manifest_json, updated_at) VALUES (?1, '{}', ?2)",
+        )
+        .bind("jellyrin-xtream-provider")
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let configuration = json!({
+            "Url": "https://provider.invalid",
+            "Username": "idempotent-user",
+            "Password": "idempotent-password"
+        });
+
+        assert!(
+            db.update_plugin_configuration_json("jellyrin-xtream-provider", configuration.clone(),)
+                .await
+                .unwrap()
+        );
+        let first = db
+            .plugin_configuration_json("jellyrin-xtream-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let first_reference = ProviderSecretReference::from_configuration(&first).unwrap();
+        assert!(
+            db.update_plugin_configuration_json("jellyrin-xtream-provider", configuration.clone(),)
+                .await
+                .unwrap()
+        );
+        let unchanged = db
+            .plugin_configuration_json("jellyrin-xtream-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ProviderSecretReference::from_configuration(&unchanged).unwrap(),
+            first_reference
+        );
+        assert_eq!(db.provider_secret_count().await.unwrap(), 1);
+
+        let mut changed = configuration;
+        changed["Password"] = json!("updated-password");
+        assert!(
+            db.update_plugin_configuration_json("jellyrin-xtream-provider", changed)
+                .await
+                .unwrap()
+        );
+        let updated = db
+            .plugin_configuration_json("jellyrin-xtream-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let updated_reference = ProviderSecretReference::from_configuration(&updated).unwrap();
+        assert_eq!(updated_reference.id, first_reference.id);
+        assert_eq!(updated_reference.revision, first_reference.revision + 1);
+        assert_eq!(db.provider_secret_count().await.unwrap(), 1);
+        assert_eq!(
+            db.resolve_provider_configuration(&updated).await.unwrap()["Password"],
+            "updated-password"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_protection_uses_copy_on_write_for_changed_credentials() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let original = db
+            .protect_provider_configuration(
+                "xtream",
+                json!({
+                    "Username": "copy-on-write-user",
+                    "Password": "old-password"
+                }),
+            )
+            .await
+            .unwrap();
+        let original_reference = ProviderSecretReference::from_configuration(&original).unwrap();
+        let mut changed = db.resolve_provider_configuration(&original).await.unwrap();
+        changed["Password"] = json!("new-password");
+
+        let protected_changed = db
+            .protect_provider_configuration("xtream", changed)
+            .await
+            .unwrap();
+        let changed_reference =
+            ProviderSecretReference::from_configuration(&protected_changed).unwrap();
+        assert_ne!(changed_reference.id, original_reference.id);
+        assert_eq!(db.provider_secret_count().await.unwrap(), 2);
+        assert_eq!(
+            db.resolve_provider_configuration(&original).await.unwrap()["Password"],
+            "old-password"
+        );
+        assert_eq!(
+            db.resolve_provider_configuration(&protected_changed)
+                .await
+                .unwrap()["Password"],
+            "new-password"
+        );
+    }
+
+    #[tokio::test]
+    async fn tuner_snapshot_returns_the_protected_configuration_it_committed() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let protected = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: "atomic-return-tuner".to_string(),
+                    provider_type: "xtream".to_string(),
+                    name: "Atomic return".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "Id": "atomic-return-tuner",
+                        "Type": "xtream",
+                        "Username": "return-user",
+                        "Password": "return-password"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(ProviderSecretReference::from_configuration(&protected).is_some());
+        assert!(protected.get("Username").is_none());
+        assert!(protected.get("Password").is_none());
+        assert_eq!(
+            db.live_tv_tuner_configuration_by_id("atomic-return-tuner")
+                .await
+                .unwrap(),
+            Some(protected)
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_tuner_delete_collects_only_an_unreferenced_secret_envelope() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let first_tuner_id = "shared-secret-tuner-a";
+        let second_tuner_id = "shared-secret-tuner-b";
+        let first_configuration = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: first_tuner_id.to_string(),
+                    provider_type: "xtream".to_string(),
+                    name: "Shared secret A".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "Id": first_tuner_id,
+                        "Type": "xtream",
+                        "Username": "shared-user",
+                        "Password": "shared-password"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let reference = ProviderSecretReference::from_configuration(&first_configuration).unwrap();
+        let mut second_configuration = first_configuration;
+        second_configuration["Id"] = json!(second_tuner_id);
+        let second_configuration = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: second_tuner_id.to_string(),
+                    provider_type: "xtream".to_string(),
+                    name: "Shared secret B".to_string(),
+                    source_url: None,
+                    configuration: second_configuration,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ProviderSecretReference::from_configuration(&second_configuration)
+                .unwrap()
+                .id,
+            reference.id
+        );
+
+        db.delete_live_tv_tuner_state(&first_tuner_id.to_ascii_uppercase())
+            .await
+            .unwrap();
+        let envelope_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_secrets WHERE secret_id = ?1")
+                .bind(&reference.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(envelope_count, 1);
+        let (_, credentials) = db
+            .provider_credentials_for_configuration(&second_configuration)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(credentials.username(), "shared-user");
+        assert_eq!(credentials.password(), "shared-password");
+
+        db.delete_live_tv_tuner_state(second_tuner_id)
+            .await
+            .unwrap();
+        let envelope_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_secrets WHERE secret_id = ?1")
+                .bind(&reference.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(envelope_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_provider_secret_reconciliation_collects_historical_orphans_fail_closed() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let persisted = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: "reconciliation-live".to_string(),
+                    provider_type: "xtream".to_string(),
+                    name: "Reconciliation live".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "Id": "reconciliation-live",
+                        "Type": "xtream",
+                        "Username": "live-user",
+                        "Password": "live-password"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let live_reference = ProviderSecretReference::from_configuration(&persisted).unwrap();
+        let orphan = db
+            .protect_provider_configuration(
+                "xtream",
+                json!({"Username": "orphan-user", "Password": "orphan-password"}),
+            )
+            .await
+            .unwrap();
+        let orphan_reference = ProviderSecretReference::from_configuration(&orphan).unwrap();
+        assert_ne!(live_reference.id, orphan_reference.id);
+
+        assert_eq!(db.reconcile_orphaned_provider_secrets().await.unwrap(), 1);
+        assert_eq!(db.provider_secret_count().await.unwrap(), 1);
+        assert_eq!(
+            db.provider_credentials_for_configuration(&persisted)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .username(),
+            "live-user"
+        );
+
+        let retained_on_error = db
+            .protect_provider_configuration(
+                "xtream",
+                json!({"Username": "retained-user", "Password": "retained-password"}),
+            )
+            .await
+            .unwrap();
+        let retained_reference =
+            ProviderSecretReference::from_configuration(&retained_on_error).unwrap();
+        sqlx::query(
+            "INSERT INTO named_configurations (key, payload_json, updated_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind("malformed-provider-reference")
+        .bind(
+            json!({
+                "JellyrinProviderSecretRef": {
+                    "Id": "unknown",
+                    "Provider": "xtream"
+                }
+            })
+            .to_string(),
+        )
+        .bind("2026-08-08T00:00:00Z")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(db.reconcile_orphaned_provider_secrets().await.is_err());
+        let retained_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provider_secrets WHERE secret_id = ?1")
+                .bind(&retained_reference.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained_count, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_secret_write_readiness_requires_an_explicit_vault() {
+        let in_memory = Database::connect("sqlite::memory:").await.unwrap();
+        in_memory
+            .validate_provider_secret_write_readiness()
+            .unwrap();
+        assert!(
+            in_memory
+                .provider_credentials_for_configuration(&json!({"Username": "not-a-ref"}))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("provider-write-readiness.db");
+        std::fs::File::create(&path).unwrap();
+        let database_url = format!("sqlite://{}", path.display());
+        let persistent = Database::connect(&database_url).await.unwrap();
+        assert!(
+            persistent
+                .validate_provider_secret_write_readiness()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be stored")
+        );
+        persistent
+            .with_provider_secret_vault(ProviderSecretVault::new("test", vec![0x74; 32]).unwrap())
+            .validate_provider_secret_write_readiness()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_legacy_sqlite_uses_rollback_journal_until_wal_fix_is_pinned() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("rollback-journal.db");
+        std::fs::File::create(&path).unwrap();
+        let database_url = format!("sqlite://{}", path.display());
+        let db = Database::connect(&database_url).await.unwrap();
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+    }
+
+    #[tokio::test]
+    async fn plugin_tuner_snapshot_encrypts_core_credentials_and_preserves_opaque_reference() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.validate_provider_secret_write_readiness().unwrap();
+        let plugin_id = Uuid::new_v4();
+        let provider_type = format!("plugin:{plugin_id}");
+        let tuner_id = format!("magstv-plugin-tuner-{plugin_id}");
+        let public_configuration = json!({
+            "PluginId": plugin_id,
+            "Provider": "MAGSTV",
+            "PortalUrl": "https://magstv.invalid",
+            "SecretReference": {
+                "Namespace": "magstv",
+                "Key": format!("tuners/{tuner_id}/credentials")
+            }
+        });
+
+        let persisted = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.clone(),
+                    provider_type: provider_type.clone(),
+                    name: "MAGSTV plugin tuner".to_string(),
+                    source_url: None,
+                    configuration: public_configuration.clone(),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(persisted, public_configuration);
+        let (stored_provider_type, stored_configuration): (String, String) = sqlx::query_as(
+            "SELECT provider_type, configuration_json FROM live_tv_tuners WHERE tuner_id = ?1",
+        )
+        .bind(&tuner_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored_provider_type, provider_type);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_configuration).unwrap(),
+            public_configuration
+        );
+        assert_eq!(db.provider_secret_count().await.unwrap(), 0);
+
+        let mut submitted = public_configuration.clone();
+        submitted["Username"] = json!("magstv-user");
+        submitted["Password"] = json!("magstv-password");
+        let protected = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.clone(),
+                    provider_type: provider_type.clone(),
+                    name: "MAGSTV plugin tuner".to_string(),
+                    source_url: None,
+                    configuration: submitted,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let reference = ProviderSecretReference::from_configuration(&protected).unwrap();
+        assert_eq!(reference.provider_type, format!("plugin-{plugin_id}"));
+        assert!(protected.get("Username").is_none());
+        assert!(protected.get("Password").is_none());
+        assert_eq!(
+            protected["SecretReference"],
+            public_configuration["SecretReference"]
+        );
+        assert_eq!(db.provider_secret_count().await.unwrap(), 1);
+        let (resolved_reference, credentials) = db
+            .provider_credentials_for_configuration(&protected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved_reference, reference);
+        assert_eq!(credentials.username(), "magstv-user");
+        assert_eq!(credentials.password(), "magstv-password");
+
+        let partial = json!({
+            "PluginId": plugin_id,
+            "Provider": "MAGSTV",
+            "SecretReference": public_configuration["SecretReference"].clone(),
+            "Password": "updated-password"
+        });
+        let updated = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.clone(),
+                    provider_type: provider_type.clone(),
+                    name: "MAGSTV plugin tuner".to_string(),
+                    source_url: None,
+                    configuration: partial,
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let updated_reference = ProviderSecretReference::from_configuration(&updated).unwrap();
+        assert_eq!(updated_reference.id, reference.id);
+        assert_eq!(updated_reference.provider_type, reference.provider_type);
+        assert_eq!(updated_reference.revision, reference.revision + 1);
+        let (_, updated_credentials) = db
+            .provider_credentials_for_configuration(&updated)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_credentials.username(), "magstv-user");
+        assert_eq!(updated_credentials.password(), "updated-password");
+
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_plugin_tuner_update
+            BEFORE UPDATE ON live_tv_tuners
+            BEGIN
+                SELECT RAISE(ABORT, 'forced plugin tuner failure');
+            END
+            "#,
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let failed_update = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.clone(),
+                    provider_type: provider_type.clone(),
+                    name: "MAGSTV plugin tuner".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "PluginId": plugin_id,
+                        "Password": "must-roll-back"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(failed_update.is_err());
+        let after_rollback = db
+            .live_tv_tuner_configuration_by_id(&tuner_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_rollback, updated);
+        let (reference_after_rollback, credentials_after_rollback) = db
+            .provider_credentials_for_configuration(&after_rollback)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference_after_rollback, updated_reference);
+        assert_eq!(credentials_after_rollback.password(), "updated-password");
+
+        let core_reference_result = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.clone(),
+                    provider_type: provider_type.clone(),
+                    name: "MAGSTV plugin tuner".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "PluginId": plugin_id,
+                        "JellyrinProviderSecretRef": {
+                            "Id": "ps_foreign",
+                            "Provider": "xtream",
+                            "Revision": 1
+                        }
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(core_reference_result.is_err());
+        assert_eq!(
+            db.live_tv_tuner_configuration_by_id(&tuner_id)
+                .await
+                .unwrap(),
+            Some(updated)
+        );
+        assert_eq!(db.provider_secret_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn named_live_tv_plugin_credentials_use_the_canonical_vault_namespace() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = Uuid::new_v4();
+        let opaque_reference = json!({
+            "Namespace": "magstv",
+            "Key": "tuners/named-plugin/credentials"
+        });
+
+        db.update_named_configuration(
+            "livetv",
+            json!({
+                "TunerHosts": [{
+                    "Id": "named-plugin",
+                    "Type": "plugin",
+                    "PluginId": plugin_id,
+                    "SecretReference": opaque_reference,
+                    "Username": "named-user",
+                    "Password": "named-password"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let configuration = db.named_configuration("livetv").await.unwrap().unwrap();
+        let host = &configuration["TunerHosts"][0];
+        let reference = ProviderSecretReference::from_configuration(host).unwrap();
+        assert_eq!(host["Type"], "plugin");
+        assert_eq!(host["SecretReference"], opaque_reference);
+        assert!(host.get("Username").is_none());
+        assert!(host.get("Password").is_none());
+        assert_eq!(reference.provider_type, format!("plugin-{plugin_id}"));
+        let (_, credentials) = db
+            .provider_credentials_for_configuration(host)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(credentials.username(), "named-user");
+        assert_eq!(credentials.password(), "named-password");
+
+        db.update_named_configuration(
+            "livetv",
+            json!({
+                "TunerHosts": [{
+                    "Id": "named-plugin",
+                    "Type": "plugin",
+                    "PluginId": plugin_id,
+                    "SecretReference": opaque_reference,
+                    "PortalUrl": "https://updated.magstv.invalid"
+                }]
+            }),
+        )
+        .await
+        .unwrap();
+        let partially_updated = db.named_configuration("livetv").await.unwrap().unwrap();
+        let partially_updated_host = &partially_updated["TunerHosts"][0];
+        assert_eq!(
+            ProviderSecretReference::from_configuration(partially_updated_host).unwrap(),
+            reference
+        );
+        let (_, credentials) = db
+            .provider_credentials_for_configuration(partially_updated_host)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(credentials.username(), "named-user");
+        assert_eq!(credentials.password(), "named-password");
+
+        let malformed = db
+            .update_named_configuration(
+                "livetv",
+                json!({
+                    "TunerHosts": [{
+                        "Id": "named-plugin",
+                        "Type": "plugin",
+                        "PluginId": plugin_id,
+                        "JellyrinProviderSecretRef": {
+                            "Id": "",
+                            "Provider": format!("plugin-{plugin_id}"),
+                            "Revision": 0
+                        }
+                    }]
+                }),
+            )
+            .await;
+        assert!(malformed.is_err());
+        assert_eq!(
+            db.named_configuration("livetv").await.unwrap().unwrap(),
+            partially_updated
+        );
+        assert_eq!(db.provider_secret_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn named_live_tv_rejects_core_secret_fields_without_a_supported_provider_type() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = Uuid::new_v4();
+        let public_configuration = json!({
+            "TunerHosts": [{
+                "Id": "opaque-plugin-tuner",
+                "Type": format!("plugin:{plugin_id}"),
+                "PluginId": plugin_id,
+                "SecretReference": {
+                    "Namespace": "magstv",
+                    "Key": "tuners/opaque-plugin-tuner/credentials"
+                }
+            }]
+        });
+        db.update_named_configuration("livetv", public_configuration.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.named_configuration("livetv").await.unwrap().unwrap(),
+            public_configuration
+        );
+        assert_eq!(db.provider_secret_count().await.unwrap(), 0);
+
+        let invalid_hosts = [
+            json!({
+                "Id": "missing-type-credentials",
+                "Username": "must-not-persist",
+                "Password": "must-not-persist"
+            }),
+            json!({
+                "Id": "missing-type-reference",
+                "JellyrinProviderSecretRef": {
+                    "Id": "ps_must_not_persist",
+                    "Provider": "xtream",
+                    "Revision": 1
+                }
+            }),
+            json!({
+                "Id": "unknown-type-credentials",
+                "Type": "magstv",
+                "UserName": "must-not-persist",
+                "Password": "must-not-persist"
+            }),
+            json!({
+                "Id": "unknown-type-placeholder",
+                "Type": "unsupported-provider",
+                "Password": "********"
+            }),
+        ];
+        for host in invalid_hosts {
+            let result = db
+                .update_named_configuration("livetv", json!({"TunerHosts": [host]}))
+                .await;
+            assert!(result.is_err());
+            assert_eq!(
+                db.named_configuration("livetv").await.unwrap().unwrap(),
+                public_configuration
+            );
+            assert_eq!(db.provider_secret_count().await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_tuner_identity_change_requires_complete_replacement_credentials() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let first_plugin = Uuid::new_v4();
+        let second_plugin = Uuid::new_v4();
+        let tuner_id = "plugin-identity-change";
+        let first = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.to_string(),
+                    provider_type: format!("plugin:{first_plugin}"),
+                    name: "First plugin".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "PluginId": first_plugin,
+                        "Username": "first-user",
+                        "Password": "first-password"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let first_reference = ProviderSecretReference::from_configuration(&first).unwrap();
+
+        let incomplete_change = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.to_string(),
+                    provider_type: format!("plugin:{second_plugin}"),
+                    name: "Second plugin".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "PluginId": second_plugin,
+                        "Password": "second-password"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            incomplete_change
+                .unwrap_err()
+                .to_string()
+                .contains("complete provider credentials")
+        );
+        assert_eq!(
+            db.live_tv_tuner_configuration_by_id(tuner_id)
+                .await
+                .unwrap(),
+            Some(first.clone())
+        );
+
+        let second = db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: tuner_id.to_string(),
+                    provider_type: format!("plugin:{second_plugin}"),
+                    name: "Second plugin".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "PluginId": second_plugin,
+                        "Username": "second-user",
+                        "Password": "second-password"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let second_reference = ProviderSecretReference::from_configuration(&second).unwrap();
+        assert_ne!(second_reference.id, first_reference.id);
+        assert_eq!(
+            second_reference.provider_type,
+            format!("plugin-{second_plugin}")
+        );
+        let (_, credentials) = db
+            .provider_credentials_for_configuration(&second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(credentials.username(), "second-user");
+        assert_eq!(credentials.password(), "second-password");
+        assert_eq!(db.provider_secret_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn tuner_and_named_writers_rollback_their_secret_envelopes_on_failure() {
+        let tuner_db = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_tuner_configuration
+            BEFORE INSERT ON live_tv_tuners
+            BEGIN
+                SELECT RAISE(ABORT, 'forced tuner failure');
+            END
+            "#,
+        )
+        .execute(tuner_db.pool())
+        .await
+        .unwrap();
+        let tuner_result = tuner_db
+            .replace_live_tv_tuner_snapshot(
+                LiveTvTunerUpsert {
+                    tuner_id: "rollback-tuner".to_string(),
+                    provider_type: "xtream".to_string(),
+                    name: "Rollback tuner".to_string(),
+                    source_url: None,
+                    configuration: json!({
+                        "Username": "tuner-user",
+                        "Password": "tuner-password"
+                    }),
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        assert!(tuner_result.is_err());
+        assert_eq!(tuner_db.provider_secret_count().await.unwrap(), 0);
+
+        let named_db = Database::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_named_configuration
+            BEFORE INSERT ON named_configurations
+            WHEN NEW.key = 'livetv'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced named configuration failure');
+            END
+            "#,
+        )
+        .execute(named_db.pool())
+        .await
+        .unwrap();
+        let named_result = named_db
+            .update_named_configuration(
+                "livetv",
+                json!({
+                    "TunerHosts": [{
+                        "Id": "rollback-named",
+                        "Type": "xtream",
+                        "Username": "named-user",
+                        "Password": "named-password"
+                    }]
+                }),
+            )
+            .await;
+        assert!(named_result.is_err());
+        assert_eq!(named_db.provider_secret_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_backfill_rolls_back_envelope_and_earlier_rewrites_on_failure() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let raw = json!({
+            "Id": "xtream-plugin",
+            "Type": "xtream",
+            "Url": "https://provider.invalid",
+            "Username": "rollback-user",
+            "Password": "rollback-password"
+        });
+        let now = "2026-08-08T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO plugin_configurations (plugin_id, configuration_json, updated_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind("jellyrin-xtream-provider")
+        .bind(raw.to_string())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO named_configurations (key, payload_json, updated_at) VALUES ('livetv', ?1, ?2)",
+        )
+        .bind(json!({ "TunerHosts": [raw] }).to_string())
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_livetv_backfill
+            BEFORE UPDATE OF payload_json ON named_configurations
+            WHEN NEW.key = 'livetv'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced backfill failure');
+            END
+            "#,
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(db.backfill_legacy_provider_secrets().await.is_err());
+        assert_eq!(db.provider_secret_count().await.unwrap(), 0);
+        let persisted_plugin = db
+            .plugin_configuration_json("jellyrin-xtream-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let persisted_named = db.named_configuration("livetv").await.unwrap().unwrap();
+        assert_eq!(persisted_plugin["Password"], "rollback-password");
+        assert_eq!(
+            persisted_named["TunerHosts"][0]["Password"],
+            "rollback-password"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_key_rotation_is_all_or_nothing() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        for suffix in ["a", "b"] {
+            db.protect_provider_configuration(
+                "xtream",
+                json!({
+                    "Username": format!("rotation-{suffix}"),
+                    "Password": format!("secret-{suffix}")
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let revisions_before = sqlx::query_as::<_, (String, i64)>(
+            "SELECT key_id, revision FROM provider_secrets ORDER BY secret_id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_last_secret_rotation
+            BEFORE UPDATE ON provider_secrets
+            WHEN OLD.secret_id = (SELECT max(secret_id) FROM provider_secrets)
+            BEGIN
+                SELECT RAISE(ABORT, 'forced rotation failure');
+            END
+            "#,
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let rotated_vault = ProviderSecretVault::new("test-v2", vec![0x6b; 32])
+            .unwrap()
+            .with_decryption_key("test-v1", vec![0x5a; 32])
+            .unwrap();
+        let rotated_db = db.clone().with_provider_secret_vault(rotated_vault);
+
+        assert!(
+            rotated_db
+                .rotate_provider_secrets_to_active_key()
+                .await
+                .is_err()
+        );
+        let revisions_after = sqlx::query_as::<_, (String, i64)>(
+            "SELECT key_id, revision FROM provider_secrets ORDER BY secret_id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(revisions_after, revisions_before);
+    }
+
+    #[tokio::test]
+    async fn sqlite_catalog_page_keeps_exact_total_and_batches_user_data() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db.first_user().await.unwrap();
+        let alpha_id = Uuid::new_v4();
+        let beta_id = Uuid::new_v4();
+        db.replace_remote_media_library_snapshot(
+            "Catalog",
+            "movies",
+            "provider://catalog",
+            vec![
+                RemoteMediaItemUpsert {
+                    id: alpha_id.to_string(),
+                    name: "Alpha Feature".to_string(),
+                    path: "provider://catalog/alpha.mkv".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: Some(100),
+                    bitrate: Some(1_000),
+                    width: Some(3840),
+                    height: Some(2160),
+                    media_streams: vec![
+                        json!({"Type": "Video"}),
+                        json!({"Type": "Audio", "Language": "fre"}),
+                        json!({"Type": "Subtitle", "Language": "spa"}),
+                    ],
+                    metadata: json!({
+                        "Overview": "A hidden needle",
+                        "Album": "Alpha Album",
+                        "Artists": [{"Name": "Artist Two", "Id": "forbidden-id"}]
+                    }),
+                },
+                RemoteMediaItemUpsert {
+                    id: beta_id.to_string(),
+                    name: "Beta Feature".to_string(),
+                    path: "provider://catalog/beta.mp4".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: Some(200),
+                    bitrate: Some(2_000),
+                    width: Some(1920),
+                    height: Some(1080),
+                    media_streams: vec![json!({"Type": "Video"})],
+                    // Searching metadata must inspect scalar values, not object keys.
+                    metadata: json!({
+                        "Needle": "absent",
+                        "AlbumName": "100%_\\ Mix",
+                        "Artists": ["Artist One"]
+                    }),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: alpha_id,
+            media_source_id: Some(alpha_id.to_string()),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(2),
+            position_ticks: 90,
+            is_paused: false,
+            played: true,
+        })
+        .await
+        .unwrap();
+
+        let page = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                start_index: 1,
+                limit: 1,
+                search_term: Some("feature".to_string()),
+                include_item_types: vec!["Movie".to_string()],
+                user_id: Some(user.id),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_record_count, 2);
+        assert_eq!(page.start_index, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].item.id, beta_id);
+        assert!(page.items[0].playback_state.is_none());
+
+        let count_only = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 0,
+                search_term: Some("feature".to_string()),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(count_only.total_record_count, 2);
+        assert!(count_only.items.is_empty());
+
+        let metadata_search = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                search_term: Some("needle".to_string()),
+                search_scope: MediaItemCatalogSearchScope::AllMetadataScalars,
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(metadata_search.total_record_count, 1);
+        assert_eq!(metadata_search.items[0].item.id, alpha_id);
+        assert_eq!(
+            metadata_search.items[0].metadata["Overview"],
+            "A hidden needle"
+        );
+
+        let hint_page = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 1,
+                search_term: Some("artist".to_string()),
+                search_scope: MediaItemCatalogSearchScope::SearchHintFields,
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hint_page.total_record_count, 2);
+        assert_eq!(hint_page.items.len(), 1);
+        assert_eq!(hint_page.items[0].item.id, alpha_id);
+        for excluded_term in ["hidden needle", "forbidden-id", "Needle"] {
+            let excluded = db
+                .media_item_catalog_page(&MediaItemCatalogQuery {
+                    limit: 10,
+                    search_term: Some(excluded_term.to_string()),
+                    search_scope: MediaItemCatalogSearchScope::SearchHintFields,
+                    ..MediaItemCatalogQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(excluded.total_record_count, 0, "term={excluded_term}");
+        }
+        let literal_wildcards = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                search_term: Some("%_\\".to_string()),
+                search_scope: MediaItemCatalogSearchScope::SearchHintFields,
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(literal_wildcards.total_record_count, 1);
+        assert_eq!(literal_wildcards.items[0].item.id, beta_id);
+
+        let french_audio = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                audio_languages: vec!["fra".to_string()],
+                has_subtitles: Some(true),
+                is_4k: Some(true),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(french_audio.total_record_count, 1);
+        assert_eq!(french_audio.items[0].item.id, alpha_id);
+
+        let played = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                user_id: Some(user.id),
+                is_played: Some(true),
+                favorite: Some(MediaItemFavoriteFilter::Favorite(false)),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(played.total_record_count, 1);
+        assert!(
+            played.items[0]
+                .playback_state
+                .as_ref()
+                .is_some_and(|state| state.played)
+        );
+
+        let batched = db
+            .playback_states_for_items(user.id, &[alpha_id, beta_id])
+            .await
+            .unwrap();
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0].item_id, alpha_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_next_up_candidates_filter_played_and_unrelated_items_in_sql() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db.create_user("next-up-sqlite", None).await.unwrap();
+        let played_id = Uuid::new_v4();
+        let unplayed_id = Uuid::new_v4();
+        db.replace_remote_media_library_snapshot(
+            "Next Up Shows",
+            "tvshows",
+            "provider://next-up",
+            vec![
+                RemoteMediaItemUpsert {
+                    id: played_id.to_string(),
+                    name: "SQL Show S01E01".to_string(),
+                    path: "provider://next-up/SQL Show/Season 01/SQL Show S01E01.mp4".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({"SeriesName": "SQL Show"}),
+                },
+                RemoteMediaItemUpsert {
+                    id: unplayed_id.to_string(),
+                    name: "SQL Show S01E02".to_string(),
+                    path: "provider://next-up/SQL Show/Season 01/SQL Show S01E02.mp4".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({"SeriesName": "SQL Show"}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        db.replace_remote_media_library_snapshot(
+            "Unrelated Movies",
+            "movies",
+            "provider://movies",
+            vec![RemoteMediaItemUpsert {
+                id: Uuid::new_v4().to_string(),
+                name: "Must Not Leak".to_string(),
+                path: "provider://movies/leak.mp4".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: played_id,
+            media_source_id: None,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: 0,
+            is_paused: false,
+            played: true,
+        })
+        .await
+        .unwrap();
+
+        let candidates = db.tv_next_up_candidates(user.id).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].item.id, unplayed_id);
+        assert_eq!(candidates[0].metadata["SeriesName"], "SQL Show");
+        assert!(candidates[0].playback_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_tv_series_lookup_candidates_exclude_unrelated_catalog_and_include_metadata() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let movies = (0..512)
+            .map(|index| RemoteMediaItemUpsert {
+                id: Uuid::new_v4().to_string(),
+                name: format!("Movie {index:04}"),
+                path: format!("provider://movies/{index}.mp4"),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({"SeriesId": Uuid::new_v4().to_string()}),
+            })
+            .collect();
+        db.replace_remote_media_library_snapshot(
+            "Many Movies",
+            "movies",
+            "provider://movies",
+            movies,
+        )
+        .await
+        .unwrap();
+        let episode_id = Uuid::new_v4();
+        let canonical_series_id = Uuid::new_v4();
+        db.replace_remote_media_library_snapshot(
+            "Shows",
+            "tvshows",
+            "provider://shows",
+            vec![RemoteMediaItemUpsert {
+                id: episode_id.to_string(),
+                name: "Example Show S01E01".to_string(),
+                path: "provider://shows/Example Show/Season 01/Example Show S01E01.mp4".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "tvshows".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({
+                    "SeriesId": canonical_series_id,
+                    "SeriesName": "Example Show"
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let candidates = db.tv_series_lookup_candidates().await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].item.id, episode_id);
+        assert_eq!(
+            candidates[0].metadata["SeriesId"],
+            canonical_series_id.to_string()
+        );
+        assert_eq!(candidates[0].metadata["SeriesName"], "Example Show");
+        assert!(candidates[0].playback_state.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_effective_type_candidates_are_exact_and_include_visible_metadata() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let movie_id = Uuid::new_v4();
+        let audio_id = Uuid::new_v4();
+        let extra_id = Uuid::new_v4();
+        let hidden_extra_id = Uuid::new_v4();
+        let item = |id: Uuid,
+                    name: &str,
+                    path: &str,
+                    media_type: &str,
+                    collection_type: &str,
+                    marker: &str| RemoteMediaItemUpsert {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+            media_type: media_type.to_string(),
+            collection_type: collection_type.to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({"Marker": marker}),
+        };
+        db.replace_remote_media_library_snapshot(
+            "Typed Candidates",
+            "mixed",
+            "provider://typed",
+            vec![
+                item(
+                    Uuid::new_v4(),
+                    "Episode",
+                    "provider://typed/show/season/episode.mkv",
+                    "Video",
+                    "tvshows",
+                    "excluded",
+                ),
+                item(
+                    movie_id,
+                    "alpha",
+                    "provider://typed/alpha.mp4",
+                    "Video",
+                    "movies",
+                    "movie",
+                ),
+                item(
+                    audio_id,
+                    "Beta",
+                    "provider://typed/beta.flac",
+                    "Audio",
+                    "music",
+                    "audio",
+                ),
+                item(
+                    extra_id,
+                    "Final Extra",
+                    "provider://typed/show/Season 01/ Extras /clip.mkv",
+                    "Video",
+                    "tvshows",
+                    "extra",
+                ),
+                item(
+                    hidden_extra_id,
+                    "Hidden Extra",
+                    "provider://typed/show/Featurettes/hidden.mkv",
+                    "Video",
+                    "tvshows",
+                    "hidden",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE media_items SET missing_since = ?1 WHERE id = ?2")
+            .bind("2026-08-09T00:00:00Z")
+            .bind(hidden_extra_id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let candidates = db
+            .media_items_with_metadata_by_effective_types(&[
+                "aUdIo".to_string(),
+                "MOVIE".to_string(),
+                "Video".to_string(),
+            ])
+            .await
+            .unwrap();
+        let by_id = candidates
+            .iter()
+            .map(|entry| (entry.item.id, &entry.metadata))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            by_id.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([movie_id, audio_id, extra_id])
+        );
+        assert_eq!(by_id[&movie_id]["Marker"], "movie");
+        assert_eq!(by_id[&audio_id]["Marker"], "audio");
+        assert_eq!(by_id[&extra_id]["Marker"], "extra");
+        assert!(
+            candidates
+                .iter()
+                .all(|entry| entry.playback_state.is_none())
+        );
+        assert!(
+            db.media_items_with_metadata_by_effective_types(&[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let telemetry = db.telemetry_diagnostics();
+        let operation = telemetry
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.name == "catalog.effective_type_candidates"
+                    && operation.pool == DatabasePoolRole::Api
+            })
+            .expect("effective-type candidate telemetry");
+        assert_eq!((operation.calls, operation.succeeded), (2, 2));
+        assert_eq!(operation.rows.total, 3);
+    }
+
+    #[tokio::test]
+    async fn sqlite_visible_item_point_contract_accepts_both_storage_id_forms() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let simple_id = Uuid::new_v4();
+        let hyphenated_id = Uuid::new_v4();
+        let missing_id = Uuid::new_v4();
+        let item = |id: Uuid, name: &str| RemoteMediaItemUpsert {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("provider://point/{id}.mp4"),
+            media_type: "Video".to_string(),
+            collection_type: "movies".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({}),
+        };
+        db.replace_remote_media_library_snapshot(
+            "Point Lookups",
+            "movies",
+            "provider://point",
+            vec![
+                item(simple_id, "Simple"),
+                item(hyphenated_id, "Hyphenated"),
+                item(missing_id, "Missing"),
+            ],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE media_items SET id = ?1 WHERE id = ?2")
+            .bind(simple_id.simple().to_string())
+            .bind(simple_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO media_items (
+                id, virtual_folder_id, name, path, media_type, collection_type,
+                created_at, updated_at, last_seen_at, missing_since, file_size, modified_at,
+                runtime_ticks, bitrate, width, height, media_streams_json, metadata_json
+            )
+            SELECT ?1, virtual_folder_id, 'Hyphenated Twin', ?2, media_type, collection_type,
+                   created_at, updated_at, last_seen_at, missing_since, file_size, modified_at,
+                   runtime_ticks, bitrate, width, height, media_streams_json, metadata_json
+            FROM media_items WHERE id = ?3
+            "#,
+        )
+        .bind(simple_id.to_string())
+        .bind("provider://point/simple-twin.mp4")
+        .bind(simple_id.simple().to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE media_items SET missing_since = CURRENT_TIMESTAMP WHERE id = ?1")
+            .bind(missing_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        for (id, expected_name) in [(simple_id, "Simple"), (hyphenated_id, "Hyphenated")] {
+            assert!(db.media_item_exists(id).await.unwrap());
+            assert_eq!(
+                db.media_item_by_id_visible(id).await.unwrap().unwrap().name,
+                expected_name
+            );
+        }
+        assert_eq!(
+            db.media_item_by_id_visible(simple_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .path,
+            format!("provider://point/{simple_id}.mp4"),
+            "the legacy simple storage id must win when both text forms exist"
+        );
+        assert!(!db.media_item_exists(missing_id).await.unwrap());
+        assert!(
+            db.media_item_by_id_visible(missing_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let absent_id = Uuid::new_v4();
+        assert!(!db.media_item_exists(absent_id).await.unwrap());
+        assert!(
+            db.media_item_by_id_visible(absent_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_catalog_counts_preserve_exact_metadata_series_and_playback_semantics() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db.first_user().await.unwrap();
+        let movie_id = Uuid::new_v4();
+        let item = |id: Uuid,
+                    name: &str,
+                    path: &str,
+                    media_type: &str,
+                    collection_type: &str,
+                    metadata: serde_json::Value| RemoteMediaItemUpsert {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+            media_type: media_type.to_string(),
+            collection_type: collection_type.to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata,
+        };
+        db.replace_remote_media_library_snapshot(
+            "Count Catalog",
+            "mixed",
+            "provider://counts",
+            vec![
+                item(
+                    movie_id,
+                    "Count Movie",
+                    "provider://counts/movie.mkv",
+                    "Video",
+                    "movies",
+                    json!({
+                        "Album": [[" Album "], 7, 7.0, {"Name": "Nested"}, "\u{a0}Écho\u{a0}", "écho"],
+                        "AlbumName": "album",
+                        "Artists": ["ARTIST", "artist", {"Name": "Other"}, [9]],
+                        "RemoteTrailers": [" https://one ", [
+                            {"Url": "https://two"}, {"path": "https://three"},
+                            {"Url": null, "url": "https://ignored"}, ""
+                        ]],
+                        "Trailers": {"Path": "https://four"}
+                    }),
+                ),
+                item(Uuid::new_v4(), "Song", "provider://counts/song.flac", "Audio", "music", json!({})),
+                item(Uuid::new_v4(), "Show S01E01", "provider://counts/Show/Season 01/Show S01E01.mkv", "Video", "tvshows", json!({})),
+                item(Uuid::new_v4(), "Show S01E02", "provider://counts/Show/Season 01/Show S01E02.mkv", "Video", "tvshows", json!({})),
+                item(Uuid::new_v4(), "Clip", "provider://counts/clip.mkv", "Video", "musicvideos", json!({})),
+                item(Uuid::new_v4(), "Book", "provider://counts/book.epub", "Book", "books", json!({})),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let counts = db
+            .media_item_catalog_counts(&MediaItemCatalogQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(counts.item_count, 6);
+        assert_eq!(counts.movie_count, 1);
+        assert_eq!(counts.episode_count, 2);
+        assert_eq!(counts.series_count, 1);
+        assert_eq!(counts.song_count, 1);
+        assert_eq!(counts.music_video_count, 1);
+        assert_eq!(counts.book_count, 1);
+        assert_eq!(counts.album_count, 6);
+        assert_eq!(counts.artist_count, 3);
+        assert_eq!(counts.trailer_count, 4);
+
+        db.upsert_playback_state(UpsertPlaybackState {
+            user_id: user.id,
+            item_id: movie_id,
+            media_source_id: None,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            position_ticks: 10,
+            is_paused: false,
+            played: true,
+        })
+        .await
+        .unwrap();
+        let played = db
+            .media_item_catalog_counts(&MediaItemCatalogQuery {
+                user_id: Some(user.id),
+                is_played: Some(true),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(played.item_count, 1);
+        assert_eq!(played.movie_count, 1);
+        assert_eq!(played.album_count, 6);
+    }
+
+    #[tokio::test]
+    async fn sqlite_catalog_page_caps_rows_without_truncating_total() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let items = (0..=MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE)
+            .map(|index| RemoteMediaItemUpsert {
+                id: Uuid::new_v4().to_string(),
+                name: format!("Bulk {index:04}"),
+                path: format!("provider://bulk/{index:04}.mkv"),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({}),
+            })
+            .collect();
+        db.replace_remote_media_library_snapshot(
+            "Bulk Catalog",
+            "movies",
+            "provider://bulk",
+            items,
+        )
+        .await
+        .unwrap();
+
+        let page = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: usize::MAX,
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.total_record_count,
+            MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE + 1
+        );
+        assert_eq!(page.items.len(), MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn sqlite_remote_library_batch_rolls_back_every_library_on_late_conflict() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let movie_id = Uuid::new_v4();
+        let series_id = Uuid::new_v4();
+        let new_movie_id = Uuid::new_v4();
+        let item =
+            |id: Uuid, name: &str, path: &str, collection_type: &str| RemoteMediaItemUpsert {
+                id: id.to_string(),
+                name: name.to_string(),
+                path: path.to_string(),
+                media_type: "Video".to_string(),
+                collection_type: collection_type.to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({}),
+            };
+
+        db.replace_remote_media_library_snapshots(vec![
+            RemoteMediaLibrarySnapshot {
+                library_name: "Atomic Movies".to_string(),
+                collection_type: "movies".to_string(),
+                source_location: "xtream://atomic/movies/v1".to_string(),
+                items: vec![item(
+                    movie_id,
+                    "Original Movie",
+                    "xtream://atomic/movies/original.mp4",
+                    "movies",
+                )],
+            },
+            RemoteMediaLibrarySnapshot {
+                library_name: "Atomic Series".to_string(),
+                collection_type: "tvshows".to_string(),
+                source_location: "xtream://atomic/series/v1".to_string(),
+                items: vec![item(
+                    series_id,
+                    "Original Episode",
+                    "xtream://atomic/series/original.mp4",
+                    "tvshows",
+                )],
+            },
+        ])
+        .await
+        .unwrap();
+
+        let failed = db
+            .replace_remote_media_library_snapshots(vec![
+                RemoteMediaLibrarySnapshot {
+                    library_name: "Atomic Movies".to_string(),
+                    collection_type: "movies".to_string(),
+                    source_location: "xtream://atomic/movies/v2".to_string(),
+                    items: vec![item(
+                        new_movie_id,
+                        "Uncommitted Movie",
+                        "xtream://atomic/movies/new.mp4",
+                        "movies",
+                    )],
+                },
+                RemoteMediaLibrarySnapshot {
+                    library_name: "Atomic Series".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    source_location: "xtream://atomic/series/v2".to_string(),
+                    // This id is owned by the movie folder. The error occurs only after the
+                    // first library has been applied inside the transaction.
+                    items: vec![item(
+                        movie_id,
+                        "Cross-folder Conflict",
+                        "xtream://atomic/series/conflict.mp4",
+                        "tvshows",
+                    )],
+                },
+            ])
+            .await;
+        assert!(failed.is_err());
+
+        let visible = db.media_items().await.unwrap();
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().any(|item| item.id == movie_id));
+        assert!(visible.iter().any(|item| item.id == series_id));
+        assert!(!visible.iter().any(|item| item.id == new_movie_id));
+        let folders = db.virtual_folders().await.unwrap();
+        assert!(folders.iter().any(|folder| {
+            folder.name == "Atomic Movies"
+                && folder.locations == ["xtream://atomic/movies/v1".to_string()]
+        }));
+        assert!(folders.iter().any(|folder| {
+            folder.name == "Atomic Series"
+                && folder.locations == ["xtream://atomic/series/v1".to_string()]
+        }));
+        let completed_generations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM catalog_sync_runs WHERE status = 'completed'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(completed_generations, 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_remote_library_batch_publishes_two_empty_generations_and_keeps_tombstones() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let movie_id = Uuid::new_v4();
+        let episode_id = Uuid::new_v4();
+        let item = |id: Uuid, path: &str, collection_type: &str| RemoteMediaItemUpsert {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: path.to_string(),
+            media_type: "Video".to_string(),
+            collection_type: collection_type.to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({}),
+        };
+        let snapshot = |movies, series| {
+            vec![
+                RemoteMediaLibrarySnapshot {
+                    library_name: "Empty Movies".to_string(),
+                    collection_type: "movies".to_string(),
+                    source_location: "xtream://empty/movies".to_string(),
+                    items: movies,
+                },
+                RemoteMediaLibrarySnapshot {
+                    library_name: "Empty Series".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    source_location: "xtream://empty/series".to_string(),
+                    items: series,
+                },
+            ]
+        };
+
+        db.replace_remote_media_library_snapshots(snapshot(
+            vec![item(movie_id, "xtream://empty/movies/movie.mp4", "movies")],
+            vec![item(
+                episode_id,
+                "xtream://empty/series/episode.mp4",
+                "tvshows",
+            )],
+        ))
+        .await
+        .unwrap();
+        db.replace_remote_media_library_snapshots(snapshot(Vec::new(), Vec::new()))
+            .await
+            .unwrap();
+
+        assert!(db.media_items().await.unwrap().is_empty());
+        let tombstones: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE missing_since IS NOT NULL")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(tombstones, 2);
+        let completed_empty_generations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM catalog_sync_runs WHERE status = 'completed' AND item_count = 0",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(completed_empty_generations, 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_identical_remote_snapshot_keeps_item_timestamps_stable() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let item_id = Uuid::new_v4();
+        let snapshot = || RemoteMediaLibrarySnapshot {
+            library_name: "No-op Movies".to_string(),
+            collection_type: "movies".to_string(),
+            source_location: "xtream://noop/movies".to_string(),
+            items: vec![RemoteMediaItemUpsert {
+                id: item_id.to_string(),
+                name: "Stable Movie".to_string(),
+                path: "xtream://noop/movies/stable.mp4".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: Some(100),
+                bitrate: Some(1_000),
+                width: Some(1920),
+                height: Some(1080),
+                media_streams: vec![json!({"Type": "Video"})],
+                metadata: json!({"Provider": "xtream"}),
+            }],
+        };
+
+        db.replace_remote_media_library_snapshots(vec![snapshot()])
+            .await
+            .unwrap();
+        let sentinel = "2000-01-01T00:00:00Z";
+        sqlx::query("UPDATE media_items SET updated_at = ?1, last_seen_at = ?1 WHERE id = ?2")
+            .bind(sentinel)
+            .bind(item_id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        db.replace_remote_media_library_snapshots(vec![snapshot()])
+            .await
+            .unwrap();
+        let timestamps = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT updated_at, last_seen_at FROM media_items WHERE id = ?1",
+        )
+        .bind(item_id.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(timestamps.0, sentinel);
+        assert_eq!(timestamps.1.as_deref(), Some(sentinel));
+        let generations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM catalog_sync_runs WHERE status = 'completed'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(generations, 2);
     }
 
     #[tokio::test]
@@ -10400,6 +16979,32 @@ mod tests {
     }
 
     #[test]
+    fn ffprobe_timeout_policy_is_bounded() {
+        assert_eq!(super::ffprobe_timeout_seconds_from_value(None), 15);
+        assert_eq!(super::ffprobe_timeout_seconds_from_value(Some("1")), 1);
+        assert_eq!(super::ffprobe_timeout_seconds_from_value(Some("120")), 120);
+        assert_eq!(super::ffprobe_timeout_seconds_from_value(Some("0")), 15);
+        assert_eq!(super::ffprobe_timeout_seconds_from_value(Some("121")), 15);
+        assert_eq!(
+            super::ffprobe_timeout_seconds_from_value(Some("invalid")),
+            15
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffprobe_process_timeout_kills_and_reaps_child() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        let started = std::time::Instant::now();
+        let output =
+            super::run_ffprobe_command(command, std::time::Duration::from_millis(25)).await;
+
+        assert_eq!(output, Err(super::FfprobeOutcome::TimedOut));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
     fn parses_local_nfo_metadata_json() {
         let metadata = parse_local_nfo_metadata(
             r#"
@@ -10612,6 +17217,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_resume_page_filters_policy_before_offset_beyond_five_hundred() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("resume-page-admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let item_ids = (0..513).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        db.replace_remote_media_library_snapshot(
+            "Large Resume Library",
+            "movies",
+            "provider://large-resume",
+            item_ids
+                .iter()
+                .enumerate()
+                .map(|(index, item_id)| RemoteMediaItemUpsert {
+                    id: item_id.to_string(),
+                    name: format!("Resume Movie {index:04}"),
+                    path: format!("provider://large-resume/{item_id}.mkv"),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: Some(10_000_000_000),
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({}),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+        for item_id in &item_ids {
+            db.upsert_playback_state(UpsertPlaybackState {
+                user_id: user.id,
+                item_id: *item_id,
+                media_source_id: None,
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+                position_ticks: 1_000_000_000,
+                is_paused: false,
+                played: false,
+            })
+            .await
+            .unwrap();
+        }
+
+        let page = db
+            .resume_items_page_for_user(
+                user.id,
+                ResumeItemsPageQuery {
+                    start_index: 500,
+                    limit: 13,
+                    min_pct: 5,
+                    max_pct: 90,
+                    min_duration_ticks: 3_000_000_000,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.total_record_count, 513);
+        assert_eq!(page.start_index, 500);
+        assert_eq!(page.items.len(), 13);
+    }
+
+    #[tokio::test]
     async fn rescan_renamed_file_preserves_item_id_and_playback_state() {
         let tmp = tempfile::tempdir().unwrap();
         let movie = tmp.path().join("Example Movie.mp4");
@@ -10724,6 +17395,466 @@ mod tests {
         assert_eq!(users.len(), 2);
         assert!(users.iter().any(|user| user.name == "admin"));
         assert!(users.iter().any(|user| user.name == "jellyrin-e2e-admin"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_query_filter_values_are_set_based_exact_and_unbounded() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut items = (0..512_u128)
+            .map(|index| RemoteMediaItemUpsert {
+                id: Uuid::from_u128(index + 1).to_string(),
+                name: format!("Noise {index:03}"),
+                path: format!("provider://filter/noise/{index:03}.mp4"),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: if index == 511 {
+                    json!({ "Genres": ["Tail Genre"] })
+                } else {
+                    json!({})
+                },
+            })
+            .collect::<Vec<_>>();
+        items.extend([
+            RemoteMediaItemUpsert {
+                id: Uuid::from_u128(20_000).to_string(),
+                name: "A Filter Target".to_string(),
+                path: "provider://filter/target-a.MP4".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: Some(1920),
+                height: Some(1080),
+                media_streams: vec![
+                    json!({ "Type": "Audio", "Language": "fre" }),
+                    json!({ "Type": "Subtitle", "Language": "spa" }),
+                    json!({ "Type": " Audio ", "Language": "ita" }),
+                    json!({ "Type": "Audio", "Language": "und" }),
+                    json!({ "Type": "Audio", "Language": 123 }),
+                ],
+                metadata: json!({
+                    "Genres": [
+                        "Drama",
+                        ["Nested"],
+                        { "Name": "Object Genre", "Ignored": "Nope" },
+                        { "Name": 123 }
+                    ],
+                    "SeriesGenres": ["Excluded Series Genre"],
+                    "Tags": ["Featured"],
+                    "OfficialRating": "PG-13",
+                    "OfficialRatings": ["R"],
+                    "SeriesOfficialRating": "Excluded Rating",
+                    "ProductionYear": 2024,
+                    "Years": [2025],
+                    "SeriesStatus": "Continuing",
+                    "Status": "Excluded Status",
+                    "People": [{ "Name": "Primary Person" }],
+                    "SeriesPeople": ["Series Person"],
+                    "Cast": ["Excluded Cast"],
+                    "Artists": ["Track Artist"],
+                    "AlbumArtists": ["Album Artist"],
+                    "Album": "Primary Album",
+                    "AlbumName": "Alternate Album",
+                    "Albums": ["Excluded Album"],
+                    "Studios": [{ "Name": "Primary Studio" }],
+                    "SeriesStudios": ["Excluded Studio"],
+                    "remoteTrailers": [{ "path": "https://example.test/trailer.mp4" }]
+                }),
+            },
+            RemoteMediaItemUpsert {
+                id: Uuid::from_u128(20_001).to_string(),
+                name: "Z Filter Target".to_string(),
+                path: "provider://filter/target-z.mp4".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: Some(1280),
+                height: Some(720),
+                media_streams: vec![json!({ "Type": "Audio", "Language": "ENG" })],
+                metadata: json!({ "Genres": ["drama"] }),
+            },
+        ]);
+        let folder = db
+            .replace_remote_media_library_snapshot(
+                "Filter Values",
+                "movies",
+                "provider://filter",
+                items,
+            )
+            .await
+            .unwrap();
+
+        let query = MediaItemCatalogQuery {
+            virtual_folder_ids: vec![folder.id],
+            include_item_types: vec!["Movie".to_string()],
+            media_types: vec!["Video".to_string()],
+            containers: vec!["mp4".to_string()],
+            ..MediaItemCatalogQuery::default()
+        };
+        let values = db.media_item_query_filter_values(&query).await.unwrap();
+        assert_eq!(
+            values.genres,
+            ["Drama", "Nested", "Object Genre", "Tail Genre"]
+        );
+        assert_eq!(values.tags, ["Featured"]);
+        assert_eq!(values.official_ratings, ["PG-13", "R"]);
+        assert_eq!(values.years, ["2024", "2025"]);
+        assert_eq!(values.containers, ["mp4"]);
+        assert_eq!(values.media_types, ["Video"]);
+        assert_eq!(values.video_types, ["VideoFile"]);
+        assert_eq!(values.series_statuses, ["Continuing"]);
+        assert_eq!(values.staff_names, ["Primary Person", "Series Person"]);
+        assert_eq!(values.artists, ["Album Artist", "Track Artist"]);
+        assert_eq!(values.albums, ["Alternate Album", "Primary Album"]);
+        assert_eq!(values.studios, ["Primary Studio"]);
+        assert_eq!(values.audio_languages, ["ENG", "fra"]);
+        assert_eq!(values.subtitle_languages, ["spa"]);
+        assert!(values.has_subtitles);
+        assert!(values.has_trailer);
+        for excluded in [
+            "Excluded Series Genre",
+            "Excluded Rating",
+            "Excluded Status",
+            "Excluded Cast",
+            "Excluded Album",
+            "Excluded Studio",
+            "ita",
+            "und",
+        ] {
+            assert!(
+                !format!("{values:?}").contains(excluded),
+                "unexpected broadened mapping: {excluded}"
+            );
+        }
+
+        let narrowed = db
+            .media_item_query_filter_values(&MediaItemCatalogQuery {
+                audio_languages: vec!["fra".to_string()],
+                ..query
+            })
+            .await
+            .unwrap();
+        assert_eq!(narrowed.genres, ["Drama", "Nested", "Object Genre"]);
+        assert_eq!(narrowed.audio_languages, ["fra"]);
+
+        let extension_items = [
+            ".hidden",
+            ".foo.bar",
+            "foo.",
+            "foo.tar.gz",
+            "slash/",
+            "back\\slash.mkv",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| RemoteMediaItemUpsert {
+            id: Uuid::from_u128(30_000 + index as u128).to_string(),
+            name: format!("Extension {index}"),
+            path: format!("provider://extensions/{path}"),
+            media_type: "Video".to_string(),
+            collection_type: "movies".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: if index == 0 {
+                json!({
+                    "Trailers": [
+                        {
+                            "Url": "",
+                            "url": "https://example.test/must-not-fallback-empty.mp4"
+                        },
+                        {
+                            "Url": null,
+                            "url": "https://example.test/must-not-fallback-null.mp4"
+                        },
+                        {
+                            "Url": 123,
+                            "url": "https://example.test/must-not-fallback-number.mp4"
+                        }
+                    ]
+                })
+            } else {
+                json!({})
+            },
+        })
+        .collect();
+        let extension_folder = db
+            .replace_remote_media_library_snapshot(
+                "Filter Extensions",
+                "movies",
+                "provider://extensions",
+                extension_items,
+            )
+            .await
+            .unwrap();
+        let extension_values = db
+            .media_item_query_filter_values(&MediaItemCatalogQuery {
+                virtual_folder_ids: vec![extension_folder.id],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(extension_values.containers, ["", "bar", "gz", "mkv"]);
+        assert!(!extension_values.has_trailer);
+    }
+
+    #[tokio::test]
+    async fn sqlite_media_item_facets_are_atomic_idempotent_and_rebuilt_in_batches() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let item_ids = (0..501)
+            .map(|index| Uuid::from_u128(index + 1))
+            .collect::<Vec<_>>();
+        let items = item_ids
+            .iter()
+            .enumerate()
+            .map(|(index, item_id)| RemoteMediaItemUpsert {
+                id: item_id.to_string(),
+                name: format!("Facet Item {index:03}"),
+                path: format!("provider://facets/{index:03}.mp3"),
+                media_type: "Audio".to_string(),
+                collection_type: "music".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: if index == 500 {
+                    json!({
+                        "Genres": [" Drama ", "drama"],
+                        "Artists": ["Track Artist"],
+                        "AlbumArtists": ["Album Artist"],
+                        "People": [
+                            {
+                                "Name": "Jane Doe",
+                                "Id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                                "Role": "Lead"
+                            },
+                            { "Name": "Legacy Person", "Id": "IMPORTED-PERSON" }
+                        ],
+                        "Tags": [format!("Tag {index:03}")]
+                    })
+                } else {
+                    json!({ "Tags": [format!("Tag {index:03}")] })
+                },
+            })
+            .collect::<Vec<_>>();
+        let folder = db
+            .replace_remote_media_library_snapshot(
+                "Facet Music",
+                "music",
+                "provider://facets",
+                items.clone(),
+            )
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM media_item_facets")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.rebuild_media_item_facets().await.unwrap();
+        db.rebuild_media_item_facets().await.unwrap();
+        let tags = db
+            .media_item_facet_values(MediaItemFacetKind::Tag, &[folder.id])
+            .await
+            .unwrap();
+        assert_eq!(tags.len(), 501, "rebuild must cross the 500-row batch");
+        let genres = db
+            .media_item_facet_values(MediaItemFacetKind::Genre, &[folder.id])
+            .await
+            .unwrap();
+        assert_eq!(genres.len(), 1);
+        assert_eq!(genres[0].display_value, "Drama");
+        assert_eq!(genres[0].payload, json!(" Drama "));
+        assert_eq!(
+            db.media_item_facet_values(MediaItemFacetKind::MusicArtist, &[folder.id])
+                .await
+                .unwrap()[0]
+                .display_value,
+            "Track Artist"
+        );
+        assert_eq!(
+            db.media_item_facet_values(MediaItemFacetKind::MusicAlbumArtist, &[folder.id])
+                .await
+                .unwrap()[0]
+                .display_value,
+            "Album Artist"
+        );
+
+        let person = db
+            .media_item_facet_by_entity_id(
+                MediaItemFacetKind::Person,
+                "aaaaaaaabbbbccccddddeeeeeeeeeeee",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(person.display_value, "Jane Doe");
+        assert_eq!(person.payload["Role"], "Lead");
+        assert_eq!(
+            db.media_item_facet_by_entity_id(
+                MediaItemFacetKind::Person,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            )
+            .await
+            .unwrap(),
+            Some(person.clone())
+        );
+        assert_eq!(
+            db.media_item_facet_by_entity_id(MediaItemFacetKind::Person, "imported-person")
+                .await
+                .unwrap()
+                .unwrap()
+                .display_value,
+            "Legacy Person"
+        );
+        assert_eq!(
+            db.media_item_facet_by_normalized_value(
+                MediaItemFacetKind::Person,
+                " JANE DOE ",
+                &[folder.id],
+            )
+            .await
+            .unwrap(),
+            Some(person.clone())
+        );
+        assert!(
+            db.media_item_facet_by_normalized_value(
+                MediaItemFacetKind::Person,
+                "Jane Doe",
+                &[Uuid::new_v4()],
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            db.media_item_facet_by_entity_id(MediaItemFacetKind::Person, &person.stable_id)
+                .await
+                .unwrap(),
+            Some(person.clone())
+        );
+        assert_eq!(
+            db.media_item_ids_for_facets(&MediaItemFacetCandidateQuery {
+                kind: Some(MediaItemFacetKind::Person),
+                entity_ids: vec!["aaaaaaaabbbbccccddddeeeeeeeeeeee".to_string()],
+                virtual_folder_ids: vec![folder.id],
+                ..MediaItemFacetCandidateQuery::default()
+            })
+            .await
+            .unwrap(),
+            vec![item_ids[500]]
+        );
+
+        db.update_media_item_metadata(
+            item_ids[500],
+            json!({ "Tags": ["Current Tag"], "People": ["New Person"] }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.media_item_facet_by_entity_id(MediaItemFacetKind::Person, "imported-person")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query(
+            "CREATE TRIGGER fail_facet_update BEFORE INSERT ON media_item_facets \
+             WHEN NEW.display_value = 'ROLLBACK' BEGIN \
+             SELECT RAISE(ABORT, 'facet rollback test'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(
+            db.update_media_item_metadata(item_ids[500], json!({ "Tags": ["ROLLBACK"] }))
+                .await
+                .is_err()
+        );
+        let payload: String =
+            sqlx::query_scalar("SELECT metadata_json FROM media_items WHERE id IN (?1, ?2)")
+                .bind(item_ids[500].simple().to_string())
+                .bind(item_ids[500].to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap()["Tags"][0],
+            "Current Tag"
+        );
+        sqlx::query("DROP TRIGGER fail_facet_update")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.replace_remote_media_library_snapshot(
+            "Facet Music",
+            "music",
+            "provider://facets",
+            items[..500].to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.media_item_ids_for_facets(&MediaItemFacetCandidateQuery {
+                kind: Some(MediaItemFacetKind::Person),
+                normalized_values: vec!["Jane Doe".to_string()],
+                ..MediaItemFacetCandidateQuery::default()
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+            "tombstoned facet owners must not be visible"
+        );
+        db.replace_remote_media_library_snapshot(
+            "Facet Music",
+            "music",
+            "provider://facets",
+            items,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.media_item_facet_by_entity_id(MediaItemFacetKind::Person, "imported-person")
+                .await
+                .unwrap()
+                .is_some(),
+            "resurrection must republish facets atomically"
+        );
+
+        let storage_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE id IN (?1, ?2)")
+                .bind(item_ids[500].simple().to_string())
+                .bind(item_ids[500].to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        sqlx::query("DELETE FROM media_items WHERE id = ?1")
+            .bind(&storage_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let facet_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_item_facets WHERE item_id = ?1")
+                .bind(&storage_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let alias_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_item_facet_aliases WHERE item_id = ?1")
+                .bind(storage_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((facet_count, alias_count), (0, 0));
     }
 
     #[tokio::test]

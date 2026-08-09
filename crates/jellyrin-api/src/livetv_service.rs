@@ -1,8 +1,10 @@
 use jellyrin_db::{
-    Database, LiveTvCategoryRecord, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
+    LiveTvCategoryRecord, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
     LiveTvChannelUpsert, LiveTvPage, LiveTvTunerUpsert,
 };
 use serde_json::Value;
+
+use crate::Database;
 
 /// Persistence boundary for Live TV catalogue and tuner state.
 pub(crate) struct LiveTvService<'a> {
@@ -55,7 +57,7 @@ impl<'a> LiveTvService<'a> {
         tuner: LiveTvTunerUpsert,
         categories: Vec<LiveTvCategoryUpsert>,
         channels: Vec<LiveTvChannelUpsert>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Value> {
         self.db
             .replace_live_tv_tuner_snapshot(tuner, categories, channels)
             .await

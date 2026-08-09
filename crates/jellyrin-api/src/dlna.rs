@@ -7,27 +7,27 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jellyrin_core::{MediaItem, VirtualFolder};
-use jellyrin_db::Database;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::{
         LazyLock, Mutex as StdMutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
-use tokio::{net::UdpSocket, process::Command, task::JoinHandle, time};
+use tokio::{net::UdpSocket, process::Command, sync::Semaphore, task::JoinHandle, time};
 use uuid::Uuid;
 
 use crate::{
-    ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION, ImageOwner,
+    ApiError, AppState, COMPATIBLE_PRODUCT_NAME, COMPATIBLE_SERVER_VERSION, Database, ImageOwner,
     SubtitleStreamRoute, default_network_configuration, dlna_hls_master_playlist_response,
-    dlna_hls_media_playlist_response, dlna_hls_segment_response, parse_subtitle_stream_query,
-    stream_media_item, subscribe_system_lifecycle_commands, subtitle_stream_response,
+    dlna_hls_media_playlist_response, dlna_hls_segment_response, media_process_input,
+    parse_subtitle_stream_query, run_auxiliary_ffmpeg_output, stream_resolved_media_item,
+    subscribe_system_lifecycle_commands, subtitle_stream_response,
 };
 
 const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
@@ -37,6 +37,10 @@ const SSDP_NOTIFY_INTERVAL_SECONDS: u64 = 60;
 const SSDP_CONFIG_CHECK_SECONDS: u64 = 5;
 const UPNP_EVENT_DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
 const UPNP_EVENT_MAX_TIMEOUT_SECONDS: u64 = 7200;
+const UPNP_EVENT_MAX_SUBSCRIPTIONS: usize = 256;
+const UPNP_EVENT_MAX_CALLBACK_URLS: usize = 4;
+const UPNP_EVENT_MAX_CALLBACK_URL_BYTES: usize = 2 * 1024;
+const UPNP_EVENT_NOTIFY_CONCURRENCY: usize = 16;
 const UPNP_DEVICE_NS: &str = "urn:schemas-upnp-org:device-1-0";
 const DLNA_DEVICE_NS: &str = "urn:schemas-dlna-org:device-1-0";
 const UPNP_SERVICE_NS: &str = "urn:schemas-upnp-org:service-1-0";
@@ -53,6 +57,19 @@ const MEDIA_SERVER_DEVICE: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 const DLNA_STATE_CONFIGURATION_KEY: &str = "dlna";
 static DLNA_EVENT_SUBSCRIPTIONS: LazyLock<StdMutex<HashMap<String, DlnaEventSubscription>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+static DLNA_EVENT_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(StdDuration::from_secs(2))
+        .timeout(StdDuration::from_secs(5))
+        .pool_max_idle_per_host(2)
+        .build()
+        .expect("DLNA event HTTP client configuration must be valid")
+});
+static DLNA_EVENT_NOTIFY_SEMAPHORE: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(UPNP_EVENT_NOTIFY_CONCURRENCY));
+static DLNA_EVENT_NOTIFY_DROPPED: AtomicU64 = AtomicU64::new(0);
 static DLNA_SYSTEM_UPDATE_ID: AtomicU32 = AtomicU32::new(0);
 static DLNA_SOURCE_PROTOCOL_INFO: LazyLock<String> = LazyLock::new(dlna_source_protocol_info);
 const DLNA_PROTOCOL_FLAGS: &str =
@@ -541,33 +558,59 @@ pub(crate) async fn content_directory_control(
 
 pub(crate) async fn content_directory_events(
     State(state): State<AppState>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     method: Method,
     headers: HeaderMap,
     Path(server_id): Path<String>,
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
     sync_dlna_system_update_id_from_db(&state.db).await?;
-    event_subscription_response(DlnaEventService::ContentDirectory, &method, &headers)
+    event_subscription_response(
+        DlnaEventService::ContentDirectory,
+        &method,
+        &headers,
+        dlna_event_peer_ip(connect_info)?,
+    )
 }
 
 pub(crate) async fn connection_manager_events(
     State(state): State<AppState>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     method: Method,
     headers: HeaderMap,
     Path(server_id): Path<String>,
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
-    event_subscription_response(DlnaEventService::ConnectionManager, &method, &headers)
+    event_subscription_response(
+        DlnaEventService::ConnectionManager,
+        &method,
+        &headers,
+        dlna_event_peer_ip(connect_info)?,
+    )
 }
 
 pub(crate) async fn media_receiver_registrar_events(
     State(state): State<AppState>,
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     method: Method,
     headers: HeaderMap,
     Path(server_id): Path<String>,
 ) -> Result<Response, ApiError> {
     dlna_context(&state, &server_id).await?;
-    event_subscription_response(DlnaEventService::MediaReceiverRegistrar, &method, &headers)
+    event_subscription_response(
+        DlnaEventService::MediaReceiverRegistrar,
+        &method,
+        &headers,
+        dlna_event_peer_ip(connect_info)?,
+    )
+}
+
+fn dlna_event_peer_ip(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+) -> Result<IpAddr, ApiError> {
+    connect_info
+        .map(|Extension(ConnectInfo(peer))| normalize_event_peer_ip(peer.ip()))
+        .ok_or_else(|| ApiError::forbidden("DLNA event peer address is unavailable"))
 }
 
 pub(crate) async fn media_stream(
@@ -582,7 +625,7 @@ pub(crate) async fn media_stream(
         .media_item_by_id(item_id)
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
-    stream_media_item(item, &headers, true).await
+    stream_resolved_media_item(&state, item, &headers, true).await
 }
 
 pub(crate) async fn media_stream_head(
@@ -597,7 +640,7 @@ pub(crate) async fn media_stream_head(
         .media_item_by_id(item_id)
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
-    stream_media_item(item, &headers, false).await
+    stream_resolved_media_item(&state, item, &headers, false).await
 }
 
 pub(crate) async fn media_hls_master_playlist(
@@ -873,7 +916,8 @@ fn dlna_thumbnail_sizing_supported(content_type: &str) -> bool {
 }
 
 async fn resize_dlna_thumbnail(path: &FsPath, sizing: DlnaThumbnailSizing) -> Option<Vec<u8>> {
-    let output = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         .arg("-hide_banner")
         .arg("-nostdin")
         .arg("-v")
@@ -881,6 +925,8 @@ async fn resize_dlna_thumbnail(path: &FsPath, sizing: DlnaThumbnailSizing) -> Op
         .arg("-i")
         .arg(path)
         .arg("-frames:v")
+        .arg("1")
+        .arg("-threads")
         .arg("1")
         .arg("-vf")
         .arg(sizing.ffmpeg_scale_filter())
@@ -892,19 +938,14 @@ async fn resize_dlna_thumbnail(path: &FsPath, sizing: DlnaThumbnailSizing) -> Op
         .arg("mjpeg")
         .arg("pipe:1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    let output = run_auxiliary_ffmpeg_output(command, StdDuration::from_secs(30))
         .await
         .ok()?;
     if !output.status.success() || output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .take(512)
-            .collect::<String>();
         tracing::warn!(
             path = %path.display(),
             status = %output.status,
-            stderr = %stderr,
             "ffmpeg failed to resize DLNA thumbnail"
         );
         return None;
@@ -1082,15 +1123,21 @@ async fn find_dlna_generated_video_thumbnail(
 
     tokio::fs::create_dir_all(&dir).await?;
     let tmp_path = path.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
-    let output = Command::new("ffmpeg")
+    let input = media_process_input(state, item, StdDuration::from_secs(2 * 60)).await?;
+    let mut command = Command::new("ffmpeg");
+    command
         .arg("-hide_banner")
         .arg("-nostdin")
+        .arg("-v")
+        .arg("error")
         .arg("-y")
         .arg("-ss")
         .arg(dlna_thumbnail_seek_seconds(item))
         .arg("-i")
-        .arg(&item.path)
+        .arg(input.as_str())
         .arg("-frames:v")
+        .arg("1")
+        .arg("-threads")
         .arg("1")
         .arg("-vf")
         .arg("scale='min(320,iw)':-2:force_original_aspect_ratio=decrease")
@@ -1102,22 +1149,17 @@ async fn find_dlna_generated_video_thumbnail(
         .arg("mjpeg")
         .arg(&tmp_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await;
+        .stderr(Stdio::piped());
+    let output = run_auxiliary_ffmpeg_output(command, StdDuration::from_secs(30)).await;
     let Ok(output) = output else {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
         return Ok(None);
     };
     if !output.status.success() {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        let stderr = String::from_utf8_lossy(&output.stderr)
-            .chars()
-            .take(512)
-            .collect::<String>();
         tracing::warn!(
             item_id = %item.id,
             status = %output.status,
-            stderr = %stderr,
             "ffmpeg failed to generate DLNA video thumbnail"
         );
         return Ok(None);
@@ -1177,6 +1219,7 @@ enum DlnaEventService {
 #[derive(Clone, Debug)]
 struct DlnaEventSubscription {
     service: DlnaEventService,
+    peer_ip: IpAddr,
     expires_at: Instant,
     callback_urls: Vec<String>,
     next_seq: u32,
@@ -1199,9 +1242,12 @@ pub(crate) fn dlna_diagnostics_json() -> Result<Value, ApiError> {
         "SystemUpdateID": dlna_system_update_id(),
         "EventSubscriptions": {
             "Total": subscriptions.len(),
+            "Limit": UPNP_EVENT_MAX_SUBSCRIPTIONS,
             "ContentDirectory": content_directory,
             "ConnectionManager": connection_manager,
-            "MediaReceiverRegistrar": media_receiver_registrar
+            "MediaReceiverRegistrar": media_receiver_registrar,
+            "NotifyConcurrency": UPNP_EVENT_NOTIFY_CONCURRENCY,
+            "NotifyDropped": DLNA_EVENT_NOTIFY_DROPPED.load(Ordering::Relaxed)
         },
         "Services": [
             "ContentDirectory",
@@ -1216,11 +1262,12 @@ fn event_subscription_response(
     service: DlnaEventService,
     method: &Method,
     headers: &HeaderMap,
+    peer_ip: IpAddr,
 ) -> Result<Response, ApiError> {
     cleanup_expired_event_subscriptions()?;
     match method.as_str() {
-        "SUBSCRIBE" => subscribe_event_response(service, headers),
-        "UNSUBSCRIBE" => unsubscribe_event_response(service, headers),
+        "SUBSCRIBE" => subscribe_event_response(service, headers, peer_ip),
+        "UNSUBSCRIBE" => unsubscribe_event_response(service, headers, peer_ip),
         _ => Ok((StatusCode::METHOD_NOT_ALLOWED, BodyBytes::new()).into_response()),
     }
 }
@@ -1228,7 +1275,9 @@ fn event_subscription_response(
 fn subscribe_event_response(
     service: DlnaEventService,
     headers: &HeaderMap,
+    peer_ip: IpAddr,
 ) -> Result<Response, ApiError> {
+    let peer_ip = normalize_event_peer_ip(peer_ip);
     let timeout = requested_event_timeout(headers);
     if let Some(sid) = event_header(headers, "sid") {
         if event_header(headers, "callback").is_some() || event_header(headers, "nt").is_some() {
@@ -1244,6 +1293,9 @@ fn subscribe_event_response(
         if subscription.service != service {
             return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
         }
+        if subscription.peer_ip != peer_ip {
+            return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+        }
         subscription.expires_at = event_expires_at(timeout);
         return Ok(event_subscription_ok_response(&sid, timeout));
     }
@@ -1252,28 +1304,34 @@ fn subscribe_event_response(
     let nt = event_header(headers, "nt");
     if callback
         .as_deref()
-        .is_none_or(|callback| !valid_event_callback(callback))
+        .is_none_or(|callback| !valid_event_callback(callback, peer_ip))
         || nt
             .as_deref()
             .is_none_or(|nt| !nt.eq_ignore_ascii_case("upnp:event"))
     {
         return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
     }
-    let callback_urls = event_callback_urls(callback.as_deref().unwrap_or_default());
+    let callback_urls = event_callback_urls(callback.as_deref().unwrap_or_default(), peer_ip);
     if callback_urls.is_empty() {
         return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
     }
 
     let sid = format!("uuid:{}", Uuid::new_v4());
-    dlna_event_subscriptions()?.insert(
+    let mut subscriptions = dlna_event_subscriptions()?;
+    if !event_subscription_capacity_available(subscriptions.len()) {
+        return Ok((StatusCode::SERVICE_UNAVAILABLE, BodyBytes::new()).into_response());
+    }
+    subscriptions.insert(
         sid.clone(),
         DlnaEventSubscription {
             service,
+            peer_ip,
             expires_at: event_expires_at(timeout),
             callback_urls: callback_urls.clone(),
             next_seq: 1,
         },
     );
+    drop(subscriptions);
     spawn_initial_event_notify(service, sid.clone(), callback_urls);
     Ok(event_subscription_ok_response(&sid, timeout))
 }
@@ -1281,7 +1339,9 @@ fn subscribe_event_response(
 fn unsubscribe_event_response(
     service: DlnaEventService,
     headers: &HeaderMap,
+    peer_ip: IpAddr,
 ) -> Result<Response, ApiError> {
+    let peer_ip = normalize_event_peer_ip(peer_ip);
     let Some(sid) = event_header(headers, "sid") else {
         return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
     };
@@ -1291,6 +1351,9 @@ fn unsubscribe_event_response(
         return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
     };
     if subscription.service != service {
+        return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
+    }
+    if subscription.peer_ip != peer_ip {
         return Ok((StatusCode::PRECONDITION_FAILED, BodyBytes::new()).into_response());
     }
     subscriptions.remove(&sid);
@@ -1343,19 +1406,70 @@ fn event_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn valid_event_callback(callback: &str) -> bool {
-    !event_callback_urls(callback).is_empty()
+fn normalize_event_peer_ip(peer_ip: IpAddr) -> IpAddr {
+    match peer_ip {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        peer_ip => peer_ip,
+    }
 }
 
-fn event_callback_urls(callback: &str) -> Vec<String> {
-    callback
-        .split('>')
-        .filter_map(|part| part.trim().strip_prefix('<'))
-        .filter_map(|url| {
-            let url = url.trim();
-            url.starts_with("http://").then(|| url.to_string())
-        })
-        .collect()
+fn valid_event_callback(callback: &str, peer_ip: IpAddr) -> bool {
+    !event_callback_urls(callback, peer_ip).is_empty()
+}
+
+fn event_subscription_capacity_available(subscription_count: usize) -> bool {
+    subscription_count < UPNP_EVENT_MAX_SUBSCRIPTIONS
+}
+
+fn event_callback_urls(callback: &str, peer_ip: IpAddr) -> Vec<String> {
+    let peer_ip = normalize_event_peer_ip(peer_ip);
+    let mut remaining = callback.trim();
+    let mut urls = Vec::new();
+    while !remaining.is_empty() {
+        let Some(after_open) = remaining.strip_prefix('<') else {
+            return Vec::new();
+        };
+        let Some(close) = after_open.find('>') else {
+            return Vec::new();
+        };
+        let candidate = after_open[..close].trim();
+        if candidate.is_empty() || candidate.len() > UPNP_EVENT_MAX_CALLBACK_URL_BYTES {
+            return Vec::new();
+        }
+        let Ok(url) = reqwest::Url::parse(candidate) else {
+            return Vec::new();
+        };
+        if url.scheme() != "http"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+            || url.host_str().is_none()
+            || url.port_or_known_default().is_none()
+        {
+            return Vec::new();
+        }
+        let Some(callback_ip) = url
+            .host_str()
+            .and_then(|host| host.parse::<IpAddr>().ok())
+            .map(normalize_event_peer_ip)
+        else {
+            // Hostnames would reintroduce DNS rebinding and cannot be tied to
+            // the TCP peer that created this unauthenticated UPnP subscription.
+            return Vec::new();
+        };
+        if callback_ip != peer_ip {
+            return Vec::new();
+        }
+        urls.push(url.to_string());
+        if urls.len() > UPNP_EVENT_MAX_CALLBACK_URLS {
+            return Vec::new();
+        }
+        remaining = after_open[close + 1..].trim_start();
+    }
+    urls
 }
 
 fn normalize_event_sid(sid: &str) -> Result<String, ApiError> {
@@ -1441,20 +1555,24 @@ fn notify_event_subscribers(service: DlnaEventService, body: String) {
     }
 
     tokio::spawn(async move {
-        for notification in notifications {
-            for callback_url in notification.callback_urls {
-                if let Err(error) = send_event_notify(
-                    &callback_url,
-                    &notification.sid,
-                    notification.seq,
-                    body.clone(),
-                )
-                .await
-                {
-                    tracing::warn!(%error, %callback_url, "DLNA change event notification failed");
+        use futures_util::StreamExt as _;
+
+        let notifications = notifications.into_iter().flat_map(|notification| {
+            notification
+                .callback_urls
+                .into_iter()
+                .map(move |callback_url| (callback_url, notification.sid.clone(), notification.seq))
+        });
+        futures_util::stream::iter(notifications)
+            .for_each_concurrent(UPNP_EVENT_NOTIFY_CONCURRENCY, |(callback_url, sid, seq)| {
+                let body = body.clone();
+                async move {
+                    if let Err(error) = send_event_notify(&callback_url, &sid, seq, body).await {
+                        tracing::warn!(%error, "DLNA change event notification failed");
+                    }
                 }
-            }
-        }
+            })
+            .await;
     });
 }
 
@@ -1490,7 +1608,7 @@ fn spawn_initial_event_notify(service: DlnaEventService, sid: String, callback_u
     tokio::spawn(async move {
         for callback_url in callback_urls {
             if let Err(error) = send_event_notify(&callback_url, &sid, 0, body.clone()).await {
-                tracing::warn!(%error, %callback_url, "DLNA initial event notification failed");
+                tracing::warn!(%error, "DLNA initial event notification failed");
             }
         }
     });
@@ -1502,8 +1620,12 @@ async fn send_event_notify(
     seq: u32,
     body: String,
 ) -> anyhow::Result<()> {
+    let Ok(_permit) = DLNA_EVENT_NOTIFY_SEMAPHORE.try_acquire() else {
+        DLNA_EVENT_NOTIFY_DROPPED.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    };
     let method = reqwest::Method::from_bytes(b"NOTIFY")?;
-    let response = reqwest::Client::new()
+    let response = DLNA_EVENT_HTTP_CLIENT
         .request(method, callback_url)
         .header("NT", "upnp:event")
         .header("NTS", "upnp:propchange")
@@ -1513,7 +1635,14 @@ async fn send_event_notify(
         .header("USER-AGENT", ssdp_server_header())
         .body(body)
         .send()
-        .await?;
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "DLNA callback request failed (timeout={}, connect={})",
+                error.is_timeout(),
+                error.is_connect()
+            )
+        })?;
     if !response.status().is_success() {
         anyhow::bail!("callback returned HTTP {}", response.status());
     }
@@ -2371,7 +2500,7 @@ async fn browse_response(
             let child_count = directory_child_count(&folder, &items, "");
             BrowsePayload::metadata(didl_folder_metadata(&folder, child_count))
         } else if is_music_folder(&folder) {
-            let metadata = media_item_metadata_map(db).await?;
+            let metadata = media_item_metadata_map(db, &items).await?;
             music_album_browse_payload(
                 &folder,
                 &items,
@@ -2381,7 +2510,7 @@ async fn browse_response(
                 render_context,
             )?
         } else if is_tv_folder(&folder) {
-            let metadata = media_item_metadata_map(db).await?;
+            let metadata = media_item_metadata_map(db, &items).await?;
             tv_series_browse_payload(
                 &folder,
                 &items,
@@ -2411,7 +2540,7 @@ async fn browse_response(
             return Err(ApiError::not_found("DLNA album not found"));
         }
         let items = media_items_for_folder(db, folder.id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let album_items = music_album_items(&items, &metadata, &album_title);
         if album_items.is_empty() {
             return Err(ApiError::not_found("DLNA album not found"));
@@ -2443,7 +2572,7 @@ async fn browse_response(
             return Err(ApiError::not_found("DLNA artist not found"));
         }
         let items = media_items_for_folder(db, folder.id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let artist_items = music_artist_items(&items, &metadata, &artist_name);
         if artist_items.is_empty() {
             return Err(ApiError::not_found("DLNA artist not found"));
@@ -2474,7 +2603,7 @@ async fn browse_response(
             return Err(ApiError::not_found("DLNA series not found"));
         }
         let items = media_items_for_folder(db, folder.id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let series_items = tv_series_items(&items, &metadata, &series_title);
         if series_items.is_empty() {
             return Err(ApiError::not_found("DLNA series not found"));
@@ -2507,7 +2636,7 @@ async fn browse_response(
             return Err(ApiError::not_found("DLNA season not found"));
         }
         let items = media_items_for_folder(db, folder.id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let season_items = tv_season_items(&items, &metadata, &series_title, &season_key);
         if season_items.is_empty() {
             return Err(ApiError::not_found("DLNA season not found"));
@@ -2581,12 +2710,7 @@ async fn media_items_for_folder(
     db: &Database,
     folder_id: Uuid,
 ) -> Result<Vec<MediaItem>, ApiError> {
-    Ok(db
-        .media_items()
-        .await?
-        .into_iter()
-        .filter(|item| item.virtual_folder_id == folder_id)
-        .collect())
+    Ok(db.media_items_for_virtual_folders(&[folder_id]).await?)
 }
 
 #[derive(Clone, Copy)]
@@ -2607,7 +2731,7 @@ async fn search_response(
     let (starting_index, requested_count) = browse_window(request);
     let folders = db.virtual_folders().await?;
     let mut items = search_container_items(db, &folders, &container_id).await?;
-    let metadata = media_item_metadata_map(db).await?;
+    let metadata = media_item_metadata_map(db, &items).await?;
     items.retain(|item| dlna_search_criteria_matches_with_metadata(item, &metadata, &criteria));
     sort_media_items(&mut items, &sort_criteria);
     let total_matches = items.len();
@@ -2654,7 +2778,7 @@ async fn search_container_items(
             return Err(ApiError::not_found("DLNA album not found"));
         }
         let items = media_items_for_folder(db, folder_id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let album_items = items
             .into_iter()
             .filter(|item| item_has_album(item, &metadata, &album_title))
@@ -2674,7 +2798,7 @@ async fn search_container_items(
             return Err(ApiError::not_found("DLNA artist not found"));
         }
         let items = media_items_for_folder(db, folder_id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let artist_items = items
             .into_iter()
             .filter(|item| item_has_artist(item, &metadata, &artist_name))
@@ -2694,7 +2818,7 @@ async fn search_container_items(
             return Err(ApiError::not_found("DLNA series not found"));
         }
         let items = media_items_for_folder(db, folder_id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let series_items = items
             .into_iter()
             .filter(|item| item_has_series(item, &metadata, &series_title))
@@ -2714,7 +2838,7 @@ async fn search_container_items(
             return Err(ApiError::not_found("DLNA season not found"));
         }
         let items = media_items_for_folder(db, folder_id).await?;
-        let metadata = media_item_metadata_map(db).await?;
+        let metadata = media_item_metadata_map(db, &items).await?;
         let season_items = items
             .into_iter()
             .filter(|item| item_in_series_season(item, &metadata, &series_title, &season_key))
@@ -2811,10 +2935,21 @@ fn didl_root_metadata(child_count: usize) -> String {
 }
 
 async fn didl_root_children(db: &Database, folders: &[VirtualFolder]) -> Result<String, ApiError> {
+    let folder_ids = folders.iter().map(|folder| folder.id).collect::<Vec<_>>();
+    let mut items_by_folder = HashMap::<Uuid, Vec<MediaItem>>::new();
+    for item in db.media_items_for_virtual_folders(&folder_ids).await? {
+        items_by_folder
+            .entry(item.virtual_folder_id)
+            .or_default()
+            .push(item);
+    }
     let mut didl = didl_prefix();
     for folder in folders {
-        let items = media_items_for_folder(db, folder.id).await?;
-        let child_count = directory_child_count(folder, &items, "");
+        let items = items_by_folder
+            .get(&folder.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let child_count = directory_child_count(folder, items, "");
         didl.push_str("<container id=\"");
         didl.push_str(&escape_xml(&format!("folder:{}", folder.id)));
         didl.push_str("\" parentID=\"0\" restricted=\"1\" searchable=\"1\" childCount=\"");
@@ -2849,9 +2984,13 @@ fn directory_browse_payload(
     ))
 }
 
-async fn media_item_metadata_map(db: &Database) -> Result<HashMap<Uuid, Value>, ApiError> {
+async fn media_item_metadata_map(
+    db: &Database,
+    items: &[MediaItem],
+) -> Result<HashMap<Uuid, Value>, ApiError> {
+    let item_ids = items.iter().map(|item| item.id).collect::<HashSet<_>>();
     Ok(db
-        .media_item_metadata()
+        .media_item_metadata_by_item_ids(&item_ids)
         .await?
         .into_iter()
         .map(|metadata| (metadata.item_id, metadata.payload))
@@ -5607,6 +5746,110 @@ mod tests {
 
     fn test_server_id() -> Uuid {
         Uuid::parse_str("58deb718-f9ee-4ac5-a1d4-05286d64cf42").unwrap()
+    }
+
+    #[test]
+    fn resource_caps_event_callbacks_are_strict_and_bounded() {
+        let peer: IpAddr = "192.168.1.10".parse().unwrap();
+        assert_eq!(
+            event_callback_urls(
+                "<http://192.168.1.10:1400/events><http://192.168.1.10:1401/events>",
+                peer,
+            ),
+            vec![
+                "http://192.168.1.10:1400/events".to_string(),
+                "http://192.168.1.10:1401/events".to_string()
+            ]
+        );
+        for invalid in [
+            "https://192.168.1.10/events",
+            "<https://192.168.1.10/events>",
+            "<http://user:secret@192.168.1.10/events>",
+            "<http://192.168.1.10/events#fragment>",
+            "<http://192.168.1.10/events> trailing",
+            "<http://127.0.0.1/events>",
+            "<http://169.254.169.254/latest/meta-data>",
+            "<http://192.168.1.11/events>",
+            "<http://renderer.local/events>",
+        ] {
+            assert!(event_callback_urls(invalid, peer).is_empty(), "{invalid}");
+        }
+        let too_many = (0..=UPNP_EVENT_MAX_CALLBACK_URLS)
+            .map(|index| format!("<http://{peer}:{}/events>", 1400 + index))
+            .collect::<String>();
+        assert!(event_callback_urls(&too_many, peer).is_empty());
+        let oversized = format!(
+            "<http://{peer}/events?{}>",
+            "x".repeat(UPNP_EVENT_MAX_CALLBACK_URL_BYTES)
+        );
+        assert!(event_callback_urls(&oversized, peer).is_empty());
+        assert_eq!(
+            event_callback_urls(
+                "<http://192.168.1.10/events>",
+                "::ffff:192.168.1.10".parse().unwrap(),
+            ),
+            vec!["http://192.168.1.10/events".to_string()]
+        );
+        assert!(event_subscription_capacity_available(
+            UPNP_EVENT_MAX_SUBSCRIPTIONS - 1
+        ));
+        assert!(!event_subscription_capacity_available(
+            UPNP_EVENT_MAX_SUBSCRIPTIONS
+        ));
+    }
+
+    #[test]
+    fn resource_caps_event_renewal_and_unsubscribe_are_peer_bound() {
+        let sid = format!("uuid:{}", Uuid::new_v4());
+        let peer: IpAddr = "192.168.1.10".parse().unwrap();
+        dlna_event_subscriptions().unwrap().insert(
+            sid.clone(),
+            DlnaEventSubscription {
+                service: DlnaEventService::ContentDirectory,
+                peer_ip: peer,
+                expires_at: Instant::now() + StdDuration::from_secs(60),
+                callback_urls: vec!["http://192.168.1.10/events".to_string()],
+                next_seq: 1,
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("sid", sid.parse().unwrap());
+
+        let other_peer: IpAddr = "192.168.1.11".parse().unwrap();
+        let renewal = event_subscription_response(
+            DlnaEventService::ContentDirectory,
+            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+            &headers,
+            other_peer,
+        )
+        .unwrap();
+        assert_eq!(renewal.status(), StatusCode::PRECONDITION_FAILED);
+        let unsubscribe = event_subscription_response(
+            DlnaEventService::ContentDirectory,
+            &Method::from_bytes(b"UNSUBSCRIBE").unwrap(),
+            &headers,
+            other_peer,
+        )
+        .unwrap();
+        assert_eq!(unsubscribe.status(), StatusCode::PRECONDITION_FAILED);
+
+        let renewal = event_subscription_response(
+            DlnaEventService::ContentDirectory,
+            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+            &headers,
+            peer,
+        )
+        .unwrap();
+        assert_eq!(renewal.status(), StatusCode::OK);
+        let unsubscribe = event_subscription_response(
+            DlnaEventService::ContentDirectory,
+            &Method::from_bytes(b"UNSUBSCRIBE").unwrap(),
+            &headers,
+            "::ffff:192.168.1.10".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unsubscribe.status(), StatusCode::OK);
+        assert!(!dlna_event_subscriptions().unwrap().contains_key(&sid));
     }
 
     #[test]

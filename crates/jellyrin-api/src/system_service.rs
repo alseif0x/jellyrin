@@ -1,4 +1,4 @@
-use jellyrin_db::Database;
+use crate::Database;
 
 /// Persistence boundary for system-level runtime settings.
 pub(crate) struct SystemService<'a> {

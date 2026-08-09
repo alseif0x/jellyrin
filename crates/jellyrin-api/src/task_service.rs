@@ -1,6 +1,8 @@
-use jellyrin_db::{Database, TaskRun};
+use jellyrin_db::TaskRun;
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::Database;
 
 /// Persistence boundary for scheduled-task lifecycle and progress.
 pub(crate) struct TaskService<'a> {

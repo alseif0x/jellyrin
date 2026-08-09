@@ -5,6 +5,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { isPostgresUrl, prepareIsolatedPostgres } = require('./postgres-smoke');
 
 const repoRoot = path.resolve(__dirname, '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
@@ -27,59 +28,75 @@ async function main() {
     logs: path.join(root, 'var', 'log', 'jellyrin'),
     web: path.join(root, 'srv', 'jellyrin', 'web'),
   };
-  const checks = [];
-  const serviceText = await fs.readFile(path.join(repoRoot, 'ops', 'jellyrin.service'), 'utf8');
-  const envText = await fs.readFile(path.join(repoRoot, 'ops', 'jellyrin.env.example'), 'utf8');
-  checks.push(check('service-execstart-installed-path', serviceText.includes('ExecStart=/usr/local/bin/jellyrin-server')));
-  checks.push(check('service-env-file-installed-path', serviceText.includes('EnvironmentFile=/etc/jellyrin/jellyrin.env')));
+  let postgres = null;
+  try {
+    const checks = [];
+    const serviceText = await fs.readFile(path.join(repoRoot, 'ops', 'jellyrin.service'), 'utf8');
+    const envText = await fs.readFile(path.join(repoRoot, 'ops', 'jellyrin.env.example'), 'utf8');
+    checks.push(check('service-execstart-installed-path', serviceText.includes('ExecStart=/usr/local/bin/jellyrin-server')));
+    checks.push(check('service-env-file-installed-path', serviceText.includes('EnvironmentFile=/etc/jellyrin/jellyrin.env')));
+    checks.push(check('service-requires-migration-unit', serviceText.includes('Requires=jellyrin-migrate.service')));
 
-  await prepareInstallRoot(layout, serviceText);
-  const sourceBinary = await ensureServerBinary();
-  await fs.copyFile(sourceBinary, layout.execStart);
-  await fs.chmod(layout.execStart, 0o755);
-  const port = await availablePort();
-  const env = rewriteEnv(envText, layout, port);
-  await fs.writeFile(layout.envFile, renderEnvFile(env));
+    postgres = await prepareIsolatedPostgres('systemd_runtime');
+    await prepareInstallRoot(layout, serviceText);
+    const sourceBinary = await ensureServerBinary();
+    await fs.copyFile(sourceBinary, layout.execStart);
+    await fs.chmod(layout.execStart, 0o755);
+    const port = await availablePort();
+    const env = rewriteEnv(envText, layout, port, postgres.databaseUrl);
+    await fs.writeFile(layout.envFile, renderEnvFile(env), { mode: 0o600 });
 
-  const result = await runInstalledServer(layout.execStart, env, port);
-  checks.push(check('installed-binary-copied', await exists(layout.execStart)));
-  checks.push(check('env-data-dir-rewritten', env.JELLYRIN_DATA_DIR === layout.data));
-  checks.push(check('env-database-url-rewritten', env.DATABASE_URL === `sqlite://${path.join(layout.data, 'jellyrin.db')}?mode=rwc`));
-  checks.push(check('installed-runtime-healthz', result.health?.Status === 'Healthy'));
-  checks.push(check('installed-runtime-readyz', result.ready?.Status === 'Ready'));
-  checks.push(check('installed-runtime-public-info', publicInfoLooksCompatible(result.publicInfo)));
-  checks.push(check('installed-runtime-sqlite-created', await exists(path.join(layout.data, 'jellyrin.db'))));
-  checks.push(check('installed-runtime-server-stopped', result.stopped));
+    const result = await runInstalledServer(layout.execStart, env, port);
+    checks.push(check('installed-binary-copied', await exists(layout.execStart)));
+    checks.push(check('installed-env-file-private', ((await fs.stat(layout.envFile)).mode & 0o777) === 0o600));
+    checks.push(check('env-data-dir-rewritten', env.JELLYRIN_DATA_DIR === layout.data && env.JELLYRIN_TRANSCODE_DIR === path.join(layout.cache, 'transcodes')));
+    checks.push(check('env-database-url-rewritten', isPostgresUrl(env.DATABASE_URL)));
+    checks.push(check('postgres-schema-migrated', postgres.migrationCount > 0));
+    checks.push(check('installed-runtime-healthz', result.health?.Status === 'Healthy'));
+    checks.push(check('installed-runtime-readyz', result.ready?.Status === 'Ready'));
+    checks.push(check('installed-runtime-public-info', publicInfoLooksCompatible(result.publicInfo)));
+    checks.push(check('installed-runtime-no-local-database-file', !(await exists(path.join(layout.data, 'jellyrin.db')))));
+    checks.push(check('installed-runtime-server-stopped', result.stopped));
 
-  const failed = checks.filter((item) => item.status !== 'passed');
-  const evidence = {
-    generatedAt: new Date().toISOString(),
-    status: failed.length === 0 ? 'passed' : 'failed',
-    summary: {
-      passed: checks.length - failed.length,
-      failed: failed.length,
-      total: checks.length,
-    },
-    layout: redactTempRoot(layout),
-    sourceBinary: path.relative(repoRoot, sourceBinary),
-    installedCommand: '/usr/local/bin/jellyrin-server with EnvironmentFile=/etc/jellyrin/jellyrin.env',
-    checks,
-    commandResult: {
-      exit: result.exit,
-      stdoutTail: tail(result.stdout),
-      stderrTail: tail(result.stderr),
-    },
-  };
+    const failed = checks.filter((item) => item.status !== 'passed');
+    const evidence = {
+      generatedAt: new Date().toISOString(),
+      status: failed.length === 0 ? 'passed' : 'failed',
+      summary: {
+        passed: checks.length - failed.length,
+        failed: failed.length,
+        total: checks.length,
+      },
+      layout: redactTempRoot(layout),
+      database: {
+        engine: 'postgresql',
+        schema: '<isolated-qa-schema>',
+        appliedMigrations: postgres.migrationCount,
+      },
+      sourceBinary: path.relative(repoRoot, sourceBinary),
+      installedCommand: '/usr/local/bin/jellyrin-server with EnvironmentFile=/etc/jellyrin/jellyrin.env',
+      checks,
+      commandResult: {
+        exit: result.exit,
+        stdoutTail: tail(result.stdout),
+        stderrTail: tail(result.stderr),
+      },
+    };
 
-  await fs.mkdir(generatedDir, { recursive: true });
-  await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
-  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence));
-  await fs.rm(root, { recursive: true, force: true });
-  console.log(`wrote ${evidencePath}`);
-  console.log(`wrote ${evidenceMarkdownPath}`);
+    await fs.mkdir(generatedDir, { recursive: true });
+    await fs.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+    await fs.writeFile(evidenceMarkdownPath, renderMarkdown(evidence));
+    console.log(`wrote ${evidencePath}`);
+    console.log(`wrote ${evidenceMarkdownPath}`);
 
-  if (failed.length > 0) {
-    process.exitCode = 1;
+    if (failed.length > 0) {
+      process.exitCode = 1;
+    }
+  } finally {
+    if (postgres) {
+      await postgres.cleanup();
+    }
+    await fs.rm(root, { recursive: true, force: true });
   }
 }
 
@@ -104,9 +121,6 @@ async function ensureServerBinary() {
     return configured;
   }
   const binary = path.join(repoRoot, 'target', 'debug', 'jellyrin-server');
-  if (await exists(binary)) {
-    return binary;
-  }
   const build = await runCommand('cargo', ['build', '-p', 'jellyrin-server']);
   if (build.code !== 0) {
     throw new Error(`cargo build -p jellyrin-server failed: ${tail(build.stderr).join('\n')}`);
@@ -117,7 +131,7 @@ async function ensureServerBinary() {
   return binary;
 }
 
-function rewriteEnv(envText, layout, port) {
+function rewriteEnv(envText, layout, port, databaseUrl) {
   const env = parseEnv(envText);
   env.JELLYRIN_HOST = '127.0.0.1';
   env.JELLYRIN_PORT = String(port);
@@ -126,7 +140,8 @@ function rewriteEnv(envText, layout, port) {
   env.JELLYRIN_CACHE_DIR = layout.cache;
   env.JELLYRIN_LOG_DIR = layout.logs;
   env.JELLYRIN_WEB_DIR = layout.web;
-  env.DATABASE_URL = `sqlite://${path.join(layout.data, 'jellyrin.db')}?mode=rwc`;
+  env.JELLYRIN_TRANSCODE_DIR = path.join(layout.cache, 'transcodes');
+  env.DATABASE_URL = databaseUrl;
   env.RUST_LOG = process.env.RUST_LOG || 'jellyrin=warn,tower_http=warn';
   return env;
 }
@@ -179,7 +194,13 @@ async function runInstalledServer(binary, env, port) {
   let stopped = false;
   try {
     const baseUrl = `http://127.0.0.1:${port}`;
-    health = await waitForJson(`${baseUrl}/healthz`, startupTimeoutMs);
+    health = await waitForJson(`${baseUrl}/healthz`, startupTimeoutMs, () => {
+      if (!exit) {
+        return null;
+      }
+      const detail = tail(stderr).join('\n') || tail(stdout).join('\n') || 'no process output';
+      return new Error(`installed server exited before healthz (${JSON.stringify(exit)}): ${detail}`);
+    });
     ready = await fetchJson(`${baseUrl}/readyz`);
     publicInfo = await fetchJson(`${baseUrl}/System/Info/Public`);
   } finally {
@@ -215,7 +236,7 @@ function availablePort() {
   });
 }
 
-async function waitForJson(url, timeoutMs) {
+async function waitForJson(url, timeoutMs, processFailure = () => null) {
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
   while (Date.now() < deadline) {
@@ -223,6 +244,10 @@ async function waitForJson(url, timeoutMs) {
       return await fetchJson(url);
     } catch (error) {
       lastError = error;
+      const failure = processFailure();
+      if (failure) {
+        throw failure;
+      }
       await sleep(250);
     }
   }

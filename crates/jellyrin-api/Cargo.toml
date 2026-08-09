@@ -14,10 +14,12 @@ bytes.workspace = true
 futures-util.workspace = true
 jellyrin-compat = { path = "../jellyrin-compat" }
 jellyrin-core = { path = "../jellyrin-core" }
-jellyrin-db = { path = "../jellyrin-db" }
+jellyrin-db = { path = "../jellyrin-db", default-features = false }
 jellyrin-plugin-rpc = { path = "../jellyrin-plugin-rpc" }
+jellyrin-plugin-sdk = { path = "../jellyrin-plugin-sdk" }
 jellyrin-transcode = { path = "../jellyrin-transcode" }
 jellyrin-xtream-provider = { path = "../jellyrin-xtream-provider" }
+libc.workspace = true
 notify.workspace = true
 notify-debouncer-mini.workspace = true
 rand_core.workspace = true
@@ -26,17 +28,19 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+zip.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
 http-body-util.workspace = true
+jellyrin-db = { path = "../jellyrin-db", default-features = false, features = ["sqlite"] }
 serial_test.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true

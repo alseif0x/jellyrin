@@ -1524,6 +1524,10 @@ mod tests {
 
     #[tokio::test]
     async fn dotnet_host_executes_declared_assembly_for_capability() {
+        if !dotnet_test_sdk_available() {
+            eprintln!("skipping .NET assembly fixture: .NET 10 SDK is unavailable");
+            return;
+        }
         let temp = tempdir().unwrap();
         let plugin_dir = temp.path().join("plugin");
         tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
@@ -1580,6 +1584,10 @@ mod tests {
 
     #[tokio::test]
     async fn dotnet_host_invokes_declared_reflection_method_for_capability() {
+        if !dotnet_test_sdk_available() {
+            eprintln!("skipping .NET reflection fixture: .NET 10 SDK is unavailable");
+            return;
+        }
         let temp = tempdir().unwrap();
         let plugin_dir = temp.path().join("plugin");
         tokio::fs::create_dir_all(&plugin_dir).await.unwrap();
@@ -1772,35 +1780,48 @@ public sealed class PluginEntry
         );
     }
 
-    fn dotnet_sdk_root() -> PathBuf {
+    fn try_dotnet_sdk_root() -> Option<PathBuf> {
         let output = std::process::Command::new(dotnet_command())
             .arg("--info")
             .output()
-            .unwrap();
-        assert!(output.status.success(), "dotnet --info failed");
-        let text = String::from_utf8(output.stdout).unwrap();
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
         for line in text.lines() {
             if let Some(path) = line.trim().strip_prefix("Base Path:") {
-                return PathBuf::from(path.trim());
+                return Some(PathBuf::from(path.trim()));
             }
         }
-        panic!("dotnet --info did not include SDK base path");
+        None
     }
 
-    fn dotnet_ref_dir() -> PathBuf {
+    fn dotnet_sdk_root() -> PathBuf {
+        try_dotnet_sdk_root().expect("dotnet --info did not include a usable SDK base path")
+    }
+
+    fn try_dotnet_ref_dir() -> Option<PathBuf> {
         let dotnet_root = std::env::var_os("DOTNET_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/usr/local/share/dotnet"));
         let pack_root = dotnet_root.join("packs").join("Microsoft.NETCore.App.Ref");
         let mut versions = std::fs::read_dir(&pack_root)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
             .filter(|path| path.join("ref/net10.0").is_dir())
             .collect::<Vec<_>>();
         versions.sort();
-        versions
-            .pop()
-            .expect("missing Microsoft.NETCore.App.Ref net10.0 pack")
-            .join("ref/net10.0")
+        versions.pop().map(|path| path.join("ref/net10.0"))
+    }
+
+    fn dotnet_ref_dir() -> PathBuf {
+        try_dotnet_ref_dir().expect("missing Microsoft.NETCore.App.Ref net10.0 pack")
+    }
+
+    fn dotnet_test_sdk_available() -> bool {
+        try_dotnet_sdk_root().is_some_and(|root| root.join("Roslyn/bincore/csc.dll").is_file())
+            && try_dotnet_ref_dir().is_some()
     }
 }

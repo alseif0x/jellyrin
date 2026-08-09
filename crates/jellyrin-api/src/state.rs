@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use jellyrin_db::Database;
+use crate::Database;
 
 #[derive(Clone)]
 pub struct AppState {

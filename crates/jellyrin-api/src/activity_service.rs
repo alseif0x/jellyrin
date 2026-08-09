@@ -1,5 +1,6 @@
-use jellyrin_db::Database;
 use uuid::Uuid;
+
+use crate::Database;
 
 /// Persistence boundary for activity/audit entries emitted by the API.
 pub(crate) struct ActivityService<'a> {

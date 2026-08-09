@@ -1,9 +1,8 @@
 use axum::http::HeaderMap;
 use jellyrin_core::{DeviceToken, User};
-use jellyrin_db::Database;
 use uuid::Uuid;
 
-use crate::ApiError;
+use crate::{ApiError, Database};
 
 #[derive(Debug)]
 pub(crate) struct ClientAuth {

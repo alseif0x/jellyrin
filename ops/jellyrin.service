@@ -1,7 +1,8 @@
 [Unit]
 Description=Jellyrin media server
 Documentation=https://github.com/alseif0x/jellyrin
-After=network-online.target
+Requires=jellyrin-migrate.service
+After=network-online.target jellyrin-migrate.service
 Wants=network-online.target
 
 [Service]
@@ -9,18 +10,49 @@ Type=simple
 User=jellyrin
 Group=jellyrin
 EnvironmentFile=/etc/jellyrin/jellyrin.env
+# PID 1 reads the root-only source and exposes an immutable, per-unit copy. Keep the
+# source outside ConfigurationDirectory because a fresh systemd-created config directory
+# can be owned by the service identity.
+LoadCredential=provider-secret-keyring.json:/etc/jellyrin-secrets/provider-secret-keyring.json
+Environment=JELLYRIN_PROVIDER_SECRET_KEYRING_FILE=%d/provider-secret-keyring.json
 ExecStart=/usr/local/bin/jellyrin-server
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=45
+KillMode=control-group
 StateDirectory=jellyrin
+StateDirectoryMode=0750
 CacheDirectory=jellyrin
+CacheDirectoryMode=0750
 LogsDirectory=jellyrin
+LogsDirectoryMode=0750
 ConfigurationDirectory=jellyrin
+ConfigurationDirectoryMode=0750
 ReadWritePaths=/var/lib/jellyrin /var/cache/jellyrin /var/log/jellyrin /etc/jellyrin
+UMask=0077
+LimitNOFILE=8192
+TasksMax=256
+# The quota covers every FFmpeg child in this service cgroup and preserves host capacity for
+# PostgreSQL and the OS. Override it with a systemd drop-in after measuring the target host.
+CPUQuota=150%
+MemoryHigh=1536M
+MemoryMax=2G
+OOMPolicy=stop
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectHome=true
 ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

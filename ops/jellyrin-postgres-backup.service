@@ -1,0 +1,36 @@
+[Unit]
+Description=Encrypted Jellyrin PostgreSQL backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jellyrin-backup
+Group=jellyrin-backup
+UMask=0077
+Environment=JELLYRIN_POSTGRES_BACKUP_DIR=/var/backups/jellyrin-postgres
+Environment=JELLYRIN_POSTGRES_BACKUP_SERVICE=jellyrin-backup
+Environment=JELLYRIN_POSTGRES_BACKUP_AGE_RECIPIENTS=%d/age-recipients.txt
+Environment=PGSERVICEFILE=%d/pg_service.conf
+Environment=PGPASSFILE=%d/pgpass
+EnvironmentFile=-/etc/jellyrin/postgres-backup.env
+LoadCredential=age-recipients.txt:/etc/jellyrin-backup/age-recipients.txt
+LoadCredential=pg_service.conf:/etc/jellyrin-backup/pg_service.conf
+LoadCredential=pgpass:/etc/jellyrin-backup/pgpass
+ExecStart=/usr/local/libexec/jellyrin/postgres-backup
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/jellyrin-postgres
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+

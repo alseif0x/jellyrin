@@ -1,30 +1,138 @@
 services:
+  # Keep infrastructure definitions in one place while making this the complete entrypoint:
+  # `docker compose up -d --build` starts PostgreSQL, migrates, then starts Jellyrin.
+  postgres:
+    extends:
+      file: docker-compose.infrastructure.yml
+      service: postgres
+
+  redis:
+    # Repeat the profile at the top-level entrypoint so Redis cannot become a
+    # default dependency if Compose `extends` behavior or this file changes.
+    profiles: ["cache", "distributed-cache"]
+    extends:
+      file: docker-compose.infrastructure.yml
+      service: redis
+
+  jellyrin-migrate:
+    build:
+      context: .
+      args:
+        RUST_IMAGE: ${RUST_IMAGE:-rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260808T000000Z}
+        FFMPEG_PACKAGE_VERSION: ${FFMPEG_PACKAGE_VERSION:-7:5.1.9-0+deb12u1}
+        FFMPEG_UPSTREAM_VERSION: ${FFMPEG_UPSTREAM_VERSION:-5.1.9}
+        VCS_REF: ${JELLYRIN_VCS_REF:-local}
+    image: ${JELLYRIN_IMAGE:-jellyrin:local}
+    restart: "no"
+    entrypoint: ["/usr/local/bin/jellyrin-migrate"]
+    command: ["schema"]
+    environment:
+      DATABASE_URL: >-
+        postgresql://jellyrin_migrator:${POSTGRES_MIGRATOR_PASSWORD:?set POSTGRES_MIGRATOR_PASSWORD in .env}@postgres:5432/jellyrin?sslmode=disable
+      RUST_LOG: jellyrin_migrate=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - jellyrin-backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.50
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+
   jellyrin:
     build:
       context: .
-    image: jellyrin:local
-    container_name: jellyrin
+      args:
+        RUST_IMAGE: ${RUST_IMAGE:-rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241}
+        DEBIAN_SNAPSHOT: ${DEBIAN_SNAPSHOT:-20260808T000000Z}
+        FFMPEG_PACKAGE_VERSION: ${FFMPEG_PACKAGE_VERSION:-7:5.1.9-0+deb12u1}
+        FFMPEG_UPSTREAM_VERSION: ${FFMPEG_UPSTREAM_VERSION:-5.1.9}
+        VCS_REF: ${JELLYRIN_VCS_REF:-local}
+    image: ${JELLYRIN_IMAGE:-jellyrin:local}
     restart: unless-stopped
     env_file:
-      - ./ops/jellyrin.env.example
+      - ${JELLYRIN_ENV_FILE:-./ops/jellyrin.env.example}
+    environment:
+      # Runtime credentials cannot create or alter persistent schema objects.
+      JELLYRIN_DB_DRIVER: postgresql
+      DATABASE_URL: >-
+        postgresql://jellyrin_runtime:${POSTGRES_RUNTIME_PASSWORD:?set POSTGRES_RUNTIME_PASSWORD in .env}@postgres:5432/jellyrin?sslmode=disable
+      # Keep the container port and published target coherent even when a custom env_file
+      # contains a stale JELLYRIN_PORT value. Change only the host-side port below.
+      # The process listens on the container interface; Docker publishes it only on host loopback.
+      JELLYRIN_HOST: "0.0.0.0"
+      JELLYRIN_PORT: "8096"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      jellyrin-migrate:
+        condition: service_completed_successfully
     ports:
-      - "8096:8096"
+      - "${JELLYRIN_PUBLISH_ADDRESS:-127.0.0.1}:${JELLYRIN_HOST_PORT:-8096}:8096"
     volumes:
       - jellyrin-data:/var/lib/jellyrin
       - jellyrin-cache:/var/cache/jellyrin
+      - jellyrin-transcodes:/var/cache/jellyrin/transcodes
       - jellyrin-logs:/var/log/jellyrin
       - jellyrin-config:/etc/jellyrin
       - ./web:/srv/jellyrin/web:ro
-      - ./media:/media:ro
+    networks:
+      # The edge network preserves outbound access to external media providers. Only the
+      # internal backend network can reach PostgreSQL and the dormant Redis benchmark scaffold.
+      - jellyrin-edge
+      - jellyrin-backend
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${JELLYRIN_MEMORY_LIMIT:-2g}
+    cpus: ${JELLYRIN_CPU_LIMIT:-1.5}
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
+    stop_grace_period: 45s
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8096/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
 volumes:
+  jellyrin-postgres:
   jellyrin-data:
   jellyrin-cache:
+  jellyrin-transcodes:
   jellyrin-logs:
   jellyrin-config:
+
+networks:
+  jellyrin-backend:
+    internal: true
+  jellyrin-edge:

@@ -1,6 +1,8 @@
 use jellyrin_core::VirtualFolder;
-use jellyrin_db::{Database, MediaList};
+use jellyrin_db::MediaList;
 use uuid::Uuid;
+
+use crate::Database;
 
 /// Persistence boundary for library folders and media-list lifecycle.
 pub(crate) struct LibraryService<'a> {

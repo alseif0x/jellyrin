@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
+use zeroize::Zeroize;
 
 pub const TARGET_ABI: &str = "jellyrin-wasi-0.1";
 pub const CAPABILITY_SCHEDULED_TASK: &str = "ScheduledTask";
@@ -14,6 +15,9 @@ pub const CAPABILITY_METADATA_PROVIDER: &str = "MetadataProvider";
 pub const CAPABILITY_IMAGE_PROVIDER: &str = "ImageProvider";
 pub const CAPABILITY_CHANNEL_PROVIDER: &str = "ChannelProvider";
 pub const CAPABILITY_LIVE_TV_PROVIDER: &str = "LiveTvProvider";
+/// Permission a plugin must request in its manifest, and an administrator must grant, before
+/// Jellyrin may issue ephemeral provider-secret grants to it.
+pub const PERMISSION_PROVIDER_SECRETS: &str = "ProviderSecrets";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -335,7 +339,121 @@ impl ChannelResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A string containing secret material.
+///
+/// Serialization is intentionally transparent for the short-lived plugin RPC message. Debug
+/// output is always redacted and the owned allocation is zeroized when it is dropped.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveString(String);
+
+impl SensitiveString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Exposes the secret only at the point where it is needed by the provider implementation.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+
+    /// Transfers ownership to another secret-bearing type without cloning the allocation.
+    ///
+    /// The caller becomes responsible for zeroizing the returned `String`; this is intended for
+    /// moving a grant into a provider's own zeroizing credential container.
+    pub fn into_secret(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl std::fmt::Debug for SensitiveString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SensitiveString([REDACTED])")
+    }
+}
+
+impl Zeroize for SensitiveString {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for SensitiveString {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+/// Credentials released to one plugin invocation only.
+///
+/// The host must validate the complete scope and the `ProviderSecrets` permission before
+/// creating this value. Plugins must reject a grant whose plugin, tuner, or action binding does
+/// not match the invocation they are handling.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveTvProviderSecretGrant {
+    pub plugin_id: String,
+    pub tuner_id: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    pub username: SensitiveString,
+    pub password: SensitiveString,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, SensitiveString>,
+}
+
+impl LiveTvProviderSecretGrant {
+    pub fn new(
+        plugin_id: impl Into<String>,
+        tuner_id: impl Into<String>,
+        action: impl Into<String>,
+        username: SensitiveString,
+        password: SensitiveString,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            tuner_id: tuner_id.into(),
+            action: action.into(),
+            secret_id: None,
+            revision: None,
+            username,
+            password,
+            fields: BTreeMap::new(),
+        }
+    }
+
+    pub fn secret_reference(mut self, secret_id: impl Into<String>, revision: i64) -> Self {
+        self.secret_id = Some(secret_id.into());
+        self.revision = Some(revision);
+        self
+    }
+
+    pub fn field(mut self, name: impl Into<String>, value: SensitiveString) -> Self {
+        self.fields.insert(name.into(), value);
+        self
+    }
+}
+
+impl std::fmt::Debug for LiveTvProviderSecretGrant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveTvProviderSecretGrant")
+            .field("plugin_id", &self.plugin_id)
+            .field("tuner_id", &self.tuner_id)
+            .field("action", &self.action)
+            .field("secret_id_present", &self.secret_id.is_some())
+            .field("revision_present", &self.revision.is_some())
+            .field("username_present", &true)
+            .field("password_present", &true)
+            .field("additional_fields_present", &(!self.fields.is_empty()))
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct LiveTvProviderRequest {
     pub action: String,
@@ -343,6 +461,20 @@ pub struct LiveTvProviderRequest {
     pub tuner_config: Value,
     #[serde(default)]
     pub arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_grant: Option<LiveTvProviderSecretGrant>,
+}
+
+impl std::fmt::Debug for LiveTvProviderRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveTvProviderRequest")
+            .field("action", &self.action)
+            .field("tuner_config", &"[REDACTED]")
+            .field("arguments", &"[REDACTED]")
+            .field("secret_grant", &self.secret_grant)
+            .finish()
+    }
 }
 
 impl LiveTvProviderRequest {
@@ -351,6 +483,7 @@ impl LiveTvProviderRequest {
             action: "ImportChannels".to_string(),
             tuner_config,
             arguments: json!({}),
+            secret_grant: None,
         }
     }
 
@@ -359,6 +492,7 @@ impl LiveTvProviderRequest {
             action: "ImportPrograms".to_string(),
             tuner_config,
             arguments: json!({}),
+            secret_grant: None,
         }
     }
 
@@ -367,8 +501,112 @@ impl LiveTvProviderRequest {
             action: "SyncMedia".to_string(),
             tuner_config,
             arguments: json!({}),
+            secret_grant: None,
         }
     }
+
+    /// Requests an ephemeral playback URL for an opaque catalog reference. Credentials and
+    /// signed URLs must never be embedded in `provider_reference` or persisted by the server.
+    pub fn resolve_playback(
+        tuner_config: Value,
+        provider_reference: impl Into<String>,
+        context: LiveTvPlaybackContext,
+    ) -> Self {
+        let mut arguments = serde_json::to_value(context)
+            .expect("LiveTvPlaybackContext must serialize as an object");
+        if let Value::Object(object) = &mut arguments {
+            object.insert(
+                "ProviderReference".to_string(),
+                Value::String(provider_reference.into()),
+            );
+        }
+        Self {
+            action: "ResolvePlayback".to_string(),
+            tuner_config,
+            arguments,
+            secret_grant: None,
+        }
+    }
+
+    pub fn with_secret_grant(mut self, secret_grant: LiveTvProviderSecretGrant) -> Self {
+        self.secret_grant = Some(secret_grant);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveTvPlaybackContext {
+    /// Trusted public egress address used by the provider sidecar, never the viewer's address.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "ClientIp")]
+    pub egress_ip: Option<String>,
+    pub delivery_capabilities: LiveTvDeliveryCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveTvDeliveryCapabilities {
+    pub direct_proxy: bool,
+    pub hls_remux: bool,
+}
+
+/// A secret URL that can cross the plugin RPC boundary without becoming printable through
+/// `Debug`. Callers should expose it only at the point that opens the upstream connection.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveUrl(String);
+
+impl SensitiveUrl {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SensitiveUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SensitiveUrl([REDACTED])")
+    }
+}
+
+impl Zeroize for SensitiveUrl {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for SensitiveUrl {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveTvPlaybackDelivery {
+    pub container: String,
+    pub preferred: String,
+    pub requires_provider_egress: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_codec: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LiveTvPlaybackResult {
+    pub source_url: SensitiveUrl,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub delivery: LiveTvPlaybackDelivery,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_streams: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -646,7 +884,7 @@ impl CapabilityRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CapabilityResponse {
     pub status: String,
@@ -654,6 +892,17 @@ pub struct CapabilityResponse {
     pub capability: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+}
+
+impl std::fmt::Debug for CapabilityResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapabilityResponse")
+            .field("status", &self.status)
+            .field("capability", &self.capability)
+            .field("result", &self.result.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl CapabilityResponse {
@@ -698,6 +947,13 @@ impl CapabilityResponse {
         Self::executed(
             CAPABILITY_LIVE_TV_PROVIDER,
             serde_json::to_value(result).expect("LiveTvProviderResult must serialize"),
+        )
+    }
+
+    pub fn live_tv_playback(result: LiveTvPlaybackResult) -> Self {
+        Self::executed(
+            CAPABILITY_LIVE_TV_PROVIDER,
+            serde_json::to_value(result).expect("LiveTvPlaybackResult must serialize"),
         )
     }
 
@@ -789,6 +1045,167 @@ mod tests {
         assert_eq!(value["TaskName"], "Fixture Task");
         assert_eq!(value["ItemsProcessed"], 3);
         assert!(value.get("Result").is_none());
+    }
+
+    #[test]
+    fn live_tv_playback_contract_keeps_source_url_out_of_debug_output() {
+        let request = LiveTvProviderRequest::resolve_playback(
+            json!({"SecretReference": "provider/account-a"}),
+            "provider:v1:opaque.signature",
+            LiveTvPlaybackContext {
+                egress_ip: Some("203.0.113.7".to_string()),
+                delivery_capabilities: LiveTvDeliveryCapabilities {
+                    direct_proxy: true,
+                    hls_remux: true,
+                },
+            },
+        );
+        let request = serde_json::to_value(request).unwrap();
+        assert_eq!(request["Action"], "ResolvePlayback");
+        assert_eq!(
+            request["Arguments"]["ProviderReference"],
+            "provider:v1:opaque.signature"
+        );
+        assert_eq!(request["Arguments"]["EgressIp"], "203.0.113.7");
+
+        let playback = LiveTvPlaybackResult {
+            source_url: SensitiveUrl::new("https://provider.invalid/signed?token=secret"),
+            expires_at: Some("2030-01-01T00:00:00Z".to_string()),
+            delivery: LiveTvPlaybackDelivery {
+                container: "MpegTs".to_string(),
+                preferred: "DirectProxy".to_string(),
+                requires_provider_egress: true,
+                fallback: Some("HlsRemux".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            },
+            media_streams: Vec::new(),
+        };
+        let debug = format!("{playback:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("token=secret"));
+        let response = CapabilityResponse::live_tv_playback(playback);
+        let response_debug = format!("{response:?}");
+        assert!(response_debug.contains("[REDACTED]"));
+        assert!(!response_debug.contains("token=secret"));
+        let wire = response.into_host_value();
+        assert_eq!(
+            wire["SourceUrl"],
+            "https://provider.invalid/signed?token=secret"
+        );
+    }
+
+    #[test]
+    fn live_tv_provider_request_without_grant_remains_wire_compatible() {
+        let legacy_wire = json!({
+            "Action": "ImportChannels",
+            "TunerConfig": { "Type": "plugin:magstv" },
+            "Arguments": {}
+        });
+
+        let request: LiveTvProviderRequest = serde_json::from_value(legacy_wire.clone()).unwrap();
+        assert!(request.secret_grant.is_none());
+        assert_eq!(serde_json::to_value(request).unwrap(), legacy_wire);
+
+        let constructed =
+            serde_json::to_value(LiveTvProviderRequest::import_channels(json!({}))).unwrap();
+        assert!(constructed.get("SecretGrant").is_none());
+    }
+
+    #[test]
+    fn live_tv_provider_secret_grant_uses_pascal_case_wire_contract() {
+        let request = LiveTvProviderRequest::import_channels(json!({
+            "Type": "plugin:magstv"
+        }))
+        .with_secret_grant(
+            LiveTvProviderSecretGrant::new(
+                "magstv-plugin",
+                "tuner-a",
+                "ImportChannels",
+                SensitiveString::new("provider-user"),
+                SensitiveString::new("provider-password"),
+            )
+            .secret_reference("secret-a", 7)
+            .field("DeviceId", SensitiveString::new("device-secret")),
+        );
+
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["SecretGrant"]["PluginId"], "magstv-plugin");
+        assert_eq!(wire["SecretGrant"]["TunerId"], "tuner-a");
+        assert_eq!(wire["SecretGrant"]["Action"], "ImportChannels");
+        assert_eq!(wire["SecretGrant"]["SecretId"], "secret-a");
+        assert_eq!(wire["SecretGrant"]["Revision"], 7);
+        assert_eq!(wire["SecretGrant"]["Username"], "provider-user");
+        assert_eq!(wire["SecretGrant"]["Password"], "provider-password");
+        assert_eq!(wire["SecretGrant"]["Fields"]["DeviceId"], "device-secret");
+
+        let decoded: LiveTvProviderRequest = serde_json::from_value(wire).unwrap();
+        let grant = decoded.secret_grant.unwrap();
+        assert_eq!(grant.username.expose_secret(), "provider-user");
+        assert_eq!(grant.password.expose_secret(), "provider-password");
+        assert_eq!(grant.fields["DeviceId"].expose_secret(), "device-secret");
+    }
+
+    #[test]
+    fn live_tv_provider_secret_debug_reveals_scope_but_never_values() {
+        let request = LiveTvProviderRequest::import_channels(json!({
+            "LegacyPassword": "legacy-config-secret"
+        }))
+        .with_secret_grant(
+            LiveTvProviderSecretGrant::new(
+                "magstv-plugin",
+                "tuner-a",
+                "ImportChannels",
+                SensitiveString::new("provider-user"),
+                SensitiveString::new("provider-password"),
+            )
+            .secret_reference("secret-identifier", 7)
+            .field("DeviceSecret", SensitiveString::new("device-secret")),
+        );
+
+        let debug = format!("{request:?}");
+        assert!(debug.contains("magstv-plugin"));
+        assert!(debug.contains("tuner-a"));
+        assert!(debug.contains("ImportChannels"));
+        assert!(debug.contains("secret_id_present: true"));
+        assert!(debug.contains("additional_fields_present: true"));
+        for secret in [
+            "legacy-config-secret",
+            "provider-user",
+            "provider-password",
+            "secret-identifier",
+            "device-secret",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn sensitive_string_is_transparent_redacted_and_zeroizable() {
+        let mut secret = SensitiveString::new("provider-password");
+        assert_eq!(serde_json::to_value(&secret).unwrap(), "provider-password");
+        assert_eq!(format!("{secret:?}"), "SensitiveString([REDACTED])");
+
+        secret.zeroize();
+        assert!(secret.expose_secret().is_empty());
+
+        let mut transferred = SensitiveString::new("one-use-secret").into_secret();
+        assert_eq!(transferred, "one-use-secret");
+        transferred.zeroize();
+        assert!(transferred.is_empty());
+    }
+
+    #[test]
+    fn sensitive_url_is_transparent_redacted_and_zeroizable() {
+        let mut url = SensitiveUrl::new("https://provider.invalid/live?token=secret");
+        assert_eq!(
+            serde_json::to_value(&url).unwrap(),
+            "https://provider.invalid/live?token=secret"
+        );
+        assert_eq!(format!("{url:?}"), "SensitiveUrl([REDACTED])");
+
+        url.zeroize();
+        assert!(url.expose_secret().is_empty());
     }
 
     #[test]

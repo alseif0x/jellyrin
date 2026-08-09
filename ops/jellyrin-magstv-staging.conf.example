@@ -1,0 +1,6 @@
+[Service]
+# Staging only: permits an ExternalProcess package whose SourceUrl is a regular
+# file already provisioned on this host. Production releases must use HTTPS and
+# a published checksum-pinned repository instead.
+Environment=JELLYRIN_ALLOW_LOCAL_EXTERNAL_PLUGIN_PACKAGES=true
+ReadOnlyPaths=/srv/jellyrin/plugin-repository

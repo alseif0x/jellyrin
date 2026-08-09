@@ -1,0 +1,29 @@
+# Temporary HTTP-only vhost used to obtain the first certificate without
+# stopping nginx or exposing Jellyrin before TLS is available.
+# This file is included inside nginx's `http` context. Keep query strings out
+# of the bootstrap log too: clients may discover the hostname before TLS exists.
+log_format jellyrin_path_only
+    '$remote_addr - $remote_user [$time_local] '
+    '"$request_method $uri $server_protocol" $status $body_bytes_sent '
+    '"$http_user_agent"';
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name jellyrin.test.kode.live;
+
+    access_log /var/log/nginx/jellyrin.access.log jellyrin_path_only;
+    # Nginx error messages can contain the complete request line. At this level only
+    # process-level failures are retained; application failures stay in Jellyrin logs.
+    error_log /var/log/nginx/jellyrin.error.log crit;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+
+    location / {
+        return 503;
+    }
+}

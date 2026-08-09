@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "test:e2e": "playwright test",
+    "test:e2e:web-readers": "playwright test qa/e2e/web-readers.spec.js --project=chromium --workers=1",
     "test:e2e:playback-hls": "playwright test qa/e2e/deployed-playback-hls.spec.js",
     "test:e2e:playback-hls:jellyrin": "JELLYRIN_E2E_DEPLOYED=1 JELLYRIN_E2E_NO_WEBSERVER=1 JELLYRIN_E2E_BASE_URL=${JELLYRIN_BASE_URL:-http://127.0.0.1:8097} playwright test qa/e2e/deployed-playback-hls.spec.js",
     "test:e2e:playback-hls:jellyfin": "JELLYRIN_E2E_DEPLOYED=1 JELLYRIN_E2E_NO_WEBSERVER=1 JELLYRIN_E2E_BASE_URL=${JELLYFIN_BASE_URL:-http://127.0.0.1:8096} playwright test qa/e2e/deployed-playback-hls.spec.js",
@@ -15,6 +16,8 @@
     "qa:playback-compat": "node qa/playback-compat-runner.js",
     "qa:xtream-probe": "node qa/xtream-probe.js",
     "qa:xtream-configure": "node qa/xtream-configure-jellyrin.js",
+    "qa:magstv-configure": "node qa/magstv-configure-jellyrin.js",
+    "qa:magstv-configure:test": "node --test qa/magstv-configure-jellyrin.test.js",
     "golden:api": "node qa/golden/api-parity.js",
     "golden:browser": "node qa/golden/browser-trace.js",
     "golden:startup-wizard": "node qa/golden/startup-wizard-runner.js",
@@ -50,7 +53,8 @@
     "qa:packaging-release": "node qa/packaging-release.js",
     "qa:release-install-smoke": "node qa/release-install-smoke.js",
     "qa:systemd-runtime-smoke": "node qa/systemd-runtime-smoke.js",
-    "qa:systemd-unit-smoke": "node qa/systemd-unit-smoke.js"
+    "qa:systemd-unit-smoke": "node qa/systemd-unit-smoke.js",
+    "qa:postgres-operations": "node --test qa/postgres-operations.test.js"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2"

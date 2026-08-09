@@ -1,0 +1,7 @@
+[Service]
+# Local peer authentication does not use a password file. Reset the generic
+# credential list and retain only the two credentials required on this host.
+Environment=PGPASSFILE=
+LoadCredential=
+LoadCredential=age-recipients.txt:/etc/jellyrin-backup/age-recipients.txt
+LoadCredential=pg_service.conf:/etc/jellyrin-backup/pg_service.conf

@@ -5,6 +5,7 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { prepareIsolatedPostgres } = require('./postgres-smoke');
 
 const repoRoot = path.resolve(__dirname, '..');
 const defaultPlansDir = path.resolve(repoRoot, '..', '..', 'plans');
@@ -24,86 +25,101 @@ async function main() {
     logs: path.join(root, 'var', 'log', 'jellyrin'),
     web: path.join(root, 'srv', 'jellyrin', 'web'),
   };
-  for (const dir of [layout.data, layout.config, layout.cache, layout.logs, layout.web]) {
-    await fs.mkdir(dir, { recursive: true });
-  }
-  const databasePath = path.join(layout.data, 'jellyrin.db');
-  const databaseUrl = `sqlite://${databasePath}?mode=rwc`;
-  const checks = [];
-  const commandResults = [];
+  let postgres = null;
+  try {
+    for (const dir of [layout.data, layout.config, layout.cache, layout.logs, layout.web]) {
+      await fs.mkdir(dir, { recursive: true });
+    }
+    postgres = await prepareIsolatedPostgres('release_install');
+    const databaseUrl = postgres.databaseUrl;
+    const checks = [];
+    const commandResults = [];
 
-  const first = await runServerPhase(layout, databaseUrl, 'fresh-install');
-  commandResults.push(first.commandResult);
-  checks.push(check('server-healthz', first.health.Status === 'Healthy'));
-  checks.push(check('server-readyz', first.ready.Status === 'Ready'));
-  checks.push(check('public-info', publicInfoLooksCompatible(first.publicInfo)));
-  checks.push(check('fresh-install-server-stopped', first.stopped));
-  checks.push(check('data-dir-created', await exists(layout.data)));
-  checks.push(check('config-dir-created', await exists(layout.config)));
-  checks.push(check('cache-dir-created', await exists(layout.cache)));
-  checks.push(check('log-dir-created', await exists(layout.logs)));
-  checks.push(check('sqlite-created', await exists(databasePath)));
+    const first = await runServerPhase(layout, databaseUrl, 'fresh-install');
+    commandResults.push(first.commandResult);
+    checks.push(check('postgres-schema-migrated', postgres.migrationCount > 0));
+    checks.push(check('server-healthz', first.health.Status === 'Healthy'));
+    checks.push(check('server-readyz', first.ready.Status === 'Ready'));
+    checks.push(check('public-info', publicInfoLooksCompatible(first.publicInfo)));
+    checks.push(check('fresh-install-server-stopped', first.stopped));
+    checks.push(check('data-dir-created', await exists(layout.data)));
+    checks.push(check('config-dir-created', await exists(layout.config)));
+    checks.push(check('cache-dir-created', await exists(layout.cache)));
+    checks.push(check('log-dir-created', await exists(layout.logs)));
+    checks.push(check('no-runtime-sqlite-file', !(await exists(path.join(layout.data, 'jellyrin.db')))));
 
-  const configMarker = path.join(layout.config, 'release-smoke-marker.json');
-  await fs.writeFile(configMarker, `${JSON.stringify({ phase: 'baseline' }, null, 2)}\n`);
-  const rollbackDir = path.join(root, 'rollback');
-  const rollbackDatabasePath = path.join(rollbackDir, 'jellyrin.db');
-  const rollbackConfigDir = path.join(rollbackDir, 'config');
-  await fs.mkdir(rollbackDir, { recursive: true });
-  await backupSqliteDatabase(databasePath, rollbackDatabasePath);
-  await fs.cp(layout.config, rollbackConfigDir, { recursive: true });
+    const configMarker = path.join(layout.config, 'release-smoke-marker.json');
+    await fs.writeFile(configMarker, `${JSON.stringify({ phase: 'baseline' }, null, 2)}\n`);
+    const rollbackDir = path.join(root, 'rollback');
+    const rollbackDatabaseDump = path.join(rollbackDir, 'jellyrin-postgres.dump');
+    const rollbackConfigDir = path.join(rollbackDir, 'config');
+    await fs.mkdir(rollbackDir, { recursive: true });
+    await postgres.backup(rollbackDatabaseDump);
+    await fs.cp(layout.config, rollbackConfigDir, { recursive: true });
+    checks.push(check('postgres-backup-created', await exists(rollbackDatabaseDump)));
 
-  const second = await runServerPhase(layout, databaseUrl, 'upgrade-restart', async (baseUrl) => {
-    const startupConfig = await fetchJson(`${baseUrl}/Startup/Configuration`);
-    startupConfig.ServerName = 'Release Smoke Mutated';
-    await postJson(`${baseUrl}/Startup/Configuration`, startupConfig);
-    return fetchJson(`${baseUrl}/System/Info/Public`);
-  });
-  commandResults.push(second.commandResult);
-  checks.push(check('upgrade-restart-healthz', second.health.Status === 'Healthy'));
-  checks.push(check('upgrade-restart-readyz', second.ready.Status === 'Ready'));
-  checks.push(check('upgrade-restart-preserves-server-id', second.publicInfo.Id === first.publicInfo.Id));
-  checks.push(check('upgrade-restart-mutates-state', second.extra?.ServerName === 'Release Smoke Mutated'));
-  checks.push(check('upgrade-restart-server-stopped', second.stopped));
+    const second = await runServerPhase(layout, databaseUrl, 'upgrade-restart', async (baseUrl) => {
+      const startupConfig = await fetchJson(`${baseUrl}/Startup/Configuration`);
+      startupConfig.ServerName = 'Release Smoke Mutated';
+      await postJson(`${baseUrl}/Startup/Configuration`, startupConfig);
+      return fetchJson(`${baseUrl}/System/Info/Public`);
+    });
+    commandResults.push(second.commandResult);
+    checks.push(check('upgrade-restart-healthz', second.health.Status === 'Healthy'));
+    checks.push(check('upgrade-restart-readyz', second.ready.Status === 'Ready'));
+    checks.push(check('upgrade-restart-preserves-server-id', second.publicInfo.Id === first.publicInfo.Id));
+    checks.push(check('upgrade-restart-mutates-state', second.extra?.ServerName === 'Release Smoke Mutated'));
+    checks.push(check('upgrade-restart-server-stopped', second.stopped));
 
-  await restoreSqliteDatabase(rollbackDatabasePath, databasePath);
-  await fs.rm(layout.config, { recursive: true, force: true });
-  await fs.cp(rollbackConfigDir, layout.config, { recursive: true });
-  const restoredMarker = JSON.parse(await fs.readFile(configMarker, 'utf8'));
-  checks.push(check('rollback-config-restored', restoredMarker.phase === 'baseline'));
+    await postgres.restore(rollbackDatabaseDump);
+    await fs.rm(layout.config, { recursive: true, force: true });
+    await fs.cp(rollbackConfigDir, layout.config, { recursive: true });
+    const restoredMarker = JSON.parse(await fs.readFile(configMarker, 'utf8'));
+    checks.push(check('rollback-config-restored', restoredMarker.phase === 'baseline'));
 
-  const third = await runServerPhase(layout, databaseUrl, 'rollback-restore');
-  commandResults.push(third.commandResult);
-  checks.push(check('rollback-healthz', third.health.Status === 'Healthy'));
-  checks.push(check('rollback-readyz', third.ready.Status === 'Ready'));
-  checks.push(check('rollback-preserves-server-id', third.publicInfo.Id === first.publicInfo.Id));
-  checks.push(check('rollback-restores-server-name', third.publicInfo.ServerName === first.publicInfo.ServerName));
-  checks.push(check('rollback-server-stopped', third.stopped));
+    const third = await runServerPhase(layout, databaseUrl, 'rollback-restore');
+    commandResults.push(third.commandResult);
+    checks.push(check('rollback-healthz', third.health.Status === 'Healthy'));
+    checks.push(check('rollback-readyz', third.ready.Status === 'Ready'));
+    checks.push(check('rollback-preserves-server-id', third.publicInfo.Id === first.publicInfo.Id));
+    checks.push(check('rollback-restores-server-name', third.publicInfo.ServerName === first.publicInfo.ServerName));
+    checks.push(check('rollback-server-stopped', third.stopped));
 
-  const failed = checks.filter((item) => item.status !== 'passed');
-  const result = {
-    generatedAt: new Date().toISOString(),
-    status: failed.length === 0 ? 'passed' : 'failed',
-    summary: {
-      passed: checks.length - failed.length,
-      failed: failed.length,
-      total: checks.length,
-    },
-    layout: redactTempRoot(layout),
-    checks,
-    command: 'cargo run -p jellyrin-server --quiet -- --host 127.0.0.1 --port <port> --data-dir <tmp> --config-dir <tmp> --cache-dir <tmp> --log-dir <tmp> --web-dir <tmp> --database-url sqlite://<tmp>/jellyrin.db?mode=rwc',
-    commandResults,
-  };
+    const failed = checks.filter((item) => item.status !== 'passed');
+    const result = {
+      generatedAt: new Date().toISOString(),
+      status: failed.length === 0 ? 'passed' : 'failed',
+      summary: {
+        passed: checks.length - failed.length,
+        failed: failed.length,
+        total: checks.length,
+      },
+      layout: redactTempRoot(layout),
+      database: {
+        engine: 'postgresql',
+        schema: '<isolated-qa-schema>',
+        appliedMigrations: postgres.migrationCount,
+        backupFormat: 'pg_dump custom',
+      },
+      checks,
+      command: 'DATABASE_URL=postgresql://<redacted>/<database> cargo run -p jellyrin-server --quiet -- --host 127.0.0.1 --port <port> --data-dir <tmp> --config-dir <tmp> --cache-dir <tmp> --log-dir <tmp> --web-dir <tmp>',
+      commandResults,
+    };
 
-  await fs.mkdir(generatedDir, { recursive: true });
-  await fs.writeFile(evidencePath, `${JSON.stringify(result, null, 2)}\n`);
-  await fs.writeFile(evidenceMarkdownPath, renderMarkdown(result));
-  await fs.rm(root, { recursive: true, force: true });
-  console.log(`wrote ${evidencePath}`);
-  console.log(`wrote ${evidenceMarkdownPath}`);
+    await fs.mkdir(generatedDir, { recursive: true });
+    await fs.writeFile(evidencePath, `${JSON.stringify(result, null, 2)}\n`);
+    await fs.writeFile(evidenceMarkdownPath, renderMarkdown(result));
+    console.log(`wrote ${evidencePath}`);
+    console.log(`wrote ${evidenceMarkdownPath}`);
 
-  if (failed.length > 0) {
-    process.exitCode = 1;
+    if (failed.length > 0) {
+      process.exitCode = 1;
+    }
+  } finally {
+    if (postgres) {
+      await postgres.cleanup();
+    }
+    await fs.rm(root, { recursive: true, force: true });
   }
 }
 
@@ -150,13 +166,12 @@ async function runServerPhase(layout, databaseUrl, phase, duringRun) {
       layout.logs,
       '--web-dir',
       layout.web,
-      '--database-url',
-      databaseUrl,
     ],
     {
       cwd: repoRoot,
       env: {
         ...process.env,
+        DATABASE_URL: databaseUrl,
         RUST_LOG: process.env.RUST_LOG || 'jellyrin=warn,tower_http=warn',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -279,27 +294,6 @@ async function exists(filePath) {
     return true;
   } catch {
     return false;
-  }
-}
-
-async function backupSqliteDatabase(sourcePath, backupPath) {
-  for (const suffix of ['', '-wal', '-shm']) {
-    const source = `${sourcePath}${suffix}`;
-    if (await exists(source)) {
-      await fs.copyFile(source, `${backupPath}${suffix}`);
-    }
-  }
-}
-
-async function restoreSqliteDatabase(backupPath, targetPath) {
-  for (const suffix of ['', '-wal', '-shm']) {
-    await fs.rm(`${targetPath}${suffix}`, { force: true });
-  }
-  for (const suffix of ['', '-wal', '-shm']) {
-    const source = `${backupPath}${suffix}`;
-    if (await exists(source)) {
-      await fs.copyFile(source, `${targetPath}${suffix}`);
-    }
   }
 }
 

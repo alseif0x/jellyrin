@@ -1,8 +1,8 @@
 use jellyrin_core::StartupConfig;
-use jellyrin_db::{
-    BrandingConfig, Database, NamedConfigurationPayload, SystemConfigurationPayloads,
-};
+use jellyrin_db::{BrandingConfig, NamedConfigurationPayload, SystemConfigurationPayloads};
 use serde_json::Value;
+
+use crate::Database;
 
 /// Persistence boundary for named application configuration.
 pub(crate) struct ConfigurationService<'a> {

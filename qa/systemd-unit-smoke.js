@@ -15,15 +15,40 @@ const evidenceMarkdownPath = path.join(generatedDir, 'systemd-unit-smoke.md');
 async function main() {
   const serviceText = await fs.readFile(path.join(repoRoot, 'ops/jellyrin.service'), 'utf8');
   const envText = await fs.readFile(path.join(repoRoot, 'ops/jellyrin.env.example'), 'utf8');
+  const migrationServiceText = await fs.readFile(
+    path.join(repoRoot, 'ops/jellyrin-migrate.service'),
+    'utf8',
+  );
+  const migrationEnvText = await fs.readFile(
+    path.join(repoRoot, 'ops/jellyrin-migrate.env.example'),
+    'utf8',
+  );
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'jellyrin-systemd-smoke-'));
   const checks = [
     check('systemd-analyze-present', await commandExists('systemd-analyze')),
     check('service-execstart-release-binary', serviceText.includes('ExecStart=/usr/local/bin/jellyrin-server')),
     check('service-env-file', serviceText.includes('EnvironmentFile=/etc/jellyrin/jellyrin.env')),
     check('service-state-dirs', ['StateDirectory=jellyrin', 'CacheDirectory=jellyrin', 'LogsDirectory=jellyrin', 'ConfigurationDirectory=jellyrin'].every((needle) => serviceText.includes(needle))),
-    check('service-hardening', ['NoNewPrivileges=true', 'PrivateTmp=true', 'ProtectHome=true', 'ProtectSystem=strict'].every((needle) => serviceText.includes(needle))),
+    check('service-hardening', [
+      'NoNewPrivileges=true',
+      'PrivateTmp=true',
+      'PrivateDevices=true',
+      'ProtectHome=true',
+      'ProtectSystem=strict',
+      'ProtectKernelTunables=true',
+      'ProtectKernelModules=true',
+      'ProtectControlGroups=true',
+      'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6',
+      'CapabilityBoundingSet=',
+      'LoadCredential=provider-secret-keyring.json:/etc/jellyrin-secrets/provider-secret-keyring.json',
+      'Environment=JELLYRIN_PROVIDER_SECRET_KEYRING_FILE=%d/provider-secret-keyring.json',
+    ].every((needle) => serviceText.includes(needle))),
     check('service-restart-policy', serviceText.includes('Restart=on-failure') && serviceText.includes('RestartSec=5')),
     check('service-network-online', serviceText.includes('After=network-online.target') && serviceText.includes('Wants=network-online.target')),
+    check('service-requires-schema-migration', serviceText.includes('Requires=jellyrin-migrate.service') && serviceText.includes('After=network-online.target jellyrin-migrate.service')),
+    check('migration-service-oneshot', migrationServiceText.includes('Type=oneshot') && migrationServiceText.includes('ExecStart=/usr/local/bin/jellyrin-migrate schema')),
+    check('migration-service-retries-external-postgres', migrationServiceText.includes('Restart=on-failure') && migrationServiceText.includes('RestartSec=10')),
+    check('migration-service-separate-env', migrationServiceText.includes('EnvironmentFile=/etc/jellyrin-migrate.env') && migrationEnvText.includes('jellyrin_migrator')),
     check('env-release-paths', [
       'JELLYRIN_DATA_DIR=/var/lib/jellyrin',
       'JELLYRIN_CONFIG_DIR=/etc/jellyrin',
@@ -31,12 +56,18 @@ async function main() {
       'JELLYRIN_LOG_DIR=/var/log/jellyrin',
       'JELLYRIN_WEB_DIR=/srv/jellyrin/web',
     ].every((needle) => envText.includes(needle))),
-    check('env-sqlite-release-db', envText.includes('DATABASE_URL=sqlite:///var/lib/jellyrin/jellyrin.db?mode=rwc')),
+    check('env-postgres-release-db', envText.includes('DATABASE_URL=postgresql://jellyrin_runtime:') && !envText.includes('DATABASE_URL=sqlite:')),
   ];
 
   let verify = { code: 1, stdout: '', stderr: 'systemd-analyze not available' };
   if (checks[0].status === 'passed') {
-    await createSystemdRoot(root, serviceText, envText);
+    await createSystemdRoot(
+      root,
+      serviceText,
+      envText,
+      migrationServiceText,
+      migrationEnvText,
+    );
     verify = await runCommand('systemd-analyze', [
       'verify',
       `--root=${root}`,
@@ -74,13 +105,27 @@ async function main() {
   }
 }
 
-async function createSystemdRoot(root, serviceText, envText) {
+async function createSystemdRoot(
+  root,
+  serviceText,
+  envText,
+  migrationServiceText,
+  migrationEnvText,
+) {
   await fs.mkdir(path.join(root, 'etc/systemd/system'), { recursive: true });
   await fs.mkdir(path.join(root, 'etc/jellyrin'), { recursive: true });
   await fs.mkdir(path.join(root, 'usr/local/bin'), { recursive: true });
   await fs.writeFile(path.join(root, 'etc/systemd/system/jellyrin.service'), serviceText);
+  await fs.writeFile(
+    path.join(root, 'etc/systemd/system/jellyrin-migrate.service'),
+    migrationServiceText,
+  );
   await fs.writeFile(path.join(root, 'etc/jellyrin/jellyrin.env'), envText);
+  await fs.writeFile(path.join(root, 'etc/jellyrin-migrate.env'), migrationEnvText);
   await fs.writeFile(path.join(root, 'usr/local/bin/jellyrin-server'), '#!/bin/sh\nexit 0\n', {
+    mode: 0o755,
+  });
+  await fs.writeFile(path.join(root, 'usr/local/bin/jellyrin-migrate'), '#!/bin/sh\nexit 0\n', {
     mode: 0o755,
   });
   for (const unit of ['sysinit.target', 'basic.target', 'multi-user.target', 'network-online.target']) {

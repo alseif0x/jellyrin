@@ -2,10 +2,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use jellyrin_db::Database;
 use notify::RecursiveMode;
 use notify_debouncer_mini::{DebounceEventResult, DebouncedEventKind, new_debouncer};
 use tokio::sync::mpsc;
+
+use crate::Database;
 
 /// Describes a change detected by the file watcher.
 #[derive(Debug, Clone)]

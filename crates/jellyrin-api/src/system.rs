@@ -23,7 +23,8 @@ pub(crate) async fn health() -> Json<HealthResponse> {
 }
 
 pub(crate) async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
-    sqlx::query("SELECT 1").execute(state.db.pool()).await?;
+    state.db.health().await?;
+    state.db.schema_health().await?;
     Ok(Json(HealthResponse { status: "Ready" }))
 }
 

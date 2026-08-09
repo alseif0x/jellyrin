@@ -3,7 +3,10 @@ name: Rust CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -16,29 +19,120 @@ env:
 jobs:
   format:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.93.0
         with:
+          toolchain: 1.93.0
           components: rustfmt
       - run: cargo fmt --all -- --check
 
   check:
     name: Check and Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Supply-chain lock policy
+        run: node qa/supply-chain.js
+      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.93.0
         with:
+          toolchain: 1.93.0
           components: clippy
+      - run: cargo check -p jellyrin-server
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Release packaging and database dependency boundary
+        env:
+          JELLYRIN_PLANS_DIR: ${{ runner.temp }}/jellyrin-plans
+        run: node qa/packaging-release.js
 
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.93.0
+        with:
+          toolchain: 1.93.0
       - run: cargo test --workspace --all-targets
+
+  postgres-schema:
+    name: PostgreSQL schema
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f
+        env:
+          POSTGRES_DB: jellyrin_test
+          POSTGRES_USER: jellyrin_test
+          POSTGRES_PASSWORD: local-ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jellyrin_test -d jellyrin_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      JELLYRIN_TEST_POSTGRES_URL: postgresql://jellyrin_test:local-ci-only@127.0.0.1:5432/jellyrin_test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.93.0
+        with:
+          toolchain: 1.93.0
+      - run: cargo test -p jellyrin-db -- --test-threads=4
+      - run: cargo test -p jellyrin-migrate -- --test-threads=2
+
+  supply-chain:
+    name: Locked image and SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: [format, check, test, postgres-schema]
+    # A scheduled security scan must not disappear because an unrelated gate failed. Pull requests,
+    # branch pushes and release tags retain the normal requirement that every prerequisite passed.
+    if: >-
+      ${{
+        always() &&
+        (github.event_name == 'schedule' ||
+          (needs.format.result == 'success' &&
+           needs.check.result == 'success' &&
+           needs.test.result == 'success' &&
+           needs['postgres-schema'].result == 'success'))
+      }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Load public supply-chain lock
+        run: sed -n '/^[A-Z0-9_][A-Z0-9_]*=/p' ops/supply-chain.lock.env >> "$GITHUB_ENV"
+      - name: Verify supply-chain policy
+        run: node qa/supply-chain.js
+      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.93.0
+        with:
+          toolchain: 1.93.0
+      - name: Build locked release image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker build --pull \
+            --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
+            --build-arg "RUNTIME_IMAGE=${RUNTIME_IMAGE}" \
+            --build-arg "DEBIAN_SNAPSHOT=${DEBIAN_SNAPSHOT}" \
+            --build-arg "FFMPEG_PACKAGE_VERSION=${FFMPEG_PACKAGE_VERSION}" \
+            --build-arg "FFMPEG_UPSTREAM_VERSION=${FFMPEG_UPSTREAM_VERSION}" \
+            --build-arg "VCS_REF=${GITHUB_SHA}" \
+            --tag jellyrin:ci \
+            .
+      - name: Generate and verify image/source SBOM bundle
+        run: ops/generate-sbom.sh jellyrin:ci supply-chain-artifacts
+      - name: Scan Rust dependencies and release image
+        run: ops/scan-vulnerabilities.sh jellyrin:ci vulnerability-artifacts
+      - name: Upload verified supply-chain bundle
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jellyrin-supply-chain-${{ github.sha }}
+          path: |
+            supply-chain-artifacts/
+            vulnerability-artifacts/
+          if-no-files-found: error
+          retention-days: 90

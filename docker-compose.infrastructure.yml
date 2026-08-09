@@ -1,0 +1,109 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17.10-bookworm@sha256:9b18b78397054fce88a9552e9d5a3ad5bb7fd258c5b3cc1c5028e46373d6ea8f}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jellyrin
+      # This account is reserved for cluster administration and is never used by Jellyrin.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}
+      POSTGRES_MIGRATOR_PASSWORD: ${POSTGRES_MIGRATOR_PASSWORD:?set POSTGRES_MIGRATOR_PASSWORD in .env}
+      POSTGRES_RUNTIME_PASSWORD: ${POSTGRES_RUNTIME_PASSWORD:?set POSTGRES_RUNTIME_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --data-checksums --auth-host=scram-sha-256 --auth-local=trust
+    command:
+      - postgres
+      - -c
+      - max_connections=20
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - log_min_duration_statement=500ms
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - pg_stat_statements.max=5000
+      - -c
+      - pg_stat_statements.save=on
+    shm_size: 128mb
+    mem_limit: 512m
+    cpus: 0.75
+    pids_limit: 128
+    volumes:
+      - jellyrin-postgres:/var/lib/postgresql/data
+      - ./ops/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$${POSTGRES_RUNTIME_PASSWORD}"
+          psql -h 127.0.0.1 -U jellyrin_runtime -d "$${POSTGRES_DB}"
+          -Atqc 'SELECT 1' >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - jellyrin-backend
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.2.14-bookworm@sha256:f0707c78ea880b293ccdeb410c9c0a8ccae93fe7128799b751333a698b0a39a7}
+    profiles: ["cache", "distributed-cache"]
+    restart: unless-stopped
+    environment:
+      # Dormant benchmark/future-reevaluation scaffold. It is not part of the current topology and
+      # fails closed if an operator deliberately enables a profile without a secret.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        : "$${REDIS_PASSWORD:?set REDIS_PASSWORD before enabling the Redis profile}"
+        exec redis-server \
+          --save "" \
+          --appendonly no \
+          --maxmemory 64mb \
+          --maxmemory-policy allkeys-lru \
+          --maxclients 64 \
+          --requirepass "$${REDIS_PASSWORD}"
+    mem_limit: 96m
+    cpus: 0.25
+    pids_limit: 64
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          REDISCLI_AUTH="$${REDIS_PASSWORD}"
+          redis-cli --no-auth-warning ping | grep -q '^PONG$'
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+    networks:
+      - jellyrin-backend
+
+volumes:
+  jellyrin-postgres:
+
+networks:
+  jellyrin-backend:
+    internal: true

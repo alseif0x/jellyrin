@@ -1,6 +1,8 @@
-use jellyrin_db::{Database, TrickplayInfo};
+use jellyrin_db::TrickplayInfo;
 use serde_json::Value;
 use uuid::Uuid;
+
+use crate::Database;
 
 /// Persistence boundary for media-item metadata and derived media data.
 pub(crate) struct MediaService<'a> {

@@ -1,7 +1,18 @@
 services:
+  postgres:
+    # A host-network Jellyrin cannot use Docker DNS. Publish PostgreSQL only on loopback so
+    # the optional DLNA mode can still use the bundled database without exposing it on the LAN.
+    ports:
+      - "127.0.0.1:${JELLYRIN_POSTGRES_HOST_PORT:-5432}:5432"
+
   jellyrin:
     # DLNA/UPnP SSDP discovery needs multicast UDP 1900 on the host LAN.
     # Docker bridge port publishing is not enough for many renderers, because
     # multicast discovery and advertised LOCATION addresses must match the LAN.
     network_mode: host
     ports: !reset []
+    networks: !reset []
+    environment:
+      JELLYRIN_DB_DRIVER: postgresql
+      DATABASE_URL: >-
+        postgresql://jellyrin_runtime:${POSTGRES_RUNTIME_PASSWORD:?set POSTGRES_RUNTIME_PASSWORD in .env}@127.0.0.1:${JELLYRIN_POSTGRES_HOST_PORT:-5432}/jellyrin?sslmode=disable

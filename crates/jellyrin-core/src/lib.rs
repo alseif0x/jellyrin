@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::OnceLock;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -79,6 +81,132 @@ pub struct MediaItem {
     pub updated_at: OffsetDateTime,
 }
 
+/// Whether a TV-library video lives below one of Jellyfin's conventional extras directories.
+/// Directory matching is ASCII case-insensitive and ignores surrounding whitespace.
+pub fn is_tv_extra_media_item(item: &MediaItem) -> bool {
+    Path::new(item.path.strip_prefix("file://").unwrap_or(&item.path))
+        .parent()
+        .is_some_and(|parent| {
+            parent.components().any(|component| {
+                component.as_os_str().to_str().is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "extras"
+                            | "featurettes"
+                            | "special features"
+                            | "behind the scenes"
+                            | "deleted scenes"
+                            | "interviews"
+                            | "trailers"
+                    )
+                })
+            })
+        })
+}
+
+/// Public Jellyfin item type derived from the neutral persisted media fields.
+pub fn effective_media_item_type(item: &MediaItem) -> &'static str {
+    match (item.media_type.as_str(), item.collection_type.as_deref()) {
+        ("Video", Some("movies")) => "Movie",
+        ("Video", Some("musicvideos" | "musicvideo")) => "MusicVideo",
+        ("Video", Some("tvshows" | "tvshow" | "series")) if is_tv_extra_media_item(item) => "Video",
+        ("Video", Some("tvshows" | "tvshow" | "series")) => "Episode",
+        ("Video", _) => "Video",
+        ("Audio", _) => "Audio",
+        ("Photo", _) => "Photo",
+        ("Book", _) => "Book",
+        _ => "BaseItem",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TvEpisodePathInfo {
+    pub series_name: String,
+    pub season_number: Option<i32>,
+    pub episode_number: Option<i32>,
+}
+
+/// Derive Jellyfin's synthetic TV hierarchy solely from the persisted episode name and path.
+///
+/// Classification (including exclusion of extras) remains the caller's responsibility. Keeping
+/// this path parser in core lets catalogue counting and the API use one exact implementation.
+pub fn tv_episode_path_info(name: &str, path: &str) -> TvEpisodePathInfo {
+    let components = Path::new(path)
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .filter(|component| !component.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let season_component_index = components
+        .iter()
+        .rposition(|component| parse_season_component(component).is_some());
+    let season_number = season_component_index
+        .and_then(|index| components.get(index))
+        .and_then(|component| parse_season_component(component))
+        .or_else(|| parse_sxe_numbers(name).map(|(season, _)| season));
+    let episode_number = parse_sxe_numbers(name).map(|(_, episode)| episode);
+    let series_name = season_component_index
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| components.get(index))
+        .cloned()
+        .or_else(|| components.last().cloned())
+        .unwrap_or_else(|| name.to_string());
+    TvEpisodePathInfo {
+        series_name,
+        season_number,
+        episode_number,
+    }
+}
+
+fn parse_season_component(value: &str) -> Option<i32> {
+    let value = value.trim().to_ascii_lowercase();
+    let digits = value
+        .strip_prefix("season")
+        .or_else(|| value.strip_prefix("series"))
+        .map(str::trim)?
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn parse_sxe_numbers(value: &str) -> Option<(i32, i32)> {
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len().saturating_sub(3) {
+        if !bytes[index].eq_ignore_ascii_case(&b's') {
+            continue;
+        }
+        let mut cursor = index + 1;
+        let season_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if season_start == cursor
+            || cursor >= bytes.len()
+            || !bytes[cursor].eq_ignore_ascii_case(&b'e')
+        {
+            continue;
+        }
+        let episode_start = cursor + 1;
+        cursor = episode_start;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if episode_start == cursor {
+            continue;
+        }
+        let season = value[season_start..episode_start - 1].parse().ok()?;
+        let episode = value[episode_start..cursor].parse().ok()?;
+        return Some((season, episode));
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackState {
     pub user_id: Uuid,
@@ -101,6 +229,137 @@ pub struct TranscodeStreamSelection {
     pub subtitle_stream_index: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HlsStreamMode {
+    Copy,
+    Encode,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum H264Preset {
+    Ultrafast,
+    Superfast,
+    Veryfast,
+    Faster,
+    Fast,
+    Medium,
+}
+
+/// Process-wide defaults applied when an HLS request is created.
+///
+/// Keeping the encoder settings together gives the application one value to
+/// load at startup and pass explicitly. [`HlsTranscodeRequest::new`] remains a
+/// compatibility convenience and caches that complete value once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HlsEncodingConfig {
+    pub video_threads: Option<u16>,
+    pub video_preset: H264Preset,
+}
+
+impl Default for HlsEncodingConfig {
+    fn default() -> Self {
+        Self {
+            video_threads: Some(2),
+            video_preset: H264Preset::Ultrafast,
+        }
+    }
+}
+
+impl HlsEncodingConfig {
+    pub fn from_values(preset: Option<&str>, threads: Option<&str>) -> Self {
+        let defaults = Self::default();
+        Self {
+            video_preset: preset
+                .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                    "ultrafast" => Some(H264Preset::Ultrafast),
+                    "superfast" => Some(H264Preset::Superfast),
+                    "veryfast" => Some(H264Preset::Veryfast),
+                    "faster" => Some(H264Preset::Faster),
+                    "fast" => Some(H264Preset::Fast),
+                    "medium" => Some(H264Preset::Medium),
+                    _ => None,
+                })
+                .unwrap_or(defaults.video_preset),
+            video_threads: match threads {
+                Some(value) if value.eq_ignore_ascii_case("auto") => None,
+                Some(value) => value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|threads| (1..=64).contains(threads))
+                    .or(defaults.video_threads),
+                None => defaults.video_threads,
+            },
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let preset = std::env::var("JELLYRIN_TRANSCODE_PRESET").ok();
+        let threads = std::env::var("JELLYRIN_TRANSCODE_THREADS").ok();
+        Self::from_values(preset.as_deref(), threads.as_deref())
+    }
+}
+
+static HLS_ENCODING_CONFIG: OnceLock<HlsEncodingConfig> = OnceLock::new();
+
+/// Loads and returns the process-wide HLS encoder defaults.
+///
+/// The server calls this during startup so environment validation is complete
+/// before requests are accepted. Other embedders can pass an explicit
+/// [`HlsEncodingConfig`] to [`HlsTranscodeRequest::new_with_encoding_config`].
+pub fn configured_hls_encoding_config() -> &'static HlsEncodingConfig {
+    HLS_ENCODING_CONFIG.get_or_init(HlsEncodingConfig::from_env)
+}
+
+impl H264Preset {
+    fn as_ffmpeg_value(self) -> &'static str {
+        match self {
+            Self::Ultrafast => "ultrafast",
+            Self::Superfast => "superfast",
+            Self::Veryfast => "veryfast",
+            Self::Faster => "faster",
+            Self::Fast => "fast",
+            Self::Medium => "medium",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum H264Profile {
+    Baseline,
+    Main,
+    High,
+}
+
+impl H264Profile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Main => "main",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AacProfile {
+    LowComplexity,
+}
+
+impl AacProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LowComplexity => "lc",
+        }
+    }
+
+    fn as_ffmpeg_value(self) -> &'static str {
+        match self {
+            Self::LowComplexity => "aac_low",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HlsTranscodeRequest {
     pub input_path: String,
@@ -108,17 +367,40 @@ pub struct HlsTranscodeRequest {
     pub segment_pattern_path: String,
     pub selection: TranscodeStreamSelection,
     pub include_video: bool,
+    pub video_mode: HlsStreamMode,
+    pub audio_mode: HlsStreamMode,
     pub start_position_ticks: i64,
     pub duration_ticks: Option<i64>,
     pub hls_start_number: Option<u32>,
     pub output_ts_offset_ticks: Option<i64>,
     pub event_playlist: bool,
+    pub hls_list_size: u32,
+    pub hls_delete_threshold: Option<u32>,
+    pub hls_delete_segments: bool,
+    pub hls_omit_endlist: bool,
+    pub hls_temp_file: bool,
     pub max_video_width: Option<u32>,
     pub max_video_height: Option<u32>,
     pub video_bitrate: Option<u32>,
+    pub video_profile: Option<H264Profile>,
+    /// H.264 level encoded as Jellyfin's decimal-tenths integer (`41` = level 4.1).
+    pub video_level: Option<u8>,
+    /// Maximum encoded frame rate in thousandths of a frame per second.
+    pub max_video_frame_rate_millihertz: Option<u32>,
+    /// Maximum number of worker threads used by the video encoder.
+    ///
+    /// A small default prevents one software encode from consuming every host CPU. Set this to
+    /// `None` only when an operator deliberately wants FFmpeg's automatic thread selection.
+    pub video_threads: Option<u16>,
+    pub video_preset: H264Preset,
     pub audio_bitrate: Option<u32>,
+    pub audio_profile: Option<AacProfile>,
+    pub audio_channels: Option<u8>,
     pub segment_time_seconds: u32,
     pub burn_in_subtitle: bool,
+    /// Percentage of native input rate used for a finite remote VOD source (110 = 1.10x).
+    pub input_readrate_percent: Option<u16>,
+    pub input_readrate_initial_burst_seconds: Option<u16>,
 }
 
 impl HlsTranscodeRequest {
@@ -128,23 +410,55 @@ impl HlsTranscodeRequest {
         segment_pattern_path: impl Into<String>,
         selection: TranscodeStreamSelection,
     ) -> Self {
+        Self::new_with_encoding_config(
+            input_path,
+            output_playlist_path,
+            segment_pattern_path,
+            selection,
+            *configured_hls_encoding_config(),
+        )
+    }
+
+    pub fn new_with_encoding_config(
+        input_path: impl Into<String>,
+        output_playlist_path: impl Into<String>,
+        segment_pattern_path: impl Into<String>,
+        selection: TranscodeStreamSelection,
+        encoding: HlsEncodingConfig,
+    ) -> Self {
         Self {
             input_path: input_path.into(),
             output_playlist_path: output_playlist_path.into(),
             segment_pattern_path: segment_pattern_path.into(),
             selection,
             include_video: true,
+            video_mode: HlsStreamMode::Encode,
+            audio_mode: HlsStreamMode::Encode,
             start_position_ticks: 0,
             duration_ticks: None,
             hls_start_number: None,
             output_ts_offset_ticks: None,
             event_playlist: false,
+            hls_list_size: 0,
+            hls_delete_threshold: None,
+            hls_delete_segments: false,
+            hls_omit_endlist: false,
+            hls_temp_file: false,
             max_video_width: None,
             max_video_height: None,
             video_bitrate: None,
+            video_profile: None,
+            video_level: None,
+            max_video_frame_rate_millihertz: None,
+            video_threads: encoding.video_threads,
+            video_preset: encoding.video_preset,
             audio_bitrate: None,
+            audio_profile: None,
+            audio_channels: None,
             segment_time_seconds: DEFAULT_HLS_SEGMENT_TIME_SECONDS,
             burn_in_subtitle: false,
+            input_readrate_percent: None,
+            input_readrate_initial_burst_seconds: None,
         }
     }
 }
@@ -190,18 +504,87 @@ impl FfmpegProgress {
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case("end"))
     }
+
+    /// Returns FFmpeg's numeric frame rate without retaining arbitrary stderr text.
+    pub fn fps_value(&self) -> Option<f64> {
+        parse_ffmpeg_nonnegative_metric(self.fps.as_deref()?, false)
+    }
+
+    /// Returns FFmpeg's processing speed as a realtime ratio (`1.0` means realtime).
+    pub fn speed_ratio(&self) -> Option<f64> {
+        parse_ffmpeg_nonnegative_metric(self.speed.as_deref()?, true)
+    }
+}
+
+fn parse_ffmpeg_nonnegative_metric(value: &str, requires_x_suffix: bool) -> Option<f64> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 32 || !value.is_ascii() {
+        return None;
+    }
+    let value = if requires_x_suffix {
+        value.strip_suffix('x')?
+    } else {
+        value
+    };
+    let parsed = value.parse::<f64>().ok()?;
+    (parsed.is_finite() && (0.0..=10_000.0).contains(&parsed)).then_some(parsed)
 }
 
 pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandSpec {
+    let should_burn_subtitle = request.include_video
+        && request.burn_in_subtitle
+        && request
+            .selection
+            .subtitle_stream_index
+            .is_some_and(|index| index >= 0);
+    let video_mode = if should_burn_subtitle {
+        HlsStreamMode::Encode
+    } else {
+        request.video_mode
+    };
+
     let mut args = vec![
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
         "-y".to_string(),
+        "-loglevel".to_string(),
+        "warning".to_string(),
+        "-nostats".to_string(),
+        "-stats_period".to_string(),
+        "2".to_string(),
     ];
+
+    if request.include_video
+        && video_mode == HlsStreamMode::Encode
+        && let Some(video_threads) = request.video_threads.filter(|threads| *threads > 0)
+    {
+        // Encoder thread limits do not constrain FFmpeg's filter graphs. Apply the same budget
+        // to simple and complex graphs before the input so automatic scaling and subtitle burn-in
+        // cannot independently consume all host CPUs.
+        args.push("-filter_threads".to_string());
+        args.push(video_threads.to_string());
+        args.push("-filter_complex_threads".to_string());
+        args.push(video_threads.to_string());
+    }
 
     if request.start_position_ticks > 0 {
         args.push("-ss".to_string());
         args.push(format_ticks_as_seconds(request.start_position_ticks));
+    }
+
+    if let Some(readrate_percent) = request
+        .input_readrate_percent
+        .filter(|percent| (1..=1000).contains(percent))
+    {
+        args.push("-readrate".to_string());
+        args.push(format!("{:.2}", f64::from(readrate_percent) / 100.0));
+        if let Some(initial_burst_seconds) = request
+            .input_readrate_initial_burst_seconds
+            .filter(|seconds| *seconds > 0)
+        {
+            args.push("-readrate_initial_burst".to_string());
+            args.push(initial_burst_seconds.to_string());
+        }
     }
 
     args.push("-i".to_string());
@@ -214,13 +597,6 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         args.push(format_ticks_as_seconds(duration_ticks));
     }
 
-    let should_burn_subtitle = request.include_video
-        && request.burn_in_subtitle
-        && request
-            .selection
-            .subtitle_stream_index
-            .is_some_and(|index| index >= 0);
-
     if should_burn_subtitle {
         args.push("-filter_complex".to_string());
         args.push(format!(
@@ -230,12 +606,16 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         ));
         args.push("-map".to_string());
         args.push("[v]".to_string());
-    } else if request.include_video {
+    } else if request.include_video && video_mode != HlsStreamMode::Drop {
         push_selected_stream_map(&mut args, "v", request.selection.video_stream_index, true);
     } else {
         args.push("-vn".to_string());
     }
-    push_selected_stream_map(&mut args, "a", request.selection.audio_stream_index, true);
+    if request.audio_mode == HlsStreamMode::Drop {
+        args.push("-an".to_string());
+    } else {
+        push_selected_stream_map(&mut args, "a", request.selection.audio_stream_index, true);
+    }
     if should_burn_subtitle {
         args.push("-sn".to_string());
     } else if request
@@ -255,15 +635,42 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         args.push("-sn".to_string());
     }
 
-    if request.include_video {
+    if request.include_video && video_mode == HlsStreamMode::Copy {
+        args.push("-c:v".to_string());
+        args.push("copy".to_string());
+    } else if request.include_video && video_mode == HlsStreamMode::Encode {
         args.push("-c:v".to_string());
         args.push("libx264".to_string());
         args.push("-preset".to_string());
-        args.push("veryfast".to_string());
+        args.push(request.video_preset.as_ffmpeg_value().to_string());
         args.push("-profile:v".to_string());
-        args.push("main".to_string());
+        args.push(
+            request
+                .video_profile
+                .unwrap_or(H264Profile::Main)
+                .as_str()
+                .to_string(),
+        );
+        if let Some(video_level) = request
+            .video_level
+            .filter(|level| (10..=62).contains(level))
+        {
+            args.push("-level:v".to_string());
+            args.push(format_h264_level(video_level));
+        }
         args.push("-pix_fmt".to_string());
         args.push("yuv420p".to_string());
+        args.push("-force_key_frames".to_string());
+        args.push(format!(
+            "expr:gte(t,n_forced*{})",
+            request.segment_time_seconds.max(1)
+        ));
+        args.push("-sc_threshold".to_string());
+        args.push("0".to_string());
+        if let Some(video_threads) = request.video_threads.filter(|threads| *threads > 0) {
+            args.push("-threads:v".to_string());
+            args.push(video_threads.to_string());
+        }
 
         if let Some(video_bitrate) = request.video_bitrate {
             args.push("-b:v".to_string());
@@ -274,22 +681,51 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
             args.push(video_bitrate.saturating_mul(2).to_string());
         }
 
+        let mut video_filters = Vec::new();
         if request.max_video_width.is_some() || request.max_video_height.is_some() {
-            args.push("-vf".to_string());
-            args.push(scale_filter(
+            video_filters.push(scale_filter(
                 request.max_video_width,
                 request.max_video_height,
             ));
         }
+        if let Some(frame_rate) = request
+            .max_video_frame_rate_millihertz
+            .filter(|frame_rate| *frame_rate > 0)
+        {
+            video_filters.push(format!("fps={}", format_millihertz(frame_rate)));
+        }
+        if !video_filters.is_empty() {
+            args.push("-vf".to_string());
+            args.push(video_filters.join(","));
+        }
     }
 
-    args.push("-c:a".to_string());
-    args.push("aac".to_string());
-    args.push("-ac".to_string());
-    args.push("2".to_string());
-    if let Some(audio_bitrate) = request.audio_bitrate {
-        args.push("-b:a".to_string());
-        args.push(audio_bitrate.to_string());
+    match request.audio_mode {
+        HlsStreamMode::Copy => {
+            args.push("-c:a".to_string());
+            args.push("copy".to_string());
+        }
+        HlsStreamMode::Encode => {
+            args.push("-c:a".to_string());
+            args.push("aac".to_string());
+            if let Some(audio_profile) = request.audio_profile {
+                args.push("-profile:a".to_string());
+                args.push(audio_profile.as_ffmpeg_value().to_string());
+            }
+            args.push("-ac".to_string());
+            args.push(
+                request
+                    .audio_channels
+                    .filter(|channels| (1..=8).contains(channels))
+                    .unwrap_or(2)
+                    .to_string(),
+            );
+            if let Some(audio_bitrate) = request.audio_bitrate {
+                args.push("-b:a".to_string());
+                args.push(audio_bitrate.to_string());
+            }
+        }
+        HlsStreamMode::Drop => {}
     }
 
     if let Some(output_ts_offset_ticks) = request.output_ts_offset_ticks
@@ -310,7 +746,28 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         "vod".to_string()
     });
     args.push("-hls_list_size".to_string());
-    args.push("0".to_string());
+    args.push(request.hls_list_size.to_string());
+    if let Some(delete_threshold) = request.hls_delete_threshold.filter(|value| *value > 0) {
+        args.push("-hls_delete_threshold".to_string());
+        args.push(delete_threshold.to_string());
+    }
+    let mut hls_flags = Vec::new();
+    if request.hls_delete_segments {
+        hls_flags.push("delete_segments");
+    }
+    if request.hls_omit_endlist {
+        hls_flags.push("omit_endlist");
+    }
+    if request.hls_temp_file {
+        hls_flags.push("temp_file");
+    }
+    if request.include_video && video_mode == HlsStreamMode::Encode {
+        hls_flags.push("independent_segments");
+    }
+    if !hls_flags.is_empty() {
+        args.push("-hls_flags".to_string());
+        args.push(hls_flags.join("+"));
+    }
     if let Some(start_number) = request.hls_start_number {
         args.push("-start_number".to_string());
         args.push(start_number.to_string());
@@ -394,6 +851,21 @@ fn scale_filter(max_width: Option<u32>, max_height: Option<u32>) -> String {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-2".to_string());
     format!("scale='min({width},iw)':'min({height},ih)':force_original_aspect_ratio=decrease")
+}
+
+fn format_h264_level(level: u8) -> String {
+    format!("{}.{}", level / 10, level % 10)
+}
+
+fn format_millihertz(value: u32) -> String {
+    let whole = value / 1_000;
+    let fractional = value % 1_000;
+    if fractional == 0 {
+        return whole.to_string();
+    }
+    format!("{whole}.{fractional:03}")
+        .trim_end_matches('0')
+        .to_string()
 }
 
 fn format_ticks_as_seconds(ticks: i64) -> String {
@@ -508,9 +980,88 @@ pub fn format_time_for_json(value: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HlsTranscodeRequest, TranscodeStreamSelection, build_hls_ffmpeg_command,
-        build_hls_ffmpeg_command_from_stdin, parse_ffmpeg_progress,
+        AacProfile, FfmpegProgress, H264Preset, H264Profile, HlsEncodingConfig, HlsStreamMode,
+        HlsTranscodeRequest, MediaItem, TranscodeStreamSelection, build_hls_ffmpeg_command,
+        build_hls_ffmpeg_command_from_stdin, effective_media_item_type, is_tv_extra_media_item,
+        parse_ffmpeg_progress, tv_episode_path_info,
     };
+
+    #[test]
+    fn hls_encoding_config_parses_preset_and_thread_values_together() {
+        assert_eq!(
+            HlsEncodingConfig::from_values(Some(" veryfast "), Some("4")),
+            HlsEncodingConfig {
+                video_threads: Some(4),
+                video_preset: H264Preset::Veryfast,
+            }
+        );
+        assert_eq!(
+            HlsEncodingConfig::from_values(Some("invalid"), Some("auto")),
+            HlsEncodingConfig {
+                video_threads: None,
+                video_preset: H264Preset::Ultrafast,
+            }
+        );
+        assert_eq!(
+            HlsEncodingConfig::from_values(None, Some("65")),
+            HlsEncodingConfig::default()
+        );
+        assert_eq!(
+            HlsEncodingConfig::from_values(None, Some(" auto ")),
+            HlsEncodingConfig::default()
+        );
+    }
+
+    #[test]
+    fn effective_media_item_type_handles_tv_extra_directory_variants() {
+        let item = |path: &str| MediaItem {
+            id: uuid::Uuid::nil(),
+            virtual_folder_id: uuid::Uuid::nil(),
+            name: "Clip".to_string(),
+            path: path.to_string(),
+            media_type: "Video".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+
+        for path in [
+            "/media/Show/Featurettes/clip.mkv",
+            "/media/Show/ Special Features /clip.mkv",
+            "/media/Show/Season 01/Extras/clip.mkv",
+            "file:///media/Show/Trailers/clip.mkv",
+        ] {
+            let item = item(path);
+            assert!(is_tv_extra_media_item(&item), "path={path}");
+            assert_eq!(effective_media_item_type(&item), "Video", "path={path}");
+        }
+
+        let episode = item("/media/Show/Season 01/episode.mkv");
+        assert!(!is_tv_extra_media_item(&episode));
+        assert_eq!(effective_media_item_type(&episode), "Episode");
+    }
+
+    #[test]
+    fn tv_episode_path_parser_preserves_synthetic_hierarchy_semantics() {
+        let nested = tv_episode_path_info(
+            "Example S02E03",
+            "/media/Example Show/Season 02/Example S02E03.mkv",
+        );
+        assert_eq!(nested.series_name, "Example Show");
+        assert_eq!(nested.season_number, Some(2));
+        assert_eq!(nested.episode_number, Some(3));
+
+        let name_fallback = tv_episode_path_info("Fallback S04E05", "");
+        assert_eq!(name_fallback.series_name, "Fallback S04E05");
+        assert_eq!(name_fallback.season_number, Some(4));
+        assert_eq!(name_fallback.episode_number, Some(5));
+    }
 
     #[test]
     fn hls_ffmpeg_command_preserves_selected_streams_and_output_paths() {
@@ -539,6 +1090,15 @@ mod tests {
                 "-hide_banner",
                 "-nostdin",
                 "-y",
+                "-loglevel",
+                "warning",
+                "-nostats",
+                "-stats_period",
+                "2",
+                "-filter_threads",
+                "2",
+                "-filter_complex_threads",
+                "2",
                 "-ss",
                 "1234.500",
                 "-i",
@@ -551,11 +1111,17 @@ mod tests {
                 "-c:v",
                 "libx264",
                 "-preset",
-                "veryfast",
+                "ultrafast",
                 "-profile:v",
                 "main",
                 "-pix_fmt",
                 "yuv420p",
+                "-force_key_frames",
+                "expr:gte(t,n_forced*3)",
+                "-sc_threshold",
+                "0",
+                "-threads:v",
+                "2",
                 "-b:v",
                 "4000000",
                 "-maxrate",
@@ -578,6 +1144,8 @@ mod tests {
                 "vod",
                 "-hls_list_size",
                 "0",
+                "-hls_flags",
+                "independent_segments",
                 "-hls_segment_filename",
                 "/tmp/jellyrin/transcodes/play-1/segment_%05d.ts",
                 "-progress",
@@ -585,6 +1153,36 @@ mod tests {
                 "/tmp/jellyrin/transcodes/play-1/main.m3u8",
             ]
         );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_applies_validated_codec_profile_limits() {
+        let mut request = HlsTranscodeRequest::new(
+            "/media/Movie.mkv",
+            "/tmp/main.m3u8",
+            "/tmp/segment_%05d.ts",
+            TranscodeStreamSelection::default(),
+        );
+        request.max_video_width = Some(1920);
+        request.video_profile = Some(H264Profile::High);
+        request.video_level = Some(41);
+        request.max_video_frame_rate_millihertz = Some(29_970);
+        request.audio_profile = Some(AacProfile::LowComplexity);
+        request.audio_channels = Some(6);
+
+        let command = build_hls_ffmpeg_command(&request);
+
+        for pair in [
+            ["-profile:v", "high"],
+            ["-level:v", "4.1"],
+            ["-profile:a", "aac_low"],
+            ["-ac", "6"],
+        ] {
+            assert!(command.args.windows(2).any(|actual| actual == pair));
+        }
+        assert!(command.args.windows(2).any(|pair| {
+            pair[0] == "-vf" && pair[1].contains("min(1920,iw)") && pair[1].contains("fps=29.97")
+        }));
     }
 
     #[test]
@@ -676,6 +1274,7 @@ mod tests {
 
         assert!(command.args.iter().any(|arg| arg == "-vn"));
         assert!(!command.args.iter().any(|arg| arg == "-c:v"));
+        assert!(!command.args.iter().any(|arg| arg == "-threads:v"));
         assert!(command.args.windows(2).any(|pair| pair == ["-map", "0:1?"]));
         assert!(command.args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
         assert!(
@@ -684,6 +1283,139 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["-b:a", "128000"])
         );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_can_disable_or_override_video_thread_limits() {
+        let mut request = HlsTranscodeRequest::new(
+            "/media/Movie.mkv",
+            "/tmp/main.m3u8",
+            "/tmp/segment_%05d.ts",
+            TranscodeStreamSelection::default(),
+        );
+        request.video_threads = Some(1);
+        let limited = build_hls_ffmpeg_command(&request);
+        for pair in [
+            ["-threads:v", "1"],
+            ["-filter_threads", "1"],
+            ["-filter_complex_threads", "1"],
+        ] {
+            assert!(limited.args.windows(2).any(|actual| actual == pair));
+        }
+
+        request.video_threads = None;
+        let automatic = build_hls_ffmpeg_command(&request);
+        for option in ["-threads:v", "-filter_threads", "-filter_complex_threads"] {
+            assert!(!automatic.args.iter().any(|arg| arg == option));
+        }
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_supports_remux_and_partial_transcode() {
+        let mut request = HlsTranscodeRequest::new(
+            "https://media.example/movie.mkv",
+            "/tmp/main.m3u8",
+            "/tmp/segment_%05d.ts",
+            TranscodeStreamSelection::default(),
+        );
+        request.video_mode = HlsStreamMode::Copy;
+        request.audio_mode = HlsStreamMode::Copy;
+        let remux = build_hls_ffmpeg_command(&request);
+        assert!(remux.args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(remux.args.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+        assert!(!remux.args.iter().any(|argument| argument == "libx264"));
+        assert!(
+            !remux
+                .args
+                .iter()
+                .any(|argument| argument == "-filter_threads"
+                    || argument == "-filter_complex_threads")
+        );
+
+        request.audio_mode = HlsStreamMode::Encode;
+        let partial = build_hls_ffmpeg_command(&request);
+        assert!(partial.args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
+        assert!(partial.args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+        assert!(!partial.args.iter().any(|argument| argument == "libx264"));
+        assert!(
+            !partial
+                .args
+                .iter()
+                .any(|argument| argument == "-filter_threads"
+                    || argument == "-filter_complex_threads")
+        );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_rate_limits_remote_vod_before_input() {
+        let mut request = HlsTranscodeRequest::new(
+            "https://provider.example/movie/42.mkv",
+            "/tmp/rate/main.m3u8",
+            "/tmp/rate/segment_%05d.ts",
+            TranscodeStreamSelection::default(),
+        );
+        request.input_readrate_percent = Some(110);
+        request.input_readrate_initial_burst_seconds = Some(15);
+
+        let command = build_hls_ffmpeg_command(&request);
+        let input_index = command.args.iter().position(|arg| arg == "-i").unwrap();
+        let readrate_index = command
+            .args
+            .iter()
+            .position(|arg| arg == "-readrate")
+            .unwrap();
+        let burst_index = command
+            .args
+            .iter()
+            .position(|arg| arg == "-readrate_initial_burst")
+            .unwrap();
+
+        assert!(readrate_index < input_index);
+        assert!(burst_index < input_index);
+        assert_eq!(command.args[readrate_index + 1], "1.10");
+        assert_eq!(command.args[burst_index + 1], "15");
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-nostats", "-stats_period"])
+        );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_supports_bounded_live_window() {
+        let mut request = HlsTranscodeRequest::new(
+            "https://provider.example/live/42.ts",
+            "/tmp/live/main.m3u8",
+            "/tmp/live/segment_%05d.ts",
+            TranscodeStreamSelection::default(),
+        );
+        request.event_playlist = true;
+        request.hls_list_size = 20;
+        request.hls_delete_threshold = Some(2);
+        request.hls_delete_segments = true;
+        request.hls_omit_endlist = true;
+        request.hls_temp_file = true;
+
+        let command = build_hls_ffmpeg_command(&request);
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-hls_list_size", "20"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-hls_delete_threshold", "2"])
+        );
+        assert!(command.args.windows(2).any(|pair| {
+            pair == [
+                "-hls_flags",
+                "delete_segments+omit_endlist+temp_file+independent_segments",
+            ]
+        }));
     }
 
     #[test]
@@ -771,8 +1503,42 @@ progress=continue
         assert_eq!(progress.frame, Some(42));
         assert_eq!(progress.total_size, Some(123456));
         assert_eq!(progress.position_ticks(), Some(123456780));
+        assert_eq!(progress.fps_value(), Some(25.0));
+        assert_eq!(progress.speed_ratio(), Some(1.25));
         assert_eq!(progress.progress.as_deref(), Some("continue"));
         assert!(!progress.is_complete());
+    }
+
+    #[test]
+    fn rejects_unbounded_or_non_numeric_ffmpeg_progress_metrics() {
+        for value in [
+            "",
+            "N/A",
+            "NaN",
+            "inf",
+            "-1",
+            "10001",
+            "💥",
+            "123456789012345678901234567890123",
+        ] {
+            let progress = FfmpegProgress {
+                fps: Some(value.to_string()),
+                ..FfmpegProgress::default()
+            };
+            assert_eq!(progress.fps_value(), None, "unexpected fps value: {value}");
+        }
+
+        for value in ["", "1", "1X", "N/Ax", "NaNx", "-1x", "10001x"] {
+            let progress = FfmpegProgress {
+                speed: Some(value.to_string()),
+                ..FfmpegProgress::default()
+            };
+            assert_eq!(
+                progress.speed_ratio(),
+                None,
+                "unexpected speed value: {value}"
+            );
+        }
     }
 
     #[test]

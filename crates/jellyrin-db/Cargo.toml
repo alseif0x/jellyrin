@@ -6,17 +6,31 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Public adapter feature. SQLite remains restricted to migration/tests until its
+# production conformance matrix is complete.
+sqlite = ["sqlx/sqlite"]
+# Backwards-compatible alias; new consumers should request `sqlite`.
+legacy-sqlite = ["sqlite"]
+
 [dependencies]
 anyhow.workspace = true
 argon2.workspace = true
 jellyrin-core = { path = "../jellyrin-core" }
+jellyrin-transcode = { path = "../jellyrin-transcode" }
 rand_core.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+ring.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
 time.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+sqlx = { workspace = true, features = ["sqlite"] }
 tokio.workspace = true
 tempfile.workspace = true
