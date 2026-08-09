@@ -37,6 +37,7 @@ async function main() {
       psql(connection, seedSql(size));
       psql(connection, sampleSql(size, repetitions, false));
       const currentPlan = explain(connection, moviePageSql(size));
+      const currentGenrePlans = genrePlans(connection);
       psql(connection, candidateIndexSql());
       psql(connection, sampleSql(size, repetitions, true));
       const candidatePlan = explain(connection, moviePageSql(size));
@@ -54,6 +55,13 @@ async function main() {
           ),
           currentPlan: summarizePlan(currentPlan),
           candidatePlan: summarizePlan(candidatePlan),
+        },
+        genreSelectorProjection: {
+          selectiveVisibleRows: Math.floor((size - 1) / 1000) + 1,
+          commonVisibleRows: Math.floor(size / 5) - Math.floor(size / 100),
+          order: 'alternating-exists-in-and-in-exists',
+          p95: genreMetricSummary(byScenario, 'current'),
+          plans: currentGenrePlans,
         },
       });
       psql(connection, `DROP INDEX IF EXISTS ${ident(schema)}.media_items_visible_collection_name_page_idx;`);
@@ -133,6 +141,11 @@ function setupSql() {
       position_ticks bigint NOT NULL,
       PRIMARY KEY (user_id, item_id)
     );
+    CREATE TABLE ${ident(schema)}.media_item_genre_selectors (
+      item_id uuid NOT NULL REFERENCES ${ident(schema)}.media_items(id) ON DELETE CASCADE,
+      selector text NOT NULL,
+      PRIMARY KEY (item_id, selector)
+    );
     CREATE TABLE ${ident(schema)}.samples (
       dataset_size integer NOT NULL,
       scenario text NOT NULL,
@@ -150,12 +163,15 @@ function setupSql() {
     CREATE INDEX media_items_visible_updated_page_idx
       ON ${ident(schema)}.media_items (updated_at, id)
       WHERE missing_since IS NULL;
+    CREATE INDEX media_item_genre_selectors_lookup_idx
+      ON ${ident(schema)}.media_item_genre_selectors (selector, item_id);
   `;
 }
 
 function seedSql(size) {
   return `
-    TRUNCATE ${ident(schema)}.media_items, ${ident(schema)}.playback_states;
+    TRUNCATE ${ident(schema)}.media_items, ${ident(schema)}.playback_states,
+      ${ident(schema)}.media_item_genre_selectors;
     DELETE FROM ${ident(schema)}.samples WHERE dataset_size = ${size};
     BEGIN;
     SET LOCAL synchronous_commit = off;
@@ -191,9 +207,18 @@ function seedSql(size) {
       CASE WHEN (row_number() OVER ()) % 5 = 0 THEN 900000000 ELSE 0 END
     FROM ${ident(schema)}.media_items
     WHERE missing_since IS NULL AND collection_type = 'movies';
+    INSERT INTO ${ident(schema)}.media_item_genre_selectors (item_id, selector)
+    SELECT md5('item-' || value)::uuid, 'genre-common'
+    FROM generate_series(1, ${size}) AS value
+    WHERE value % 5 = 0
+    UNION ALL
+    SELECT md5('item-' || value)::uuid, 'genre-rare'
+    FROM generate_series(1, ${size}) AS value
+    WHERE value % 1000 = 1;
     COMMIT;
     ANALYZE ${ident(schema)}.media_items;
     ANALYZE ${ident(schema)}.playback_states;
+    ANALYZE ${ident(schema)}.media_item_genre_selectors;
   `;
 }
 
@@ -239,9 +264,37 @@ function sampleSql(size, sampleRepetitions, candidate) {
           ORDER BY lower(name), id LIMIT 100 OFFSET ${offset};
         INSERT INTO ${ident(schema)}.samples VALUES
           (${size}, 'folder_page_${suffix}', extract(epoch FROM clock_timestamp() - started) * 1000);
+
+        ${candidate ? '' : [
+          genreBenchmarkPairSql(size, suffix, 'rare', 'page'),
+          genreBenchmarkPairSql(size, suffix, 'common', 'page'),
+          genreBenchmarkPairSql(size, suffix, 'rare', 'count'),
+          genreBenchmarkPairSql(size, suffix, 'common', 'count'),
+        ].join('\n')}
       END LOOP;
     END $benchmark$;
   `;
+}
+
+function genreBenchmarkPairSql(size, suffix, selector, operation) {
+  const selectorValue = `genre-${selector}`;
+  const count = operation === 'count';
+  const existsQuery = genreQuerySql(selectorValue, 'exists', count).replace(/^SELECT /, 'PERFORM ');
+  const inQuery = genreQuerySql(selectorValue, 'in', count).replace(/^SELECT /, 'PERFORM ');
+  const timed = (query, shape) => `
+    started := clock_timestamp();
+    ${query};
+    INSERT INTO ${ident(schema)}.samples VALUES
+      (${size}, 'genre_${selector}_${shape}_${operation}_${suffix}',
+       extract(epoch FROM clock_timestamp() - started) * 1000);`;
+  return `
+    IF iteration % 2 = 1 THEN
+      ${timed(existsQuery, 'exists')}
+      ${timed(inQuery, 'in')}
+    ELSE
+      ${timed(inQuery, 'in')}
+      ${timed(existsQuery, 'exists')}
+    END IF;`;
 }
 
 function candidateIndexSql() {
@@ -258,6 +311,51 @@ function moviePageSql(size) {
   return `SELECT id FROM ${ident(schema)}.media_items
     WHERE missing_since IS NULL AND collection_type = 'movies'
     ORDER BY lower(name), id LIMIT 100 OFFSET ${offset}`;
+}
+
+function genreQuerySql(selector, shape, count) {
+  const predicate = shape === 'exists'
+    ? `EXISTS (
+        SELECT 1 FROM ${ident(schema)}.media_item_genre_selectors AS genre
+        WHERE genre.item_id = item.id AND genre.selector = ANY(ARRAY['${selector}']::text[])
+      )`
+    : `item.id IN (
+        SELECT genre.item_id FROM ${ident(schema)}.media_item_genre_selectors AS genre
+        WHERE genre.selector = ANY(ARRAY['${selector}']::text[])
+      )`;
+  const select = count ? 'count(*)' : 'item.id';
+  const page = count ? '' : ' ORDER BY lower(item.name), item.id LIMIT 100';
+  return `SELECT ${select} FROM ${ident(schema)}.media_items AS item
+    WHERE item.missing_since IS NULL AND ${predicate}${page}`;
+}
+
+function genrePlans(connection) {
+  return Object.fromEntries(
+    ['genre-rare', 'genre-common'].flatMap((selector) =>
+      ['exists', 'in'].flatMap((shape) =>
+        [false, true].map((count) => [
+          `${selector.replace('genre-', '')}_${shape}_${count ? 'count' : 'page'}`,
+          summarizePlan(explain(connection, genreQuerySql(selector, shape, count))),
+        ]),
+      ),
+    ),
+  );
+}
+
+function genreMetricSummary(metrics, suffix) {
+  const result = {};
+  for (const selector of ['rare', 'common']) {
+    for (const operation of ['page', 'count']) {
+      const exists = metrics[`genre_${selector}_exists_${operation}_${suffix}`]?.p95Ms ?? null;
+      const inSubquery = metrics[`genre_${selector}_in_${operation}_${suffix}`]?.p95Ms ?? null;
+      result[`${selector}_${operation}`] = {
+        existsMs: exists,
+        inMs: inSubquery,
+        inSpeedup: ratio(exists, inSubquery),
+      };
+    }
+  }
+  return result;
 }
 
 function explain(connection, query) {

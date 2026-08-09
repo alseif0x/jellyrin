@@ -685,6 +685,11 @@ SET updated_at = CASE
     ELSE replace(updated_at, ' ', 'T') || 'Z'
 END;
 
+-- The bulk import bypasses repository hooks that maintain derived facets/selectors. Invalidating
+-- the marker makes the next SQLite connection rebuild them transactionally from metadata_json.
+DELETE FROM jellyrin_derived_projection_versions
+WHERE projection_name = 'media_item_facets';
+
 COMMIT;
 
 DETACH DATABASE jf;

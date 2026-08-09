@@ -132,15 +132,15 @@ use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActivityLogEntry, ActivityLogFilter,
     ActivityLogSortField, BackupManifest, BrandingConfig, DeviceSession, DiscoveredPluginPackage,
     InstallPluginPackage, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
-    LiveTvChannelUpsert, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore,
-    MediaItemCatalogCounts, MediaItemCatalogQuery, MediaItemCatalogSearchScope,
-    MediaItemCatalogSortField, MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata,
-    MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
-    NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
-    ProviderSecretReference, QuickConnectSession, ResumeItemsPageQuery, SortDirection,
-    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
-    UpsertTranscodeSession, probe_remote_media_info_admitted,
+    LiveTvChannelUpsert, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
+    MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore, MediaItemCatalogCounts,
+    MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemCatalogSortField,
+    MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterValues,
+    MediaList, MediaListItem, MediaListUserPermission, NamedConfigurationPayload,
+    PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert, ProviderSecretReference,
+    QuickConnectSession, ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads, TaskRun,
+    TranscodeSession, TrickplayInfo, UpsertActivePlaybackSession, UpsertActiveViewingSession,
+    UpsertPlaybackState, UpsertTranscodeSession, probe_remote_media_info_admitted,
     provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
     upcoming_media_item_premiere_date,
 };
@@ -28289,6 +28289,19 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Normalize and bound genre selectors before any path can choose the O(N) legacy fallback.
+fn normalized_genre_ids_for_catalog(query: &ItemsQuery) -> Result<Vec<String>, ApiError> {
+    let mut genre_ids = csv_values_lowercase(&query.genre_ids).unwrap_or_default();
+    genre_ids.sort_unstable();
+    genre_ids.dedup();
+    if genre_ids.len() > MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS {
+        return Err(ApiError::bad_request(format!(
+            "GenreIds accepts at most {MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS} distinct values"
+        )));
+    }
+    Ok(genre_ids)
+}
+
 /// Build the dialect-neutral database query for the bounded `/Items` hot path.
 ///
 /// The fallback is intentional: unresolved parent/virtual hierarchies and metadata-only filters
@@ -28298,6 +28311,7 @@ fn media_catalog_query_for_items(
     query: &ItemsQuery,
     user_id: Option<Uuid>,
 ) -> Result<Option<MediaItemCatalogQuery>, ApiError> {
+    let genre_ids = normalized_genre_ids_for_catalog(query)?;
     let Some(limit) = query.limit else {
         // The repository is deliberately bounded. Preserve the legacy unbounded response until
         // clients have supplied an explicit page size.
@@ -28310,7 +28324,6 @@ fn media_catalog_query_for_items(
             .start_index
             .is_some_and(|index| i64::try_from(index).is_err())
         || !query.person_ids.is_empty()
-        || !query.genre_ids.is_empty()
         || !query.studio_ids.is_empty()
         || !query.official_ratings.is_empty()
         || !query.tags.is_empty()
@@ -28332,7 +28345,6 @@ fn media_catalog_query_for_items(
     {
         return Ok(None);
     }
-
     let include_item_types = csv_values_lowercase(&query.include_item_types).unwrap_or_default();
     if include_item_types
         .iter()
@@ -28417,6 +28429,7 @@ fn media_catalog_query_for_items(
         video_types: query.video_types.clone(),
         audio_languages: query.audio_languages.clone(),
         subtitle_languages: query.subtitle_languages.clone(),
+        genre_ids,
         location_types: query.location_types.clone(),
         exclude_location_types: query.exclude_location_types.clone(),
         search_term: query.search_term.clone(),
@@ -28472,9 +28485,17 @@ async fn resolved_media_catalog_query_for_items(
     query: &ItemsQuery,
     user_id: Option<Uuid>,
 ) -> Result<Option<MediaItemCatalogQuery>, ApiError> {
+    let genre_ids = normalized_genre_ids_for_catalog(query)?;
     let Some(parent_id) = query.parent_id.as_deref() else {
         return media_catalog_query_for_items(query, user_id);
     };
+
+    // The legacy GenreIds path expands a real virtual-folder parent to all descendants even when
+    // Recursive is absent/false. The existing SQL parent scope intentionally does not. Keep that
+    // historical combination on the legacy matcher until parent traversal itself is unified.
+    if !genre_ids.is_empty() && query.recursive != Some(true) {
+        return Ok(None);
+    }
 
     // The legacy response can synthesize physical/Series/Season folder nodes for this shape; the
     // media-item repository intentionally returns only persisted catalogue rows.
@@ -46094,7 +46115,8 @@ async fn filtered_media_items(
     let audio_languages = csv_values_lowercase(&query.audio_languages);
     let subtitle_languages = csv_values_lowercase(&query.subtitle_languages);
     let person_ids = csv_values_lowercase(&query.person_ids);
-    let genre_ids = csv_values_lowercase(&query.genre_ids);
+    let genre_ids = normalized_genre_ids_for_catalog(query)?;
+    let genre_ids = (!genre_ids.is_empty()).then_some(genre_ids);
     let studio_ids = csv_values_lowercase(&query.studio_ids);
     let official_ratings = csv_values_lowercase(&query.official_ratings);
     let tags = csv_values_lowercase(&query.tags);
@@ -83936,8 +83958,75 @@ done
                 .iter()
                 .all(|(_, direction)| *direction == jellyrin_db::SortDirection::Descending)
         );
+        let genre_query = super::media_catalog_query_for_items(
+            &super::parse_items_query(Some("GenreIds=Drama,genre-id&Limit=10")),
+            Some(user.id),
+        )
+        .unwrap()
+        .expect("bounded genre filters should use database paging");
+        assert_eq!(genre_query.genre_ids, ["drama", "genre-id"]);
+        let oversized_genres = super::ItemsQuery {
+            limit: Some(10),
+            genre_ids: (0..=jellyrin_db::MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
+                .map(|index| format!("genre-{index}"))
+                .collect(),
+            ..super::ItemsQuery::default()
+        };
+        let oversized_error =
+            super::media_catalog_query_for_items(&oversized_genres, Some(user.id)).unwrap_err();
+        assert_eq!(oversized_error.status(), StatusCode::BAD_REQUEST);
+        let mut oversized_without_limit = oversized_genres.clone();
+        oversized_without_limit.limit = None;
+        assert_eq!(
+            super::media_catalog_query_for_items(&oversized_without_limit, Some(user.id))
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut oversized_with_legacy_filter = oversized_genres.clone();
+        oversized_with_legacy_filter.person_ids = vec!["person".to_string()];
+        assert_eq!(
+            super::media_catalog_query_for_items(&oversized_with_legacy_filter, Some(user.id))
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            super::filtered_media_items(Vec::new(), &oversized_without_limit, Some(user.id), &db)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "legacy item routes must reject the same oversized selector set"
+        );
+        let oversized_csv = (0..=jellyrin_db::MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
+            .map(|index| format!("genre-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let oversized_csv_query =
+            super::parse_items_query(Some(&format!("GenreIds={oversized_csv}&Limit=10")));
+        assert_eq!(
+            super::media_catalog_query_for_items(&oversized_csv_query, Some(user.id))
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let duplicate_csv = std::iter::repeat_n(
+            "Drama",
+            jellyrin_db::MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS + 1,
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+        let duplicate_query =
+            super::parse_items_query(Some(&format!("GenreIds={duplicate_csv}&Limit=10")));
+        assert_eq!(
+            super::media_catalog_query_for_items(&duplicate_query, Some(user.id))
+                .unwrap()
+                .unwrap()
+                .genre_ids,
+            ["drama"]
+        );
         for complex_query in [
-            "GenreIds=drama&Limit=10",
             "IncludeItemTypes=Series&Limit=10",
             "HasOverview=true&Limit=10",
         ] {
@@ -84077,7 +84166,10 @@ done
                         "Index": 0,
                         "Codec": "h264"
                     })],
-                    metadata: json!({ "Overview": "Parent overview" }),
+                    metadata: json!({
+                        "Overview": "Parent overview",
+                        "Genres": ["Drama"]
+                    }),
                 }],
             )
             .await
@@ -84102,7 +84194,10 @@ done
                         "Index": 0,
                         "Codec": "h264"
                     })],
-                    metadata: json!({ "Overview": "Child overview" }),
+                    metadata: json!({
+                        "Overview": "Child overview",
+                        "Genres": ["Drama"]
+                    }),
                 }],
             )
             .await
@@ -84173,6 +84268,54 @@ done
             HashSet::from([parent.id, child.id])
         );
 
+        let direct_genre_query = super::parse_items_query(Some(&format!(
+            "ParentId={}&GenreIds=Drama&IncludeItemTypes=Movie&Limit=10&Recursive=false",
+            parent.id.simple()
+        )));
+        assert!(
+            super::resolved_media_catalog_query_for_items(&db, &direct_genre_query, Some(user.id))
+                .await
+                .unwrap()
+                .is_none(),
+            "non-recursive parent GenreIds must retain legacy descendant expansion"
+        );
+
+        let recursive_genre_query = super::parse_items_query(Some(&format!(
+            "ParentId={}&GenreIds=Drama&IncludeItemTypes=Movie&Limit=10&Recursive=true",
+            parent.id.simple()
+        )));
+        assert!(
+            super::resolved_media_catalog_query_for_items(
+                &db,
+                &recursive_genre_query,
+                Some(user.id)
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "recursive parent GenreIds can use the equivalent SQL scope"
+        );
+
+        let oversized_parent_genres = (0..=jellyrin_db::MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
+            .map(|index| format!("genre-{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let oversized_parent_query = super::parse_items_query(Some(&format!(
+            "ParentId={}&GenreIds={oversized_parent_genres}&IncludeItemTypes=Movie&Limit=10",
+            parent.id.simple()
+        )));
+        assert_eq!(
+            super::resolved_media_catalog_query_for_items(
+                &db,
+                &oversized_parent_query,
+                Some(user.id)
+            )
+            .await
+            .unwrap_err()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let invalid_query = super::parse_items_query(Some(
             "ParentId=not-a-valid-id&IncludeItemTypes=Movie&Limit=10",
         ));
@@ -84221,6 +84364,24 @@ done
         assert_eq!(direct["TotalRecordCount"], 1);
         assert_eq!(direct["Items"][0]["Id"], parent_item_id);
         assert_eq!(direct["Items"][0]["Overview"], "Parent overview");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?ParentId={parent_id}&Recursive=false&GenreIds=Drama&IncludeItemTypes=Movie&Limit=10"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let direct_genre: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(direct_genre["TotalRecordCount"], 2);
 
         let response = app
             .clone()
@@ -96341,7 +96502,7 @@ done
                 item.id,
                 json!({
                     "Genres": ["Drama", "drama", "Thriller"],
-                    "SeriesGenres": ["Comedy"],
+                    "SeriesGenres": [{ "Name": "Comedy", "Id": "Imported-Genre" }],
                     "MusicGenres": ["Rock", "Jazz"],
                     "Artists": ["Artist One", "artist one", "Artist Two"],
                     "AlbumArtists": ["Album Artist", "Album Artist Two"],
@@ -97308,15 +97469,22 @@ done
                 0,
             ),
             (
-                format!("/Items?IncludeItemTypes=Movie&GenreIds={comedy_genre_id}"),
+                format!("/Items?IncludeItemTypes=Movie&GenreIds={comedy_genre_id}&Limit=1"),
                 1,
             ),
             (
-                format!("/Items?IncludeItemTypes=Movie&genreId={comedy_genre_id}"),
+                format!(
+                    "/Users/{}/Items?IncludeItemTypes=Movie&genreId={comedy_genre_id}&Limit=1",
+                    admin.id
+                ),
                 1,
             ),
             (
-                "/Items?IncludeItemTypes=Movie&GenreIds=00000000000000000000000000000000"
+                "/Items?IncludeItemTypes=Movie&GenreIds=Imported-Genre&Limit=1".to_string(),
+                1,
+            ),
+            (
+                "/Items?IncludeItemTypes=Movie&GenreIds=00000000000000000000000000000000&Limit=1"
                     .to_string(),
                 0,
             ),

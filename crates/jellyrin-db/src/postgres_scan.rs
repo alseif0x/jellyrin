@@ -3,19 +3,23 @@ use std::{collections::HashSet, path::Path};
 use anyhow::Context;
 use jellyrin_core::VirtualFolder;
 use serde_json::{Value, json};
+use sqlx::Acquire;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
     PostgresDatabase, collect_media_files_if_root_available, media_type_for_path,
     merge_metadata_values, metadata_lock_data, metadata_lock_key, metadata_locked_fields,
-    probe_media_info, read_local_nfo_metadata,
+    postgres_catalog::replace_postgres_media_item_facets, probe_media_info,
+    read_local_nfo_metadata,
 };
 
 impl PostgresDatabase {
     pub async fn scan_virtual_folder_items(&self, folder_id: Uuid) -> anyhow::Result<usize> {
         let (mut lock_connection, lock_key) = self.acquire_scan_lock(folder_id).await?;
-        let scan_result = self.scan_virtual_folder_items_locked(folder_id).await;
+        let scan_result = self
+            .scan_virtual_folder_items_locked(folder_id, &mut lock_connection)
+            .await;
         let unlock_result =
             sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
                 .bind(lock_key)
@@ -31,7 +35,11 @@ impl PostgresDatabase {
         }
     }
 
-    async fn scan_virtual_folder_items_locked(&self, folder_id: Uuid) -> anyhow::Result<usize> {
+    async fn scan_virtual_folder_items_locked(
+        &self,
+        folder_id: Uuid,
+        lock_connection: &mut sqlx::PgConnection,
+    ) -> anyhow::Result<usize> {
         let folder = self
             .postgres_scan_virtual_folder(folder_id)
             .await?
@@ -61,8 +69,14 @@ impl PostgresDatabase {
                     continue;
                 };
                 found_paths.insert(path_string);
-                self.postgres_upsert_local_media_item(&folder, &name, &path, media_type)
-                    .await?;
+                self.postgres_upsert_local_media_item(
+                    lock_connection,
+                    &folder,
+                    &name,
+                    &path,
+                    media_type,
+                )
+                .await?;
                 scanned += 1;
             }
         }
@@ -80,7 +94,7 @@ impl PostgresDatabase {
             )
             .bind(folder.id)
             .bind(found_paths)
-            .execute(&self.pool)
+            .execute(&mut *lock_connection)
             .await?;
         }
         Ok(scanned)
@@ -148,7 +162,13 @@ impl PostgresDatabase {
             {
                 let (mut lock_connection, lock_key) = self.acquire_scan_lock(folder.id).await?;
                 let scan_result = self
-                    .postgres_upsert_local_media_item(&folder, &name, path, media_type)
+                    .postgres_upsert_local_media_item(
+                        &mut lock_connection,
+                        &folder,
+                        &name,
+                        path,
+                        media_type,
+                    )
                     .await;
                 let unlock_result = sqlx::query_scalar::<_, bool>(
                     "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
@@ -214,6 +234,7 @@ impl PostgresDatabase {
 
     async fn postgres_upsert_local_media_item(
         &self,
+        lock_connection: &mut sqlx::PgConnection,
         folder: &VirtualFolder,
         name: &str,
         path: &Path,
@@ -239,7 +260,7 @@ impl PostgresDatabase {
             "SELECT id FROM media_items WHERE path = $1 ORDER BY missing_since NULLS FIRST LIMIT 1",
         )
         .bind(&path)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *lock_connection)
         .await?;
         let identity_id = if exact_id.is_none() {
             match (file_size, modified_at) {
@@ -263,7 +284,7 @@ impl PostgresDatabase {
                     .bind(file_size)
                     .bind(modified_at)
                     .bind(&path)
-                    .fetch_optional(&self.pool)
+                    .fetch_optional(&mut *lock_connection)
                     .await?
                 }
                 _ => None,
@@ -276,11 +297,12 @@ impl PostgresDatabase {
         let current_metadata =
             sqlx::query_scalar::<_, Value>("SELECT metadata FROM media_items WHERE id = $1")
                 .bind(item_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *lock_connection)
                 .await?
                 .unwrap_or_else(|| json!({}));
         let metadata = merge_scanned_metadata(current_metadata, media_info.metadata);
 
+        let mut transaction = lock_connection.begin().await?;
         sqlx::query(
             r#"
             INSERT INTO media_items (
@@ -325,9 +347,11 @@ impl PostgresDatabase {
         .bind(media_info.width)
         .bind(media_info.height)
         .bind(serde_json::to_value(media_info.media_streams)?)
-        .bind(metadata)
-        .execute(&self.pool)
+        .bind(&metadata)
+        .execute(&mut *transaction)
         .await?;
+        replace_postgres_media_item_facets(&mut transaction, item_id, &metadata).await?;
+        transaction.commit().await?;
         Ok(())
     }
 }
@@ -390,7 +414,10 @@ fn merge_scanned_metadata(current: Value, scanned: Value) -> Value {
 mod tests {
     use uuid::Uuid;
 
-    use super::{super::PostgresSettings, PostgresDatabase};
+    use super::{
+        super::{MediaItemCatalogQuery, PostgresSettings},
+        PostgresDatabase,
+    };
 
     #[tokio::test]
     async fn postgres_incremental_scan_resurrects_tombstoned_item_when_configured() {
@@ -407,6 +434,12 @@ mod tests {
         tokio::fs::write(&path, b"not-a-real-container")
             .await
             .unwrap();
+        tokio::fs::write(
+            path.with_extension("nfo"),
+            "<movie><genre>Scan Genre</genre></movie>",
+        )
+        .await
+        .unwrap();
         let folder = database
             .upsert_virtual_folder(
                 &format!("scan-test-{}", Uuid::new_v4()),
@@ -429,6 +462,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
+        let genre_page = database
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                genre_ids: vec!["scan genre".to_string()],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(genre_page.total_record_count, 1);
+        assert_eq!(genre_page.items[0].item.id, first[0].id);
         assert!(
             database
                 .mark_media_item_missing_by_path(&path.to_string_lossy())

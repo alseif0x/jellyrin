@@ -481,4 +481,9 @@ SET metadata_json = json_set(
 )
 WHERE json_extract(metadata_json, '$.SeriesId') IS NOT NULL;
 
+-- Metadata facets/selectors are derived in Rust. Force an exact one-time rebuild on the next
+-- SQLite connection instead of leaving a falsely current projection marker behind.
+DELETE FROM jellyrin_derived_projection_versions
+WHERE projection_name = 'media_item_facets';
+
 COMMIT;

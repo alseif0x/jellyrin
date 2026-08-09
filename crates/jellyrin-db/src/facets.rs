@@ -132,6 +132,55 @@ pub fn extract_media_item_facets(metadata: &Value) -> Vec<ExtractedMediaItemFace
     extracted
 }
 
+/// Exact selector projection for Jellyfin's GenreIds filter.
+///
+/// Unlike display facets this also retains an imported `Id` from an object that has no `Name`,
+/// because the legacy metadata matcher accepts that shape. Keeping selector tokens separate avoids
+/// exposing an artificial empty genre through Filters/Genres.
+pub fn extract_media_item_genre_selectors(metadata: &Value) -> Vec<String> {
+    let mut selectors = BTreeSet::new();
+    for key in ["Genres", "SeriesGenres"] {
+        if let Some(value) = metadata_field_case_insensitive(metadata, key) {
+            collect_genre_selectors(value, &mut selectors);
+        }
+    }
+    selectors.into_iter().collect()
+}
+
+fn collect_genre_selectors(value: &Value, selectors: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_genre_selectors(value, selectors);
+            }
+        }
+        Value::String(name) => insert_genre_name_selectors(name, selectors),
+        Value::Number(name) => insert_genre_name_selectors(&name.to_string(), selectors),
+        Value::Object(object) => {
+            if let Some(imported_id) = object
+                .get("Id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                selectors.insert(imported_id.to_ascii_lowercase());
+            }
+            if let Some(name) = object.get("Name").and_then(Value::as_str) {
+                insert_genre_name_selectors(name, selectors);
+            }
+        }
+        Value::Bool(_) | Value::Null => {}
+    }
+}
+
+fn insert_genre_name_selectors(name: &str, selectors: &mut BTreeSet<String>) {
+    let name = name.trim();
+    if !name.is_empty() {
+        selectors.insert(name.to_ascii_lowercase());
+        selectors.insert(stable_entity_id("Genre", name).to_ascii_lowercase());
+    }
+}
+
 #[derive(Debug)]
 struct PendingFacet {
     normalized_value: String,
@@ -198,10 +247,19 @@ fn insert_facet(
     facet.aliases.insert(stable_id);
     if let Some(imported_id) = imported_id.map(str::trim).filter(|id| !id.is_empty()) {
         facet.aliases.insert(imported_id.to_ascii_lowercase());
-        if let Ok(imported_uuid) = Uuid::parse_str(imported_id) {
+        if kind == MediaItemFacetKind::Person
+            && let Ok(imported_uuid) = Uuid::parse_str(imported_id)
+        {
             facet.aliases.insert(imported_uuid.simple().to_string());
         }
     }
+}
+
+fn metadata_field_case_insensitive<'a>(metadata: &'a Value, key: &str) -> Option<&'a Value> {
+    metadata
+        .as_object()?
+        .iter()
+        .find_map(|(candidate, value)| candidate.eq_ignore_ascii_case(key).then_some(value))
 }
 
 #[cfg(test)]
@@ -238,6 +296,32 @@ mod tests {
             .unwrap();
         assert_eq!(drama.normalized_value, "drama");
         assert_eq!(drama.display_value, "Drama");
+        let genre_selectors = extract_media_item_genre_selectors(&json!({
+            "gEnReS": [
+                {"Id": "Id-Only"},
+                {"Name": "Comedy", "Id": "Imported-Genre"},
+                2026,
+                [["Nested Genre"]],
+                {"Id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+            ]
+        }));
+        assert_eq!(
+            genre_selectors,
+            BTreeSet::from([
+                stable_entity_id("Genre", "2026"),
+                stable_entity_id("Genre", "Comedy"),
+                stable_entity_id("Genre", "Nested Genre"),
+                "2026".to_string(),
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                "comedy".to_string(),
+                "id-only".to_string(),
+                "imported-genre".to_string(),
+                "nested genre".to_string(),
+            ])
+            .into_iter()
+            .collect::<Vec<_>>()
+        );
+        assert!(!genre_selectors.contains(&"aaaaaaaabbbbccccddddeeeeeeeeeeee".to_string()));
         let jane = facets
             .iter()
             .find(|facet| {

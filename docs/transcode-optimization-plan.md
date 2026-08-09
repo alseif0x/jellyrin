@@ -81,7 +81,7 @@ histórica y no debe confundirse con este estado vigente.
   fallback. Búsqueda y comparaciones sensibles a collation, más filtros no
   modelados, permanecen deliberadamente en el fallback legacy.
 - El pushdown general no está terminado. Una petición sin `Limit`, filtros aún
-  no modelados —personas, géneros, estudios, tags, ratings, años o premiere—,
+  no modelados —personas, estudios, tags, ratings, años o premiere—,
   jerarquías Series/Season y endpoints como próximos episodios pueden seguir
   materializando catálogo y filtrar/ordenar en Rust. Resume con `Limit` y sin
   predicados adicionales ya aplica policy, count y página en SQL; su fallback
@@ -93,6 +93,12 @@ histórica y no debe confundirse con este estado vigente.
   Series/Season y filtros complejos conservan exactamente el fallback legacy.
   Por eso el cap 500 protege el camino SQL, pero todavía no constituye una
   garantía global de memoria para toda la API.
+- `GenreIds` ya dispone de una proyección exacta y un `EXISTS` indexado para
+  `/Items` y `/Users/{id}/Items` paginados. Acepta nombre, ID estable e ID
+  importado con semántica OR, normaliza/deduplica y rechaza más de 64 selectores
+  distintos con 400 en vez de activar el fallback O(N). El caso `ParentId` no
+  recursivo conserva todavía el camino legacy porque ese camino expande hijos;
+  `Recursive=true` sí tiene scope SQL equivalente.
 - La migración 108 normaliza las facetas de catálogo usadas por colecciones y
   lookups (`Genre`, `MusicGenre`, artistas, álbum, personas, estudios, tags y
   año) en `media_item_facets`/`media_item_facet_aliases`. Snapshot, update y
@@ -100,7 +106,11 @@ histórica y no debe confundirse con este estado vigente.
   migración PostgreSQL 109 añade un marker de versión: upgrade y migración
   SQLite→PostgreSQL reconstruyen la proyección una sola vez dentro de la misma
   transacción; readiness rechaza marker ausente, viejo o futuro. Un segundo
-  `schema` es O(1) y no cambia `completed_at` ni `xmin`.
+  `schema` es O(1) y no cambia `completed_at` ni `xmin`. La migración 110 añade
+  `media_item_genre_selectors(selector,item_id)` y eleva el extractor a v2.
+  Snapshots, updates y escaneos NFO actualizan facetas y selectores dentro de la
+  misma transacción. SQLite invalida/reconstruye una sola vez su proyección
+  legacy y rechaza versiones futuras en lugar de degradarlas silenciosamente.
 - Las colecciones de metadata y sus rutas by-name/by-ID usan ahora esas facetas
   indexadas para los shapes globales o de carpeta equivalentes. `/Items/Filters`
   y `Filters2` tienen un contrato set-based separado, sin `LIMIT`, que reutiliza
@@ -265,11 +275,17 @@ histórica y no debe confundirse con este estado vigente.
 
 ### Evidencia vigente y alcance
 
-El cierre local del workspace está completo sobre el árbol actual: 646 pruebas
-aprobadas, 0 fallidas y 5 ignoradas. Los contratos dirigidos de catálogo,
-Search/Hints, sync y telemetría también se ejecutaron contra PostgreSQL 16.14 real.
-Por paquete, la API pasa 346 pruebas, 0 fallidas y 3 ignoradas;
-`jellyrin-db`, 142/0/2 más su doctest; `jellyrin-plugin-sdk`, 12/12;
+El último cierre completo del workspace, anterior al delta GenreIds, registró
+646 pruebas aprobadas, 0 fallidas y 5 ignoradas. Para el árbol actual se volvió
+a ejecutar íntegramente la superficie afectada contra PostgreSQL 17.10 real:
+la API pasa 347 pruebas, 0 fallidas y 3 ignoradas; `jellyrin-db`, 145/0/2 más
+doctests; y el migrador, 36/36. El comando real de schema confirmó versión
+`202608080110`, 14 migraciones embebidas y cero pendientes. `check` y
+`clippy -D warnings` de DB/API/migrador
+con todos sus targets y features también terminan limpios. El intento de repetir
+todo el workspace no produjo fallos de test, pero agotó el disco durante el
+enlace duplicado de la API; por tanto no se presenta como un cierre completo
+nuevo. En la baseline anterior, `jellyrin-plugin-sdk` pasó 12/12;
 `jellyrin-plugin-rpc`, 15/15; `jellyrin-transcode`, 40/40;
 `jellyrin-server`, 7/7; y
 `jellyrin-core`, 18/18. `cargo clippy --workspace --all-targets --locked --
@@ -352,12 +368,12 @@ se marcará completo solo después de su validación y rollout correspondiente.
 
 | Área | Código local | Evidencia ejecutada | Fuera de este cierre |
 | --- | --- | --- | --- |
-| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 144/0/2 más doctest sobre PG real donde corresponde; aislamiento API/worker real; migrador 36/36; esquema y proyección hasta migración 109 probados en PG16.14; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements registrados; checks locked y clippy DB/API estrictos verdes tras el delta | E2E, carga de handlers, cutover y contratos restantes antes de otro backend |
+| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 145/0/2 más doctests sobre PostgreSQL real donde corresponde; aislamiento API/worker real; migrador 36/36; esquema y proyección 108/109/110 probados en PostgreSQL 17.10; `pg_stat_statements` precargado e instalado en el staging vigente, con 49 statements registrados; checks locked y clippy DB/API/migrador estrictos verdes tras el delta | E2E, carga de handlers, cutover y contratos restantes antes de otro backend |
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC | Imagen AArch64 final `a852c5b81213`, 157.058.151 bytes, id `922ac235...96ef5f`; corpus real MP4/MKV/MPEG-TS probe+HLS copy verde como usuario no-root; aliases, specifiers, filtros, codec implícito y comandos no confiables cubiertos; validadores de capacidades exactas añadidos | E2E Xtream/clientes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen en staging; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado; clave de referencia root-only generada | Pin público aún viejo; falta guardar el repositorio e instalar 0.1.1; perfil WireGuard MX, metadatos/secretos legítimos restantes, E2E real y publicación pendientes |
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD y escritura/backfill/rotación transaccionales; auditorías DB y runtime counts-only fail-closed | Xtream 20/20 post-XOR/ImageUrl; auditoría PostgreSQL/SQLite cubre claves legacy, probes malformados, tombstones y stream URL; scanner binario cubre logs, argv, URL userinfo/query, paths Xtream y bypasses del relay sin exponer canarios; 757 canales staging | Ejecutar ambos audits tras reimport real, reproducción E2E y matriz de clientes |
 | Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET`; Counts agregado/proyectado; lookups UUID puntuales; Search/Hints acotado; tipos efectivos compartidos y candidatos por dominio; Upcoming común transmite filas TV y retiene solo episodios futuros con metadata inline; refresh TV O(N); fallbacks conservadores | Workspace base 646/0/5; Upcoming añade conformance SQLite/PG real y gate/API, con parser/precedencia RFC3339 compartidos; Counts, Resume, tipos efectivos, Ancestors, Search/Hints y Series validados; benchmark PG16.14 10k/100k/500k: Movie page p95 1.193→0.963 ms, 9.777→6.544 ms y 11.098→6.587 ms | Llevar filtro de fecha Upcoming a columnas normalizadas para evitar el scan TV, predicados metadata complejos, resume complejo/sin límite, E2E/carga representativa |
-| Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 con backfill transaccional único; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; check locked y clippy DB/API `-D warnings` verdes | Filtros complejos por Person/Genre/Studio/Tag/rating/premiere, baseline productiva concurrente y E2E cliente real |
+| Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 y selector exacto GenreIds 110; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL 17.10 real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; GenreIds por nombre, stable/imported/Id-only, OR y paginación; cap de 64 selectores antes de cualquier fallback; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; benchmark reducido 10k valida `EXISTS` frente a `IN`; API 347/0/3, DB 145/0/2 y clippy estricto verdes | Repetir benchmark 10k/100k/500k, filtros complejos Person/Studio/Tag/rating/premiere y shapes Genre no equivalentes, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 46/46; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `8026d7f60615` desplegado; servidor SHA-256 `95f70e1c...3b6f`; FFmpeg/ffprobe `8.2-dev-git-1e0279143db9`; migración 109 current, capacidades y arranque verdes; `/healthz`/`/readyz` local+HTTPS, 0 reinicios y sin hijos FFmpeg; rollback `pre-8026d7f-20260809T144300Z`; Xtream conserva 757 canales | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; el cambio distroless afecta al contenedor, no exige reemplazar estos binarios bare-metal |
@@ -367,11 +383,13 @@ se marcará completo solo después de su validación y rollout correspondiente.
 El cierre se divide expresamente para no confundir código terminado con un
 rollout probado:
 
-1. **Último cierre de validación del árbol — completado:** workspace 646 aprobadas/0 fallidas/5
-   ignoradas con PostgreSQL real; API 346/0/3; DB 142/0/2 más doctest; SDK
-   12/12; RPC 15/15; transcode 40/40; server 7/7; core 18/18; y clippy del workspace con
-   todos los targets/features y warnings denegados. Este cierre acredita código
-   local, no sustituye el E2E con proveedores/clientes reales.
+1. **Cierre dirigido del delta GenreIds — completado:** API 347/0/3, DB 145/0/2
+   más doctests y migrador 36/36 sobre PostgreSQL 17.10 real; check y clippy
+   estrictos de los tres paquetes, formato, packaging, supply-chain e higiene
+   runtime verdes. La última baseline completa previa fue workspace 646/0/5.
+   El workspace completo actual debe repetirse tras liberar espacio; este cierre
+   acredita la superficie modificada, no sustituye el E2E con proveedores y
+   clientes reales.
 2. **Cierre y rollout JIT para Xtream integrado:** el código ya persiste
    `RemoteSourceRef={Version,Provider,TunerId,Kind,RemoteId,Extension}`, resuelve
    la URL justo antes de sync/proxy/probe y usa la revisión opaca del secreto.
@@ -412,7 +430,7 @@ rollout probado:
    incluido `ParentId` de carpeta virtual. Counts, colecciones de metadata y los
    dos endpoints Filters agregan el catálogo completo compatible sin depender
    del cap de página y conservan fallback exacto para shapes complejos. La
-   proyección facet 108/109 evita scans y backfills repetidos. Las peticiones de listado sin `Limit`, filtros
+   proyección facet/selectores 108/109/110 evita scans y backfills repetidos. Las peticiones de listado sin `Limit`, filtros
    metadata no modelados, Series/Season, sugerencias, resume sin límite o con
    filtros/orden complejos y episodios especiales todavía pueden ejecutar
    `fetch_all`, filtrar/ordenar después en Rust o hacer N+1. Resume simple con
@@ -1769,11 +1787,17 @@ timestamps ya son columnas. El estado vigente es:
   tabla de aliases añade stable/imported IDs y UUID simple para Person. La PK y
   los índices permiten lookup por item/kind/value/entity sin transportar
   metadata cruda.
+- `media_item_genre_selectors` conserva separadamente todos los tokens exactos
+  admitidos por `GenreIds`, incluidos IDs importados sin `Name`. Así se puede
+  filtrar en SQL sin inventar una faceta visible vacía ni ampliar los endpoints
+  de colecciones.
 - `jellyrin_derived_projection_versions` registra extractor, fecha y conteos.
-  La migración 109 no inserta un falso marker desde SQL: Rust lo escribe como
+  La migración PostgreSQL 109 no inserta un falso marker desde SQL: Rust lo escribe como
   última sentencia del backfill. `EnsureCurrent` es O(1) si la versión coincide;
   `Force` se usa después de importar SQLite. Fallo, cancelación o trigger revierten
-  delete, inserts y marker juntos, y runtime solo lee/verifica la versión.
+  delete, inserts y marker juntos, y runtime solo lee/verifica la versión. La
+  migración 110 incorpora los selectores de género y eleva ese contrato a v2;
+  SQLite mantiene su marker equivalente para reconstrucción única.
 - Ratings, estados, jerarquía de episodios y filtros complejos todavía no tienen
   toda la superficie normalizada necesaria para retirar sus fallbacks en Rust.
 - `catalog_sync_runs`: proveedor, generación, estado, conteos, timestamps y
@@ -1826,8 +1850,9 @@ El pipeline y sus optimizaciones restantes quedan así:
    inmediatamente ni activar cascadas sobre progreso/listas.
 8. `[~]` Géneros/tags y las otras ocho clases base de faceta ya se extraen y
    actualizan de forma set-based/atómica. Los filtros equivalentes las aprovechan
-   solo cuando su mapping coincide; Person/Genre/Studio/Tag y rangos complejos
-   aún conservan fallback hasta portar sus predicados exactos a `EXISTS`.
+   solo cuando su mapping coincide; Person/Studio/Tag, rangos complejos y formas
+   de Genre no equivalentes aún conservan fallback hasta portar sus predicados
+   exactos a `EXISTS`.
 9. `[x]` Confirmar atómicamente la publicación y el sync completado.
 10. `[~]` Staging temporal se limpia al commit y existe política/esquema de
     tombstones; falta validar el purge operativo con retención a escala.
@@ -1929,7 +1954,7 @@ el alcance legacy cross-folder ni el orden de updates.
 siguen en el camino legacy. El pushdown exige `Limit`; valores mayores se
 reducen a 500. Live TV tiene un contrato paginado separado con el mismo máximo.
 
-Las peticiones generales de `/Items` sin límite y filtros de personas, géneros,
+Las peticiones generales de `/Items` sin límite y filtros de personas,
 estudios, tags, ratings, años/premiere, Series/Season y algunos endpoints de
 sugerencias y resume complejo/sin límite todavía pueden materializar catálogos o
 filtrar/ordenar en Rust. Esto no incluye ya las colecciones/filtros simples
@@ -1960,6 +1985,12 @@ La evidencia JSON está guardada en
 El índice candidato sigue incorporado por la migración `202608080107` tanto en
 PostgreSQL como en SQLite.
 
+El harness actual añade además una distribución de género común (20 %) y rara
+(0,1 %), páginas y counts, y compara explícitamente `EXISTS` correlacionado con
+el semijoin `IN (SELECT item_id ...)` mediante p50/p95/max y planes con buffers.
+Ese delta todavía necesita un rerun real antes de elegir otra forma SQL; el
+árbol productivo conserva `EXISTS` hasta que la medida demuestre lo contrario.
+
 Esto es un benchmark sintético aislado, no una baseline productiva: demuestra
 la selección del índice y el orden de magnitud, pero no cierra distribución
 representativa, pool concurrente, RSS, sync de proveedor ni p95 E2E con
@@ -1968,8 +1999,8 @@ handlers/clientes reales.
 Los siguientes índices o normalizaciones se decidirán con
 `EXPLAIN (ANALYZE, BUFFERS)`, no por intuición. Candidatos reales:
 
-- Relaciones e índices para géneros/tags/personas/estudios si se porta ese
-  filtro fuera de JSONB.
+- Relaciones e índices para tags/personas/estudios si se portan esos filtros
+  fuera de JSONB; género ya usa la relación dedicada de la migración 110.
 - Columnas de jerarquía Series/Season/Episode y sus órdenes estables.
 - Columnas de streams consultadas con frecuencia solo si expandir JSONB aparece
   en los perfiles lentos.
@@ -2588,8 +2619,8 @@ reales del proveedor.
 4. `[~]` Staging/generaciones, batch atómico, no-op e índices están
    implementados. `/Items` tiene pushdown/cap 500 parcial; colecciones/filtros
    simples usan facetas/CTE sin cap y los candidatos por tipo efectivo usan
-   prefiltrado sargable. La proyección facet está versionada y backfilled por la
-   migración 109. Quedan predicados complejos y `EXPLAIN`/p95 de handlers
+   prefiltrado sargable. La proyección facet está versionada por 109 y sus
+   selectores `GenreIds` por 110. Quedan predicados complejos y `EXPLAIN`/p95 de handlers
    representativos. COPY ya fue medido a 100k/500k y descartado por una mejora
    de solo 1,046x/1,030x.
 5. `[~]` `jellyrin-migrate` pasa 36/36 en PostgreSQL real; `provider_secrets`

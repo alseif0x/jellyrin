@@ -702,6 +702,11 @@ pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
         reason: "derived stable and imported facet identifiers",
     },
     OmittedTableSpec {
+        table: "media_item_genre_selectors",
+        strategy: "rebuild",
+        reason: "derived exact GenreIds selector projection",
+    },
+    OmittedTableSpec {
         table: "media_item_versions",
         strategy: "rebuild",
         reason: "derived catalog relationship",
@@ -774,6 +779,10 @@ pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
 ];
 
 pub static TARGET_ONLY_OMITTED_TABLES: &[OmittedTableSpec] = &[];
+
+/// Source-owned derived metadata used only to decide whether SQLite projections need rebuilding.
+/// It is validated as schema infrastructure, never copied into the PostgreSQL target.
+pub static SOURCE_INFRASTRUCTURE_TABLES: &[&str] = &["jellyrin_derived_projection_versions"];
 
 /// Target-owned migration infrastructure. These tables are schema prerequisites, not imported
 /// application data, so they are intentionally excluded from target emptiness checks.

@@ -20,8 +20,8 @@ use super::{
     MediaItemFacetKind, MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary,
     MediaItemForImageTag, MediaItemMetadata, MediaItemQueryFilterValues, PostgresDatabase,
     RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, SortDirection, catalog_sync_duration_millis,
-    extract_media_item_facets, is_upcoming_media_item_entry, nonnegative_count,
-    normalized_facet_query_values, retain_entries_with_effective_types,
+    extract_media_item_facets, extract_media_item_genre_selectors, is_upcoming_media_item_entry,
+    nonnegative_count, normalized_facet_query_values, retain_entries_with_effective_types,
     telemetry::DatabaseOperation,
 };
 
@@ -30,7 +30,7 @@ const FACET_STAGE_INSERT_CHUNK_SIZE: usize = 2_000;
 const FACET_REBUILD_BATCH_SIZE: i64 = 500;
 
 pub const MEDIA_ITEM_FACET_PROJECTION_NAME: &str = "media_item_facets";
-pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 1;
+pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaItemFacetProjectionMode {
@@ -88,13 +88,17 @@ pub async fn ensure_media_item_facet_projection(
         .await
         .context("failed to configure media item facet projection lock timeout")?;
     sqlx::query(
-        "LOCK TABLE media_items, media_item_facets, media_item_facet_aliases \
+        "LOCK TABLE media_items, media_item_facets, media_item_facet_aliases, \
+         media_item_genre_selectors \
          IN SHARE ROW EXCLUSIVE MODE",
     )
     .execute(&mut **tx)
     .await
     .context("failed to lock media item facet projection tables")?;
     sqlx::query("DELETE FROM media_item_facets")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM media_item_genre_selectors")
         .execute(&mut **tx)
         .await?;
 
@@ -179,6 +183,23 @@ pub async fn ensure_media_item_facet_projection(
                         .push_bind(*entity_id);
                 },
             );
+            query.build().execute(&mut **tx).await?;
+        }
+        let genre_selectors = rows
+            .iter()
+            .flat_map(|(item_id, metadata)| {
+                extract_media_item_genre_selectors(metadata)
+                    .into_iter()
+                    .map(move |selector| (*item_id, selector))
+            })
+            .collect::<Vec<_>>();
+        for selector_chunk in genre_selectors.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO media_item_genre_selectors (item_id, selector) ",
+            );
+            query.push_values(selector_chunk, |mut values, (item_id, selector)| {
+                values.push_bind(*item_id).push_bind(selector);
+            });
             query.build().execute(&mut **tx).await?;
         }
         last_item_id = rows.last().map(|(item_id, _)| *item_id);
@@ -625,6 +646,7 @@ impl PostgresDatabase {
         &self,
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemCatalogPage> {
+        super::validate_media_item_catalog_query(query)?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
@@ -707,6 +729,7 @@ impl PostgresDatabase {
         &self,
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemCatalogCounts> {
+        super::validate_media_item_catalog_query(query)?;
         let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
         let transaction_result = self.pool.begin().await;
         acquire.finish_result(&transaction_result);
@@ -816,6 +839,7 @@ impl PostgresDatabase {
         &self,
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
+        super::validate_media_item_catalog_query(query)?;
         let mut values = QueryBuilder::<Postgres>::new(
             "WITH RECURSIVE selected AS MATERIALIZED (\
              SELECT item.id, lower(item.name) AS item_sort, item.path, item.media_type, \
@@ -988,7 +1012,7 @@ impl PostgresDatabase {
                        ROW_NUMBER() OVER (
                            PARTITION BY kind, CASE WHEN kind = 'media_types'
                                THEN display_value ELSE lower(btrim(display_value)) END
-                           ORDER BY item_sort, item_id, key_priority, position
+                           ORDER BY item_sort COLLATE "C", item_id, key_priority, position
                        ) AS spelling_rank
                 FROM candidate_values
                 WHERE display_value IS NOT NULL
@@ -997,8 +1021,8 @@ impl PostgresDatabase {
             SELECT kind, display_value
             FROM ranked_values
             WHERE spelling_rank = 1
-            ORDER BY kind, CASE WHEN kind = 'media_types'
-                THEN display_value ELSE lower(btrim(display_value)) END
+            ORDER BY kind COLLATE "C", (CASE WHEN kind = 'media_types'
+                THEN display_value ELSE lower(btrim(display_value)) END) COLLATE "C"
             "#,
         );
 
@@ -1804,10 +1828,24 @@ impl PostgresDatabase {
             )
             .execute(&mut **tx)
             .await?;
+            sqlx::query(
+                r#"
+                CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_genre_selector_stage (
+                    item_id uuid NOT NULL,
+                    selector text NOT NULL,
+                    PRIMARY KEY (item_id, selector)
+                ) ON COMMIT DROP
+                "#,
+            )
+            .execute(&mut **tx)
+            .await?;
             sqlx::query("TRUNCATE jellyrin_media_item_facet_stage")
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("TRUNCATE jellyrin_media_item_facet_alias_stage")
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("TRUNCATE jellyrin_media_item_genre_selector_stage")
                 .execute(&mut **tx)
                 .await?;
 
@@ -1887,6 +1925,24 @@ impl PostgresDatabase {
                                 .push_bind(*entity_id);
                         },
                     );
+                    query.build().execute(&mut **tx).await?;
+                }
+                let genre_selectors = chunk
+                    .iter()
+                    .flat_map(|item| {
+                        extract_media_item_genre_selectors(&item.metadata)
+                            .into_iter()
+                            .map(move |selector| (item.id, selector))
+                    })
+                    .collect::<Vec<_>>();
+                for selector_chunk in genre_selectors.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+                    let mut query = QueryBuilder::<Postgres>::new(
+                        "INSERT INTO jellyrin_media_item_genre_selector_stage \
+                         (item_id, selector) ",
+                    );
+                    query.push_values(selector_chunk, |mut values, (item_id, selector)| {
+                        values.push_bind(*item_id).push_bind(selector);
+                    });
                     query.build().execute(&mut **tx).await?;
                 }
             }
@@ -2091,6 +2147,32 @@ impl PostgresDatabase {
             SELECT item_id, facet_kind, normalized_value, entity_id
             FROM jellyrin_media_item_facet_alias_stage
             ON CONFLICT (item_id, facet_kind, normalized_value, entity_id) DO NOTHING
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM media_item_genre_selectors AS current
+            USING jellyrin_remote_snapshot_stage AS item_stage
+            WHERE current.item_id = item_stage.id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM jellyrin_media_item_genre_selector_stage AS staged
+                  WHERE staged.item_id = current.item_id
+                    AND staged.selector = current.selector
+              )
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_genre_selectors (item_id, selector)
+            SELECT item_id, selector
+            FROM jellyrin_media_item_genre_selector_stage
+            ON CONFLICT (item_id, selector) DO NOTHING
             "#,
         )
         .execute(&mut **tx)
@@ -2613,6 +2695,20 @@ fn push_postgres_catalog_filters(
         false,
     );
     push_postgres_ci_any_filter(builder, "item.media_type", &query.media_types, false);
+
+    let mut genre_selectors = normalized_catalog_values(&query.genre_ids);
+    genre_selectors.sort_unstable();
+    genre_selectors.dedup();
+    if !genre_selectors.is_empty() {
+        builder
+            .push(
+                " AND EXISTS (\
+                 SELECT 1 FROM media_item_genre_selectors AS genre \
+                 WHERE genre.item_id = item.id AND genre.selector = ANY(",
+            )
+            .push_bind(genre_selectors)
+            .push("))");
+    }
 
     let containers = normalized_catalog_values(&query.containers)
         .into_iter()
@@ -3254,11 +3350,15 @@ fn parse_locations(locations: Value) -> anyhow::Result<Vec<String>> {
     serde_json::from_value(locations).context("invalid virtual folder locations in database")
 }
 
-async fn replace_postgres_media_item_facets(
+pub(super) async fn replace_postgres_media_item_facets(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     item_id: Uuid,
     metadata: &Value,
 ) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_genre_selectors WHERE item_id = $1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM media_item_facets WHERE item_id = $1")
         .bind(item_id)
         .execute(&mut **tx)
@@ -3296,6 +3396,13 @@ async fn replace_postgres_media_item_facets(
             .execute(&mut **tx)
             .await?;
         }
+    }
+    for selector in extract_media_item_genre_selectors(metadata) {
+        sqlx::query("INSERT INTO media_item_genre_selectors (item_id, selector) VALUES ($1, $2)")
+            .bind(item_id)
+            .bind(selector)
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }
@@ -4112,7 +4219,9 @@ mod tests {
                 json!({
                     "Overview": "A hidden needle",
                     "Album": "Alpha Album",
-                    "Artists": [{"Name": "Artist Two", "Id": "forbidden-id"}]
+                    "Artists": [{"Name": "Artist Two", "Id": "forbidden-id"}],
+                    "Genres": [{"Name": "Drama", "Id": "Imported-Drama"}],
+                    "seriesgenres": [{"Id": "Id-Only-Genre"}]
                 }),
             );
             alpha.width = Some(3840);
@@ -4139,7 +4248,8 @@ mod tests {
                             json!({
                                 "Needle": "absent",
                                 "AlbumName": "100%_\\ Mix",
-                                "Artists": ["Artist One"]
+                                "Artists": ["Artist One"],
+                                "Genres": ["Comedy"]
                             }),
                         ),
                     ],
@@ -4245,6 +4355,35 @@ mod tests {
             assert_eq!(literal_wildcards.total_record_count, 1);
             assert_eq!(literal_wildcards.items[0].item.id, beta_id);
 
+            for selector in [
+                "drama".to_string(),
+                jellyrin_core::stable_entity_id("Genre", "Drama"),
+                "imported-drama".to_string(),
+                "id-only-genre".to_string(),
+            ] {
+                let genre = test
+                    .database
+                    .media_item_catalog_page(&MediaItemCatalogQuery {
+                        limit: 10,
+                        genre_ids: vec![selector],
+                        ..MediaItemCatalogQuery::default()
+                    })
+                    .await?;
+                assert_eq!(genre.total_record_count, 1);
+                assert_eq!(genre.items[0].item.id, alpha_id);
+            }
+            let genre_or_page = test
+                .database
+                .media_item_catalog_page(&MediaItemCatalogQuery {
+                    start_index: 1,
+                    limit: 1,
+                    genre_ids: vec!["DRAMA".to_string(), "comedy".to_string()],
+                    ..MediaItemCatalogQuery::default()
+                })
+                .await?;
+            assert_eq!(genre_or_page.total_record_count, 2);
+            assert_eq!(genre_or_page.items[0].item.id, beta_id);
+
             let played = test
                 .database
                 .media_item_catalog_page(&MediaItemCatalogQuery {
@@ -4283,8 +4422,8 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing PostgreSQL telemetry operation {name}"))
             };
             let pages = operation("catalog.page", DatabasePoolRole::Api);
-            assert_eq!((pages.calls, pages.succeeded, pages.errors), (9, 9, 0));
-            assert_eq!(pages.rows.total, 5);
+            assert_eq!((pages.calls, pages.succeeded, pages.errors), (14, 14, 0));
+            assert_eq!(pages.rows.total, 10);
             let publish = operation("catalog_sync.publish", DatabasePoolRole::Worker);
             assert_eq!(
                 (publish.calls, publish.succeeded, publish.rows.total),

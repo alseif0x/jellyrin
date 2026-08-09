@@ -59,7 +59,7 @@ mod telemetry;
 pub use driver::{DatabaseBackend, DatabaseDriver};
 pub use facets::{
     ExtractedMediaItemFacet, MediaItemFacetCandidateQuery, MediaItemFacetKind, MediaItemFacetValue,
-    extract_media_item_facets,
+    extract_media_item_facets, extract_media_item_genre_selectors,
 };
 use ffprobe_telemetry::{FfprobeOutcome, ffprobe_telemetry};
 pub use ffprobe_telemetry::{FfprobeTelemetrySnapshot, ffprobe_telemetry_snapshot};
@@ -370,6 +370,28 @@ pub struct MediaItemMetadata {
 /// Callers may request a larger page, but both database adapters clamp it to this value. The
 /// exact count is still computed over the complete filtered result set.
 pub const MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE: usize = 500;
+/// Bound repeated facet selectors so SQLite stays below its bind limit and hostile queries cannot
+/// create unbounded SQL. API requests above this limit are rejected instead of invoking the more
+/// expensive application fallback; repository callers receive an error as a second line of defense.
+pub const MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS: usize = 64;
+
+fn validate_media_item_catalog_query(query: &MediaItemCatalogQuery) -> anyhow::Result<()> {
+    let selector_count = query
+        .genre_ids
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>()
+        .len();
+    anyhow::ensure!(
+        selector_count <= MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
+        "media catalog genre selector count exceeds {}",
+        MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS
+    );
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaItemCatalogSortField {
@@ -418,6 +440,8 @@ pub struct MediaItemCatalogQuery {
     pub video_types: Vec<String>,
     pub audio_languages: Vec<String>,
     pub subtitle_languages: Vec<String>,
+    /// Genre names, stable IDs or imported entity IDs. Any selector may match.
+    pub genre_ids: Vec<String>,
     pub location_types: Vec<String>,
     pub exclude_location_types: Vec<String>,
     pub search_term: Option<String>,
@@ -461,6 +485,7 @@ impl Default for MediaItemCatalogQuery {
             video_types: Vec::new(),
             audio_languages: Vec::new(),
             subtitle_languages: Vec::new(),
+            genre_ids: Vec::new(),
             location_types: Vec::new(),
             exclude_location_types: Vec::new(),
             search_term: None,
@@ -1644,6 +1669,22 @@ fn push_sqlite_catalog_filters(
     push_sqlite_ci_in_filter(builder, "item.collection_type", &query.collection_types);
     push_sqlite_ci_in_filter(builder, "item.media_type", &query.media_types);
 
+    let mut genre_selectors = sqlite_normalized_catalog_values(&query.genre_ids);
+    genre_selectors.sort_unstable();
+    genre_selectors.dedup();
+    if !genre_selectors.is_empty() {
+        builder.push(
+            " AND EXISTS (\
+             SELECT 1 FROM media_item_genre_selectors AS genre \
+             WHERE genre.item_id = item.id AND genre.selector IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for selector in &genre_selectors {
+            separated.push_bind(selector);
+        }
+        separated.push_unseparated("))");
+    }
+
     let containers = sqlite_normalized_catalog_values(&query.containers);
     if !containers.is_empty() {
         builder.push(" AND (");
@@ -2010,6 +2051,10 @@ async fn replace_sqlite_media_item_facets(
     item_id: &str,
     metadata: &Value,
 ) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_genre_selectors WHERE item_id = ?1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM media_item_facets WHERE item_id = ?1")
         .bind(item_id)
         .execute(&mut **tx)
@@ -2048,6 +2093,13 @@ async fn replace_sqlite_media_item_facets(
             .await?;
         }
     }
+    for selector in extract_media_item_genre_selectors(metadata) {
+        sqlx::query("INSERT INTO media_item_genre_selectors (item_id, selector) VALUES (?1, ?2)")
+            .bind(item_id)
+            .bind(selector)
+            .execute(&mut **tx)
+            .await?;
+    }
     Ok(())
 }
 
@@ -2078,7 +2130,7 @@ impl SqliteDatabase {
             .await
             .context("failed to run migrations")?;
 
-        Ok(Self {
+        let database = Self {
             pool,
             // In-memory SQLite exists exclusively as the fast conformance/test harness, including
             // when jellyrin-db is compiled as another crate's dev-dependency (where cfg(test) is
@@ -2088,7 +2140,25 @@ impl SqliteDatabase {
                 .eq_ignore_ascii_case("sqlite::memory:")
                 .then(ProviderSecretVault::for_legacy_test_harness),
             telemetry: Arc::new(DatabaseTelemetry::default()),
-        })
+        };
+        let projection_version = sqlx::query_scalar::<_, i32>(
+            "SELECT extractor_version FROM jellyrin_derived_projection_versions \
+             WHERE projection_name = ?1",
+        )
+        .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
+        .fetch_optional(&database.pool)
+        .await
+        .context("failed to inspect SQLite media item facet projection")?;
+        anyhow::ensure!(
+            projection_version.is_none_or(|version| version <= MEDIA_ITEM_FACET_PROJECTION_VERSION),
+            "SQLite media item facet projection version {} is newer than supported version {}",
+            projection_version.unwrap_or_default(),
+            MEDIA_ITEM_FACET_PROJECTION_VERSION
+        );
+        if projection_version != Some(MEDIA_ITEM_FACET_PROJECTION_VERSION) {
+            database.rebuild_media_item_facets().await?;
+        }
+        Ok(database)
     }
 
     pub fn with_provider_secret_vault(mut self, vault: ProviderSecretVault) -> Self {
@@ -7140,6 +7210,7 @@ impl SqliteDatabase {
         &self,
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemCatalogPage> {
+        validate_media_item_catalog_query(query)?;
         let mut transaction = self.pool.begin().await?;
 
         let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) ");
@@ -7220,6 +7291,7 @@ impl SqliteDatabase {
         &self,
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemCatalogCounts> {
+        validate_media_item_catalog_query(query)?;
         let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
         let transaction_result = self.pool.begin().await;
         acquire.finish_result(&transaction_result);
@@ -7329,6 +7401,7 @@ impl SqliteDatabase {
         &self,
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
+        validate_media_item_catalog_query(query)?;
         let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
         let transaction_result = self.pool.begin().await;
         acquire.finish_result(&transaction_result);
@@ -8109,6 +8182,9 @@ impl SqliteDatabase {
         sqlx::query("DELETE FROM media_item_facets")
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM media_item_genre_selectors")
+            .execute(&mut *tx)
+            .await?;
         let mut last_item_id = None::<String>;
         loop {
             let rows = if let Some(last_item_id) = last_item_id.as_deref() {
@@ -8137,6 +8213,29 @@ impl SqliteDatabase {
             }
             last_item_id = rows.last().map(|(item_id, _)| item_id.clone());
         }
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_derived_projection_versions (
+                projection_name, extractor_version, completed_at, source_item_count,
+                projected_facet_count, projected_alias_count
+            )
+            SELECT ?1, ?2, ?3,
+                   (SELECT COUNT(*) FROM media_items),
+                   (SELECT COUNT(*) FROM media_item_facets),
+                   (SELECT COUNT(*) FROM media_item_facet_aliases)
+            ON CONFLICT(projection_name) DO UPDATE SET
+                extractor_version = excluded.extractor_version,
+                completed_at = excluded.completed_at,
+                source_item_count = excluded.source_item_count,
+                projected_facet_count = excluded.projected_facet_count,
+                projected_alias_count = excluded.projected_alias_count
+            "#,
+        )
+        .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -9968,15 +10067,17 @@ impl SqliteDatabase {
         item_id: &str,
         scanned_metadata: Value,
     ) -> anyhow::Result<()> {
+        let mut transaction = self.pool.begin().await?;
         let current =
             sqlx::query_scalar::<_, String>("SELECT metadata_json FROM media_items WHERE id = ?1")
                 .bind(item_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *transaction)
                 .await?
                 .and_then(|value| serde_json::from_str::<Value>(&value).ok())
                 .unwrap_or_else(|| json!({}));
         let mut merged = current.as_object().cloned().unwrap_or_default();
         if metadata_lock_data(&merged) {
+            transaction.commit().await?;
             return Ok(());
         }
         let locked_fields = metadata_locked_fields(&merged);
@@ -9987,12 +10088,15 @@ impl SqliteDatabase {
                 }
             }
         }
-        let metadata_json = serde_json::to_string(&Value::Object(merged))?;
+        let metadata = Value::Object(merged);
+        let metadata_json = serde_json::to_string(&metadata)?;
         sqlx::query("UPDATE media_items SET metadata_json = ?2 WHERE id = ?1")
             .bind(item_id)
             .bind(metadata_json)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        replace_sqlite_media_item_facets(&mut transaction, item_id, &metadata).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -13581,11 +13685,12 @@ mod tests {
 
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, DatabaseDriver, DatabasePoolRole,
-        InstallPluginPackage, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE,
-        MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemFacetCandidateQuery,
-        MediaItemFacetKind, MediaItemFavoriteFilter, PluginRuntimeInstanceUpsert,
-        ProviderSecretReference, ProviderSecretVault, RemoteMediaItemUpsert,
-        RemoteMediaLibrarySnapshot, ResumeItemsPageQuery, SortDirection,
+        InstallPluginPackage, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
+        MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MEDIA_ITEM_FACET_PROJECTION_NAME,
+        MEDIA_ITEM_FACET_PROJECTION_VERSION, MediaItemCatalogQuery, MediaItemCatalogSearchScope,
+        MediaItemFacetCandidateQuery, MediaItemFacetKind, MediaItemFavoriteFilter,
+        PluginRuntimeInstanceUpsert, ProviderSecretReference, ProviderSecretVault,
+        RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, ResumeItemsPageQuery, SortDirection,
         SystemConfigurationPayloads, UpsertActivePlaybackSession, UpsertActiveViewingSession,
         UpsertPlaybackState, UpsertTranscodeSession, parse_ffprobe_media_info,
         parse_local_nfo_metadata,
@@ -15048,7 +15153,9 @@ mod tests {
                     metadata: json!({
                         "Overview": "A hidden needle",
                         "Album": "Alpha Album",
-                        "Artists": [{"Name": "Artist Two", "Id": "forbidden-id"}]
+                        "Artists": [{"Name": "Artist Two", "Id": "forbidden-id"}],
+                        "Genres": [{"Name": "Drama", "Id": "Imported-Drama"}],
+                        "seriesgenres": [{"Id": "Id-Only-Genre"}]
                     }),
                 },
                 RemoteMediaItemUpsert {
@@ -15066,7 +15173,8 @@ mod tests {
                     metadata: json!({
                         "Needle": "absent",
                         "AlbumName": "100%_\\ Mix",
-                        "Artists": ["Artist One"]
+                        "Artists": ["Artist One"],
+                        "Genres": ["Comedy"]
                     }),
                 },
             ],
@@ -15166,6 +15274,62 @@ mod tests {
             .unwrap();
         assert_eq!(literal_wildcards.total_record_count, 1);
         assert_eq!(literal_wildcards.items[0].item.id, beta_id);
+
+        for selector in [
+            "drama".to_string(),
+            jellyrin_core::stable_entity_id("Genre", "Drama"),
+            "imported-drama".to_string(),
+            "id-only-genre".to_string(),
+        ] {
+            let genre = db
+                .media_item_catalog_page(&MediaItemCatalogQuery {
+                    limit: 10,
+                    genre_ids: vec![selector],
+                    ..MediaItemCatalogQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(genre.total_record_count, 1);
+            assert_eq!(genre.items[0].item.id, alpha_id);
+        }
+        let genre_or_page = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                start_index: 1,
+                limit: 1,
+                genre_ids: vec!["DRAMA".to_string(), "comedy".to_string()],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(genre_or_page.total_record_count, 2);
+        assert_eq!(genre_or_page.items[0].item.id, beta_id);
+
+        let oversized_genres = MediaItemCatalogQuery {
+            genre_ids: (0..=MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
+                .map(|index| format!("genre-{index}"))
+                .collect(),
+            ..MediaItemCatalogQuery::default()
+        };
+        assert!(db.media_item_catalog_page(&oversized_genres).await.is_err());
+        assert!(
+            db.media_item_catalog_counts(&oversized_genres)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.media_item_query_filter_values(&oversized_genres)
+                .await
+                .is_err()
+        );
+        let duplicate_genres = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                genre_ids: vec!["Drama".to_string(); MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS + 1],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(duplicate_genres.total_record_count, 1);
 
         let french_audio = db
             .media_item_catalog_page(&MediaItemCatalogQuery {
@@ -17344,6 +17508,16 @@ mod tests {
         assert_eq!(metadata["Overview"], "NFO overview one");
         assert_eq!(metadata["Genres"], json!(["Drama"]));
         assert_eq!(metadata["ProviderIds"]["Imdb"], "tt0000001");
+        let projected_genre = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                genre_ids: vec!["drama".to_string()],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(projected_genre.total_record_count, 1);
+        assert_eq!(projected_genre.items[0].item.id, item.id);
 
         db.update_media_item_metadata(
             item.id,
@@ -17384,6 +17558,17 @@ mod tests {
         assert_eq!(metadata["Genres"], json!(["Manual Genre"]));
         assert_eq!(metadata["Studios"], json!(["Studio Two"]));
         assert_eq!(metadata["ProviderIds"]["Imdb"], "tt0000002");
+        assert_eq!(
+            db.media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                genre_ids: vec!["manual genre".to_string()],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap()
+            .total_record_count,
+            1
+        );
     }
 
     #[tokio::test]
@@ -18099,6 +18284,111 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((facet_count, alias_count), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_connect_rebuilds_stale_facets_once_and_rejects_future_extractors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("facet-projection.db");
+        std::fs::File::create(&path).unwrap();
+        let database_url = format!("sqlite://{}", path.display());
+        let db = Database::connect(&database_url).await.unwrap();
+        let item_id = Uuid::new_v4();
+        db.replace_remote_media_library_snapshot(
+            "Persistent facets",
+            "movies",
+            "provider://persistent-facets",
+            vec![RemoteMediaItemUpsert {
+                id: item_id.to_string(),
+                name: "Persistent Genre".to_string(),
+                path: "provider://persistent-facets/movie.mkv".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({ "Genres": ["Rebuilt Genre"] }),
+            }],
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM media_item_genre_selectors")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE jellyrin_derived_projection_versions SET extractor_version = 1 \
+             WHERE projection_name = ?1",
+        )
+        .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.pool.close().await;
+
+        let rebuilt = Database::connect(&database_url).await.unwrap();
+        let page = rebuilt
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                genre_ids: vec!["rebuilt genre".to_string()],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_record_count, 1);
+        assert_eq!(page.items[0].item.id, item_id);
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>(
+                "SELECT extractor_version FROM jellyrin_derived_projection_versions \
+                 WHERE projection_name = ?1",
+            )
+            .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
+            .fetch_one(&rebuilt.pool)
+            .await
+            .unwrap(),
+            MEDIA_ITEM_FACET_PROJECTION_VERSION
+        );
+        let completed_at = sqlx::query_scalar::<_, String>(
+            "SELECT completed_at FROM jellyrin_derived_projection_versions \
+             WHERE projection_name = ?1",
+        )
+        .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
+        .fetch_one(&rebuilt.pool)
+        .await
+        .unwrap();
+        rebuilt.pool.close().await;
+
+        let current = Database::connect(&database_url).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT completed_at FROM jellyrin_derived_projection_versions \
+                 WHERE projection_name = ?1",
+            )
+            .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
+            .fetch_one(&current.pool)
+            .await
+            .unwrap(),
+            completed_at,
+            "a current SQLite projection must not be rebuilt on every connection"
+        );
+        sqlx::query(
+            "UPDATE jellyrin_derived_projection_versions SET extractor_version = ?2 \
+             WHERE projection_name = ?1",
+        )
+        .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION + 1)
+        .execute(&current.pool)
+        .await
+        .unwrap();
+        current.pool.close().await;
+
+        let error = match Database::connect(&database_url).await {
+            Ok(_) => panic!("future SQLite facet extractor must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("newer than supported"));
     }
 
     #[tokio::test]

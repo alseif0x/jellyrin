@@ -29,13 +29,13 @@ pub use runtime_hygiene::{
     RuntimeHygieneAuditOptions, RuntimeHygieneCounts, RuntimeHygieneReport, audit_runtime_hygiene,
 };
 use spec::{
-    ColumnKind, MIGRATED_TABLES, OMITTED_TABLES, TARGET_INFRASTRUCTURE_TABLES,
-    TARGET_ONLY_OMITTED_TABLES, TableSpec,
+    ColumnKind, MIGRATED_TABLES, OMITTED_TABLES, SOURCE_INFRASTRUCTURE_TABLES,
+    TARGET_INFRASTRUCTURE_TABLES, TARGET_ONLY_OMITTED_TABLES, TableSpec,
 };
 use value::{TypedValue, parse_uuid};
 
-pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_080_108;
-pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_109;
+pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_080_110;
+pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_110;
 const MIN_POSTGRES_VERSION_NUM: i64 = 160_000;
 const MIGRATION_BATCH_ROWS: usize = 500;
 const TARGET_APPLICATION_LOCK_TIMEOUT: &str = "10s";
@@ -549,6 +549,12 @@ async fn preflight_source(source: &mut SqliteConnection) -> anyhow::Result<Sourc
             source_tables.contains(table.table),
             "SQLite source is missing required table {}",
             table.table
+        );
+    }
+    for table in SOURCE_INFRASTRUCTURE_TABLES {
+        anyhow::ensure!(
+            source_tables.contains(*table),
+            "SQLite source is missing required infrastructure table {table}"
         );
     }
     validate_case_insensitive_plugin_ids(source).await?;
@@ -1757,6 +1763,11 @@ mod tests {
             .iter()
             .map(|table| table.source.to_owned())
             .chain(OMITTED_TABLES.iter().map(|table| table.table.to_owned()))
+            .chain(
+                SOURCE_INFRASTRUCTURE_TABLES
+                    .iter()
+                    .map(|table| (*table).to_owned()),
+            )
             .collect::<HashSet<_>>();
         assert_eq!(actual, expected);
         for table in MIGRATED_TABLES {
@@ -2183,7 +2194,7 @@ mod tests {
                     )
                     .fetch_one(&target)
                     .await?,
-                    (1, 0, 0, 0)
+                    (jellyrin_db::MEDIA_ITEM_FACET_PROJECTION_VERSION, 0, 0, 0)
                 );
 
                 let mut schema_lock = target.begin().await?;
