@@ -482,7 +482,7 @@ pub async fn try_import_media_from_payload(
     );
     let movie_limit = live_tv_u64_field(payload, "MovieLimit")
         .or_else(|| live_tv_u64_field(payload, "VodLimit"))
-        .map(|value| bounded_usize(value, 1, LIVE_TV_XTREAM_MAX_IMPORT_LIMIT));
+        .and_then(|value| positive_bounded_usize(value, LIVE_TV_XTREAM_MAX_IMPORT_LIMIT));
     let movie_categories = fetch_xtream_array(
         &client,
         &username,
@@ -590,7 +590,7 @@ pub async fn try_import_media_from_payload(
     .map_err(|error| XtreamImportError::new("series catalogue", error))?;
     let series_limit = live_tv_u64_field(payload, "SeriesLimit")
         .or_else(|| live_tv_u64_field(payload, "XtreamSeriesLimit"))
-        .map(|value| bounded_usize(value, 1, XTREAM_MAX_SERIES_REQUESTS));
+        .and_then(|value| positive_bounded_usize(value, XTREAM_MAX_SERIES_REQUESTS));
     let episode_limit = live_tv_u64_field(payload, "SeriesEpisodeLimit")
         .or_else(|| live_tv_u64_field(payload, "XtreamSeriesEpisodeLimit"))
         .map(|value| bounded_usize(value, 1, XTREAM_MAX_EPISODES_PER_SERIES))
@@ -1107,6 +1107,10 @@ fn bounded_usize(value: u64, minimum: usize, maximum: usize) -> usize {
     usize::try_from(value)
         .unwrap_or(usize::MAX)
         .clamp(minimum, maximum)
+}
+
+fn positive_bounded_usize(value: u64, maximum: usize) -> Option<usize> {
+    (value > 0).then(|| bounded_usize(value, 1, maximum))
 }
 
 #[cfg(test)]
@@ -2548,7 +2552,9 @@ where
         );
         let movie_limit = live_tv_u64_field(payload, "MovieLimit")
             .or_else(|| live_tv_u64_field(payload, "VodLimit"))
-            .map(|value| bounded_usize(value, 1, REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS));
+            .and_then(|value| {
+                positive_bounded_usize(value, REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS)
+            });
         let mut movie_chunks = fetch_xtream_array_chunks(
             &client,
             &username,
@@ -2605,7 +2611,7 @@ where
         );
         let series_limit = live_tv_u64_field(payload, "SeriesLimit")
             .or_else(|| live_tv_u64_field(payload, "XtreamSeriesLimit"))
-            .map(|value| bounded_usize(value, 1, XTREAM_MAX_SERIES_REQUESTS));
+            .and_then(|value| positive_bounded_usize(value, XTREAM_MAX_SERIES_REQUESTS));
         let episode_limit = live_tv_u64_field(payload, "SeriesEpisodeLimit")
             .or_else(|| live_tv_u64_field(payload, "XtreamSeriesEpisodeLimit"))
             .map(|value| bounded_usize(value, 1, XTREAM_MAX_EPISODES_PER_SERIES))
@@ -3302,7 +3308,9 @@ mod tests {
                 "Id": XTREAM_PRIMARY_TUNER_ID,
                 "Url": format!("http://{address}"),
                 "Username": "account",
-                "Password": "secret"
+                "Password": "secret",
+                "MovieLimit": 0,
+                "SeriesLimit": 0
             }),
         )
         .await
@@ -3351,6 +3359,7 @@ mod tests {
                 "Url": format!("http://{address}"),
                 "Username": "account",
                 "Password": "secret",
+                "SeriesLimit": 0,
                 "SeriesCategoryIds": ["20", "21"]
             }),
         )
@@ -3894,6 +3903,9 @@ mod tests {
     fn xtream_hardening_catalog_and_configured_limits_are_hard_bounded() {
         assert_eq!(bounded_usize(0, 1, 2_000), 1);
         assert_eq!(bounded_usize(u64::MAX, 1, 2_000), 2_000);
+        assert_eq!(positive_bounded_usize(0, 2_000), None);
+        assert_eq!(positive_bounded_usize(25, 2_000), Some(25));
+        assert_eq!(positive_bounded_usize(u64::MAX, 2_000), Some(2_000));
         assert_eq!(validate_item_count(100_000, 100_000), Ok(()));
         assert_eq!(
             validate_item_count(100_001, 100_000),
