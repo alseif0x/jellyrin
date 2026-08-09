@@ -44,6 +44,7 @@ const XTREAM_MAX_SERIES_REQUESTS: usize = 100_000;
 const XTREAM_MAX_EPISODES_PER_SERIES: usize = 10_000;
 const XTREAM_MAX_EPG_LISTINGS: usize = 256;
 const XTREAM_ARRAY_CHUNK_ITEMS: usize = 500;
+const XTREAM_SERIES_INFO_ATTEMPTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum XtreamFetchError {
@@ -931,16 +932,29 @@ async fn fetch_series_info(
     if !valid_xtream_identifier(series_id) {
         return Err(XtreamFetchError::InvalidInput);
     }
-    let result = fetch_xtream_json::<serde_json::Value>(
-        client,
-        username,
-        password,
-        "get_series_info",
-        Duration::from_secs(20),
-        XTREAM_MAX_SERIES_INFO_BODY_BYTES,
-        &[("series_id", series_id)],
-    )
-    .await;
+    let mut attempt = 0usize;
+    let result = loop {
+        attempt = attempt.saturating_add(1);
+        let result = fetch_xtream_json::<serde_json::Value>(
+            client,
+            username,
+            password,
+            "get_series_info",
+            Duration::from_secs(20),
+            XTREAM_MAX_SERIES_INFO_BODY_BYTES,
+            &[("series_id", series_id)],
+        )
+        .await;
+        if result
+            .as_ref()
+            .err()
+            .is_none_or(|error| !transient_xtream_fetch_error(*error))
+            || attempt >= XTREAM_SERIES_INFO_ATTEMPTS
+        {
+            break result;
+        }
+        tokio::time::sleep(xtream_series_retry_delay(attempt)).await;
+    };
     match result {
         Ok(value)
             if valid_series_info_shape(&value)
@@ -960,6 +974,26 @@ async fn fetch_series_info(
             warn_xtream_fetch("get_series_info", error);
             Err(error)
         }
+    }
+}
+
+fn transient_xtream_fetch_error(error: XtreamFetchError) -> bool {
+    matches!(
+        error,
+        XtreamFetchError::Request { .. }
+            | XtreamFetchError::Http(reqwest::StatusCode::TOO_MANY_REQUESTS)
+    ) || matches!(error, XtreamFetchError::Http(status) if status.is_server_error())
+}
+
+fn xtream_series_retry_delay(failed_attempt: usize) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = failed_attempt;
+        Duration::from_millis(1)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_millis(250_u64.saturating_mul(1_u64 << failed_attempt.saturating_sub(1)))
     }
 }
 
@@ -2435,6 +2469,10 @@ where
                     progress.skipped_series = progress.skipped_series.saturating_add(1);
                     continue;
                 }
+                Err(error) if transient_xtream_fetch_error(error) => {
+                    progress.skipped_series = progress.skipped_series.saturating_add(1);
+                    continue;
+                }
                 Err(error) => return Err(XtreamImportError::new("series details", error).into()),
             };
             let selected_episode_count = series_episode_count(&info).min(episode_limit);
@@ -3136,7 +3174,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..9 {
+            let mut series_200_requests = 0usize;
+            for _ in 0..13 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 loop {
@@ -3163,6 +3202,27 @@ mod tests {
                     stream.write_all(headers.as_bytes()).await.unwrap();
                     continue;
                 }
+                if request.contains("action=get_series_info") && request.contains("series_id=200") {
+                    series_200_requests = series_200_requests.saturating_add(1);
+                    if series_200_requests == 1 {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                }
+                if request.contains("action=get_series_info") && request.contains("series_id=300") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    continue;
+                }
                 let body: &[u8] = if request.contains("action=get_vod_categories") {
                     b"[]"
                 } else if request.contains("action=get_series_categories") {
@@ -3177,10 +3237,6 @@ mod tests {
                     && request.contains("series_id=200")
                 {
                     br#"{"info":{"name":"Comedy Show"},"episodes":{"1":[{"id":"2001","title":"Comedy Episode","episode_num":1,"container_extension":"mp4"}]}}"#
-                } else if request.contains("action=get_series_info")
-                    && request.contains("series_id=300")
-                {
-                    br#"{"info":{"name":"Broken Show"}}"#
                 } else if request.contains("action=get_series")
                     && request.contains("category_id=20")
                 {
