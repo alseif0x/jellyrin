@@ -47106,11 +47106,32 @@ async fn tv_series_items_result(
     user_id: Option<Uuid>,
     server_id: &str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let catalog_virtual_folder_id = if let Some(parent_id) = query.parent_id.as_deref() {
+        parse_jellyfin_uuid(parent_id).ok().map(Some)
+    } else {
+        Some(None)
+    };
+    let catalog_virtual_folder_id = if let Some(Some(parent_id)) = catalog_virtual_folder_id {
+        let is_tv_library = db.virtual_folders().await?.iter().any(|folder| {
+            folder.id == parent_id
+                && folder
+                    .collection_type
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("tvshows"))
+        });
+        is_tv_library.then_some(Some(parent_id))
+    } else {
+        catalog_virtual_folder_id
+    };
+    let mut catalog_query = query.clone();
+    catalog_query.parent_id = None;
     if query.search_term.is_none()
         && query_requests_only_item_type(query, "Series")
-        && fast_name_search_query_is_simple(query)
+        && fast_name_search_query_is_simple(&catalog_query)
+        && let Some(virtual_folder_id) = catalog_virtual_folder_id
         && let Some(page) = MediaCatalogStore::tv_series_catalog_page(
             db,
+            virtual_folder_id,
             query.start_index.unwrap_or(0),
             query
                 .limit
@@ -83980,6 +84001,30 @@ done
         db.replace_remote_media_library_snapshot("Shows", "tvshows", "provider://shows", episodes)
             .await
             .unwrap();
+        db.replace_remote_media_library_snapshot(
+            "Other Shows",
+            "tvshows",
+            "provider://other-shows",
+            vec![RemoteMediaItemUpsert {
+                id: Uuid::new_v4().simple().to_string(),
+                name: "Other Series S01E01".to_string(),
+                path: "provider://other-shows/Other Series/Season 01/Other Series S01E01.mp4"
+                    .to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "tvshows".to_string(),
+                runtime_ticks: Some(10_000_000),
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({
+                    "SeriesId": stable_entity_id("series-page-test", "Other Series"),
+                    "SeriesName": "Other Series",
+                }),
+            }],
+        )
+        .await
+        .unwrap();
         let query = super::ItemsQuery {
             include_item_types: vec!["Series".to_string()],
             ..super::ItemsQuery::default()
@@ -83988,9 +84033,30 @@ done
             .await
             .unwrap()
             .0;
-        assert_eq!(response["TotalRecordCount"], 30);
+        assert_eq!(response["TotalRecordCount"], 31);
         assert_eq!(response["Items"].as_array().unwrap().len(), 25);
         assert_eq!(response["StartIndex"], 0);
+
+        let shows_id = db
+            .virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.name == "Shows")
+            .unwrap()
+            .id;
+        let scoped_query = super::ItemsQuery {
+            parent_id: Some(shows_id.simple().to_string()),
+            include_item_types: vec!["Series".to_string()],
+            limit: Some(20),
+            ..super::ItemsQuery::default()
+        };
+        let scoped = super::tv_series_items_result(&db, &scoped_query, None, "server")
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(scoped["TotalRecordCount"], 30);
+        assert_eq!(scoped["Items"].as_array().unwrap().len(), 20);
     }
 
     #[tokio::test]

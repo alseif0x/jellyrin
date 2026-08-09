@@ -1145,6 +1145,7 @@ impl PostgresDatabase {
 
     pub async fn tv_series_catalog_page(
         &self,
+        virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
@@ -1157,12 +1158,14 @@ impl PostgresDatabase {
             SELECT EXISTS(SELECT 1 FROM media_items
             WHERE missing_since IS NULL AND media_type = 'Video'
               AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+              AND ($1::uuid IS NULL OR virtual_folder_id = $1)
               AND (NULLIF(btrim(metadata->>'SeriesId'), '') IS NULL
                                       OR btrim(metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
                                       OR NULLIF(btrim(metadata->>'SeriesName'), '') IS NULL)
             LIMIT 1)
             "#,
         )
+        .bind(virtual_folder_id)
         .fetch_one(&mut *transaction)
         .await?;
         if invalid_series {
@@ -1178,11 +1181,13 @@ impl PostgresDatabase {
             FROM media_items
             WHERE missing_since IS NULL AND media_type = 'Video'
               AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+              AND ($1::uuid IS NULL OR virtual_folder_id = $1)
             GROUP BY btrim(metadata->>'SeriesId')
             ORDER BY lower(MIN(btrim(metadata->>'SeriesName'))), MIN(btrim(metadata->>'SeriesName')), btrim(metadata->>'SeriesId')
-            LIMIT $1 OFFSET $2
+            LIMIT $2 OFFSET $3
             "#,
         )
+        .bind(virtual_folder_id)
         .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
         .fetch_all(&mut *transaction)
@@ -1193,8 +1198,9 @@ impl PostgresDatabase {
             0
         } else {
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(DISTINCT btrim(metadata->>'SeriesId')) FROM media_items WHERE missing_since IS NULL AND media_type = 'Video' AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])",
+                "SELECT COUNT(DISTINCT btrim(metadata->>'SeriesId')) FROM media_items WHERE missing_since IS NULL AND media_type = 'Video' AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[]) AND ($1::uuid IS NULL OR virtual_folder_id = $1)",
             )
+            .bind(virtual_folder_id)
             .fetch_one(&mut *transaction)
             .await?
         };
@@ -1223,10 +1229,12 @@ impl PostgresDatabase {
                 WHERE item.missing_since IS NULL
                   AND item.media_type = 'Video'
                   AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
-                  AND btrim(item.metadata->>'SeriesId') = ANY($1::text[])
+                  AND ($1::uuid IS NULL OR item.virtual_folder_id = $1)
+                  AND btrim(item.metadata->>'SeriesId') = ANY($2::text[])
                 ORDER BY lower(item.name), item.name, item.id
                 "#,
             )
+            .bind(virtual_folder_id)
             .bind(
                 series
                     .iter()
@@ -6093,7 +6101,11 @@ mod tests {
             return;
         };
         let result = async {
-            let empty_page = test.database.tv_series_catalog_page(0, 20).await?.unwrap();
+            let empty_page = test
+                .database
+                .tv_series_catalog_page(None, 0, 20)
+                .await?
+                .unwrap();
             assert_eq!(empty_page.total_record_count, 0);
             assert!(empty_page.episodes.is_empty());
             let movies = (0..512)
@@ -6146,14 +6158,22 @@ mod tests {
             );
             assert_eq!(candidates[0].metadata["SeriesName"], "Example Show");
             assert!(candidates[0].playback_state.is_none());
-            let page = test.database.tv_series_catalog_page(0, 1).await?.unwrap();
+            let page = test
+                .database
+                .tv_series_catalog_page(None, 0, 1)
+                .await?
+                .unwrap();
             assert_eq!(page.total_record_count, 1);
             assert_eq!(page.series.len(), 1);
             assert_eq!(page.series[0].id, canonical_series_id.simple().to_string());
             assert_eq!(page.series[0].name, "Example Show");
             assert_eq!(page.episodes.len(), 1);
             assert_eq!(page.episodes[0].item.id, episode_id);
-            let empty = test.database.tv_series_catalog_page(1, 1).await?.unwrap();
+            let empty = test
+                .database
+                .tv_series_catalog_page(None, 1, 1)
+                .await?
+                .unwrap();
             assert_eq!(empty.total_record_count, 1);
             assert!(empty.series.is_empty());
             assert!(empty.episodes.is_empty());
