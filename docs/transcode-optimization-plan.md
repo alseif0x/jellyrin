@@ -249,7 +249,9 @@ histórica y no debe confundirse con este estado vigente.
   el array JSON incrementalmente en bloques de 500 y lo entrega al staging DB
   en lotes máximos de 1.000. El límite se aplica después de filtrar categorías;
   `MovieLimit=0` y `SeriesLimit=0` significan importar todo. El parser valida
-  también el cierre y contenido restante del documento antes de publicar.
+  también el cierre y contenido restante del documento antes de publicar. Si el
+  catálogo Series global supera 64 MiB, usa `category_id` sobre las categorías
+  seleccionadas, exige que cada respuesta respete el filtro y deduplica IDs.
 - Escritura de envelope y actualización de configuración comparten transacción
   tanto en PostgreSQL como en SQLite. El backfill bloquea y reconcilia las tres
   copias legacy —plugin, tuner y configuración Live TV— en una transacción,
@@ -1894,16 +1896,17 @@ El incidente real de staging mostró que el límite debía aplicarse a los items
 seleccionados, no al array bruto del proveedor. El nuevo parser admite hasta
 1.000.000 de elementos inspeccionados por biblioteca, filtra cada bloque antes
 del append y valida el documento completo, incluido JSON truncado después de un
-bloque válido. El límite de cuerpo sigue siendo 64 MiB; el proveedor real que
-originó el incidente cabe en él. Una respuesta mayor fallará cerrada sin alterar
-el catálogo visible hasta incorporar un fallback por categoría medido.
+bloque válido. El límite por respuesta sigue siendo 64 MiB. En el E2E real,
+Movies llegó a 39.093 items pero el catálogo Series global superó ese tamaño;
+la generación se abortó sin publicación parcial. El fallback por categoría ya
+está implementado y validado sintéticamente, pendiente de repetir el sync real.
 
 No se adopta `page`/`limit` como contrato principal: no pertenece a la superficie
 Xtream interoperable y algunos paneles lo ignoran. El catálogo se pagina al
-cliente desde PostgreSQL después de una ingestión incremental completa. Como
-fallback futuro para respuestas superiores a 64 MiB se evaluará
-`category_id`, validando que el panel respeta realmente el filtro y detectando
-solapes; nunca se asumirán páginas completas basadas en extensiones no estándar.
+cliente desde PostgreSQL después de una ingestión incremental completa. El
+fallback para Series superiores a 64 MiB usa `category_id`, valida que el panel
+respeta realmente el filtro y rechaza IDs repetidos/solapes; nunca asume páginas
+completas basadas en extensiones no estándar.
 
 El pipeline y sus optimizaciones restantes quedan así:
 
@@ -1944,8 +1947,9 @@ El pipeline y sus optimizaciones restantes quedan así:
     elementos inspeccionados, tamaño por elemento y concurrencia.
 15. `[~]` Probadas 100.001 filas brutas, chunks acotados, Unicode/cortes JSON,
     límite inspeccionado, duplicados globales, invisibilidad y publicación
-    atómica en SQLite/PostgreSQL. Faltan solapes/fallback `category_id` si un
-    proveedor real supera también 64 MiB.
+    atómica en SQLite/PostgreSQL, además del fallback `category_id` ante un
+    `Content-Length` global excesivo. Falta completar ese fallback contra el
+    proveedor real y añadir un fixture explícito de filtro ignorado/solapes.
 16. `[ ]` Repetir `SyncXtreamMedia` real: deben aparecer `Xtream Movies` y
     `Xtream Series`, registrar conteos no secretos y permitir browse/paginación
     desde Jellyfin Web sin un pico sostenido de CPU/RAM.
