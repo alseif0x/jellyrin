@@ -20,8 +20,9 @@ use super::{
     MediaItemFacetKind, MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary,
     MediaItemForImageTag, MediaItemMetadata, MediaItemQueryFilterValues, PostgresDatabase,
     RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, SortDirection, catalog_sync_duration_millis,
-    extract_media_item_facets, extract_media_item_genre_selectors, is_upcoming_media_item_entry,
-    nonnegative_count, normalized_facet_query_values, retain_entries_with_effective_types,
+    extract_media_item_facets, extract_media_item_filter_selectors,
+    extract_media_item_genre_selectors, is_upcoming_media_item_entry, nonnegative_count,
+    normalized_facet_query_values, retain_entries_with_effective_types,
     telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
 };
 
@@ -30,7 +31,7 @@ const FACET_STAGE_INSERT_CHUNK_SIZE: usize = 2_000;
 const FACET_REBUILD_BATCH_SIZE: i64 = 500;
 
 pub const MEDIA_ITEM_FACET_PROJECTION_NAME: &str = "media_item_facets";
-pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 3;
+pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaItemFacetProjectionMode {
@@ -89,7 +90,7 @@ pub async fn ensure_media_item_facet_projection(
         .context("failed to configure media item facet projection lock timeout")?;
     sqlx::query(
         "LOCK TABLE media_items, media_item_facets, media_item_facet_aliases, \
-         media_item_genre_selectors, media_item_upcoming_dates \
+         media_item_genre_selectors, media_item_filter_selectors, media_item_upcoming_dates \
          IN SHARE ROW EXCLUSIVE MODE",
     )
     .execute(&mut **tx)
@@ -102,6 +103,9 @@ pub async fn ensure_media_item_facet_projection(
         .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM media_item_upcoming_dates")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM media_item_filter_selectors")
         .execute(&mut **tx)
         .await?;
 
@@ -202,6 +206,27 @@ pub async fn ensure_media_item_facet_projection(
             );
             query.push_values(selector_chunk, |mut values, (item_id, selector)| {
                 values.push_bind(*item_id).push_bind(selector);
+            });
+            query.build().execute(&mut **tx).await?;
+        }
+        let filter_selectors = rows
+            .iter()
+            .flat_map(|(item_id, metadata)| {
+                extract_media_item_filter_selectors(metadata)
+                    .into_iter()
+                    .map(move |(kind, selector)| (*item_id, kind, selector))
+            })
+            .collect::<Vec<_>>();
+        for selector_chunk in filter_selectors.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                "INSERT INTO media_item_filter_selectors \
+                 (item_id, selector_kind, selector) ",
+            );
+            query.push_values(selector_chunk, |mut values, (item_id, kind, selector)| {
+                values
+                    .push_bind(*item_id)
+                    .push_bind(kind.as_str())
+                    .push_bind(selector);
             });
             query.build().execute(&mut **tx).await?;
         }
@@ -1888,6 +1913,18 @@ impl PostgresDatabase {
             )
             .execute(&mut **tx)
             .await?;
+            sqlx::query(
+                r#"
+                CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_filter_selector_stage (
+                    item_id uuid NOT NULL,
+                    selector_kind text NOT NULL,
+                    selector text NOT NULL,
+                    PRIMARY KEY (item_id, selector_kind, selector)
+                ) ON COMMIT DROP
+                "#,
+            )
+            .execute(&mut **tx)
+            .await?;
             sqlx::query("TRUNCATE jellyrin_media_item_facet_stage")
                 .execute(&mut **tx)
                 .await?;
@@ -1898,6 +1935,9 @@ impl PostgresDatabase {
                 .execute(&mut **tx)
                 .await?;
             sqlx::query("TRUNCATE jellyrin_media_item_upcoming_date_stage")
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("TRUNCATE jellyrin_media_item_filter_selector_stage")
                 .execute(&mut **tx)
                 .await?;
 
@@ -1994,6 +2034,27 @@ impl PostgresDatabase {
                     );
                     query.push_values(selector_chunk, |mut values, (item_id, selector)| {
                         values.push_bind(*item_id).push_bind(selector);
+                    });
+                    query.build().execute(&mut **tx).await?;
+                }
+                let filter_selectors = chunk
+                    .iter()
+                    .flat_map(|item| {
+                        extract_media_item_filter_selectors(&item.metadata)
+                            .into_iter()
+                            .map(move |(kind, selector)| (item.id, kind, selector))
+                    })
+                    .collect::<Vec<_>>();
+                for selector_chunk in filter_selectors.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+                    let mut query = QueryBuilder::<Postgres>::new(
+                        "INSERT INTO jellyrin_media_item_filter_selector_stage \
+                         (item_id, selector_kind, selector) ",
+                    );
+                    query.push_values(selector_chunk, |mut values, (item_id, kind, selector)| {
+                        values
+                            .push_bind(*item_id)
+                            .push_bind(kind.as_str())
+                            .push_bind(selector);
                     });
                     query.build().execute(&mut **tx).await?;
                 }
@@ -2279,6 +2340,33 @@ impl PostgresDatabase {
                 media_item_upcoming_dates.unix_seconds,
                 media_item_upcoming_dates.nanosecond
             ) IS DISTINCT FROM ROW(excluded.unix_seconds, excluded.nanosecond)
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM media_item_filter_selectors AS current
+            USING jellyrin_remote_snapshot_stage AS item_stage
+            WHERE current.item_id = item_stage.id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM jellyrin_media_item_filter_selector_stage AS staged
+                  WHERE staged.item_id = current.item_id
+                    AND staged.selector_kind = current.selector_kind
+                    AND staged.selector = current.selector
+              )
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_filter_selectors (item_id, selector_kind, selector)
+            SELECT item_id, selector_kind, selector
+            FROM jellyrin_media_item_filter_selector_stage
+            ON CONFLICT (item_id, selector_kind, selector) DO NOTHING
             "#,
         )
         .execute(&mut **tx)
@@ -2744,9 +2832,39 @@ const POSTGRES_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
 END"#;
 
 fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &MediaItemCatalogQuery) {
+    let selector_groups = normalized_postgres_filter_selector_groups(query);
+    if selector_groups.is_empty() {
+        builder.push(" FROM media_items AS item ");
+    } else {
+        builder.push(" FROM (");
+        for (index, (kind, selectors)) in selector_groups.into_iter().enumerate() {
+            if index > 0 {
+                builder.push(" INTERSECT ");
+            }
+            builder
+                .push(
+                    "SELECT DISTINCT filter_selector.item_id \
+                     FROM media_item_filter_selectors AS filter_selector \
+                     WHERE filter_selector.selector_kind = ",
+                )
+                .push_bind(kind)
+                .push(" AND filter_selector.selector = ANY(")
+                .push_bind(selectors)
+                .push(")");
+        }
+        // OFFSET 0 is an intentional optimizer barrier: the small selector intersection must
+        // drive indexed PK lookups instead of PostgreSQL flattening the LATERAL and scanning the
+        // whole media_items table. This is the same measured shape used by Upcoming candidates.
+        builder.push(
+            ") AS matching_filter_item \
+             CROSS JOIN LATERAL (\
+               SELECT candidate.* FROM media_items AS candidate \
+               WHERE candidate.id = matching_filter_item.item_id OFFSET 0\
+             ) AS item ",
+        );
+    }
     builder.push(
-        " FROM media_items AS item \
-         LEFT JOIN playback_states AS playback \
+        "LEFT JOIN playback_states AS playback \
            ON playback.item_id = item.id AND ",
     );
     if let Some(user_id) = query.user_id {
@@ -2754,6 +2872,25 @@ fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &Medi
     } else {
         builder.push("FALSE");
     }
+}
+
+fn normalized_postgres_filter_selector_groups(
+    query: &MediaItemCatalogQuery,
+) -> Vec<(&'static str, Vec<String>)> {
+    let mut groups = Vec::new();
+    for (kind, values) in [
+        ("person", &query.person_ids),
+        ("studio", &query.studio_ids),
+        ("tag", &query.tags),
+    ] {
+        let mut selectors = normalized_catalog_values(values);
+        selectors.sort_unstable();
+        selectors.dedup();
+        if !selectors.is_empty() {
+            groups.push((kind, selectors));
+        }
+    }
+    groups
 }
 
 fn push_postgres_catalog_filters(
@@ -3461,6 +3598,10 @@ pub(super) async fn replace_postgres_media_item_facets(
     item_id: Uuid,
     metadata: &Value,
 ) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_filter_selectors WHERE item_id = $1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM media_item_upcoming_dates WHERE item_id = $1")
         .bind(item_id)
         .execute(&mut **tx)
@@ -3513,6 +3654,17 @@ pub(super) async fn replace_postgres_media_item_facets(
             .bind(selector)
             .execute(&mut **tx)
             .await?;
+    }
+    for (kind, selector) in extract_media_item_filter_selectors(metadata) {
+        sqlx::query(
+            "INSERT INTO media_item_filter_selectors \
+             (item_id, selector_kind, selector) VALUES ($1, $2, $3)",
+        )
+        .bind(item_id)
+        .bind(kind.as_str())
+        .bind(selector)
+        .execute(&mut **tx)
+        .await?;
     }
     if let Some((unix_seconds, nanosecond)) = upcoming_media_item_premiere_parts(metadata) {
         sqlx::query(
@@ -4342,7 +4494,14 @@ mod tests {
                     "Album": "Alpha Album",
                     "Artists": [{"Name": "Artist Two", "Id": "forbidden-id"}],
                     "Genres": [{"Name": "Drama", "Id": "Imported-Drama"}],
-                    "seriesgenres": [{"Id": "Id-Only-Genre"}]
+                    "seriesgenres": [{"Id": "Id-Only-Genre"}],
+                    "pEoPlE": [{"Name": "Jane Doe", "Id": "Imported-Person"}],
+                    "SeriesPeople": ["Suppressed Person"],
+                    "Studios": [
+                        {"Id": "Studio-Id-Only"},
+                        {"Name": "HBO", "Id": "Imported-HBO"}
+                    ],
+                    "Tags": ["Featured"]
                 }),
             );
             alpha.width = Some(3840);
@@ -4370,7 +4529,10 @@ mod tests {
                                 "Needle": "absent",
                                 "AlbumName": "100%_\\ Mix",
                                 "Artists": ["Artist One"],
-                                "Genres": ["Comedy"]
+                                "Genres": ["Comedy"],
+                                "People": ["Other Person"],
+                                "Studios": ["Other Studio"],
+                                "Tags": ["Archive"]
                             }),
                         ),
                     ],
@@ -4505,6 +4667,67 @@ mod tests {
             assert_eq!(genre_or_page.total_record_count, 2);
             assert_eq!(genre_or_page.items[0].item.id, beta_id);
 
+            for (field, selector) in [
+                ("person", "jane doe".to_string()),
+                (
+                    "person",
+                    jellyrin_core::stable_entity_id("Person", "Jane Doe"),
+                ),
+                ("person", "imported-person".to_string()),
+                ("studio", "hbo".to_string()),
+                ("studio", jellyrin_core::stable_entity_id("Studio", "HBO")),
+                ("studio", "imported-hbo".to_string()),
+                ("studio", "studio-id-only".to_string()),
+                ("tag", "featured".to_string()),
+            ] {
+                let mut filter = MediaItemCatalogQuery {
+                    limit: 10,
+                    ..MediaItemCatalogQuery::default()
+                };
+                match field {
+                    "person" => filter.person_ids.push(selector),
+                    "studio" => filter.studio_ids.push(selector),
+                    "tag" => filter.tags.push(selector),
+                    _ => unreachable!(),
+                }
+                let page = test.database.media_item_catalog_page(&filter).await?;
+                assert_eq!(page.total_record_count, 1, "field={field}");
+                assert_eq!(page.items[0].item.id, alpha_id, "field={field}");
+            }
+            let combined = test
+                .database
+                .media_item_catalog_page(&MediaItemCatalogQuery {
+                    limit: 10,
+                    person_ids: vec!["Jane Doe".to_string()],
+                    studio_ids: vec!["HBO".to_string()],
+                    tags: vec!["FEATURED".to_string()],
+                    ..MediaItemCatalogQuery::default()
+                })
+                .await?;
+            assert_eq!(combined.total_record_count, 1);
+            assert_eq!(combined.items[0].item.id, alpha_id);
+            for filter in [
+                MediaItemCatalogQuery {
+                    limit: 10,
+                    person_ids: vec!["Suppressed Person".to_string()],
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    limit: 10,
+                    person_ids: vec!["Jane Doe".to_string()],
+                    tags: vec!["Archive".to_string()],
+                    ..MediaItemCatalogQuery::default()
+                },
+            ] {
+                assert_eq!(
+                    test.database
+                        .media_item_catalog_page(&filter)
+                        .await?
+                        .total_record_count,
+                    0
+                );
+            }
+
             let played = test
                 .database
                 .media_item_catalog_page(&MediaItemCatalogQuery {
@@ -4543,8 +4766,8 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing PostgreSQL telemetry operation {name}"))
             };
             let pages = operation("catalog.page", DatabasePoolRole::Api);
-            assert_eq!((pages.calls, pages.succeeded, pages.errors), (14, 14, 0));
-            assert_eq!(pages.rows.total, 10);
+            assert_eq!((pages.calls, pages.succeeded, pages.errors), (25, 25, 0));
+            assert_eq!(pages.rows.total, 19);
             let publish = operation("catalog_sync.publish", DatabasePoolRole::Worker);
             assert_eq!(
                 (publish.calls, publish.succeeded, publish.rows.total),
@@ -5716,6 +5939,13 @@ mod tests {
             .bind(item_ids[500])
             .fetch_one(&test.database.pool)
             .await?;
+            let filter_selector_xmin_before: String = sqlx::query_scalar(
+                "SELECT xmin::text FROM media_item_filter_selectors \
+                 WHERE item_id = $1 AND selector_kind = 'person' AND selector = 'imported-person'",
+            )
+            .bind(item_ids[500])
+            .fetch_one(&test.database.pool)
+            .await?;
 
             let xmin_before: String = sqlx::query_scalar(
                 "SELECT xmin::text FROM media_item_facets WHERE item_id = $1 AND facet_kind = 'person'",
@@ -5748,6 +5978,17 @@ mod tests {
                 upcoming_xmin_before, upcoming_xmin_after,
                 "no-op snapshot rewrote Upcoming date row"
             );
+            let filter_selector_xmin_after: String = sqlx::query_scalar(
+                "SELECT xmin::text FROM media_item_filter_selectors \
+                 WHERE item_id = $1 AND selector_kind = 'person' AND selector = 'imported-person'",
+            )
+            .bind(item_ids[500])
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(
+                filter_selector_xmin_before, filter_selector_xmin_after,
+                "no-op snapshot rewrote an exact filter selector"
+            );
 
             let facet_count_before: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM media_item_facets")
@@ -5755,6 +5996,10 @@ mod tests {
                     .await?;
             let upcoming_count_before: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM media_item_upcoming_dates")
+                    .fetch_one(&test.database.pool)
+                    .await?;
+            let filter_selector_count_before: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM media_item_filter_selectors")
                     .fetch_one(&test.database.pool)
                     .await?;
             let marker_before_failed_rebuild =
@@ -5808,6 +6053,13 @@ mod tests {
                     .await?,
                 upcoming_count_before,
                 "failed rebuild must restore the previous Upcoming date projection"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_item_filter_selectors")
+                    .fetch_one(&test.database.pool)
+                    .await?,
+                filter_selector_count_before,
+                "failed rebuild must restore the previous exact filter selector projection"
             );
             assert_eq!(
                 sqlx::query_as::<_, (i32, OffsetDateTime, i64, i64, i64, String)>(

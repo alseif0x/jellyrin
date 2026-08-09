@@ -59,7 +59,8 @@ mod telemetry;
 pub use driver::{DatabaseBackend, DatabaseDriver};
 pub use facets::{
     ExtractedMediaItemFacet, MediaItemFacetCandidateQuery, MediaItemFacetKind, MediaItemFacetValue,
-    extract_media_item_facets, extract_media_item_genre_selectors,
+    MediaItemFilterSelectorKind, extract_media_item_facets, extract_media_item_filter_selectors,
+    extract_media_item_genre_selectors,
 };
 use ffprobe_telemetry::{FfprobeOutcome, ffprobe_telemetry};
 pub use ffprobe_telemetry::{FfprobeTelemetrySnapshot, ffprobe_telemetry_snapshot};
@@ -376,20 +377,26 @@ pub const MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE: usize = 500;
 pub const MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS: usize = 64;
 
 fn validate_media_item_catalog_query(query: &MediaItemCatalogQuery) -> anyhow::Result<()> {
-    let selector_count = query
-        .genre_ids
-        .iter()
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<BTreeSet<_>>()
-        .len();
-    anyhow::ensure!(
-        selector_count <= MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
-        "media catalog genre selector count exceeds {}",
-        MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS
-    );
+    for (kind, values) in [
+        ("genre", &query.genre_ids),
+        ("person", &query.person_ids),
+        ("studio", &query.studio_ids),
+        ("tag", &query.tags),
+    ] {
+        let selector_count = values
+            .iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect::<BTreeSet<_>>()
+            .len();
+        anyhow::ensure!(
+            selector_count <= MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
+            "media catalog {kind} selector count exceeds {}",
+            MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS
+        );
+    }
     Ok(())
 }
 
@@ -442,6 +449,12 @@ pub struct MediaItemCatalogQuery {
     pub subtitle_languages: Vec<String>,
     /// Genre names, stable IDs or imported entity IDs. Any selector may match.
     pub genre_ids: Vec<String>,
+    /// Person names, stable IDs or imported entity IDs. Any selector may match.
+    pub person_ids: Vec<String>,
+    /// Studio names, stable IDs or imported entity IDs. Any selector may match.
+    pub studio_ids: Vec<String>,
+    /// Raw tag values. Any selector may match.
+    pub tags: Vec<String>,
     pub location_types: Vec<String>,
     pub exclude_location_types: Vec<String>,
     pub search_term: Option<String>,
@@ -486,6 +499,9 @@ impl Default for MediaItemCatalogQuery {
             audio_languages: Vec::new(),
             subtitle_languages: Vec::new(),
             genre_ids: Vec::new(),
+            person_ids: Vec::new(),
+            studio_ids: Vec::new(),
+            tags: Vec::new(),
             location_types: Vec::new(),
             exclude_location_types: Vec::new(),
             search_term: None,
@@ -1693,6 +1709,33 @@ fn push_sqlite_catalog_filters(
         separated.push_unseparated("))");
     }
 
+    for (kind, values) in [
+        ("person", &query.person_ids),
+        ("studio", &query.studio_ids),
+        ("tag", &query.tags),
+    ] {
+        let mut selectors = sqlite_normalized_catalog_values(values);
+        selectors.sort_unstable();
+        selectors.dedup();
+        if selectors.is_empty() {
+            continue;
+        }
+        builder
+            .push(
+                " AND EXISTS (\
+                 SELECT 1 FROM media_item_filter_selectors AS filter_selector \
+                 WHERE filter_selector.item_id = item.id \
+                   AND filter_selector.selector_kind = ",
+            )
+            .push_bind(kind)
+            .push(" AND filter_selector.selector IN (");
+        let mut separated = builder.separated(", ");
+        for selector in &selectors {
+            separated.push_bind(selector);
+        }
+        separated.push_unseparated("))");
+    }
+
     let containers = sqlite_normalized_catalog_values(&query.containers);
     if !containers.is_empty() {
         builder.push(" AND (");
@@ -2059,6 +2102,10 @@ async fn replace_sqlite_media_item_facets(
     item_id: &str,
     metadata: &Value,
 ) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_filter_selectors WHERE item_id = ?1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("DELETE FROM media_item_upcoming_dates WHERE item_id = ?1")
         .bind(item_id)
         .execute(&mut **tx)
@@ -2111,6 +2158,17 @@ async fn replace_sqlite_media_item_facets(
             .bind(selector)
             .execute(&mut **tx)
             .await?;
+    }
+    for (kind, selector) in extract_media_item_filter_selectors(metadata) {
+        sqlx::query(
+            "INSERT INTO media_item_filter_selectors \
+             (item_id, selector_kind, selector) VALUES (?1, ?2, ?3)",
+        )
+        .bind(item_id)
+        .bind(kind.as_str())
+        .bind(selector)
+        .execute(&mut **tx)
+        .await?;
     }
     if let Some((unix_seconds, nanosecond)) = upcoming_media_item_premiere_parts(metadata) {
         sqlx::query(
@@ -8217,6 +8275,9 @@ impl SqliteDatabase {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM media_item_upcoming_dates")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM media_item_filter_selectors")
             .execute(&mut *tx)
             .await?;
         let mut last_item_id = None::<String>;
@@ -15232,7 +15293,14 @@ mod tests {
                         "Album": "Alpha Album",
                         "Artists": [{"Name": "Artist Two", "Id": "forbidden-id"}],
                         "Genres": [{"Name": "Drama", "Id": "Imported-Drama"}],
-                        "seriesgenres": [{"Id": "Id-Only-Genre"}]
+                        "seriesgenres": [{"Id": "Id-Only-Genre"}],
+                        "pEoPlE": [{"Name": "Jane Doe", "Id": "Imported-Person"}],
+                        "SeriesPeople": ["Suppressed Person"],
+                        "Studios": [
+                            {"Id": "Studio-Id-Only"},
+                            {"Name": "HBO", "Id": "Imported-HBO"}
+                        ],
+                        "Tags": ["Featured"]
                     }),
                 },
                 RemoteMediaItemUpsert {
@@ -15251,7 +15319,10 @@ mod tests {
                         "Needle": "absent",
                         "AlbumName": "100%_\\ Mix",
                         "Artists": ["Artist One"],
-                        "Genres": ["Comedy"]
+                        "Genres": ["Comedy"],
+                        "People": ["Other Person"],
+                        "Studios": ["Other Studio"],
+                        "Tags": ["Archive"]
                     }),
                 },
             ],
@@ -15381,6 +15452,67 @@ mod tests {
         assert_eq!(genre_or_page.total_record_count, 2);
         assert_eq!(genre_or_page.items[0].item.id, beta_id);
 
+        for (field, selector) in [
+            ("person", "jane doe".to_string()),
+            (
+                "person",
+                jellyrin_core::stable_entity_id("Person", "Jane Doe"),
+            ),
+            ("person", "imported-person".to_string()),
+            ("studio", "hbo".to_string()),
+            ("studio", jellyrin_core::stable_entity_id("Studio", "HBO")),
+            ("studio", "imported-hbo".to_string()),
+            ("studio", "studio-id-only".to_string()),
+            ("tag", "featured".to_string()),
+        ] {
+            let mut filter = MediaItemCatalogQuery {
+                limit: 10,
+                ..MediaItemCatalogQuery::default()
+            };
+            match field {
+                "person" => filter.person_ids.push(selector),
+                "studio" => filter.studio_ids.push(selector),
+                "tag" => filter.tags.push(selector),
+                _ => unreachable!(),
+            }
+            let page = db.media_item_catalog_page(&filter).await.unwrap();
+            assert_eq!(page.total_record_count, 1, "field={field}");
+            assert_eq!(page.items[0].item.id, alpha_id, "field={field}");
+        }
+        let combined = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                limit: 10,
+                person_ids: vec!["Jane Doe".to_string()],
+                studio_ids: vec!["HBO".to_string()],
+                tags: vec!["FEATURED".to_string()],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(combined.total_record_count, 1);
+        assert_eq!(combined.items[0].item.id, alpha_id);
+        for filter in [
+            MediaItemCatalogQuery {
+                limit: 10,
+                person_ids: vec!["Suppressed Person".to_string()],
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                limit: 10,
+                person_ids: vec!["Jane Doe".to_string()],
+                tags: vec!["Archive".to_string()],
+                ..MediaItemCatalogQuery::default()
+            },
+        ] {
+            assert_eq!(
+                db.media_item_catalog_page(&filter)
+                    .await
+                    .unwrap()
+                    .total_record_count,
+                0
+            );
+        }
+
         let oversized_genres = MediaItemCatalogQuery {
             genre_ids: (0..=MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
                 .map(|index| format!("genre-{index}"))
@@ -15407,6 +15539,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(duplicate_genres.total_record_count, 1);
+        for oversized in [
+            MediaItemCatalogQuery {
+                person_ids: (0..=MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
+                    .map(|index| format!("person-{index}"))
+                    .collect(),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                studio_ids: (0..=MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
+                    .map(|index| format!("studio-{index}"))
+                    .collect(),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                tags: (0..=MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS)
+                    .map(|index| format!("tag-{index}"))
+                    .collect(),
+                ..MediaItemCatalogQuery::default()
+            },
+        ] {
+            assert!(db.media_item_catalog_page(&oversized).await.is_err());
+        }
 
         let french_audio = db
             .media_item_catalog_page(&MediaItemCatalogQuery {
@@ -18404,11 +18558,26 @@ mod tests {
                 .unwrap();
         let upcoming_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM media_item_upcoming_dates WHERE item_id = ?1")
-                .bind(storage_id)
+                .bind(&storage_id)
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!((facet_count, alias_count, upcoming_count), (0, 0, 0));
+        let filter_selector_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_item_filter_selectors WHERE item_id = ?1",
+        )
+        .bind(&storage_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                facet_count,
+                alias_count,
+                upcoming_count,
+                filter_selector_count
+            ),
+            (0, 0, 0, 0)
+        );
     }
 
     #[tokio::test]
@@ -18436,7 +18605,10 @@ mod tests {
                 media_streams: Vec::new(),
                 metadata: json!({
                     "Genres": ["Rebuilt Genre"],
-                    "PremiereDate": "2035-02-03T04:05:06.123456789Z"
+                    "PremiereDate": "2035-02-03T04:05:06.123456789Z",
+                    "People": [{"Name": "Rebuilt Person", "Id": "Person-ID"}],
+                    "Studios": [{"Name": "Rebuilt Studio", "Id": "Studio-ID"}],
+                    "Tags": ["Rebuilt Tag"]
                 }),
             }],
         )
@@ -18450,8 +18622,12 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
+        sqlx::query("DELETE FROM media_item_filter_selectors")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         sqlx::query(
-            "UPDATE jellyrin_derived_projection_versions SET extractor_version = 2 \
+            "UPDATE jellyrin_derived_projection_versions SET extractor_version = 3 \
              WHERE projection_name = ?1",
         )
         .bind(MEDIA_ITEM_FACET_PROJECTION_NAME)
@@ -18481,6 +18657,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(upcoming_date.1, 123_456_789);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_item_filter_selectors \
+                 WHERE item_id IN (?1, ?2)",
+            )
+            .bind(item_id.simple().to_string())
+            .bind(item_id.to_string())
+            .fetch_one(&rebuilt.pool)
+            .await
+            .unwrap(),
+            7,
+            "v3 to v4 rebuild must publish raw/stable/imported entity selectors and tag"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i32>(
                 "SELECT extractor_version FROM jellyrin_derived_projection_versions \

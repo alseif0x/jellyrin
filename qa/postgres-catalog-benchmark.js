@@ -39,6 +39,7 @@ async function main() {
       const currentPlan = explain(connection, moviePageSql(size));
       const currentGenrePlans = genrePlans(connection);
       const currentUpcomingPlans = upcomingPlans(connection);
+      const currentFilterSelectorPlans = filterSelectorPlans(connection);
       psql(connection, candidateIndexSql());
       psql(connection, sampleSql(size, repetitions, true));
       const candidatePlan = explain(connection, moviePageSql(size));
@@ -69,6 +70,12 @@ async function main() {
           futureTvRows: futureTvRows(size),
           p95: upcomingMetricSummary(byScenario),
           plans: currentUpcomingPlans,
+        },
+        filterSelectorProjection: {
+          expectedVisibleRows: combinedFilterSelectorRows(size),
+          semantics: 'or-within-kind-and-across-person-studio-tag',
+          p95: filterSelectorMetricSummary(byScenario),
+          plans: currentFilterSelectorPlans,
         },
       });
       psql(connection, `DROP INDEX IF EXISTS ${ident(schema)}.media_items_visible_collection_name_page_idx;`);
@@ -160,6 +167,12 @@ function setupSql() {
       unix_seconds bigint NOT NULL,
       nanosecond integer NOT NULL
     );
+    CREATE TABLE ${ident(schema)}.media_item_filter_selectors (
+      item_id uuid NOT NULL REFERENCES ${ident(schema)}.media_items(id) ON DELETE CASCADE,
+      selector_kind text NOT NULL CHECK (selector_kind IN ('person', 'studio', 'tag')),
+      selector text NOT NULL,
+      PRIMARY KEY (item_id, selector_kind, selector)
+    );
     CREATE TABLE ${ident(schema)}.samples (
       dataset_size integer NOT NULL,
       scenario text NOT NULL,
@@ -181,13 +194,16 @@ function setupSql() {
       ON ${ident(schema)}.media_item_genre_selectors (selector, item_id);
     CREATE INDEX media_item_upcoming_dates_range_idx
       ON ${ident(schema)}.media_item_upcoming_dates (unix_seconds, nanosecond, item_id);
+    CREATE INDEX media_item_filter_selectors_lookup_idx
+      ON ${ident(schema)}.media_item_filter_selectors (selector_kind, selector, item_id);
   `;
 }
 
 function seedSql(size) {
   return `
     TRUNCATE ${ident(schema)}.media_items, ${ident(schema)}.playback_states,
-      ${ident(schema)}.media_item_genre_selectors, ${ident(schema)}.media_item_upcoming_dates;
+      ${ident(schema)}.media_item_genre_selectors, ${ident(schema)}.media_item_upcoming_dates,
+      ${ident(schema)}.media_item_filter_selectors;
     DELETE FROM ${ident(schema)}.samples WHERE dataset_size = ${size};
     BEGIN;
     SET LOCAL synchronous_commit = off;
@@ -248,11 +264,23 @@ function seedSql(size) {
       CASE WHEN value % 100 = 1 THEN 2000000000 ELSE 1000000000 END,
       CASE WHEN value % 100 = 1 THEN 1 ELSE 0 END
     FROM generate_series(1, ${size}) AS value;
+    INSERT INTO ${ident(schema)}.media_item_filter_selectors (
+      item_id, selector_kind, selector
+    )
+    SELECT md5('item-' || value)::uuid, 'person', 'person-common'
+    FROM generate_series(1, ${size}) AS value WHERE value % 5 = 0
+    UNION ALL
+    SELECT md5('item-' || value)::uuid, 'studio', 'studio-common'
+    FROM generate_series(1, ${size}) AS value WHERE value % 7 = 0
+    UNION ALL
+    SELECT md5('item-' || value)::uuid, 'tag', 'tag-common'
+    FROM generate_series(1, ${size}) AS value WHERE value % 11 = 0;
     COMMIT;
     ANALYZE ${ident(schema)}.media_items;
     ANALYZE ${ident(schema)}.playback_states;
     ANALYZE ${ident(schema)}.media_item_genre_selectors;
     ANALYZE ${ident(schema)}.media_item_upcoming_dates;
+    ANALYZE ${ident(schema)}.media_item_filter_selectors;
   `;
 }
 
@@ -306,6 +334,8 @@ function sampleSql(size, sampleRepetitions, candidate) {
           genreBenchmarkPairSql(size, suffix, 'common', 'count'),
           upcomingBenchmarkSql(size, 'scan'),
           upcomingBenchmarkSql(size, 'projection'),
+          filterSelectorBenchmarkSql(size, 'scan'),
+          filterSelectorBenchmarkSql(size, 'projection'),
         ].join('\n')}
       END LOOP;
     END $benchmark$;
@@ -319,6 +349,15 @@ function upcomingBenchmarkSql(size, shape) {
     ${query};
     INSERT INTO ${ident(schema)}.samples VALUES
       (${size}, 'upcoming_${shape}', extract(epoch FROM clock_timestamp() - started) * 1000);`;
+}
+
+function filterSelectorBenchmarkSql(size, shape) {
+  const query = filterSelectorQuerySql(shape).replace(/^SELECT /, 'PERFORM ');
+  return `
+    started := clock_timestamp();
+    ${query};
+    INSERT INTO ${ident(schema)}.samples VALUES
+      (${size}, 'filter_selectors_${shape}', extract(epoch FROM clock_timestamp() - started) * 1000);`;
 }
 
 function genreBenchmarkPairSql(size, suffix, selector, operation) {
@@ -415,9 +454,50 @@ function upcomingPlans(connection) {
   };
 }
 
+function filterSelectorQuerySql(shape) {
+  if (shape === 'projection') {
+    return `SELECT item.id, item.metadata
+      FROM (
+        SELECT item_id FROM ${ident(schema)}.media_item_filter_selectors
+        WHERE selector_kind = 'person' AND selector = ANY(ARRAY['person-common']::text[])
+        INTERSECT
+        SELECT item_id FROM ${ident(schema)}.media_item_filter_selectors
+        WHERE selector_kind = 'studio' AND selector = ANY(ARRAY['studio-common']::text[])
+        INTERSECT
+        SELECT item_id FROM ${ident(schema)}.media_item_filter_selectors
+        WHERE selector_kind = 'tag' AND selector = ANY(ARRAY['tag-common']::text[])
+      ) AS matching_filter_item
+      CROSS JOIN LATERAL (
+        SELECT candidate.id, candidate.metadata, candidate.missing_since
+        FROM ${ident(schema)}.media_items AS candidate
+        WHERE candidate.id = matching_filter_item.item_id OFFSET 0
+      ) AS item
+      WHERE item.missing_since IS NULL`;
+  }
+  return `SELECT item.id, item.metadata FROM ${ident(schema)}.media_items AS item
+    WHERE item.missing_since IS NULL`;
+}
+
+function filterSelectorPlans(connection) {
+  return {
+    scan: summarizePlan(explain(connection, filterSelectorQuerySql('scan'))),
+    projection: summarizePlan(explain(connection, filterSelectorQuerySql('projection'))),
+  };
+}
+
 function upcomingMetricSummary(metrics) {
   const scan = metrics.upcoming_scan?.p95Ms ?? null;
   const projection = metrics.upcoming_projection?.p95Ms ?? null;
+  return {
+    scanMs: scan,
+    projectionMs: projection,
+    speedup: ratio(scan, projection),
+  };
+}
+
+function filterSelectorMetricSummary(metrics) {
+  const scan = metrics.filter_selectors_scan?.p95Ms ?? null;
+  const projection = metrics.filter_selectors_projection?.p95Ms ?? null;
   return {
     scanMs: scan,
     projectionMs: projection,
@@ -503,6 +583,12 @@ function visibleTvRows(size) {
 
 function futureTvRows(size) {
   return Math.floor((size - 1) / 300) + 1;
+}
+
+function combinedFilterSelectorRows(size) {
+  const selected = Math.floor(size / 385);
+  const missingSelected = Math.floor(size / 7700);
+  return selected - missingSelected;
 }
 
 function ident(value) {

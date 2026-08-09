@@ -91,6 +91,23 @@ pub struct MediaItemFacetCandidateQuery {
     pub virtual_folder_ids: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MediaItemFilterSelectorKind {
+    Person,
+    Studio,
+    Tag,
+}
+
+impl MediaItemFilterSelectorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Studio => "studio",
+            Self::Tag => "tag",
+        }
+    }
+}
+
 pub fn extract_media_item_facets(metadata: &Value) -> Vec<ExtractedMediaItemFacet> {
     let specs: [(MediaItemFacetKind, &[&str]); 9] = [
         (MediaItemFacetKind::Genre, &["Genres", "SeriesGenres"]),
@@ -145,6 +162,138 @@ pub fn extract_media_item_genre_selectors(metadata: &Value) -> Vec<String> {
         }
     }
     selectors.into_iter().collect()
+}
+
+/// Exact selector projection for metadata-backed `/Items` filters.
+///
+/// Person selection preserves Jellyfin's inheritance rule: any non-empty `People` or `Cast`
+/// value suppresses `SeriesPeople`. Entity selectors accept raw names, stable IDs and imported
+/// object IDs, while Tags accept only their raw normalized values.
+pub fn extract_media_item_filter_selectors(
+    metadata: &Value,
+) -> Vec<(MediaItemFilterSelectorKind, String)> {
+    let mut selectors = BTreeSet::new();
+    let people = metadata_field_case_insensitive(metadata, "People");
+    let cast = metadata_field_case_insensitive(metadata, "Cast");
+    let has_item_people =
+        people.is_some_and(metadata_value_has_items) || cast.is_some_and(metadata_value_has_items);
+    for value in [people, cast]
+        .into_iter()
+        .chain(
+            (!has_item_people).then(|| metadata_field_case_insensitive(metadata, "SeriesPeople")),
+        )
+        .flatten()
+    {
+        collect_entity_filter_selectors(
+            value,
+            MediaItemFilterSelectorKind::Person,
+            "Person",
+            &mut selectors,
+        );
+    }
+    for key in ["Studios", "SeriesStudios"] {
+        if let Some(value) = metadata_field_case_insensitive(metadata, key) {
+            collect_entity_filter_selectors(
+                value,
+                MediaItemFilterSelectorKind::Studio,
+                "Studio",
+                &mut selectors,
+            );
+        }
+    }
+    if let Some(value) = metadata_field_case_insensitive(metadata, "Tags") {
+        collect_tag_filter_selectors(value, &mut selectors);
+    }
+    selectors.into_iter().collect()
+}
+
+fn metadata_value_has_items(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => !values.is_empty(),
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Object(object) => !object.is_empty(),
+        Value::Number(_) | Value::Bool(_) | Value::Null => false,
+    }
+}
+
+fn collect_entity_filter_selectors(
+    value: &Value,
+    kind: MediaItemFilterSelectorKind,
+    entity_type: &str,
+    selectors: &mut BTreeSet<(MediaItemFilterSelectorKind, String)>,
+) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_entity_filter_selectors(value, kind, entity_type, selectors);
+            }
+        }
+        Value::String(name) => insert_entity_filter_name(name, kind, entity_type, selectors),
+        Value::Number(name) => {
+            insert_entity_filter_name(&name.to_string(), kind, entity_type, selectors);
+        }
+        Value::Object(object) => {
+            if let Some(imported_id) = object
+                .get("Id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                selectors.insert((kind, imported_id.to_ascii_lowercase()));
+            }
+            if let Some(name) = object.get("Name").and_then(Value::as_str) {
+                insert_entity_filter_name(name, kind, entity_type, selectors);
+            }
+        }
+        Value::Bool(_) | Value::Null => {}
+    }
+}
+
+fn insert_entity_filter_name(
+    name: &str,
+    kind: MediaItemFilterSelectorKind,
+    entity_type: &str,
+    selectors: &mut BTreeSet<(MediaItemFilterSelectorKind, String)>,
+) {
+    let name = name.trim();
+    if !name.is_empty() {
+        selectors.insert((kind, name.to_ascii_lowercase()));
+        selectors.insert((
+            kind,
+            stable_entity_id(entity_type, name).to_ascii_lowercase(),
+        ));
+    }
+}
+
+fn collect_tag_filter_selectors(
+    value: &Value,
+    selectors: &mut BTreeSet<(MediaItemFilterSelectorKind, String)>,
+) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_tag_filter_selectors(value, selectors);
+            }
+        }
+        Value::String(tag) => insert_tag_filter_selector(tag, selectors),
+        Value::Number(tag) => insert_tag_filter_selector(&tag.to_string(), selectors),
+        Value::Object(object) => {
+            if let Some(name) = object.get("Name").and_then(Value::as_str) {
+                insert_tag_filter_selector(name, selectors);
+            }
+        }
+        Value::Bool(_) | Value::Null => {}
+    }
+}
+
+fn insert_tag_filter_selector(
+    tag: &str,
+    selectors: &mut BTreeSet<(MediaItemFilterSelectorKind, String)>,
+) {
+    let tag = tag.trim();
+    if !tag.is_empty() {
+        selectors.insert((MediaItemFilterSelectorKind::Tag, tag.to_ascii_lowercase()));
+    }
 }
 
 fn collect_genre_selectors(value: &Value, selectors: &mut BTreeSet<String>) {
@@ -322,6 +471,58 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert!(!genre_selectors.contains(&"aaaaaaaabbbbccccddddeeeeeeeeeeee".to_string()));
+        let filter_selectors = extract_media_item_filter_selectors(&json!({
+            "pEoPlE": [
+                {"Name": " Jane Doe ", "Id": "IMPORTED-PERSON"},
+                2026
+            ],
+            "SeriesPeople": ["Inherited Person"],
+            "sTuDiOs": [{"Id": "STUDIO-ID"}, {"Name": "HBO"}],
+            "tAgS": [" Featured ", 7, {"Name": "Object Tag", "Id": "ignored"}]
+        }));
+        let filter_selectors = filter_selectors.into_iter().collect::<BTreeSet<_>>();
+        for selector in [
+            "jane doe".to_string(),
+            stable_entity_id("Person", "Jane Doe"),
+            "imported-person".to_string(),
+            "2026".to_string(),
+            stable_entity_id("Person", "2026"),
+        ] {
+            assert!(filter_selectors.contains(&(MediaItemFilterSelectorKind::Person, selector)));
+        }
+        assert!(!filter_selectors.contains(&(
+            MediaItemFilterSelectorKind::Person,
+            "inherited person".to_string()
+        )));
+        assert!(
+            filter_selectors
+                .contains(&(MediaItemFilterSelectorKind::Studio, "studio-id".to_string()))
+        );
+        assert!(filter_selectors.contains(&(
+            MediaItemFilterSelectorKind::Studio,
+            stable_entity_id("Studio", "HBO")
+        )));
+        for selector in ["featured", "7", "object tag"] {
+            assert!(
+                filter_selectors
+                    .contains(&(MediaItemFilterSelectorKind::Tag, selector.to_string()))
+            );
+        }
+        assert!(!filter_selectors.contains(&(
+            MediaItemFilterSelectorKind::Tag,
+            stable_entity_id("Tag", "Featured")
+        )));
+        assert!(
+            extract_media_item_filter_selectors(&json!({
+                "People": [],
+                "Cast": " ",
+                "SeriesPeople": ["Inherited Person"]
+            }))
+            .contains(&(
+                MediaItemFilterSelectorKind::Person,
+                "inherited person".to_string()
+            ))
+        );
         let jane = facets
             .iter()
             .find(|facet| {

@@ -712,6 +712,11 @@ pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
         reason: "derived exact Upcoming date projection",
     },
     OmittedTableSpec {
+        table: "media_item_filter_selectors",
+        strategy: "rebuild",
+        reason: "derived exact PersonIds, StudioIds and Tags selector projection",
+    },
+    OmittedTableSpec {
         table: "media_item_versions",
         strategy: "rebuild",
         reason: "derived catalog relationship",
