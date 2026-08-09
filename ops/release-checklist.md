@@ -14,6 +14,9 @@
   `SHA256SUMS`. A local policy-only QA pass is not vulnerability scan evidence.
 - Run `qa/ffmpeg-remux-smoke.sh` against the exact release image; retain a passing MP4, Matroska and
   MPEG-TS probe/stream-copy result before promotion.
+- Run `qa/runtime-container-smoke.sh` against the exact release image; require migrations,
+  non-root read-only startup, health/readiness and graceful shutdown to pass against disposable
+  PostgreSQL before promotion.
 - Install both binaries under `/usr/local/bin/`.
 - Install FFmpeg and verify both `ffmpeg -version` and `ffprobe -version` as the
   service user; startup requires a usable `ffprobe` even when FFmpeg jobs are disabled.

@@ -74,6 +74,7 @@ docker build --pull \
   --tag jellyrin:release \
   .
 ops/generate-sbom.sh jellyrin:release supply-chain-artifacts
+qa/runtime-container-smoke.sh jellyrin:release
 ops/scan-vulnerabilities.sh jellyrin:release vulnerability-artifacts
 (cd supply-chain-artifacts && sha256sum --check --strict SHA256SUMS)
 (cd vulnerability-artifacts && sha256sum --check --strict SHA256SUMS)
@@ -92,6 +93,12 @@ Trivy versions and database metadata, machine-readable Rust and image findings, 
 FFmpeg result set, verified fix baseline, generated ignore policy, scanner exit codes and checksums. The runner downloads the cargo-audit crate and
 Trivy archive into an isolated temporary directory and verifies both before execution. It does not
 assume either scanner is installed globally and does not modify the developer's Cargo tools.
+
+The runtime smoke creates an isolated PostgreSQL network, applies every embedded migration with
+the migrator role, starts the read-only distroless server as UID/GID `10001:10001`, exercises its
+internal healthcheck plus `/healthz` and `/readyz`, and requires a clean graceful shutdown. All
+containers, anonymous volumes and the network are disposable test state; no provider credential is
+required. CI also rejects a release image whose native architecture is not AMD64.
 
 Rust dependencies can also be gated independently on a host without Docker:
 

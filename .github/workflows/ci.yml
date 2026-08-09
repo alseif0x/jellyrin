@@ -127,8 +127,12 @@ jobs:
             .
       - name: Generate and verify image/source SBOM bundle
         run: ops/generate-sbom.sh jellyrin:ci supply-chain-artifacts
+      - name: Require native AMD64 release image
+        run: test "$(docker image inspect --format '{{.Architecture}}' jellyrin:ci)" = amd64
       - name: Verify minimal FFmpeg probe and remux corpus
         run: qa/ffmpeg-remux-smoke.sh jellyrin:ci
+      - name: Verify distroless migrator and server runtime
+        run: qa/runtime-container-smoke.sh jellyrin:ci
       - name: Scan Rust dependencies and release image
         run: ops/scan-vulnerabilities.sh jellyrin:ci vulnerability-artifacts
       - name: Upload verified supply-chain bundle

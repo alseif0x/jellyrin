@@ -27,6 +27,7 @@ async function main() {
     deploymentPreflight,
     nginx,
     ffmpegSmoke,
+    runtimeSmoke,
     ffmpegSecurityBaseline,
   ] = await Promise.all([
     read('ops/supply-chain.lock.env'),
@@ -49,6 +50,7 @@ async function main() {
     read('ops/deployment-preflight.sh'),
     read('ops/nginx-jellyrin.test.kode.live.conf.example'),
     read('qa/ffmpeg-remux-smoke.sh'),
+    read('qa/runtime-container-smoke.sh'),
     read('ops/ffmpeg-security-baseline.txt'),
   ]);
   const cargoLock = await read('Cargo.lock');
@@ -303,6 +305,10 @@ async function main() {
         workflow.includes('name: jellyrin-supply-chain-${{ github.sha }}'),
     ),
     check(
+      'ci-requires-native-amd64-image',
+      workflow.includes("test \"$(docker image inspect --format '{{.Architecture}}' jellyrin:ci)\" = amd64"),
+    ),
+    check(
       'vulnerability-exceptions-are-governed',
       exceptionErrors.length === 0,
       exceptionErrors.join('; '),
@@ -364,6 +370,14 @@ async function main() {
         ffmpegSmoke.includes('-c copy -f hls') &&
         ffmpegSmoke.includes('[[ -z "${encoder_names}" ]]') &&
         ffmpegSmoke.includes('[[ "${decoder_names}" == "aac" ]]'),
+    ),
+    check(
+      'ci-runs-distroless-runtime-smoke',
+      workflow.includes('qa/runtime-container-smoke.sh jellyrin:ci') &&
+        runtimeSmoke.includes('/usr/local/bin/jellyrin-migrate') &&
+        runtimeSmoke.includes('/usr/local/bin/jellyrin-server --healthcheck') &&
+        runtimeSmoke.includes('--read-only') &&
+        runtimeSmoke.includes('10001:10001'),
     ),
     check(
       'ci-runs-and-retains-vulnerability-gate',
