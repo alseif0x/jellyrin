@@ -392,22 +392,22 @@ se marcará completo solo después de su validación y rollout correspondiente.
 
 | Área | Código local | Evidencia ejecutada | Fuera de este cierre |
 | --- | --- | --- | --- |
-| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 150/0/2 más doctests y staging durable 113 sobre PostgreSQL 17.10 real; aislamiento API/worker real; migrador 36/36; proyecciones 108/109/110/111/112 verificadas; `pg_stat_statements` precargado e instalado en el staging vigente, con 49 statements registrados; checks y clippy DB/API/migrador estrictos verdes tras el delta | Aplicar 113 en staging, E2E, carga de handlers, cutover y contratos restantes antes de otro backend |
+| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 150/0/2 más doctests y staging durable 113 sobre PostgreSQL 17.10 real; migrador 36/36; 113 aplicada también en staging; proyecciones 108/109/110/111/112 verificadas; checks y clippy DB/API/migrador estrictos verdes | E2E de reproducción/carga de handlers, cutover y contratos restantes antes de otro backend |
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC | Imagen AArch64 final `a852c5b81213`, 157.058.151 bytes, id `922ac235...96ef5f`; corpus real MP4/MKV/MPEG-TS probe+HLS copy verde como usuario no-root; aliases, specifiers, filtros, codec implícito y comandos no confiables cubiertos; validadores de capacidades exactas añadidos | E2E Xtream/clientes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen en staging; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado; clave de referencia root-only generada | Pin público aún viejo; falta guardar el repositorio e instalar 0.1.1; perfil WireGuard MX, metadatos/secretos legítimos restantes, E2E real y publicación pendientes |
-| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series incremental a staging durable, publicación conjunta y `0 = todo`; auditorías DB y runtime counts-only fail-closed | Xtream 25/25, incluido sync sintético de 100.001 películas; staging 113 probado en SQLite y PostgreSQL 17.10 con invisibilidad, proyecciones, duplicados, rollback/retry y GC; 757 canales en el staging desplegado anterior | Desplegar 113, cambiar el límite guardado de Series de 250 a 0, reimportar y verificar Movies/Series, audits, reproducción y clientes reales |
+| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series incremental a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; auditorías DB y runtime counts-only fail-closed | Xtream 26/26, incluido sync sintético de 100.001 películas y fallback >64 MiB; staging 113 probado en SQLite/PostgreSQL 17.10 y desplegado; sync real completado en 186 s con 39.093 películas, 1.974 episodios, pico 105.803.776 bytes y 0 stages residuales | Audits post-import, reproducción y matriz de clientes reales |
 | Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET`; Counts agregado/proyectado; lookups UUID puntuales; Search/Hints acotado; tipos efectivos compartidos y candidatos por dominio; Upcoming común parte de una proyección temporal exacta e indexada y solo transporta candidatos futuros; refresh TV O(N); fallbacks conservadores | Workspace base 646/0/5; Upcoming tiene conformance SQLite/PG real y gate/API, parser/precedencia RFC3339 compartidos, offsets+nanos y mantenimiento transaccional; benchmark PG17.10 10k/100k/500k reduce filas TV 3.300→34, 33.000→334 y 165.000→1.667; p95 SQL 2,420→0,981 ms (2,467x), 23,033→6,285 ms (3,665x) y 120,633→47,030 ms (2,565x), con range index+nested-loop/PK; Counts, Resume, tipos efectivos, Ancestors, Search/Hints y Series validados; el índice candidato Movie no alcanza un gate estable 2x en el rerun PG17.10 | Repetir con handlers; predicados metadata complejos, resume complejo/sin límite y E2E/carga representativa |
-| Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109, selector exacto GenreIds 110, fecha Upcoming 111 y selector exacto Person/Studio/Tag 112; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL 17.10 real con >500 seleccionados; Genre/Person/Studio/Tag por nombre raw y representaciones exactas legacy, OR interno/AND entre clases, paginación y parent recursivo; cap independiente de 64 antes de cualquier fallback; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; benchmark 112 a 10k/100k/500k reduce filas 9.900/99.000/495.000→24/247/1.234 y mejora p95 SQL 1,360x/1,528x/1,306x con PK lookup; API 347/0/3, DB 146/0/2 y migrador 36/36 | Ratings/premiere y shapes no equivalentes, baseline productiva concurrente y E2E cliente real |
+| Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109, selector exacto GenreIds 110, fecha Upcoming 111 y selector exacto Person/Studio/Tag 112; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL 17.10 real con >500 seleccionados; Genre/Person/Studio/Tag por nombre raw y representaciones exactas legacy, OR interno/AND entre clases, paginación y parent recursivo; cap independiente de 64 antes de cualquier fallback; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; benchmark 112 a 10k/100k/500k reduce filas 9.900/99.000/495.000→24/247/1.234 y mejora p95 SQL 1,360x/1,528x/1,306x con PK lookup; API 347/0/3, DB 150/0/2 y migrador 36/36 | Ratings/premiere y shapes no equivalentes, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 46/46; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `8026d7f60615` desplegado; servidor SHA-256 `95f70e1c...3b6f`; FFmpeg/ffprobe `8.2-dev-git-1e0279143db9`; migración 109 current, capacidades y arranque verdes; `/healthz`/`/readyz` local+HTTPS, 0 reinicios y sin hijos FFmpeg; rollback `pre-8026d7f-20260809T144300Z`; Xtream conserva 757 canales | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; el cambio distroless afecta al contenedor, no exige reemplazar estos binarios bare-metal |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `ff9412e` desplegado; servidor SHA-256 `056b0430...a251`; FFmpeg/ffprobe `8.2-dev-git-1e0279143db9`; migración 113 current; `/healthz`/`/readyz` local+HTTPS, 0 reinicios; backups binarios y dump PostgreSQL pre-113; Xtream conserva 757 canales y añade 39.093 películas/1.974 episodios | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; el cambio distroless afecta al contenedor, no exige reemplazar estos binarios bare-metal |
 
 ### Trabajo restante y gates de salida
 
 El cierre se divide expresamente para no confundir código terminado con un
 rollout probado:
 
-1. **Cierre dirigido de GenreIds y Upcoming — completado:** API 347/0/3, DB 146/0/2
+1. **Cierre dirigido de GenreIds y Upcoming — completado:** API 347/0/3, DB 150/0/2
    más doctests y migrador 36/36 sobre PostgreSQL 17.10 real; check y clippy
    estrictos de los tres paquetes, formato, packaging, supply-chain e higiene
    runtime verdes. La última baseline completa previa fue workspace 646/0/5.
@@ -421,9 +421,10 @@ rollout probado:
    transaccional de plugin/tuner/livetv hacia una referencia única. Antes de
    habilitar datos reales aún hay que aplicar la migración de invariante Live TV
    en staging/producción y ejecutar el E2E. La configuración real ya está dada
-   de alta y el catálogo indexa 757 canales. El bloqueo de más de 100.000 VOD
-   está resuelto localmente con parser incremental y staging 113; falta desplegar,
-   poner `SeriesLimit=0`, ejecutar el sync real y probar reproducción/clientes.
+   de alta y el catálogo indexa 757 canales. El bloqueo de más de 100.000 VOD y
+   el catálogo Series global >64 MiB están resueltos y desplegados: con
+   `SeriesLimit=0`, el sync real publicó 39.093 películas y 1.974 episodios.
+   Falta probar reproducción y clientes reales.
    Después se buscarán
    `RemoteSourceUrl`, `RemoteMediaProbe.SourceUrl` y
    `live_tv_channels.stream_url`; cualquier catálogo afectado se reimporta y se
@@ -568,11 +569,13 @@ rollout probado:
    aplicó ese límite al catálogo bruto antes de filtrar las 60 categorías VOD.
    La publicación conjunta se abortó correctamente, por lo que no se crearon
    aún `Xtream Movies` ni `Xtream Series`; la configuración conserva además 24
-   categorías de series y un límite de 250 series. No es un fallo de
-   credenciales ni de navegación. La corrección de escala de 13.6 ya está
-   implementada y probada localmente con 100.001 películas, pero aún no está
-   desplegada: la configuración real conserva `SeriesLimit=250` y deberá pasar
-   a 0 para indexar todas. La matriz sintética
+   categorías de series y un límite de 250 series. No era un fallo de
+   credenciales ni de navegación. La corrección de escala de 13.6 y la migración
+   113 se desplegaron desde `ff9412e`; `SeriesLimit` pasó de 250 a 0 sin alterar
+   el resto de la configuración. Un segundo sync activó el fallback validado
+   para las 24 categorías y publicó atómicamente 39.093 películas y 1.974
+   episodios en 186 segundos. El servicio alcanzó 105.803.776 bytes de memoria,
+   terminó con 0 stages, 0 reinicios y health/readiness verdes. La matriz sintética
    10k/100k/500k ya se ejecutó; falta
    repetir con una distribución productiva y handlers E2E representativos,
    completar los prerrequisitos e importar MAGSTV con una cuenta
@@ -1898,8 +1901,9 @@ seleccionados, no al array bruto del proveedor. El nuevo parser admite hasta
 del append y valida el documento completo, incluido JSON truncado después de un
 bloque válido. El límite por respuesta sigue siendo 64 MiB. En el E2E real,
 Movies llegó a 39.093 items pero el catálogo Series global superó ese tamaño;
-la generación se abortó sin publicación parcial. El fallback por categoría ya
-está implementado y validado sintéticamente, pendiente de repetir el sync real.
+la generación se abortó sin publicación parcial. El fallback por las 24
+categorías se desplegó después y el siguiente sync real publicó 39.093 películas
+y 1.974 episodios en 186 segundos, con pico de servicio de 105.803.776 bytes.
 
 No se adopta `page`/`limit` como contrato principal: no pertenece a la superficie
 Xtream interoperable y algunos paneles lo ignoran. El catálogo se pagina al
@@ -1948,11 +1952,11 @@ El pipeline y sus optimizaciones restantes quedan así:
 15. `[~]` Probadas 100.001 filas brutas, chunks acotados, Unicode/cortes JSON,
     límite inspeccionado, duplicados globales, invisibilidad y publicación
     atómica en SQLite/PostgreSQL, además del fallback `category_id` ante un
-    `Content-Length` global excesivo. Falta completar ese fallback contra el
-    proveedor real y añadir un fixture explícito de filtro ignorado/solapes.
-16. `[ ]` Repetir `SyncXtreamMedia` real: deben aparecer `Xtream Movies` y
-    `Xtream Series`, registrar conteos no secretos y permitir browse/paginación
-    desde Jellyfin Web sin un pico sostenido de CPU/RAM.
+    `Content-Length` global excesivo. El proveedor real completó las 24
+    categorías; falta un fixture explícito de filtro ignorado/solapes.
+16. `[~]` `SyncXtreamMedia` real ya creó `Xtream Movies` y `Xtream Series`,
+    registró conteos no secretos y mantuvo RAM acotada. Falta validar browse y
+    paginación visual, además de reproducción, desde clientes Jellyfin reales.
 
 Una sincronización fallida deja visible la generación anterior. Cancelación,
 timeout o caída del proveedor no pueden producir un catálogo vacío. Los locks de
