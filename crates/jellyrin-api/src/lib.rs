@@ -220,6 +220,7 @@ const INTERNAL_REMOTE_RELAY_TRANSCODE_TTL: StdDuration = StdDuration::from_secs(
 const REMOTE_MEDIA_RESPONSE_HEADER_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const REMOTE_MEDIA_CHUNK_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const REMOTE_MEDIA_DNS_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const REMOTE_MEDIA_MAX_REDIRECTS: usize = 5;
 const LIVE_HLS_SESSION_REGISTRY_MAX_ENTRIES: usize = 4_096;
 const HLS_SEGMENT_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const HLS_SEGMENT_WAIT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
@@ -41527,34 +41528,71 @@ async fn stream_remote_media(
     headers: &HeaderMap,
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
-    let (url, client) = validated_remote_media_client(source_url).await?;
-    let mut request = if include_body {
-        client.get(url)
-    } else {
-        client.head(url)
-    };
-    request = request.header(header::ACCEPT_ENCODING, "identity");
-    for forwarded_header in [header::RANGE, header::IF_RANGE] {
-        if let Some(value) = headers.get(&forwarded_header) {
-            request = request.header(forwarded_header, value);
+    let initial_url = validated_remote_media_url(source_url)?;
+    let initial_was_https = initial_url.scheme() == "https";
+    let open = async {
+        let mut target = initial_url;
+        for redirect_count in 0..=REMOTE_MEDIA_MAX_REDIRECTS {
+            // Re-resolve and pin every hop independently. A custom reqwest redirect policy
+            // cannot perform this asynchronous DNS validation and would reopen DNS rebinding
+            // or redirects into loopback/private networks.
+            let (url, client) = validated_remote_media_client(target.as_str()).await?;
+            if initial_was_https && url.scheme() != "https" {
+                return Err(ApiError::service_unavailable(
+                    "remote media source redirected to an insecure destination",
+                ));
+            }
+            let mut request = if include_body {
+                client.get(url.clone())
+            } else {
+                client.head(url.clone())
+            };
+            request = request.header(header::ACCEPT_ENCODING, "identity");
+            for forwarded_header in [header::RANGE, header::IF_RANGE] {
+                if let Some(value) = headers.get(&forwarded_header) {
+                    request = request.header(forwarded_header, value);
+                }
+            }
+            let response = request.send().await.map_err(|error| {
+                tracing::warn!(
+                    item_id = %item.id,
+                    timeout = error.is_timeout(),
+                    connect = error.is_connect(),
+                    "remote direct proxy request failed"
+                );
+                ApiError::service_unavailable("remote media source unavailable")
+            })?;
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(response);
+            }
+            if redirect_count == REMOTE_MEDIA_MAX_REDIRECTS {
+                return Err(ApiError::service_unavailable(
+                    "remote media source exceeded redirect limit",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    ApiError::service_unavailable("remote media source returned invalid redirect")
+                })?;
+            target = url.join(location).map_err(|_| {
+                ApiError::service_unavailable("remote media source returned invalid redirect")
+            })?;
+            // Reject credentials, fragments, non-HTTP schemes and oversized/control-byte URLs
+            // before the next DNS lookup. Query tokens remain opaque and are never logged.
+            target = validated_remote_media_url(target.as_str())?;
         }
-    }
+        unreachable!("bounded redirect loop always returns")
+    };
 
-    let upstream = tokio::time::timeout(REMOTE_MEDIA_RESPONSE_HEADER_TIMEOUT, request.send())
+    let upstream = tokio::time::timeout(REMOTE_MEDIA_RESPONSE_HEADER_TIMEOUT, open)
         .await
         .map_err(|_| {
             tracing::warn!(item_id = %item.id, "remote direct proxy response headers timed out");
             ApiError::service_unavailable("remote media source timed out")
-        })?
-        .map_err(|error| {
-            tracing::warn!(
-                item_id = %item.id,
-                timeout = error.is_timeout(),
-                connect = error.is_connect(),
-                "remote direct proxy request failed"
-            );
-            ApiError::service_unavailable("remote media source unavailable")
-        })?;
+        })??;
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .map_err(|_| ApiError::service_unavailable("invalid remote media response"))?;
     if !matches!(
@@ -93071,6 +93109,19 @@ done
             let read = socket.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
             assert!(request.starts_with("get /movie/user/pass/42.mkv"));
+            assert!(request.contains("range: bytes=2-5"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /cdn/42.mkv?opaque=redirect-token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut redirected_request = vec![0_u8; 4096];
+            let read = socket.read(&mut redirected_request).await.unwrap();
+            let request = String::from_utf8_lossy(&redirected_request[..read]).to_ascii_lowercase();
+            assert!(request.starts_with("get /cdn/42.mkv?opaque=redirect-token"));
             assert!(request.contains("range: bytes=2-5"));
             socket
                 .write_all(
