@@ -20,12 +20,13 @@ use super::{
     MediaItemFacetKind, MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary,
     MediaItemForImageTag, MediaItemMetadata, MediaItemQueryFilterValues, PostgresDatabase,
     REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, RemoteMediaCatalogStage, RemoteMediaItemUpsert,
-    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection,
-    catalog_sync_duration_millis, extract_media_item_facets, extract_media_item_filter_selectors,
-    extract_media_item_genre_selectors, is_upcoming_media_item_entry, nonnegative_count,
-    normalized_facet_query_values, prepare_remote_media_library_stage_specs,
-    retain_entries_with_effective_types, telemetry::DatabaseOperation,
-    upcoming_media_item_premiere_parts, validate_remote_media_catalog_stage_append,
+    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection, TvSeriesCatalogKey,
+    TvSeriesCatalogPage, catalog_sync_duration_millis, extract_media_item_facets,
+    extract_media_item_filter_selectors, extract_media_item_genre_selectors,
+    is_upcoming_media_item_entry, nonnegative_count, normalized_facet_query_values,
+    prepare_remote_media_library_stage_specs, retain_entries_with_effective_types,
+    telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
+    validate_remote_media_catalog_stage_append,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -1140,6 +1141,93 @@ impl PostgresDatabase {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    pub async fn tv_series_catalog_page(
+        &self,
+        start_index: usize,
+        limit: usize,
+    ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let (missing_names, total): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FILTER (WHERE NULLIF(btrim(metadata->>'SeriesId'), '') IS NULL
+                                      OR btrim(metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
+                                      OR NULLIF(btrim(metadata->>'SeriesName'), '') IS NULL),
+                   COUNT(DISTINCT NULLIF(btrim(metadata->>'SeriesId'), ''))
+            FROM media_items
+            WHERE missing_since IS NULL AND media_type = 'Video'
+              AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+            "#,
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if missing_names != 0 {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        let series = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT btrim(metadata->>'SeriesId') AS series_id,
+                   MIN(btrim(metadata->>'SeriesName')) AS series_name
+            FROM media_items
+            WHERE missing_since IS NULL AND media_type = 'Video'
+              AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+            GROUP BY btrim(metadata->>'SeriesId')
+            ORDER BY lower(MIN(btrim(metadata->>'SeriesName'))), MIN(btrim(metadata->>'SeriesName')), btrim(metadata->>'SeriesId')
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(i64::try_from(limit)?)
+        .bind(i64::try_from(start_index)?)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let rows = if series.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
+                r#"
+                SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                       item.media_type, item.collection_type, item.file_size,
+                       item.runtime_ticks, item.bitrate, item.width, item.height,
+                       item.media_streams, item.metadata, item.created_at, item.updated_at,
+                       NULL::uuid AS playback_user_id, NULL::uuid AS playback_item_id,
+                       NULL::text AS playback_media_source_id,
+                       NULL::bigint AS playback_audio_stream_index,
+                       NULL::bigint AS playback_subtitle_stream_index,
+                       NULL::bigint AS playback_position_ticks,
+                       NULL::boolean AS playback_is_paused, NULL::boolean AS playback_played,
+                       NULL::boolean AS playback_is_favorite,
+                       NULL::double precision AS playback_rating,
+                       NULL::timestamptz AS playback_updated_at
+                FROM media_items AS item
+                WHERE item.missing_since IS NULL
+                  AND item.media_type = 'Video'
+                  AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+                  AND btrim(item.metadata->>'SeriesId') = ANY($1::text[])
+                ORDER BY lower(item.name), item.name, item.id
+                "#,
+            )
+            .bind(series.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
+            .fetch_all(&mut *transaction)
+            .await?
+        };
+        transaction.commit().await?;
+        Ok(Some(TvSeriesCatalogPage {
+            series: series
+                .into_iter()
+                .map(|(id, name)| TvSeriesCatalogKey { id, name })
+                .collect(),
+            episodes: rows
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            total_record_count: usize::try_from(total)?,
+            start_index,
+        }))
     }
 
     pub async fn tv_next_up_candidates(
@@ -5984,6 +6072,9 @@ mod tests {
             return;
         };
         let result = async {
+            let empty_page = test.database.tv_series_catalog_page(0, 20).await?.unwrap();
+            assert_eq!(empty_page.total_record_count, 0);
+            assert!(empty_page.episodes.is_empty());
             let movies = (0..512)
                 .map(|index| {
                     remote_item(
@@ -6018,7 +6109,7 @@ mod tests {
                         "Video",
                         "tvshows",
                         json!({
-                            "SeriesId": canonical_series_id,
+                            "SeriesId": canonical_series_id.simple().to_string(),
                             "SeriesName": "Example Show"
                         }),
                     )],
@@ -6030,10 +6121,21 @@ mod tests {
             assert_eq!(candidates[0].item.id, episode_id);
             assert_eq!(
                 candidates[0].metadata["SeriesId"],
-                canonical_series_id.to_string()
+                canonical_series_id.simple().to_string()
             );
             assert_eq!(candidates[0].metadata["SeriesName"], "Example Show");
             assert!(candidates[0].playback_state.is_none());
+            let page = test.database.tv_series_catalog_page(0, 1).await?.unwrap();
+            assert_eq!(page.total_record_count, 1);
+            assert_eq!(page.series.len(), 1);
+            assert_eq!(page.series[0].id, canonical_series_id.simple().to_string());
+            assert_eq!(page.series[0].name, "Example Show");
+            assert_eq!(page.episodes.len(), 1);
+            assert_eq!(page.episodes[0].item.id, episode_id);
+            let empty = test.database.tv_series_catalog_page(1, 1).await?.unwrap();
+            assert_eq!(empty.total_record_count, 1);
+            assert!(empty.series.is_empty());
+            assert!(empty.episodes.is_empty());
             anyhow::Ok(())
         }
         .await;

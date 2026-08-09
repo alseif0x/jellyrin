@@ -47106,6 +47106,65 @@ async fn tv_series_items_result(
     user_id: Option<Uuid>,
     server_id: &str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if query.search_term.is_none()
+        && query_requests_only_item_type(query, "Series")
+        && fast_name_search_query_is_simple(query)
+        && let Some(page) = MediaCatalogStore::tv_series_catalog_page(
+            db,
+            query.start_index.unwrap_or(0),
+            query
+                .limit
+                .unwrap_or(25)
+                .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
+        )
+        .await?
+    {
+        let episode_ids = page
+            .episodes
+            .iter()
+            .map(|entry| entry.item.id)
+            .collect::<Vec<_>>();
+        let playback_by_item = if let Some(user_id) = user_id {
+            MediaCatalogStore::playback_states_for_items(db, user_id, &episode_ids)
+                .await?
+                .into_iter()
+                .map(|state| (state.item_id, state))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+        let mut grouped = HashMap::<String, TvSeriesSummary>::new();
+        for entry in &page.episodes {
+            let Some(info) = tv_episode_info(&entry.item) else {
+                continue;
+            };
+            let Some(series_id) = first_metadata_value_from_json(&entry.metadata, &["SeriesId"])
+            else {
+                continue;
+            };
+            let summary = grouped
+                .entry(series_id.trim().to_string())
+                .or_insert_with(|| TvSeriesSummary::new(info.series_name.clone()));
+            summary.add_episode(
+                &entry.item,
+                &info,
+                Some(&entry.metadata),
+                playback_by_item.get(&entry.item.id),
+            );
+        }
+        let items = page
+            .series
+            .iter()
+            .filter_map(|series| grouped.remove(&series.id))
+            .map(|summary| tv_series_json(server_id, summary))
+            .collect::<Vec<_>>();
+        return Ok(Json(query_result_with_total(
+            items,
+            page.total_record_count,
+            page.start_index,
+        )));
+    }
+
     let mut episode_query = query.clone();
     episode_query.include_item_types = vec!["Episode".to_string()];
     episode_query.is_folder = None;
@@ -83890,6 +83949,48 @@ done
         let intros: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(intros["TotalRecordCount"], 0);
         assert_eq!(intros["Items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn series_catalog_defaults_to_a_bounded_page_with_an_exact_total() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let episodes = (0..30)
+            .map(|index| {
+                let series_name = format!("Series {index:02}");
+                RemoteMediaItemUpsert {
+                    id: Uuid::new_v4().simple().to_string(),
+                    name: format!("{series_name} S01E01"),
+                    path: format!(
+                        "provider://shows/{series_name}/Season 01/{series_name} S01E01.mp4"
+                    ),
+                    media_type: "Video".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: Some(10_000_000),
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({
+                        "SeriesId": stable_entity_id("series-page-test", &series_name),
+                        "SeriesName": series_name,
+                    }),
+                }
+            })
+            .collect();
+        db.replace_remote_media_library_snapshot("Shows", "tvshows", "provider://shows", episodes)
+            .await
+            .unwrap();
+        let query = super::ItemsQuery {
+            include_item_types: vec!["Series".to_string()],
+            ..super::ItemsQuery::default()
+        };
+        let response = super::tv_series_items_result(&db, &query, None, "server")
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response["TotalRecordCount"], 30);
+        assert_eq!(response["Items"].as_array().unwrap().len(), 25);
+        assert_eq!(response["StartIndex"], 0);
     }
 
     #[tokio::test]
