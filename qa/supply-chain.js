@@ -309,6 +309,13 @@ async function main() {
       workflow.includes("test \"$(docker image inspect --format '{{.Architecture}}' jellyrin:ci)\" = amd64"),
     ),
     check(
+      'ci-validates-locked-compose-topology',
+      workflow.includes('name: Validate locked Compose topology') &&
+        workflow.includes('docker compose config --quiet') &&
+        workflow.includes('POSTGRES_MIGRATOR_PASSWORD: ci-compose-migrator') &&
+        workflow.includes('POSTGRES_RUNTIME_PASSWORD: ci-compose-runtime'),
+    ),
+    check(
       'vulnerability-exceptions-are-governed',
       exceptionErrors.length === 0,
       exceptionErrors.join('; '),

@@ -359,7 +359,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Catálogo general | Pushdown SQL acotado con total exacto, playback join, ParentId de carpeta y cap 500; Resume simple con límite aplica policy antes de `LIMIT/OFFSET` y obtiene count+página en un snapshot; Counts agregado/proyectado sin transportar catálogo; existencia/lookup por UUID puntuales; Search/Hints acotado a 100 con scope metadata exacto; tipos efectivos compartidos y prefiltrado sargable con metadata inline para similares, soundtrack, instant mix y remote search; resolución, episodios, temporadas, similares, Ancestors y updates/refresh de Series limitados al dominio TV; refresh TV agrupado O(TV) en vez de O(series×catálogo); fallbacks semánticos conservados, batching amplio y DLNA/sidecars acotados por carpeta | Workspace 646/0/5; Counts conformance SQLite/PG real y API 513 items; Resume SQLite con 513 filas/offset 500 y PostgreSQL real 1/1, además del handler API; contrato de tipos efectivos y point contract SQLite/PG real; Ancestors/owners con 512 películas; Search/Hints y candidatos Series validados en ambos drivers; regresión TV cross-folder y extras; benchmark aislado PG16.14 10k/100k/500k: Movie page p95 current→candidate 1.193→0.963 ms, 9.777→6.544 ms y 11.098→6.587 ms | Predicados metadata cross-domain complejos, resume complejo/sin límite, distribución/handlers E2E representativos, baseline productiva y carga concurrente de handlers |
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 con backfill transaccional único; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; check locked y clippy DB/API `-D warnings` verdes | Filtros complejos por Person/Genre/Studio/Tag/rating/premiere, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
-| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 43/43; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar el nuevo gate AMD64 nativo de CI y solo entonces firma/provenance |
+| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 44/44; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `8026d7f60615` desplegado; servidor SHA-256 `95f70e1c...3b6f`; FFmpeg/ffprobe `8.2-dev-git-1e0279143db9`; migración 109 current, capacidades y arranque verdes; `/healthz`/`/readyz` local+HTTPS, 0 reinicios y sin hijos FFmpeg; rollback `pre-8026d7f-20260809T144300Z`; Xtream conserva 757 canales | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; el cambio distroless afecta al contenedor, no exige reemplazar estos binarios bare-metal |
 
 ### Trabajo restante y gates de salida
@@ -487,7 +487,7 @@ rollout probado:
    se añade CPE y el gate falla si Trivy no demuestra que lo inventarió. Trivy
    0.70 todavía no lo demuestra, por lo que falta integrar un matcher válido.
    Después se debe construir/analizar AMD64 y solo con
-   gates verdes firmar el digest y adjuntar provenance. El QA 43/43 solo
+   gates verdes firmar el digest y adjuntar provenance. El QA 44/44 solo
    acredita política y pins, no sustituye estos resultados reales. El Jellyfin
    Web endurecido se construyó localmente y su gate Playwright aislado pasó
    1/1 sobre PostgreSQL 16 real: wizard y login, foto servida por descarga,
@@ -2369,7 +2369,7 @@ desde cero y ejecutar repositorios/migrador. Añadir jobs separados para:
 - Servidor PostgreSQL-only y comprobación de dependencias.
 - Migración de fixtures SQLite.
 - Tests FFmpeg cuando la imagen contenga la versión fijada.
-- Compose config y smoke completo de la topología. El gate de imagen ya aplica
+- Compose config queda exigido en CI y el gate de imagen ya aplica
   migraciones, arranca el servidor distroless contra PostgreSQL, valida
   health/readiness y exige cierre limpio; falta la envoltura Compose exacta.
 - Auditoría de dependencias, imagen y secretos accidentales.
@@ -2511,7 +2511,7 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
 - [x] Imágenes base, snapshot Debian, FFmpeg, Syft, cargo-audit, RustSec, Trivy
   y GitHub Actions tienen pins públicos e inmutables adecuados a cada entrada;
   las descargas de herramientas verifican SHA-256 antes de ejecutarse.
-- [x] El QA local 43/43 valida pins, runtime distroless, contrato de CI y el registro único de
+- [x] El QA local 44/44 valida pins, runtime distroless, Compose, contrato de CI y el registro único de
   excepciones; no hay excepciones activas y cualquier futura aceptación exige
   componente/purl, owner, ticket, motivo y caducidad máxima de 30 días.
 - [x] RustSec puede ejecutarse como gate real independiente sin Docker usando

@@ -106,6 +106,12 @@ jobs:
         run: sed -n '/^[A-Z0-9_][A-Z0-9_]*=/p' ops/supply-chain.lock.env >> "$GITHUB_ENV"
       - name: Verify supply-chain policy
         run: node qa/supply-chain.js
+      - name: Validate locked Compose topology
+        env:
+          POSTGRES_ADMIN_PASSWORD: ci-compose-admin
+          POSTGRES_MIGRATOR_PASSWORD: ci-compose-migrator
+          POSTGRES_RUNTIME_PASSWORD: ci-compose-runtime
+        run: docker compose config --quiet
       - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.94.0
         with:
           toolchain: 1.94.0
