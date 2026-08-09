@@ -269,15 +269,21 @@ reales. `pg_stat_statements` está realmente precargado, su extensión está
 instalada en la base `jellyrin` y registra 49 statements. Xtream quedó
 configurado y su catálogo contiene 757 canales; esto acredita configuración e
 indexación, pero no sustituye la reproducción E2E con clientes reales.
-El release vigente del núcleo se desplegó el 2026-08-09 desde el commit local
-`bde4922` con SHA-256
-`123c2d6ff616947f535c7c7e41ca80340d1cce11e29acc6220872bc2c24424b0`;
-el binario anterior (`8f402cf9b65d1846c78a72dcae37aaa6100cb1ee0aa3b8313406d901ae78fcbe`)
-se conserva como `/usr/local/bin/jellyrin-server.pre-20260809T115000Z` para
-rollback. El reinicio cerró el runtime sin timeout y `/health`/`/readyz` local y
-HTTPS quedaron verdes. Esta revisión añade refresco inmediato y acotado del
-catálogo al guardar un repositorio habilitado, conservando la respuesta 204
-compatible incluso si el origen falla y registrando el fallo en su estado.
+El candidato vigente del núcleo se desplegó en staging el 2026-08-09 desde el
+commit `a852c5b81213b444da5ab5d0008defd7628a5934`. El servidor tiene SHA-256
+`43bd1379ef8dab622f1b3b7d1fd7fd1bd7222b51a65f459e402a0a397136eef4` y el
+migrador `b95fccd4ee6af954b867da9374c12f17fce6a7ba6834d58360ed96112757f387`.
+FFmpeg/ffprobe 8.1.2 mínimos quedaron en `/usr/local/bin` con hashes
+`324bf6b508e04659b0d833461c1cdb6f7b54e764ab27ff61a523c37c2c560268` y
+`31423250ef5967cd393a4dbddd899120d225fa9772e5a5958fa83a2ba4299ebf`.
+Los binarios anteriores de servidor y migrador se conservan como
+`/usr/local/bin/jellyrin-server.pre-20260809T133348Z` y
+`/usr/local/bin/jellyrin-migrate.pre-20260809T133348Z`. El shutdown previo no
+tuvo timeout ni hijos residuales, el migrador confirmó esquema 109 sin aplicar
+cambios, el arranque validó explícitamente las capacidades FFmpeg en modo
+`RemuxOnly`, y `/health`/`/readyz` local y HTTPS quedaron verdes con cero
+reinicios. Este es un rollout de staging para E2E; los gates de vulnerabilidades
+siguen rojos y bloquean promoción.
 
 La migración 106 se ejecutó realmente en PostgreSQL 16.14 y aceptó filas legacy
 y opacas válidas; sus tests SQLite rechazan mixed/neither y preservan filas en
@@ -324,7 +330,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109 con backfill transaccional único; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL real con >500 seleccionados; API padre+hijo/otra carpeta con 515 géneros; UUID Person dashed/simple/stable; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; check locked y clippy DB/API `-D warnings` verdes | Filtros complejos por Person/Genre/Studio/Tag/rating/premiere, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime sin `curl`; FFmpeg fuente reproducible con CPE integrado en SBOM, inventario fail-closed y corpus CI; Jellyfin Web endurecido | QA supply-chain 39/39; imagen final AArch64 y corpus verdes; SBOM verificado en `supply-chain-arm64-a852c5b81213-complete`; gate real conserva RustSec=1, Trivy-image=1 y Trivy-FFmpeg=98 en `vulnerability-arm64-a852c5b81213`; Trivy genérico no puede dar verde falso | Resolver `rsa` lock-only y los 13 CVE únicos/22 ocurrencias de imagen, añadir matcher FFmpeg validado, repetir AMD64 y solo entonces firma/provenance |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential` y cgroup software-only endurecido | Núcleo `bde4922` desplegado, SHA-256 `123c2d6f...24424b0`; migración y arranque verdes; `/health`/`/readyz` local+HTTPS; `pg_stat_statements` precargado e instalado en `jellyrin`, con 49 statements; smokes systemd/performance/security, `nginx -t`, Certbot dry-run y restore drill verdes; backup post-Xtream `20260809T103116Z`; Xtream configurado con 757 canales; repositorio MAGSTV 0.1.1 preparado | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; pin público compatible pendiente |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg 8.1.2 remux-only endurecidos | Núcleo `a852c5b81213` desplegado, servidor SHA-256 `43bd1379...6eef4`; migración 109 current, validación de capacidades FFmpeg y arranque verdes; `/health`/`/readyz` local+HTTPS; cero reinicios/hijos residuales; rollback fechado conservado; `pg_stat_statements` con 49 statements; Xtream configurado con 757 canales; repositorio MAGSTV 0.1.1 preparado | E2E de reproducción Xtream y clientes/FFmpeg; guardar repositorio e instalar MAGSTV 0.1.1, resolver egress/secretos operativos y ejecutar su E2E real; resolver gates de vulnerabilidades y pin público compatible |
 
 ### Trabajo restante y gates de salida
 
