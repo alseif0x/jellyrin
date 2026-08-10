@@ -1,6 +1,6 @@
 # Plan integral de optimización de Jellyrin: base de datos, catálogo y FFmpeg
 
-## Estado de ejecución (iniciado 2026-08-07; actualizado 2026-08-09)
+## Estado de ejecución (iniciado 2026-08-07; actualizado 2026-08-10)
 
 Este bloque describe el árbol de trabajo actual, todavía sin publicar. El
 diagnóstico de la sección 2 se conserva deliberadamente como línea base
@@ -157,8 +157,11 @@ histórica y no debe confundirse con este estado vigente.
   fue solo 1,046x más rápido a 100k y 1,030x a 500k en PostgreSQL local, muy
   lejos del gate 2x; la ruta productiva permanece simple y medida.
 - La reproducción remota elige `DirectLocal`, `DirectProxy`, `HlsRemux` o
-  `HlsTranscode` por stream. El proxy soporta Range, no sigue redirects, fija
-  DNS y bloquea SSRF. H.264/AAC compatible evita encode; H.264 con audio no
+  `HlsTranscode` por stream. El proxy soporta Range y redirects HTTP explícitos
+  con máximo de cinco saltos; reconstruye el cliente, resuelve y fija DNS, y
+  revalida SSRF en cada destino. Bloquea HTTPS→HTTP y nunca registra URLs.
+  Las fuentes de configuración continúan sin seguir redirects. H.264/AAC
+  compatible evita encode; H.264 con audio no
   compatible convierte solo audio y vídeo incompatible puede convertir solo
   vídeo cuando el perfil lo requiere.
 - `MaxStreamingBitrate`, `TranscodingProfiles` y `CodecProfiles` participan en
@@ -231,9 +234,10 @@ histórica y no debe confundirse con este estado vigente.
   ya está aplicado y validado contra el core local. El árbol integra
   `origin/main` `2700d7f` mediante el merge `43551fe`, añade la adaptación
   `ExternalProcess` local `8ce47b4` y fija 0.1.1 en `9596f1c`; el pin público
-  todavía apunta a la revisión anterior. Los prerrequisitos, la instalación y
-  refresh del artefacto, egress, secretos operativos y el E2E real siguen siendo
-  gates. La clave de referencia no asociada a la cuenta ya se generó en el env
+  todavía apunta a la revisión anterior. Staging refrescó el repositorio,
+  instaló y activó 0.1.1, y su configuración admin responde sin devolver
+  `Username` ni `Password`. Egress, secretos operativos y el E2E real siguen
+  siendo gates. La clave de referencia no asociada a la cuenta ya se generó en el env
   root-only de staging; faltan todavía el perfil WireGuard de salida MX y los
   metadatos/secretos legítimos que no pueden inventarse desde el core.
 - Xtream integrado persiste nuevas publicaciones Live TV con
@@ -252,6 +256,11 @@ histórica y no debe confundirse con este estado vigente.
   también el cierre y contenido restante del documento antes de publicar. Si el
   catálogo Series global supera 64 MiB, usa `category_id` sobre las categorías
   seleccionadas, exige que cada respuesta respete el filtro y deduplica IDs.
+  El resultado de sync conserva los contadores legacy y añade observabilidad
+  counts-only de recibidos, seleccionados, staged y publicados para Movies,
+  Series y Episodes. Publicado solo aumenta después del publish atómico; los
+  límites efectivos de bytes, items inspeccionados, chunks, append y
+  concurrencia Series=1 son numéricos y no contienen URLs ni identidades.
 - Escritura de envelope y actualización de configuración comparten transacción
   tanto en PostgreSQL como en SQLite. El backfill bloquea y reconcilia las tres
   copias legacy —plugin, tuner y configuración Live TV— en una transacción,
@@ -302,9 +311,9 @@ histórica y no debe confundirse con este estado vigente.
 El último cierre completo del workspace, anterior al delta GenreIds, registró
 646 pruebas aprobadas, 0 fallidas y 5 ignoradas. Para el árbol actual se volvió
 a ejecutar íntegramente la superficie afectada contra PostgreSQL 17.10 real:
-la API pasa 347 pruebas, 0 fallidas y 3 ignoradas; `jellyrin-db`, 150/0/2 más
-doctests; el proveedor Xtream, 25/0; y el migrador, 36/36. La migración nueva
-lleva el objetivo a `202608080113`, 17 migraciones embebidas. `check` y
+la API pasa 353 pruebas, 0 fallidas y 3 ignoradas; `jellyrin-db`, 150/0/2 más
+doctests; el proveedor Xtream, 27/0; y el migrador, 36/36. La migración vigente
+lleva el objetivo a `202608080115`, 19 migraciones embebidas. `check` y
 `clippy -D warnings` de DB/API/migrador
 con todos sus targets y features también terminan limpios. El intento de repetir
 todo el workspace no produjo fallos de test, pero agotó el disco durante el
@@ -337,12 +346,13 @@ los snapshots todavía no se han replicado fuera de este host. Esto
 acredita la plataforma base, no el E2E con credenciales, clientes y reproducción
 reales. `pg_stat_statements` está realmente precargado, su extensión está
 instalada en la base `jellyrin` y registra 49 statements. Xtream quedó
-configurado y su catálogo contiene 757 canales; esto acredita configuración e
-indexación, pero no sustituye la reproducción E2E con clientes reales.
-El candidato vigente del núcleo se desplegó en staging el 2026-08-09 desde el
-commit `33d16bb`, precedido por `d82fb29`, `353ddc1` y `954369c` para el catálogo Series.
+configurado y su catálogo contiene 757 canales. El probe HTTP real ya acredita
+direct stream y HLS remux del core; los clientes Jellyfin reales siguen fuera
+de este cierre.
+El candidato vigente del núcleo se desplegó en staging el 2026-08-10 desde el
+commit `585468d`, precedido por `506c878`, `33d16bb`, `d82fb29`, `353ddc1` y `954369c`.
 El servidor tiene SHA-256
-`ca53d430e7cf73959283626802f642a46307667eecb839f6f3d9e8d22bb3641c`; el
+`803e0bdfe4bd646d1a4eeb6b0e1cf93eecee992540d3b18c7281270ce60dfde2`; el
 esquema PostgreSQL está en 115 y el migrador embebe 19 migraciones.
 FFmpeg/ffprobe 8.1.2 mínimos quedaron en `/usr/local/bin` con hashes
 `324bf6b508e04659b0d833461c1cdb6f7b54e764ab27ff61a523c37c2c560268` y
@@ -376,15 +386,19 @@ Para no bloquear el E2E se construyó y validó el ZIP AArch64 0.1.1 contra el
 árbol local. Su SHA-256 es
 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`.
 La UI fue corregida para solicitar únicamente las credenciales de cuenta; no
-presenta settings operativos como si fueran secretos configurables. Sus
-prerrequisitos de runtime/egress, instalación autenticada y E2E siguen
-pendientes y no se consideran cubiertos por el smoke de la página.
-El ZIP 0.1.1 y su índice están preparados en `/srv/jellyrin/plugin-repository`.
-El core desplegado ya refresca ese índice al volver a guardar el repositorio,
-pero Jellyrin todavía no ha instalado 0.1.1 ni se ha ejecutado ese guardado
-autenticado. Egress, secretos
+presenta settings operativos como si fueran secretos configurables. El ZIP
+0.1.1 y su índice están en `/srv/jellyrin/plugin-repository`. Tras un backup
+PostgreSQL completo y otro del plugin 0.1.0, staging refrescó el repositorio,
+instaló y activó `Jellyrin MAGSTV` 0.1.1. El endpoint admin de configuración
+responde 200 con el objeto operativo y sin campos `Username`/`Password`; no
+existe todavía ningún tuner MAGSTV. Egress, secretos
 operativos del proveedor y el E2E real siguen pendientes. Este artefacto local
 no debe publicarse como release ni presentarse como rollout completado.
+
+Los rollbacks previos a esa actualización son
+`postgres-pre-magstv-0.1.1-20260810T000255Z.dump` y
+`magstv-plugin-pre-0.1.1-20260810T000255Z.tar.gz` dentro de
+`/var/backups/jellyrin`.
 
 Este bloque refleja el árbol de trabajo, no una release publicada. Cada elemento
 se marcará completo solo después de su validación y rollout correspondiente.
@@ -394,14 +408,14 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Área | Código local | Evidencia ejecutada | Fuera de este cierre |
 | --- | --- | --- | --- |
 | Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 150/0/2 más doctests y staging durable sobre PostgreSQL 17.10 real; migrador 36/36; esquema 115 aplicado en staging; proyecciones 108–112 e índices Series 114/115 verificados; checks y clippy DB/API/migrador estrictos verdes | E2E de reproducción/carga de handlers, cutover y contratos restantes antes de otro backend |
-| FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC | Corpus aislado verde; VOD Xtream real H.264/AAC/MKV eligió DirectProxy, siguió un 302 revalidado, sirvió Range 206/65.536 bytes con 0 procesos FFmpeg y ~40,7 ms CPU de servicio | Live TV y matriz de clientes reales, medidas sostenidas del host, relay opaco con TunerCount=1 y límite físico del volumen; repetir AMD64 |
-| MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c`; core `bde4922` refresca el catálogo al guardar | 91/0/4 ignoradas contra SDK/RPC local; fmt/diff/clippy verdes; ZIP AArch64 0.1.1 validado, SHA-256 `00cb1db58101c3b4af3041431c52bef5296cb650a552b64bbf9a64dbbc01a92f`; repositorio staging preparado; clave de referencia root-only generada | Pin público aún viejo; falta guardar el repositorio e instalar 0.1.1; perfil WireGuard MX, metadatos/secretos legítimos restantes, E2E real y publicación pendientes |
-| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series incremental a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; reintentos acotados para detalles transitorios | Xtream 26/26; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales | Audits post-import, reproducción y matriz de clientes reales |
-| Catálogo general | Pushdown SQL acotado con total exacto, playback join y ParentId; Series pagina claves canónicas por driver con fallback legacy e índices 114/115 | API 348/0/3, DB 150/0/2, migrador 36/36 y Clippy estrictos; PostgreSQL real: 22.194 series, páginas 20/20/14 en ~1,07 s, total exacto, `Limit=0`, memoria pico de servicio ~16 MiB | Proyección materializada si una biblioteca heterogénea o una serie extrema supera el gate; E2E visual/reproducción |
+| FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC; redirects opacos revalidados por salto | Corpus aislado verde; VOD real DirectProxy 206/65.536 bytes con 0 FFmpeg; Live TV real leyó 112.827 bytes directo con 0 FFmpeg y HLS produjo 1.702.152 bytes como remux, sin fallback, ~15,3 MiB RSS, PID reap y leases 0→0 | Matriz de clientes reales, medidas sostenidas/concurrentes del host y límite físico del volumen; repetir AMD64 |
+| MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c` | 91/0/4 ignoradas contra SDK/RPC local; ZIP AArch64 0.1.1 validado e instalado/activo en staging tras backups; configuración admin 200 sin credenciales; clave de referencia root-only generada | Pin público aún viejo; perfil WireGuard MX, metadatos/secretos legítimos restantes, cuenta/tuner, E2E real y publicación pendientes |
+| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series incremental a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde | Audit post-import DB/logs/argv, concurrencia y matriz de clientes reales |
+| Catálogo general | Pushdown SQL acotado con total exacto, playback join y ParentId; Series pagina claves canónicas por driver con fallback legacy e índices 114/115 | API 353/0/3, DB 150/0/2, migrador 36/36 y Clippy estrictos; PostgreSQL real: 22.194 series, páginas 20/20/14 en ~1,07 s, total exacto, `Limit=0`, memoria pico de servicio ~16 MiB | Proyección materializada si una biblioteca heterogénea o una serie extrema supera el gate; E2E visual/reproducción |
 | Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109, selector exacto GenreIds 110, fecha Upcoming 111 y selector exacto Person/Studio/Tag 112; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL 17.10 real con >500 seleccionados; Genre/Person/Studio/Tag por nombre raw y representaciones exactas legacy, OR interno/AND entre clases, paginación y parent recursivo; cap independiente de 64 antes de cualquier fallback; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; benchmark 112 a 10k/100k/500k reduce filas 9.900/99.000/495.000→24/247/1.234 y mejora p95 SQL 1,360x/1,528x/1,306x con PK lookup; API 347/0/3, DB 150/0/2 y migrador 36/36 | Ratings/premiere y shapes no equivalentes, baseline productiva concurrente y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 46/46; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `33d16bb`; servidor SHA-256 `ca53d430...3641c`; esquema 115; health/ready local y health HTTPS verdes, 0 reinicios; backups pre-114/pre-115/pre-33d16bb; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios; DirectProxy VOD real verde | E2E Live TV y clientes; instalar/validar MAGSTV, resolver egress/secretos operativos y ejecutar su E2E real |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `585468d`; servidor SHA-256 `803e0bdf...fde2`; esquema 115; health/ready local y health HTTPS verdes, 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios; VOD directo y Live TV direct/remux reales verdes; MAGSTV 0.1.1 activo | Clientes reales; resolver egress/secretos operativos y ejecutar E2E MAGSTV; carga concurrente y backups off-host |
 
 ### Trabajo restante y gates de salida
 
@@ -428,8 +442,10 @@ rollout probado:
    455.520 episodios agrupados en 22.194 series; omitió 3 detalles remotos
    persistentemente transitorios sin invalidar el resto de la generación.
    DirectProxy VOD real ya conserva H.264/AAC sin FFmpeg y sirve rangos a través
-   de la redirección CDN validada. Faltan Live TV y clientes reales.
-   Después se buscarán
+   de la redirección CDN validada. Live TV real expone direct y HLS para la
+   referencia opaca: el directo no crea FFmpeg y el HLS usa stream-copy remux
+   sin fallback, con stop/reap y leases restituidos. Faltan clientes reales y
+   carga concurrente/sostenida. Después se buscarán
    `RemoteSourceUrl`, `RemoteMediaProbe.SourceUrl` y
    `live_tv_channels.stream_url`; cualquier catálogo afectado se reimporta y se
    ejecutan las auditorías counts-only de DB/logs/argv. `direct_source` no reconstruible se rechaza: no se persiste
@@ -441,9 +457,9 @@ rollout probado:
    adaptación `ExternalProcess` local es `8ce47b4` y la versión 0.1.1 queda en
    `9596f1c`. Contra SDK/RPC local pasa 91 aprobadas, 0 fallidas y 4 ignoradas,
    con clippy/fmt/diff verdes. El ZIP AArch64 0.1.1 está validado y el repositorio
-   staging preparado. El core `bde4922` desplegado refresca el catálogo de forma
-   inmediata al guardar el repositorio habilitado; falta ejecutar ese guardado
-   con una sesión administradora e instalar 0.1.1. Repetir
+   staging preparado. El repositorio se refrescó y 0.1.1 quedó instalado,
+   habilitado y con configuración admin accesible; se conservaron backups de
+   PostgreSQL y 0.1.0. Repetir
    la matriz contra el core publicado compatible y, después de publicar
    Jellyrin, fijar el commit SDK/RPC exacto en el plugin; el pin público actual
    sigue viejo. La
@@ -561,7 +577,7 @@ rollout probado:
    navegación, RTL y vista doble. El recorrido detectó además un alias SQL
    reservado (`session_user`) en el broadcast de sesiones; se corrigió y el
    test PG de sesiones cubre ahora todos los reads que consume ese broadcast.
-6. **Staging — plataforma base desplegada; E2E real pendiente:**
+6. **Staging — plataforma base desplegada; E2E HTTP Xtream parcial:**
    `jellyrin.test.kode.live` ya ejecuta el binario release contra PostgreSQL
    local mediante roles separados, backend loopback, proxy TLS, keyring por
    credencial systemd y límites software-only. Migraciones, health/ready,
@@ -588,9 +604,13 @@ rollout probado:
    servicio ronda 16 MiB al navegar. La matriz sintética 10k/100k/500k ya se
    ejecutó. DirectProxy VOD real ya respondió 206 a una lectura acotada de
    65.536 bytes a través de la redirección CDN, sin lanzar FFmpeg y con unos
-   40,7 ms de CPU del servicio; faltan carga concurrente, Live TV y clientes,
-   completar los prerrequisitos e importar MAGSTV con una cuenta
-   controlada, la matriz Jellyfin Web/TV/DLNA y reproducción direct/remux. Ninguna
+   40,7 ms de CPU del servicio. El probe Live TV posterior recorrió como máximo
+   25 filas y encontró una fuente funcional en el segundo intento: directo
+   200/112.827 bytes con cero FFmpeg; HLS 200/1.702.152 bytes como `remux`, sin
+   fallback, ~15,3 MiB RSS y CPU instantánea 0%; stop dejó PID reap, leases y
+   FFmpeg en su baseline cero. MAGSTV 0.1.1 está instalado y activo, pero sin
+   tuner: faltan sus secretos operativos/egress y una cuenta controlada, carga
+   concurrente, matriz Jellyfin Web/TV/DLNA y reproducción sostenida. Ninguna
    credencial real se incorpora a fixtures o logs. El backend queda en
    `127.0.0.1`; la plantilla Nginx registra método + `$uri`, nunca query,
    referrer, `$request` ni `$request_uri`, para que `api_key` no llegue al
@@ -599,11 +619,13 @@ rollout probado:
    pendiente no impide usar el formulario inicial, pero sí declarar
    proveedores/clientes reales y rollout completados.
 7. **Cutover y publicación:** generar backup verificado, aplicar esquema con el
-   rol migrator, migrar SQLite legacy, comprobar digests, arrancar con el rol
-   runtime y mantener rollback. Después se publican commits/releases separados
+   rol migrator y arrancar con el rol runtime. La migración SQLite→PostgreSQL y
+   sus digests solo son obligatorios si se entrega un snapshot legacy real; el
+   staging actual nació en PostgreSQL y reindexa catálogos externos. Después se
+   publican commits/releases separados
    y se actualiza el pin del repositorio MAGSTV al commit público de Jellyrin;
-   los commits locales `757033a` y `bde4922` del core y los cinco commits locales
-   del plugin aún no se han enviado a `origin`.
+   los commits locales del core, incluidos `506c878` y `585468d`, aún no se han
+   enviado a `origin`.
 
 Redis no está en esta lista: el resultado medido fue **no-go** para este nodo y
 permanece apagado. Sólo vuelve a evaluación si aparece coordinación multinodo o
@@ -1964,9 +1986,13 @@ El pipeline y sus optimizaciones restantes quedan así:
     esa serie. La reanudación idempotente tras un ACK incierto requeriría
     `chunk_no + digest`; el contrato vigente es one-shot y reintenta con una
     generación nueva.
-14. `[ ]` Separar métricas counts-only para filas recibidas, seleccionadas,
-    deduplicadas, staged y publicadas, junto con límites explícitos de bytes,
-    elementos inspeccionados, tamaño por elemento y concurrencia.
+14. `[x]` El resultado conserva los cuatro contadores legacy y separa métricas
+    counts-only: Movies recibidas/seleccionadas/staged/publicadas, Series
+    recibidas/seleccionadas/omitidas/deduplicadas y Episodes
+    seleccionados/staged/publicados. Publicado solo se marca después de
+    `publish`; los límites numéricos explicitan body por clase, items
+    inspeccionados, chunk de 500, append máximo de 1.000 y concurrencia de
+    detalles Series=1. Los tests rechazan texto dinámico en `Metrics`/`Limits`.
 15. `[x]` Probadas 100.001 filas brutas, chunks acotados, Unicode/cortes JSON,
     límite inspeccionado, duplicados globales, invisibilidad y publicación
     atómica en SQLite/PostgreSQL, además del fallback `category_id` ante un
@@ -2499,20 +2525,19 @@ Automatizar pruebas de:
 
 ### 14.5 Gates automáticos
 
-**Estado del cierre local vigente:** el workspace pasa 641 pruebas, 0 fallidas y 5
-ignoradas con PostgreSQL real. El desglose relevante es API 344/0/3, DB 142/0/2
-más doctest, SDK 12/12, RPC 15/15, transcode 39/39, server 7/7 y core 17/17. El migrador
-pasa 36/36 con round-trip byte-exact BLOB→`bytea`, y Xtream pasa 20/20
-post-XOR/ImageUrl. `cargo clippy --workspace --all-targets --locked -- -D
-warnings` está verde. Packaging 46/46, supply-chain 38/38, systemd runtime
+**Estado del cierre dirigido vigente:** API pasa 353/0/3 y Xtream 27/27; ambos
+tienen formato, diff-check y Clippy estricto verdes. DB conserva 150/0/2 más
+doctest y el migrador 36/36 con round-trip byte-exact BLOB→`bytea`. La última
+baseline completa del workspace queda como evidencia histórica y deberá
+repetirse antes de release; no se mezclan sus contadores con el árbol actual.
+Packaging 46/46, supply-chain 38/38, systemd runtime
 13/13, systemd unit 14/14, performance/recovery 37/37 y security-hardening
 16/16, además de sintaxis Node y diff-check, también están verdes. La matriz
 MAGSTV 0.1.1 aplicada localmente pasa 91/0/4 ignoradas contra SDK/RPC local,
-clippy, fmt y diff-check; el ZIP AArch64 validado y su repositorio staging no
-equivalen a instalación. El core `bde4922` ya está desplegado y refresca el
-catálogo al guardar el repositorio, pero todavía falta ese guardado autenticado
-y la instalación de 0.1.1. El
-E2E con cuentas/clientes reales sigue fuera de este cierre, aunque la plataforma
+clippy, fmt y diff-check; el ZIP AArch64 validado quedó instalado y activo en
+staging, aunque no existe todavía tuner MAGSTV. El core `585468d` está
+desplegado y su E2E HTTP Xtream direct/remux es verde. El E2E con clientes y la
+cuenta MAGSTV reales sigue fuera de este cierre, aunque la plataforma
 base de staging ya está desplegada y saludable. Los smokes de
 systemd/performance/security pasaron; `pg_stat_statements` está precargado e
 instalado en `jellyrin` y registra 49 statements. Xtream está configurado con
@@ -2624,9 +2649,10 @@ inicial; estos criterios no deben leerse como una declaración de rollout.
 ### 15.2 Reproducción
 
 **Estado general `[~]`:** las decisiones, límites y cleanup tienen cobertura
-offline. DirectProxy VOD ya está acreditado con una fuente Xtream real y medidas
-del host; la aceptación definitiva exige Live TV/MAGSTV reales, clientes
-Jellyfin usados en producción y medidas sostenidas de CPU/`speed`.
+offline. DirectProxy VOD y Live TV direct/remux ya están acreditados con una
+fuente Xtream real y medidas acotadas del host; la aceptación definitiva exige
+MAGSTV real, clientes Jellyfin usados en producción y medidas concurrentes y
+sostenidas de CPU/`speed`.
 
 Las condiciones de profile/level/bit depth/frame rate/channels y sus razones ya
 están implementadas. Process groups, `SIGTERM` con gracia, escalado a `SIGKILL`
@@ -2636,21 +2662,25 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
 - `[x]` Un VOD Xtream remoto compatible usa direct proxy, revalida cada salto
   CDN, conserva `Range` y no crea proceso FFmpeg: 206/65.536 bytes, ~40,7 ms de
   CPU y pico de servicio menor de 10 MiB en el probe desplegado.
+- `[x]` Live TV Xtream remoto expone direct stream y HLS sin revelar la fuente:
+  directo 200/112.827 bytes con 0 FFmpeg; HLS 200/1.702.152 bytes en modo
+  efectivo `remux`, sin fallback, ~15,3 MiB RSS, stop/reap y leases 0→0.
 - Un contenedor incompatible con H.264/AAC compatible usa remux y no contiene
   encoder de vídeo en el comando.
 - Audio incompatible con vídeo compatible usa `-c:v copy`.
 - Nunca hay más recodificaciones de vídeo que el límite configurado.
 - Un seek no deja dos encoders activos para la misma sesión.
 - Una desconexión detiene el trabajo dentro del timeout configurado.
-- Live HLS eficiente mantiene el disco dentro de una cota verificable.
+- `[~]` Live HLS eficiente cerró una sesión real sin residuales; falta carga
+  sostenida para acreditar la cota física de disco.
 - `PlaybackInfo` explica el modo y las razones reales.
 - Ningún log o respuesta expone credenciales del proveedor.
 - En este host, el servidor conserva CPU disponible durante una reproducción
   software y mantiene `speed >= 1x` sin buffering.
-- Un cierre explícito termina el proceso en segundos; una desaparición silenciosa
-  lo detiene dentro del idle timeout.
-- No quedan procesos, permisos de semáforo ni archivos temporales huérfanos tras
-  error, cancelación o SIGTERM.
+- `[~]` Un cierre explícito real terminó y reaprovechó/eliminó el proceso; falta
+  validar desaparición silenciosa e idle timeout con fuente real.
+- `[~]` El stop Live real dejó cero procesos y leases; faltan error, SIGTERM y
+  carga concurrente para cerrar todos los caminos de cleanup.
 - Las escrituras de progreso están acotadas y no saturan PostgreSQL.
 
 ### 15.3 Seguridad y degradación
@@ -2664,14 +2694,16 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
   local con 91 pruebas aprobadas, 0 fallidas y 4 ignoradas, además de
   clippy/fmt/diff verdes. Integra `origin/main` `2700d7f` por `43551fe`, la
   adaptación `ExternalProcess` local `8ce47b4` y 0.1.1 `9596f1c`, pero el pin
-  público sigue viejo. El core `bde4922` desplegado ya refresca el repositorio
-  al guardarlo, pero aún falta guardar e instalar el ZIP 0.1.1.
+  público sigue viejo. El ZIP 0.1.1 quedó instalado y activo en staging tras
+  refrescar el repositorio; su configuración admin responde sin devolver
+  credenciales, pero aún no existe un tuner MAGSTV.
   El vault AEAD, readiness,
   backfill, rotación y escritura/configuración atómica están implementados y
   cubiertos en DB local. Xtream está configurado en staging y ha indexado 757
-  canales, pero la reproducción E2E con clientes reales continúa pendiente. La
+  canales; su direct/remux HTTP real está validado, pero la reproducción E2E
+  con clientes Jellyfin reales continúa pendiente. La
   UI MAGSTV fue corregida para aceptar solo credenciales; no quedan cubiertos
-  por ello egress, secretos operativos, instalación ni E2E real.
+  por ello egress, secretos operativos, cuenta/tuner ni E2E real.
   La migración 106 impone URL legacy XOR referencia opaca en Live TV y ya pasó
   en PostgreSQL real. Falta publicar el plugin, actualizar su pin tras publicar
   el core, ejecutar el E2E actualmente diferido, reimportar cualquier catálogo
@@ -2736,9 +2768,9 @@ reales del proveedor.
    el fallback de credenciales de cuenta por entorno ya está aplicado y validado
    contra el core local con 91/0/4 ignoradas y clippy/fmt/diff verdes. Integra
    `origin/main` `2700d7f` por `43551fe`, la adaptación local `8ce47b4` y 0.1.1
-   `9596f1c`; su ZIP AArch64 está validado y el repositorio staging preparado.
-   Su UI corregida solicita únicamente credenciales de cuenta. Faltan instalar
-   y refrescar 0.1.1 en Jellyrin, egress, secretos operativos, publicar ambos,
+   `9596f1c`; su ZIP AArch64 está validado, instalado y activo en staging.
+   Su UI corregida solicita únicamente credenciales de cuenta. Faltan egress,
+   secretos operativos, crear el tuner con una cuenta real, publicar ambos,
    fijar el pin público compatible y ejecutar la resolución JIT E2E
    con una cuenta controlada, sin persistir secretos ni URLs firmadas.
 3. `[~]` SQLite persistente usa rollback journal fail-closed y no WAL mientras
@@ -2796,7 +2828,8 @@ Después de instrumentación, este track puede desarrollarse en paralelo:
    contrato de probes a otros proveedores.
 8. `[x]` Observación HLS numérica: CPU/RSS Linux a 2 s, frame/fps/speed/posición
    para VOD/Live/seek, cleanup del sampler y agregados de cardinalidad fija sin
-   credenciales. Falta medir sesiones reales; no es deuda de implementación.
+   credenciales. Una sesión Live real acreditó modo remux, fallback false,
+   ~15,3 MiB RSS y cleanup; faltan sesiones concurrentes/sostenidas y clientes.
 9. `[x]` Ejecuciones FFmpeg auxiliares bajo admisión compartida y telemetría de
    cardinalidad fija con outcomes y duración, sin retener payload sensible.
 10. `[x]` Seek HLS con deadline derivado/cap validado, stop/reap, cleanup seguro
