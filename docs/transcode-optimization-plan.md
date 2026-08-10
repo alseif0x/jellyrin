@@ -454,16 +454,53 @@ la migración la aplicó únicamente `jellyrin-migrate.service`:
   tuner sin secretos en claro; el `argv` de FFmpeg solo contiene una URL
   loopback, sin query, sin credenciales en ruta y sin token.
 
-Queda un gate sin cumplir, **anterior a 120**: el listado de Series responde 500.
-`media_item_tv_series_coverage` está vacía aunque la proyección tiene 22.194
-series y 455.520 miembros válidos, así que `tv_series_catalog_page` devuelve
-`None` y el fallback escanea `media_items` completo sin límite, superando
+Durante los smokes apareció un gate incumplido **anterior a 120**: el listado de
+Series respondía 500. `media_item_tv_series_coverage` estaba vacía aunque la
+proyección tenía 22.194 series y 455.520 miembros válidos, así que
+`tv_series_catalog_page` devolvía `None` y el fallback legacy materializaba
+`media_items` completo, superando
 `JELLYRIN_DB_API_STATEMENT_TIMEOUT_SECONDS=10`. El mismo error
 (`canceling statement due to statement timeout at line 3418`) ya aparece en el
 journal a las 20:12 UTC con el binario anterior y esquema 119. Los triggers de
 invalidación borran la coverage en cualquier cambio de `media_items` y solo la
-reconstruye la sincronización de la carpeta, por lo que el fallback debe acotarse
-o la coverage republicarse.
+reconstruye la sincronización de la carpeta.
+
+#### Página de Series acotada sin coverage publicada
+
+`TvSeriesCatalogPage` reserva `None` para episodios sin `SeriesId`/`SeriesName`
+canónicos, no para una coverage caducada, así que ambos drivers ahora recomputan
+esa misma página desde las filas vivas cuando falta la coverage. Las tablas de
+proyección no se leen: solo su coverage certifica frescura, de modo que la
+frontera fail-closed se conserva.
+
+Una sola pasada de agrupación responde lo que certificaría la coverage —
+elegibilidad, total exacto y la página pedida— usando `min(...) <> max(...)` para
+detectar un segundo valor distinto por grupo sin el orden por grupo que exige
+`count(DISTINCT ...)`: esa variante costaba 3,95 s por sí sola. La pasada se
+mantiene como un único hash aggregate de una fila por serie con `SET LOCAL
+work_mem = '64MB'`, porque los 4 MB por defecto volcaban cada tupla a un merge
+externo de 547 MB (2,32 s con volcado frente a 1,17 s y 4,8 MB sin él). Un
+`SeriesId` con dos nombres, repartido entre carpetas o fuera de una biblioteca de
+TV sigue devolviendo `None` y delegando en la agrupación legacy, que es
+exactamente lo que la reconstrucción se niega a proyectar.
+
+Evidencia sobre la base productiva con la coverage todavía sin publicar:
+
+- Series `StartIndex=0` y `StartIndex=40`: 200 con total exacto 22.194, 20 ítems
+  por página y orden por nombre correcto, en 4,43 s;
+- Movies 39.093 en 0,202 s y `Items/Filters2` de Series en 9,6 ms, sin cambios;
+- `jellyrin-db` 170/0/4; API 354/0/3 con `/usr/bin/ffmpeg`; `cargo fmt --check` y
+  Clippy estricto de DB, migrador y API limpios;
+- binarios reinstalados como conjunto: servidor
+  `555ac9b17c11e3f497703c676ee72d889c328543d221cf99b52f1c0f9d89aee2`, migrador
+  `c61e2d59a9492ac22b1b93213682fea0927d5092bdd278f53d588d55dd01c889`, con los
+  anteriores conservados en `/var/backups/jellyrin`; esquema intacto en
+  `202608080120`, `NRestarts=0` y health/readiness local y HTTPS en 200.
+
+`/Shows/NextUp` sigue devolviendo 500 por el otro camino sin acotar
+(`tv_next_up_candidates` materializa todos los candidatos de TV visibles). Ya
+fallaba igual a las 20:12 UTC con el binario anterior y continúa como trabajo
+aparte.
 
 La base bare-metal de staging ya está desplegada en
 `jellyrin.test.kode.live`: PostgreSQL 16.14 y Jellyrin solo escuchan en loopback,
@@ -586,11 +623,11 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg `8.2-dev-git-1e0279143db9` mínimo sin encoders y solo decoder AAC; redirects opacos revalidados por salto | Corpus aislado verde en imagen ARM64 exacta de HEAD; VOD real DirectProxy 206/65.536 bytes con 0 FFmpeg; Live TV real leyó 112.827 bytes directo con 0 FFmpeg y HLS produjo 1.702.152 bytes como remux, sin fallback, ~15,3 MiB RSS, PID reap y leases 0→0 | Matriz de clientes reales, medidas sostenidas/concurrentes del host y límite físico del volumen; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c` | 91/0/4 ignoradas contra SDK/RPC local; ZIP AArch64 0.1.1 validado e instalado/activo en staging tras backups; configuración admin 200 sin credenciales; salud `Degraded` esperada sin tuner/egress; clave de referencia root-only generada | Pin público aún viejo; perfil WireGuard MX, metadatos/secretos legítimos restantes, cuenta/tuner, E2E real y publicación pendientes |
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series por streaming acotado a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; probe media+metadata agrupado; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde; audits DB/logs/argv 0 findings | Repetición periódica del audit y matriz de clientes reales |
-| Catálogo general | Pushdown SQL paginado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed; filtros normalizan `Series`/`Movie,Series` a episodios persistidos | API 354/0/3, DB 169/0/4 y Clippy estricto sobre el lote; migrador baseline 36/36; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto. Tras el rollout 120, Movies devuelve 39.093 en 77 ms, pero el listado de Series responde 500 porque su coverage no está publicada y el fallback legacy escanea la tabla completa | Republicar la coverage de Series y acotar su fallback; E2E visual/reproducción |
+| Catálogo general | Pushdown SQL paginado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed; filtros normalizan `Series`/`Movie,Series` a episodios persistidos | API 354/0/3, DB 169/0/4 y Clippy estricto sobre el lote; migrador baseline 36/36; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto. Tras el rollout 120, Movies devuelve 39.093 en 77 ms y Series 22.194 exactos en 4,43 s mediante la página acotada en vivo que sustituye al fallback sin límite cuando la coverage no está publicada | Acotar también `/Shows/NextUp`; E2E visual/reproducción |
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; runtime sin DML directo ni bypass GUC | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms y 120 en 886 ms sobre la base productiva. PostgreSQL 16 aislado valida ACL, rebuild/punto y ataques con GUC/sombras temporales; ACL de solo lectura y `SECURITY DEFINER` reverificados en staging tras el rollout; API 354/0/3 y DB efectiva 169/0/4 | Scope padre+hijos/múltiple, coalescer de grandes lotes y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 500 por coverage `media_item_tv_series` sin publicar, defecto anterior a 120 | Republicar la coverage de Series y acotar su fallback; E2E visual autenticado; optimizar `NextUp`; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 200 con total exacto 22.194 en 4,43 s por la página acotada en vivo, con la coverage aún sin publicar | `/Shows/NextUp` sigue en 500 por su propio camino sin acotar; E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
 

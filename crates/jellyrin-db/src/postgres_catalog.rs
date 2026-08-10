@@ -1717,8 +1717,15 @@ impl PostgresDatabase {
         .fetch_one(&mut *transaction)
         .await?;
         if !projection_covered {
+            let page = Self::tv_series_catalog_page_from_live(
+                &mut transaction,
+                virtual_folder_id,
+                start_index,
+                limit,
+            )
+            .await?;
             transaction.commit().await?;
-            return Ok(None);
+            return Ok(page);
         }
         let requested_limit = limit;
         let mut series = sqlx::query_as::<_, (String, String, i64)>(
@@ -1804,6 +1811,168 @@ impl PostgresDatabase {
             series: series
                 .into_iter()
                 .map(|(id, name, _)| TvSeriesCatalogKey { id, name })
+                .collect(),
+            episodes: rows
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            total_record_count: usize::try_from(total)?,
+            start_index,
+        }))
+    }
+
+    /// Bounded page computed directly from `media_items` when the durable projection rows exist but
+    /// their coverage row was invalidated.
+    ///
+    /// `TvSeriesCatalogPage` reserves `None` for episodes without a canonical persisted
+    /// SeriesId/SeriesName, so a merely stale coverage row must not push the caller onto the legacy
+    /// path that materializes every episode in the library. The projection tables are deliberately
+    /// not read here: only their coverage row certifies freshness, so this recomputes the same page
+    /// from the live rows and keeps the fail-closed contract intact.
+    async fn tv_series_catalog_page_from_live(
+        tx: &mut Transaction<'_, Postgres>,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+    ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
+        let canonical: bool = sqlx::query_scalar(
+            r#"
+            SELECT NOT EXISTS (
+                SELECT 1
+                FROM media_items AS invalid
+                WHERE invalid.missing_since IS NULL
+                  AND invalid.media_type = 'Video'
+                  AND lower(invalid.collection_type) = ANY(
+                      ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                  AND ($1::uuid IS NULL OR invalid.virtual_folder_id = $1)
+                  AND (
+                      NULLIF(btrim(invalid.metadata->>'SeriesId'), '') IS NULL
+                      OR btrim(invalid.metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
+                      OR NULLIF(btrim(invalid.metadata->>'SeriesName'), '') IS NULL
+                  )
+            )
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !canonical {
+            return Ok(None);
+        }
+
+        // One grouped pass answers everything the coverage row would otherwise certify: whether the
+        // data is still projection-eligible, how many series exist, and which belong on the page.
+        // `min(...) <> max(...)` detects a second distinct value per group without the per-group
+        // sort that `count(DISTINCT ...)` needs, keeping this a single hash aggregate of one row
+        // per series. The default 4 MB `work_mem` would instead spill every heap tuple into an
+        // external merge sort, which made this path exceed the API statement timeout, so raise it
+        // for this transaction only.
+        sqlx::query("SET LOCAL work_mem = '64MB'")
+            .execute(&mut **tx)
+            .await?;
+
+        let requested_limit = limit;
+        let grouped = sqlx::query_as::<_, (i64, bool, bool, bool, Option<String>, Option<String>)>(
+            r#"
+            WITH grouped AS (
+                SELECT btrim(item.metadata->>'SeriesId') AS series_id,
+                       min(btrim(item.metadata->>'SeriesName')) AS series_name,
+                       max(btrim(item.metadata->>'SeriesName')) AS series_name_last,
+                       min(item.virtual_folder_id::text) AS folder_first,
+                       max(item.virtual_folder_id::text) AS folder_last,
+                       bool_or(lower(coalesce(folder.collection_type, '')) <> ALL(
+                           ARRAY['tvshows', 'tvshow', 'series']::text[]
+                       )) AS foreign_folder
+                FROM media_items AS item
+                LEFT JOIN virtual_folders AS folder ON folder.id = item.virtual_folder_id
+                WHERE item.missing_since IS NULL
+                  AND item.media_type = 'Video'
+                  AND lower(item.collection_type) = ANY(
+                      ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                  AND ($1::uuid IS NULL OR item.virtual_folder_id = $1)
+                GROUP BY btrim(item.metadata->>'SeriesId')
+            ), stats AS (
+                SELECT count(*)::bigint AS total,
+                       coalesce(bool_or(series_name <> series_name_last), FALSE) AS name_conflict,
+                       coalesce(bool_or(folder_first <> folder_last), FALSE) AS folder_conflict,
+                       coalesce(bool_or(foreign_folder), FALSE) AS foreign_folder
+                FROM grouped
+            ), page AS (
+                SELECT series_id, series_name
+                FROM grouped
+                ORDER BY lower(series_name), series_name, series_id
+                LIMIT $2 OFFSET $3
+            )
+            SELECT stats.total, stats.name_conflict, stats.folder_conflict,
+                   stats.foreign_folder, page.series_id, page.series_name
+            FROM stats
+            LEFT JOIN page ON TRUE
+            ORDER BY lower(page.series_name), page.series_name, page.series_id
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .bind(i64::try_from(limit.max(1))?)
+        .bind(i64::try_from(start_index)?)
+        .fetch_all(&mut **tx)
+        .await?;
+        let Some(first) = grouped.first() else {
+            return Ok(None);
+        };
+        let (total, name_conflict, folder_conflict, foreign_folder) =
+            (first.0, first.1, first.2, first.3);
+        // A SeriesId carrying two display names, spanning two folders, or living outside a TV
+        // library is exactly what `rebuild_tv_series_catalog_projection_in_transaction` refuses to
+        // project, so those keep deferring to the caller's legacy grouping.
+        if name_conflict || (virtual_folder_id.is_none() && (folder_conflict || foreign_folder)) {
+            return Ok(None);
+        }
+        let mut series = grouped
+            .iter()
+            .filter_map(|(_, _, _, _, id, name)| Some((id.clone()?, name.clone()?)))
+            .collect::<Vec<_>>();
+        if requested_limit == 0 {
+            series.clear();
+        }
+        let rows = if series.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
+                r#"
+                SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                       item.media_type, item.collection_type, item.file_size,
+                       item.runtime_ticks, item.bitrate, item.width, item.height,
+                       item.media_streams, item.metadata, item.created_at, item.updated_at,
+                       NULL::uuid AS playback_user_id, NULL::uuid AS playback_item_id,
+                       NULL::text AS playback_media_source_id,
+                       NULL::bigint AS playback_audio_stream_index,
+                       NULL::bigint AS playback_subtitle_stream_index,
+                       NULL::bigint AS playback_position_ticks,
+                       NULL::boolean AS playback_is_paused, NULL::boolean AS playback_played,
+                       NULL::boolean AS playback_is_favorite,
+                       NULL::double precision AS playback_rating,
+                       NULL::timestamptz AS playback_updated_at
+                FROM media_items AS item
+                WHERE item.missing_since IS NULL
+                  AND item.media_type = 'Video'
+                  AND lower(item.collection_type) = ANY(
+                      ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                  AND ($1::uuid IS NULL OR item.virtual_folder_id = $1)
+                  AND btrim(item.metadata->>'SeriesId') = ANY($2::text[])
+                ORDER BY lower(item.name), item.name, item.id
+                "#,
+            )
+            .bind(virtual_folder_id)
+            .bind(series.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>())
+            .fetch_all(&mut **tx)
+            .await?
+        };
+        Ok(Some(TvSeriesCatalogPage {
+            series: series
+                .into_iter()
+                .map(|(id, name)| TvSeriesCatalogKey { id, name })
                 .collect(),
             episodes: rows
                 .into_iter()
@@ -9027,12 +9196,27 @@ mod tests {
                 .bind(episode_id)
                 .execute(&test.database.pool)
                 .await?;
-            assert!(
-                test.database
-                    .tv_series_catalog_page(Some(folder.id), 0, 20)
-                    .await?
-                    .is_none()
-            );
+            // The invalidation trigger drops the coverage row on any media_items change. A stale
+            // projection must still serve a bounded page computed from the live rows instead of
+            // pushing the caller onto the legacy path that materializes every episode.
+            let coverage_rows = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM media_item_tv_series_coverage WHERE virtual_folder_id = $1",
+            )
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(coverage_rows, 0);
+            let stale = test
+                .database
+                .tv_series_catalog_page(Some(folder.id), 0, 20)
+                .await?
+                .context("stale coverage must still serve a bounded live page")?;
+            assert_eq!(stale.total_record_count, 1);
+            assert_eq!(stale.series.len(), 1);
+            assert_eq!(stale.series[0].id, series_id.simple().to_string());
+            assert_eq!(stale.series[0].name, "Projected");
+            assert_eq!(stale.episodes.len(), 1);
+            assert_eq!(stale.episodes[0].item.id, episode_id);
 
             test.database
                 .replace_remote_media_library_snapshot(
@@ -9049,6 +9233,53 @@ mod tests {
                 .context("projection was not restored by snapshot publication")?;
             assert_eq!(restored.total_record_count, 1);
             assert_eq!(restored.episodes.len(), 1);
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_tv_series_live_page_defers_when_series_ids_are_not_canonical() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let series_id = Uuid::new_v4();
+            let conflicting = |name: &str, series_name: &str| {
+                remote_item(
+                    Uuid::new_v4(),
+                    name,
+                    &format!("provider://conflicting/{name}.mp4"),
+                    "Video",
+                    "tvshows",
+                    json!({
+                        "SeriesId": series_id.simple().to_string(),
+                        "SeriesName": series_name
+                    }),
+                )
+            };
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Conflicting Shows",
+                    "tvshows",
+                    "provider://conflicting",
+                    vec![
+                        conflicting("Conflict S01E01", "One"),
+                        conflicting("Conflict S01E02", "Two"),
+                    ],
+                )
+                .await?;
+            // One SeriesId carrying two display names is not projectable, so the bounded live page
+            // must keep deferring to the caller's legacy grouping instead of inventing a winner.
+            assert!(
+                test.database
+                    .tv_series_catalog_page(Some(folder.id), 0, 20)
+                    .await?
+                    .is_none()
+            );
             anyhow::Ok(())
         }
         .await;
