@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     path::Path,
 };
@@ -11,6 +11,10 @@ use serde_json::Value;
 use sqlx::{Acquire, PgConnection, Postgres, QueryBuilder, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use crate::query_filter_projection::{
+    MediaItemQueryFilterProjectedValue, MediaItemQueryFilterValueKind,
+};
 
 use super::{
     CatalogSyncCountsRow, CatalogSyncDiagnostics, CatalogSyncRunDiagnostics, DatabasePoolRole,
@@ -2230,19 +2234,10 @@ impl PostgresDatabase {
         .bind(context.folder_id)
         .execute(&mut **tx)
         .await?;
-        let mut affected_values = if context.old_projection.values == projection.values {
-            Vec::new()
-        } else {
-            context
-                .old_projection
-                .values
-                .iter()
-                .chain(&projection.values)
-                .map(|value| (value.kind.as_str().to_owned(), value.display_value.clone()))
-                .collect::<Vec<_>>()
-        };
-        affected_values.sort_unstable();
-        affected_values.dedup();
+        let affected_values = postgres_query_filter_changed_multivalue_buckets(
+            &context.old_projection.values,
+            &projection.values,
+        );
 
         sqlx::query("SET LOCAL jellyrin.query_filter_summary_rebuild = 'on'")
             .execute(&mut **tx)
@@ -6571,6 +6566,39 @@ fn postgres_query_filter_scalar_memberships(
         ));
     }
     values
+}
+
+fn postgres_query_filter_value_buckets<'a>(
+    values: &'a [MediaItemQueryFilterProjectedValue],
+) -> BTreeMap<(MediaItemQueryFilterValueKind, String), Vec<&'a MediaItemQueryFilterProjectedValue>>
+{
+    let mut buckets = BTreeMap::new();
+    for value in values {
+        buckets
+            .entry((value.kind, value.display_value.clone()))
+            .or_insert_with(Vec::new)
+            .push(value);
+    }
+    buckets
+}
+
+/// Return only buckets whose contributors for this item changed. A new stream language must not
+/// force rescanning unrelated, unchanged genres/tags across a very large Series library.
+fn postgres_query_filter_changed_multivalue_buckets(
+    old_values: &[MediaItemQueryFilterProjectedValue],
+    new_values: &[MediaItemQueryFilterProjectedValue],
+) -> Vec<(String, String)> {
+    let old_buckets = postgres_query_filter_value_buckets(old_values);
+    let new_buckets = postgres_query_filter_value_buckets(new_values);
+    old_buckets
+        .keys()
+        .chain(new_buckets.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| old_buckets.get(key) != new_buckets.get(key))
+        .map(|(kind, display)| (kind.as_str().to_owned(), display))
+        .collect()
 }
 
 fn normalized_locations(locations: Vec<String>) -> Vec<String> {
