@@ -2230,13 +2230,17 @@ impl PostgresDatabase {
         .bind(context.folder_id)
         .execute(&mut **tx)
         .await?;
-        let mut affected_values = context
-            .old_projection
-            .values
-            .iter()
-            .chain(&projection.values)
-            .map(|value| (value.kind.as_str().to_owned(), value.display_value.clone()))
-            .collect::<Vec<_>>();
+        let mut affected_values = if context.old_projection.values == projection.values {
+            Vec::new()
+        } else {
+            context
+                .old_projection
+                .values
+                .iter()
+                .chain(&projection.values)
+                .map(|value| (value.kind.as_str().to_owned(), value.display_value.clone()))
+                .collect::<Vec<_>>()
+        };
         affected_values.sort_unstable();
         affected_values.dedup();
 
@@ -2349,11 +2353,22 @@ impl PostgresDatabase {
             .execute(&mut **tx)
             .await?;
             sqlx::query(
-                "UPDATE media_item_query_filter_summary_values \
-                 SET contributor_count = contributor_count - 1 \
-                 WHERE virtual_folder_id = $1 AND effective_item_type = $2 \
-                   AND value_kind = $3 AND normalized_value = $4 \
-                   AND contributor_count > 1",
+                "WITH removed AS (\
+                     DELETE FROM media_item_query_filter_summary_values \
+                     WHERE virtual_folder_id = $1 AND effective_item_type = $2 \
+                       AND value_kind = $3 AND normalized_value = $4 \
+                       AND contributor_count > 1 \
+                     RETURNING *\
+                 ) \
+                 INSERT INTO media_item_query_filter_summary_values (\
+                     virtual_folder_id, effective_item_type, value_kind, normalized_value, \
+                     display_value, winner_item_sort, winner_item_id, winner_source_priority, \
+                     winner_source_position, contributor_count\
+                 ) \
+                 SELECT virtual_folder_id, effective_item_type, value_kind, normalized_value, \
+                        display_value, winner_item_sort, winner_item_id, winner_source_priority, \
+                        winner_source_position, contributor_count - 1 \
+                 FROM removed",
             )
             .bind(context.folder_id)
             .bind(&context.effective_item_type)
@@ -2364,14 +2379,24 @@ impl PostgresDatabase {
         }
         for (kind, normalized, display) in new_scalars.difference(&old_scalars) {
             sqlx::query(
-                "INSERT INTO media_item_query_filter_summary_values (\
+                "WITH removed AS (\
+                     DELETE FROM media_item_query_filter_summary_values \
+                     WHERE virtual_folder_id = $1 AND effective_item_type = $2 \
+                       AND value_kind = $3 AND normalized_value = $4 \
+                     RETURNING display_value, winner_item_sort, winner_item_id, \
+                               winner_source_priority, winner_source_position, contributor_count\
+                 ) \
+                 INSERT INTO media_item_query_filter_summary_values (\
                      virtual_folder_id, effective_item_type, value_kind, normalized_value, \
                      display_value, winner_item_sort, winner_item_id, \
                      winner_source_priority, winner_source_position, contributor_count\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, '', 1) \
-                 ON CONFLICT (virtual_folder_id, effective_item_type, value_kind, normalized_value) \
-                 DO UPDATE SET contributor_count = \
-                     media_item_query_filter_summary_values.contributor_count + 1",
+                 ) \
+                 SELECT $1, $2, $3, $4, display_value, winner_item_sort, winner_item_id, \
+                        winner_source_priority, winner_source_position, contributor_count + 1 \
+                 FROM removed \
+                 UNION ALL \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, 0, '', 1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM removed)",
             )
             .bind(context.folder_id)
             .bind(&context.effective_item_type)

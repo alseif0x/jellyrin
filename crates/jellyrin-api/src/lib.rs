@@ -37606,6 +37606,7 @@ async fn open_live_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
+    RawQuery(raw_query): RawQuery,
     body: Option<Json<OpenLiveStreamBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
@@ -37614,10 +37615,17 @@ async fn open_live_stream(
         open_token: None,
         media_source_id: None,
     });
+    let query_item_id = query_string_values(
+        raw_query.as_deref(),
+        &["ItemId", "MediaSourceId", "OpenToken"],
+    )
+    .into_iter()
+    .find(|value| !value.trim().is_empty());
     let item_id = body
         .item_id
         .or(body.media_source_id)
         .or(body.open_token)
+        .or(query_item_id)
         .ok_or_else(|| ApiError::bad_request("ItemId is required"))?;
     if let Ok(channel) = live_tv_channel_by_id(&state.db, &item_id).await {
         let media_source = live_tv_channel_media_source(&channel)?;
@@ -82546,10 +82554,10 @@ done
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/LiveStreams/Open")
+                    .uri(format!("/LiveStreams/Open?ItemId={item_id}"))
                     .header("X-Emby-Token", &api_key)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(json!({ "ItemId": item_id }).to_string()))
+                    .body(Body::from(json!({ "DeviceProfile": {} }).to_string()))
                     .unwrap(),
             )
             .await
