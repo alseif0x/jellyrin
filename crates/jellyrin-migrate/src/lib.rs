@@ -38,7 +38,7 @@ use spec::{
 use value::{TypedValue, parse_uuid};
 
 pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_080_119;
-pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_119;
+pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_120;
 const MIN_POSTGRES_VERSION_NUM: i64 = 160_000;
 const MIGRATION_BATCH_ROWS: usize = 500;
 const TARGET_APPLICATION_LOCK_TIMEOUT: &str = "10s";
@@ -1874,6 +1874,37 @@ mod tests {
             sql.contains("revoke all privileges on table _sqlx_migrations from jellyrin_runtime")
         );
         assert!(sql.contains("grant select on table _sqlx_migrations to jellyrin_runtime"));
+    }
+
+    #[test]
+    fn query_filter_summary_publication_boundary_is_narrow_and_fail_closed() {
+        let migration = POSTGRES_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_608_080_120)
+            .expect("query-filter summary publication-boundary migration must be embedded");
+        let sql = migration.sql.as_ref().to_ascii_lowercase();
+
+        assert!(sql.contains("security definer"));
+        assert!(sql.contains("security invoker"));
+        assert!(sql.contains("current_user = summary_owner"));
+        assert!(sql.contains("set search_path to pg_catalog, %i, pg_temp"));
+        assert!(!sql.contains("current_setting"));
+        assert!(!sql.contains("jellyrin.query_filter_summary_source_patch"));
+        assert!(!sql.contains("jellyrin.query_filter_summary_rebuild"));
+        assert!(
+            sql.contains("revoke all privileges on table media_item_query_filter_summary_values")
+        );
+        assert!(sql.contains("grant select on table media_item_query_filter_summary_values"));
+        assert!(sql.contains(
+            "revoke all on function jellyrin_rebuild_query_filter_summary(uuid) from public"
+        ));
+        assert!(
+            sql.contains("grant execute on function jellyrin_rebuild_query_filter_summary(uuid)")
+        );
+        assert!(sql.contains("create function jellyrin_reconcile_query_filter_summary_item"));
+        assert!(
+            !sql.contains("grant insert, update, delete on table media_item_query_filter_summary")
+        );
     }
 
     #[test]
