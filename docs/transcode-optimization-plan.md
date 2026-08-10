@@ -519,7 +519,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118 y revisiones/CAS incremental 119 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; selección por familias; contratos Web tipados y sin cap | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms. Carrera, case-fold, no-op y dos contributors verdes; probe Xtream mantiene coverage 0→2 sin FFmpeg. HTTPS 80/8 p95 0,111–0,122 s | Scope padre+hijos/múltiple, coalescer de grandes lotes, encapsular el GUC interno y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `ad0e14d`; servidor SHA-256 `9ba49ca4...37660a`; esquema 119; health/readiness local/HTTPS verdes, 0 reinicios, revisiones 2/2 limpias y 0 FFmpeg; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios; VOD directo y Live TV direct/remux reales verdes; MAGSTV 0.1.1 activo | E2E visual autenticado; esquema 120; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `f856131`; esquema 119; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206; episodio HEVC+AC3 HLS 200 en 3,424 s/segmento; VOD 4K HLS 200 pero por debajo de tiempo real. Live TV 2958/2965 verde y 2966 caído en upstream; MAGSTV 0.1.1 activo | E2E visual autenticado; esquema 120; optimizar `NextUp`; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
 
@@ -2808,6 +2808,17 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
 - `[x]` Live TV Xtream remoto expone direct stream y HLS sin revelar la fuente:
   directo 200/112.827 bytes con 0 FFmpeg; HLS 200/1.702.152 bytes en modo
   efectivo `remux`, sin fallback, ~15,3 MiB RSS, stop/reap y leases 0→0.
+- `[x]` El contrato real de Jellyfin Web para `LiveStreams/Open` acepta `ItemId`,
+  `MediaSourceId` y `OpenToken` en query además del cuerpo. En staging, dos
+  canales Xtream del mismo tuner entregan 200; un tercer canal concreto devuelve
+  503 porque el upstream resetea su conexión antes de cabeceras. No es un fallo
+  de FFmpeg, credenciales, DNS, egress ni construcción de la URL.
+- `[x]` El bare-metal ARM64 usa el FFmpeg Debian con encoders software bajo un
+  único job, dos threads, niceness 10 y `CPUQuota=150%`. Un episodio HEVC+AC3
+  incompatible pasó de `NoCompatibleStream` a HLS y produjo el primer segmento
+  en 3,424 s con 3,860 s de CPU de cgroup. Un VOD 4K HEVC+AC3 produjo segmento
+  en 11,613 s con 13,677 s de CPU: demuestra compatibilidad y contención, pero
+  no velocidad de tiempo real para 4K.
 - `[~]` Un contenedor incompatible con H.264/AAC compatible usa remux y no contiene
   encoder de vídeo en el comando.
 - `[~]` Audio incompatible con vídeo compatible usa `-c:v copy`.
@@ -2819,7 +2830,9 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
 - `[~]` `PlaybackInfo` explica el modo y las razones reales.
 - `[~]` Ningún log o respuesta expone credenciales del proveedor.
 - `[~]` En este host, el servidor conserva CPU disponible durante una reproducción
-  software y mantiene `speed >= 1x` sin buffering.
+  software por la cuota física. 1080p medido queda cerca del tiempo real; 4K
+  software no cumple todavía `speed >= 1x` y requiere worker externo o hardware
+  de vídeo real, no ampliar la cuota del host índice.
 - `[~]` Un cierre explícito real terminó y reaprovechó/eliminó el proceso; falta
   validar desaparición silenciosa e idle timeout con fuente real.
 - `[~]` El stop Live real dejó cero procesos y leases; faltan error, SIGTERM y

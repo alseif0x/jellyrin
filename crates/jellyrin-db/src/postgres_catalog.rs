@@ -6568,10 +6568,9 @@ fn postgres_query_filter_scalar_memberships(
     values
 }
 
-fn postgres_query_filter_value_buckets<'a>(
-    values: &'a [MediaItemQueryFilterProjectedValue],
-) -> BTreeMap<(MediaItemQueryFilterValueKind, String), Vec<&'a MediaItemQueryFilterProjectedValue>>
-{
+fn postgres_query_filter_value_buckets(
+    values: &[MediaItemQueryFilterProjectedValue],
+) -> BTreeMap<(MediaItemQueryFilterValueKind, String), Vec<&MediaItemQueryFilterProjectedValue>> {
     let mut buckets = BTreeMap::new();
     for value in values {
         buckets
