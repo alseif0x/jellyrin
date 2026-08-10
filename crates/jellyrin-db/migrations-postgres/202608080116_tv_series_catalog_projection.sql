@@ -46,98 +46,81 @@ CREATE TABLE media_item_tv_series_coverage (
     completed_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-WITH eligible AS (
-    SELECT folder.id
-    FROM virtual_folders AS folder
-    WHERE lower(coalesce(folder.collection_type, '')) = ANY(
-              ARRAY['tvshows', 'tvshow', 'series']::text[]
-          )
-      AND NOT EXISTS (
-          SELECT 1
-          FROM media_items AS invalid
-          WHERE invalid.virtual_folder_id = folder.id
-            AND invalid.missing_since IS NULL
-            AND invalid.media_type = 'Video'
-            AND lower(invalid.collection_type) = ANY(
-                  ARRAY['tvshows', 'tvshow', 'series']::text[]
-                )
-            AND (
-                NULLIF(btrim(invalid.metadata->>'SeriesId'), '') IS NULL
-                OR btrim(invalid.metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
-                OR NULLIF(btrim(invalid.metadata->>'SeriesName'), '') IS NULL
-            )
+-- Extract the JSON fields once into a narrow, transaction-local working set.  Apart
+-- from avoiding repeated JSON evaluation, this keeps validation and grouping from
+-- sorting the complete (and potentially heavily bloated) media_items rows.
+CREATE TEMP TABLE jellyrin_tv_series_candidates ON COMMIT DROP AS
+SELECT item.id AS item_id,
+       item.virtual_folder_id,
+       btrim(item.metadata->>'SeriesId') AS series_id,
+       btrim(item.metadata->>'SeriesName') AS series_name
+FROM media_items AS item
+JOIN virtual_folders AS folder ON folder.id = item.virtual_folder_id
+WHERE lower(coalesce(folder.collection_type, '')) = ANY(
+          ARRAY['tvshows', 'tvshow', 'series']::text[]
       )
-      AND NOT EXISTS (
-          SELECT 1
-          FROM media_items AS conflicting
-          WHERE conflicting.virtual_folder_id = folder.id
-            AND conflicting.missing_since IS NULL
-            AND conflicting.media_type = 'Video'
-            AND lower(conflicting.collection_type) = ANY(
-                  ARRAY['tvshows', 'tvshow', 'series']::text[]
-                )
-          GROUP BY btrim(conflicting.metadata->>'SeriesId')
-          HAVING count(DISTINCT btrim(conflicting.metadata->>'SeriesName')) > 1
+  AND item.missing_since IS NULL
+  AND item.media_type = 'Video'
+  AND lower(item.collection_type) = ANY(
+        ARRAY['tvshows', 'tvshow', 'series']::text[]
+      );
+
+CREATE INDEX jellyrin_tv_series_candidates_folder_series
+ON jellyrin_tv_series_candidates (virtual_folder_id, series_id);
+
+ANALYZE jellyrin_tv_series_candidates;
+
+CREATE TEMP TABLE jellyrin_tv_series_eligible (
+    id uuid PRIMARY KEY
+) ON COMMIT DROP;
+
+INSERT INTO jellyrin_tv_series_eligible (id)
+SELECT folder.id
+FROM virtual_folders AS folder
+WHERE lower(coalesce(folder.collection_type, '')) = ANY(
+          ARRAY['tvshows', 'tvshow', 'series']::text[]
+      );
+
+DELETE FROM jellyrin_tv_series_eligible AS eligible
+WHERE EXISTS (
+    SELECT 1
+    FROM jellyrin_tv_series_candidates AS candidate
+    WHERE candidate.virtual_folder_id = eligible.id
+      AND (
+          NULLIF(candidate.series_id, '') IS NULL
+          OR candidate.series_id !~ '^[0-9a-f]{32}$'
+          OR NULLIF(candidate.series_name, '') IS NULL
       )
-)
+);
+
+DELETE FROM jellyrin_tv_series_eligible AS eligible
+WHERE EXISTS (
+    SELECT 1
+    FROM jellyrin_tv_series_candidates AS candidate
+    WHERE candidate.virtual_folder_id = eligible.id
+    GROUP BY candidate.series_id
+    HAVING count(DISTINCT candidate.series_name) > 1
+);
+
 INSERT INTO media_item_tv_series (
     virtual_folder_id, series_id, series_name, episode_count
 )
-SELECT item.virtual_folder_id,
-       btrim(item.metadata->>'SeriesId'),
-       min(btrim(item.metadata->>'SeriesName')),
+SELECT candidate.virtual_folder_id,
+       candidate.series_id,
+       min(candidate.series_name),
        count(*)
-FROM media_items AS item
-JOIN eligible ON eligible.id = item.virtual_folder_id
-WHERE item.missing_since IS NULL
-  AND item.media_type = 'Video'
-  AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
-GROUP BY item.virtual_folder_id, btrim(item.metadata->>'SeriesId');
+FROM jellyrin_tv_series_candidates AS candidate
+JOIN jellyrin_tv_series_eligible AS eligible
+  ON eligible.id = candidate.virtual_folder_id
+GROUP BY candidate.virtual_folder_id, candidate.series_id;
 
 INSERT INTO media_item_tv_series_members (item_id, virtual_folder_id, series_id)
-SELECT item.id, item.virtual_folder_id, btrim(item.metadata->>'SeriesId')
-FROM media_items AS item
+SELECT candidate.item_id, candidate.virtual_folder_id, candidate.series_id
+FROM jellyrin_tv_series_candidates AS candidate
 JOIN media_item_tv_series AS series
-  ON series.virtual_folder_id = item.virtual_folder_id
- AND series.series_id = btrim(item.metadata->>'SeriesId')
-WHERE item.missing_since IS NULL
-  AND item.media_type = 'Video'
-  AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[]);
+  ON series.virtual_folder_id = candidate.virtual_folder_id
+ AND series.series_id = candidate.series_id;
 
-WITH eligible AS (
-    SELECT folder.id
-    FROM virtual_folders AS folder
-    WHERE lower(coalesce(folder.collection_type, '')) = ANY(
-              ARRAY['tvshows', 'tvshow', 'series']::text[]
-          )
-      AND NOT EXISTS (
-          SELECT 1
-          FROM media_items AS invalid
-          WHERE invalid.virtual_folder_id = folder.id
-            AND invalid.missing_since IS NULL
-            AND invalid.media_type = 'Video'
-            AND lower(invalid.collection_type) = ANY(
-                  ARRAY['tvshows', 'tvshow', 'series']::text[]
-                )
-            AND (
-                NULLIF(btrim(invalid.metadata->>'SeriesId'), '') IS NULL
-                OR btrim(invalid.metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
-                OR NULLIF(btrim(invalid.metadata->>'SeriesName'), '') IS NULL
-            )
-      )
-      AND NOT EXISTS (
-          SELECT 1
-          FROM media_items AS conflicting
-          WHERE conflicting.virtual_folder_id = folder.id
-            AND conflicting.missing_since IS NULL
-            AND conflicting.media_type = 'Video'
-            AND lower(conflicting.collection_type) = ANY(
-                  ARRAY['tvshows', 'tvshow', 'series']::text[]
-                )
-          GROUP BY btrim(conflicting.metadata->>'SeriesId')
-          HAVING count(DISTINCT btrim(conflicting.metadata->>'SeriesName')) > 1
-      )
-)
 INSERT INTO media_item_tv_series_coverage (
     virtual_folder_id, projection_version, episode_count, series_count
 )
@@ -147,7 +130,7 @@ SELECT eligible.id,
         WHERE member.virtual_folder_id = eligible.id),
        (SELECT count(*) FROM media_item_tv_series AS series
         WHERE series.virtual_folder_id = eligible.id)
-FROM eligible;
+FROM jellyrin_tv_series_eligible AS eligible;
 
 CREATE FUNCTION jellyrin_invalidate_tv_series_after_insert()
 RETURNS trigger
