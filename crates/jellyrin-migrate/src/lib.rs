@@ -335,41 +335,54 @@ async fn open_postgres(target_url: &str) -> anyhow::Result<PgPool> {
 async fn postgres_provider_url_retention_counts(
     target: &mut Transaction<'_, Postgres>,
 ) -> anyhow::Result<ProviderUrlRetentionCounts> {
-    let (remote_source_url_rows, remote_probe_source_url_rows, invalid_remote_probe_rows): (
-        i64,
-        i64,
-        i64,
-    ) = sqlx::query_as(
+    // Keep each full-catalog JSON inspection in its own bounded statement. Combining these
+    // independent scans into one SELECT makes PostgreSQL evaluate all three before returning and
+    // exceeded the fail-closed 10 s statement budget on the 494k-item staging catalogue.
+    let remote_source_url_rows: i64 = sqlx::query_scalar(
         r#"
-            SELECT
-                count(*) FILTER (WHERE EXISTS (
-                    SELECT 1 FROM jsonb_object_keys(metadata) AS key
-                    WHERE lower(key) = lower('RemoteSourceUrl')
-                )),
-                count(*) FILTER (
-                    WHERE EXISTS (
-                        SELECT 1 FROM jsonb_each(metadata) AS probe(key, value)
-                        WHERE lower(probe.key) = lower('RemoteMediaProbe')
-                          AND jsonb_typeof(probe.value) = 'object'
-                          AND EXISTS (
-                              SELECT 1 FROM jsonb_object_keys(probe.value) AS nested_key
-                              WHERE lower(nested_key) = lower('SourceUrl')
-                          )
-                    )
-                ),
-                count(*) FILTER (
-                    WHERE EXISTS (
-                        SELECT 1 FROM jsonb_each(metadata) AS probe(key, value)
-                        WHERE lower(probe.key) = lower('RemoteMediaProbe')
-                          AND jsonb_typeof(probe.value) <> 'object'
-                    )
-                )
+            SELECT count(*)
             FROM media_items
+            WHERE EXISTS (
+                SELECT 1 FROM jsonb_object_keys(metadata) AS key
+                WHERE lower(key) = lower('RemoteSourceUrl')
+            )
             "#,
     )
     .fetch_one(&mut **target)
     .await
     .context("failed to audit PostgreSQL media provider URL retention")?;
+    let remote_probe_source_url_rows: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)
+        FROM media_items
+        WHERE EXISTS (
+            SELECT 1 FROM jsonb_each(metadata) AS probe(key, value)
+            WHERE lower(probe.key) = lower('RemoteMediaProbe')
+              AND jsonb_typeof(probe.value) = 'object'
+              AND EXISTS (
+                  SELECT 1 FROM jsonb_object_keys(probe.value) AS nested_key
+                  WHERE lower(nested_key) = lower('SourceUrl')
+              )
+        )
+        "#,
+    )
+    .fetch_one(&mut **target)
+    .await
+    .context("failed to audit PostgreSQL remote probe URL retention")?;
+    let invalid_remote_probe_rows: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)
+        FROM media_items
+        WHERE EXISTS (
+            SELECT 1 FROM jsonb_each(metadata) AS probe(key, value)
+            WHERE lower(probe.key) = lower('RemoteMediaProbe')
+              AND jsonb_typeof(probe.value) <> 'object'
+        )
+        "#,
+    )
+    .fetch_one(&mut **target)
+    .await
+    .context("failed to audit malformed PostgreSQL remote probes")?;
     let live_tv_stream_url_rows: i64 = sqlx::query_scalar(
         r#"
         SELECT count(*)
