@@ -37,6 +37,7 @@ const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
 const FACET_STAGE_INSERT_CHUNK_SIZE: usize = 2_000;
 const FACET_REBUILD_BATCH_SIZE: i64 = 500;
 pub const MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME: &str = "media_item_query_filter_values";
+const MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION: i32 = 1;
 
 pub const MEDIA_ITEM_FACET_PROJECTION_NAME: &str = "media_item_facets";
 pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 4;
@@ -267,6 +268,13 @@ pub async fn ensure_media_item_query_filter_projection(
     .bind(i64::try_from(projected_value_count).context("query-filter value count overflow")?)
     .execute(&mut **tx)
     .await?;
+    let folder_ids = sqlx::query_scalar::<_, Uuid>("SELECT id FROM virtual_folders ORDER BY id")
+        .fetch_all(&mut **tx)
+        .await?;
+    for folder_id in folder_ids {
+        PostgresDatabase::rebuild_media_item_query_filter_summary_in_transaction(tx, folder_id)
+            .await?;
+    }
     Ok(MediaItemQueryFilterProjectionReport {
         rebuilt: true,
         source_item_count,
@@ -1131,6 +1139,19 @@ impl PostgresDatabase {
             .execute(&mut *transaction)
             .await?;
 
+        if let Some((folder_ids, effective_item_types)) = postgres_query_filter_summary_scope(query)
+            && let Some(values) = Self::media_item_query_filter_values_summary(
+                &folder_ids,
+                &effective_item_types,
+                selection,
+                &mut transaction,
+            )
+            .await?
+        {
+            transaction.commit().await?;
+            return Ok(values);
+        }
+
         let mut coverage = QueryBuilder::<Postgres>::new(
             "WITH selected AS MATERIALIZED (SELECT item.id, item.virtual_folder_id ",
         );
@@ -1198,6 +1219,58 @@ impl PostgresDatabase {
         };
         transaction.commit().await?;
         result
+    }
+
+    async fn media_item_query_filter_values_summary(
+        folder_ids: &[Uuid],
+        effective_item_types: &[String],
+        selection: MediaItemQueryFilterSelection,
+        connection: &mut PgConnection,
+    ) -> anyhow::Result<Option<MediaItemQueryFilterValues>> {
+        let covered = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT count(*) = cardinality($1::uuid[])
+               AND COALESCE(bool_and(projection_version = $2), FALSE)
+            FROM media_item_query_filter_summary_coverage
+            WHERE virtual_folder_id = ANY($1)
+              AND effective_item_type = $3
+            "#,
+        )
+        .bind(folder_ids)
+        .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
+        .bind(&effective_item_types[0])
+        .fetch_one(&mut *connection)
+        .await?;
+        if !covered {
+            return Ok(None);
+        }
+
+        let rows = sqlx::query_as::<_, PostgresQueryFilterValueRow>(
+            r#"
+            WITH ranked AS (
+                SELECT value_kind AS kind, normalized_value, display_value,
+                       row_number() OVER (
+                           PARTITION BY value_kind, normalized_value
+                           ORDER BY winner_item_sort COLLATE "C", winner_item_id,
+                                    winner_source_priority, winner_source_position
+                       ) AS spelling_rank
+                FROM media_item_query_filter_summary_values
+                WHERE virtual_folder_id = ANY($1)
+                  AND effective_item_type = ANY($2)
+                  AND value_kind = ANY($3)
+            )
+            SELECT kind, display_value
+            FROM ranked
+            WHERE spelling_rank = 1
+            ORDER BY kind COLLATE "C", normalized_value COLLATE "C"
+            "#,
+        )
+        .bind(folder_ids)
+        .bind(effective_item_types)
+        .bind(selection.summary_fields())
+        .fetch_all(&mut *connection)
+        .await?;
+        Ok(Some(postgres_query_filter_values_from_rows(rows)?))
     }
 
     async fn media_item_query_filter_values_projected(
@@ -1727,6 +1800,223 @@ impl PostgresDatabase {
             total_record_count: usize::try_from(total)?,
             start_index,
         }))
+    }
+
+    async fn rebuild_media_item_query_filter_summary_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        virtual_folder_id: Uuid,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "DELETE FROM media_item_query_filter_summary_coverage \
+             WHERE virtual_folder_id = $1",
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM media_item_query_filter_summary_values \
+             WHERE virtual_folder_id = $1",
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+
+        let mut multivalue = QueryBuilder::<Postgres>::new(
+            "INSERT INTO media_item_query_filter_summary_values (\
+                 virtual_folder_id, effective_item_type, value_kind, normalized_value, \
+                 display_value, winner_item_sort, winner_item_id, \
+                 winner_source_priority, winner_source_position, contributor_count\
+             ) \
+             SELECT DISTINCT ON (\
+                        item.virtual_folder_id, effective_item_type, value.value_kind, \
+                        lower(btrim(value.display_value))\
+                    ) \
+                    item.virtual_folder_id, (",
+        );
+        multivalue.push(POSTGRES_MEDIA_ITEM_TYPE_SQL).push(
+            ") AS effective_item_type, value.value_kind, \
+             lower(btrim(value.display_value)) AS normalized_value, \
+             value.display_value, lower(item.name), item.id, value.source_priority, \
+             value.source_position, count(*) OVER (\
+                 PARTITION BY item.virtual_folder_id, (",
+        );
+        multivalue.push(POSTGRES_MEDIA_ITEM_TYPE_SQL).push(
+            "), value.value_kind, lower(btrim(value.display_value))\
+             ) \
+             FROM media_items AS item \
+             JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = item.id \
+              AND source.virtual_folder_id = item.virtual_folder_id \
+              AND source.extractor_version = ",
+        );
+        multivalue
+            .push_bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+            .push(
+                " JOIN media_item_query_filter_values AS value \
+                    ON value.item_id = source.item_id \
+                   AND value.virtual_folder_id = source.virtual_folder_id \
+                  WHERE item.virtual_folder_id = ",
+            )
+            .push_bind(virtual_folder_id)
+            .push(" AND item.missing_since IS NULL AND (")
+            .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
+            .push(") = ANY(ARRAY['movie','episode']::text[]) ORDER BY item.virtual_folder_id, ")
+            .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
+            .push(
+                ", value.value_kind, lower(btrim(value.display_value)), \
+                 lower(item.name) COLLATE \"C\", item.id, value.source_priority, \
+                 value.source_position",
+            );
+        multivalue.build().execute(&mut **tx).await?;
+
+        let mut scalars = QueryBuilder::<Postgres>::new(
+            "WITH sources AS MATERIALIZED (\
+             SELECT item.virtual_folder_id, (",
+        );
+        scalars.push(POSTGRES_MEDIA_ITEM_TYPE_SQL).push(
+            ") AS effective_item_type, item.id AS item_id, source.container_present, \
+             source.container_value, source.media_type, source.is_video, \
+             source.has_subtitles, source.has_trailer \
+             FROM media_items AS item \
+             JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = item.id \
+              AND source.virtual_folder_id = item.virtual_folder_id \
+              AND source.extractor_version = ",
+        );
+        scalars
+            .push_bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+            .push(" WHERE item.virtual_folder_id = ")
+            .push_bind(virtual_folder_id)
+            .push(" AND item.missing_since IS NULL AND (")
+            .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
+            .push(
+                ") = ANY(ARRAY['movie','episode']::text[])\
+             ), scalar_values AS (\
+             SELECT virtual_folder_id, effective_item_type, 'containers' AS value_kind, \
+                    lower(container_value) AS normalized_value, \
+                    lower(container_value) AS display_value, \
+                    min(item_id::text)::uuid AS winner_item_id, \
+                    count(*) AS contributor_count \
+             FROM sources WHERE container_present \
+             GROUP BY virtual_folder_id, effective_item_type, lower(container_value) \
+             UNION ALL \
+             SELECT virtual_folder_id, effective_item_type, 'media_types', media_type, \
+                    media_type, min(item_id::text)::uuid, count(*) \
+             FROM sources \
+             GROUP BY virtual_folder_id, effective_item_type, media_type \
+             UNION ALL \
+             SELECT virtual_folder_id, effective_item_type, 'video_types', 'videofile', \
+                    'VideoFile', min(item_id::text)::uuid, count(*) \
+             FROM sources WHERE is_video \
+             GROUP BY virtual_folder_id, effective_item_type \
+             UNION ALL \
+             SELECT virtual_folder_id, effective_item_type, 'has_subtitles', 'true', \
+                    'true', min(item_id::text)::uuid, count(*) \
+             FROM sources WHERE has_subtitles \
+             GROUP BY virtual_folder_id, effective_item_type \
+             UNION ALL \
+             SELECT virtual_folder_id, effective_item_type, 'has_trailer', 'true', \
+                    'true', min(item_id::text)::uuid, count(*) \
+             FROM sources WHERE has_trailer \
+             GROUP BY virtual_folder_id, effective_item_type\
+             ) \
+             INSERT INTO media_item_query_filter_summary_values (\
+                 virtual_folder_id, effective_item_type, value_kind, normalized_value, \
+                 display_value, winner_item_sort, winner_item_id, \
+                 winner_source_priority, winner_source_position, contributor_count\
+             ) \
+             SELECT virtual_folder_id, effective_item_type, value_kind, normalized_value, \
+                    display_value, '', winner_item_id, 0, '', contributor_count \
+             FROM scalar_values",
+            );
+        scalars.build().execute(&mut **tx).await?;
+
+        let mut coverage = QueryBuilder::<Postgres>::new(
+            "WITH folder_type AS (\
+             SELECT CASE \
+                      WHEN lower(folder.collection_type) = 'movies' THEN 'movie' \
+                      WHEN lower(folder.collection_type) = ANY(\
+                           ARRAY['tvshows','tvshow','series']::text[]) THEN 'episode' \
+                    END AS effective_item_type \
+             FROM virtual_folders AS folder \
+             WHERE folder.id = ",
+        );
+        coverage
+            .push_bind(virtual_folder_id)
+            .push(
+                " AND lower(folder.collection_type) = ANY(\
+                       ARRAY['movies','tvshows','tvshow','series']::text[])\
+             ), value_counts AS MATERIALIZED (\
+             SELECT value.item_id, count(*) AS actual_value_count \
+             FROM media_item_query_filter_values AS value \
+             WHERE value.virtual_folder_id = ",
+            )
+            .push_bind(virtual_folder_id)
+            .push(
+                " GROUP BY value.item_id\
+             ), source_items AS MATERIALIZED (\
+             SELECT item.id, source.item_id AS source_item_id, source.extractor_version, \
+                    source.projected_value_count, \
+                    COALESCE(value_counts.actual_value_count, 0) AS actual_value_count \
+             FROM media_items AS item \
+             CROSS JOIN folder_type \
+             LEFT JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = item.id \
+              AND source.virtual_folder_id = item.virtual_folder_id \
+             LEFT JOIN value_counts ON value_counts.item_id = item.id \
+             WHERE item.virtual_folder_id = ",
+            )
+            .push_bind(virtual_folder_id)
+            .push(" AND item.missing_since IS NULL AND (")
+            .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
+            .push(
+                ") = folder_type.effective_item_type\
+             ), source_stats AS (\
+             SELECT count(*) AS item_count, count(source_item_id) AS source_count, \
+                    COALESCE(sum(projected_value_count), 0) AS contribution_count, \
+                    COALESCE(bool_and(extractor_version = ",
+            )
+            .push_bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+            .push(
+                " AND projected_value_count = actual_value_count), TRUE) AS complete \
+             FROM source_items\
+             ) \
+             INSERT INTO media_item_query_filter_summary_coverage (\
+                 virtual_folder_id, effective_item_type, projection_version, source_item_count, \
+                 source_contribution_count, summary_value_count, completed_at\
+             ) \
+             SELECT ",
+            )
+            .push_bind(virtual_folder_id)
+            .push(", folder_type.effective_item_type, ")
+            .push_bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
+            .push(
+                ", source_stats.source_count, source_stats.contribution_count, \
+                 (SELECT count(*) FROM media_item_query_filter_summary_values \
+                  WHERE virtual_folder_id = ",
+            )
+            .push_bind(virtual_folder_id)
+            .push(
+                " AND effective_item_type = folder_type.effective_item_type), CURRENT_TIMESTAMP \
+             FROM folder_type, source_stats \
+             WHERE source_stats.complete \
+               AND source_stats.source_count = source_stats.item_count \
+               AND COALESCE((\
+                   SELECT sum(summary.contributor_count) \
+                   FROM media_item_query_filter_summary_values AS summary \
+                   WHERE summary.virtual_folder_id = ",
+            );
+        coverage.push_bind(virtual_folder_id).push(
+            " AND summary.effective_item_type = folder_type.effective_item_type \
+                     AND summary.value_kind = ANY(ARRAY[\
+                         'albums','artists','audio_languages','genres','official_ratings',\
+                         'series_statuses','staff_names','studios','subtitle_languages',\
+                         'tags','years'\
+                     ]::text[])\
+               ), 0) = source_stats.contribution_count",
+        );
+        coverage.build().execute(&mut **tx).await?;
+        Ok(())
     }
 
     async fn rebuild_tv_series_catalog_projection_in_transaction(
@@ -4111,6 +4401,18 @@ impl PostgresDatabase {
             !incomplete,
             "query-filter projection publication coverage mismatch"
         );
+        let summary_current = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+             SELECT 1 FROM media_item_query_filter_summary_coverage \
+             WHERE virtual_folder_id = $1 AND projection_version = $2)",
+        )
+        .bind(folder_id)
+        .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !summary_current {
+            Self::rebuild_media_item_query_filter_summary_in_transaction(tx, folder_id).await?;
+        }
         Self::rebuild_tv_series_catalog_projection_in_transaction(tx, folder_id).await?;
 
         sqlx::query(
@@ -4577,6 +4879,72 @@ const POSTGRES_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
     WHEN item.media_type = 'Book' THEN 'book'
     ELSE 'baseitem'
 END"#;
+
+/// Return the exact summary domain for the common Jellyfin filter shape.
+///
+/// The summary currently covers remote Movie and Episode libraries. Every additional predicate
+/// must keep using the item-level projection so a cache-like optimization can never broaden the
+/// selected set. A user id alone is harmless because playback state is not consulted unless one
+/// of the user-state predicates below is active.
+fn postgres_query_filter_summary_scope(
+    query: &MediaItemCatalogQuery,
+) -> Option<(Vec<Uuid>, Vec<String>)> {
+    if query.virtual_folder_ids.len() != 1
+        || !query.ids.is_empty()
+        || !query.exclude_item_types.is_empty()
+        || !query.collection_types.is_empty()
+        || !query.media_types.is_empty()
+        || !query.containers.is_empty()
+        || !query.video_types.is_empty()
+        || !query.audio_languages.is_empty()
+        || !query.subtitle_languages.is_empty()
+        || !query.genre_ids.is_empty()
+        || !query.person_ids.is_empty()
+        || !query.studio_ids.is_empty()
+        || !query.tags.is_empty()
+        || !query.location_types.is_empty()
+        || !query.exclude_location_types.is_empty()
+        || query.search_term.is_some()
+        || query.has_subtitles.is_some()
+        || query.is_hd.is_some()
+        || query.is_4k.is_some()
+        || query.min_width.is_some()
+        || query.max_width.is_some()
+        || query.min_height.is_some()
+        || query.max_height.is_some()
+        || query.is_missing.is_some()
+        || query.is_unaired.is_some()
+        || query.is_folder.is_some()
+        || query.min_date_created.is_some()
+        || query.max_date_created.is_some()
+        || query.min_date_last_saved.is_some()
+        || query.max_date_last_saved.is_some()
+        || query.name_starts_with.is_some()
+        || query.name_starts_with_or_greater.is_some()
+        || query.name_less_than.is_some()
+        || query.is_played.is_some()
+        || query.favorite.is_some()
+        || query.is_resumable
+    {
+        return None;
+    }
+
+    let mut effective_item_types = normalized_catalog_values(&query.include_item_types);
+    effective_item_types.sort_unstable();
+    effective_item_types.dedup();
+    if effective_item_types.len() != 1
+        || effective_item_types
+            .iter()
+            .any(|item_type| item_type != "movie" && item_type != "episode")
+    {
+        return None;
+    }
+
+    let mut folder_ids = query.virtual_folder_ids.clone();
+    folder_ids.sort_unstable();
+    folder_ids.dedup();
+    Some((folder_ids, effective_item_types))
+}
 
 fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &MediaItemCatalogQuery) {
     let selector_groups = normalized_postgres_filter_selector_groups(query);
@@ -6221,6 +6589,7 @@ mod tests {
 
             let query = MediaItemCatalogQuery {
                 limit: 0,
+                virtual_folder_ids: vec![movie_folder.id],
                 include_item_types: vec!["Movie".to_string()],
                 ..MediaItemCatalogQuery::default()
             };
@@ -7551,6 +7920,19 @@ mod tests {
             assert!(values.has_trailer);
             assert!(!format!("{values:?}").contains("Must Not Leak"));
             assert!(!format!("{values:?}").contains("Wrong Genre"));
+            let summary_coverage: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1 \
+                   AND effective_item_type = 'movie' \
+                   AND projection_version = $2",
+            )
+            .bind(target_folder.id)
+            .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
+            .fetch_one(&test.database.pool)
+            .await?;
+            // Conflicting display spellings keep the exact item-order winner in the summary;
+            // they must not disable acceleration for the whole folder.
+            assert_eq!(summary_coverage, 1);
 
             let filters2_values = test
                 .database
@@ -7571,10 +7953,183 @@ mod tests {
             assert!(!filters2_values.has_subtitles);
             assert!(!filters2_values.has_trailer);
 
+            let summary_item_id = Uuid::new_v4();
+            let summary_folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Summary Filters",
+                    "movies",
+                    "provider://summary-filters",
+                    vec![remote_item(
+                        summary_item_id,
+                        "Summary Movie",
+                        "provider://summary-filters/movie.mkv",
+                        "Video",
+                        "movies",
+                        json!({ "Genres": ["Summary Genre"], "Tags": ["Summary Tag"] }),
+                    )],
+                )
+                .await?;
+            let summary_query = MediaItemCatalogQuery {
+                limit: 0,
+                virtual_folder_ids: vec![summary_folder.id],
+                include_item_types: vec!["Movie".to_string()],
+                ..MediaItemCatalogQuery::default()
+            };
+            let summary_result = test
+                .database
+                .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(summary_result.genres, ["Summary Genre"]);
+            let fast_coverage: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1 AND effective_item_type = 'movie'",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(fast_coverage, 1);
+
+            sqlx::query(
+                "DELETE FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(summary_folder.id)
+            .execute(&test.database.pool)
+            .await?;
+            let projected_result = test
+                .database
+                .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(summary_result, projected_result);
+
+            // Restore coverage with an unchanged publication first, so the next changed
+            // publication proves that an existing current marker cannot hide stale values.
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Summary Filters",
+                    "movies",
+                    "provider://summary-filters",
+                    vec![remote_item(
+                        summary_item_id,
+                        "Summary Movie",
+                        "provider://summary-filters/movie.mkv",
+                        "Video",
+                        "movies",
+                        json!({ "Genres": ["Summary Genre"], "Tags": ["Summary Tag"] }),
+                    )],
+                )
+                .await?;
+            let restored_coverage: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1 AND effective_item_type = 'movie'",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(restored_coverage, 1);
+
+            // A publication with changed metadata must invalidate and atomically rebuild an
+            // already-covered summary. Otherwise the fast path could return stale filters.
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Summary Filters",
+                    "movies",
+                    "provider://summary-filters",
+                    vec![remote_item(
+                        summary_item_id,
+                        "Summary Movie",
+                        "provider://summary-filters/movie.mkv",
+                        "Video",
+                        "movies",
+                        json!({ "Genres": ["Updated Genre"], "Tags": ["Updated Tag"] }),
+                    )],
+                )
+                .await?;
+            let updated_summary = test
+                .database
+                .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(updated_summary.genres, ["Updated Genre"]);
+            assert_eq!(updated_summary.tags, ["Updated Tag"]);
+            let rebuilt_coverage: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1 AND effective_item_type = 'movie'",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(rebuilt_coverage, 1);
+
+            let tombstone_id = Uuid::new_v4();
+            let updated_item = || {
+                remote_item(
+                    summary_item_id,
+                    "Summary Movie",
+                    "provider://summary-filters/movie.mkv",
+                    "Video",
+                    "movies",
+                    json!({ "Genres": ["Updated Genre"], "Tags": ["Updated Tag"] }),
+                )
+            };
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Summary Filters",
+                    "movies",
+                    "provider://summary-filters",
+                    vec![
+                        updated_item(),
+                        remote_item(
+                            tombstone_id,
+                            "Removed Movie",
+                            "provider://summary-filters/removed.mkv",
+                            "Video",
+                            "movies",
+                            json!({ "Genres": ["Removed Genre"] }),
+                        ),
+                    ],
+                )
+                .await?;
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Summary Filters",
+                    "movies",
+                    "provider://summary-filters",
+                    vec![updated_item()],
+                )
+                .await?;
+            sqlx::query("DELETE FROM media_item_query_filter_sources WHERE item_id = $1")
+                .bind(summary_item_id)
+                .execute(&test.database.pool)
+                .await?;
+            let mut corrupted_tx = test.database.worker_pool.begin().await?;
+            PostgresDatabase::rebuild_media_item_query_filter_summary_in_transaction(
+                &mut corrupted_tx,
+                summary_folder.id,
+            )
+            .await?;
+            corrupted_tx.commit().await?;
+            let compensated_coverage: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(compensated_coverage, 0);
+
             sqlx::query("DELETE FROM media_item_query_filter_sources WHERE item_id = $1")
                 .bind(target_id)
                 .execute(&test.database.pool)
                 .await?;
+            let invalidated_coverage: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(target_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(invalidated_coverage, 0);
             let legacy_fallback = test
                 .database
                 .media_item_query_filter_values(&filter_query, MediaItemQueryFilterSelection::ALL)

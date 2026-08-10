@@ -262,6 +262,20 @@ impl MediaItemQueryFilterSelection {
         .filter(|field| self.includes_field(field))
         .collect()
     }
+
+    pub(crate) fn summary_fields(self) -> Vec<&'static str> {
+        let mut fields = self.projected_fields();
+        if self.includes_scalars() {
+            fields.extend([
+                "containers",
+                "media_types",
+                "video_types",
+                "has_subtitles",
+                "has_trailer",
+            ]);
+        }
+        fields
+    }
 }
 
 impl MediaItemQueryFilterValues {
