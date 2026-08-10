@@ -63,6 +63,22 @@ pub struct MediaItemQueryFilterProjectionReport {
     pub projected_value_count: u64,
 }
 
+#[derive(Debug)]
+struct MediaItemQueryFilterSummaryPointContext {
+    folder_id: Uuid,
+    effective_item_type: String,
+    item_sort: String,
+    old_projection: MediaItemQueryFilterProjection,
+    coverage: Option<MediaItemQueryFilterSummaryCoverage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MediaItemQueryFilterSummaryCoverage {
+    source_item_count: i64,
+    source_contribution_count: i64,
+    source_revision: i64,
+}
+
 pub async fn ensure_media_item_query_filter_projection(
     tx: &mut Transaction<'_, Postgres>,
     mode: MediaItemFacetProjectionMode,
@@ -1230,10 +1246,16 @@ impl PostgresDatabase {
         let covered = sqlx::query_scalar::<_, bool>(
             r#"
             SELECT count(*) = cardinality($1::uuid[])
-               AND COALESCE(bool_and(projection_version = $2), FALSE)
-            FROM media_item_query_filter_summary_coverage
-            WHERE virtual_folder_id = ANY($1)
-              AND effective_item_type = $3
+               AND COALESCE(bool_and(
+                       coverage.projection_version = $2
+                       AND coverage.source_revision = revision.source_revision
+                       AND revision.reconciled_revision = revision.source_revision
+                   ), FALSE)
+            FROM media_item_query_filter_summary_coverage AS coverage
+            JOIN media_item_query_filter_summary_revisions AS revision
+              ON revision.virtual_folder_id = coverage.virtual_folder_id
+            WHERE coverage.virtual_folder_id = ANY($1)
+              AND coverage.effective_item_type = $3
             "#,
         )
         .bind(folder_ids)
@@ -1806,6 +1828,37 @@ impl PostgresDatabase {
         tx: &mut Transaction<'_, Postgres>,
         virtual_folder_id: Uuid,
     ) -> anyhow::Result<()> {
+        Self::lock_media_item_query_filter_summary_in_transaction(tx, virtual_folder_id).await?;
+        sqlx::query(
+            "INSERT INTO media_item_query_filter_summary_revisions (\
+                 virtual_folder_id, source_revision, reconciled_revision, dirty_at, updated_at\
+             ) VALUES ($1, 1, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+             ON CONFLICT (virtual_folder_id) DO NOTHING",
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        let source_revision = sqlx::query_scalar::<_, i64>(
+            "SELECT source_revision \
+             FROM media_item_query_filter_summary_revisions \
+             WHERE virtual_folder_id = $1 FOR UPDATE",
+        )
+        .bind(virtual_folder_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE media_item_query_filter_summary_revisions \
+             SET reconciled_revision = NULL, \
+                 dirty_at = COALESCE(dirty_at, CURRENT_TIMESTAMP), \
+                 updated_at = CURRENT_TIMESTAMP \
+             WHERE virtual_folder_id = $1",
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("SET LOCAL jellyrin.query_filter_summary_rebuild = 'on'")
+            .execute(&mut **tx)
+            .await?;
         sqlx::query(
             "DELETE FROM media_item_query_filter_summary_coverage \
              WHERE virtual_folder_id = $1",
@@ -1983,7 +2036,7 @@ impl PostgresDatabase {
              ) \
              INSERT INTO media_item_query_filter_summary_coverage (\
                  virtual_folder_id, effective_item_type, projection_version, source_item_count, \
-                 source_contribution_count, summary_value_count, completed_at\
+                 source_contribution_count, summary_value_count, completed_at, source_revision\
              ) \
              SELECT ",
             )
@@ -1997,7 +2050,11 @@ impl PostgresDatabase {
             )
             .push_bind(virtual_folder_id)
             .push(
-                " AND effective_item_type = folder_type.effective_item_type), CURRENT_TIMESTAMP \
+                " AND effective_item_type = folder_type.effective_item_type), CURRENT_TIMESTAMP, ",
+            )
+            .push_bind(source_revision)
+            .push(
+                " \
              FROM folder_type, source_stats \
              WHERE source_stats.complete \
                AND source_stats.source_count = source_stats.item_count \
@@ -2015,7 +2072,378 @@ impl PostgresDatabase {
                      ]::text[])\
                ), 0) = source_stats.contribution_count",
         );
-        coverage.build().execute(&mut **tx).await?;
+        let published = coverage.build().execute(&mut **tx).await?.rows_affected() == 1;
+        if published {
+            let reconciled = sqlx::query(
+                "UPDATE media_item_query_filter_summary_revisions \
+                 SET reconciled_revision = $2, dirty_at = NULL, updated_at = CURRENT_TIMESTAMP \
+                 WHERE virtual_folder_id = $1 AND source_revision = $2",
+            )
+            .bind(virtual_folder_id)
+            .bind(source_revision)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected()
+                == 1;
+            if !reconciled {
+                sqlx::query(
+                    "DELETE FROM media_item_query_filter_summary_coverage \
+                     WHERE virtual_folder_id = $1",
+                )
+                .bind(virtual_folder_id)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn lock_media_item_query_filter_summary_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        virtual_folder_id: Uuid,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended(\
+                 'jellyrin-query-filter-summary:' || $1::text, 0))",
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn begin_media_item_query_filter_summary_point_update(
+        tx: &mut Transaction<'_, Postgres>,
+        item_id: Uuid,
+    ) -> anyhow::Result<MediaItemQueryFilterSummaryPointContext> {
+        let locked_folder_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT virtual_folder_id FROM media_items WHERE id = $1",
+        )
+        .bind(item_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        Self::lock_media_item_query_filter_summary_in_transaction(tx, locked_folder_id).await?;
+
+        let mut item = QueryBuilder::<Postgres>::new("SELECT item.virtual_folder_id, (");
+        item.push(POSTGRES_MEDIA_ITEM_TYPE_SQL).push(
+            ")::text, lower(item.name) COLLATE \"C\", item.path, item.media_type, \
+             item.media_streams, item.metadata \
+             FROM media_items AS item WHERE item.id = ",
+        );
+        item.push_bind(item_id).push(" FOR UPDATE");
+        let (folder_id, effective_item_type, item_sort, path, media_type, streams, metadata) = item
+            .build_query_as::<(Uuid, String, String, String, String, Value, Value)>()
+            .fetch_one(&mut **tx)
+            .await?;
+        anyhow::ensure!(
+            folder_id == locked_folder_id,
+            "media item moved while acquiring query-filter summary lock"
+        );
+        let stream_values = streams.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        let old_projection =
+            extract_media_item_query_filter_projection(MediaItemQueryFilterProjectionSource {
+                path: &path,
+                media_type: &media_type,
+                media_streams: stream_values,
+                metadata: &metadata,
+            });
+        let coverage = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT coverage.source_item_count, coverage.source_contribution_count, \
+                    coverage.source_revision \
+             FROM media_item_query_filter_summary_coverage AS coverage \
+             JOIN media_item_query_filter_summary_revisions AS revision \
+               ON revision.virtual_folder_id = coverage.virtual_folder_id \
+              AND revision.source_revision = coverage.source_revision \
+              AND revision.reconciled_revision = revision.source_revision \
+             WHERE coverage.virtual_folder_id = $1 \
+               AND coverage.effective_item_type = $2 \
+               AND coverage.projection_version = $3",
+        )
+        .bind(folder_id)
+        .bind(&effective_item_type)
+        .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(
+            |(source_item_count, source_contribution_count, source_revision)| {
+                MediaItemQueryFilterSummaryCoverage {
+                    source_item_count,
+                    source_contribution_count,
+                    source_revision,
+                }
+            },
+        );
+        sqlx::query("SET LOCAL jellyrin.query_filter_summary_source_patch = 'on'")
+            .execute(&mut **tx)
+            .await?;
+        Ok(MediaItemQueryFilterSummaryPointContext {
+            folder_id,
+            effective_item_type,
+            item_sort,
+            old_projection,
+            coverage,
+        })
+    }
+
+    async fn reconcile_media_item_query_filter_summary_point_update(
+        tx: &mut Transaction<'_, Postgres>,
+        item_id: Uuid,
+        context: MediaItemQueryFilterSummaryPointContext,
+        projection: &MediaItemQueryFilterProjection,
+    ) -> anyhow::Result<()> {
+        let Some(coverage) = context.coverage else {
+            return Ok(());
+        };
+        let current_revision = sqlx::query_scalar::<_, i64>(
+            "SELECT source_revision FROM media_item_query_filter_summary_revisions \
+             WHERE virtual_folder_id = $1 FOR UPDATE",
+        )
+        .bind(context.folder_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if current_revision != coverage.source_revision {
+            Self::rebuild_media_item_query_filter_summary_in_transaction(tx, context.folder_id)
+                .await?;
+            return Ok(());
+        }
+        let source_revision = current_revision
+            .checked_add(1)
+            .context("query-filter source revision overflow")?;
+        let revision_bumped = sqlx::query(
+            "UPDATE media_item_query_filter_summary_revisions \
+             SET source_revision = $2, reconciled_revision = NULL, \
+                 dirty_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+             WHERE virtual_folder_id = $1 AND source_revision = $3",
+        )
+        .bind(context.folder_id)
+        .bind(source_revision)
+        .bind(current_revision)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+            == 1;
+        anyhow::ensure!(revision_bumped, "query-filter source revision changed");
+        sqlx::query(
+            "DELETE FROM media_item_query_filter_summary_coverage \
+             WHERE virtual_folder_id = $1",
+        )
+        .bind(context.folder_id)
+        .execute(&mut **tx)
+        .await?;
+        let mut affected_values = context
+            .old_projection
+            .values
+            .iter()
+            .chain(&projection.values)
+            .map(|value| (value.kind.as_str().to_owned(), value.display_value.clone()))
+            .collect::<Vec<_>>();
+        affected_values.sort_unstable();
+        affected_values.dedup();
+
+        sqlx::query("SET LOCAL jellyrin.query_filter_summary_rebuild = 'on'")
+            .execute(&mut **tx)
+            .await?;
+        if !affected_values.is_empty() {
+            let kinds = affected_values
+                .iter()
+                .map(|(kind, _)| kind.clone())
+                .collect::<Vec<_>>();
+            let values = affected_values
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>();
+            sqlx::query(
+                "DELETE FROM media_item_query_filter_summary_values AS summary \
+                 USING unnest($3::text[], $4::text[]) AS affected(value_kind, display_value) \
+                 WHERE summary.virtual_folder_id = $1 \
+                   AND summary.effective_item_type = $2 \
+                   AND summary.value_kind = affected.value_kind \
+                   AND summary.normalized_value = lower(btrim(affected.display_value))",
+            )
+            .bind(context.folder_id)
+            .bind(&context.effective_item_type)
+            .bind(&kinds)
+            .bind(&values)
+            .execute(&mut **tx)
+            .await?;
+
+            let mut rebuild = QueryBuilder::<Postgres>::new(
+                "INSERT INTO media_item_query_filter_summary_values (\
+                     virtual_folder_id, effective_item_type, value_kind, normalized_value, \
+                     display_value, winner_item_sort, winner_item_id, \
+                     winner_source_priority, winner_source_position, contributor_count\
+                 ) SELECT DISTINCT ON (value.value_kind, lower(btrim(value.display_value))) \
+                     item.virtual_folder_id, (",
+            );
+            rebuild.push(POSTGRES_MEDIA_ITEM_TYPE_SQL).push(
+                ") AS effective_item_type, value.value_kind, \
+                 lower(btrim(value.display_value)), value.display_value, lower(item.name), \
+                 item.id, value.source_priority, value.source_position, \
+                 count(*) OVER (PARTITION BY value.value_kind, lower(btrim(value.display_value))) \
+                 FROM media_items AS item \
+                 JOIN media_item_query_filter_sources AS source \
+                   ON source.item_id = item.id \
+                  AND source.virtual_folder_id = item.virtual_folder_id \
+                  AND source.extractor_version = ",
+            );
+            rebuild
+                .push_bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+                .push(
+                    " JOIN media_item_query_filter_values AS value \
+                        ON value.item_id = source.item_id \
+                       AND value.virtual_folder_id = source.virtual_folder_id \
+                       JOIN (SELECT DISTINCT affected_kind AS value_kind, \
+                                             lower(btrim(affected_display)) AS normalized_value \
+                             FROM unnest(",
+                )
+                .push_bind(kinds)
+                .push("::text[], ")
+                .push_bind(values)
+                .push(
+                    "::text[]) AS raw_affected(affected_kind, affected_display) \
+                       ) AS affected \
+                       ON affected.value_kind = value.value_kind \
+                      AND affected.normalized_value = lower(btrim(value.display_value)) \
+                     WHERE item.virtual_folder_id = ",
+                )
+                .push_bind(context.folder_id)
+                .push(" AND item.missing_since IS NULL AND (")
+                .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
+                .push(") = ")
+                .push_bind(&context.effective_item_type)
+                .push(
+                    " ORDER BY value.value_kind, lower(btrim(value.display_value)), \
+                       lower(item.name) COLLATE \"C\", item.id, value.source_priority, \
+                       value.source_position",
+                );
+            rebuild.build().execute(&mut **tx).await?;
+        }
+
+        let (old_container, new_container) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT CASE WHEN $1 THEN lower(COALESCE($2, '')) END, \
+                    CASE WHEN $3 THEN lower(COALESCE($4, '')) END",
+        )
+        .bind(context.old_projection.features.container_present)
+        .bind(context.old_projection.features.container.as_deref())
+        .bind(projection.features.container_present)
+        .bind(projection.features.container.as_deref())
+        .fetch_one(&mut **tx)
+        .await?;
+        let old_scalars = postgres_query_filter_scalar_memberships(
+            &context.old_projection,
+            old_container.as_deref(),
+        );
+        let new_scalars =
+            postgres_query_filter_scalar_memberships(projection, new_container.as_deref());
+        for (kind, normalized, _) in old_scalars.difference(&new_scalars) {
+            sqlx::query(
+                "DELETE FROM media_item_query_filter_summary_values \
+                 WHERE virtual_folder_id = $1 AND effective_item_type = $2 \
+                   AND value_kind = $3 AND normalized_value = $4 \
+                   AND contributor_count = 1",
+            )
+            .bind(context.folder_id)
+            .bind(&context.effective_item_type)
+            .bind(kind)
+            .bind(normalized)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "UPDATE media_item_query_filter_summary_values \
+                 SET contributor_count = contributor_count - 1 \
+                 WHERE virtual_folder_id = $1 AND effective_item_type = $2 \
+                   AND value_kind = $3 AND normalized_value = $4 \
+                   AND contributor_count > 1",
+            )
+            .bind(context.folder_id)
+            .bind(&context.effective_item_type)
+            .bind(kind)
+            .bind(normalized)
+            .execute(&mut **tx)
+            .await?;
+        }
+        for (kind, normalized, display) in new_scalars.difference(&old_scalars) {
+            sqlx::query(
+                "INSERT INTO media_item_query_filter_summary_values (\
+                     virtual_folder_id, effective_item_type, value_kind, normalized_value, \
+                     display_value, winner_item_sort, winner_item_id, \
+                     winner_source_priority, winner_source_position, contributor_count\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, '', 1) \
+                 ON CONFLICT (virtual_folder_id, effective_item_type, value_kind, normalized_value) \
+                 DO UPDATE SET contributor_count = \
+                     media_item_query_filter_summary_values.contributor_count + 1",
+            )
+            .bind(context.folder_id)
+            .bind(&context.effective_item_type)
+            .bind(kind)
+            .bind(normalized)
+            .bind(display)
+            .bind(&context.item_sort)
+            .bind(item_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        let old_count = i64::try_from(context.old_projection.values.len())?;
+        let new_count = i64::try_from(projection.values.len())?;
+        let source_contribution_count = coverage
+            .source_contribution_count
+            .checked_sub(old_count)
+            .and_then(|count| count.checked_add(new_count))
+            .context("query-filter contribution count overflow")?;
+        let actual_contribution_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(sum(summary.contributor_count), 0)::bigint \
+             FROM media_item_query_filter_summary_values AS summary \
+             WHERE summary.virtual_folder_id = $1 \
+               AND summary.effective_item_type = $2 \
+               AND summary.value_kind = ANY(ARRAY[\
+                   'albums','artists','audio_languages','genres','official_ratings',\
+                   'series_statuses','staff_names','studios','subtitle_languages',\
+                   'tags','years'\
+               ]::text[])",
+        )
+        .bind(context.folder_id)
+        .bind(&context.effective_item_type)
+        .fetch_one(&mut **tx)
+        .await?;
+        if actual_contribution_count != source_contribution_count {
+            Self::rebuild_media_item_query_filter_summary_in_transaction(tx, context.folder_id)
+                .await?;
+            return Ok(());
+        }
+        let summary_value_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_item_query_filter_summary_values \
+             WHERE virtual_folder_id = $1 AND effective_item_type = $2",
+        )
+        .bind(context.folder_id)
+        .bind(&context.effective_item_type)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_query_filter_summary_coverage (\
+                 virtual_folder_id, effective_item_type, projection_version, \
+                 source_item_count, source_contribution_count, summary_value_count, \
+                 completed_at, source_revision\
+             ) VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, $7)",
+        )
+        .bind(context.folder_id)
+        .bind(&context.effective_item_type)
+        .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
+        .bind(coverage.source_item_count)
+        .bind(source_contribution_count)
+        .bind(summary_value_count)
+        .bind(source_revision)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE media_item_query_filter_summary_revisions \
+             SET reconciled_revision = $2, dirty_at = NULL, updated_at = CURRENT_TIMESTAMP \
+             WHERE virtual_folder_id = $1 AND source_revision = $2",
+        )
+        .bind(context.folder_id)
+        .bind(source_revision)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 
@@ -3617,6 +4045,7 @@ impl PostgresDatabase {
         .fetch_one(&mut **tx)
         .await?;
         let folder_id = folder_row.id;
+        Self::lock_media_item_query_filter_summary_in_transaction(tx, folder_id).await?;
         let sync_run_id = Uuid::new_v4();
         let generation_id = Uuid::new_v4();
         let sync_started_at = OffsetDateTime::now_utc();
@@ -4403,8 +4832,14 @@ impl PostgresDatabase {
         );
         let summary_current = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (\
-             SELECT 1 FROM media_item_query_filter_summary_coverage \
-             WHERE virtual_folder_id = $1 AND projection_version = $2)",
+             SELECT 1 \
+             FROM media_item_query_filter_summary_coverage AS coverage \
+             JOIN media_item_query_filter_summary_revisions AS revision \
+               ON revision.virtual_folder_id = coverage.virtual_folder_id \
+              AND revision.source_revision = coverage.source_revision \
+              AND revision.reconciled_revision = revision.source_revision \
+             WHERE coverage.virtual_folder_id = $1 \
+               AND coverage.projection_version = $2)",
         )
         .bind(folder_id)
         .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
@@ -4716,12 +5151,16 @@ impl PostgresDatabase {
         media_streams: Vec<Value>,
     ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
+        let summary =
+            Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
         let result = sqlx::query(
             r#"
             UPDATE media_items
             SET runtime_ticks = $2, bitrate = $3, width = $4, height = $5,
                 media_streams = $6
             WHERE id = $1
+              AND ROW(runtime_ticks, bitrate, width, height, media_streams)
+                  IS DISTINCT FROM ROW($2, $3, $4, $5, $6)
             "#,
         )
         .bind(item_id)
@@ -4732,8 +5171,19 @@ impl PostgresDatabase {
         .bind(serde_json::to_value(media_streams)?)
         .execute(&mut *tx)
         .await?;
-        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
-        replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let projection =
+            replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
+        Self::reconcile_media_item_query_filter_summary_point_update(
+            &mut tx,
+            item_id,
+            summary,
+            &projection,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -4744,11 +5194,14 @@ impl PostgresDatabase {
         metadata: Value,
     ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
+        let summary =
+            Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
         let result = sqlx::query(
             r#"
             UPDATE media_items
             SET metadata = $2, updated_at = $3
             WHERE id = $1
+              AND metadata IS DISTINCT FROM $2
             "#,
         )
         .bind(item_id)
@@ -4756,9 +5209,20 @@ impl PostgresDatabase {
         .bind(OffsetDateTime::now_utc())
         .execute(&mut *tx)
         .await?;
-        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
         replace_postgres_media_item_facets(&mut tx, item_id, &metadata).await?;
-        replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
+        let projection =
+            replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
+        Self::reconcile_media_item_query_filter_summary_point_update(
+            &mut tx,
+            item_id,
+            summary,
+            &projection,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -4770,11 +5234,14 @@ impl PostgresDatabase {
     ) -> anyhow::Result<()> {
         let item_id = Uuid::parse_str(item_id).context("invalid media item id")?;
         let mut tx = self.pool.begin().await?;
+        let summary =
+            Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
         let result = sqlx::query(
             r#"
             UPDATE media_items
             SET metadata = $2, updated_at = $3
             WHERE id = $1
+              AND metadata IS DISTINCT FROM $2
             "#,
         )
         .bind(item_id)
@@ -4782,9 +5249,20 @@ impl PostgresDatabase {
         .bind(OffsetDateTime::now_utc())
         .execute(&mut *tx)
         .await?;
-        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
         replace_postgres_media_item_facets(&mut tx, item_id, metadata).await?;
-        replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
+        let projection =
+            replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
+        Self::reconcile_media_item_query_filter_summary_point_update(
+            &mut tx,
+            item_id,
+            summary,
+            &projection,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5924,7 +6402,7 @@ pub(super) async fn replace_postgres_media_item_query_filter_projection(
 async fn replace_postgres_media_item_query_filter_projection_from_live(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     item_id: Uuid,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MediaItemQueryFilterProjection> {
     let (folder_id, path, media_type, media_streams, metadata) =
         sqlx::query_as::<_, (Uuid, String, String, Value, Value)>(
             "SELECT virtual_folder_id, path, media_type, media_streams, metadata FROM media_items WHERE id = $1",
@@ -5940,7 +6418,47 @@ async fn replace_postgres_media_item_query_filter_projection_from_live(
             media_streams: streams,
             metadata: &metadata,
         });
-    replace_postgres_media_item_query_filter_projection(tx, item_id, folder_id, &projection).await
+    replace_postgres_media_item_query_filter_projection(tx, item_id, folder_id, &projection)
+        .await?;
+    Ok(projection)
+}
+
+fn postgres_query_filter_scalar_memberships(
+    projection: &MediaItemQueryFilterProjection,
+    normalized_container: Option<&str>,
+) -> BTreeSet<(String, String, String)> {
+    let mut values = BTreeSet::new();
+    if projection.features.container_present {
+        let container = normalized_container.unwrap_or_default().to_owned();
+        values.insert(("containers".to_owned(), container.clone(), container));
+    }
+    values.insert((
+        "media_types".to_owned(),
+        projection.features.media_type.clone(),
+        projection.features.media_type.clone(),
+    ));
+    if projection.features.is_video {
+        values.insert((
+            "video_types".to_owned(),
+            "videofile".to_owned(),
+            "VideoFile".to_owned(),
+        ));
+    }
+    if projection.features.has_subtitles {
+        values.insert((
+            "has_subtitles".to_owned(),
+            "true".to_owned(),
+            "true".to_owned(),
+        ));
+    }
+    if projection.features.has_trailer {
+        values.insert((
+            "has_trailer".to_owned(),
+            "true".to_owned(),
+            "true".to_owned(),
+        ));
+    }
+    values
 }
 
 fn normalized_locations(locations: Vec<String>) -> Vec<String> {
@@ -8060,6 +8578,218 @@ mod tests {
             .fetch_one(&test.database.pool)
             .await?;
             assert_eq!(rebuilt_coverage, 1);
+
+            // Detail/playback probes update one Xtream item at a time. They must patch the
+            // covered summary atomically instead of forcing a full-library rebuild or leaving
+            // the fast path disabled until the next snapshot publication.
+            test.database
+                .update_media_item_metadata(
+                    summary_item_id,
+                    json!({ "Genres": ["Point Genre"], "Tags": ["Point Tag"] }),
+                )
+                .await?;
+            let point_metadata_summary = test
+                .database
+                .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(point_metadata_summary.genres, ["Point Genre"]);
+            assert_eq!(point_metadata_summary.tags, ["Point Tag"]);
+            let revision_after_metadata = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
+                "SELECT revision.source_revision, revision.reconciled_revision, \
+                        coverage.source_revision \
+                 FROM media_item_query_filter_summary_revisions AS revision \
+                 JOIN media_item_query_filter_summary_coverage AS coverage \
+                   ON coverage.virtual_folder_id = revision.virtual_folder_id \
+                 WHERE revision.virtual_folder_id = $1",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(revision_after_metadata.1, Some(revision_after_metadata.0));
+            assert_eq!(revision_after_metadata.2, revision_after_metadata.0);
+            test.database
+                .update_media_item_metadata(
+                    summary_item_id,
+                    json!({ "Genres": ["Point Genre"], "Tags": ["Point Tag"] }),
+                )
+                .await?;
+            let revision_after_metadata_noop = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
+                "SELECT revision.source_revision, revision.reconciled_revision, \
+                        coverage.source_revision \
+                 FROM media_item_query_filter_summary_revisions AS revision \
+                 JOIN media_item_query_filter_summary_coverage AS coverage \
+                   ON coverage.virtual_folder_id = revision.virtual_folder_id \
+                 WHERE revision.virtual_folder_id = $1",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(revision_after_metadata_noop, revision_after_metadata);
+
+            test.database
+                .update_media_item_media_info(
+                    summary_item_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![json!({ "Type": "Subtitle", "Language": "spa" })],
+                )
+                .await?;
+            let point_stream_summary = test
+                .database
+                .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(point_stream_summary.genres, ["Point Genre"]);
+            assert_eq!(point_stream_summary.subtitle_languages, ["spa"]);
+            assert!(point_stream_summary.has_subtitles);
+            let point_coverage: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1 AND effective_item_type = 'movie'",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(point_coverage, 1);
+
+            sqlx::query(
+                "DELETE FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(summary_folder.id)
+            .execute(&test.database.pool)
+            .await?;
+            let point_fallback = test
+                .database
+                .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(point_stream_summary, point_fallback);
+
+            let case_first_id = Uuid::new_v4();
+            let case_second_id = Uuid::new_v4();
+            let case_item = |id, name: &str, genre: &str| {
+                remote_item(
+                    id,
+                    name,
+                    &format!("provider://case-filters/{id}.mkv"),
+                    "Video",
+                    "movies",
+                    json!({ "Genres": [genre] }),
+                )
+            };
+            let case_folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Case Filters",
+                    "movies",
+                    "provider://case-filters",
+                    vec![
+                        case_item(case_first_id, "A Winner", "Drama"),
+                        case_item(case_second_id, "B Contributor", "drama"),
+                    ],
+                )
+                .await?;
+            let case_query = MediaItemCatalogQuery {
+                limit: 0,
+                virtual_folder_ids: vec![case_folder.id],
+                include_item_types: vec!["Movie".to_owned()],
+                ..MediaItemCatalogQuery::default()
+            };
+            test.database
+                .update_media_item_metadata(case_first_id, json!({ "Genres": ["drama"] }))
+                .await?;
+            let normalized_case = test
+                .database
+                .media_item_query_filter_values(&case_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(normalized_case.genres, ["drama"]);
+            let normalized_contributors: i64 = sqlx::query_scalar(
+                "SELECT contributor_count \
+                 FROM media_item_query_filter_summary_values \
+                 WHERE virtual_folder_id = $1 AND effective_item_type = 'movie' \
+                   AND value_kind = 'genres' AND normalized_value = 'drama'",
+            )
+            .bind(case_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(normalized_contributors, 2);
+
+            // A writer that does not participate in the advisory-lock protocol may advance the
+            // revision between capture and publication. The point writer must detect that CAS
+            // mismatch and rebuild exactly; it cannot adopt the other writer's revision.
+            let mut point_tx = test.database.pool.begin().await?;
+            let point_context =
+                PostgresDatabase::begin_media_item_query_filter_summary_point_update(
+                    &mut point_tx,
+                    case_first_id,
+                )
+                .await?;
+            let mut concurrent_tx = test.database.pool.begin().await?;
+            let concurrent_metadata = json!({ "Genres": ["Concurrent Genre"] });
+            sqlx::query("UPDATE media_items SET metadata = $2 WHERE id = $1")
+                .bind(case_second_id)
+                .bind(&concurrent_metadata)
+                .execute(&mut *concurrent_tx)
+                .await?;
+            replace_postgres_media_item_facets(
+                &mut concurrent_tx,
+                case_second_id,
+                &concurrent_metadata,
+            )
+            .await?;
+            replace_postgres_media_item_query_filter_projection_from_live(
+                &mut concurrent_tx,
+                case_second_id,
+            )
+            .await?;
+            concurrent_tx.commit().await?;
+
+            let point_metadata = json!({ "Genres": ["Point CAS Genre"] });
+            sqlx::query("UPDATE media_items SET metadata = $2 WHERE id = $1")
+                .bind(case_first_id)
+                .bind(&point_metadata)
+                .execute(&mut *point_tx)
+                .await?;
+            replace_postgres_media_item_facets(&mut point_tx, case_first_id, &point_metadata)
+                .await?;
+            let point_projection = replace_postgres_media_item_query_filter_projection_from_live(
+                &mut point_tx,
+                case_first_id,
+            )
+            .await?;
+            PostgresDatabase::reconcile_media_item_query_filter_summary_point_update(
+                &mut point_tx,
+                case_first_id,
+                point_context,
+                &point_projection,
+            )
+            .await?;
+            point_tx.commit().await?;
+            let concurrent_summary = test
+                .database
+                .media_item_query_filter_values(&case_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(
+                concurrent_summary
+                    .genres
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["Concurrent Genre".to_owned(), "Point CAS Genre".to_owned()])
+            );
+            let concurrent_revision_current: bool = sqlx::query_scalar(
+                "SELECT EXISTS (\
+                 SELECT 1 \
+                 FROM media_item_query_filter_summary_coverage AS coverage \
+                 JOIN media_item_query_filter_summary_revisions AS revision \
+                   ON revision.virtual_folder_id = coverage.virtual_folder_id \
+                  AND revision.source_revision = coverage.source_revision \
+                  AND revision.reconciled_revision = revision.source_revision \
+                 WHERE coverage.virtual_folder_id = $1)",
+            )
+            .bind(case_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert!(concurrent_revision_current);
 
             let tombstone_id = Uuid::new_v4();
             let updated_item = || {

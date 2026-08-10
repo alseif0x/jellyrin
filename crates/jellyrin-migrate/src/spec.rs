@@ -712,6 +712,11 @@ pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
         reason: "derived aggregate item-filter coverage marker",
     },
     OmittedTableSpec {
+        table: "media_item_query_filter_summary_revisions",
+        strategy: "rebuild",
+        reason: "derived aggregate item-filter source revision",
+    },
+    OmittedTableSpec {
         table: "remote_media_catalog_stage_query_filter_sources",
         strategy: "rebuild",
         reason: "derived durable-stage item-filter source projection",
