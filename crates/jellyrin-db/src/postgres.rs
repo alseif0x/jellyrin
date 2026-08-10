@@ -12,9 +12,11 @@ use uuid::Uuid;
 use super::{
     DatabaseDriver, DatabaseRuntimeDiagnostics, DatabaseTelemetryDiagnostics,
     MEDIA_ITEM_FACET_PROJECTION_NAME, MEDIA_ITEM_FACET_PROJECTION_VERSION,
+    MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME, MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION,
     MediaItemFacetProjectionMode, NamedConfigurationPayload, ProviderSecretVault,
     SystemConfigurationPayloads, database_pool_diagnostics, ensure_media_item_facet_projection,
-    normalize_configuration_key, telemetry::DatabaseTelemetry,
+    ensure_media_item_query_filter_projection, normalize_configuration_key,
+    telemetry::DatabaseTelemetry,
 };
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 6;
@@ -283,6 +285,12 @@ impl PostgresDatabase {
         )
         .await
         .context("failed to ensure PostgreSQL media item facet projection")?;
+        ensure_media_item_query_filter_projection(
+            &mut migration_lock,
+            MediaItemFacetProjectionMode::EnsureCurrent,
+        )
+        .await
+        .context("failed to ensure PostgreSQL media item query-filter projection")?;
         migration_lock
             .commit()
             .await
@@ -347,6 +355,22 @@ impl PostgresDatabase {
             projection_version == Some(MEDIA_ITEM_FACET_PROJECTION_VERSION),
             "PostgreSQL media item facet projection is not current (expected version {}); run the migration job before Jellyrin",
             MEDIA_ITEM_FACET_PROJECTION_VERSION
+        );
+        let query_filter_marker = sqlx::query_as::<_, (i32, i64, i64)>(
+            "SELECT extractor_version, source_item_count, projected_facet_count \
+             FROM jellyrin_derived_projection_versions WHERE projection_name = $1",
+        )
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+        .fetch_optional(&self.pool)
+        .await
+        .context("PostgreSQL media item query-filter projection metadata is unavailable")?;
+        ensure!(
+            query_filter_marker.is_some_and(|marker| {
+                marker.0 == MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION
+                    && marker.1 >= 0
+                    && marker.2 >= 0
+            }),
+            "PostgreSQL media item query-filter projection is not current; run the migration job before Jellyrin"
         );
         Ok(())
     }

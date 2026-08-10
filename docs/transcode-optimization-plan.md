@@ -24,13 +24,14 @@ histórica y no debe confundirse con este estado vigente.
   productiva por `cc-debian13:nonroot` fijado por digest: inventaría 13 paquetes,
   ejecuta FFmpeg/ffprobe durante el build, pasa el corpus real y da 0 hallazgos
   HIGH/CRITICAL en Trivy. El commit exacto `6a15aec579b8` ya repitió corpus,
-  SBOM, RustSec, NVD y Trivy con todos los gates en cero. El smoke de runtime
-  aplica las 13 migraciones, arranca la imagen read-only como `10001:10001`,
+  SBOM, RustSec, NVD y Trivy con todos los gates en cero. El smoke histórico de
+  ese commit aplica sus 13 migraciones, arranca la imagen read-only como `10001:10001`,
   valida health/readiness y cierre limpio contra PostgreSQL desechable. Falta
   validar AMD64; QEMU 8.2.2 del host ARM falla internamente durante la
   compilación, por lo que CI exige ahora una imagen AMD64 nativa.
-  `8026d7f` sigue sano en staging,
-  pero continúa expresamente no promovible como release.
+  Esta evidencia pertenece a `6a15aec`/`8026d7f`, no al HEAD actual. El HEAD
+  conserva RustSec real en cero, pero debe reconstruir imagen, corpus, SBOM,
+  NVD y Trivy en AArch64 y repetirlos en AMD64 nativo antes de promoción.
 
 - La costura de selección de persistencia ya tiene `DatabaseDriver` con
   `PostgreSql`, `Sqlite` y `MySql`, además de `DatabaseConfig` y una única
@@ -64,7 +65,7 @@ histórica y no debe confundirse con este estado vigente.
   sync y transcodes se recrean. El fixture completo ya pasó contra PostgreSQL
   real y comparó BLOB→`bytea` byte a byte. El cierre final de
   `jellyrin-db` cubre baseline, repositorios, snapshots/no-op, vault y telemetría:
-  pasan 150 pruebas aprobadas, 0 fallidas y 2 ignoradas más su doctest contra el árbol actual, con PostgreSQL real
+  pasan 169 pruebas aprobadas, 0 fallidas y 4 ignoradas más su doctest contra el árbol actual, con PostgreSQL real
   donde corresponde.
 - El hot path compatible de `/Items` y `/Users/{id}/Items` ya usa el contrato
   `MediaCatalogStore`: `COUNT(*)` exacto y página `LIMIT/OFFSET` en el mismo
@@ -133,6 +134,13 @@ histórica y no debe confundirse con este estado vigente.
   parents sintéticos y Live TV conservan el fallback; no se mezclan
   `SeriesGenres`, `Albums`, `Cast` ni `SeriesStudios` donde el endpoint legacy
   no los exponía.
+- La migración 117 elimina la expansión JSON recursiva del hot path de
+  `/Items/Filters`: mantiene una proyección exacta y versionada por item y
+  carpeta, con candidates source-aware, FKs compuestas, invalidación y fallback
+  fail-closed. El publish de snapshots es diferencial y un no-op conserva
+  `xmin`/`completed_at`; PostgreSQL usa el índice de carpeta para un scope único
+  y probes por item para scopes globales o múltiples, con `jit=off` y
+  `work_mem=32MB` limitados a la transacción interactiva.
 - DLNA ya no relee el catálogo completo por cada carpeta: browse/search usa
   `media_items_for_virtual_folders` y solo hidrata metadata para los IDs del
   dominio seleccionado. El detalle de carpeta reutiliza conteos SQL agrupados
@@ -313,9 +321,10 @@ histórica y no debe confundirse con este estado vigente.
 El último cierre completo del workspace, anterior al delta GenreIds, registró
 646 pruebas aprobadas, 0 fallidas y 5 ignoradas. Para el árbol actual se volvió
 a ejecutar íntegramente la superficie afectada contra PostgreSQL 17.10 real:
-la API pasa 353 pruebas, 0 fallidas y 3 ignoradas; `jellyrin-db`, 152/0/3 más
+la API pasa 353 pruebas, 0 fallidas y 3 ignoradas; `jellyrin-db`, 169/0/4 más
 doctests; el proveedor Xtream, 27/27; y el migrador, 36/36. La migración vigente
-lleva el objetivo a `202608080116`, 20 migraciones embebidas. `check` y
+en el árbol lleva el objetivo a `202608080117`, 21 migraciones embebidas; staging
+permanece en 116 hasta completar el rollout de este delta. `check` y
 `clippy -D warnings` de DB/API/migrador
 con todos sus targets y features también terminan limpios. El intento de repetir
 todo el workspace no produjo fallos de test, pero agotó el disco durante el
@@ -429,14 +438,14 @@ se marcará completo solo después de su validación y rollout correspondiente.
 
 | Área | Código local | Evidencia ejecutada | Fuera de este cierre |
 | --- | --- | --- | --- |
-| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 152/0/3 más doctests y staging durable sobre PostgreSQL real; migrador 36/36; esquema 116 aplicado en staging; proyecciones 108–112/116 e índices Series verificados; checks y clippy DB/API/migrador estrictos verdes | E2E de reproducción/carga de handlers y contratos restantes antes de otro backend |
+| Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 169/0/4 más doctests y staging durable sobre PostgreSQL real; migrador 36/36; esquema 117 validado en clon real y 116 aún aplicado en staging; checks y clippy DB/API/migrador estrictos verdes | E2E de reproducción/carga de handlers y contratos restantes antes de otro backend |
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg 8.1.2 mínimo sin encoders y solo decoder AAC; redirects opacos revalidados por salto | Corpus aislado verde; VOD real DirectProxy 206/65.536 bytes con 0 FFmpeg; Live TV real leyó 112.827 bytes directo con 0 FFmpeg y HLS produjo 1.702.152 bytes como remux, sin fallback, ~15,3 MiB RSS, PID reap y leases 0→0 | Matriz de clientes reales, medidas sostenidas/concurrentes del host y límite físico del volumen; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c` | 91/0/4 ignoradas contra SDK/RPC local; ZIP AArch64 0.1.1 validado e instalado/activo en staging tras backups; configuración admin 200 sin credenciales; salud `Degraded` esperada sin tuner/egress; clave de referencia root-only generada | Pin público aún viejo; perfil WireGuard MX, metadatos/secretos legítimos restantes, cuenta/tuner, E2E real y publicación pendientes |
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series incremental a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde; audits DB/logs/argv 0 findings | Concurrencia, repetición periódica del audit y matriz de clientes reales |
-| Catálogo general | Pushdown SQL acotado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed | API 353/0/3, DB 152/0/3, migrador 36/36 y Clippy estrictos; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto, frente a p95 6.169 ms anterior | E2E visual/reproducción y matriz de clientes reales |
-| Facetas y filtros | Facetas normalizadas/alias/payload mantenidas atómicamente; marker/versionado PG 109, selector exacto GenreIds 110, fecha Upcoming 111 y selector exacto Person/Studio/Tag 112; colecciones/name/ID indexados; `/Items/Filters` y `Filters2` agregados set-based sin cap para shapes equivalentes y fallback conservador | SQLite y PostgreSQL 17.10 real con >500 seleccionados; Genre/Person/Studio/Tag por nombre raw y representaciones exactas legacy, OR interno/AND entre clases, paginación y parent recursivo; cap independiente de 64 antes de cualquier fallback; no-op `completed_at`/`xmin`, Force tras import y rollback por trigger comprobados; benchmark 112 a 10k/100k/500k reduce filas 9.900/99.000/495.000→24/247/1.234 y mejora p95 SQL 1,360x/1,528x/1,306x con PK lookup; API 347/0/3, DB 150/0/2 y migrador 36/36 | Ratings/premiere y shapes no equivalentes, baseline productiva concurrente y E2E cliente real |
+| Catálogo general | Pushdown SQL acotado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed | API 353/0/3, DB 169/0/4, migrador 36/36 y Clippy estrictos; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto, frente a p95 6.169 ms anterior | E2E visual/reproducción y matriz de clientes reales |
+| Facetas y filtros | Facetas/aliases/selectores 108–112 más proyección query-filter 117 folder-aware, exacta, atómica, diferencial y fail-closed; `/Items/Filters` y `Filters2` siguen sin cap | DB 169/0/4 y migrador 36/36; clon real 494.613 items: migración 115→117 en 147,5 s, 0 desajustes, ensure posterior 1,1 s. Benchmark 455.520+39.093: p50 1,187 s, p95 1,198 s, 4 concurrentes 2,679 s, 0 temporales/fallos/timeouts; no-op conserva `xmin` | Repetir carga HTTP 400/16 tras rollout; scope extremo sin tipo sobre ambos catálogos aún excede 10 s y queda como fast path futuro; E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
-| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | QA supply-chain 46/46; imagen AArch64 exacta `6a15aec579b8`, 87.663.302 bytes, 13 paquetes OS, FFmpeg/ffprobe y corpus verdes; SBOM verificado; RustSec=0, Trivy=0 y NVD-FFmpeg=0; smoke real migrator/server PostgreSQL verde como `10001:10001` | Ejecutar Compose y el nuevo gate AMD64 nativo de CI; solo entonces firma/provenance |
+| Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37 y RustSec real 0 vulnerabilidades. La última imagen completa verde es la AArch64 histórica `6a15aec579b8`; no acredita el HEAD actual | Reconstruir imagen/corpus/SBOM/Trivy/NVD AArch64 de HEAD; ejecutar Compose v2 y repetir todo en AMD64 nativo; solo entonces firma/provenance |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `e6e2d30`; servidor SHA-256 `c27ab033...ca3c`; esquema 116; health local/HTTPS verdes, 0 reinicios tras el arranque final; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios; carga Series concurrente, VOD directo y Live TV direct/remux reales verdes; MAGSTV 0.1.1 activo | Clientes reales; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
@@ -1763,11 +1772,11 @@ interfaz de repositorio persistente.
 El contrato operativo y el checklist para añadir otro adaptador están
 desarrollados en [`database-drivers.md`](database-drivers.md).
 
-La línea SQLx 0.8 fijada limita hoy `libsqlite3-sys` a 0.30.x y empaqueta SQLite
+La línea SQLx 0.9 actual todavía conserva `libsqlite3-sys` 0.30.x y empaqueta SQLite
 3.46.0, anterior a la corrección WAL-reset. Como mitigación inmediata, el
 adaptador legacy deja de activar WAL en bases persistentes y usa rollback
 journal; un test impide reactivarlo accidentalmente. Sigue pendiente actualizar
-la dependencia embebida —probablemente junto al salto controlado de SQLx/Rust—
+la dependencia embebida cuando exista una combinación corregida compatible
 antes de volver a permitir WAL. Esto sigue siendo necesario aunque SQLite no
 esté en producción, porque el migrador abre la base histórica y los tests
 ejercitan el adaptador. No cambia la decisión de mantener PostgreSQL como único backend
@@ -2462,7 +2471,7 @@ la consulta: usarlo en staging o con extremo cuidado para escrituras.
 
 ### 13.13 Pruebas de la migración
 
-**Estado actual:** `jellyrin-db` pasa 150/0/2 más su doctest, usando
+**Estado actual:** `jellyrin-db` pasa 169/0/4 más su doctest, usando
 PostgreSQL real para selectors/manager, baseline, todos los repositorios,
 catálogo paginado/no-op y vault AEAD con atomicidad. El migrador pasa 36/36,
 incluido el round-trip byte-exact BLOB→`bytea`; Xtream pasa 27/27. La última
@@ -2563,7 +2572,7 @@ Automatizar pruebas de:
 ### 14.5 Gates automáticos
 
 **Estado del cierre dirigido vigente:** API pasa 353/0/3 y Xtream 27/27; ambos
-tienen formato, diff-check y Clippy estricto verdes. DB conserva 152/0/3 más
+tienen formato, diff-check y Clippy estricto verdes. DB conserva 169/0/4 más
 doctest y el migrador 36/36 con round-trip byte-exact BLOB→`bytea`. La última
 baseline completa del workspace queda como evidencia histórica y deberá
 repetirse antes de release; no se mezclan sus contadores con el árbol actual.
@@ -2608,9 +2617,12 @@ desde cero y ejecutar repositorios/migrador. Añadir jobs separados para:
 - Servidor PostgreSQL-only y comprobación de dependencias.
 - Migración de fixtures SQLite.
 - Tests FFmpeg cuando la imagen contenga la versión fijada.
-- Compose config queda exigido en CI y el gate de imagen ya aplica
-  migraciones, arranca el servidor distroless contra PostgreSQL, valida
-  health/readiness y exige cierre limpio; falta la envoltura Compose exacta.
+- Compose config queda exigido en CI. Compose v2 2.40.3 ARM64 está instalado
+  localmente y `docker compose config --quiet` pasa con secretos efímeros; el
+  daemon queda deshabilitado fuera de las pruebas para no consumir recursos.
+  El gate de imagen ya aplica migraciones, arranca el servidor distroless contra
+  PostgreSQL, valida health/readiness y exige cierre limpio; falta ejecutar el
+  stack Compose exacto sobre la imagen del HEAD final.
 - Auditoría de dependencias, imagen y secretos accidentales.
 
 ### 14.6 Objetivos provisionales de rendimiento
@@ -2653,7 +2665,7 @@ inicial; estos criterios no deben leerse como una declaración de rollout.
   persistencia queda dentro de `jellyrin-db`/`jellyrin-migrate`.
 - [x] Una base PostgreSQL vacía se crea completamente mediante migraciones; la
   baseline y el delta post-vault están cubiertos por la suite DB sobre
-  PostgreSQL real: 142/0/2 más su doctest.
+  PostgreSQL real: 169/0/4 más su doctest.
 - [~] El migrador preserva y valida todo dato irremplazable; los catálogos marcados
   como reconstruibles se reindexan correctamente. `provider_secrets` y su
   mapping BLOB↔`bytea` pasan 36/36 con PostgreSQL real, referencias, digest y
@@ -2664,9 +2676,10 @@ inicial; estos criterios no deben leerse como una declaración de rollout.
   `updated_at`/`last_seen_at`; sí registra el sync y puede tocar metadata de
   carpeta.
 - [~] Búsqueda, filtros, orden y IDs mantienen el contrato Jellyfin. Facetas,
-  colecciones y filtros simples ya tienen contratos SQL sin cap y regresiones
-  SQLite/PG/API con más de 500 seleccionados; quedan carga concurrente real y
-  predicados complejos de `/Items` que requieren fallback exacto.
+  colecciones y filtros simples ya tienen contratos SQL sin cap, proyección 117
+  fail-closed y regresiones SQLite/PG/API; el benchmark real de Movies queda en
+  p95 1,198 s y 0 bytes temporales. Quedan el scope mixto sin tipo, la repetición
+  HTTP 400/16 y predicados complejos que requieren fallback exacto.
 - [~] El backup se restaura en una base aislada. El timer endurecido está activo
   en staging y el snapshot cifrado post-Xtream `20260809T103116Z` pasó checksum,
   descifrado y restore de 49 tablas con cero migraciones fallidas, cero
@@ -2675,7 +2688,10 @@ inicial; estos criterios no deben leerse como una declaración de rollout.
   clave a un destino recuperable fuera del host y conservar allí la evidencia
   periódica.
 - [ ] Bajo la carga objetivo no hay agotamiento de pool, deadlocks sin resolver ni
-  queries interactivas que excedan su timeout.
+  queries interactivas que excedan su timeout. La primera carga mixta real
+  (400 peticiones, concurrencia 16 sobre pool 6) quedó roja: 185 fallos, 5,1 GB
+  temporales y timeouts en Movies/`Items/Filters`; cero deadlocks. Debe repetirse
+  después del pushdown sargable y de retirar la expansión JSON recursiva.
 - [~] El benchmark aislado PostgreSQL 10k/100k/500k ya registra p50/p95 y planes.
   Movie page no supera el gate con el índice candidato
   (0,954×/1,035×/1,127×); Upcoming y los selectores 112 sí usan índices para
@@ -2703,23 +2719,23 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
 - `[x]` Live TV Xtream remoto expone direct stream y HLS sin revelar la fuente:
   directo 200/112.827 bytes con 0 FFmpeg; HLS 200/1.702.152 bytes en modo
   efectivo `remux`, sin fallback, ~15,3 MiB RSS, stop/reap y leases 0→0.
-- Un contenedor incompatible con H.264/AAC compatible usa remux y no contiene
+- `[~]` Un contenedor incompatible con H.264/AAC compatible usa remux y no contiene
   encoder de vídeo en el comando.
-- Audio incompatible con vídeo compatible usa `-c:v copy`.
-- Nunca hay más recodificaciones de vídeo que el límite configurado.
-- Un seek no deja dos encoders activos para la misma sesión.
-- Una desconexión detiene el trabajo dentro del timeout configurado.
+- `[~]` Audio incompatible con vídeo compatible usa `-c:v copy`.
+- `[~]` Nunca hay más recodificaciones de vídeo que el límite configurado.
+- `[~]` Un seek no deja dos encoders activos para la misma sesión.
+- `[~]` Una desconexión detiene el trabajo dentro del timeout configurado.
 - `[~]` Live HLS eficiente cerró una sesión real sin residuales; falta carga
   sostenida para acreditar la cota física de disco.
-- `PlaybackInfo` explica el modo y las razones reales.
-- Ningún log o respuesta expone credenciales del proveedor.
-- En este host, el servidor conserva CPU disponible durante una reproducción
+- `[~]` `PlaybackInfo` explica el modo y las razones reales.
+- `[~]` Ningún log o respuesta expone credenciales del proveedor.
+- `[~]` En este host, el servidor conserva CPU disponible durante una reproducción
   software y mantiene `speed >= 1x` sin buffering.
 - `[~]` Un cierre explícito real terminó y reaprovechó/eliminó el proceso; falta
   validar desaparición silenciosa e idle timeout con fuente real.
 - `[~]` El stop Live real dejó cero procesos y leases; faltan error, SIGTERM y
   carga concurrente para cerrar todos los caminos de cleanup.
-- Las escrituras de progreso están acotadas y no saturan PostgreSQL.
+- `[~]` Las escrituras de progreso están acotadas y no saturan PostgreSQL.
 
 ### 15.3 Seguridad y degradación
 
@@ -2800,7 +2816,9 @@ reales del proveedor.
 
 ### 16.1 Prerrequisitos comunes
 
-1. `[ ]` Fijar datasets, clientes, fuentes y métricas de baseline reales.
+1. `[~]` Ya están fijados el catálogo Xtream real, VOD/direct, Live/remux y las
+   métricas de catálogo; faltan clientes Jellyfin reales, MAGSTV y carga
+   sostenida para cerrar la baseline.
 2. `[~]` El contrato neutral y el grant `ProviderSecrets` del core están
    implementados. El parche que los consume en `jellyrin-plugin-magstv` y retira
    el fallback de credenciales de cuenta por entorno ya está aplicado y validado
@@ -2880,7 +2898,8 @@ Después de instrumentación, este track puede desarrollarse en paralelo:
     process-wide con FFmpeg, con carril propio, cola acotada, timeout y permisos
     RAII; la admisión externa Xtream se conserva sin adquirir dos veces el
     permiso central.
-12. `[ ]` Aceleración hardware solo en futuros hosts compatibles.
+12. **Fuera del alcance de este host:** aceleración hardware solo en futuros
+    hosts compatibles; no es gate de esta entrega software-only.
 
 ### 16.4 Integración y rollout
 

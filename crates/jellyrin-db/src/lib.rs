@@ -55,6 +55,7 @@ mod postgres_provider_secrets;
 mod postgres_scan;
 mod postgres_sessions;
 mod provider_secrets;
+mod query_filter_projection;
 mod telemetry;
 pub use driver::{DatabaseBackend, DatabaseDriver};
 pub use facets::{
@@ -68,8 +69,9 @@ pub use manager::{DatabaseConfig, DatabaseManager};
 pub use postgres::{PostgresDatabase, PostgresSettings};
 pub use postgres_catalog::{
     MEDIA_ITEM_FACET_PROJECTION_NAME, MEDIA_ITEM_FACET_PROJECTION_VERSION,
-    MediaItemFacetProjectionMode, MediaItemFacetProjectionReport,
-    ensure_media_item_facet_projection,
+    MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME, MediaItemFacetProjectionMode,
+    MediaItemFacetProjectionReport, MediaItemQueryFilterProjectionReport,
+    ensure_media_item_facet_projection, ensure_media_item_query_filter_projection,
 };
 pub use provider_secrets::{
     PROVIDER_SECRET_REFERENCE_FIELD, ProviderCredentials, ProviderSecretEnvelope,
@@ -98,6 +100,11 @@ use telemetry::{DatabaseOperation, DatabaseTelemetry};
 pub type ProductionDatabase = PostgresDatabase;
 
 const TV_SERIES_CATALOG_PROJECTION_VERSION: i32 = 1;
+use query_filter_projection::{
+    MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION, MediaItemQueryFilterProjection,
+    MediaItemQueryFilterProjectionSource, encode_media_item_query_filter_position,
+    extract_media_item_query_filter_projection,
+};
 
 #[cfg(test)]
 pub type Database = SqliteDatabase;
@@ -2429,6 +2436,86 @@ async fn replace_sqlite_media_item_facets(
 }
 
 #[cfg(any(test, feature = "sqlite"))]
+async fn replace_sqlite_media_item_query_filter_projection(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    item_id: &str,
+    folder_id: &str,
+    projection: &MediaItemQueryFilterProjection,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_query_filter_sources WHERE item_id = ?1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO media_item_query_filter_sources (
+            item_id, virtual_folder_id, extractor_version, container_present, container_value, media_type,
+            is_video, has_subtitles, has_trailer, projected_value_count, completed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(item_id)
+    .bind(folder_id)
+    .bind(projection.extractor_version)
+    .bind(projection.features.container_present)
+    .bind(&projection.features.container)
+    .bind(&projection.features.media_type)
+    .bind(projection.features.is_video)
+    .bind(projection.features.has_subtitles)
+    .bind(projection.features.has_trailer)
+    .bind(i64::try_from(projection.values.len()).context("query-filter value count overflow")?)
+    .execute(&mut **tx)
+    .await?;
+    for value in &projection.values {
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_query_filter_values (
+                item_id, virtual_folder_id, value_kind, display_value, source_key,
+                source_priority, source_position
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(item_id)
+        .bind(folder_id)
+        .bind(value.kind.as_str())
+        .bind(&value.display_value)
+        .bind(&value.source_key)
+        .bind(i64::from(value.source_priority))
+        .bind(encode_media_item_query_filter_position(&value.position))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+async fn replace_sqlite_media_item_query_filter_projection_from_live(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    item_id: &str,
+) -> anyhow::Result<()> {
+    let (folder_id, path, media_type, media_streams_json, metadata_json) =
+        sqlx::query_as::<_, (String, String, String, String, String)>(
+            "SELECT virtual_folder_id, path, media_type, media_streams_json, metadata_json \
+             FROM media_items WHERE id = ?1",
+        )
+        .bind(item_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let media_streams = serde_json::from_str::<Vec<Value>>(&media_streams_json)
+        .context("invalid projected media streams JSON")?;
+    let metadata = serde_json::from_str::<Value>(&metadata_json)
+        .context("invalid projected media metadata JSON")?;
+    let projection =
+        extract_media_item_query_filter_projection(MediaItemQueryFilterProjectionSource {
+            path: &path,
+            media_type: &media_type,
+            media_streams: &media_streams,
+            metadata: &metadata,
+        });
+    replace_sqlite_media_item_query_filter_projection(tx, item_id, &folder_id, &projection).await
+}
+
+#[cfg(any(test, feature = "sqlite"))]
 impl SqliteDatabase {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         let options = database_url
@@ -2482,6 +2569,59 @@ impl SqliteDatabase {
         );
         if projection_version != Some(MEDIA_ITEM_FACET_PROJECTION_VERSION) {
             database.rebuild_media_item_facets().await?;
+        }
+        let query_filter_marker = sqlx::query_as::<_, (i32, i64, i64)>(
+            "SELECT extractor_version, source_item_count, projected_facet_count \
+             FROM jellyrin_derived_projection_versions \
+             WHERE projection_name = ?1",
+        )
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+        .fetch_optional(&database.pool)
+        .await
+        .context("failed to inspect SQLite media item query-filter projection")?;
+        anyhow::ensure!(
+            query_filter_marker
+                .is_none_or(|marker| marker.0 <= MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION),
+            "SQLite query-filter projection version {} is newer than supported version {}",
+            query_filter_marker.unwrap_or_default().0,
+            MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION
+        );
+        let actual_query_filter_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "WITH value_counts AS (SELECT item_id, count(*) AS value_count \
+                 FROM media_item_query_filter_values GROUP BY item_id) \
+             SELECT (SELECT count(*) FROM media_items), \
+                    count(*) FILTER (WHERE source.extractor_version = ?1), \
+                    coalesce(sum(value_counts.value_count), 0), \
+                    count(*) FILTER (WHERE source.projected_value_count \
+                        <> coalesce(value_counts.value_count, 0)) \
+             FROM media_item_query_filter_sources AS source \
+             LEFT JOIN value_counts ON value_counts.item_id = source.item_id",
+        )
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .fetch_one(&database.pool)
+        .await?;
+        let query_filter_current = query_filter_marker.is_some_and(|marker| {
+            marker.0 == MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION
+                && actual_query_filter_counts.0 == actual_query_filter_counts.1
+                && actual_query_filter_counts.3 == 0
+        });
+        if query_filter_current {
+            sqlx::query(
+                "UPDATE jellyrin_derived_projection_versions \
+                 SET source_item_count = ?2, projected_facet_count = ?3, \
+                     completed_at = CURRENT_TIMESTAMP \
+                 WHERE projection_name = ?1 \
+                   AND (source_item_count <> ?2 OR projected_facet_count <> ?3)",
+            )
+            .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+            .bind(actual_query_filter_counts.0)
+            .bind(actual_query_filter_counts.2)
+            .execute(&database.pool)
+            .await?;
+        } else {
+            database
+                .rebuild_media_item_query_filter_projection()
+                .await?;
         }
         Ok(database)
     }
@@ -7731,6 +7871,114 @@ impl SqliteDatabase {
         let transaction_result = self.pool.begin().await;
         acquire.finish_result(&transaction_result);
         let mut transaction = transaction_result?;
+        let mut coverage = QueryBuilder::<Sqlite>::new(
+            "WITH selected_items AS (SELECT item.id, item.virtual_folder_id ",
+        );
+        push_sqlite_catalog_from(&mut coverage, query);
+        push_sqlite_catalog_filters(&mut coverage, query)?;
+        coverage.push(
+            ") SELECT NOT EXISTS (\
+             SELECT 1 FROM selected_items \
+             LEFT JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = selected_items.id \
+              AND source.virtual_folder_id = selected_items.virtual_folder_id \
+              AND source.extractor_version = ",
+        );
+        coverage.push_bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION);
+        coverage.push(
+            " WHERE source.item_id IS NULL OR source.projected_value_count <> (\
+                SELECT count(*) FROM media_item_query_filter_values AS projected \
+                WHERE projected.item_id = selected_items.id \
+                  AND projected.virtual_folder_id = selected_items.virtual_folder_id))",
+        );
+        let covered = coverage
+            .build_query_scalar::<bool>()
+            .fetch_one(&mut *transaction)
+            .await?;
+        let result = if covered {
+            Self::media_item_query_filter_values_projected(query, &mut transaction).await
+        } else {
+            Self::media_item_query_filter_values_legacy(query, &mut transaction).await
+        };
+        transaction.commit().await?;
+        result
+    }
+
+    async fn media_item_query_filter_values_projected(
+        query: &MediaItemCatalogQuery,
+        transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    ) -> anyhow::Result<MediaItemQueryFilterValues> {
+        let mut projected = QueryBuilder::<Sqlite>::new(
+            "WITH selected_items AS (SELECT item.id, item.virtual_folder_id, lower(item.name) AS item_sort ",
+        );
+        push_sqlite_catalog_from(&mut projected, query);
+        push_sqlite_catalog_filters(&mut projected, query)?;
+        projected.push(
+            "), candidates(field, normalized_value, display_value, item_sort, item_id, \
+                            key_priority, position) AS (\
+             SELECT value.value_kind, lower(trim(value.display_value)), value.display_value, \
+                    selected_items.item_sort, selected_items.id, \
+                    value.source_priority, value.source_position \
+             FROM selected_items JOIN media_item_query_filter_values AS value \
+               ON value.item_id = selected_items.id \
+              AND value.virtual_folder_id = selected_items.virtual_folder_id \
+             UNION ALL \
+             SELECT 'containers', lower(source.container_value), lower(source.container_value), \
+                    selected_items.item_sort, selected_items.id, 0, '' \
+             FROM selected_items JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = selected_items.id \
+              AND source.virtual_folder_id = selected_items.virtual_folder_id \
+             WHERE source.container_present = 1 \
+             UNION ALL \
+             SELECT 'media_types', source.media_type, source.media_type, \
+                    selected_items.item_sort, selected_items.id, 0, '' \
+             FROM selected_items JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = selected_items.id \
+              AND source.virtual_folder_id = selected_items.virtual_folder_id \
+             UNION ALL \
+             SELECT 'video_types', 'videofile', 'VideoFile', selected_items.item_sort, \
+                    selected_items.id, 0, '' \
+             FROM selected_items JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = selected_items.id \
+              AND source.virtual_folder_id = selected_items.virtual_folder_id \
+             WHERE source.is_video = 1 \
+             UNION ALL \
+             SELECT '__has_subtitles', 'true', '1', selected_items.item_sort, \
+                    selected_items.id, 0, '' \
+             FROM selected_items JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = selected_items.id \
+              AND source.virtual_folder_id = selected_items.virtual_folder_id \
+             WHERE source.has_subtitles = 1 \
+             UNION ALL \
+             SELECT '__has_trailer', 'true', '1', selected_items.item_sort, \
+                    selected_items.id, 0, '' \
+             FROM selected_items JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = selected_items.id \
+              AND source.virtual_folder_id = selected_items.virtual_folder_id \
+             WHERE source.has_trailer = 1\
+             ), ranked AS (\
+             SELECT field, normalized_value, display_value, \
+                    row_number() OVER (PARTITION BY field, normalized_value \
+                      ORDER BY item_sort, item_id, key_priority, position) AS value_rank \
+             FROM candidates) \
+             SELECT field, display_value FROM ranked WHERE value_rank = 1 \
+             ORDER BY field, normalized_value COLLATE BINARY",
+        );
+        let rows = projected
+            .build_query_as::<(String, String)>()
+            .fetch_all(&mut **transaction)
+            .await?;
+        let mut values = MediaItemQueryFilterValues::default();
+        for (field, display_value) in rows {
+            push_media_item_query_filter_value(&mut values, &field, display_value);
+        }
+        Ok(values)
+    }
+
+    async fn media_item_query_filter_values_legacy(
+        query: &MediaItemCatalogQuery,
+        transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    ) -> anyhow::Result<MediaItemQueryFilterValues> {
         let mut metadata = QueryBuilder::<Sqlite>::new(
             "WITH RECURSIVE selected_items AS (\
              SELECT item.id, item.name, item.metadata_json ",
@@ -7835,7 +8083,7 @@ impl SqliteDatabase {
 
         let metadata_rows = metadata
             .build_query_as::<(String, String)>()
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await?;
 
         let mut scalar = QueryBuilder::<Sqlite>::new(
@@ -7909,9 +8157,8 @@ impl SqliteDatabase {
         );
         let scalar_rows = scalar
             .build_query_as::<(String, String)>()
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await?;
-        transaction.commit().await?;
 
         let mut values = MediaItemQueryFilterValues::default();
         for (field, display_value) in metadata_rows.into_iter().chain(scalar_rows) {
@@ -8845,6 +9092,82 @@ impl SqliteDatabase {
         Ok(())
     }
 
+    async fn rebuild_media_item_query_filter_projection(&self) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM media_item_query_filter_sources")
+            .execute(&mut *tx)
+            .await?;
+        let mut last_item_id = None::<String>;
+        loop {
+            let rows = if let Some(last_item_id) = last_item_id.as_deref() {
+                sqlx::query_as::<_, (String, String, String, String, String, String)>(
+                    "SELECT id, virtual_folder_id, path, media_type, media_streams_json, metadata_json \
+                     FROM media_items WHERE id > ?1 ORDER BY id LIMIT ?2",
+                )
+                .bind(last_item_id)
+                .bind(FACET_REBUILD_BATCH_SIZE)
+                .fetch_all(&mut *tx)
+                .await?
+            } else {
+                sqlx::query_as::<_, (String, String, String, String, String, String)>(
+                    "SELECT id, virtual_folder_id, path, media_type, media_streams_json, metadata_json \
+                     FROM media_items ORDER BY id LIMIT ?1",
+                )
+                .bind(FACET_REBUILD_BATCH_SIZE)
+                .fetch_all(&mut *tx)
+                .await?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            for (item_id, folder_id, path, media_type, media_streams_json, metadata_json) in &rows {
+                let media_streams = serde_json::from_str::<Vec<Value>>(media_streams_json)
+                    .with_context(|| format!("invalid media streams JSON for item {item_id}"))?;
+                let metadata = serde_json::from_str::<Value>(metadata_json)
+                    .with_context(|| format!("invalid metadata JSON for item {item_id}"))?;
+                let projection = extract_media_item_query_filter_projection(
+                    MediaItemQueryFilterProjectionSource {
+                        path,
+                        media_type,
+                        media_streams: &media_streams,
+                        metadata: &metadata,
+                    },
+                );
+                replace_sqlite_media_item_query_filter_projection(
+                    &mut tx,
+                    item_id,
+                    folder_id,
+                    &projection,
+                )
+                .await?;
+            }
+            last_item_id = rows.last().map(|row| row.0.clone());
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_derived_projection_versions (
+                projection_name, extractor_version, completed_at, source_item_count,
+                projected_facet_count, projected_alias_count
+            ) SELECT ?1, ?2, ?3,
+                     (SELECT count(*) FROM media_item_query_filter_sources),
+                     (SELECT count(*) FROM media_item_query_filter_values), 0
+            ON CONFLICT(projection_name) DO UPDATE SET
+                extractor_version = excluded.extractor_version,
+                completed_at = excluded.completed_at,
+                source_item_count = excluded.source_item_count,
+                projected_facet_count = excluded.projected_facet_count,
+                projected_alias_count = 0
+            "#,
+        )
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn replace_media_item_facets_in_transaction(
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         item_id: &str,
@@ -8864,13 +9187,15 @@ impl SqliteDatabase {
         sqlx::query(
             r#"
             INSERT INTO remote_media_catalog_stages (
-                id, status, extractor_version, created_at, updated_at
+                id, status, extractor_version, query_filter_extractor_version,
+                created_at, updated_at
             )
-            VALUES (?1, 'open', ?2, ?3, ?3)
+            VALUES (?1, 'open', ?2, ?3, ?4, ?4)
             "#,
         )
         .bind(stage.id())
         .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
@@ -8925,16 +9250,22 @@ impl SqliteDatabase {
             locked.rows_affected() == 1,
             "remote media catalogue stage not found"
         );
-        let (status, extractor_version) = sqlx::query_as::<_, (String, i32)>(
-            "SELECT status, extractor_version FROM remote_media_catalog_stages WHERE id = ?1",
-        )
-        .bind(stage.id())
-        .fetch_one(&mut *tx)
-        .await?;
+        let (status, extractor_version, query_filter_version) =
+            sqlx::query_as::<_, (String, i32, i32)>(
+                "SELECT status, extractor_version, query_filter_extractor_version \
+             FROM remote_media_catalog_stages WHERE id = ?1",
+            )
+            .bind(stage.id())
+            .fetch_one(&mut *tx)
+            .await?;
         anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
         anyhow::ensure!(
             extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
             "remote media catalogue stage extractor version is stale"
+        );
+        anyhow::ensure!(
+            query_filter_version == MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION,
+            "remote media catalogue stage query-filter extractor version is stale"
         );
         let appended_count = i64::try_from(prepared.len())
             .context("remote media catalogue stage append count overflow")?;
@@ -8988,6 +9319,50 @@ impl SqliteDatabase {
 
             let metadata = serde_json::from_str::<Value>(&item.metadata_json)
                 .with_context(|| format!("invalid metadata JSON for media item {}", item.id))?;
+            let media_streams = serde_json::from_str::<Vec<Value>>(&item.media_streams_json)
+                .with_context(|| {
+                    format!("invalid media streams JSON for media item {}", item.id)
+                })?;
+            let projection =
+                extract_media_item_query_filter_projection(MediaItemQueryFilterProjectionSource {
+                    path: &item.path,
+                    media_type: &item.media_type,
+                    media_streams: &media_streams,
+                    metadata: &metadata,
+                });
+            sqlx::query(
+                "INSERT INTO remote_media_catalog_stage_query_filter_sources (stage_id, item_id, \
+                 container_present, container_value, media_type, is_video, has_subtitles, \
+                 has_trailer, projected_value_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(stage.id())
+            .bind(&item.id)
+            .bind(projection.features.container_present)
+            .bind(&projection.features.container)
+            .bind(&projection.features.media_type)
+            .bind(projection.features.is_video)
+            .bind(projection.features.has_subtitles)
+            .bind(projection.features.has_trailer)
+            .bind(i64::try_from(projection.values.len()).context("projection value overflow")?)
+            .execute(&mut *tx)
+            .await?;
+            for value in &projection.values {
+                sqlx::query(
+                    "INSERT INTO remote_media_catalog_stage_query_filter_values (stage_id, \
+                     item_id, value_kind, display_value, source_key, source_priority, \
+                     source_position) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .bind(stage.id())
+                .bind(&item.id)
+                .bind(value.kind.as_str())
+                .bind(&value.display_value)
+                .bind(&value.source_key)
+                .bind(i64::from(value.source_priority))
+                .bind(encode_media_item_query_filter_position(&value.position))
+                .execute(&mut *tx)
+                .await?;
+            }
             let facets = extract_media_item_facets(&metadata);
             for facet in &facets {
                 let position = i64::from(facet.position);
@@ -9140,11 +9515,13 @@ impl SqliteDatabase {
         let locked = sqlx::query(
             "UPDATE remote_media_catalog_stages \
              SET status = 'publishing', updated_at = ?1 \
-             WHERE id = ?2 AND status = 'open' AND extractor_version = ?3",
+             WHERE id = ?2 AND status = 'open' AND extractor_version = ?3 \
+               AND query_filter_extractor_version = ?4",
         )
         .bind(&now)
         .bind(stage.id())
         .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
         .execute(&mut *tx)
         .await?;
         anyhow::ensure!(
@@ -9351,6 +9728,81 @@ impl SqliteDatabase {
             .bind(&now)
             .bind(stage.id())
             .bind(&library.key)
+            .execute(&mut *tx)
+            .await?;
+
+            let projection_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                "SELECT count(*), coalesce(sum(source.projected_value_count), 0), \
+                        (SELECT count(*) FROM remote_media_catalog_stage_query_filter_values AS value \
+                         JOIN remote_media_catalog_stage_items AS item \
+                           ON item.stage_id = value.stage_id AND item.id = value.item_id \
+                         WHERE value.stage_id = ?1 AND item.library_key = ?2), \
+                        (SELECT count(*) \
+                         FROM remote_media_catalog_stage_query_filter_sources AS checked \
+                         JOIN remote_media_catalog_stage_items AS checked_item \
+                           ON checked_item.stage_id = checked.stage_id \
+                          AND checked_item.id = checked.item_id \
+                         WHERE checked.stage_id = ?1 AND checked_item.library_key = ?2 \
+                           AND checked.projected_value_count <> (SELECT count(*) \
+                             FROM remote_media_catalog_stage_query_filter_values AS checked_value \
+                             WHERE checked_value.stage_id = checked.stage_id \
+                               AND checked_value.item_id = checked.item_id)) \
+                 FROM remote_media_catalog_stage_query_filter_sources AS source \
+                 JOIN remote_media_catalog_stage_items AS item \
+                   ON item.stage_id = source.stage_id AND item.id = source.item_id \
+                 WHERE source.stage_id = ?1 AND item.library_key = ?2",
+            )
+            .bind(stage.id())
+            .bind(&library.key)
+            .fetch_one(&mut *tx)
+            .await?;
+            anyhow::ensure!(
+                projection_counts.0 == item_count
+                    && projection_counts.1 == projection_counts.2
+                    && projection_counts.3 == 0,
+                "remote media catalogue stage query-filter coverage mismatch"
+            );
+            sqlx::query(
+                "DELETE FROM media_item_query_filter_sources WHERE item_id IN (\
+                 SELECT id FROM remote_media_catalog_stage_items \
+                 WHERE stage_id = ?1 AND library_key = ?2)",
+            )
+            .bind(stage.id())
+            .bind(&library.key)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_item_query_filter_sources (item_id, virtual_folder_id, extractor_version, \
+                 container_present, container_value, media_type, is_video, has_subtitles, \
+                 has_trailer, projected_value_count, completed_at) \
+                 SELECT source.item_id, ?3, ?4, source.container_present, source.container_value, \
+                        source.media_type, source.is_video, source.has_subtitles, \
+                        source.has_trailer, source.projected_value_count, ?5 \
+                 FROM remote_media_catalog_stage_query_filter_sources AS source \
+                 JOIN remote_media_catalog_stage_items AS item \
+                   ON item.stage_id = source.stage_id AND item.id = source.item_id \
+                 WHERE source.stage_id = ?1 AND item.library_key = ?2",
+            )
+            .bind(stage.id())
+            .bind(&library.key)
+            .bind(&folder_id)
+            .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_item_query_filter_values (item_id, virtual_folder_id, value_kind, display_value, \
+                 source_key, source_priority, source_position) \
+                 SELECT value.item_id, ?3, value.value_kind, value.display_value, value.source_key, \
+                        value.source_priority, value.source_position \
+                 FROM remote_media_catalog_stage_query_filter_values AS value \
+                 JOIN remote_media_catalog_stage_items AS item \
+                   ON item.stage_id = value.stage_id AND item.id = value.item_id \
+                 WHERE value.stage_id = ?1 AND item.library_key = ?2",
+            )
+            .bind(stage.id())
+            .bind(&library.key)
+            .bind(&folder_id)
             .execute(&mut *tx)
             .await?;
 
@@ -9759,6 +10211,7 @@ impl SqliteDatabase {
             let metadata = serde_json::from_str::<Value>(&item.metadata_json)
                 .with_context(|| format!("invalid metadata JSON for media item {}", item.id))?;
             Self::replace_media_item_facets_in_transaction(tx, &item.id, &metadata).await?;
+            replace_sqlite_media_item_query_filter_projection_from_live(tx, &item.id).await?;
         }
 
         Self::rebuild_tv_series_catalog_projection_in_transaction(tx, &folder_id).await?;
@@ -10098,21 +10551,25 @@ impl SqliteDatabase {
     ) -> anyhow::Result<()> {
         let item_id = self.media_item_storage_id(item_id).await?;
         let media_streams_json = serde_json::to_string(&media_streams)?;
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
             r#"
             UPDATE media_items
             SET runtime_ticks = ?2, bitrate = ?3, width = ?4, height = ?5, media_streams_json = ?6
             WHERE id = ?1
         "#,
         )
-        .bind(item_id)
+        .bind(&item_id)
         .bind(runtime_ticks)
         .bind(bitrate)
         .bind(width)
         .bind(height)
         .bind(media_streams_json)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        replace_sqlite_media_item_query_filter_projection_from_live(&mut tx, &item_id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -10138,6 +10595,7 @@ impl SqliteDatabase {
         .await?;
         anyhow::ensure!(result.rows_affected() > 0, "media item not found");
         Self::replace_media_item_facets_in_transaction(&mut tx, &item_id, &metadata).await?;
+        replace_sqlite_media_item_query_filter_projection_from_live(&mut tx, &item_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -10164,6 +10622,7 @@ impl SqliteDatabase {
         .await?;
         anyhow::ensure!(result.rows_affected() > 0, "media item not found");
         Self::replace_media_item_facets_in_transaction(&mut tx, item_id, metadata).await?;
+        replace_sqlite_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -11163,6 +11622,7 @@ impl SqliteDatabase {
                 )
                 .await?
         {
+            let mut tx = self.pool.begin().await?;
             sqlx::query(
                 r#"
                 UPDATE media_items
@@ -11186,14 +11646,18 @@ impl SqliteDatabase {
             .bind(media_info.width)
             .bind(media_info.height)
             .bind(&media_streams_json)
-            .bind(missing_id)
-            .execute(&self.pool)
+            .bind(&missing_id)
+            .execute(&mut *tx)
             .await?;
+            replace_sqlite_media_item_query_filter_projection_from_live(&mut tx, &missing_id)
+                .await?;
+            tx.commit().await?;
             return Ok(());
         }
 
         let existing_id = exact_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
+        let mut base_tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             INSERT INTO media_items (
@@ -11233,8 +11697,11 @@ impl SqliteDatabase {
         .bind(media_info.width)
         .bind(media_info.height)
         .bind(media_streams_json)
-        .execute(&self.pool)
+        .execute(&mut *base_tx)
         .await?;
+        replace_sqlite_media_item_query_filter_projection_from_live(&mut base_tx, &existing_id)
+            .await?;
+        base_tx.commit().await?;
 
         if media_info
             .metadata
@@ -11263,6 +11730,8 @@ impl SqliteDatabase {
                 .unwrap_or_else(|| json!({}));
         let mut merged = current.as_object().cloned().unwrap_or_default();
         if metadata_lock_data(&merged) {
+            replace_sqlite_media_item_query_filter_projection_from_live(&mut transaction, item_id)
+                .await?;
             transaction.commit().await?;
             return Ok(());
         }
@@ -11282,6 +11751,8 @@ impl SqliteDatabase {
             .execute(&mut *transaction)
             .await?;
         replace_sqlite_media_item_facets(&mut transaction, item_id, &metadata).await?;
+        replace_sqlite_media_item_query_filter_projection_from_live(&mut transaction, item_id)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -14873,14 +15344,14 @@ mod tests {
         ActivityLogFilter, ActivityLogSortField, Database, DatabaseDriver, DatabasePoolRole,
         InstallPluginPackage, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
         MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MEDIA_ITEM_FACET_PROJECTION_NAME,
-        MEDIA_ITEM_FACET_PROJECTION_VERSION, MediaItemCatalogQuery, MediaItemCatalogSearchScope,
-        MediaItemFacetCandidateQuery, MediaItemFacetKind, MediaItemFavoriteFilter,
-        PluginRuntimeInstanceUpsert, ProviderSecretReference, ProviderSecretVault,
-        REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS, RemoteMediaItemUpsert,
-        RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, ResumeItemsPageQuery,
-        SortDirection, SystemConfigurationPayloads, UpsertActivePlaybackSession,
-        UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
-        parse_ffprobe_media_info, parse_local_nfo_metadata,
+        MEDIA_ITEM_FACET_PROJECTION_VERSION, MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME,
+        MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemFacetCandidateQuery,
+        MediaItemFacetKind, MediaItemFavoriteFilter, PluginRuntimeInstanceUpsert,
+        ProviderSecretReference, ProviderSecretVault, REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
+        RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec,
+        ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads,
+        UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+        UpsertTranscodeSession, parse_ffprobe_media_info, parse_local_nfo_metadata,
     };
     use serde_json::{Value, json};
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -19891,6 +20362,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_query_filter_projection_invalidates_on_folder_move() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let item_id = Uuid::from_u128(40_000);
+        let source = db
+            .replace_remote_media_library_snapshot(
+                "Projection move source",
+                "movies",
+                "provider://projection-move-source",
+                vec![RemoteMediaItemUpsert {
+                    id: item_id.to_string(),
+                    name: "Moved item".to_string(),
+                    path: "provider://projection-move-source/movie.mkv".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({"Genres": ["Moved"]}),
+                }],
+            )
+            .await
+            .unwrap();
+        let destination = db
+            .replace_remote_media_library_snapshot(
+                "Projection move destination",
+                "movies",
+                "provider://projection-move-destination",
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE media_items SET virtual_folder_id = ?1 WHERE id = ?2")
+            .bind(destination.id.to_string())
+            .bind(item_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM media_item_query_filter_sources WHERE item_id = ?1",
+        )
+        .bind(item_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(
+            db.media_item_query_filter_values(&MediaItemCatalogQuery {
+                virtual_folder_ids: vec![source.id],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap()
+            .genres
+            .is_empty()
+        );
+        assert_eq!(
+            db.media_item_query_filter_values(&MediaItemCatalogQuery {
+                virtual_folder_ids: vec![destination.id],
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap()
+            .genres,
+            ["Moved"]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_query_filter_projection_is_exact_and_fails_closed_on_corruption() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let item_id = Uuid::from_u128(40_001);
+        let folder = db
+            .replace_remote_media_library_snapshot(
+                "Projection fallback",
+                "movies",
+                "provider://projection-fallback",
+                vec![RemoteMediaItemUpsert {
+                    id: item_id.to_string(),
+                    name: "Projection item".to_string(),
+                    path: "provider://projection-fallback/movie.ÉXT".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: vec![json!({"Type": "Subtitle", "Language": "spa"})],
+                    metadata: json!({"Genres": ["Straße", "STRASSE"], "Tags": ["One"]}),
+                }],
+            )
+            .await
+            .unwrap();
+        let query = MediaItemCatalogQuery {
+            virtual_folder_ids: vec![folder.id],
+            ..MediaItemCatalogQuery::default()
+        };
+        let projected = db.media_item_query_filter_values(&query).await.unwrap();
+        assert_eq!(projected.containers, ["Éxt"]);
+        assert_eq!(projected.genres, ["STRASSE", "Straße"]);
+
+        sqlx::query("DELETE FROM media_item_query_filter_sources WHERE item_id = ?1")
+            .bind(item_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.media_item_query_filter_values(&query).await.unwrap(),
+            projected
+        );
+
+        db.rebuild_media_item_query_filter_projection()
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE media_item_query_filter_sources SET projected_value_count = \
+             projected_value_count + 1 WHERE item_id = ?1",
+        )
+        .bind(item_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            db.media_item_query_filter_values(&query).await.unwrap(),
+            projected
+        );
+
+        sqlx::query("UPDATE media_items SET metadata_json = ?1 WHERE id = ?2")
+            .bind(r#"{"Genres":["Changed"]}"#)
+            .bind(item_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM media_item_query_filter_sources WHERE item_id = ?1",
+        )
+        .bind(item_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            db.media_item_query_filter_values(&query)
+                .await
+                .unwrap()
+                .genres,
+            ["Changed"]
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_media_item_facets_are_atomic_idempotent_and_rebuilt_in_batches() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let item_ids = (0..501)
@@ -20201,6 +20825,87 @@ mod tests {
                 filter_selector_count
             ),
             (0, 0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_connect_reconciles_query_filter_marker_without_rebuild() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("query-filter-marker.db");
+        std::fs::File::create(&path).unwrap();
+        let database_url = format!("sqlite://{}", path.display());
+        let db = Database::connect(&database_url).await.unwrap();
+        let item_id = Uuid::new_v4();
+        db.replace_remote_media_library_snapshot(
+            "Persistent query filters",
+            "movies",
+            "provider://persistent-query-filters",
+            vec![RemoteMediaItemUpsert {
+                id: item_id.to_string(),
+                name: "Persistent filters".to_string(),
+                path: "provider://persistent-query-filters/movie.mkv".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({"Genres": ["Drama"], "Tags": ["Stable"]}),
+            }],
+        )
+        .await
+        .unwrap();
+        let source_completed_at: String = sqlx::query_scalar(
+            "SELECT completed_at FROM media_item_query_filter_sources WHERE item_id = ?1",
+        )
+        .bind(item_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_query_filter_rebuild BEFORE DELETE \
+             ON media_item_query_filter_sources BEGIN \
+             SELECT RAISE(ABORT, 'query-filter projection was rebuilt'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        db.pool.close().await;
+
+        let reconciled = Database::connect(&database_url).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT completed_at FROM media_item_query_filter_sources WHERE item_id = ?1",
+            )
+            .bind(item_id.to_string())
+            .fetch_one(&reconciled.pool)
+            .await
+            .unwrap(),
+            source_completed_at
+        );
+        let marker = sqlx::query_as::<_, (i64, i64, String)>(
+            "SELECT source_item_count, projected_facet_count, completed_at \
+             FROM jellyrin_derived_projection_versions WHERE projection_name = ?1",
+        )
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+        .fetch_one(&reconciled.pool)
+        .await
+        .unwrap();
+        assert_eq!((marker.0, marker.1), (1, 2));
+        reconciled.pool.close().await;
+
+        let unchanged = Database::connect(&database_url).await.unwrap();
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, String)>(
+                "SELECT source_item_count, projected_facet_count, completed_at \
+                 FROM jellyrin_derived_projection_versions WHERE projection_name = ?1",
+            )
+            .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+            .fetch_one(&unchanged.pool)
+            .await
+            .unwrap(),
+            marker
         );
     }
 

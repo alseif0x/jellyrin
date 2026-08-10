@@ -692,6 +692,26 @@ pub struct OmittedTableSpec {
 
 pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
     OmittedTableSpec {
+        table: "media_item_query_filter_sources",
+        strategy: "rebuild",
+        reason: "derived exact item-filter source and coverage projection",
+    },
+    OmittedTableSpec {
+        table: "media_item_query_filter_values",
+        strategy: "rebuild",
+        reason: "derived exact item-filter value projection",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_query_filter_sources",
+        strategy: "rebuild",
+        reason: "derived durable-stage item-filter source projection",
+    },
+    OmittedTableSpec {
+        table: "remote_media_catalog_stage_query_filter_values",
+        strategy: "rebuild",
+        reason: "derived durable-stage item-filter value projection",
+    },
+    OmittedTableSpec {
         table: "media_item_tv_series",
         strategy: "rebuild",
         reason: "derived TV series catalogue projection",

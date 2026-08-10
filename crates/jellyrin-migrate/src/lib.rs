@@ -12,7 +12,10 @@ use std::{
 
 use anyhow::Context;
 use futures_util::TryStreamExt;
-use jellyrin_db::{MediaItemFacetProjectionMode, ensure_media_item_facet_projection};
+use jellyrin_db::{
+    MediaItemFacetProjectionMode, ensure_media_item_facet_projection,
+    ensure_media_item_query_filter_projection,
+};
 use report::{MigrationReport, OmittedTableReport, TableReport, ValidationReport};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -34,8 +37,8 @@ use spec::{
 };
 use value::{TypedValue, parse_uuid};
 
-pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_080_116;
-pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_116;
+pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_080_117;
+pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_117;
 const MIN_POSTGRES_VERSION_NUM: i64 = 160_000;
 const MIGRATION_BATCH_ROWS: usize = 500;
 const TARGET_APPLICATION_LOCK_TIMEOUT: &str = "10s";
@@ -154,6 +157,12 @@ pub async fn apply_schema(target_url: &str) -> anyhow::Result<SchemaReport> {
     )
     .await
     .context("failed to ensure PostgreSQL media item facet projection")?;
+    let query_filter_projection = ensure_media_item_query_filter_projection(
+        &mut migration_lock,
+        MediaItemFacetProjectionMode::EnsureCurrent,
+    )
+    .await
+    .context("failed to ensure PostgreSQL media item query-filter projection")?;
     let schema_version_after = postgres_schema_version(&target)
         .await?
         .context("PostgreSQL migration history was not created")?;
@@ -180,7 +189,10 @@ pub async fn apply_schema(target_url: &str) -> anyhow::Result<SchemaReport> {
     Ok(SchemaReport {
         report_version: 1,
         tool_version: env!("CARGO_PKG_VERSION"),
-        status: if applied_migrations == 0 && !facet_projection.rebuilt {
+        status: if applied_migrations == 0
+            && !facet_projection.rebuilt
+            && !query_filter_projection.rebuilt
+        {
             "schema_current"
         } else {
             "schema_migrated"

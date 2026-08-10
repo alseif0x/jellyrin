@@ -8,10 +8,13 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    PostgresDatabase, collect_media_files_if_root_available, media_type_for_path,
-    merge_metadata_values, metadata_lock_data, metadata_lock_key, metadata_locked_fields,
-    postgres_catalog::replace_postgres_media_item_facets, probe_media_info,
-    read_local_nfo_metadata,
+    MediaItemQueryFilterProjectionSource, PostgresDatabase, collect_media_files_if_root_available,
+    extract_media_item_query_filter_projection, media_type_for_path, merge_metadata_values,
+    metadata_lock_data, metadata_lock_key, metadata_locked_fields,
+    postgres_catalog::{
+        replace_postgres_media_item_facets, replace_postgres_media_item_query_filter_projection,
+    },
+    probe_media_info, read_local_nfo_metadata,
 };
 
 impl PostgresDatabase {
@@ -301,6 +304,14 @@ impl PostgresDatabase {
                 .await?
                 .unwrap_or_else(|| json!({}));
         let metadata = merge_scanned_metadata(current_metadata, media_info.metadata);
+        let projection =
+            extract_media_item_query_filter_projection(MediaItemQueryFilterProjectionSource {
+                path: &path,
+                media_type,
+                media_streams: &media_info.media_streams,
+                metadata: &metadata,
+            });
+        let media_streams = serde_json::to_value(&media_info.media_streams)?;
 
         let mut transaction = lock_connection.begin().await?;
         sqlx::query(
@@ -346,11 +357,18 @@ impl PostgresDatabase {
         .bind(media_info.bitrate)
         .bind(media_info.width)
         .bind(media_info.height)
-        .bind(serde_json::to_value(media_info.media_streams)?)
+        .bind(media_streams)
         .bind(&metadata)
         .execute(&mut *transaction)
         .await?;
         replace_postgres_media_item_facets(&mut transaction, item_id, &metadata).await?;
+        replace_postgres_media_item_query_filter_projection(
+            &mut transaction,
+            item_id,
+            folder.id,
+            &projection,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }

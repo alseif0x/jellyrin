@@ -8,22 +8,25 @@ use anyhow::Context;
 use futures_util::TryStreamExt;
 use jellyrin_core::{MediaItem, PlaybackState, VirtualFolder, tv_episode_path_info};
 use serde_json::Value;
-use sqlx::{Postgres, QueryBuilder, Transaction};
+use sqlx::{Acquire, PgConnection, Postgres, QueryBuilder, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
     CatalogSyncCountsRow, CatalogSyncDiagnostics, CatalogSyncRunDiagnostics, DatabasePoolRole,
-    EffectiveTypeCandidateScope, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaItemCatalogCounts,
-    MediaItemCatalogEntry, MediaItemCatalogPage, MediaItemCatalogQuery,
-    MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetCandidateQuery,
-    MediaItemFacetKind, MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary,
-    MediaItemForImageTag, MediaItemMetadata, MediaItemQueryFilterValues, PostgresDatabase,
-    REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, RemoteMediaCatalogStage, RemoteMediaItemUpsert,
-    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection,
-    TV_SERIES_CATALOG_PROJECTION_VERSION, TvSeriesCatalogKey, TvSeriesCatalogPage,
-    catalog_sync_duration_millis, extract_media_item_facets, extract_media_item_filter_selectors,
-    extract_media_item_genre_selectors, is_upcoming_media_item_entry, nonnegative_count,
+    EffectiveTypeCandidateScope, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE,
+    MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION, MediaItemCatalogCounts, MediaItemCatalogEntry,
+    MediaItemCatalogPage, MediaItemCatalogQuery, MediaItemCatalogSearchScope,
+    MediaItemCatalogSortField, MediaItemFacetCandidateQuery, MediaItemFacetKind,
+    MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary, MediaItemForImageTag,
+    MediaItemMetadata, MediaItemQueryFilterProjection, MediaItemQueryFilterProjectionSource,
+    MediaItemQueryFilterValues, PostgresDatabase, REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS,
+    RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot,
+    RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION,
+    TvSeriesCatalogKey, TvSeriesCatalogPage, catalog_sync_duration_millis,
+    encode_media_item_query_filter_position, extract_media_item_facets,
+    extract_media_item_filter_selectors, extract_media_item_genre_selectors,
+    extract_media_item_query_filter_projection, is_upcoming_media_item_entry, nonnegative_count,
     normalized_facet_query_values, prepare_remote_media_library_stage_specs,
     retain_entries_with_effective_types, telemetry::DatabaseOperation,
     upcoming_media_item_premiere_parts, validate_remote_media_catalog_stage_append,
@@ -32,6 +35,7 @@ use super::{
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
 const FACET_STAGE_INSERT_CHUNK_SIZE: usize = 2_000;
 const FACET_REBUILD_BATCH_SIZE: i64 = 500;
+pub const MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME: &str = "media_item_query_filter_values";
 
 pub const MEDIA_ITEM_FACET_PROJECTION_NAME: &str = "media_item_facets";
 pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 4;
@@ -48,6 +52,225 @@ pub struct MediaItemFacetProjectionReport {
     pub source_item_count: u64,
     pub projected_facet_count: u64,
     pub projected_alias_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaItemQueryFilterProjectionReport {
+    pub rebuilt: bool,
+    pub source_item_count: u64,
+    pub projected_value_count: u64,
+}
+
+pub async fn ensure_media_item_query_filter_projection(
+    tx: &mut Transaction<'_, Postgres>,
+    mode: MediaItemFacetProjectionMode,
+) -> anyhow::Result<MediaItemQueryFilterProjectionReport> {
+    let marker = sqlx::query_as::<_, (i32, i64, i64)>(
+        "SELECT extractor_version, source_item_count, projected_facet_count \
+         FROM jellyrin_derived_projection_versions WHERE projection_name = $1",
+    )
+    .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((version, source_count, value_count)) = marker {
+        anyhow::ensure!(
+            version <= MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION,
+            "media item query-filter projection version {version} is newer than supported version {MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION}"
+        );
+        if mode == MediaItemFacetProjectionMode::EnsureCurrent
+            && version == MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION
+        {
+            let actual = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                "WITH value_counts AS (\
+                     SELECT item_id, count(*) AS value_count \
+                     FROM media_item_query_filter_values GROUP BY item_id\
+                 ) \
+                 SELECT (SELECT count(*) FROM media_items), \
+                        count(*) FILTER (WHERE source.extractor_version = $1), \
+                        coalesce(sum(value_counts.value_count), 0)::bigint, \
+                        count(*) FILTER (WHERE source.projected_value_count \
+                            <> coalesce(value_counts.value_count, 0)) \
+                 FROM media_item_query_filter_sources AS source \
+                 LEFT JOIN value_counts ON value_counts.item_id = source.item_id",
+            )
+            .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+            .fetch_one(&mut **tx)
+            .await?;
+            if actual.0 == actual.1 && actual.3 == 0 {
+                if source_count != actual.0 || value_count != actual.2 {
+                    sqlx::query(
+                        "UPDATE jellyrin_derived_projection_versions \
+                         SET source_item_count = $2, projected_facet_count = $3, \
+                             completed_at = CURRENT_TIMESTAMP \
+                         WHERE projection_name = $1 \
+                           AND (source_item_count, projected_facet_count) \
+                               IS DISTINCT FROM ($2, $3)",
+                    )
+                    .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+                    .bind(actual.0)
+                    .bind(actual.2)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+                return Ok(MediaItemQueryFilterProjectionReport {
+                    rebuilt: false,
+                    source_item_count: u64::try_from(actual.0)
+                        .context("negative query-filter projection source count")?,
+                    projected_value_count: u64::try_from(actual.2)
+                        .context("negative query-filter projection value count")?,
+                });
+            }
+        }
+    }
+
+    sqlx::query("SET LOCAL lock_timeout = '10s'")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "LOCK TABLE media_items, media_item_query_filter_sources, \
+         media_item_query_filter_values IN SHARE ROW EXCLUSIVE MODE",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM media_item_query_filter_sources")
+        .execute(&mut **tx)
+        .await?;
+
+    let mut last_item_id = None::<Uuid>;
+    let mut source_item_count = 0_u64;
+    let mut projected_value_count = 0_u64;
+    loop {
+        let rows = if let Some(last_item_id) = last_item_id {
+            sqlx::query_as::<_, (Uuid, Uuid, String, String, Value, Value)>(
+                "SELECT id, virtual_folder_id, path, media_type, media_streams, metadata FROM media_items \
+                 WHERE id > $1 ORDER BY id LIMIT $2",
+            )
+            .bind(last_item_id)
+            .bind(FACET_REBUILD_BATCH_SIZE)
+            .fetch_all(&mut **tx)
+            .await?
+        } else {
+            sqlx::query_as::<_, (Uuid, Uuid, String, String, Value, Value)>(
+                "SELECT id, virtual_folder_id, path, media_type, media_streams, metadata FROM media_items \
+                 ORDER BY id LIMIT $1",
+            )
+            .bind(FACET_REBUILD_BATCH_SIZE)
+            .fetch_all(&mut **tx)
+            .await?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let projections = rows
+            .iter()
+            .map(
+                |(item_id, folder_id, path, media_type, media_streams, metadata)| {
+                    let streams = media_streams.as_array().map(Vec::as_slice).unwrap_or(&[]);
+                    let projection = (
+                        *item_id,
+                        *folder_id,
+                        extract_media_item_query_filter_projection(
+                            MediaItemQueryFilterProjectionSource {
+                                path,
+                                media_type,
+                                media_streams: streams,
+                                metadata,
+                            },
+                        ),
+                    );
+                    let projected_value_count = i32::try_from(projection.2.values.len())
+                        .context("query-filter value count overflow")?;
+                    Ok((
+                        projection.0,
+                        projection.1,
+                        projection.2,
+                        projected_value_count,
+                    ))
+                },
+            )
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut source_insert = QueryBuilder::<Postgres>::new(
+            "INSERT INTO media_item_query_filter_sources (item_id, virtual_folder_id, extractor_version, \
+             container_present, container_value, media_type, is_video, has_subtitles, \
+             has_trailer, projected_value_count, completed_at) ",
+        );
+        source_insert.push_values(
+            &projections,
+            |mut values, (item_id, folder_id, projection, projected_value_count)| {
+                values
+                    .push_bind(*item_id)
+                    .push_bind(*folder_id)
+                    .push_bind(projection.extractor_version)
+                    .push_bind(projection.features.container_present)
+                    .push_bind(&projection.features.container)
+                    .push_bind(&projection.features.media_type)
+                    .push_bind(projection.features.is_video)
+                    .push_bind(projection.features.has_subtitles)
+                    .push_bind(projection.features.has_trailer)
+                    .push_bind(*projected_value_count)
+                    .push("CURRENT_TIMESTAMP");
+            },
+        );
+        source_insert.build().execute(&mut **tx).await?;
+        let projected_values = projections
+            .iter()
+            .flat_map(|(item_id, folder_id, projection, _)| {
+                projection
+                    .values
+                    .iter()
+                    .map(move |value| (*item_id, *folder_id, value))
+            })
+            .collect::<Vec<_>>();
+        for chunk in projected_values.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut insert = QueryBuilder::<Postgres>::new(
+                "INSERT INTO media_item_query_filter_values (item_id, virtual_folder_id, value_kind, \
+                 display_value, source_key, source_priority, source_position) ",
+            );
+            insert.push_values(chunk, |mut values, (item_id, folder_id, value)| {
+                values
+                    .push_bind(*item_id)
+                    .push_bind(*folder_id)
+                    .push_bind(value.kind.as_str())
+                    .push_bind(&value.display_value)
+                    .push_bind(&value.source_key)
+                    .push_bind(i32::from(value.source_priority))
+                    .push_bind(encode_media_item_query_filter_position(&value.position));
+            });
+            insert.build().execute(&mut **tx).await?;
+        }
+        source_item_count = source_item_count
+            .checked_add(u64::try_from(projections.len()).context("source count overflow")?)
+            .context("source count overflow")?;
+        projected_value_count = projected_value_count
+            .checked_add(u64::try_from(projected_values.len()).context("value count overflow")?)
+            .context("value count overflow")?;
+        last_item_id = rows.last().map(|row| row.0);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO jellyrin_derived_projection_versions (
+            projection_name, extractor_version, completed_at, source_item_count,
+            projected_facet_count, projected_alias_count
+        ) VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, 0)
+        ON CONFLICT (projection_name) DO UPDATE SET
+            extractor_version = excluded.extractor_version,
+            completed_at = excluded.completed_at,
+            source_item_count = excluded.source_item_count,
+            projected_facet_count = excluded.projected_facet_count,
+            projected_alias_count = 0
+        "#,
+    )
+    .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+    .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+    .bind(i64::try_from(source_item_count).context("query-filter source count overflow")?)
+    .bind(i64::try_from(projected_value_count).context("query-filter value count overflow")?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(MediaItemQueryFilterProjectionReport {
+        rebuilt: true,
+        source_item_count,
+        projected_value_count,
+    })
 }
 
 pub async fn ensure_media_item_facet_projection(
@@ -894,6 +1117,175 @@ impl PostgresDatabase {
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
         super::validate_media_item_catalog_query(query)?;
+        let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
+        let connection_result = self.pool.acquire().await;
+        acquire.finish_result(&connection_result);
+        let mut connection = connection_result?;
+        let mut transaction = connection.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+
+        let mut coverage = QueryBuilder::<Postgres>::new(
+            "WITH selected AS MATERIALIZED (SELECT item.id, item.virtual_folder_id ",
+        );
+        push_postgres_catalog_from(&mut coverage, query);
+        push_postgres_catalog_filters(&mut coverage, query);
+        if query.virtual_folder_ids.len() == 1 {
+            coverage.push(
+                "), value_counts AS (\
+                 SELECT projected.item_id, projected.virtual_folder_id, count(*) AS value_count \
+                 FROM media_item_query_filter_values AS projected \
+                 WHERE projected.virtual_folder_id = ANY(",
+            );
+            coverage.push_bind(&query.virtual_folder_ids);
+            coverage.push(
+                ") GROUP BY projected.item_id, projected.virtual_folder_id\
+                 ) SELECT (SELECT count(*) FROM selected) = count(source.item_id) \
+                    AND coalesce(bool_and(source.projected_value_count \
+                        = coalesce(value_counts.value_count, 0)), TRUE) \
+                 FROM selected \
+                 JOIN media_item_query_filter_sources AS source \
+                   ON source.item_id = selected.id \
+                  AND source.virtual_folder_id = selected.virtual_folder_id \
+                  AND source.extractor_version = ",
+            );
+            coverage.push_bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION);
+            coverage.push(
+                " LEFT JOIN value_counts \
+                    ON value_counts.item_id = selected.id \
+                   AND value_counts.virtual_folder_id = selected.virtual_folder_id",
+            );
+        } else {
+            coverage.push(
+                ") SELECT NOT EXISTS (\
+             SELECT 1 FROM selected \
+             LEFT JOIN media_item_query_filter_sources AS source \
+               ON source.item_id = selected.id \
+              AND source.virtual_folder_id = selected.virtual_folder_id \
+              AND source.extractor_version = ",
+            );
+            coverage.push_bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION);
+            coverage.push(
+                " WHERE source.item_id IS NULL OR source.projected_value_count <> (\
+                SELECT count(*) FROM media_item_query_filter_values AS projected \
+                WHERE projected.item_id = selected.id \
+                  AND projected.virtual_folder_id = selected.virtual_folder_id))",
+            );
+        }
+        let covered = coverage
+            .build_query_scalar::<bool>()
+            .fetch_one(&mut *transaction)
+            .await?;
+        let result = if covered {
+            sqlx::query("SET LOCAL work_mem = '32MB'")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("SET LOCAL jit = off")
+                .execute(&mut *transaction)
+                .await?;
+            Self::media_item_query_filter_values_projected(query, &mut transaction).await
+        } else {
+            Self::media_item_query_filter_values_legacy(query, &mut transaction).await
+        };
+        transaction.commit().await?;
+        result
+    }
+
+    async fn media_item_query_filter_values_projected(
+        query: &MediaItemCatalogQuery,
+        connection: &mut PgConnection,
+    ) -> anyhow::Result<MediaItemQueryFilterValues> {
+        let mut values = QueryBuilder::<Postgres>::new(
+            "WITH selected AS MATERIALIZED (SELECT item.id, item.virtual_folder_id, lower(item.name) AS item_sort ",
+        );
+        push_postgres_catalog_from(&mut values, query);
+        push_postgres_catalog_filters(&mut values, query);
+        values.push(
+            r#"), candidates(kind, normalized_value, display_value, item_sort, item_id,
+                             key_priority, position) AS (
+                SELECT projected.value_kind, lower(btrim(projected.display_value)),
+                       projected.display_value, selected.item_sort, selected.id,
+                       projected.source_priority, projected.source_position
+            "#,
+        );
+        if query.virtual_folder_ids.len() == 1 {
+            values.push(
+                " FROM media_item_query_filter_values AS projected \
+                  JOIN selected ON selected.id = projected.item_id \
+                   AND selected.virtual_folder_id = projected.virtual_folder_id \
+                  WHERE projected.virtual_folder_id = ANY(",
+            );
+            values.push_bind(&query.virtual_folder_ids);
+            values.push(")");
+        } else {
+            values.push(
+                r#" FROM selected
+                    CROSS JOIN LATERAL (
+                        SELECT value.value_kind, value.display_value, value.source_priority,
+                               value.source_position
+                        FROM media_item_query_filter_values AS value
+                        WHERE value.item_id = selected.id
+                          AND value.virtual_folder_id = selected.virtual_folder_id
+                        OFFSET 0
+                    ) AS projected"#,
+            );
+        }
+        values.push(
+            r#" UNION ALL
+                SELECT scalar.kind, scalar.normalized_value, scalar.display_value,
+                       selected.item_sort, selected.id, 0, ''
+                FROM selected
+                CROSS JOIN LATERAL (
+                    SELECT source.container_value, source.container_present, source.media_type,
+                           source.is_video, source.has_subtitles, source.has_trailer,
+                           source.virtual_folder_id
+                    FROM media_item_query_filter_sources AS source
+                    WHERE source.item_id = selected.id
+                      AND source.virtual_folder_id = selected.virtual_folder_id
+                    OFFSET 0
+                ) AS source
+                CROSS JOIN LATERAL (VALUES
+                    ('containers', lower(source.container_value),
+                     lower(source.container_value), source.container_present),
+                    ('media_types', source.media_type, source.media_type, TRUE),
+                    ('video_types', 'videofile', 'VideoFile', source.is_video),
+                    ('has_subtitles', 'true', 'true', source.has_subtitles),
+                    ('has_trailer', 'true', 'true', source.has_trailer)
+                ) AS scalar(kind, normalized_value, display_value, present)
+                WHERE scalar.present
+            "#,
+        );
+        if query.virtual_folder_ids.len() == 1 {
+            values.push(" AND source.virtual_folder_id = ANY(");
+            values.push_bind(&query.virtual_folder_ids);
+            values.push(")");
+        }
+        values.push(
+            r#"), ranked AS (
+                SELECT kind, normalized_value, display_value,
+                       row_number() OVER (
+                           PARTITION BY kind, normalized_value
+                           ORDER BY item_sort COLLATE "C", item_id, key_priority, position
+                       ) AS spelling_rank
+                FROM candidates
+            )
+            SELECT kind, display_value
+            FROM ranked WHERE spelling_rank = 1
+            ORDER BY kind COLLATE "C", normalized_value COLLATE "C"
+            "#,
+        );
+        let rows = values
+            .build_query_as::<PostgresQueryFilterValueRow>()
+            .fetch_all(connection)
+            .await?;
+        postgres_query_filter_values_from_rows(rows)
+    }
+
+    async fn media_item_query_filter_values_legacy(
+        query: &MediaItemCatalogQuery,
+        connection: &mut PgConnection,
+    ) -> anyhow::Result<MediaItemQueryFilterValues> {
         let mut values = QueryBuilder::<Postgres>::new(
             "WITH RECURSIVE selected AS MATERIALIZED (\
              SELECT item.id, lower(item.name) AS item_sort, item.path, item.media_type, \
@@ -913,8 +1305,6 @@ impl PostgresDatabase {
                 CROSS JOIN (VALUES
                     ('albums', 'Album', 0),
                     ('albums', 'AlbumName', 1),
-                    ('artists', 'Artists', 0),
-                    ('artists', 'AlbumArtists', 1),
                     ('genres', 'Genres', 0),
                     ('official_ratings', 'OfficialRating', 0),
                     ('official_ratings', 'OfficialRatings', 1),
@@ -922,8 +1312,6 @@ impl PostgresDatabase {
                     ('staff_names', 'People', 0),
                     ('staff_names', 'SeriesPeople', 1),
                     ('studios', 'Studios', 0),
-                    ('tags', 'Tags', 0),
-                    ('years', 'ProductionYear', 0),
                     ('years', 'Years', 1)
                 ) AS mapping(kind, key, key_priority)
                 WHERE selected.metadata ? mapping.key
@@ -970,6 +1358,32 @@ impl PostgresDatabase {
                        item_sort, item_id, key_priority, position, FALSE
                 FROM expanded_metadata
                 WHERE kind <> 'trailer_source'
+            ),
+            projected_metadata_values(
+                kind, display_value, item_sort, item_id, key_priority, position,
+                preserve_empty
+            ) AS (
+                SELECT CASE facet.facet_kind
+                           WHEN 'music_artist' THEN 'artists'
+                           WHEN 'music_album_artist' THEN 'artists'
+                           WHEN 'tag' THEN 'tags'
+                           WHEN 'year' THEN 'years'
+                       END,
+                       facet.display_value, selected.item_sort, selected.id,
+                       CASE facet.facet_kind
+                           WHEN 'music_album_artist' THEN 1 ELSE 0
+                       END,
+                       ARRAY[facet.position::bigint], FALSE
+                FROM selected
+                JOIN media_item_facets AS facet ON facet.item_id = selected.id
+                WHERE (
+                    (facet.facet_kind = 'music_artist' AND selected.metadata ? 'Artists')
+                    OR (facet.facet_kind = 'music_album_artist'
+                        AND selected.metadata ? 'AlbumArtists')
+                    OR (facet.facet_kind = 'tag' AND selected.metadata ? 'Tags')
+                    OR (facet.facet_kind = 'year'
+                        AND selected.metadata ? 'ProductionYear')
+                )
             ),
             stream_values(
                 kind, display_value, item_sort, item_id, key_priority, position,
@@ -1055,6 +1469,8 @@ impl PostgresDatabase {
             ) AS (
                 SELECT * FROM metadata_values
                 UNION ALL
+                SELECT * FROM projected_metadata_values
+                UNION ALL
                 SELECT * FROM stream_values
                 UNION ALL
                 SELECT * FROM item_values
@@ -1080,37 +1496,11 @@ impl PostgresDatabase {
             "#,
         );
 
-        let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
-        let connection_result = self.pool.acquire().await;
-        acquire.finish_result(&connection_result);
-        let mut connection = connection_result?;
         let rows = values
             .build_query_as::<PostgresQueryFilterValueRow>()
-            .fetch_all(&mut *connection)
+            .fetch_all(connection)
             .await?;
-        let mut result = MediaItemQueryFilterValues::default();
-        for row in rows {
-            match row.kind.as_str() {
-                "albums" => result.albums.push(row.display_value),
-                "artists" => result.artists.push(row.display_value),
-                "audio_languages" => result.audio_languages.push(row.display_value),
-                "containers" => result.containers.push(row.display_value),
-                "genres" => result.genres.push(row.display_value),
-                "has_subtitles" => result.has_subtitles = true,
-                "has_trailer" => result.has_trailer = true,
-                "media_types" => result.media_types.push(row.display_value),
-                "official_ratings" => result.official_ratings.push(row.display_value),
-                "series_statuses" => result.series_statuses.push(row.display_value),
-                "staff_names" => result.staff_names.push(row.display_value),
-                "studios" => result.studios.push(row.display_value),
-                "subtitle_languages" => result.subtitle_languages.push(row.display_value),
-                "tags" => result.tags.push(row.display_value),
-                "video_types" => result.video_types.push(row.display_value),
-                "years" => result.years.push(row.display_value),
-                unexpected => anyhow::bail!("unexpected PostgreSQL item-filter kind {unexpected}"),
-            }
-        }
-        Ok(result)
+        postgres_query_filter_values_from_rows(rows)
     }
 
     pub async fn tv_series_lookup_candidates(&self) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
@@ -1971,13 +2361,15 @@ impl PostgresDatabase {
         sqlx::query(
             r#"
             INSERT INTO remote_media_catalog_stages (
-                id, status, extractor_version, created_at, updated_at
+                id, status, extractor_version, query_filter_extractor_version,
+                created_at, updated_at
             )
-            VALUES ($1, 'open', $2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES ($1, 'open', $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             "#,
         )
         .bind(stage_id)
         .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
         .execute(&mut *tx)
         .await?;
         for library in libraries {
@@ -2020,18 +2412,23 @@ impl PostgresDatabase {
             .map(PreparedRemoteMediaItem::try_from)
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut tx = self.worker_pool.begin().await?;
-        let (status, extractor_version) = sqlx::query_as::<_, (String, i32)>(
-            "SELECT status, extractor_version \
+        let (status, extractor_version, query_filter_version) =
+            sqlx::query_as::<_, (String, i32, i32)>(
+                "SELECT status, extractor_version, query_filter_extractor_version \
              FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
-        )
-        .bind(stage_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .context("remote media catalogue stage not found")?;
+            )
+            .bind(stage_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("remote media catalogue stage not found")?;
         anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
         anyhow::ensure!(
             extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
             "remote media catalogue stage extractor version is stale"
+        );
+        anyhow::ensure!(
+            query_filter_version == MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION,
+            "remote media catalogue stage query-filter extractor version is stale"
         );
         let appended_count = i64::try_from(prepared.len())
             .context("remote media catalogue stage append count overflow")?;
@@ -2080,6 +2477,72 @@ impl PostgresDatabase {
                 .push_bind(&item.metadata);
         });
         item_query.build().execute(&mut *tx).await?;
+
+        let query_filter_projections = prepared
+            .iter()
+            .map(|item| {
+                let streams = item
+                    .media_streams
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let projection = extract_media_item_query_filter_projection(
+                    MediaItemQueryFilterProjectionSource {
+                        path: &item.path,
+                        media_type: &item.media_type,
+                        media_streams: streams,
+                        metadata: &item.metadata,
+                    },
+                );
+                let value_count = i32::try_from(projection.values.len())
+                    .context("staged query-filter value count overflow")?;
+                Ok((item.id, projection, value_count))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if !query_filter_projections.is_empty() {
+            let mut sources = QueryBuilder::<Postgres>::new(
+                "INSERT INTO remote_media_catalog_stage_query_filter_sources (stage_id, item_id, \
+                 container_present, container_value, media_type, is_video, has_subtitles, \
+                 has_trailer, projected_value_count) ",
+            );
+            sources.push_values(
+                &query_filter_projections,
+                |mut row, (item_id, projection, value_count)| {
+                    row.push_bind(stage_id)
+                        .push_bind(*item_id)
+                        .push_bind(projection.features.container_present)
+                        .push_bind(&projection.features.container)
+                        .push_bind(&projection.features.media_type)
+                        .push_bind(projection.features.is_video)
+                        .push_bind(projection.features.has_subtitles)
+                        .push_bind(projection.features.has_trailer)
+                        .push_bind(*value_count);
+                },
+            );
+            sources.build().execute(&mut *tx).await?;
+        }
+        let query_filter_values = query_filter_projections
+            .iter()
+            .flat_map(|(item_id, projection, _)| {
+                projection.values.iter().map(move |value| (*item_id, value))
+            })
+            .collect::<Vec<_>>();
+        for chunk in query_filter_values.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+            let mut values = QueryBuilder::<Postgres>::new(
+                "INSERT INTO remote_media_catalog_stage_query_filter_values (stage_id, item_id, \
+                 value_kind, display_value, source_key, source_priority, source_position) ",
+            );
+            values.push_values(chunk, |mut row, (item_id, value)| {
+                row.push_bind(stage_id)
+                    .push_bind(*item_id)
+                    .push_bind(value.kind.as_str())
+                    .push_bind(&value.display_value)
+                    .push_bind(&value.source_key)
+                    .push_bind(i32::from(value.source_priority))
+                    .push_bind(encode_media_item_query_filter_position(&value.position));
+            });
+            values.build().execute(&mut *tx).await?;
+        }
 
         let mut facets = Vec::new();
         for item in &prepared {
@@ -2272,18 +2735,23 @@ impl PostgresDatabase {
     ) -> anyhow::Result<Vec<VirtualFolder>> {
         let stage_id = stage.parsed_id()?;
         let mut tx = self.worker_pool.begin().await?;
-        let (status, extractor_version) = sqlx::query_as::<_, (String, i32)>(
-            "SELECT status, extractor_version \
+        let (status, extractor_version, query_filter_version) =
+            sqlx::query_as::<_, (String, i32, i32)>(
+                "SELECT status, extractor_version, query_filter_extractor_version \
              FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
-        )
-        .bind(stage_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .context("remote media catalogue stage not found")?;
+            )
+            .bind(stage_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("remote media catalogue stage not found")?;
         anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
         anyhow::ensure!(
             extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
             "remote media catalogue stage extractor version is stale"
+        );
+        anyhow::ensure!(
+            query_filter_version == MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION,
+            "remote media catalogue stage query-filter extractor version is stale"
         );
         let rows = sqlx::query_as::<_, (String, i16, String, String, String, i64)>(
             r#"
@@ -2497,11 +2965,43 @@ impl PostgresDatabase {
         .execute(&mut **tx)
         .await?;
         sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_query_filter_source_stage (
+                item_id uuid PRIMARY KEY,
+                container_present boolean NOT NULL,
+                container_value text,
+                media_type text NOT NULL,
+                is_video boolean NOT NULL,
+                has_subtitles boolean NOT NULL,
+                has_trailer boolean NOT NULL,
+                projected_value_count integer NOT NULL
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_query_filter_value_stage (
+                item_id uuid NOT NULL,
+                value_kind text NOT NULL,
+                display_value text NOT NULL,
+                source_key text NOT NULL,
+                source_priority integer NOT NULL,
+                source_position text NOT NULL,
+                PRIMARY KEY (item_id, value_kind, source_key, source_position)
+            ) ON COMMIT DROP
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
             "TRUNCATE jellyrin_remote_snapshot_stage, \
              jellyrin_media_item_facet_alias_stage, jellyrin_media_item_facet_stage, \
              jellyrin_media_item_genre_selector_stage, \
              jellyrin_media_item_filter_selector_stage, \
-             jellyrin_media_item_upcoming_date_stage",
+             jellyrin_media_item_upcoming_date_stage, jellyrin_query_filter_value_stage, \
+             jellyrin_query_filter_source_stage",
         )
         .execute(&mut **tx)
         .await?;
@@ -2600,6 +3100,61 @@ impl PostgresDatabase {
         .bind(library_key)
         .execute(&mut **tx)
         .await?;
+        let projected_sources = sqlx::query(
+            r#"
+            INSERT INTO jellyrin_query_filter_source_stage (
+                item_id, container_present, container_value, media_type, is_video,
+                has_subtitles, has_trailer, projected_value_count
+            )
+            SELECT source.item_id, source.container_present, source.container_value,
+                   source.media_type, source.is_video, source.has_subtitles,
+                   source.has_trailer, source.projected_value_count
+            FROM remote_media_catalog_stage_query_filter_sources AS source
+            JOIN remote_media_catalog_stage_items AS item
+              ON item.stage_id = source.stage_id AND item.id = source.item_id
+            WHERE source.stage_id = $1 AND item.library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO jellyrin_query_filter_value_stage (
+                item_id, value_kind, display_value, source_key, source_priority, source_position
+            )
+            SELECT value.item_id, value.value_kind, value.display_value, value.source_key,
+                   value.source_priority, value.source_position
+            FROM remote_media_catalog_stage_query_filter_values AS value
+            JOIN remote_media_catalog_stage_items AS item
+              ON item.stage_id = value.stage_id AND item.id = value.item_id
+            WHERE value.stage_id = $1 AND item.library_key = $2
+            "#,
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        anyhow::ensure!(
+            projected_sources.rows_affected() == inserted.rows_affected(),
+            "remote media catalogue stage query-filter source coverage is incomplete"
+        );
+        let projection_counts = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT coalesce(sum(projected_value_count), 0), \
+                    (SELECT count(*) FROM jellyrin_query_filter_value_stage), \
+                    (SELECT count(*) FROM jellyrin_query_filter_source_stage AS source \
+                     WHERE source.projected_value_count <> (SELECT count(*) \
+                       FROM jellyrin_query_filter_value_stage AS value \
+                       WHERE value.item_id = source.item_id)) \
+             FROM jellyrin_query_filter_source_stage",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        anyhow::ensure!(
+            projection_counts.0 == projection_counts.1 && projection_counts.2 == 0,
+            "remote media catalogue stage query-filter value coverage is incomplete"
+        );
         Ok(inserted.rows_affected())
     }
 
@@ -2840,6 +3395,24 @@ impl PostgresDatabase {
             )
             .execute(&mut **tx)
             .await?;
+            sqlx::query(
+                "CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_query_filter_source_stage (\
+                 item_id uuid PRIMARY KEY, container_present boolean NOT NULL, \
+                 container_value text, media_type text NOT NULL, is_video boolean NOT NULL, \
+                 has_subtitles boolean NOT NULL, has_trailer boolean NOT NULL, \
+                 projected_value_count integer NOT NULL) ON COMMIT DROP",
+            )
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_query_filter_value_stage (\
+                 item_id uuid NOT NULL, value_kind text NOT NULL, display_value text NOT NULL, \
+                 source_key text NOT NULL, source_priority integer NOT NULL, \
+                 source_position text NOT NULL, \
+                 PRIMARY KEY (item_id, value_kind, source_key, source_position)) ON COMMIT DROP",
+            )
+            .execute(&mut **tx)
+            .await?;
             sqlx::query("TRUNCATE jellyrin_media_item_facet_stage")
                 .execute(&mut **tx)
                 .await?;
@@ -2855,6 +3428,11 @@ impl PostgresDatabase {
             sqlx::query("TRUNCATE jellyrin_media_item_filter_selector_stage")
                 .execute(&mut **tx)
                 .await?;
+            sqlx::query(
+                "TRUNCATE jellyrin_query_filter_value_stage, jellyrin_query_filter_source_stage",
+            )
+            .execute(&mut **tx)
+            .await?;
 
             for chunk in prepared.chunks(REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE) {
                 let mut query = QueryBuilder::<Postgres>::new(
@@ -2877,6 +3455,68 @@ impl PostgresDatabase {
                         .push_bind(&item.metadata);
                 });
                 query.build().execute(&mut **tx).await?;
+
+                let projections = chunk
+                    .iter()
+                    .map(|item| {
+                        let streams = item
+                            .media_streams
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]);
+                        let projection = extract_media_item_query_filter_projection(
+                            MediaItemQueryFilterProjectionSource {
+                                path: &item.path,
+                                media_type: &item.media_type,
+                                media_streams: streams,
+                                metadata: &item.metadata,
+                            },
+                        );
+                        let value_count = i32::try_from(projection.values.len())
+                            .context("prepared query-filter value count overflow")?;
+                        Ok((item.id, projection, value_count))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                let mut sources = QueryBuilder::<Postgres>::new(
+                    "INSERT INTO jellyrin_query_filter_source_stage (item_id, \
+                     container_present, container_value, media_type, is_video, has_subtitles, \
+                     has_trailer, projected_value_count) ",
+                );
+                sources.push_values(
+                    &projections,
+                    |mut row, (item_id, projection, value_count)| {
+                        row.push_bind(*item_id)
+                            .push_bind(projection.features.container_present)
+                            .push_bind(&projection.features.container)
+                            .push_bind(&projection.features.media_type)
+                            .push_bind(projection.features.is_video)
+                            .push_bind(projection.features.has_subtitles)
+                            .push_bind(projection.features.has_trailer)
+                            .push_bind(*value_count);
+                    },
+                );
+                sources.build().execute(&mut **tx).await?;
+                let values = projections
+                    .iter()
+                    .flat_map(|(item_id, projection, _)| {
+                        projection.values.iter().map(move |value| (*item_id, value))
+                    })
+                    .collect::<Vec<_>>();
+                for value_chunk in values.chunks(FACET_STAGE_INSERT_CHUNK_SIZE) {
+                    let mut insert = QueryBuilder::<Postgres>::new(
+                        "INSERT INTO jellyrin_query_filter_value_stage (item_id, value_kind, \
+                         display_value, source_key, source_priority, source_position) ",
+                    );
+                    insert.push_values(value_chunk, |mut row, (item_id, value)| {
+                        row.push_bind(*item_id)
+                            .push_bind(value.kind.as_str())
+                            .push_bind(&value.display_value)
+                            .push_bind(&value.source_key)
+                            .push_bind(i32::from(value.source_priority))
+                            .push_bind(encode_media_item_query_filter_position(&value.position));
+                    });
+                    insert.build().execute(&mut **tx).await?;
+                }
 
                 let mut facets = Vec::new();
                 for item in chunk {
@@ -2997,6 +3637,24 @@ impl PostgresDatabase {
                     query.build().execute(&mut **tx).await?;
                 }
             }
+            let projection_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                "SELECT count(*), coalesce(sum(projected_value_count), 0), \
+                        (SELECT count(*) FROM jellyrin_query_filter_value_stage), \
+                        (SELECT count(*) FROM jellyrin_query_filter_source_stage AS source \
+                         WHERE source.projected_value_count <> (SELECT count(*) \
+                           FROM jellyrin_query_filter_value_stage AS value \
+                           WHERE value.item_id = source.item_id)) \
+                 FROM jellyrin_query_filter_source_stage",
+            )
+            .fetch_one(&mut **tx)
+            .await?;
+            anyhow::ensure!(
+                projection_counts.0
+                    == i64::try_from(prepared.len()).context("projection source count overflow")?
+                    && projection_counts.1 == projection_counts.2
+                    && projection_counts.3 == 0,
+                "prepared query-filter projection coverage mismatch"
+            );
             Ok(())
         }
         .await;
@@ -3299,6 +3957,119 @@ impl PostgresDatabase {
         .execute(&mut **tx)
         .await?;
 
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_query_filter_sources (
+                item_id, virtual_folder_id, extractor_version, container_present, container_value, media_type,
+                is_video, has_subtitles, has_trailer, projected_value_count, completed_at
+            )
+            SELECT item_id, $2, $1, container_present, container_value, media_type, is_video,
+                   has_subtitles, has_trailer, projected_value_count, CURRENT_TIMESTAMP
+            FROM jellyrin_query_filter_source_stage
+            WHERE TRUE
+            ON CONFLICT (item_id) DO UPDATE SET
+                virtual_folder_id = excluded.virtual_folder_id,
+                extractor_version = excluded.extractor_version,
+                container_present = excluded.container_present,
+                container_value = excluded.container_value,
+                media_type = excluded.media_type,
+                is_video = excluded.is_video,
+                has_subtitles = excluded.has_subtitles,
+                has_trailer = excluded.has_trailer,
+                projected_value_count = excluded.projected_value_count,
+                completed_at = excluded.completed_at
+            WHERE (media_item_query_filter_sources.virtual_folder_id,
+                   media_item_query_filter_sources.extractor_version,
+                   media_item_query_filter_sources.container_present,
+                   media_item_query_filter_sources.container_value,
+                   media_item_query_filter_sources.media_type,
+                   media_item_query_filter_sources.is_video,
+                   media_item_query_filter_sources.has_subtitles,
+                   media_item_query_filter_sources.has_trailer,
+                   media_item_query_filter_sources.projected_value_count)
+                IS DISTINCT FROM
+                  (excluded.virtual_folder_id, excluded.extractor_version,
+                   excluded.container_present, excluded.container_value,
+                   excluded.media_type, excluded.is_video, excluded.has_subtitles,
+                   excluded.has_trailer, excluded.projected_value_count)
+            "#,
+        )
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .bind(folder_id)
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM media_item_query_filter_values AS current
+            USING jellyrin_remote_snapshot_stage AS item_stage
+            WHERE current.item_id = item_stage.id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM jellyrin_query_filter_value_stage AS staged
+                  WHERE staged.item_id = current.item_id
+                    AND staged.value_kind = current.value_kind
+                    AND staged.source_key = current.source_key
+                    AND staged.source_position = current.source_position
+              )
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_query_filter_values (
+                item_id, virtual_folder_id, value_kind, display_value, source_key,
+                source_priority, source_position
+            )
+            SELECT item_id, $1, value_kind, display_value, source_key,
+                   source_priority, source_position
+            FROM jellyrin_query_filter_value_stage
+            WHERE TRUE
+            ON CONFLICT (item_id, value_kind, source_key, source_position) DO UPDATE SET
+                virtual_folder_id = excluded.virtual_folder_id,
+                display_value = excluded.display_value,
+                source_priority = excluded.source_priority
+            WHERE (media_item_query_filter_values.virtual_folder_id,
+                   media_item_query_filter_values.display_value,
+                   media_item_query_filter_values.source_priority)
+                IS DISTINCT FROM
+                  (excluded.virtual_folder_id, excluded.display_value,
+                   excluded.source_priority)
+            "#,
+        )
+        .bind(folder_id)
+        .execute(&mut **tx)
+        .await?;
+        let incomplete = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM jellyrin_query_filter_source_stage AS staged
+                LEFT JOIN media_item_query_filter_sources AS source
+                  ON source.item_id = staged.item_id
+                 AND source.virtual_folder_id = $1
+                 AND source.extractor_version = $2
+                 AND source.projected_value_count = staged.projected_value_count
+                LEFT JOIN LATERAL (
+                    SELECT count(*)::integer AS value_count
+                    FROM media_item_query_filter_values AS value
+                    WHERE value.item_id = staged.item_id
+                      AND value.virtual_folder_id = $1
+                ) AS value_count ON TRUE
+                WHERE source.item_id IS NULL
+                   OR value_count.value_count <> staged.projected_value_count
+            )
+            "#,
+        )
+        .bind(folder_id)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .fetch_one(&mut **tx)
+        .await?;
+        anyhow::ensure!(
+            !incomplete,
+            "query-filter projection publication coverage mismatch"
+        );
         Self::rebuild_tv_series_catalog_projection_in_transaction(tx, folder_id).await?;
 
         sqlx::query(
@@ -3601,7 +4372,8 @@ impl PostgresDatabase {
         height: Option<i32>,
         media_streams: Vec<Value>,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
             r#"
             UPDATE media_items
             SET runtime_ticks = $2, bitrate = $3, width = $4, height = $5,
@@ -3615,8 +4387,11 @@ impl PostgresDatabase {
         .bind(width)
         .bind(height)
         .bind(serde_json::to_value(media_streams)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        anyhow::ensure!(result.rows_affected() > 0, "media item not found");
+        replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3640,6 +4415,7 @@ impl PostgresDatabase {
         .await?;
         anyhow::ensure!(result.rows_affected() > 0, "media item not found");
         replace_postgres_media_item_facets(&mut tx, item_id, &metadata).await?;
+        replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -3665,6 +4441,7 @@ impl PostgresDatabase {
         .await?;
         anyhow::ensure!(result.rows_affected() > 0, "media item not found");
         replace_postgres_media_item_facets(&mut tx, item_id, metadata).await?;
+        replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -3843,12 +4620,7 @@ fn push_postgres_catalog_filters(
 
     let include_item_types = normalized_catalog_values(&query.include_item_types);
     if !include_item_types.is_empty() {
-        builder
-            .push(" AND (")
-            .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
-            .push(") = ANY(")
-            .push_bind(include_item_types)
-            .push(")");
+        push_postgres_include_item_types_filter(builder, &include_item_types);
     }
     let exclude_item_types = normalized_catalog_values(&query.exclude_item_types);
     if !exclude_item_types.is_empty() {
@@ -4023,6 +4795,57 @@ fn push_postgres_catalog_filters(
             }
         }
     }
+}
+
+fn push_postgres_include_item_types_filter(
+    builder: &mut QueryBuilder<Postgres>,
+    item_types: &[String],
+) {
+    let mut item_types = item_types
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    builder.push(" AND (");
+    let mut pushed = false;
+    for item_type in [
+        "movie",
+        "musicvideo",
+        "episode",
+        "video",
+        "audio",
+        "photo",
+        "book",
+        "baseitem",
+    ] {
+        if !item_types.remove(item_type) {
+            continue;
+        }
+        if pushed {
+            builder.push(" OR ");
+        }
+        builder.push(match item_type {
+            "movie" => "(item.collection_type = 'movies' AND item.media_type = 'Video')",
+            "musicvideo" => {
+                "(item.collection_type IN ('musicvideos', 'musicvideo') AND item.media_type = 'Video')"
+            }
+            "episode" => {
+                "(item.collection_type IN ('tvshows', 'tvshow', 'series') AND item.media_type = 'Video' AND lower(item.path) !~ '(^|/)(extras|featurettes|special features|behind the scenes|deleted scenes|interviews|trailers)(/|$)')"
+            }
+            "video" => {
+                "(item.media_type = 'Video' AND ((item.collection_type IN ('tvshows', 'tvshow', 'series') AND lower(item.path) ~ '(^|/)(extras|featurettes|special features|behind the scenes|deleted scenes|interviews|trailers)(/|$)') OR item.collection_type IS NULL OR item.collection_type NOT IN ('movies', 'musicvideos', 'musicvideo', 'tvshows', 'tvshow', 'series')))"
+            }
+            "audio" => "item.media_type = 'Audio'",
+            "photo" => "item.media_type = 'Photo'",
+            "book" => "item.media_type = 'Book'",
+            "baseitem" => "item.media_type NOT IN ('Video', 'Audio', 'Photo', 'Book')",
+            _ => unreachable!("fixed effective item type"),
+        });
+        pushed = true;
+    }
+    if !pushed {
+        builder.push("FALSE");
+    }
+    builder.push(")");
 }
 
 fn push_postgres_search_hint_metadata_filter(builder: &mut QueryBuilder<Postgres>, pattern: &str) {
@@ -4226,6 +5049,34 @@ fn postgres_query_filter_value_count(values: &MediaItemQueryFilterValues) -> u64
         + values.audio_languages.len()
         + values.subtitle_languages.len();
     u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+fn postgres_query_filter_values_from_rows(
+    rows: Vec<PostgresQueryFilterValueRow>,
+) -> anyhow::Result<MediaItemQueryFilterValues> {
+    let mut result = MediaItemQueryFilterValues::default();
+    for row in rows {
+        match row.kind.as_str() {
+            "albums" => result.albums.push(row.display_value),
+            "artists" => result.artists.push(row.display_value),
+            "audio_languages" => result.audio_languages.push(row.display_value),
+            "containers" => result.containers.push(row.display_value),
+            "genres" => result.genres.push(row.display_value),
+            "has_subtitles" => result.has_subtitles = true,
+            "has_trailer" => result.has_trailer = true,
+            "media_types" => result.media_types.push(row.display_value),
+            "official_ratings" => result.official_ratings.push(row.display_value),
+            "series_statuses" => result.series_statuses.push(row.display_value),
+            "staff_names" => result.staff_names.push(row.display_value),
+            "studios" => result.studios.push(row.display_value),
+            "subtitle_languages" => result.subtitle_languages.push(row.display_value),
+            "tags" => result.tags.push(row.display_value),
+            "video_types" => result.video_types.push(row.display_value),
+            "years" => result.years.push(row.display_value),
+            unexpected => anyhow::bail!("unexpected PostgreSQL item-filter kind {unexpected}"),
+        }
+    }
+    Ok(result)
 }
 
 #[derive(sqlx::FromRow)]
@@ -4609,6 +5460,80 @@ pub(super) async fn replace_postgres_media_item_facets(
     Ok(())
 }
 
+pub(super) async fn replace_postgres_media_item_query_filter_projection(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    item_id: Uuid,
+    folder_id: Uuid,
+    projection: &MediaItemQueryFilterProjection,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM media_item_query_filter_sources WHERE item_id = $1")
+        .bind(item_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO media_item_query_filter_sources (
+            item_id, virtual_folder_id, extractor_version, container_present, container_value, media_type,
+            is_video, has_subtitles, has_trailer, projected_value_count, completed_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+        "#,
+    )
+    .bind(item_id)
+    .bind(folder_id)
+    .bind(projection.extractor_version)
+    .bind(projection.features.container_present)
+    .bind(&projection.features.container)
+    .bind(&projection.features.media_type)
+    .bind(projection.features.is_video)
+    .bind(projection.features.has_subtitles)
+    .bind(projection.features.has_trailer)
+    .bind(i32::try_from(projection.values.len()).context("query-filter value count overflow")?)
+    .execute(&mut **tx)
+    .await?;
+    for value in &projection.values {
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_query_filter_values (
+                item_id, virtual_folder_id, value_kind, display_value, source_key,
+                source_priority, source_position
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(item_id)
+        .bind(folder_id)
+        .bind(value.kind.as_str())
+        .bind(&value.display_value)
+        .bind(&value.source_key)
+        .bind(i32::from(value.source_priority))
+        .bind(encode_media_item_query_filter_position(&value.position))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn replace_postgres_media_item_query_filter_projection_from_live(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    item_id: Uuid,
+) -> anyhow::Result<()> {
+    let (folder_id, path, media_type, media_streams, metadata) =
+        sqlx::query_as::<_, (Uuid, String, String, Value, Value)>(
+            "SELECT virtual_folder_id, path, media_type, media_streams, metadata FROM media_items WHERE id = $1",
+        )
+        .bind(item_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let streams = media_streams.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let projection =
+        extract_media_item_query_filter_projection(MediaItemQueryFilterProjectionSource {
+            path: &path,
+            media_type: &media_type,
+            media_streams: streams,
+            metadata: &metadata,
+        });
+    replace_postgres_media_item_query_filter_projection(tx, item_id, folder_id, &projection).await
+}
+
 fn normalized_locations(locations: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
     for location in locations {
@@ -4717,6 +5642,11 @@ mod tests {
             .expect("failed to drop isolated PostgreSQL test schema");
             self.admin_pool.close().await;
         }
+    }
+
+    fn percentile_from_sorted_samples(samples: &[u128], percent: usize) -> u128 {
+        let index = ((samples.len() - 1) * percent).div_ceil(100);
+        samples[index]
     }
 
     const SNAPSHOT_STAGE_BENCHMARK_CHUNK_SIZE: usize = 1_000;
@@ -4909,6 +5839,48 @@ mod tests {
         assert_eq!(encoded_null, br"\N");
     }
 
+    #[test]
+    fn postgres_include_item_types_use_sargable_native_predicates() {
+        let mut query = MediaItemCatalogQuery {
+            include_item_types: vec!["Movie".to_string()],
+            ..MediaItemCatalogQuery::default()
+        };
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT item.id ");
+        push_postgres_catalog_from(&mut builder, &query);
+        push_postgres_catalog_filters(&mut builder, &query);
+        let movie_sql = builder.sql();
+        let movie_sql = movie_sql.as_str();
+        assert!(movie_sql.contains("item.collection_type = 'movies'"));
+        assert!(movie_sql.contains("item.media_type = 'Video'"));
+        assert!(!movie_sql.contains(POSTGRES_MEDIA_ITEM_TYPE_SQL));
+
+        query.include_item_types = vec![
+            "Audio,Photo".to_string(),
+            "Book".to_string(),
+            "BaseItem".to_string(),
+        ];
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT item.id ");
+        push_postgres_catalog_from(&mut builder, &query);
+        push_postgres_catalog_filters(&mut builder, &query);
+        let simple_sql = builder.sql();
+        let simple_sql = simple_sql.as_str();
+        for predicate in [
+            "item.media_type = 'Audio'",
+            "item.media_type = 'Photo'",
+            "item.media_type = 'Book'",
+            "item.media_type NOT IN ('Video', 'Audio', 'Photo', 'Book')",
+        ] {
+            assert!(simple_sql.contains(predicate), "missing {predicate}");
+        }
+        assert!(!simple_sql.contains(POSTGRES_MEDIA_ITEM_TYPE_SQL));
+
+        query.include_item_types = vec!["Unknown".to_string()];
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT item.id ");
+        push_postgres_catalog_from(&mut builder, &query);
+        push_postgres_catalog_filters(&mut builder, &query);
+        assert!(builder.sql().as_str().contains("AND (FALSE)"));
+    }
+
     #[tokio::test]
     #[ignore = "local PostgreSQL benchmark; requires JELLYRIN_TEST_POSTGRES_URL"]
     async fn postgres_snapshot_stage_copy_benchmark() {
@@ -5060,6 +6032,214 @@ mod tests {
                     "page_requests": 50,
                     "page_total_millis": page_millis,
                     "page_average_millis": page_millis / 50,
+                })
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "local PostgreSQL benchmark; requires JELLYRIN_TEST_POSTGRES_URL"]
+    async fn postgres_movie_filter_values_benchmark() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            println!(
+                "{}",
+                json!({
+                    "benchmark": "postgres_movie_filter_values",
+                    "skipped": true,
+                    "reason": "JELLYRIN_TEST_POSTGRES_URL is not set",
+                })
+            );
+            return;
+        };
+        let result = async {
+            let episode_count = std::env::var("JELLYRIN_FILTER_BENCHMARK_EPISODES")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(455_520);
+            let movie_count = std::env::var("JELLYRIN_FILTER_BENCHMARK_MOVIES")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(39_093);
+            let repetitions = std::env::var("JELLYRIN_FILTER_BENCHMARK_REPETITIONS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(12);
+            anyhow::ensure!(episode_count >= 0 && movie_count > 0 && repetitions > 0);
+
+            let movie_folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Filter Benchmark Movies",
+                    "movies",
+                    "provider://filter-benchmark/movies",
+                    Vec::new(),
+                )
+                .await?;
+            let series_folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Filter Benchmark Series",
+                    "tvshows",
+                    "provider://filter-benchmark/series",
+                    Vec::new(),
+                )
+                .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO media_items (
+                    id, virtual_folder_id, name, path, media_type, collection_type,
+                    last_seen_at, media_streams, metadata, created_at, updated_at
+                )
+                SELECT md5('filter-benchmark-episode-' || value)::uuid, $1,
+                       format('Episode %s', value),
+                       'provider://filter-benchmark/series/' || value || '.ts',
+                       'Video', 'tvshows', CURRENT_TIMESTAMP, '[]'::jsonb,
+                       '{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM generate_series(1, $2) AS generated(value)
+                "#,
+            )
+            .bind(series_folder.id)
+            .bind(episode_count)
+            .execute(&test.database.worker_pool)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO media_items (
+                    id, virtual_folder_id, name, path, media_type, collection_type,
+                    last_seen_at, media_streams, metadata, created_at, updated_at
+                )
+                SELECT md5('filter-benchmark-movie-' || value)::uuid, $1,
+                       format('Movie %s', value),
+                       'provider://filter-benchmark/movies/' || value || '.mkv',
+                       'Video', 'movies', CURRENT_TIMESTAMP, '[]'::jsonb,
+                       jsonb_build_object(
+                           'Genres', jsonb_build_array(format('Genre %s', value % 60)),
+                           'Tags', jsonb_build_array(format('Tag %s', value % 100))
+                       ),
+                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM generate_series(1, $2) AS generated(value)
+                "#,
+            )
+            .bind(movie_folder.id)
+            .bind(movie_count)
+            .execute(&test.database.worker_pool)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO media_item_facets (
+                    item_id, facet_kind, normalized_value, display_value,
+                    stable_id, position, payload
+                )
+                SELECT item.id, 'tag', lower(item.metadata->'Tags'->>0),
+                       item.metadata->'Tags'->>0,
+                       md5('filter-benchmark-tag-' || (item.metadata->'Tags'->>0)),
+                       0, item.metadata->'Tags'->0
+                FROM media_items AS item
+                WHERE item.virtual_folder_id = $1
+                "#,
+            )
+            .bind(movie_folder.id)
+            .execute(&test.database.worker_pool)
+            .await?;
+            sqlx::query("ANALYZE media_items")
+                .execute(&test.database.worker_pool)
+                .await?;
+            sqlx::query("ANALYZE media_item_facets")
+                .execute(&test.database.worker_pool)
+                .await?;
+            let mut projection_tx = test.database.worker_pool.begin().await?;
+            ensure_media_item_query_filter_projection(
+                &mut projection_tx,
+                MediaItemFacetProjectionMode::Force,
+            )
+            .await?;
+            projection_tx.commit().await?;
+            sqlx::query("ANALYZE media_item_query_filter_sources")
+                .execute(&test.database.worker_pool)
+                .await?;
+            sqlx::query("ANALYZE media_item_query_filter_values")
+                .execute(&test.database.worker_pool)
+                .await?;
+
+            let query = MediaItemCatalogQuery {
+                limit: 0,
+                include_item_types: vec!["Movie".to_string()],
+                ..MediaItemCatalogQuery::default()
+            };
+            for _ in 0..2 {
+                let values = test.database.media_item_query_filter_values(&query).await?;
+                anyhow::ensure!(values.genres.len() == 60 && values.tags.len() == 100);
+            }
+            let temp_bytes_before: i64 = sqlx::query_scalar(
+                "SELECT temp_bytes FROM pg_stat_database WHERE datname = current_database()",
+            )
+            .fetch_one(&test.database.pool)
+            .await?;
+            let concurrent_started = Instant::now();
+            let (first, second, third, fourth) = tokio::try_join!(
+                test.database.media_item_query_filter_values(&query),
+                test.database.media_item_query_filter_values(&query),
+                test.database.media_item_query_filter_values(&query),
+                test.database.media_item_query_filter_values(&query),
+            )?;
+            for values in [first, second, third, fourth] {
+                anyhow::ensure!(values.genres.len() == 60 && values.tags.len() == 100);
+            }
+            let concurrent_micros = concurrent_started.elapsed().as_micros();
+            let mut samples = Vec::with_capacity(repetitions);
+            for _ in 0..repetitions {
+                let started = Instant::now();
+                let values = test.database.media_item_query_filter_values(&query).await?;
+                samples.push(started.elapsed().as_micros());
+                anyhow::ensure!(values.genres.len() == 60 && values.tags.len() == 100);
+            }
+            let temp_bytes_after: i64 = sqlx::query_scalar(
+                "SELECT temp_bytes FROM pg_stat_database WHERE datname = current_database()",
+            )
+            .fetch_one(&test.database.pool)
+            .await?;
+            samples.sort_unstable();
+            let p95_micros = percentile_from_sorted_samples(&samples, 95);
+            let temp_bytes_delta = temp_bytes_after
+                .checked_sub(temp_bytes_before)
+                .context("PostgreSQL temp byte counter moved backwards")?;
+            let p95_limit = std::env::var("JELLYRIN_FILTER_BENCHMARK_P95_MICROS")
+                .ok()
+                .and_then(|value| value.parse::<u128>().ok())
+                .unwrap_or(1_500_000);
+            let temp_limit = std::env::var("JELLYRIN_FILTER_BENCHMARK_TEMP_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(64 * 1024 * 1024);
+            anyhow::ensure!(
+                p95_micros < p95_limit,
+                "filter projection p95 threshold exceeded"
+            );
+            anyhow::ensure!(
+                concurrent_micros < p95_limit.saturating_mul(4),
+                "concurrent filter projection threshold exceeded"
+            );
+            anyhow::ensure!(
+                temp_bytes_delta <= temp_limit,
+                "filter projection temporary byte threshold exceeded"
+            );
+            println!(
+                "{}",
+                json!({
+                    "benchmark": "postgres_movie_filter_values",
+                    "episodes": episode_count,
+                    "movies": movie_count,
+                    "repetitions": repetitions,
+                    "p50_micros": percentile_from_sorted_samples(&samples, 50),
+                    "p95_micros": p95_micros,
+                    "max_micros": samples[samples.len() - 1],
+                    "four_concurrent_micros": concurrent_micros,
+                    "temp_bytes_delta": temp_bytes_delta,
                 })
             );
             anyhow::Ok(())
@@ -5998,6 +7178,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_query_filter_noop_snapshot_preserves_projection_rows() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let item_id = Uuid::new_v4();
+            let make_item = || {
+                remote_item(
+                    item_id,
+                    "Stable Movie",
+                    "provider://stable/movie.mkv",
+                    "Video",
+                    "movies",
+                    json!({"Genres": ["Drama"], "Tags": ["Stable"]}),
+                )
+            };
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Stable Filters",
+                    "movies",
+                    "provider://stable",
+                    vec![make_item()],
+                )
+                .await?;
+            let before = sqlx::query_as::<_, (String, String, Vec<String>)>(
+                r#"
+                SELECT source.xmin::text, source.completed_at::text,
+                       array_agg(value.xmin::text ORDER BY value.value_kind,
+                                 value.source_key, value.source_position)
+                FROM media_item_query_filter_sources AS source
+                JOIN media_item_query_filter_values AS value
+                  ON value.item_id = source.item_id
+                 AND value.virtual_folder_id = source.virtual_folder_id
+                WHERE source.item_id = $1 AND source.virtual_folder_id = $2
+                GROUP BY source.xmin::text, source.completed_at
+                "#,
+            )
+            .bind(item_id)
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+
+            let mut ensure_tx = test.database.worker_pool.begin().await?;
+            let ensure_report = ensure_media_item_query_filter_projection(
+                &mut ensure_tx,
+                MediaItemFacetProjectionMode::EnsureCurrent,
+            )
+            .await?;
+            ensure_tx.commit().await?;
+            anyhow::ensure!(!ensure_report.rebuilt);
+            anyhow::ensure!(ensure_report.source_item_count == 1);
+            anyhow::ensure!(ensure_report.projected_value_count == 2);
+            let after_ensure = sqlx::query_as::<_, (String, String, Vec<String>)>(
+                r#"
+                SELECT source.xmin::text, source.completed_at::text,
+                       array_agg(value.xmin::text ORDER BY value.value_kind,
+                                 value.source_key, value.source_position)
+                FROM media_item_query_filter_sources AS source
+                JOIN media_item_query_filter_values AS value
+                  ON value.item_id = source.item_id
+                 AND value.virtual_folder_id = source.virtual_folder_id
+                WHERE source.item_id = $1 AND source.virtual_folder_id = $2
+                GROUP BY source.xmin::text, source.completed_at
+                "#,
+            )
+            .bind(item_id)
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            anyhow::ensure!(before == after_ensure, "ensure rewrote query-filter rows");
+            let marker_after_reconcile = sqlx::query_as::<_, (i64, i64, String, String)>(
+                "SELECT source_item_count, projected_facet_count, completed_at::text, xmin::text \
+                 FROM jellyrin_derived_projection_versions WHERE projection_name = $1",
+            )
+            .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+            .fetch_one(&test.database.pool)
+            .await?;
+            anyhow::ensure!(marker_after_reconcile.0 == 1 && marker_after_reconcile.1 == 2);
+            let mut second_ensure_tx = test.database.worker_pool.begin().await?;
+            let second_report = ensure_media_item_query_filter_projection(
+                &mut second_ensure_tx,
+                MediaItemFacetProjectionMode::EnsureCurrent,
+            )
+            .await?;
+            second_ensure_tx.commit().await?;
+            anyhow::ensure!(!second_report.rebuilt);
+            let marker_after_noop = sqlx::query_as::<_, (i64, i64, String, String)>(
+                "SELECT source_item_count, projected_facet_count, completed_at::text, xmin::text \
+                 FROM jellyrin_derived_projection_versions WHERE projection_name = $1",
+            )
+            .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME)
+            .fetch_one(&test.database.pool)
+            .await?;
+            anyhow::ensure!(marker_after_reconcile == marker_after_noop);
+
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Stable Filters",
+                    "movies",
+                    "provider://stable",
+                    vec![make_item()],
+                )
+                .await?;
+            let after = sqlx::query_as::<_, (String, String, Vec<String>)>(
+                r#"
+                SELECT source.xmin::text, source.completed_at::text,
+                       array_agg(value.xmin::text ORDER BY value.value_kind,
+                                 value.source_key, value.source_position)
+                FROM media_item_query_filter_sources AS source
+                JOIN media_item_query_filter_values AS value
+                  ON value.item_id = source.item_id
+                 AND value.virtual_folder_id = source.virtual_folder_id
+                WHERE source.item_id = $1 AND source.virtual_folder_id = $2
+                GROUP BY source.xmin::text, source.completed_at
+                "#,
+            )
+            .bind(item_id)
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            anyhow::ensure!(before == after, "no-op snapshot rewrote query-filter rows");
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_query_filter_values_are_unpaged_scoped_and_exact() {
         let Some(test) = IsolatedPostgres::create().await else {
             return;
@@ -6111,7 +7421,22 @@ mod tests {
                     }]
                 }),
             ));
+            selected_items.push(remote_item(
+                Uuid::new_v4(),
+                "Selected Wrong Case Metadata",
+                "provider://filters/wrong-case.mkv",
+                "Video",
+                "movies",
+                json!({
+                    "artists": ["Must Not Leak Case Artist"],
+                    "tags": ["Must Not Leak Case Tag"],
+                    "productionyear": 2030
+                }),
+            ));
             // The only metadata values live beyond the catalog page-size boundary.
+            target.metadata["Albums"] = json!(["Must Not Leak Album"]);
+            target.metadata["SeriesGenres"] = json!(["Must Not Leak Series Genre"]);
+            target.metadata["Cast"] = json!(["Must Not Leak Cast"]);
             selected_items.push(target);
             test.database
                 .replace_remote_media_library_snapshot(
@@ -6129,19 +7454,20 @@ mod tests {
                 .find(|folder| folder.name == "Target Filters")
                 .context("missing target filter folder")?;
 
+            let filter_query = MediaItemCatalogQuery {
+                start_index: 999,
+                limit: 0,
+                virtual_folder_ids: vec![target_folder.id],
+                include_item_types: vec!["Movie".to_string()],
+                sort: vec![(
+                    MediaItemCatalogSortField::DateCreated,
+                    SortDirection::Descending,
+                )],
+                ..MediaItemCatalogQuery::default()
+            };
             let values = test
                 .database
-                .media_item_query_filter_values(&MediaItemCatalogQuery {
-                    start_index: 999,
-                    limit: 0,
-                    virtual_folder_ids: vec![target_folder.id],
-                    include_item_types: vec!["Movie".to_string()],
-                    sort: vec![(
-                        MediaItemCatalogSortField::DateCreated,
-                        SortDirection::Descending,
-                    )],
-                    ..MediaItemCatalogQuery::default()
-                })
+                .media_item_query_filter_values(&filter_query)
                 .await?;
             assert_eq!(values.albums, ["Album One", "Album Two"]);
             assert_eq!(values.artists, ["Artist One", "Artist Two"]);
@@ -6162,6 +7488,28 @@ mod tests {
             assert!(!format!("{values:?}").contains("Must Not Leak"));
             assert!(!format!("{values:?}").contains("Wrong Genre"));
 
+            sqlx::query("DELETE FROM media_item_query_filter_sources WHERE item_id = $1")
+                .bind(target_id)
+                .execute(&test.database.pool)
+                .await?;
+            let legacy_fallback = test
+                .database
+                .media_item_query_filter_values(&filter_query)
+                .await?;
+            assert_eq!(legacy_fallback, values);
+
+            let projected_value_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM media_item_facets \
+                 WHERE item_id = $1 \
+                   AND facet_kind = ANY(ARRAY[\
+                       'music_artist', 'music_album_artist', 'tag', 'year'\
+                   ]::text[])",
+            )
+            .bind(target_id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(projected_value_count, 4);
+
             let misleading = test
                 .database
                 .media_item_query_filter_values(&MediaItemCatalogQuery {
@@ -6180,6 +7528,153 @@ mod tests {
                 })
                 .await?;
             assert_eq!(case_sensitive_media_types.media_types, ["Video", "video"]);
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_sargable_item_types_match_the_legacy_case_expression() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let item = |name: &str, media_type: &str, collection_type: &str, path: &str| {
+                remote_item(
+                    Uuid::new_v4(),
+                    name,
+                    path,
+                    media_type,
+                    collection_type,
+                    json!({}),
+                )
+            };
+            let null_collection_id = Uuid::new_v4();
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Effective Type Matrix",
+                    "mixed",
+                    "provider://effective-types",
+                    vec![
+                        item(
+                            "Movie",
+                            "Video",
+                            "movies",
+                            "provider://effective-types/movie.mkv",
+                        ),
+                        item(
+                            "Music Video",
+                            "Video",
+                            "musicvideos",
+                            "provider://effective-types/music-video.mkv",
+                        ),
+                        item(
+                            "Episode",
+                            "Video",
+                            "tvshows",
+                            "provider://effective-types/Show/Season 01/Episode.mkv",
+                        ),
+                        item(
+                            "Extra",
+                            "Video",
+                            "tvshows",
+                            "provider://effective-types/Show/Extras/Extra.mkv",
+                        ),
+                        item(
+                            "Generic Video",
+                            "Video",
+                            "homevideos",
+                            "provider://effective-types/video.mkv",
+                        ),
+                        item(
+                            "Case Sensitive Collection",
+                            "Video",
+                            "Movies",
+                            "provider://effective-types/case-video.mkv",
+                        ),
+                        remote_item(
+                            null_collection_id,
+                            "Null Collection",
+                            "provider://effective-types/null-video.mkv",
+                            "Video",
+                            "temporary",
+                            json!({}),
+                        ),
+                        item(
+                            "Audio",
+                            "Audio",
+                            "music",
+                            "provider://effective-types/audio.flac",
+                        ),
+                        item(
+                            "Photo",
+                            "Photo",
+                            "photos",
+                            "provider://effective-types/photo.jpg",
+                        ),
+                        item(
+                            "Book",
+                            "Book",
+                            "books",
+                            "provider://effective-types/book.epub",
+                        ),
+                        item("Base", "Folder", "mixed", "provider://effective-types/base"),
+                        item(
+                            "Case Sensitive Media Type",
+                            "video",
+                            "movies",
+                            "provider://effective-types/case-base.mkv",
+                        ),
+                    ],
+                )
+                .await?;
+            sqlx::query("UPDATE media_items SET collection_type = NULL WHERE id = $1")
+                .bind(null_collection_id)
+                .execute(&test.database.pool)
+                .await?;
+
+            for item_type in [
+                "movie",
+                "musicvideo",
+                "episode",
+                "video",
+                "audio",
+                "photo",
+                "book",
+                "baseitem",
+                "unknown",
+            ] {
+                let legacy_sql = sqlx::AssertSqlSafe(format!(
+                    "SELECT item.id FROM media_items AS item \
+                     WHERE item.missing_since IS NULL \
+                       AND item.virtual_folder_id = $1 \
+                       AND ({POSTGRES_MEDIA_ITEM_TYPE_SQL}) = $2 \
+                     ORDER BY item.id"
+                ));
+                let legacy = sqlx::query_scalar::<_, Uuid>(legacy_sql)
+                    .bind(folder.id)
+                    .bind(item_type)
+                    .fetch_all(&test.database.pool)
+                    .await?;
+                let mut pushed_down = test
+                    .database
+                    .media_item_catalog_page(&MediaItemCatalogQuery {
+                        limit: 100,
+                        virtual_folder_ids: vec![folder.id],
+                        include_item_types: vec![item_type.to_string()],
+                        ..MediaItemCatalogQuery::default()
+                    })
+                    .await?
+                    .items
+                    .into_iter()
+                    .map(|entry| entry.item.id)
+                    .collect::<Vec<_>>();
+                pushed_down.sort_unstable();
+                assert_eq!(pushed_down, legacy, "item type {item_type}");
+            }
             anyhow::Ok(())
         }
         .await;
