@@ -20,13 +20,13 @@ use super::{
     MediaItemFacetKind, MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary,
     MediaItemForImageTag, MediaItemMetadata, MediaItemQueryFilterValues, PostgresDatabase,
     REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, RemoteMediaCatalogStage, RemoteMediaItemUpsert,
-    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection, TvSeriesCatalogKey,
-    TvSeriesCatalogPage, catalog_sync_duration_millis, extract_media_item_facets,
-    extract_media_item_filter_selectors, extract_media_item_genre_selectors,
-    is_upcoming_media_item_entry, nonnegative_count, normalized_facet_query_values,
-    prepare_remote_media_library_stage_specs, retain_entries_with_effective_types,
-    telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
-    validate_remote_media_catalog_stage_append,
+    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection,
+    TV_SERIES_CATALOG_PROJECTION_VERSION, TvSeriesCatalogKey, TvSeriesCatalogPage,
+    catalog_sync_duration_millis, extract_media_item_facets, extract_media_item_filter_selectors,
+    extract_media_item_genre_selectors, is_upcoming_media_item_entry, nonnegative_count,
+    normalized_facet_query_values, prepare_remote_media_library_stage_specs,
+    retain_entries_with_effective_types, telemetry::DatabaseOperation,
+    upcoming_media_item_premiere_parts, validate_remote_media_catalog_stage_append,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -1153,43 +1153,78 @@ impl PostgresDatabase {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
             .await?;
-        let invalid_series: bool = sqlx::query_scalar(
+        let projection_covered: bool = sqlx::query_scalar(
             r#"
-            SELECT EXISTS(SELECT 1 FROM media_items
-            WHERE missing_since IS NULL AND media_type = 'Video'
-              AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
-              AND ($1::uuid IS NULL OR virtual_folder_id = $1)
-              AND (NULLIF(btrim(metadata->>'SeriesId'), '') IS NULL
-                                      OR btrim(metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
-                                      OR NULLIF(btrim(metadata->>'SeriesName'), '') IS NULL)
-            LIMIT 1)
+            SELECT CASE
+                WHEN $1::uuid IS NOT NULL THEN EXISTS (
+                    SELECT 1
+                    FROM media_item_tv_series_coverage AS coverage
+                    WHERE coverage.virtual_folder_id = $1
+                      AND coverage.projection_version = $2
+                )
+                ELSE NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_folders AS folder
+                    LEFT JOIN media_item_tv_series_coverage AS coverage
+                      ON coverage.virtual_folder_id = folder.id
+                     AND coverage.projection_version = $2
+                    WHERE lower(coalesce(folder.collection_type, '')) = ANY(
+                          ARRAY['tvshows', 'tvshow', 'series']::text[]
+                      )
+                      AND coverage.virtual_folder_id IS NULL
+                ) AND NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_folders AS folder
+                    JOIN media_items AS item ON item.virtual_folder_id = folder.id
+                    WHERE lower(coalesce(folder.collection_type, '')) <> ALL(
+                              ARRAY['tvshows', 'tvshow', 'series']::text[]
+                          )
+                      AND item.missing_since IS NULL
+                      AND item.media_type = 'Video'
+                      AND lower(item.collection_type) = ANY(
+                          ARRAY['tvshows', 'tvshow', 'series']::text[]
+                      )
+                ) AND NOT EXISTS (
+                    SELECT 1
+                    FROM media_item_tv_series AS series
+                    JOIN media_item_tv_series_coverage AS coverage
+                      ON coverage.virtual_folder_id = series.virtual_folder_id
+                     AND coverage.projection_version = $2
+                    GROUP BY series.series_id
+                    HAVING count(*) > 1
+                )
+            END
             "#,
         )
         .bind(virtual_folder_id)
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
         .fetch_one(&mut *transaction)
         .await?;
-        if invalid_series {
+        if !projection_covered {
             transaction.commit().await?;
             return Ok(None);
         }
         let requested_limit = limit;
         let mut series = sqlx::query_as::<_, (String, String, i64)>(
             r#"
-            SELECT btrim(metadata->>'SeriesId') AS series_id,
-                   MIN(btrim(metadata->>'SeriesName')) AS series_name,
+            SELECT series_id,
+                   min(series_name) AS series_name,
                    COUNT(*) OVER () AS total_series
-            FROM media_items
-            WHERE missing_since IS NULL AND media_type = 'Video'
-              AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
-              AND ($1::uuid IS NULL OR virtual_folder_id = $1)
-            GROUP BY btrim(metadata->>'SeriesId')
-            ORDER BY lower(MIN(btrim(metadata->>'SeriesName'))), MIN(btrim(metadata->>'SeriesName')), btrim(metadata->>'SeriesId')
+            FROM media_item_tv_series AS series
+            JOIN media_item_tv_series_coverage AS coverage
+              ON coverage.virtual_folder_id = series.virtual_folder_id
+             AND coverage.projection_version = $4
+            WHERE true
+              AND ($1::uuid IS NULL OR series.virtual_folder_id = $1)
+            GROUP BY series_id
+            ORDER BY lower(min(series_name)), min(series_name), series_id
             LIMIT $2 OFFSET $3
             "#,
         )
         .bind(virtual_folder_id)
         .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
         .fetch_all(&mut *transaction)
         .await?;
         let total = if let Some((_, _, total)) = series.first() {
@@ -1198,9 +1233,10 @@ impl PostgresDatabase {
             0
         } else {
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(DISTINCT btrim(metadata->>'SeriesId')) FROM media_items WHERE missing_since IS NULL AND media_type = 'Video' AND lower(collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[]) AND ($1::uuid IS NULL OR virtual_folder_id = $1)",
+                "SELECT COUNT(DISTINCT series.series_id) FROM media_item_tv_series AS series JOIN media_item_tv_series_coverage AS coverage ON coverage.virtual_folder_id = series.virtual_folder_id AND coverage.projection_version = $2 WHERE ($1::uuid IS NULL OR series.virtual_folder_id = $1)",
             )
             .bind(virtual_folder_id)
+            .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
             .fetch_one(&mut *transaction)
             .await?
         };
@@ -1225,12 +1261,14 @@ impl PostgresDatabase {
                        NULL::boolean AS playback_is_favorite,
                        NULL::double precision AS playback_rating,
                        NULL::timestamptz AS playback_updated_at
-                FROM media_items AS item
+                FROM media_item_tv_series_members AS member
+                JOIN media_items AS item ON item.id = member.item_id
+                JOIN media_item_tv_series_coverage AS coverage
+                  ON coverage.virtual_folder_id = member.virtual_folder_id
+                 AND coverage.projection_version = $3
                 WHERE item.missing_since IS NULL
-                  AND item.media_type = 'Video'
-                  AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
-                  AND ($1::uuid IS NULL OR item.virtual_folder_id = $1)
-                  AND btrim(item.metadata->>'SeriesId') = ANY($2::text[])
+                  AND ($1::uuid IS NULL OR member.virtual_folder_id = $1)
+                  AND member.series_id = ANY($2::text[])
                 ORDER BY lower(item.name), item.name, item.id
                 "#,
             )
@@ -1241,6 +1279,7 @@ impl PostgresDatabase {
                     .map(|(id, _, _)| id.clone())
                     .collect::<Vec<_>>(),
             )
+            .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
             .fetch_all(&mut *transaction)
             .await?
         };
@@ -1257,6 +1296,120 @@ impl PostgresDatabase {
             total_record_count: usize::try_from(total)?,
             start_index,
         }))
+    }
+
+    async fn rebuild_tv_series_catalog_projection_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        virtual_folder_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        sqlx::query("DELETE FROM media_item_tv_series_coverage WHERE virtual_folder_id = $1")
+            .bind(virtual_folder_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM media_item_tv_series WHERE virtual_folder_id = $1")
+            .bind(virtual_folder_id)
+            .execute(&mut **tx)
+            .await?;
+
+        let eligible: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM virtual_folders AS folder
+                WHERE folder.id = $1
+                  AND lower(coalesce(folder.collection_type, '')) = ANY(
+                      ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM media_items AS invalid
+                WHERE invalid.virtual_folder_id = $1
+                  AND invalid.missing_since IS NULL
+                  AND invalid.media_type = 'Video'
+                  AND lower(invalid.collection_type) = ANY(
+                      ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                  AND (
+                      NULLIF(btrim(invalid.metadata->>'SeriesId'), '') IS NULL
+                      OR btrim(invalid.metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
+                      OR NULLIF(btrim(invalid.metadata->>'SeriesName'), '') IS NULL
+                  )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM media_items AS conflicting
+                WHERE conflicting.virtual_folder_id = $1
+                  AND conflicting.missing_since IS NULL
+                  AND conflicting.media_type = 'Video'
+                  AND lower(conflicting.collection_type) = ANY(
+                      ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                GROUP BY btrim(conflicting.metadata->>'SeriesId')
+                HAVING count(DISTINCT btrim(conflicting.metadata->>'SeriesName')) > 1
+            )
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !eligible {
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_tv_series (
+                virtual_folder_id, series_id, series_name, episode_count
+            )
+            SELECT item.virtual_folder_id,
+                   btrim(item.metadata->>'SeriesId'),
+                   min(btrim(item.metadata->>'SeriesName')),
+                   count(*)
+            FROM media_items AS item
+            WHERE item.virtual_folder_id = $1
+              AND item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) = ANY(
+                  ARRAY['tvshows', 'tvshow', 'series']::text[]
+              )
+            GROUP BY item.virtual_folder_id, btrim(item.metadata->>'SeriesId')
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_tv_series_members (item_id, virtual_folder_id, series_id)
+            SELECT item.id, item.virtual_folder_id, btrim(item.metadata->>'SeriesId')
+            FROM media_items AS item
+            WHERE item.virtual_folder_id = $1
+              AND item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) = ANY(
+                  ARRAY['tvshows', 'tvshow', 'series']::text[]
+              )
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_tv_series_coverage (
+                virtual_folder_id, projection_version, episode_count, series_count
+            )
+            SELECT $1, $2,
+                   (SELECT count(*) FROM media_item_tv_series_members
+                    WHERE virtual_folder_id = $1),
+                   (SELECT count(*) FROM media_item_tv_series
+                    WHERE virtual_folder_id = $1)
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+        .execute(&mut **tx)
+        .await?;
+        Ok(true)
     }
 
     pub async fn tv_next_up_candidates(
@@ -3146,6 +3299,8 @@ impl PostgresDatabase {
         .execute(&mut **tx)
         .await?;
 
+        Self::rebuild_tv_series_catalog_projection_in_transaction(tx, folder_id).await?;
+
         sqlx::query(
             r#"
             UPDATE catalog_sync_runs
@@ -4813,6 +4968,108 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "local PostgreSQL benchmark; requires JELLYRIN_TEST_POSTGRES_URL"]
+    async fn postgres_tv_series_projection_benchmark() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            println!(
+                "{}",
+                json!({
+                    "benchmark": "postgres_tv_series_projection",
+                    "skipped": true,
+                    "reason": "JELLYRIN_TEST_POSTGRES_URL is not set",
+                })
+            );
+            return;
+        };
+        let result = async {
+            let episode_count = std::env::var("JELLYRIN_SERIES_BENCHMARK_EPISODES")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(100_000);
+            let series_count = std::env::var("JELLYRIN_SERIES_BENCHMARK_SERIES")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(5_000);
+            anyhow::ensure!(episode_count > 0 && series_count > 0);
+            anyhow::ensure!(series_count <= episode_count);
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Series Projection Benchmark",
+                    "tvshows",
+                    "provider://series-benchmark",
+                    Vec::new(),
+                )
+                .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO media_items (
+                    id, virtual_folder_id, name, path, media_type, collection_type,
+                    last_seen_at, media_streams, metadata, created_at, updated_at
+                )
+                SELECT md5('series-projection-episode-' || row_number)::uuid,
+                       $1,
+                       format('Series %s Episode %s', series_number, row_number),
+                       'provider://series-benchmark/' || row_number || '.mp4',
+                       'Video', 'tvshows', CURRENT_TIMESTAMP, '[]'::jsonb,
+                       jsonb_build_object(
+                           'SeriesId', md5('series-projection-series-' || series_number),
+                           'SeriesName', format('Series %s', series_number)
+                       ),
+                       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                FROM (
+                    SELECT row_number,
+                           ((row_number - 1) % $3) + 1 AS series_number
+                    FROM generate_series(1, $2) AS generated(row_number)
+                ) AS fixture
+                "#,
+            )
+            .bind(folder.id)
+            .bind(episode_count)
+            .bind(series_count)
+            .execute(&test.database.worker_pool)
+            .await?;
+
+            let rebuild_started = Instant::now();
+            let mut transaction = test.database.worker_pool.begin().await?;
+            PostgresDatabase::rebuild_tv_series_catalog_projection_in_transaction(
+                &mut transaction,
+                folder.id,
+            )
+            .await?;
+            transaction.commit().await?;
+            let rebuild_millis = rebuild_started.elapsed().as_millis();
+
+            let page_started = Instant::now();
+            for page in 0..50 {
+                let result = test
+                    .database
+                    .tv_series_catalog_page(Some(folder.id), page * 50, 50)
+                    .await?
+                    .context("benchmark projection unexpectedly uncovered")?;
+                anyhow::ensure!(result.total_record_count == usize::try_from(series_count)?);
+            }
+            let page_millis = page_started.elapsed().as_millis();
+            println!(
+                "{}",
+                json!({
+                    "benchmark": "postgres_tv_series_projection",
+                    "episodes": episode_count,
+                    "series": series_count,
+                    "rebuild_millis": rebuild_millis,
+                    "page_requests": 50,
+                    "page_total_millis": page_millis,
+                    "page_average_millis": page_millis / 50,
+                })
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_diagnostics_report_separate_pools_and_safe_sync_summary() {
         let Some(test) = IsolatedPostgres::create().await else {
             return;
@@ -6177,6 +6434,80 @@ mod tests {
             assert_eq!(empty.total_record_count, 1);
             assert!(empty.series.is_empty());
             assert!(empty.episodes.is_empty());
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_tv_series_projection_is_invalidated_and_rebuilt_atomically() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let series_id = Uuid::new_v4();
+            let episode_id = Uuid::new_v4();
+            let item = remote_item(
+                episode_id,
+                "Projected S01E01",
+                "provider://projected/Projected S01E01.mp4",
+                "Video",
+                "tvshows",
+                json!({
+                    "SeriesId": series_id.simple().to_string(),
+                    "SeriesName": "Projected"
+                }),
+            );
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Projected Shows",
+                    "tvshows",
+                    "provider://projected",
+                    vec![item.clone()],
+                )
+                .await?;
+            let counts = sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT coverage.episode_count, coverage.series_count, count(member.item_id) \
+                 FROM media_item_tv_series_coverage AS coverage \
+                 LEFT JOIN media_item_tv_series_members AS member \
+                   ON member.virtual_folder_id = coverage.virtual_folder_id \
+                 WHERE coverage.virtual_folder_id = $1 \
+                 GROUP BY coverage.episode_count, coverage.series_count",
+            )
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(counts, (1, 1, 1));
+
+            sqlx::query("UPDATE media_items SET name = name || ' changed' WHERE id = $1")
+                .bind(episode_id)
+                .execute(&test.database.pool)
+                .await?;
+            assert!(
+                test.database
+                    .tv_series_catalog_page(Some(folder.id), 0, 20)
+                    .await?
+                    .is_none()
+            );
+
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Projected Shows",
+                    "tvshows",
+                    "provider://projected",
+                    vec![item],
+                )
+                .await?;
+            let restored = test
+                .database
+                .tv_series_catalog_page(Some(folder.id), 0, 20)
+                .await?
+                .context("projection was not restored by snapshot publication")?;
+            assert_eq!(restored.total_record_count, 1);
+            assert_eq!(restored.episodes.len(), 1);
             anyhow::Ok(())
         }
         .await;

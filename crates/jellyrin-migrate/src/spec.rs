@@ -692,6 +692,21 @@ pub struct OmittedTableSpec {
 
 pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
     OmittedTableSpec {
+        table: "media_item_tv_series",
+        strategy: "rebuild",
+        reason: "derived TV series catalogue projection",
+    },
+    OmittedTableSpec {
+        table: "media_item_tv_series_members",
+        strategy: "rebuild",
+        reason: "derived TV series membership projection",
+    },
+    OmittedTableSpec {
+        table: "media_item_tv_series_coverage",
+        strategy: "rebuild",
+        reason: "derived TV series projection coverage marker",
+    },
+    OmittedTableSpec {
         table: "media_item_facets",
         strategy: "rebuild",
         reason: "derived searchable catalog facet projection",

@@ -97,6 +97,8 @@ use telemetry::{DatabaseOperation, DatabaseTelemetry};
 /// concrete until another backend has a complete native implementation and conformance suite.
 pub type ProductionDatabase = PostgresDatabase;
 
+const TV_SERIES_CATALOG_PROJECTION_VERSION: i32 = 1;
+
 #[cfg(test)]
 pub type Database = SqliteDatabase;
 #[cfg(not(test))]
@@ -7958,25 +7960,59 @@ impl SqliteDatabase {
         let mut transaction = self.pool.begin().await?;
         let virtual_folder_ids =
             virtual_folder_id.map(|id| (id.simple().to_string(), id.to_string()));
-        let invalid_series: i64 = sqlx::query_scalar(
+        let projection_covered: i64 = sqlx::query_scalar(
             r#"
-            SELECT EXISTS(SELECT 1 FROM media_items
-            WHERE missing_since IS NULL AND media_type = 'Video'
-              AND lower(collection_type) IN ('tvshows', 'tvshow', 'series')
-              AND (?1 IS NULL OR virtual_folder_id IN (?1, ?2))
-              AND (NULLIF(trim(json_extract(metadata_json, '$.SeriesId')), '') IS NULL
-                                      OR length(trim(json_extract(metadata_json, '$.SeriesId'))) <> 32
-                                      OR trim(json_extract(metadata_json, '$.SeriesId')) <> lower(trim(json_extract(metadata_json, '$.SeriesId')))
-                                      OR trim(json_extract(metadata_json, '$.SeriesId')) GLOB '*[^0-9a-f]*'
-                                      OR NULLIF(trim(json_extract(metadata_json, '$.SeriesName')), '') IS NULL)
-            LIMIT 1)
+            SELECT CASE
+                WHEN ?1 IS NOT NULL THEN EXISTS (
+                    SELECT 1
+                    FROM media_item_tv_series_coverage AS coverage
+                    WHERE coverage.virtual_folder_id IN (?1, ?2)
+                      AND coverage.projection_version = ?3
+                )
+                ELSE NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_folders AS folder
+                    LEFT JOIN media_item_tv_series_coverage AS coverage
+                      ON coverage.virtual_folder_id = folder.id
+                     AND coverage.projection_version = ?3
+                    WHERE lower(coalesce(folder.collection_type, ''))
+                          IN ('tvshows', 'tvshow', 'series')
+                      AND coverage.virtual_folder_id IS NULL
+                ) AND NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_folders AS folder
+                    JOIN media_items AS item ON item.virtual_folder_id = folder.id
+                    WHERE lower(coalesce(folder.collection_type, ''))
+                          NOT IN ('tvshows', 'tvshow', 'series')
+                      AND item.missing_since IS NULL
+                      AND item.media_type = 'Video'
+                      AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+                ) AND NOT EXISTS (
+                    SELECT 1
+                    FROM media_item_tv_series AS series
+                    JOIN media_item_tv_series_coverage AS coverage
+                      ON coverage.virtual_folder_id = series.virtual_folder_id
+                     AND coverage.projection_version = ?3
+                    GROUP BY series.series_id
+                    HAVING count(*) > 1
+                )
+            END
             "#,
         )
-        .bind(virtual_folder_ids.as_ref().map(|(simple, _)| simple.as_str()))
-        .bind(virtual_folder_ids.as_ref().map(|(_, dashed)| dashed.as_str()))
+        .bind(
+            virtual_folder_ids
+                .as_ref()
+                .map(|(simple, _)| simple.as_str()),
+        )
+        .bind(
+            virtual_folder_ids
+                .as_ref()
+                .map(|(_, dashed)| dashed.as_str()),
+        )
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
         .fetch_one(&mut *transaction)
         .await?;
-        if invalid_series != 0 {
+        if projection_covered == 0 {
             transaction.commit().await?;
             return Ok(None);
         }
@@ -7985,14 +8021,15 @@ impl SqliteDatabase {
         let offset = i64::try_from(start_index)?;
         let mut series = sqlx::query_as::<_, (String, String, i64)>(
             r#"
-            SELECT trim(json_extract(metadata_json, '$.SeriesId')) AS series_id,
-                   MIN(trim(json_extract(metadata_json, '$.SeriesName'))) AS series_name,
+            SELECT series.series_id,
+                   min(series.series_name) AS series_name,
                    COUNT(*) OVER () AS total_series
-            FROM media_items
-            WHERE missing_since IS NULL AND media_type = 'Video'
-              AND lower(collection_type) IN ('tvshows', 'tvshow', 'series')
-              AND (?1 IS NULL OR virtual_folder_id IN (?1, ?2))
-            GROUP BY series_id
+            FROM media_item_tv_series AS series
+            JOIN media_item_tv_series_coverage AS coverage
+              ON coverage.virtual_folder_id = series.virtual_folder_id
+             AND coverage.projection_version = ?5
+            WHERE (?1 IS NULL OR series.virtual_folder_id IN (?1, ?2))
+            GROUP BY series.series_id
             ORDER BY series_name COLLATE NOCASE, series_name, series_id
             LIMIT ?3 OFFSET ?4
             "#,
@@ -8009,6 +8046,7 @@ impl SqliteDatabase {
         )
         .bind(limit)
         .bind(offset)
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
         .fetch_all(&mut *transaction)
         .await?;
         let total = if let Some((_, _, total)) = series.first() {
@@ -8017,10 +8055,11 @@ impl SqliteDatabase {
             0
         } else {
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(DISTINCT trim(json_extract(metadata_json, '$.SeriesId'))) FROM media_items WHERE missing_since IS NULL AND media_type = 'Video' AND lower(collection_type) IN ('tvshows', 'tvshow', 'series') AND (?1 IS NULL OR virtual_folder_id IN (?1, ?2))",
+                "SELECT COUNT(DISTINCT series.series_id) FROM media_item_tv_series AS series JOIN media_item_tv_series_coverage AS coverage ON coverage.virtual_folder_id = series.virtual_folder_id AND coverage.projection_version = ?3 WHERE (?1 IS NULL OR series.virtual_folder_id IN (?1, ?2))",
             )
             .bind(virtual_folder_ids.as_ref().map(|(simple, _)| simple.as_str()))
             .bind(virtual_folder_ids.as_ref().map(|(_, dashed)| dashed.as_str()))
+            .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
             .fetch_one(&mut *transaction)
             .await?
         };
@@ -8030,16 +8069,17 @@ impl SqliteDatabase {
         let mut rows = Vec::new();
         if !series.is_empty() {
             let mut query = QueryBuilder::<Sqlite>::new(
-                "SELECT item.id, item.virtual_folder_id, item.name, item.path, item.media_type, item.collection_type, item.file_size, item.runtime_ticks, item.bitrate, item.width, item.height, item.media_streams_json, item.metadata_json, item.created_at, item.updated_at, CAST(NULL AS TEXT) AS playback_user_id, CAST(NULL AS TEXT) AS playback_item_id, CAST(NULL AS TEXT) AS playback_media_source_id, CAST(NULL AS INTEGER) AS playback_audio_stream_index, CAST(NULL AS INTEGER) AS playback_subtitle_stream_index, CAST(NULL AS INTEGER) AS playback_position_ticks, CAST(NULL AS INTEGER) AS playback_is_paused, CAST(NULL AS INTEGER) AS playback_played, CAST(NULL AS INTEGER) AS playback_is_favorite, CAST(NULL AS REAL) AS playback_rating, CAST(NULL AS TEXT) AS playback_updated_at FROM media_items AS item WHERE item.missing_since IS NULL AND item.media_type = 'Video' AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')",
+                "SELECT item.id, item.virtual_folder_id, item.name, item.path, item.media_type, item.collection_type, item.file_size, item.runtime_ticks, item.bitrate, item.width, item.height, item.media_streams_json, item.metadata_json, item.created_at, item.updated_at, CAST(NULL AS TEXT) AS playback_user_id, CAST(NULL AS TEXT) AS playback_item_id, CAST(NULL AS TEXT) AS playback_media_source_id, CAST(NULL AS INTEGER) AS playback_audio_stream_index, CAST(NULL AS INTEGER) AS playback_subtitle_stream_index, CAST(NULL AS INTEGER) AS playback_position_ticks, CAST(NULL AS INTEGER) AS playback_is_paused, CAST(NULL AS INTEGER) AS playback_played, CAST(NULL AS INTEGER) AS playback_is_favorite, CAST(NULL AS REAL) AS playback_rating, CAST(NULL AS TEXT) AS playback_updated_at FROM media_item_tv_series_members AS member JOIN media_items AS item ON item.id = member.item_id JOIN media_item_tv_series_coverage AS coverage ON coverage.virtual_folder_id = member.virtual_folder_id WHERE item.missing_since IS NULL AND coverage.projection_version = ",
             );
+            query.push_bind(TV_SERIES_CATALOG_PROJECTION_VERSION);
             if let Some((simple, dashed)) = virtual_folder_ids.as_ref() {
-                query.push(" AND item.virtual_folder_id IN (");
+                query.push(" AND member.virtual_folder_id IN (");
                 query.push_bind(simple);
                 query.push(", ");
                 query.push_bind(dashed);
                 query.push(")");
             }
-            query.push(" AND trim(json_extract(item.metadata_json, '$.SeriesId')) IN (");
+            query.push(" AND member.series_id IN (");
             let mut separated = query.separated(", ");
             for (id, _, _) in &series {
                 separated.push_bind(id);
@@ -8063,6 +8103,118 @@ impl SqliteDatabase {
             total_record_count: usize::try_from(total)?,
             start_index,
         }))
+    }
+
+    async fn rebuild_tv_series_catalog_projection_in_transaction(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        virtual_folder_id: &str,
+    ) -> anyhow::Result<bool> {
+        sqlx::query("DELETE FROM media_item_tv_series_coverage WHERE virtual_folder_id = ?1")
+            .bind(virtual_folder_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM media_item_tv_series WHERE virtual_folder_id = ?1")
+            .bind(virtual_folder_id)
+            .execute(&mut **tx)
+            .await?;
+
+        let eligible: i64 = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM virtual_folders AS folder
+                WHERE folder.id = ?1
+                  AND lower(coalesce(folder.collection_type, ''))
+                      IN ('tvshows', 'tvshow', 'series')
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM media_items AS invalid
+                WHERE invalid.virtual_folder_id = ?1
+                  AND invalid.missing_since IS NULL
+                  AND invalid.media_type = 'Video'
+                  AND lower(invalid.collection_type) IN ('tvshows', 'tvshow', 'series')
+                  AND (
+                      NULLIF(trim(json_extract(invalid.metadata_json, '$.SeriesId')), '') IS NULL
+                      OR length(trim(json_extract(invalid.metadata_json, '$.SeriesId'))) <> 32
+                      OR trim(json_extract(invalid.metadata_json, '$.SeriesId')) <>
+                         lower(trim(json_extract(invalid.metadata_json, '$.SeriesId')))
+                      OR trim(json_extract(invalid.metadata_json, '$.SeriesId')) GLOB '*[^0-9a-f]*'
+                      OR NULLIF(trim(json_extract(invalid.metadata_json, '$.SeriesName')), '') IS NULL
+                  )
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM media_items AS conflicting
+                WHERE conflicting.virtual_folder_id = ?1
+                  AND conflicting.missing_since IS NULL
+                  AND conflicting.media_type = 'Video'
+                  AND lower(conflicting.collection_type) IN ('tvshows', 'tvshow', 'series')
+                GROUP BY trim(json_extract(conflicting.metadata_json, '$.SeriesId'))
+                HAVING count(DISTINCT trim(
+                    json_extract(conflicting.metadata_json, '$.SeriesName')
+                )) > 1
+            )
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if eligible == 0 {
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_tv_series (
+                virtual_folder_id, series_id, series_name, episode_count
+            )
+            SELECT item.virtual_folder_id,
+                   trim(json_extract(item.metadata_json, '$.SeriesId')),
+                   min(trim(json_extract(item.metadata_json, '$.SeriesName'))),
+                   count(*)
+            FROM media_items AS item
+            WHERE item.virtual_folder_id = ?1
+              AND item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+            GROUP BY item.virtual_folder_id,
+                     trim(json_extract(item.metadata_json, '$.SeriesId'))
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_tv_series_members (item_id, virtual_folder_id, series_id)
+            SELECT item.id, item.virtual_folder_id,
+                   trim(json_extract(item.metadata_json, '$.SeriesId'))
+            FROM media_items AS item
+            WHERE item.virtual_folder_id = ?1
+              AND item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO media_item_tv_series_coverage (
+                virtual_folder_id, projection_version, episode_count, series_count
+            )
+            SELECT ?1, ?2,
+                   (SELECT count(*) FROM media_item_tv_series_members
+                    WHERE virtual_folder_id = ?1),
+                   (SELECT count(*) FROM media_item_tv_series
+                    WHERE virtual_folder_id = ?1)
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+        .execute(&mut **tx)
+        .await?;
+        Ok(true)
     }
 
     pub async fn tv_next_up_candidates(
@@ -9244,6 +9396,8 @@ impl SqliteDatabase {
                 last_item_id = rows.last().map(|(item_id, _)| item_id.clone());
             }
 
+            Self::rebuild_tv_series_catalog_projection_in_transaction(&mut tx, &folder_id).await?;
+
             sqlx::query(
                 "UPDATE catalog_sync_runs SET status = 'completed', completed_at = ?1 \
                  WHERE id = ?2",
@@ -9606,6 +9760,8 @@ impl SqliteDatabase {
                 .with_context(|| format!("invalid metadata JSON for media item {}", item.id))?;
             Self::replace_media_item_facets_in_transaction(tx, &item.id, &metadata).await?;
         }
+
+        Self::rebuild_tv_series_catalog_projection_in_transaction(tx, &folder_id).await?;
 
         sqlx::query(
             r#"
@@ -16857,6 +17013,126 @@ mod tests {
         assert_eq!(empty.total_record_count, 1);
         assert!(empty.series.is_empty());
         assert!(empty.episodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_tv_series_projection_is_atomic_fail_closed_and_collision_safe() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let series_id = Uuid::new_v4();
+        let first_episode_id = Uuid::new_v4();
+        let episode = |id: Uuid, name: &str, series_name: &str, root: &str| RemoteMediaItemUpsert {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("provider://{root}/{name}.mp4"),
+            media_type: "Video".to_string(),
+            collection_type: "tvshows".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({
+                "SeriesId": series_id.simple().to_string(),
+                "SeriesName": series_name
+            }),
+        };
+        let first = episode(first_episode_id, "Projected S01E01", "Projected", "first");
+        let first_folder = db
+            .replace_remote_media_library_snapshot(
+                "Projected Shows",
+                "tvshows",
+                "provider://first",
+                vec![first.clone()],
+            )
+            .await
+            .unwrap();
+
+        let projection_counts = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT coverage.episode_count, coverage.series_count, count(member.item_id) \
+             FROM media_item_tv_series_coverage AS coverage \
+             LEFT JOIN media_item_tv_series_members AS member \
+               ON member.virtual_folder_id = coverage.virtual_folder_id \
+             WHERE coverage.virtual_folder_id = ?1 \
+             GROUP BY coverage.episode_count, coverage.series_count",
+        )
+        .bind(first_folder.id.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(projection_counts, (1, 1, 1));
+
+        sqlx::query("UPDATE media_items SET name = name || ' changed' WHERE id = ?1")
+            .bind(first_episode_id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            db.tv_series_catalog_page(Some(first_folder.id), 0, 20)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        db.replace_remote_media_library_snapshot(
+            "Projected Shows",
+            "tvshows",
+            "provider://first",
+            vec![first],
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.tv_series_catalog_page(Some(first_folder.id), 0, 20)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let second_folder = db
+            .replace_remote_media_library_snapshot(
+                "Second Shows",
+                "tvshows",
+                "provider://second",
+                vec![episode(
+                    Uuid::new_v4(),
+                    "Projected S02E01",
+                    "Projected",
+                    "second",
+                )],
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.tv_series_catalog_page(None, 0, 20)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.tv_series_catalog_page(Some(second_folder.id), 0, 20)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let inconsistent_folder = db
+            .replace_remote_media_library_snapshot(
+                "Inconsistent Shows",
+                "tvshows",
+                "provider://inconsistent",
+                vec![
+                    episode(Uuid::new_v4(), "Conflict S01E01", "One", "inconsistent"),
+                    episode(Uuid::new_v4(), "Conflict S01E02", "Two", "inconsistent"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.tv_series_catalog_page(Some(inconsistent_folder.id), 0, 20)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
