@@ -53,6 +53,30 @@ impl<'a> MediaService<'a> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn update_media_info_and_metadata(
+        &self,
+        item_id: Uuid,
+        runtime_ticks: Option<i64>,
+        bitrate: Option<i64>,
+        width: Option<i32>,
+        height: Option<i32>,
+        media_streams: Vec<Value>,
+        metadata: Value,
+    ) -> anyhow::Result<()> {
+        self.db
+            .update_media_item_media_info_and_metadata(
+                item_id,
+                runtime_ticks,
+                bitrate,
+                width,
+                height,
+                media_streams,
+                metadata,
+            )
+            .await
+    }
+
     pub(crate) async fn delete_lyrics(&self, item_id: Uuid) -> anyhow::Result<bool> {
         self.db.delete_media_item_lyrics(item_id).await
     }

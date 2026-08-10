@@ -10743,6 +10743,67 @@ impl SqliteDatabase {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_media_item_media_info_and_metadata(
+        &self,
+        item_id: Uuid,
+        runtime_ticks: Option<i64>,
+        bitrate: Option<i64>,
+        width: Option<i32>,
+        height: Option<i32>,
+        media_streams: Vec<Value>,
+        metadata: Value,
+    ) -> anyhow::Result<()> {
+        let item_id = self.media_item_storage_id(item_id).await?;
+        let media_streams_json = serde_json::to_string(&media_streams)?;
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let mut tx = self.pool.begin().await?;
+        let media_info_changed = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET runtime_ticks = ?2, bitrate = ?3, width = ?4, height = ?5,
+                media_streams_json = ?6
+            WHERE id = ?1
+              AND (runtime_ticks IS NOT ?2 OR bitrate IS NOT ?3 OR width IS NOT ?4
+                   OR height IS NOT ?5 OR media_streams_json IS NOT ?6)
+            "#,
+        )
+        .bind(&item_id)
+        .bind(runtime_ticks)
+        .bind(bitrate)
+        .bind(width)
+        .bind(height)
+        .bind(&media_streams_json)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        let metadata_changed = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET metadata_json = ?2, updated_at = ?3
+            WHERE id = ?1 AND metadata_json IS NOT ?2
+            "#,
+        )
+        .bind(&item_id)
+        .bind(&metadata_json)
+        .bind(format_time(OffsetDateTime::now_utc())?)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if !media_info_changed && !metadata_changed {
+            tx.commit().await?;
+            return Ok(());
+        }
+        if metadata_changed {
+            Self::replace_media_item_facets_in_transaction(&mut tx, &item_id, &metadata).await?;
+        }
+        replace_sqlite_media_item_query_filter_projection_from_live(&mut tx, &item_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_media_item_metadata(
         &self,
         item_id: Uuid,

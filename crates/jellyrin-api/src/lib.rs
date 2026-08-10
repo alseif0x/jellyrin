@@ -45742,10 +45742,7 @@ async fn item_filters(
         return Ok(Json(live_tv_filter_response(&state.db).await?));
     }
     let mut filter_query = query.clone();
-    if query_requests_only_item_type(&filter_query, "Series") {
-        filter_query.include_item_types = vec!["Episode".to_string()];
-        filter_query.ids = None;
-    }
+    normalize_series_filter_catalog_query(&mut filter_query);
     if let Some(values) = media_catalog_filter_values_result(
         &state.db,
         &filter_query,
@@ -45824,9 +45821,11 @@ async fn query_filters(
             "SubtitleLanguages": []
         })));
     }
+    let mut filter_query = query.clone();
+    normalize_series_filter_catalog_query(&mut filter_query);
     if let Some(values) = media_catalog_filter_values_result(
         &state.db,
-        &query,
+        &filter_query,
         requested_user_id,
         MediaItemQueryFilterSelection::FILTERS2,
     )
@@ -45834,8 +45833,13 @@ async fn query_filters(
     {
         return Ok(Json(query_filter_response(values)));
     }
-    let items =
-        filtered_items_for_query(&state, &headers, auth_query.api_key.as_deref(), &query).await?;
+    let items = filtered_items_for_query(
+        &state,
+        &headers,
+        auth_query.api_key.as_deref(),
+        &filter_query,
+    )
+    .await?;
     let metadata_values = item_filter_metadata_values(&state.db, &items).await?;
     Ok(Json(serde_json::json!({
         "Genres": query_filter_genres(metadata_values.genres.into_values()),
@@ -45843,6 +45847,31 @@ async fn query_filters(
         "AudioLanguages": query_filter_languages(metadata_values.audio_languages.into_values()),
         "SubtitleLanguages": query_filter_languages(metadata_values.subtitle_languages.into_values())
     })))
+}
+
+/// Series are synthesized from persisted episodes, so filter endpoints must query the episode
+/// projection. Rewrite every Series token (including mixed Movie,Series requests), while keeping
+/// the historical synthetic-series ID behavior for a Series-only query.
+fn normalize_series_filter_catalog_query(query: &mut ItemsQuery) {
+    let only_series = query_requests_only_item_type(query, "Series");
+    for value in &mut query.include_item_types {
+        *value = value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if value.eq_ignore_ascii_case("Series") {
+                    "Episode"
+                } else {
+                    value
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    if only_series {
+        query.ids = None;
+    }
 }
 
 fn item_filter_years(values: impl IntoIterator<Item = String>) -> Vec<i32> {
@@ -50532,19 +50561,17 @@ async fn ensure_xtream_remote_media_info(
     } else {
         media_info.media_streams
     };
+    set_xtream_remote_media_probe_metadata(metadata, &resolved_source.source_revision, "Complete");
     MediaService::new(db)
-        .update_media_info(
+        .update_media_info_and_metadata(
             item.id,
             media_info.runtime_ticks.or(item.runtime_ticks),
             media_info.bitrate.or(item.bitrate),
             media_info.width.or(item.width),
             media_info.height.or(item.height),
             streams,
+            metadata.clone(),
         )
-        .await?;
-    set_xtream_remote_media_probe_metadata(metadata, &resolved_source.source_revision, "Complete");
-    MediaService::new(db)
-        .update_metadata(item.id, metadata.clone())
         .await?;
     Ok(ResolvedXtreamMedia {
         item: db.media_item_by_id(item.id).await?,
@@ -86194,6 +86221,144 @@ done
             assert_eq!(counts["ItemCount"], expected, "{uri}");
             assert_eq!(counts["MovieCount"], expected, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn query_filters_series_uses_the_episode_catalog() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let admin = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(admin.id, "series-filter-api-test-key")
+            .await
+            .unwrap();
+        let mut episode = RemoteMediaItemUpsert {
+            id: Uuid::new_v4().to_string(),
+            name: "Series Filter Episode".to_string(),
+            path: "provider://series-filter/show/season-1/episode-1.mkv".to_string(),
+            media_type: "Video".to_string(),
+            collection_type: "tvshows".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: vec![
+                json!({ "Type": "Audio", "Language": "fra" }),
+                json!({ "Type": "Subtitle", "Language": "spa" }),
+            ],
+            metadata: json!({
+                "Genres": ["Series Genre"],
+                "Tags": ["Series Tag"],
+                "SeriesName": "Filter Show",
+                "SeasonNumber": 1,
+                "EpisodeNumber": 1
+            }),
+        };
+        episode.metadata["SeriesId"] = json!(stable_entity_id("Series", "Filter Show"));
+        let folder = db
+            .replace_remote_media_library_snapshot(
+                "Series Filters",
+                "tvshows",
+                "provider://series-filter",
+                vec![episode],
+            )
+            .await
+            .unwrap();
+        db.replace_remote_media_library_snapshot(
+            "Movie Filters",
+            "movies",
+            "provider://movie-filter",
+            vec![RemoteMediaItemUpsert {
+                id: Uuid::new_v4().to_string(),
+                name: "Movie Filter Item".to_string(),
+                path: "provider://movie-filter/movie.mkv".to_string(),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: vec![json!({ "Type": "Audio", "Language": "eng" })],
+                metadata: json!({
+                    "Genres": ["Movie Genre"],
+                    "Tags": ["Movie Tag"]
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Filters2?ParentId={}&IncludeItemTypes=Series",
+                        folder.id.simple()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let filters: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            filters["Genres"],
+            json!([{
+                "Name": "Series Genre",
+                "Id": stable_entity_id("Genre", "Series Genre")
+            }])
+        );
+        assert_eq!(filters["Tags"], json!(["Series Tag"]));
+        assert_eq!(
+            filters["AudioLanguages"],
+            json!([{ "Name": "French", "Value": "fra" }])
+        );
+        assert_eq!(
+            filters["SubtitleLanguages"],
+            json!([{ "Name": "Spanish; Castilian", "Value": "spa" }])
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Items/Filters2?IncludeItemTypes=Movie,Series")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let filters: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            filters["Genres"],
+            json!([
+                { "Name": "Movie Genre", "Id": stable_entity_id("Genre", "Movie Genre") },
+                { "Name": "Series Genre", "Id": stable_entity_id("Genre", "Series Genre") }
+            ])
+        );
+        assert_eq!(filters["Tags"], json!(["Movie Tag", "Series Tag"]));
+        assert_eq!(
+            filters["AudioLanguages"],
+            json!([
+                { "Name": "English", "Value": "eng" },
+                { "Name": "French", "Value": "fra" }
+            ])
+        );
     }
 
     #[tokio::test]

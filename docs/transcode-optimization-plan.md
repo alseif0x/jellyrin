@@ -185,6 +185,16 @@ histórica y no debe confundirse con este estado vigente.
   `reconciled=2`, una coverage vigente y cero procesos FFmpeg. La carga HTTPS
   20×4 a concurrencia 8 dio p95 0,111–0,122 s para
   Movies/Series × Filters/Filters2.
+- El siguiente lote local agrupa en una sola transacción la escritura de
+  `media_info` y metadata que realiza el probe Xtream. Si la proyección derivada
+  no cambia, no reconcilia ni avanza la revisión; si cambia, la sustituye y
+  publica coverage una sola vez. Además, `Filters` y `Filters2` traducen el tipo
+  sintético `Series` a su fuente persistida `Episode`, incluso en solicitudes
+  mixtas `Movie,Series`. La sincronización no depende de paginación Xtream no
+  estándar: descarga con límite a un temporal, parsea bloques de 500, hace
+  append a staging y publica atómicamente. La navegación sí usa páginas SQL con
+  total exacto; Series se agrupa mediante la proyección PostgreSQL y nunca carga
+  los 455.520 episodios en memoria por petición.
 - DLNA ya no relee el catálogo completo por cada carpeta: browse/search usa
   `media_items_for_virtual_folders` y solo hidrata metadata para los IDs del
   dominio seleccionado. El detalle de carpeta reutiliza conteos SQL agrupados
@@ -497,8 +507,8 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Drivers y runtime PostgreSQL | Costura de selección; PG único productivo, SQLite real para test/migración y MySQL solo reservado; sin `AnyPool`, fallback ni SQLx en API; telemetría real de hot paths por pool | DB 169/0/4 más doctests y staging durable sobre PostgreSQL real; migrador 36/36; esquema 119 validado en clon real y aplicado con backup/rollback preparado | E2E restante antes de otro backend |
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg `8.2-dev-git-1e0279143db9` mínimo sin encoders y solo decoder AAC; redirects opacos revalidados por salto | Corpus aislado verde en imagen ARM64 exacta de HEAD; VOD real DirectProxy 206/65.536 bytes con 0 FFmpeg; Live TV real leyó 112.827 bytes directo con 0 FFmpeg y HLS produjo 1.702.152 bytes como remux, sin fallback, ~15,3 MiB RSS, PID reap y leases 0→0 | Matriz de clientes reales, medidas sostenidas/concurrentes del host y límite físico del volumen; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c` | 91/0/4 ignoradas contra SDK/RPC local; ZIP AArch64 0.1.1 validado e instalado/activo en staging tras backups; configuración admin 200 sin credenciales; salud `Degraded` esperada sin tuner/egress; clave de referencia root-only generada | Pin público aún viejo; perfil WireGuard MX, metadatos/secretos legítimos restantes, cuenta/tuner, E2E real y publicación pendientes |
-| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series incremental a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde; audits DB/logs/argv 0 findings | Concurrencia, repetición periódica del audit y matriz de clientes reales |
-| Catálogo general | Pushdown SQL acotado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed | API 353/0/3, DB 169/0/4, migrador 36/36 y Clippy estrictos; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto, frente a p95 6.169 ms anterior | E2E visual/reproducción y matriz de clientes reales |
+| Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series por streaming acotado a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; probe media+metadata agrupado; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde; audits DB/logs/argv 0 findings | Repetición periódica del audit y matriz de clientes reales |
+| Catálogo general | Pushdown SQL paginado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed; filtros normalizan `Series`/`Movie,Series` a episodios persistidos | API 354/0/3, DB 169/0/4 y Clippy estricto sobre el lote; migrador baseline 36/36; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto | Rollout y E2E visual/reproducción |
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118 y revisiones/CAS incremental 119 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; selección por familias; contratos Web tipados y sin cap | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms. Carrera, case-fold, no-op y dos contributors verdes; probe Xtream mantiene coverage 0→2 sin FFmpeg. HTTPS 80/8 p95 0,111–0,122 s | Scope padre+hijos/múltiple, coalescer de grandes lotes, encapsular el GUC interno y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
@@ -562,6 +572,11 @@ rollout probado:
    incluido `ParentId` de carpeta virtual. Counts, colecciones de metadata y los
    dos endpoints Filters agregan el catálogo completo compatible sin depender
    del cap de página y conservan fallback exacto para shapes complejos. La
+   importación Xtream usa chunks y staging porque su API no garantiza una
+   paginación global interoperable; la paginación se aplica después contra la
+   base local. `Series` es una vista sintética agrupada desde episodios y sus
+   filtros normalizan también las consultas mixtas `Movie,Series`.
+   La
    proyección facet/selectores/fechas 108/109/110/111/112 evita scans y backfills repetidos. Las peticiones de listado sin `Limit`, filtros
    metadata no modelados, Series/Season, sugerencias, resume sin límite o con
    filtros/orden complejos y episodios especiales todavía pueden ejecutar

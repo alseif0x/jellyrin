@@ -2447,6 +2447,31 @@ impl PostgresDatabase {
         Ok(())
     }
 
+    async fn finish_media_item_query_filter_summary_point_update(
+        tx: &mut Transaction<'_, Postgres>,
+        item_id: Uuid,
+        context: MediaItemQueryFilterSummaryPointContext,
+    ) -> anyhow::Result<()> {
+        let (folder_id, projection) =
+            postgres_media_item_query_filter_projection_from_live(tx, item_id).await?;
+        anyhow::ensure!(
+            folder_id == context.folder_id,
+            "media item moved during query-filter point update"
+        );
+        if projection == context.old_projection {
+            return Ok(());
+        }
+        replace_postgres_media_item_query_filter_projection(tx, item_id, folder_id, &projection)
+            .await?;
+        Self::reconcile_media_item_query_filter_summary_point_update(
+            tx,
+            item_id,
+            context,
+            &projection,
+        )
+        .await
+    }
+
     async fn rebuild_tv_series_catalog_projection_in_transaction(
         tx: &mut Transaction<'_, Postgres>,
         virtual_folder_id: Uuid,
@@ -5175,15 +5200,71 @@ impl PostgresDatabase {
             tx.commit().await?;
             return Ok(());
         }
-        let projection =
-            replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
-        Self::reconcile_media_item_query_filter_summary_point_update(
-            &mut tx,
-            item_id,
-            summary,
-            &projection,
+        Self::finish_media_item_query_filter_summary_point_update(&mut tx, item_id, summary)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_media_item_media_info_and_metadata(
+        &self,
+        item_id: Uuid,
+        runtime_ticks: Option<i64>,
+        bitrate: Option<i64>,
+        width: Option<i32>,
+        height: Option<i32>,
+        media_streams: Vec<Value>,
+        metadata: Value,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let summary =
+            Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
+        let media_streams = serde_json::to_value(media_streams)?;
+        let media_info_changed = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET runtime_ticks = $2, bitrate = $3, width = $4, height = $5,
+                media_streams = $6
+            WHERE id = $1
+              AND ROW(runtime_ticks, bitrate, width, height, media_streams)
+                  IS DISTINCT FROM ROW($2, $3, $4, $5, $6)
+            "#,
         )
-        .await?;
+        .bind(item_id)
+        .bind(runtime_ticks)
+        .bind(bitrate)
+        .bind(width)
+        .bind(height)
+        .bind(&media_streams)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        let metadata_changed = sqlx::query(
+            r#"
+            UPDATE media_items
+            SET metadata = $2, updated_at = $3
+            WHERE id = $1
+              AND metadata IS DISTINCT FROM $2
+            "#,
+        )
+        .bind(item_id)
+        .bind(&metadata)
+        .bind(OffsetDateTime::now_utc())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if !media_info_changed && !metadata_changed {
+            tx.commit().await?;
+            return Ok(());
+        }
+        if metadata_changed {
+            replace_postgres_media_item_facets(&mut tx, item_id, &metadata).await?;
+        }
+        Self::finish_media_item_query_filter_summary_point_update(&mut tx, item_id, summary)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5214,15 +5295,8 @@ impl PostgresDatabase {
             return Ok(());
         }
         replace_postgres_media_item_facets(&mut tx, item_id, &metadata).await?;
-        let projection =
-            replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
-        Self::reconcile_media_item_query_filter_summary_point_update(
-            &mut tx,
-            item_id,
-            summary,
-            &projection,
-        )
-        .await?;
+        Self::finish_media_item_query_filter_summary_point_update(&mut tx, item_id, summary)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5254,15 +5328,8 @@ impl PostgresDatabase {
             return Ok(());
         }
         replace_postgres_media_item_facets(&mut tx, item_id, metadata).await?;
-        let projection =
-            replace_postgres_media_item_query_filter_projection_from_live(&mut tx, item_id).await?;
-        Self::reconcile_media_item_query_filter_summary_point_update(
-            &mut tx,
-            item_id,
-            summary,
-            &projection,
-        )
-        .await?;
+        Self::finish_media_item_query_filter_summary_point_update(&mut tx, item_id, summary)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -5367,13 +5434,11 @@ END"#;
 fn postgres_query_filter_summary_scope(
     query: &MediaItemCatalogQuery,
 ) -> Option<(Vec<Uuid>, Vec<String>)> {
-    if query.virtual_folder_ids.len() != 1
+    if query.virtual_folder_ids.is_empty()
         || !query.ids.is_empty()
         || !query.exclude_item_types.is_empty()
         || !query.collection_types.is_empty()
-        || !query.media_types.is_empty()
         || !query.containers.is_empty()
-        || !query.video_types.is_empty()
         || !query.audio_languages.is_empty()
         || !query.subtitle_languages.is_empty()
         || !query.genre_ids.is_empty()
@@ -5415,6 +5480,18 @@ fn postgres_query_filter_summary_scope(
             .iter()
             .any(|item_type| item_type != "movie" && item_type != "episode")
     {
+        return None;
+    }
+    let mut media_types = normalized_catalog_values(&query.media_types);
+    media_types.sort_unstable();
+    media_types.dedup();
+    if !media_types.is_empty() && media_types != ["video"] {
+        return None;
+    }
+    let mut video_types = normalized_catalog_values(&query.video_types);
+    video_types.sort_unstable();
+    video_types.dedup();
+    if !video_types.is_empty() && video_types != ["videofile"] {
         return None;
     }
 
@@ -6399,10 +6476,22 @@ pub(super) async fn replace_postgres_media_item_query_filter_projection(
     Ok(())
 }
 
+#[cfg(test)]
 async fn replace_postgres_media_item_query_filter_projection_from_live(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     item_id: Uuid,
 ) -> anyhow::Result<MediaItemQueryFilterProjection> {
+    let (folder_id, projection) =
+        postgres_media_item_query_filter_projection_from_live(tx, item_id).await?;
+    replace_postgres_media_item_query_filter_projection(tx, item_id, folder_id, &projection)
+        .await?;
+    Ok(projection)
+}
+
+async fn postgres_media_item_query_filter_projection_from_live(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    item_id: Uuid,
+) -> anyhow::Result<(Uuid, MediaItemQueryFilterProjection)> {
     let (folder_id, path, media_type, media_streams, metadata) =
         sqlx::query_as::<_, (Uuid, String, String, Value, Value)>(
             "SELECT virtual_folder_id, path, media_type, media_streams, metadata FROM media_items WHERE id = $1",
@@ -6418,9 +6507,7 @@ async fn replace_postgres_media_item_query_filter_projection_from_live(
             media_streams: streams,
             metadata: &metadata,
         });
-    replace_postgres_media_item_query_filter_projection(tx, item_id, folder_id, &projection)
-        .await?;
-    Ok(projection)
+    Ok((folder_id, projection))
 }
 
 fn postgres_query_filter_scalar_memberships(
@@ -8279,7 +8366,8 @@ mod tests {
                     )
                 })
                 .collect();
-            test.database
+            let irrelevant_folder = test
+                .database
                 .replace_remote_media_library_snapshot(
                     "Irrelevant Filters",
                     "movies",
@@ -8471,6 +8559,49 @@ mod tests {
             assert!(!filters2_values.has_subtitles);
             assert!(!filters2_values.has_trailer);
 
+            let multi_folder_query = MediaItemCatalogQuery {
+                start_index: 0,
+                limit: 0,
+                virtual_folder_ids: vec![target_folder.id, irrelevant_folder.id],
+                include_item_types: vec!["Movie".to_owned()],
+                ..MediaItemCatalogQuery::default()
+            };
+            let multi_folder_summary = test
+                .database
+                .media_item_query_filter_values(
+                    &multi_folder_query,
+                    MediaItemQueryFilterSelection::ALL,
+                )
+                .await?;
+            assert_eq!(multi_folder_summary.genres.len(), 513);
+            assert!(
+                multi_folder_summary
+                    .genres
+                    .iter()
+                    .any(|value| value == "Drama")
+            );
+            assert!(
+                multi_folder_summary
+                    .genres
+                    .iter()
+                    .any(|value| value == "Wrong Genre 511")
+            );
+            sqlx::query(
+                "DELETE FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(irrelevant_folder.id)
+            .execute(&test.database.pool)
+            .await?;
+            let multi_folder_fallback = test
+                .database
+                .media_item_query_filter_values(
+                    &multi_folder_query,
+                    MediaItemQueryFilterSelection::ALL,
+                )
+                .await?;
+            assert_eq!(multi_folder_summary, multi_folder_fallback);
+
             let summary_item_id = Uuid::new_v4();
             let summary_folder = test
                 .database
@@ -8652,6 +8783,48 @@ mod tests {
             .await?;
             assert_eq!(point_coverage, 1);
 
+            let revision_before_combined = sqlx::query_scalar::<_, i64>(
+                "SELECT source_revision \
+                 FROM media_item_query_filter_summary_revisions \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            test.database
+                .update_media_item_media_info_and_metadata(
+                    summary_item_id,
+                    Some(10_000),
+                    Some(2_000_000),
+                    Some(1920),
+                    Some(1080),
+                    vec![json!({ "Type": "Audio", "Language": "eng" })],
+                    json!({ "Genres": ["Combined Genre"], "Tags": ["Combined Tag"] }),
+                )
+                .await?;
+            let combined_summary = test
+                .database
+                .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
+                .await?;
+            assert_eq!(combined_summary.genres, ["Combined Genre"]);
+            assert_eq!(combined_summary.tags, ["Combined Tag"]);
+            assert_eq!(combined_summary.audio_languages, ["eng"]);
+            assert!(!combined_summary.has_subtitles);
+            let revision_after_combined = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
+                "SELECT revision.source_revision, revision.reconciled_revision, \
+                        coverage.source_revision \
+                 FROM media_item_query_filter_summary_revisions AS revision \
+                 JOIN media_item_query_filter_summary_coverage AS coverage \
+                   ON coverage.virtual_folder_id = revision.virtual_folder_id \
+                 WHERE revision.virtual_folder_id = $1",
+            )
+            .bind(summary_folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(revision_after_combined.0, revision_before_combined + 1);
+            assert_eq!(revision_after_combined.1, Some(revision_after_combined.0));
+            assert_eq!(revision_after_combined.2, revision_after_combined.0);
+
             sqlx::query(
                 "DELETE FROM media_item_query_filter_summary_coverage \
                  WHERE virtual_folder_id = $1",
@@ -8663,7 +8836,7 @@ mod tests {
                 .database
                 .media_item_query_filter_values(&summary_query, MediaItemQueryFilterSelection::ALL)
                 .await?;
-            assert_eq!(point_stream_summary, point_fallback);
+            assert_eq!(combined_summary, point_fallback);
 
             let case_first_id = Uuid::new_v4();
             let case_second_id = Uuid::new_v4();
