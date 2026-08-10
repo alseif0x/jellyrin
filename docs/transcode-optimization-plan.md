@@ -195,6 +195,13 @@ histórica y no debe confundirse con este estado vigente.
   append a staging y publica atómicamente. La navegación sí usa páginas SQL con
   total exacto; Series se agrupa mediante la proyección PostgreSQL y nunca carga
   los 455.520 episodios en memoria por petición.
+- El commit `ad0e14d` está desplegado en staging con SHA-256
+  `9ba49ca405de29b05e40ba0f909e54ab4719cbe6c50b5e660ff6f483ae37660a`.
+  Health, readiness y HTTPS quedaron verdes, el servicio conserva cero
+  reinicios, las 2/2 revisiones de filtros están reconciliadas, coverage tiene
+  dos filas vigentes y no se inició FFmpeg. El rollback recuperable es
+  `/var/backups/jellyrin/jellyrin-server-pre-ad0e14d-20260810T090845Z`, cuyo
+  SHA-256 coincide con el binario anterior `cef61151…6069c2a`.
 - DLNA ya no relee el catálogo completo por cada carpeta: browse/search usa
   `media_items_for_virtual_folders` y solo hidrata metadata para los IDs del
   dominio seleccionado. El detalle de carpeta reutiliza conteos SQL agrupados
@@ -512,7 +519,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118 y revisiones/CAS incremental 119 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; selección por familias; contratos Web tipados y sin cap | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms. Carrera, case-fold, no-op y dos contributors verdes; probe Xtream mantiene coverage 0→2 sin FFmpeg. HTTPS 80/8 p95 0,111–0,122 s | Scope padre+hijos/múltiple, coalescer de grandes lotes, encapsular el GUC interno y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `4513b58`; servidor SHA-256 `cef61151...6069c2a`; esquema 119; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios; filtros incrementales, VOD directo y Live TV direct/remux reales verdes; MAGSTV 0.1.1 activo | Clientes reales; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`, cgroup software-only y FFmpeg remux-only endurecido | Núcleo `ad0e14d`; servidor SHA-256 `9ba49ca4...37660a`; esquema 119; health/readiness local/HTTPS verdes, 0 reinicios, revisiones 2/2 limpias y 0 FFmpeg; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios; VOD directo y Live TV direct/remux reales verdes; MAGSTV 0.1.1 activo | E2E visual autenticado; esquema 120; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
 
