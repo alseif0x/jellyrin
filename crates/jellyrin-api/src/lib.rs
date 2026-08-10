@@ -135,12 +135,13 @@ use jellyrin_db::{
     LiveTvChannelUpsert, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
     MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore, MediaItemCatalogCounts,
     MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemCatalogSortField,
-    MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterValues,
-    MediaList, MediaListItem, MediaListUserPermission, NamedConfigurationPayload,
-    PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert, ProviderSecretReference,
-    QuickConnectSession, ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads, TaskRun,
-    TranscodeSession, TrickplayInfo, UpsertActivePlaybackSession, UpsertActiveViewingSession,
-    UpsertPlaybackState, UpsertTranscodeSession, probe_remote_media_info_admitted,
+    MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
+    MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
+    NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
+    ProviderSecretReference, QuickConnectSession, ResumeItemsPageQuery, SortDirection,
+    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    UpsertTranscodeSession, probe_remote_media_info_admitted,
     provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
     upcoming_media_item_premiere_date,
 };
@@ -45745,8 +45746,13 @@ async fn item_filters(
         filter_query.include_item_types = vec!["Episode".to_string()];
         filter_query.ids = None;
     }
-    if let Some(values) =
-        media_catalog_filter_values_result(&state.db, &filter_query, requested_user_id).await?
+    if let Some(values) = media_catalog_filter_values_result(
+        &state.db,
+        &filter_query,
+        requested_user_id,
+        MediaItemQueryFilterSelection::ITEMS_FILTERS,
+    )
+    .await?
     {
         return Ok(Json(item_filter_response(values)));
     }
@@ -45782,7 +45788,7 @@ async fn item_filters(
         "Genres": metadata_values.genres.into_values().collect::<Vec<_>>(),
         "Tags": metadata_values.tags.into_values().collect::<Vec<_>>(),
         "OfficialRatings": metadata_values.official_ratings.into_values().collect::<Vec<_>>(),
-        "Years": metadata_values.years.into_values().collect::<Vec<_>>(),
+        "Years": item_filter_years(metadata_values.years.into_values()),
         "Containers": containers,
         "MediaTypes": media_types,
         "VideoTypes": video_types,
@@ -45818,8 +45824,13 @@ async fn query_filters(
             "SubtitleLanguages": []
         })));
     }
-    if let Some(values) =
-        media_catalog_filter_values_result(&state.db, &query, requested_user_id).await?
+    if let Some(values) = media_catalog_filter_values_result(
+        &state.db,
+        &query,
+        requested_user_id,
+        MediaItemQueryFilterSelection::FILTERS2,
+    )
+    .await?
     {
         return Ok(Json(query_filter_response(values)));
     }
@@ -45827,11 +45838,44 @@ async fn query_filters(
         filtered_items_for_query(&state, &headers, auth_query.api_key.as_deref(), &query).await?;
     let metadata_values = item_filter_metadata_values(&state.db, &items).await?;
     Ok(Json(serde_json::json!({
-        "Genres": metadata_values.genres.into_values().collect::<Vec<_>>(),
+        "Genres": query_filter_genres(metadata_values.genres.into_values()),
         "Tags": metadata_values.tags.into_values().collect::<Vec<_>>(),
-        "AudioLanguages": metadata_values.audio_languages.into_values().collect::<Vec<_>>(),
-        "SubtitleLanguages": metadata_values.subtitle_languages.into_values().collect::<Vec<_>>()
+        "AudioLanguages": query_filter_languages(metadata_values.audio_languages.into_values()),
+        "SubtitleLanguages": query_filter_languages(metadata_values.subtitle_languages.into_values())
     })))
+}
+
+fn item_filter_years(values: impl IntoIterator<Item = String>) -> Vec<i32> {
+    values
+        .into_iter()
+        .filter_map(|value| value.trim().parse::<i32>().ok())
+        .collect()
+}
+
+fn query_filter_genres(values: impl IntoIterator<Item = String>) -> Vec<serde_json::Value> {
+    values
+        .into_iter()
+        .map(|name| {
+            let id = stable_entity_id("Genre", &name);
+            serde_json::json!({
+                "Name": name,
+                "Id": id,
+            })
+        })
+        .collect()
+}
+
+fn query_filter_languages(values: impl IntoIterator<Item = String>) -> Vec<serde_json::Value> {
+    values
+        .into_iter()
+        .map(|value| {
+            let name = language_display_name(Some(&value)).unwrap_or_else(|| value.clone());
+            serde_json::json!({
+                "Name": name,
+                "Value": value,
+            })
+        })
+        .collect()
 }
 
 fn item_filter_response(values: MediaItemQueryFilterValues) -> serde_json::Value {
@@ -45861,7 +45905,7 @@ fn item_filter_response(values: MediaItemQueryFilterValues) -> serde_json::Value
         "Genres": values.genres,
         "Tags": values.tags,
         "OfficialRatings": values.official_ratings,
-        "Years": values.years,
+        "Years": item_filter_years(values.years),
         "Containers": values.containers,
         "MediaTypes": values.media_types,
         "VideoTypes": values.video_types,
@@ -45877,10 +45921,10 @@ fn item_filter_response(values: MediaItemQueryFilterValues) -> serde_json::Value
 
 fn query_filter_response(values: MediaItemQueryFilterValues) -> serde_json::Value {
     serde_json::json!({
-        "Genres": values.genres,
+        "Genres": query_filter_genres(values.genres),
         "Tags": values.tags,
-        "AudioLanguages": values.audio_languages,
-        "SubtitleLanguages": values.subtitle_languages,
+        "AudioLanguages": query_filter_languages(values.audio_languages),
+        "SubtitleLanguages": query_filter_languages(values.subtitle_languages),
     })
 }
 
@@ -45888,13 +45932,14 @@ async fn media_catalog_filter_values_result(
     db: &Database,
     query: &ItemsQuery,
     user_id: Option<Uuid>,
+    selection: MediaItemQueryFilterSelection,
 ) -> Result<Option<MediaItemQueryFilterValues>, ApiError> {
     let Some(db_query) = resolved_media_catalog_query_for_filter_values(db, query, user_id).await?
     else {
         return Ok(None);
     };
     Ok(Some(
-        MediaCatalogStore::media_item_query_filter_values(db, &db_query).await?,
+        MediaCatalogStore::media_item_query_filter_values(db, &db_query, selection).await?,
     ))
 }
 
@@ -79939,7 +79984,7 @@ done
         assert_eq!(filters["Genres"], json!(["Drama", "Thriller"]));
         assert_eq!(filters["Tags"], json!(["Library Tag"]));
         assert_eq!(filters["OfficialRatings"], json!(["PG-13"]));
-        assert_eq!(filters["Years"], json!(["2024"]));
+        assert_eq!(filters["Years"], json!([2024]));
         assert_eq!(filters["MediaTypes"], json!(["Video"]));
         assert_eq!(filters["Containers"], json!(["mp4"]));
         assert_eq!(filters["VideoTypes"], json!(["VideoFile"]));
@@ -79983,10 +80028,22 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let filters2: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(filters2["Genres"], json!(["Drama", "Thriller"]));
+        assert_eq!(
+            filters2["Genres"],
+            json!([
+                { "Name": "Drama", "Id": stable_entity_id("Genre", "Drama") },
+                { "Name": "Thriller", "Id": stable_entity_id("Genre", "Thriller") }
+            ])
+        );
         assert_eq!(filters2["Tags"], json!(["Library Tag"]));
-        assert_eq!(filters2["AudioLanguages"], json!(["eng"]));
-        assert_eq!(filters2["SubtitleLanguages"], json!(["spa"]));
+        assert_eq!(
+            filters2["AudioLanguages"],
+            json!([{ "Name": "English", "Value": "eng" }])
+        );
+        assert_eq!(
+            filters2["SubtitleLanguages"],
+            json!([{ "Name": "Spanish; Castilian", "Value": "spa" }])
+        );
 
         let response = app
             .clone()
@@ -86359,10 +86416,28 @@ done
         let filters2: Value =
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-        assert_eq!(filters2["Genres"], json!(["Needle Alpha", "Needle Zulu"]));
+        assert_eq!(
+            filters2["Genres"],
+            json!([
+                {
+                    "Name": "Needle Alpha",
+                    "Id": stable_entity_id("Genre", "Needle Alpha")
+                },
+                {
+                    "Name": "Needle Zulu",
+                    "Id": stable_entity_id("Genre", "Needle Zulu")
+                }
+            ])
+        );
         assert_eq!(filters2["Tags"], json!(["Needle Tag"]));
-        assert_eq!(filters2["AudioLanguages"], json!(["fra"]));
-        assert_eq!(filters2["SubtitleLanguages"], json!(["spa"]));
+        assert_eq!(
+            filters2["AudioLanguages"],
+            json!([{ "Name": "French", "Value": "fra" }])
+        );
+        assert_eq!(
+            filters2["SubtitleLanguages"],
+            json!([{ "Name": "Spanish; Castilian", "Value": "spa" }])
+        );
 
         let response = app
             .clone()
@@ -86384,6 +86459,45 @@ done
         assert_eq!(
             fallback_filters["Genres"],
             json!(["Needle Alpha", "Needle Zulu"])
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Filters2?ParentId={primary_id}&HasTrailer=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let fallback_filters2: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            fallback_filters2["Genres"],
+            json!([
+                {
+                    "Name": "Needle Alpha",
+                    "Id": stable_entity_id("Genre", "Needle Alpha")
+                },
+                {
+                    "Name": "Needle Zulu",
+                    "Id": stable_entity_id("Genre", "Needle Zulu")
+                }
+            ])
+        );
+        assert_eq!(
+            fallback_filters2["AudioLanguages"],
+            json!([{ "Name": "French", "Value": "fra" }])
+        );
+        assert_eq!(
+            fallback_filters2["SubtitleLanguages"],
+            json!([{ "Name": "Spanish; Castilian", "Value": "spa" }])
         );
 
         let response = app

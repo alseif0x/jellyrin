@@ -20,16 +20,17 @@ use super::{
     MediaItemCatalogSortField, MediaItemFacetCandidateQuery, MediaItemFacetKind,
     MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary, MediaItemForImageTag,
     MediaItemMetadata, MediaItemQueryFilterProjection, MediaItemQueryFilterProjectionSource,
-    MediaItemQueryFilterValues, PostgresDatabase, REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS,
-    RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot,
-    RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION,
-    TvSeriesCatalogKey, TvSeriesCatalogPage, catalog_sync_duration_millis,
-    encode_media_item_query_filter_position, extract_media_item_facets,
-    extract_media_item_filter_selectors, extract_media_item_genre_selectors,
-    extract_media_item_query_filter_projection, is_upcoming_media_item_entry, nonnegative_count,
-    normalized_facet_query_values, prepare_remote_media_library_stage_specs,
-    retain_entries_with_effective_types, telemetry::DatabaseOperation,
-    upcoming_media_item_premiere_parts, validate_remote_media_catalog_stage_append,
+    MediaItemQueryFilterSelection, MediaItemQueryFilterValues, PostgresDatabase,
+    REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, RemoteMediaCatalogStage, RemoteMediaItemUpsert,
+    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection,
+    TV_SERIES_CATALOG_PROJECTION_VERSION, TvSeriesCatalogKey, TvSeriesCatalogPage,
+    catalog_sync_duration_millis, encode_media_item_query_filter_position,
+    extract_media_item_facets, extract_media_item_filter_selectors,
+    extract_media_item_genre_selectors, extract_media_item_query_filter_projection,
+    is_upcoming_media_item_entry, nonnegative_count, normalized_facet_query_values,
+    prepare_remote_media_library_stage_specs, retain_entries_with_effective_types,
+    telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
+    validate_remote_media_catalog_stage_append,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -1102,12 +1103,15 @@ impl PostgresDatabase {
     pub async fn media_item_query_filter_values(
         &self,
         query: &MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
         let observation = self.telemetry.start_operation(
             DatabaseOperation::CatalogFilterSummary,
             DatabasePoolRole::Api,
         );
-        let result = self.media_item_query_filter_values_unobserved(query).await;
+        let result = self
+            .media_item_query_filter_values_unobserved(query, selection)
+            .await;
         observation.finish_result(&result, postgres_query_filter_value_count);
         result
     }
@@ -1115,6 +1119,7 @@ impl PostgresDatabase {
     async fn media_item_query_filter_values_unobserved(
         &self,
         query: &MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
         super::validate_media_item_catalog_query(query)?;
         let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
@@ -1184,9 +1189,12 @@ impl PostgresDatabase {
             sqlx::query("SET LOCAL jit = off")
                 .execute(&mut *transaction)
                 .await?;
-            Self::media_item_query_filter_values_projected(query, &mut transaction).await
+            Self::media_item_query_filter_values_projected(query, selection, &mut transaction).await
         } else {
-            Self::media_item_query_filter_values_legacy(query, &mut transaction).await
+            let mut values =
+                Self::media_item_query_filter_values_legacy(query, &mut transaction).await?;
+            values.retain_selection(selection);
+            Ok(values)
         };
         transaction.commit().await?;
         result
@@ -1194,6 +1202,7 @@ impl PostgresDatabase {
 
     async fn media_item_query_filter_values_projected(
         query: &MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
         connection: &mut PgConnection,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
         let mut values = QueryBuilder::<Postgres>::new(
@@ -1217,6 +1226,8 @@ impl PostgresDatabase {
                   WHERE projected.virtual_folder_id = ANY(",
             );
             values.push_bind(&query.virtual_folder_ids);
+            values.push(") AND projected.value_kind = ANY(");
+            values.push_bind(selection.projected_fields());
             values.push(")");
         } else {
             values.push(
@@ -1227,39 +1238,14 @@ impl PostgresDatabase {
                         FROM media_item_query_filter_values AS value
                         WHERE value.item_id = selected.id
                           AND value.virtual_folder_id = selected.virtual_folder_id
+                          AND value.value_kind = ANY("#,
+            );
+            values.push_bind(selection.projected_fields());
+            values.push(
+                r#")
                         OFFSET 0
                     ) AS projected"#,
             );
-        }
-        values.push(
-            r#" UNION ALL
-                SELECT scalar.kind, scalar.normalized_value, scalar.display_value,
-                       selected.item_sort, selected.id, 0, ''
-                FROM selected
-                CROSS JOIN LATERAL (
-                    SELECT source.container_value, source.container_present, source.media_type,
-                           source.is_video, source.has_subtitles, source.has_trailer,
-                           source.virtual_folder_id
-                    FROM media_item_query_filter_sources AS source
-                    WHERE source.item_id = selected.id
-                      AND source.virtual_folder_id = selected.virtual_folder_id
-                    OFFSET 0
-                ) AS source
-                CROSS JOIN LATERAL (VALUES
-                    ('containers', lower(source.container_value),
-                     lower(source.container_value), source.container_present),
-                    ('media_types', source.media_type, source.media_type, TRUE),
-                    ('video_types', 'videofile', 'VideoFile', source.is_video),
-                    ('has_subtitles', 'true', 'true', source.has_subtitles),
-                    ('has_trailer', 'true', 'true', source.has_trailer)
-                ) AS scalar(kind, normalized_value, display_value, present)
-                WHERE scalar.present
-            "#,
-        );
-        if query.virtual_folder_ids.len() == 1 {
-            values.push(" AND source.virtual_folder_id = ANY(");
-            values.push_bind(&query.virtual_folder_ids);
-            values.push(")");
         }
         values.push(
             r#"), ranked AS (
@@ -1269,10 +1255,65 @@ impl PostgresDatabase {
                            ORDER BY item_sort COLLATE "C", item_id, key_priority, position
                        ) AS spelling_rank
                 FROM candidates
-            )
-            SELECT kind, display_value
-            FROM ranked WHERE spelling_rank = 1
-            ORDER BY kind COLLATE "C", normalized_value COLLATE "C"
+            "#,
+        );
+        if selection.includes_scalars() {
+            values.push(
+                r#"), scalar_summary AS (
+                    SELECT COALESCE(
+                               array_agg(DISTINCT lower(source.container_value))
+                                   FILTER (WHERE source.container_present),
+                               ARRAY[]::text[]
+                           ) AS containers,
+                           COALESCE(
+                               array_agg(DISTINCT source.media_type),
+                               ARRAY[]::text[]
+                           ) AS media_types,
+                           COALESCE(bool_or(source.is_video), FALSE) AS has_video,
+                           COALESCE(bool_or(source.has_subtitles), FALSE) AS has_subtitles,
+                           COALESCE(bool_or(source.has_trailer), FALSE) AS has_trailer
+                    FROM selected
+                    JOIN media_item_query_filter_sources AS source
+                      ON source.item_id = selected.id
+                     AND source.virtual_folder_id = selected.virtual_folder_id
+                )
+                "#,
+            );
+        } else {
+            values.push(")");
+        }
+        values.push(
+            r#", result AS (
+                SELECT kind, normalized_value, display_value
+                FROM ranked WHERE spelling_rank = 1
+            "#,
+        );
+        if selection.includes_scalars() {
+            values.push(
+                r#" UNION ALL
+                    SELECT 'containers', container.value, container.value
+                    FROM scalar_summary
+                    CROSS JOIN LATERAL unnest(scalar_summary.containers) AS container(value)
+                    UNION ALL
+                    SELECT 'media_types', media_type.value, media_type.value
+                    FROM scalar_summary
+                    CROSS JOIN LATERAL unnest(scalar_summary.media_types) AS media_type(value)
+                    UNION ALL
+                    SELECT 'video_types', 'videofile', 'VideoFile'
+                    FROM scalar_summary WHERE scalar_summary.has_video
+                    UNION ALL
+                    SELECT 'has_subtitles', 'true', 'true'
+                    FROM scalar_summary WHERE scalar_summary.has_subtitles
+                    UNION ALL
+                    SELECT 'has_trailer', 'true', 'true'
+                    FROM scalar_summary WHERE scalar_summary.has_trailer
+                "#,
+            );
+        }
+        values.push(
+            r#")
+                SELECT kind, display_value FROM result
+                ORDER BY kind COLLATE "C", normalized_value COLLATE "C"
             "#,
         );
         let rows = values
@@ -6068,6 +6109,18 @@ mod tests {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(12);
+            let (selection_name, selection) =
+                match std::env::var("JELLYRIN_FILTER_BENCHMARK_SELECTION")
+                    .as_deref()
+                    .unwrap_or("items")
+                {
+                    "items" => ("items", MediaItemQueryFilterSelection::ITEMS_FILTERS),
+                    "filters2" => ("filters2", MediaItemQueryFilterSelection::FILTERS2),
+                    "all" => ("all", MediaItemQueryFilterSelection::ALL),
+                    value => anyhow::bail!(
+                        "unsupported JELLYRIN_FILTER_BENCHMARK_SELECTION value: {value}"
+                    ),
+                };
             anyhow::ensure!(episode_count >= 0 && movie_count > 0 && repetitions > 0);
 
             let movie_folder = test
@@ -6172,7 +6225,10 @@ mod tests {
                 ..MediaItemCatalogQuery::default()
             };
             for _ in 0..2 {
-                let values = test.database.media_item_query_filter_values(&query).await?;
+                let values = test
+                    .database
+                    .media_item_query_filter_values(&query, selection)
+                    .await?;
                 anyhow::ensure!(values.genres.len() == 60 && values.tags.len() == 100);
             }
             let temp_bytes_before: i64 = sqlx::query_scalar(
@@ -6182,10 +6238,14 @@ mod tests {
             .await?;
             let concurrent_started = Instant::now();
             let (first, second, third, fourth) = tokio::try_join!(
-                test.database.media_item_query_filter_values(&query),
-                test.database.media_item_query_filter_values(&query),
-                test.database.media_item_query_filter_values(&query),
-                test.database.media_item_query_filter_values(&query),
+                test.database
+                    .media_item_query_filter_values(&query, selection),
+                test.database
+                    .media_item_query_filter_values(&query, selection),
+                test.database
+                    .media_item_query_filter_values(&query, selection),
+                test.database
+                    .media_item_query_filter_values(&query, selection),
             )?;
             for values in [first, second, third, fourth] {
                 anyhow::ensure!(values.genres.len() == 60 && values.tags.len() == 100);
@@ -6194,7 +6254,10 @@ mod tests {
             let mut samples = Vec::with_capacity(repetitions);
             for _ in 0..repetitions {
                 let started = Instant::now();
-                let values = test.database.media_item_query_filter_values(&query).await?;
+                let values = test
+                    .database
+                    .media_item_query_filter_values(&query, selection)
+                    .await?;
                 samples.push(started.elapsed().as_micros());
                 anyhow::ensure!(values.genres.len() == 60 && values.tags.len() == 100);
             }
@@ -6234,6 +6297,7 @@ mod tests {
                     "benchmark": "postgres_movie_filter_values",
                     "episodes": episode_count,
                     "movies": movie_count,
+                    "selection": selection_name,
                     "repetitions": repetitions,
                     "p50_micros": percentile_from_sorted_samples(&samples, 50),
                     "p95_micros": p95_micros,
@@ -7467,7 +7531,7 @@ mod tests {
             };
             let values = test
                 .database
-                .media_item_query_filter_values(&filter_query)
+                .media_item_query_filter_values(&filter_query, MediaItemQueryFilterSelection::ALL)
                 .await?;
             assert_eq!(values.albums, ["Album One", "Album Two"]);
             assert_eq!(values.artists, ["Artist One", "Artist Two"]);
@@ -7488,15 +7552,42 @@ mod tests {
             assert!(!format!("{values:?}").contains("Must Not Leak"));
             assert!(!format!("{values:?}").contains("Wrong Genre"));
 
+            let filters2_values = test
+                .database
+                .media_item_query_filter_values(
+                    &filter_query,
+                    MediaItemQueryFilterSelection::FILTERS2,
+                )
+                .await?;
+            assert_eq!(filters2_values.genres, values.genres);
+            assert_eq!(filters2_values.tags, values.tags);
+            assert_eq!(filters2_values.audio_languages, values.audio_languages);
+            assert_eq!(
+                filters2_values.subtitle_languages,
+                values.subtitle_languages
+            );
+            assert!(filters2_values.official_ratings.is_empty());
+            assert!(filters2_values.containers.is_empty());
+            assert!(!filters2_values.has_subtitles);
+            assert!(!filters2_values.has_trailer);
+
             sqlx::query("DELETE FROM media_item_query_filter_sources WHERE item_id = $1")
                 .bind(target_id)
                 .execute(&test.database.pool)
                 .await?;
             let legacy_fallback = test
                 .database
-                .media_item_query_filter_values(&filter_query)
+                .media_item_query_filter_values(&filter_query, MediaItemQueryFilterSelection::ALL)
                 .await?;
             assert_eq!(legacy_fallback, values);
+            let legacy_filters2 = test
+                .database
+                .media_item_query_filter_values(
+                    &filter_query,
+                    MediaItemQueryFilterSelection::FILTERS2,
+                )
+                .await?;
+            assert_eq!(legacy_filters2, filters2_values);
 
             let projected_value_count: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM media_item_facets \
@@ -7512,20 +7603,26 @@ mod tests {
 
             let misleading = test
                 .database
-                .media_item_query_filter_values(&MediaItemCatalogQuery {
-                    ids: vec![misleading_trailer_id],
-                    virtual_folder_ids: vec![target_folder.id],
-                    ..MediaItemCatalogQuery::default()
-                })
+                .media_item_query_filter_values(
+                    &MediaItemCatalogQuery {
+                        ids: vec![misleading_trailer_id],
+                        virtual_folder_ids: vec![target_folder.id],
+                        ..MediaItemCatalogQuery::default()
+                    },
+                    MediaItemQueryFilterSelection::ALL,
+                )
                 .await?;
             assert!(!misleading.has_trailer);
             let case_sensitive_media_types = test
                 .database
-                .media_item_query_filter_values(&MediaItemCatalogQuery {
-                    ids: vec![target_id, misleading_trailer_id],
-                    virtual_folder_ids: vec![target_folder.id],
-                    ..MediaItemCatalogQuery::default()
-                })
+                .media_item_query_filter_values(
+                    &MediaItemCatalogQuery {
+                        ids: vec![target_id, misleading_trailer_id],
+                        virtual_folder_ids: vec![target_folder.id],
+                        ..MediaItemCatalogQuery::default()
+                    },
+                    MediaItemQueryFilterSelection::ALL,
+                )
                 .await?;
             assert_eq!(case_sensitive_media_types.media_types, ["Video", "video"]);
             anyhow::Ok(())

@@ -183,6 +183,132 @@ pub struct MediaItemQueryFilterValues {
     pub has_trailer: bool,
 }
 
+/// Exact subset of filter families requested by a Jellyfin filter endpoint.
+///
+/// Keeping this in the repository contract lets each SQL adapter avoid producing and sorting
+/// values that the caller will discard, without changing the selected item set or applying a cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaItemQueryFilterSelection(u16);
+
+impl MediaItemQueryFilterSelection {
+    const ALBUMS: u16 = 1 << 0;
+    const ARTISTS: u16 = 1 << 1;
+    const AUDIO_LANGUAGES: u16 = 1 << 2;
+    const GENRES: u16 = 1 << 3;
+    const OFFICIAL_RATINGS: u16 = 1 << 4;
+    const SERIES_STATUSES: u16 = 1 << 5;
+    const STAFF_NAMES: u16 = 1 << 6;
+    const STUDIOS: u16 = 1 << 7;
+    const SUBTITLE_LANGUAGES: u16 = 1 << 8;
+    const TAGS: u16 = 1 << 9;
+    const YEARS: u16 = 1 << 10;
+    const SCALARS: u16 = 1 << 11;
+
+    pub const ITEMS_FILTERS: Self = Self(
+        Self::ALBUMS
+            | Self::ARTISTS
+            | Self::GENRES
+            | Self::OFFICIAL_RATINGS
+            | Self::SERIES_STATUSES
+            | Self::STAFF_NAMES
+            | Self::STUDIOS
+            | Self::TAGS
+            | Self::YEARS
+            | Self::SCALARS,
+    );
+
+    pub const FILTERS2: Self =
+        Self(Self::AUDIO_LANGUAGES | Self::GENRES | Self::SUBTITLE_LANGUAGES | Self::TAGS);
+
+    pub const ALL: Self = Self(Self::ITEMS_FILTERS.0 | Self::FILTERS2.0);
+
+    pub(crate) const fn includes_scalars(self) -> bool {
+        self.0 & Self::SCALARS != 0
+    }
+
+    pub(crate) fn includes_field(self, field: &str) -> bool {
+        let flag = match field {
+            "albums" => Self::ALBUMS,
+            "artists" => Self::ARTISTS,
+            "audio_languages" => Self::AUDIO_LANGUAGES,
+            "genres" => Self::GENRES,
+            "official_ratings" => Self::OFFICIAL_RATINGS,
+            "series_statuses" => Self::SERIES_STATUSES,
+            "staff_names" => Self::STAFF_NAMES,
+            "studios" => Self::STUDIOS,
+            "subtitle_languages" => Self::SUBTITLE_LANGUAGES,
+            "tags" => Self::TAGS,
+            "years" => Self::YEARS,
+            _ => 0,
+        };
+        self.0 & flag != 0
+    }
+
+    pub(crate) fn projected_fields(self) -> Vec<&'static str> {
+        [
+            "albums",
+            "artists",
+            "audio_languages",
+            "genres",
+            "official_ratings",
+            "series_statuses",
+            "staff_names",
+            "studios",
+            "subtitle_languages",
+            "tags",
+            "years",
+        ]
+        .into_iter()
+        .filter(|field| self.includes_field(field))
+        .collect()
+    }
+}
+
+impl MediaItemQueryFilterValues {
+    pub(crate) fn retain_selection(&mut self, selection: MediaItemQueryFilterSelection) {
+        if !selection.includes_field("genres") {
+            self.genres.clear();
+        }
+        if !selection.includes_field("tags") {
+            self.tags.clear();
+        }
+        if !selection.includes_field("official_ratings") {
+            self.official_ratings.clear();
+        }
+        if !selection.includes_field("years") {
+            self.years.clear();
+        }
+        if !selection.includes_field("series_statuses") {
+            self.series_statuses.clear();
+        }
+        if !selection.includes_field("staff_names") {
+            self.staff_names.clear();
+        }
+        if !selection.includes_field("artists") {
+            self.artists.clear();
+        }
+        if !selection.includes_field("albums") {
+            self.albums.clear();
+        }
+        if !selection.includes_field("studios") {
+            self.studios.clear();
+        }
+        if !selection.includes_field("audio_languages") {
+            self.audio_languages.clear();
+        }
+        if !selection.includes_field("subtitle_languages") {
+            self.subtitle_languages.clear();
+        }
+        if !selection.includes_scalars() {
+            self.containers.clear();
+            self.media_types.clear();
+            self.video_types.clear();
+            self.has_subtitles = false;
+            self.has_trailer = false;
+        }
+    }
+}
+
 /// Bounded resume-list request shared by the native database adapters.
 ///
 /// The policy values are supplied by the API because they live in Jellyfin's server
@@ -1406,6 +1532,7 @@ pub trait MediaCatalogStore: DatabaseBackend {
     fn media_item_query_filter_values<'a>(
         &'a self,
         query: &'a MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
     ) -> impl std::future::Future<Output = anyhow::Result<MediaItemQueryFilterValues>> + Send + 'a;
 
     fn playback_states_for_items<'a>(
@@ -1514,9 +1641,10 @@ impl MediaCatalogStore for PostgresDatabase {
     fn media_item_query_filter_values<'a>(
         &'a self,
         query: &'a MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
     ) -> impl std::future::Future<Output = anyhow::Result<MediaItemQueryFilterValues>> + Send + 'a
     {
-        PostgresDatabase::media_item_query_filter_values(self, query)
+        PostgresDatabase::media_item_query_filter_values(self, query, selection)
     }
 
     fn playback_states_for_items<'a>(
@@ -1648,9 +1776,10 @@ impl MediaCatalogStore for SqliteDatabase {
     fn media_item_query_filter_values<'a>(
         &'a self,
         query: &'a MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
     ) -> impl std::future::Future<Output = anyhow::Result<MediaItemQueryFilterValues>> + Send + 'a
     {
-        SqliteDatabase::media_item_query_filter_values(self, query)
+        SqliteDatabase::media_item_query_filter_values(self, query, selection)
     }
 
     fn playback_states_for_items<'a>(
@@ -7850,12 +7979,15 @@ impl SqliteDatabase {
     pub async fn media_item_query_filter_values(
         &self,
         query: &MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
         let observation = self.telemetry.start_operation(
             DatabaseOperation::CatalogFilterSummary,
             DatabasePoolRole::Api,
         );
-        let result = self.media_item_query_filter_values_unobserved(query).await;
+        let result = self
+            .media_item_query_filter_values_unobserved(query, selection)
+            .await;
         observation.finish_result(&result, |values| {
             sqlite_media_item_query_filter_value_count(values)
         });
@@ -7865,6 +7997,7 @@ impl SqliteDatabase {
     async fn media_item_query_filter_values_unobserved(
         &self,
         query: &MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
         validate_media_item_catalog_query(query)?;
         let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
@@ -7896,9 +8029,12 @@ impl SqliteDatabase {
             .fetch_one(&mut *transaction)
             .await?;
         let result = if covered {
-            Self::media_item_query_filter_values_projected(query, &mut transaction).await
+            Self::media_item_query_filter_values_projected(query, selection, &mut transaction).await
         } else {
-            Self::media_item_query_filter_values_legacy(query, &mut transaction).await
+            let mut values =
+                Self::media_item_query_filter_values_legacy(query, &mut transaction).await?;
+            values.retain_selection(selection);
+            Ok(values)
         };
         transaction.commit().await?;
         result
@@ -7906,6 +8042,7 @@ impl SqliteDatabase {
 
     async fn media_item_query_filter_values_projected(
         query: &MediaItemCatalogQuery,
+        selection: MediaItemQueryFilterSelection,
         transaction: &mut sqlx::Transaction<'_, Sqlite>,
     ) -> anyhow::Result<MediaItemQueryFilterValues> {
         let mut projected = QueryBuilder::<Sqlite>::new(
@@ -7922,46 +8059,65 @@ impl SqliteDatabase {
              FROM selected_items JOIN media_item_query_filter_values AS value \
                ON value.item_id = selected_items.id \
               AND value.virtual_folder_id = selected_items.virtual_folder_id \
-             UNION ALL \
-             SELECT 'containers', lower(source.container_value), lower(source.container_value), \
-                    selected_items.item_sort, selected_items.id, 0, '' \
-             FROM selected_items JOIN media_item_query_filter_sources AS source \
-               ON source.item_id = selected_items.id \
-              AND source.virtual_folder_id = selected_items.virtual_folder_id \
-             WHERE source.container_present = 1 \
-             UNION ALL \
-             SELECT 'media_types', source.media_type, source.media_type, \
-                    selected_items.item_sort, selected_items.id, 0, '' \
-             FROM selected_items JOIN media_item_query_filter_sources AS source \
-               ON source.item_id = selected_items.id \
-              AND source.virtual_folder_id = selected_items.virtual_folder_id \
-             UNION ALL \
-             SELECT 'video_types', 'videofile', 'VideoFile', selected_items.item_sort, \
-                    selected_items.id, 0, '' \
-             FROM selected_items JOIN media_item_query_filter_sources AS source \
-               ON source.item_id = selected_items.id \
-              AND source.virtual_folder_id = selected_items.virtual_folder_id \
-             WHERE source.is_video = 1 \
-             UNION ALL \
-             SELECT '__has_subtitles', 'true', '1', selected_items.item_sort, \
-                    selected_items.id, 0, '' \
-             FROM selected_items JOIN media_item_query_filter_sources AS source \
-               ON source.item_id = selected_items.id \
-              AND source.virtual_folder_id = selected_items.virtual_folder_id \
-             WHERE source.has_subtitles = 1 \
-             UNION ALL \
-             SELECT '__has_trailer', 'true', '1', selected_items.item_sort, \
-                    selected_items.id, 0, '' \
-             FROM selected_items JOIN media_item_query_filter_sources AS source \
-               ON source.item_id = selected_items.id \
-              AND source.virtual_folder_id = selected_items.virtual_folder_id \
-             WHERE source.has_trailer = 1\
-             ), ranked AS (\
+             WHERE value.value_kind IN (",
+        );
+        {
+            let mut fields = projected.separated(", ");
+            for field in selection.projected_fields() {
+                fields.push_bind(field);
+            }
+            fields.push_unseparated(")");
+        }
+        projected.push(
+            "), ranked AS (\
              SELECT field, normalized_value, display_value, \
                     row_number() OVER (PARTITION BY field, normalized_value \
                       ORDER BY item_sort, item_id, key_priority, position) AS value_rank \
-             FROM candidates) \
-             SELECT field, display_value FROM ranked WHERE value_rank = 1 \
+             FROM candidates), result AS (\
+             SELECT field, normalized_value, display_value \
+             FROM ranked WHERE value_rank = 1",
+        );
+        if selection.includes_scalars() {
+            projected.push(
+                " UNION ALL \
+                 SELECT 'containers', lower(source.container_value), \
+                        lower(source.container_value) \
+                 FROM selected_items JOIN media_item_query_filter_sources AS source \
+                   ON source.item_id = selected_items.id \
+                  AND source.virtual_folder_id = selected_items.virtual_folder_id \
+                 WHERE source.container_present = 1 \
+                 GROUP BY lower(source.container_value) \
+                 UNION ALL \
+                 SELECT 'media_types', source.media_type, source.media_type \
+                 FROM selected_items JOIN media_item_query_filter_sources AS source \
+                   ON source.item_id = selected_items.id \
+                  AND source.virtual_folder_id = selected_items.virtual_folder_id \
+                 GROUP BY source.media_type \
+                 UNION ALL \
+                 SELECT 'video_types', 'videofile', 'VideoFile' WHERE EXISTS (\
+                   SELECT 1 FROM selected_items \
+                   JOIN media_item_query_filter_sources AS source \
+                     ON source.item_id = selected_items.id \
+                    AND source.virtual_folder_id = selected_items.virtual_folder_id \
+                   WHERE source.is_video = 1) \
+                 UNION ALL \
+                 SELECT '__has_subtitles', 'true', '1' WHERE EXISTS (\
+                   SELECT 1 FROM selected_items \
+                   JOIN media_item_query_filter_sources AS source \
+                     ON source.item_id = selected_items.id \
+                    AND source.virtual_folder_id = selected_items.virtual_folder_id \
+                   WHERE source.has_subtitles = 1) \
+                 UNION ALL \
+                 SELECT '__has_trailer', 'true', '1' WHERE EXISTS (\
+                   SELECT 1 FROM selected_items \
+                   JOIN media_item_query_filter_sources AS source \
+                     ON source.item_id = selected_items.id \
+                    AND source.virtual_folder_id = selected_items.virtual_folder_id \
+                   WHERE source.has_trailer = 1)",
+            );
+        }
+        projected.push(
+            ") SELECT field, display_value FROM result \
              ORDER BY field, normalized_value COLLATE BINARY",
         );
         let rows = projected
@@ -15346,12 +15502,13 @@ mod tests {
         MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MEDIA_ITEM_FACET_PROJECTION_NAME,
         MEDIA_ITEM_FACET_PROJECTION_VERSION, MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME,
         MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemFacetCandidateQuery,
-        MediaItemFacetKind, MediaItemFavoriteFilter, PluginRuntimeInstanceUpsert,
-        ProviderSecretReference, ProviderSecretVault, REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
-        RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec,
-        ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads,
-        UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
-        UpsertTranscodeSession, parse_ffprobe_media_info, parse_local_nfo_metadata,
+        MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemQueryFilterSelection,
+        PluginRuntimeInstanceUpsert, ProviderSecretReference, ProviderSecretVault,
+        REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS, RemoteMediaItemUpsert,
+        RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, ResumeItemsPageQuery,
+        SortDirection, SystemConfigurationPayloads, UpsertActivePlaybackSession,
+        UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
+        parse_ffprobe_media_info, parse_local_nfo_metadata,
     };
     use serde_json::{Value, json};
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -17089,9 +17246,12 @@ mod tests {
                 .is_err()
         );
         assert!(
-            db.media_item_query_filter_values(&oversized_genres)
-                .await
-                .is_err()
+            db.media_item_query_filter_values(
+                &oversized_genres,
+                MediaItemQueryFilterSelection::ALL,
+            )
+            .await
+            .is_err()
         );
         let duplicate_genres = db
             .media_item_catalog_page(&MediaItemCatalogQuery {
@@ -20252,7 +20412,10 @@ mod tests {
             containers: vec!["mp4".to_string()],
             ..MediaItemCatalogQuery::default()
         };
-        let values = db.media_item_query_filter_values(&query).await.unwrap();
+        let values = db
+            .media_item_query_filter_values(&query, MediaItemQueryFilterSelection::ALL)
+            .await
+            .unwrap();
         assert_eq!(
             values.genres,
             ["Drama", "Nested", "Object Genre", "Tail Genre"]
@@ -20272,6 +20435,35 @@ mod tests {
         assert_eq!(values.subtitle_languages, ["spa"]);
         assert!(values.has_subtitles);
         assert!(values.has_trailer);
+
+        let items_filter_values = db
+            .media_item_query_filter_values(&query, MediaItemQueryFilterSelection::ITEMS_FILTERS)
+            .await
+            .unwrap();
+        assert_eq!(items_filter_values.genres, values.genres);
+        assert_eq!(items_filter_values.containers, values.containers);
+        assert_eq!(items_filter_values.staff_names, values.staff_names);
+        assert!(items_filter_values.audio_languages.is_empty());
+        assert!(items_filter_values.subtitle_languages.is_empty());
+        assert!(items_filter_values.has_subtitles);
+        assert!(items_filter_values.has_trailer);
+
+        let filters2_values = db
+            .media_item_query_filter_values(&query, MediaItemQueryFilterSelection::FILTERS2)
+            .await
+            .unwrap();
+        assert_eq!(filters2_values.genres, values.genres);
+        assert_eq!(filters2_values.tags, values.tags);
+        assert_eq!(filters2_values.audio_languages, values.audio_languages);
+        assert_eq!(
+            filters2_values.subtitle_languages,
+            values.subtitle_languages
+        );
+        assert!(filters2_values.official_ratings.is_empty());
+        assert!(filters2_values.containers.is_empty());
+        assert!(filters2_values.media_types.is_empty());
+        assert!(!filters2_values.has_subtitles);
+        assert!(!filters2_values.has_trailer);
         for excluded in [
             "Excluded Series Genre",
             "Excluded Rating",
@@ -20289,10 +20481,13 @@ mod tests {
         }
 
         let narrowed = db
-            .media_item_query_filter_values(&MediaItemCatalogQuery {
-                audio_languages: vec!["fra".to_string()],
-                ..query
-            })
+            .media_item_query_filter_values(
+                &MediaItemCatalogQuery {
+                    audio_languages: vec!["fra".to_string()],
+                    ..query
+                },
+                MediaItemQueryFilterSelection::ALL,
+            )
             .await
             .unwrap();
         assert_eq!(narrowed.genres, ["Drama", "Nested", "Object Genre"]);
@@ -20351,10 +20546,13 @@ mod tests {
             .await
             .unwrap();
         let extension_values = db
-            .media_item_query_filter_values(&MediaItemCatalogQuery {
-                virtual_folder_ids: vec![extension_folder.id],
-                ..MediaItemCatalogQuery::default()
-            })
+            .media_item_query_filter_values(
+                &MediaItemCatalogQuery {
+                    virtual_folder_ids: vec![extension_folder.id],
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemQueryFilterSelection::ALL,
+            )
             .await
             .unwrap();
         assert_eq!(extension_values.containers, ["", "bar", "gz", "mkv"]);
@@ -20411,20 +20609,26 @@ mod tests {
         .unwrap();
         assert_eq!(remaining, 0);
         assert!(
-            db.media_item_query_filter_values(&MediaItemCatalogQuery {
-                virtual_folder_ids: vec![source.id],
-                ..MediaItemCatalogQuery::default()
-            })
+            db.media_item_query_filter_values(
+                &MediaItemCatalogQuery {
+                    virtual_folder_ids: vec![source.id],
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemQueryFilterSelection::ALL
+            )
             .await
             .unwrap()
             .genres
             .is_empty()
         );
         assert_eq!(
-            db.media_item_query_filter_values(&MediaItemCatalogQuery {
-                virtual_folder_ids: vec![destination.id],
-                ..MediaItemCatalogQuery::default()
-            })
+            db.media_item_query_filter_values(
+                &MediaItemCatalogQuery {
+                    virtual_folder_ids: vec![destination.id],
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemQueryFilterSelection::ALL
+            )
             .await
             .unwrap()
             .genres,
@@ -20461,7 +20665,10 @@ mod tests {
             virtual_folder_ids: vec![folder.id],
             ..MediaItemCatalogQuery::default()
         };
-        let projected = db.media_item_query_filter_values(&query).await.unwrap();
+        let projected = db
+            .media_item_query_filter_values(&query, MediaItemQueryFilterSelection::ALL)
+            .await
+            .unwrap();
         assert_eq!(projected.containers, ["Éxt"]);
         assert_eq!(projected.genres, ["STRASSE", "Straße"]);
 
@@ -20471,7 +20678,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            db.media_item_query_filter_values(&query).await.unwrap(),
+            db.media_item_query_filter_values(&query, MediaItemQueryFilterSelection::ALL)
+                .await
+                .unwrap(),
             projected
         );
 
@@ -20487,7 +20696,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            db.media_item_query_filter_values(&query).await.unwrap(),
+            db.media_item_query_filter_values(&query, MediaItemQueryFilterSelection::ALL)
+                .await
+                .unwrap(),
             projected
         );
 
@@ -20506,7 +20717,7 @@ mod tests {
         .unwrap();
         assert_eq!(remaining, 0);
         assert_eq!(
-            db.media_item_query_filter_values(&query)
+            db.media_item_query_filter_values(&query, MediaItemQueryFilterSelection::ALL)
                 .await
                 .unwrap()
                 .genres,
