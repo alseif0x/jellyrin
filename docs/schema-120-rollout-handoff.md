@@ -2,6 +2,16 @@
 
 Fecha de corte: 2026-08-10 22:36 UTC.
 
+> **Ejecutado el 2026-08-10 22:46 UTC.** El esquema 120 está aplicado y ambos
+> binarios instalados. La evidencia del rollout y el único gate incumplido
+> (listado de Series 500 por la coverage `media_item_tv_series` sin publicar, un
+> defecto anterior a 120) están en
+> `docs/transcode-optimization-plan.md`, sección
+> «Rollout del esquema 120 en staging (2026-08-10)». Este documento queda como
+> registro del punto de partida y del procedimiento de rollback, que sigue
+> vigente: la base ya está en 120, así que **no** debe arrancarse el binario
+> anterior contra ella.
+
 ## Estado exacto al cerrar esta sesión
 
 - Commit preparado: `c89ccd8 security: protect query-filter summary publication`.

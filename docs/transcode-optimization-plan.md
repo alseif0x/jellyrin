@@ -399,7 +399,7 @@ aprobadas, 0 fallidas y 7 ignoradas. La API pasa 353/0/3 usando
 La superficie PostgreSQL real queda además desglosada en `jellyrin-db`
 169/0/4 más doctests, proveedor Xtream 27/27 y migrador 36/36. El objetivo
 `202608080120`, con 24 migraciones embebidas, está validado contra PostgreSQL
-real y queda pendiente de aplicar en staging mediante rollout atómico. El
+real y **desplegado** en staging el 2026-08-10 mediante rollout atómico. El
 ensure-current de 117 reconcilia el marker sin reconstruir la
 proyección ni alterar `xmin`/`completed_at` cuando fuentes y valores ya son
 exactos. `check` y `clippy -D warnings` de DB/API/migrador con todos sus targets
@@ -407,6 +407,63 @@ y features también terminan limpios. Siguen verdes packaging 46/46,
 política supply-chain 46/46, runtime systemd 13/13, unidades systemd 14/14,
 performance/recovery 37/37, seguridad 16/16, `git diff --check` y sintaxis Node;
 los smokes de systemd, performance y seguridad pasaron sobre el estado vigente.
+
+#### Rollout del esquema 120 en staging (2026-08-10)
+
+Servidor y migrador se instalaron como una unidad desde el mismo build release y
+la migración la aplicó únicamente `jellyrin-migrate.service`:
+
+- migración: `202608080119` → `202608080120`, `applied_migrations=1`, 886 ms de
+  proceso y 23,3 ms de SQL; migrador `oneshot` con `ExecMainStatus=0`;
+- hashes instalados en `/usr/local/bin`, idénticos a `target/release`: servidor
+  `f4124471cd525245aca9ada6bab031fccf190c80a144d3937b8aa1a9465997fd`, migrador
+  `954ab2743543900af6e0d4e41bc8d2007cfa256370b403d4c50ffd3495ad7810`;
+- respaldo pre-120 verificado antes de instalar:
+  `/var/backups/jellyrin-postgres/daily/20260810T223557Z`, `sha256sum -c`
+  correcto sobre `jellyrin.dump.age`, `database.txt` y `pg_dump-version.txt`
+  (PostgreSQL 16.14); binarios anteriores conservados en `/var/backups/jellyrin`
+  con sus hashes originales;
+- ACL en la base productiva: `jellyrin_runtime` con `SELECT` y nada más sobre
+  `media_item_query_filter_summary_values`, `..._coverage` y `..._revisions`;
+  `jellyrin_mark_query_filter_summary_dirty`,
+  `jellyrin_rebuild_query_filter_summary` y
+  `jellyrin_reconcile_query_filter_summary_item` en `SECURITY DEFINER` con
+  `search_path=pg_catalog, public, pg_temp`; `PUBLIC` sin `EXECUTE` en las ocho
+  funciones de publicación e invalidación;
+- reconciliación intacta tras la migración: Movies `1556 = 1556` y Series
+  `1989 = 1989`, sin `dirty_at`, con coverage de 39.093/78.380 y
+  455.520/911.097;
+- health y readiness 200 en `127.0.0.1:8096` y por HTTPS; `NRestarts=0`;
+- catálogo Movies: total exacto 39.093 en 77 ms. Filtros `Items/Filters` y
+  `Items/Filters2` en 2–8 ms desde el resumen publicado, con 59 géneros en
+  Movies y 24 en Series;
+- reproducción: VOD compatible resuelto como DirectProxy
+  (`SupportsDirectStream`, sin `TranscodingUrl`) y `Range` 206 devolviendo
+  1.048.576 bytes exactos de 1.546.982.465 con `video/x-matroska` y **cero**
+  procesos FFmpeg; episodio incompatible por HLS con un único job,
+  `-threads:v 2`, `-filter_threads 2`, `-filter_complex_threads 2` y
+  `CPUQuotaPerSecUSec=1.5s`; un segundo job concurrente quedó en `starting` y
+  terminó `failed` sin lanzar proceso, es decir fail-closed;
+- Live TV 2961/2965/2958 sirvieron 14–17 MB en 10 s como `video/mp2t` sin
+  FFmpeg; 2966 sigue devolviendo 503 y permanece como incidencia de upstream;
+- proveedores: `Xtream Codes Provider 1.0.0` y `Jellyrin MAGSTV 0.1.1` activos;
+  tuner `xtream-plugin` con 757 canales y credenciales por
+  `JellyrinProviderSecretRef`;
+- higiene de secretos: 124 líneas de journal sin `api_key`, token de sesión,
+  contraseña ni URL; `media_items.path` sin rutas remotas y configuración de
+  tuner sin secretos en claro; el `argv` de FFmpeg solo contiene una URL
+  loopback, sin query, sin credenciales en ruta y sin token.
+
+Queda un gate sin cumplir, **anterior a 120**: el listado de Series responde 500.
+`media_item_tv_series_coverage` está vacía aunque la proyección tiene 22.194
+series y 455.520 miembros válidos, así que `tv_series_catalog_page` devuelve
+`None` y el fallback escanea `media_items` completo sin límite, superando
+`JELLYRIN_DB_API_STATEMENT_TIMEOUT_SECONDS=10`. El mismo error
+(`canceling statement due to statement timeout at line 3418`) ya aparece en el
+journal a las 20:12 UTC con el binario anterior y esquema 119. Los triggers de
+invalidación borran la coverage en cualquier cambio de `media_items` y solo la
+reconstruye la sincronización de la carpeta, por lo que el fallback debe acotarse
+o la coverage republicarse.
 
 La base bare-metal de staging ya está desplegada en
 `jellyrin.test.kode.live`: PostgreSQL 16.14 y Jellyrin solo escuchan en loopback,
@@ -529,11 +586,11 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | FFmpeg/proxy/shutdown | Direct/remux/encode parcial, copy-first, intención tipada y clasificador fail-closed, cupos/process groups/cuota/watchdogs; FFmpeg `8.2-dev-git-1e0279143db9` mínimo sin encoders y solo decoder AAC; redirects opacos revalidados por salto | Corpus aislado verde en imagen ARM64 exacta de HEAD; VOD real DirectProxy 206/65.536 bytes con 0 FFmpeg; Live TV real leyó 112.827 bytes directo con 0 FFmpeg y HLS produjo 1.702.152 bytes como remux, sin fallback, ~15,3 MiB RSS, PID reap y leases 0→0 | Matriz de clientes reales, medidas sostenidas/concurrentes del host y límite físico del volumen; repetir AMD64 |
 | MAGSTV | Referencias opacas, JIT, grant core persist-first, proceso one-shot, lock R/W, detector y esquema seguro implementados; UI corregida a credenciales-only; `origin/main` `2700d7f` integrado por `43551fe`, adaptación `ExternalProcess` `8ce47b4` y versión 0.1.1 `9596f1c` | 91/0/4 ignoradas contra SDK/RPC local; ZIP AArch64 0.1.1 validado e instalado/activo en staging tras backups; configuración admin 200 sin credenciales; salud `Degraded` esperada sin tuner/egress; clave de referencia root-only generada | Pin público aún viejo; perfil WireGuard MX, metadatos/secretos legítimos restantes, cuenta/tuner, E2E real y publicación pendientes |
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series por streaming acotado a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; probe media+metadata agrupado; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde; audits DB/logs/argv 0 findings | Repetición periódica del audit y matriz de clientes reales |
-| Catálogo general | Pushdown SQL paginado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed; filtros normalizan `Series`/`Movie,Series` a episodios persistidos | API 354/0/3, DB 169/0/4 y Clippy estricto sobre el lote; migrador baseline 36/36; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto | Rollout y E2E visual/reproducción |
-| Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; runtime sin DML directo ni bypass GUC | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms. PostgreSQL 16 aislado valida ACL, rebuild/punto y ataques con GUC/sombras temporales; API 354/0/3 y DB efectiva 169/0/4 | Scope padre+hijos/múltiple, coalescer de grandes lotes, rollout 120 y E2E cliente real |
+| Catálogo general | Pushdown SQL paginado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed; filtros normalizan `Series`/`Movie,Series` a episodios persistidos | API 354/0/3, DB 169/0/4 y Clippy estricto sobre el lote; migrador baseline 36/36; PostgreSQL real: 455.520 episodios/22.194 series, rebuild 25,1 s; 80 páginas a concurrencia 8, 0 fallos, p50 448 ms, p95 669 ms, p99 895 ms y total exacto. Tras el rollout 120, Movies devuelve 39.093 en 77 ms, pero el listado de Series responde 500 porque su coverage no está publicada y el fallback legacy escanea la tabla completa | Republicar la coverage de Series y acotar su fallback; E2E visual/reproducción |
+| Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; runtime sin DML directo ni bypass GUC | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms y 120 en 886 ms sobre la base productiva. PostgreSQL 16 aislado valida ACL, rebuild/punto y ataques con GUC/sombras temporales; ACL de solo lectura y `SECURITY DEFINER` reverificados en staging tras el rollout; API 354/0/3 y DB efectiva 169/0/4 | Scope padre+hijos/múltiple, coalescer de grandes lotes y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `f856131`; esquema 119; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206; episodio HEVC+AC3 HLS 200 en 3,424 s/segmento; VOD 4K HLS 200 pero por debajo de tiempo real. Live TV 2958/2965 verde y 2966 caído en upstream; MAGSTV 0.1.1 activo | Rollout atómico del esquema 120; E2E visual autenticado; optimizar `NextUp`; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 500 por coverage `media_item_tv_series` sin publicar, defecto anterior a 120 | Republicar la coverage de Series y acotar su fallback; E2E visual autenticado; optimizar `NextUp`; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
 
@@ -2778,7 +2835,9 @@ inicial; estos criterios no deben leerse como una declaración de rollout.
   de 50 con total exacto de 39.093 Movies y 22.194 Series en 0,138/0,154 s.
   El rollout 119, el CAS concurrente, el probe Xtream real y HTTP 80/8 ya están
   verdes. El esquema 120 elimina el marcador GUC y pasa ACL, spoofing y sombras
-  temporales en PostgreSQL 16 aislado; queda su rollout. Después quedan ampliar
+  temporales en PostgreSQL 16 aislado, y quedó desplegado en staging el
+  2026-08-10 con la ACL de solo lectura y las funciones `SECURITY DEFINER`
+  reverificadas sobre la base productiva. Después quedan ampliar
   el scope mixto/padre+hijos, coalescer grandes lotes y mantener fallback exacto para
   predicados complejos.
 - [~] El backup se restaura en una base aislada. El timer endurecido está activo
