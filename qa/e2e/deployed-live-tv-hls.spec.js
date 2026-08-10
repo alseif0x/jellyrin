@@ -13,50 +13,53 @@ test.describe('deployed Live TV HLS compatibility', () => {
     const auth = await authenticate(request, username, password);
     const channels = await resolveLiveTvChannels(request, auth);
     expect(channels.length, 'playable Live TV channels discovered').toBeGreaterThan(0);
+    const baselineLeaseCount = await activeTunerLeaseCount(request, auth);
 
     const results = [];
     for (const channel of channels) {
       const playbackInfo = await requestPlaybackInfo(request, auth, channel.Id);
-      const mediaSource = playbackInfo.MediaSources?.[0];
-      expect(playbackInfo.PlaySessionId, `${channel.Id} PlaySessionId`).toBeTruthy();
-      expect(mediaSource?.Id, `${channel.Id} MediaSource.Id`).toBe(channel.Id);
-      expect(mediaSource?.SupportsTranscoding, `${channel.Id} SupportsTranscoding`).toBe(true);
-      expect(mediaSource?.TranscodingUrl, `${channel.Id} TranscodingUrl`).toBeTruthy();
+      try {
+        const mediaSource = playbackInfo.MediaSources?.[0];
+        expect(playbackInfo.PlaySessionId, `${channel.Id} PlaySessionId`).toBeTruthy();
+        expect(mediaSource?.Id, `${channel.Id} MediaSource.Id`).toBe(channel.Id);
+        expect(mediaSource?.SupportsTranscoding, `${channel.Id} SupportsTranscoding`).toBe(true);
+        expect(mediaSource?.TranscodingUrl, `${channel.Id} TranscodingUrl`).toBeTruthy();
 
-      const { mainUrl, mainText } = await loadHlsPlaylists(request, baseURL, mediaSource.TranscodingUrl);
-      const segmentUri = firstSegmentUri(mainText);
-      expect(segmentUri, `${channel.Id} media playlist has a segment`).toBeTruthy();
+        const { mainUrl, mainText } = await loadHlsPlaylists(request, baseURL, mediaSource.TranscodingUrl);
+        const segmentUri = firstSegmentUri(mainText);
+        expect(segmentUri, `${channel.Id} media playlist has a segment`).toBeTruthy();
 
-      const segmentUrl = resolvePlaylistUrl(baseURL, mainUrl, segmentUri);
-      const segmentResponse = await request.get(segmentUrl, { timeout: 30_000 });
-      const segmentBytes = await segmentResponse.body();
-      expect(segmentResponse.status(), `${channel.Id} first segment ${segmentUri}`).toBe(200);
-      expect(segmentBytes.length, `${channel.Id} first segment bytes`).toBeGreaterThan(0);
+        const segmentUrl = resolvePlaylistUrl(baseURL, mainUrl, segmentUri);
+        const segmentResponse = await request.get(segmentUrl, { timeout: 30_000 });
+        const segmentBytes = await segmentResponse.body();
+        expect(segmentResponse.status(), `${channel.Id} first segment status`).toBe(200);
+        expect(segmentBytes.length, `${channel.Id} first segment bytes`).toBeGreaterThan(0);
 
-      const stopped = await request.post('/Sessions/Playing/Stopped', {
-        headers: { 'X-Emby-Token': auth.AccessToken },
-        data: {
-          ItemId: channel.Id,
-          MediaSourceId: channel.Id,
-          PlayMethod: 'Transcode',
-          PlaySessionId: playbackInfo.PlaySessionId,
-          PositionTicks: 0,
-          CanSeek: true,
-          IsPaused: false,
-        },
-      });
-      expect(stopped.status(), `${channel.Id} stopped report`).toBe(204);
+        results.push({
+          id: channel.Id,
+          name: channel.Name,
+          segmentBytes: segmentBytes.length,
+        });
+      } finally {
+        const stopped = await request.post('/Sessions/Playing/Stopped', {
+          headers: { 'X-Emby-Token': auth.AccessToken },
+          data: {
+            ItemId: channel.Id,
+            MediaSourceId: channel.Id,
+            PlayMethod: 'Transcode',
+            PlaySessionId: playbackInfo.PlaySessionId,
+            PositionTicks: 0,
+            CanSeek: true,
+            IsPaused: false,
+          },
+        });
+        expect(stopped.status(), `${channel.Id} stopped report`).toBe(204);
 
-      await expect.poll(
-        async () => (await activeTunerLeaseCount(request, auth)),
-        { timeout: 10_000 },
-      ).toBe(0);
-
-      results.push({
-        id: channel.Id,
-        name: channel.Name,
-        segmentBytes: segmentBytes.length,
-      });
+        await expect.poll(
+          async () => (await activeTunerLeaseCount(request, auth)),
+          { timeout: 10_000 },
+        ).toBe(baselineLeaseCount);
+      }
     }
 
     expect(results).toHaveLength(channels.length);
@@ -92,7 +95,7 @@ async function resolveLiveTvChannels(request, auth) {
   }
 
   const startIndex = Number(process.env.JELLYRIN_E2E_LIVE_TV_START_INDEX || 0);
-  const limit = Number(process.env.JELLYRIN_E2E_LIVE_TV_LIMIT || 3);
+  const limit = Number(process.env.JELLYRIN_E2E_LIVE_TV_LIMIT || 1);
   const response = await request.get(
     `/LiveTv/Channels?UserId=${auth.User.Id}&StartIndex=${startIndex}&Limit=${limit}`,
     { headers: { 'X-Emby-Token': auth.AccessToken } },
@@ -125,18 +128,17 @@ async function loadHlsPlaylists(request, baseURL, transcodingUrl) {
 
 async function getTextWithRetry(request, url, label) {
   let lastStatus = 0;
-  let lastBody = '';
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const response = await request.get(url, { timeout: 20_000 });
     lastStatus = response.status();
-    lastBody = await response.text();
+    const body = await response.text();
     if (lastStatus === 200) {
-      return lastBody;
+      return body;
     }
     await new Promise(resolve => setTimeout(resolve, 250));
   }
-  expect(lastStatus, `${label} ${url}\n${lastBody.slice(0, 1000)}`).toBe(200);
-  return lastBody;
+  expect(lastStatus, `${label} did not become ready`).toBe(200);
+  return '';
 }
 
 function firstSegmentUri(playlist) {

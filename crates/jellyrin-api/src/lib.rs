@@ -252,6 +252,7 @@ const LIVE_TV_REMOTE_CONTROL_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const LIVE_TV_REMOTE_FIRST_BYTE_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const LIVE_TV_REMOTE_CHUNK_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const LIVE_TV_REMOTE_CONTROL_RESPONSE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const SENSITIVE_REMOTE_LIVE_MAX_REDIRECTS: usize = 5;
 const LIVE_TV_CONFIG_SOURCE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const LIVE_TV_CONFIG_SOURCE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const LIVE_TV_CONFIG_MAX_PROGRAMS: usize = 250_000;
@@ -7490,7 +7491,13 @@ async fn live_tv_observability_summary(db: &Database) -> Result<serde_json::Valu
             "ConfigSourceMaxBytes": LIVE_TV_CONFIG_SOURCE_LIMIT_BYTES,
             "ConfigMaxChannels": LIVE_TV_PROVIDER_CATALOG_MAX_CHANNELS,
             "ConfigMaxPrograms": LIVE_TV_CONFIG_MAX_PROGRAMS,
-            "Redirects": false,
+            "Redirects": {
+                "OpaqueStreams": true,
+                "ConfigSources": false,
+                "MaxHops": SENSITIVE_REMOTE_LIVE_MAX_REDIRECTS,
+                "RevalidateEachHop": true,
+                "BlockHttpsDowngrade": true,
+            },
             "EnvironmentProxy": false,
         },
         "ActiveRecordings": active_recordings
@@ -23204,6 +23211,22 @@ fn string_contains_sensitive_canary(value: &str, canaries: &[&str]) -> bool {
     })
 }
 
+fn validated_sensitive_remote_live_redirect(
+    current: &reqwest::Url,
+    location: &str,
+) -> Result<reqwest::Url, ApiError> {
+    let target = current.join(location).map_err(|_| {
+        ApiError::service_unavailable("Live TV provider source returned invalid redirect")
+    })?;
+    let target = validated_remote_media_url(target.as_str())?;
+    if current.scheme() == "https" && target.scheme() != "https" {
+        return Err(ApiError::service_unavailable(
+            "Live TV provider source redirected to an insecure destination",
+        ));
+    }
+    Ok(target)
+}
+
 async fn send_sensitive_remote_live_request_with_proxy(
     source_url: &str,
     requires_provider_egress: bool,
@@ -23211,31 +23234,60 @@ async fn send_sensitive_remote_live_request_with_proxy(
     header_timeout: StdDuration,
 ) -> Result<reqwest::Response, ApiError> {
     let open = async {
-        let (url, client) = if requires_provider_egress {
-            let configured_proxy = configured_proxy.ok_or_else(|| {
-                ApiError::service_unavailable("Live TV provider egress proxy is not configured")
-            })?;
-            validated_provider_egress_client(source_url, configured_proxy).await?
-        } else {
-            // This client disables environment proxies and pins every allowed origin address.
-            validated_remote_media_client(source_url).await?
-        };
-        // Opaque live sources are non-seekable. Always fetch from byte zero so the manifest guard
-        // cannot be bypassed with a partial Range request that starts after `#EXTM3U`.
-        client
-            .get(url)
-            .header(header::ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    timeout = error.is_timeout(),
-                    connect = error.is_connect(),
-                    provider_egress = requires_provider_egress,
-                    "opaque Live TV direct proxy request failed"
-                );
-                ApiError::service_unavailable("Live TV provider source is unavailable")
-            })
+        let mut target = validated_remote_media_url(source_url)?;
+        for redirect_count in 0..=SENSITIVE_REMOTE_LIVE_MAX_REDIRECTS {
+            // Rebuild the client for every hop. Direct sources are resolved and pinned again so a
+            // redirect cannot bypass the SSRF filter or exploit DNS rebinding. Provider-egress
+            // sources deliberately delegate origin DNS to the configured boundary, whose own
+            // endpoint is resolved, filtered and pinned again for every redirected request.
+            let (url, client) = if requires_provider_egress {
+                let configured_proxy = configured_proxy.ok_or_else(|| {
+                    ApiError::service_unavailable("Live TV provider egress proxy is not configured")
+                })?;
+                validated_provider_egress_client(target.as_str(), configured_proxy).await?
+            } else {
+                // This client disables environment proxies and pins every allowed origin address.
+                validated_remote_media_client(target.as_str()).await?
+            };
+            // Opaque live sources are non-seekable. Always fetch from byte zero so the manifest
+            // guard cannot be bypassed with a partial Range request that starts after `#EXTM3U`.
+            let response = client
+                .get(url.clone())
+                .header(header::ACCEPT_ENCODING, "identity")
+                .send()
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        timeout = error.is_timeout(),
+                        connect = error.is_connect(),
+                        provider_egress = requires_provider_egress,
+                        "opaque Live TV direct proxy request failed"
+                    );
+                    ApiError::service_unavailable("Live TV provider source is unavailable")
+                })?;
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(response);
+            }
+            if redirect_count == SENSITIVE_REMOTE_LIVE_MAX_REDIRECTS {
+                return Err(ApiError::service_unavailable(
+                    "Live TV provider source exceeded redirect limit",
+                ));
+            }
+            let location = response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| {
+                    ApiError::service_unavailable(
+                        "Live TV provider source returned invalid redirect",
+                    )
+                })?;
+            // Reject credentials, fragments, non-HTTP schemes and oversized/control-byte URLs
+            // and HTTPS downgrades before any DNS lookup. Opaque paths and query tokens are
+            // intentionally never logged.
+            target = validated_sensitive_remote_live_redirect(&url, location)?;
+        }
+        unreachable!("bounded redirect loop always returns")
     };
     tokio::time::timeout(header_timeout, open)
         .await
@@ -24246,11 +24298,13 @@ fn live_tv_channel_media_source(
         "File"
     };
 
-    // Remote (HDHomeRun) channels support HLS transcode in addition to direct TS stream.
+    // Every remote channel supports HLS remux in addition to direct TS stream. Opaque
+    // providers resolve their source JIT inside the loopback relay, so exposing this local
+    // route does not disclose provider credentials or signed URLs.
     // The stable play_session_id is embedded in the TranscodingUrl so clients can reuse it
     // across channel-detail fetches without starting a new session each time.
     let (supports_transcoding, transcoding_sub_protocol, transcoding_container, transcoding_url) =
-        if is_remote && !opaque_provider {
+        if is_remote {
             let play_session_id = live_tv_channel_hls_play_session_id(&playback_channel_id);
             let url = format!(
                 "/Videos/{playback_channel_id}/master.m3u8?PlaySessionId={play_session_id}"
@@ -59648,6 +59702,191 @@ done
     }
 
     #[tokio::test]
+    async fn opaque_live_tv_follows_only_supported_redirect_statuses() {
+        for (code, reason) in [
+            (301, "Moved Permanently"),
+            (302, "Found"),
+            (303, "See Other"),
+            (307, "Temporary Redirect"),
+            (308, "Permanent Redirect"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                for response in [
+                    format!(
+                        "HTTP/1.1 {code} {reason}\r\nLocation: /redirected?token=second-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes(),
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA".to_vec(),
+                ] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut scratch = [0_u8; 1024];
+                    loop {
+                        let read = socket.read(&mut scratch).await.unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&scratch[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    requests.push(String::from_utf8_lossy(&request).to_string());
+                    socket.write_all(&response).await.unwrap();
+                }
+                requests
+            });
+
+            let response = super::send_sensitive_remote_live_request_with_proxy(
+                &format!("http://{address}/live?token=first-secret"),
+                false,
+                None,
+                StdDuration::from_secs(2),
+            )
+            .await
+            .expect("supported redirect must be followed");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"DATA");
+            let requests = upstream.await.unwrap();
+            assert!(requests[0].starts_with("GET /live?token=first-secret HTTP/1.1\r\n"));
+            assert!(requests[1].starts_with("GET /redirected?token=second-secret HTTP/1.1\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_live_tv_provider_egress_follows_redirect_through_pinned_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in [
+                b"HTTP/1.1 302 Found\r\nLocation: http://redirected.invalid/live?token=second-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA".to_vec(),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut scratch = [0_u8; 1024];
+                loop {
+                    let read = socket.read(&mut scratch).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&scratch[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).to_string());
+                socket.write_all(&response).await.unwrap();
+            }
+            requests
+        });
+
+        let response = super::send_sensitive_remote_live_request_with_proxy(
+            "http://origin.invalid/live?token=first-secret",
+            true,
+            Some(&format!("http://localhost:{}", proxy_address.port())),
+            StdDuration::from_secs(2),
+        )
+        .await
+        .expect("provider egress redirect must remain inside the configured boundary");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"DATA");
+        let requests = proxy.await.unwrap();
+        assert!(
+            requests[0]
+                .starts_with("GET http://origin.invalid/live?token=first-secret HTTP/1.1\r\n")
+        );
+        assert!(
+            requests[1]
+                .starts_with("GET http://redirected.invalid/live?token=second-secret HTTP/1.1\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn opaque_live_tv_redirect_revalidates_destination_and_hides_secrets() {
+        let redirect = b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/private?token=redirect-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (source_url, source_request) = spawn_single_raw_http_response(redirect).await;
+        let error = super::send_sensitive_remote_live_request_with_proxy(
+            &format!("{source_url}?token=initial-secret"),
+            false,
+            None,
+            StdDuration::from_secs(2),
+        )
+        .await
+        .expect_err("redirect into link-local metadata must be rejected");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+        let message = error.error.to_string();
+        assert!(!message.contains("initial-secret"));
+        assert!(!message.contains("redirect-secret"));
+        assert!(
+            source_request
+                .await
+                .unwrap()
+                .starts_with("GET /image?token=initial-secret ")
+        );
+
+        let current = reqwest::Url::parse("https://provider.invalid/live").unwrap();
+        let error = super::validated_sensitive_remote_live_redirect(
+            &current,
+            "http://cdn.invalid/live?token=downgrade-secret",
+        )
+        .expect_err("HTTPS to HTTP redirect must be rejected before DNS");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!error.error.to_string().contains("downgrade-secret"));
+    }
+
+    #[tokio::test]
+    async fn opaque_live_tv_redirect_chain_is_limited_to_five_hops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for hop in 0..=super::SENSITIVE_REMOTE_LIVE_MAX_REDIRECTS {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut scratch = [0_u8; 1024];
+                loop {
+                    let read = socket.read(&mut scratch).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&scratch[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).to_string());
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /hop/{}?token=chain-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    hop + 1
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let error = super::send_sensitive_remote_live_request_with_proxy(
+            &format!("http://{address}/hop/0?token=chain-secret"),
+            false,
+            None,
+            StdDuration::from_secs(2),
+        )
+        .await
+        .expect_err("sixth redirect response must exceed the five-hop limit");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!error.error.to_string().contains("chain-secret"));
+        let requests = upstream.await.unwrap();
+        assert_eq!(
+            requests.len(),
+            super::SENSITIVE_REMOTE_LIVE_MAX_REDIRECTS + 1
+        );
+    }
+
+    #[tokio::test]
     async fn opaque_live_tv_resolution_and_headers_share_one_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -74081,6 +74320,29 @@ done
         assert_eq!(ms["DefaultAudioStreamIndex"], 1);
         assert_eq!(ms["MediaStreams"][1]["Type"], "Audio");
         assert_eq!(ms["MediaStreams"][1]["Codec"], "aac");
+    }
+
+    #[test]
+    fn live_tv_opaque_channel_exposes_direct_and_hls_without_source_url() {
+        let channel = json!({
+            "Id": "xtream_opaque_42",
+            "Name": "Opaque News",
+            "ProviderType": "xtream",
+            "ProviderReference": "xtream:v1:opaque-reference"
+        });
+        let media_source = live_tv_channel_media_source(&channel).unwrap();
+        assert_eq!(media_source["Protocol"], "Http");
+        assert_eq!(media_source["IsRemote"], true);
+        assert_eq!(media_source["Path"], serde_json::Value::Null);
+        assert_eq!(media_source["SupportsDirectStream"], true);
+        assert_eq!(media_source["SupportsTranscoding"], true);
+        assert_eq!(media_source["TranscodingSubProtocol"], "hls");
+        assert_eq!(media_source["TranscodingContainer"], "ts");
+        let direct_url = media_source["DirectStreamUrl"].as_str().unwrap();
+        let transcode_url = media_source["TranscodingUrl"].as_str().unwrap();
+        assert!(direct_url.starts_with("/LiveTv/LiveStreamFiles/xtream_opaque_42/"));
+        assert!(transcode_url.starts_with("/Videos/xtream_opaque_42/master.m3u8?"));
+        assert!(!media_source.to_string().contains("opaque-reference"));
     }
 
     // Spec: local (non-remote) channels must NOT expose SupportsTranscoding:true (no HLS for local TS).
