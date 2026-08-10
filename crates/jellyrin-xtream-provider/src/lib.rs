@@ -21,7 +21,10 @@ use jellyrin_db::{
     RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, XtreamCatalogStore,
 };
 use reqwest::Client as HttpClient;
-use serde::de::{DeserializeOwned, DeserializeSeed, Error as _, SeqAccess, Visitor};
+use serde::{
+    Serialize,
+    de::{DeserializeOwned, DeserializeSeed, Error as _, SeqAccess, Visitor},
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
 
@@ -45,6 +48,7 @@ const XTREAM_MAX_EPISODES_PER_SERIES: usize = 10_000;
 const XTREAM_MAX_EPG_LISTINGS: usize = 256;
 const XTREAM_ARRAY_CHUNK_ITEMS: usize = 500;
 const XTREAM_SERIES_INFO_ATTEMPTS: usize = 4;
+const XTREAM_SERIES_DETAIL_CONCURRENCY: usize = 1;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum XtreamFetchError {
@@ -2390,10 +2394,127 @@ fn valid_xtream_series_episode_source(
         )
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XtreamMovieSyncCounts {
+    received: usize,
+    selected: usize,
+    staged: usize,
+    published: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XtreamSeriesSyncCounts {
+    received: usize,
+    selected: usize,
+    skipped: usize,
+    deduplicated: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XtreamEpisodeSyncCounts {
+    selected: usize,
+    staged: usize,
+    published: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XtreamMediaSyncCounts {
+    movies: XtreamMovieSyncCounts,
+    series: XtreamSeriesSyncCounts,
+    episodes: XtreamEpisodeSyncCounts,
+}
+
+impl XtreamMediaSyncCounts {
+    fn mark_published(&mut self) {
+        self.movies.published = self.movies.staged;
+        self.episodes.published = self.episodes.staged;
+    }
+
+    fn saturating_add_assign(&mut self, other: Self) {
+        self.movies.received = self.movies.received.saturating_add(other.movies.received);
+        self.movies.selected = self.movies.selected.saturating_add(other.movies.selected);
+        self.movies.staged = self.movies.staged.saturating_add(other.movies.staged);
+        self.movies.published = self.movies.published.saturating_add(other.movies.published);
+        self.series.received = self.series.received.saturating_add(other.series.received);
+        self.series.selected = self.series.selected.saturating_add(other.series.selected);
+        self.series.skipped = self.series.skipped.saturating_add(other.series.skipped);
+        self.series.deduplicated = self
+            .series
+            .deduplicated
+            .saturating_add(other.series.deduplicated);
+        self.episodes.selected = self
+            .episodes
+            .selected
+            .saturating_add(other.episodes.selected);
+        self.episodes.staged = self.episodes.staged.saturating_add(other.episodes.staged);
+        self.episodes.published = self
+            .episodes
+            .published
+            .saturating_add(other.episodes.published);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XtreamSyncBodyByteLimits {
+    catalog: usize,
+    categories: usize,
+    series_detail: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct XtreamMediaSyncLimits {
+    body_bytes: XtreamSyncBodyByteLimits,
+    max_inspected_items: usize,
+    chunk_size_items: usize,
+    stage_append_max_items: usize,
+    series_detail_concurrency: usize,
+}
+
+impl Default for XtreamMediaSyncLimits {
+    fn default() -> Self {
+        Self {
+            body_bytes: XtreamSyncBodyByteLimits {
+                catalog: XTREAM_MAX_CATALOG_BODY_BYTES,
+                categories: XTREAM_MAX_CATEGORY_BODY_BYTES,
+                series_detail: XTREAM_MAX_SERIES_INFO_BODY_BYTES,
+            },
+            max_inspected_items: REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS,
+            chunk_size_items: XTREAM_ARRAY_CHUNK_ITEMS,
+            stage_append_max_items: REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
+            series_detail_concurrency: XTREAM_SERIES_DETAIL_CONCURRENCY,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct XtreamStagedMedia {
+    stage: RemoteMediaCatalogStage,
+    counts: XtreamMediaSyncCounts,
+}
+
+fn xtream_media_sync_result_json(counts: XtreamMediaSyncCounts) -> serde_json::Value {
+    serde_json::json!({
+        "MovieCount": counts.movies.published,
+        "SeriesEpisodeCount": counts.episodes.published,
+        "SkippedSeriesCount": counts.series.skipped,
+        "DeduplicatedSeriesCount": counts.series.deduplicated,
+        "Metrics": counts,
+        "Limits": XtreamMediaSyncLimits::default(),
+    })
+}
+
 #[derive(Default)]
 struct XtreamSeriesStageProgress {
+    received_series: usize,
     selected_series: usize,
-    episode_count: usize,
+    selected_episodes: usize,
+    staged_episodes: usize,
     series_ids: HashSet<String>,
     item_ids: HashSet<String>,
     item_paths: HashSet<String>,
@@ -2422,6 +2543,7 @@ where
 {
     while let Some(chunk) = chunks.receiver.recv().await {
         for series_item in chunk {
+            progress.received_series = progress.received_series.saturating_add(1);
             let category_id = item_category_id(&series_item);
             if expected_category_id.is_some_and(|expected| category_id.as_deref() != Some(expected))
             {
@@ -2476,8 +2598,11 @@ where
                 Err(error) => return Err(XtreamImportError::new("series details", error).into()),
             };
             let selected_episode_count = series_episode_count(&info).min(episode_limit);
+            progress.selected_episodes = progress
+                .selected_episodes
+                .saturating_add(selected_episode_count);
             if progress
-                .episode_count
+                .staged_episodes
                 .saturating_add(selected_episode_count)
                 > REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS
             {
@@ -2520,8 +2645,8 @@ where
             progress
                 .item_paths
                 .extend(items.iter().map(|item| item.path.clone()));
-            progress.episode_count = progress
-                .episode_count
+            progress.staged_episodes = progress
+                .staged_episodes
                 .saturating_add(append_staged_media_items(db, stage, "series", items).await?);
         }
     }
@@ -2535,10 +2660,7 @@ where
 async fn stage_xtream_media_from_payload<Database>(
     db: &Database,
     payload: &serde_json::Value,
-) -> Result<
-    Option<(RemoteMediaCatalogStage, usize, usize, usize, usize)>,
-    Box<dyn std::error::Error + Send + Sync>,
->
+) -> Result<Option<XtreamStagedMedia>, Box<dyn std::error::Error + Send + Sync>>
 where
     Database: XtreamCatalogStore + Sync,
 {
@@ -2607,6 +2729,7 @@ where
         .begin_remote_media_catalog_stage(xtream_media_library_specs(&tuner_id))
         .await?;
     let staged_result = async {
+        let mut counts = XtreamMediaSyncCounts::default();
         let vod_selection = CategorySelection::from_payload(
             payload,
             &["VodCategoryIds", "MovieCategoryIds"],
@@ -2631,15 +2754,15 @@ where
         )
         .await
         .map_err(|error| XtreamImportError::new("VOD streams", error))?;
-        let mut movie_count = 0usize;
         while let Some(mut chunk) = movie_chunks.receiver.recv().await {
             chunk.retain(|stream| vod_selection.allows(item_category_id(stream).as_deref()));
             if let Some(limit) = movie_limit {
-                chunk.truncate(limit.saturating_sub(movie_count));
+                chunk.truncate(limit.saturating_sub(counts.movies.selected));
             }
             if chunk.is_empty() {
                 continue;
             }
+            counts.movies.selected = counts.movies.selected.saturating_add(chunk.len());
             if !chunk
                 .iter()
                 .all(|stream| valid_xtream_movie_source(&client, &username, &password, stream))
@@ -2658,10 +2781,12 @@ where
                 )
                 .into());
             }
-            movie_count = movie_count
+            counts.movies.staged = counts
+                .movies
+                .staged
                 .saturating_add(append_staged_media_items(db, &stage, "movies", items).await?);
         }
-        movie_chunks
+        counts.movies.received = movie_chunks
             .finish()
             .await
             .map_err(|error| XtreamImportError::new("VOD streams", error))?;
@@ -2766,28 +2891,23 @@ where
                 return Err(XtreamImportError::new("series catalogue", error).into());
             }
         }
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-            movie_count,
-            series_progress.episode_count,
-            series_progress.skipped_series,
-            series_progress.deduplicated_series,
-        ))
+        counts.series = XtreamSeriesSyncCounts {
+            received: series_progress.received_series,
+            selected: series_progress.selected_series,
+            skipped: series_progress.skipped_series,
+            deduplicated: series_progress.deduplicated_series,
+        };
+        counts.episodes = XtreamEpisodeSyncCounts {
+            selected: series_progress.selected_episodes,
+            staged: series_progress.staged_episodes,
+            published: 0,
+        };
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(counts)
     }
     .await;
 
     match staged_result {
-        Ok((
-            movie_count,
-            series_episode_count,
-            skipped_series_count,
-            deduplicated_series_count,
-        )) => Ok(Some((
-            stage,
-            movie_count,
-            series_episode_count,
-            skipped_series_count,
-            deduplicated_series_count,
-        ))),
+        Ok(counts) => Ok(Some(XtreamStagedMedia { stage, counts })),
         Err(error) => {
             let _ = db.abort_remote_media_catalog_stage(&stage).await;
             Err(error)
@@ -2854,10 +2974,10 @@ where
 }
 
 /// Sync media for a single tuner from its payload.
-pub async fn sync_xtream_media_from_payload<Database>(
+async fn sync_xtream_media_counts_from_payload<Database>(
     db: &Database,
     payload: &serde_json::Value,
-) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<Option<XtreamMediaSyncCounts>, Box<dyn std::error::Error + Send + Sync>>
 where
     Database: XtreamCatalogStore + Sync,
 {
@@ -2865,26 +2985,28 @@ where
         OffsetDateTime::now_utc() - time::Duration::hours(24),
     )
     .await?;
-    let Some((
-        stage,
-        movie_count,
-        series_episode_count,
-        skipped_series_count,
-        deduplicated_series_count,
-    )) = stage_xtream_media_from_payload(db, payload).await?
-    else {
+    let Some(mut staged) = stage_xtream_media_from_payload(db, payload).await? else {
         return Ok(None);
     };
-    if let Err(error) = db.publish_remote_media_catalog_stage(&stage).await {
-        let _ = db.abort_remote_media_catalog_stage(&stage).await;
+    if let Err(error) = db.publish_remote_media_catalog_stage(&staged.stage).await {
+        let _ = db.abort_remote_media_catalog_stage(&staged.stage).await;
         return Err(error.into());
     }
-    Ok(Some(serde_json::json!({
-        "MovieCount": movie_count,
-        "SeriesEpisodeCount": series_episode_count,
-        "SkippedSeriesCount": skipped_series_count,
-        "DeduplicatedSeriesCount": deduplicated_series_count,
-    })))
+    staged.counts.mark_published();
+    Ok(Some(staged.counts))
+}
+
+/// Sync media for a single tuner from its payload.
+pub async fn sync_xtream_media_from_payload<Database>(
+    db: &Database,
+    payload: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
+where
+    Database: XtreamCatalogStore + Sync,
+{
+    Ok(sync_xtream_media_counts_from_payload(db, payload)
+        .await?
+        .map(xtream_media_sync_result_json))
 }
 
 /// Sync media for all configured xtream tuners.
@@ -2899,42 +3021,20 @@ where
         .await?;
     let mut synced_tuners = 0usize;
     let mut skipped_tuners = 0usize;
-    let mut movie_count = 0usize;
-    let mut series_episode_count = 0usize;
-    let mut skipped_series_count = 0usize;
-    let mut deduplicated_series_count = 0usize;
+    let mut counts = XtreamMediaSyncCounts::default();
     for tuner in tuners {
-        match sync_xtream_media_from_payload(db, &tuner).await? {
-            Some(result) => {
+        match sync_xtream_media_counts_from_payload(db, &tuner).await? {
+            Some(tuner_counts) => {
                 synced_tuners += 1;
-                movie_count += result
-                    .get("MovieCount")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                series_episode_count += result
-                    .get("SeriesEpisodeCount")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                skipped_series_count += result
-                    .get("SkippedSeriesCount")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                deduplicated_series_count += result
-                    .get("DeduplicatedSeriesCount")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
+                counts.saturating_add_assign(tuner_counts);
             }
             None => skipped_tuners += 1,
         }
     }
-    Ok(serde_json::json!({
-        "TunersSynced": synced_tuners,
-        "TunersSkipped": skipped_tuners,
-        "MovieCount": movie_count,
-        "SeriesEpisodeCount": series_episode_count,
-        "SkippedSeriesCount": skipped_series_count,
-        "DeduplicatedSeriesCount": deduplicated_series_count,
-    }))
+    let mut result = xtream_media_sync_result_json(counts);
+    result["TunersSynced"] = serde_json::json!(synced_tuners);
+    result["TunersSkipped"] = serde_json::json!(skipped_tuners);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -2960,6 +3060,17 @@ mod tests {
             chunks.push(chunk);
         }
         (chunks, parser.await.unwrap())
+    }
+
+    fn assert_counts_only(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Number(_) => {}
+            serde_json::Value::Object(fields) => {
+                assert!(!fields.is_empty());
+                fields.values().for_each(assert_counts_only);
+            }
+            other => panic!("counts-only observability contained {other:?}"),
+        }
     }
 
     #[derive(Clone, Default)]
@@ -3392,6 +3503,56 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn staged_sync_distinguishes_received_selected_staged_and_published_movies() {
+        let _private_urls = PrivateProviderUrlsGuard::allow();
+        let vod_streams = serde_json::to_vec(&serde_json::json!([
+            {
+                "stream_id": 1,
+                "name": "Selected",
+                "category_id": "10",
+                "container_extension": "mp4"
+            },
+            {
+                "stream_id": 2,
+                "name": "Limited",
+                "category_id": "10",
+                "container_extension": "mp4"
+            },
+            {
+                "stream_id": 3,
+                "name": "Filtered",
+                "category_id": "11",
+                "container_extension": "mp4"
+            }
+        ]))
+        .unwrap();
+        let (address, server) = xtream_catalog_server(vod_streams).await;
+        let store = RecordingCatalogStore::default();
+        let result = sync_xtream_media_from_payload(
+            &store,
+            &serde_json::json!({
+                "Id": XTREAM_PRIMARY_TUNER_ID,
+                "Url": format!("http://{address}"),
+                "Username": "account",
+                "Password": "secret",
+                "MovieLimit": 1,
+                "VodCategoryIds": ["10"]
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(result["Metrics"]["Movies"]["Received"], 3);
+        assert_eq!(result["Metrics"]["Movies"]["Selected"], 1);
+        assert_eq!(result["Metrics"]["Movies"]["Staged"], 1);
+        assert_eq!(result["Metrics"]["Movies"]["Published"], 1);
+        assert_eq!(result["MovieCount"], 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn staged_sync_publishes_a_catalogue_larger_than_the_legacy_100k_limit() {
         let _private_urls = PrivateProviderUrlsGuard::allow();
         let mut vod_streams = Vec::with_capacity(9_000_000);
@@ -3434,6 +3595,42 @@ mod tests {
 
         assert_eq!(result["MovieCount"], 100_001);
         assert_eq!(result["SeriesEpisodeCount"], 0);
+        assert_eq!(result["Metrics"]["Movies"]["Received"], 100_001);
+        assert_eq!(result["Metrics"]["Movies"]["Selected"], 100_001);
+        assert_eq!(result["Metrics"]["Movies"]["Staged"], 100_001);
+        assert_eq!(result["Metrics"]["Movies"]["Published"], 100_001);
+        assert_eq!(result["Metrics"]["Series"]["Received"], 0);
+        assert_eq!(result["Metrics"]["Series"]["Selected"], 0);
+        assert_eq!(result["Metrics"]["Episodes"]["Selected"], 0);
+        assert_eq!(result["Metrics"]["Episodes"]["Staged"], 0);
+        assert_eq!(result["Metrics"]["Episodes"]["Published"], 0);
+        assert_eq!(
+            result["Limits"]["BodyBytes"]["Catalog"],
+            XTREAM_MAX_CATALOG_BODY_BYTES
+        );
+        assert_eq!(
+            result["Limits"]["BodyBytes"]["Categories"],
+            XTREAM_MAX_CATEGORY_BODY_BYTES
+        );
+        assert_eq!(
+            result["Limits"]["BodyBytes"]["SeriesDetail"],
+            XTREAM_MAX_SERIES_INFO_BODY_BYTES
+        );
+        assert_eq!(
+            result["Limits"]["MaxInspectedItems"],
+            REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS
+        );
+        assert_eq!(result["Limits"]["ChunkSizeItems"], XTREAM_ARRAY_CHUNK_ITEMS);
+        assert_eq!(
+            result["Limits"]["StageAppendMaxItems"],
+            REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS
+        );
+        assert_eq!(
+            result["Limits"]["SeriesDetailConcurrency"],
+            XTREAM_SERIES_DETAIL_CONCURRENCY
+        );
+        assert_counts_only(&result["Metrics"]);
+        assert_counts_only(&result["Limits"]);
         assert_eq!(
             store
                 .staged_libraries
@@ -3486,6 +3683,16 @@ mod tests {
         assert_eq!(result["SeriesEpisodeCount"], 2);
         assert_eq!(result["SkippedSeriesCount"], 2);
         assert_eq!(result["DeduplicatedSeriesCount"], 1);
+        assert_eq!(result["Metrics"]["Movies"]["Received"], 0);
+        assert_eq!(result["Metrics"]["Series"]["Received"], 5);
+        assert_eq!(result["Metrics"]["Series"]["Selected"], 3);
+        assert_eq!(result["Metrics"]["Series"]["Skipped"], 2);
+        assert_eq!(result["Metrics"]["Series"]["Deduplicated"], 1);
+        assert_eq!(result["Metrics"]["Episodes"]["Selected"], 2);
+        assert_eq!(result["Metrics"]["Episodes"]["Staged"], 2);
+        assert_eq!(result["Metrics"]["Episodes"]["Published"], 2);
+        assert_counts_only(&result["Metrics"]);
+        assert_counts_only(&result["Limits"]);
         let appends = store.staged_appends.lock().unwrap();
         assert_eq!(
             appends
