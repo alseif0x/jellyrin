@@ -8142,6 +8142,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_query_filter_scalar_buckets_match_a_full_rebuild_through_every_transition() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let first_id = Uuid::new_v4();
+            let second_id = Uuid::new_v4();
+            let subtitled = vec![json!({"Type": "Subtitle", "Index": 0, "Codec": "subrip"})];
+            let movie = |id: Uuid, name: &str| {
+                remote_item(
+                    id,
+                    name,
+                    &format!("provider://scalar/{name}.mkv"),
+                    "Video",
+                    "movies",
+                    json!({"Genres": ["Drama"]}),
+                )
+            };
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Scalar Filters",
+                    "movies",
+                    "provider://scalar",
+                    vec![movie(first_id, "Alpha"), movie(second_id, "Beta")],
+                )
+                .await?;
+
+            let bucket_state = r#"
+                SELECT value_kind || '|' || normalized_value || '|' || display_value
+                       || '|' || winner_item_id::text || '|' || contributor_count::text
+                FROM media_item_query_filter_summary_values
+                WHERE virtual_folder_id = $1
+                ORDER BY 1
+                "#;
+
+            // Both items contribute, so the bucket carries two contributors and the smaller id wins.
+            for id in [first_id, second_id] {
+                test.database
+                    .update_media_item_media_info(
+                        id,
+                        Some(1_000),
+                        None,
+                        None,
+                        None,
+                        subtitled.clone(),
+                    )
+                    .await?;
+            }
+            let winner = sqlx::query_scalar::<_, Uuid>(
+                "SELECT winner_item_id FROM media_item_query_filter_summary_values \
+                 WHERE virtual_folder_id = $1 AND value_kind = 'has_subtitles'",
+            )
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            let loser = if winner == first_id {
+                second_id
+            } else {
+                first_id
+            };
+            anyhow::ensure!(
+                winner.to_string() < loser.to_string(),
+                "the stored winner is not the smallest contributing id"
+            );
+
+            // Each transition must leave the summary indistinguishable from one derived in full:
+            // the winner leaving, then the last contributor leaving, then the bucket coming back.
+            for (label, item_id, streams) in [
+                ("winner leaves", winner, Vec::new()),
+                ("last contributor leaves", loser, Vec::new()),
+                ("bucket returns", loser, subtitled.clone()),
+            ] {
+                test.database
+                    .update_media_item_media_info(item_id, Some(2_000), None, None, None, streams)
+                    .await?;
+                let coverage = sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                     WHERE virtual_folder_id = $1",
+                )
+                .bind(folder.id)
+                .fetch_one(&test.database.pool)
+                .await?;
+                anyhow::ensure!(coverage == 1, "{label}: coverage was left unpublished");
+                let after_point = sqlx::query_scalar::<_, String>(bucket_state)
+                    .bind(folder.id)
+                    .fetch_all(&test.database.pool)
+                    .await?;
+                let published = sqlx::query_scalar::<_, bool>(
+                    "SELECT jellyrin_rebuild_query_filter_summary($1)",
+                )
+                .bind(folder.id)
+                .fetch_one(&test.database.pool)
+                .await?;
+                anyhow::ensure!(published, "{label}: the control rebuild did not publish");
+                let after_rebuild = sqlx::query_scalar::<_, String>(bucket_state)
+                    .bind(folder.id)
+                    .fetch_all(&test.database.pool)
+                    .await?;
+                anyhow::ensure!(
+                    after_point == after_rebuild,
+                    "{label}: the patched summary diverged from a full rebuild"
+                );
+            }
+
+            // The winner's departure must hand the bucket to the remaining contributor, and the last
+            // departure must remove the bucket instead of leaving a zero behind.
+            let subtitle_buckets = sqlx::query_scalar::<_, String>(
+                "SELECT winner_item_id::text || '|' || contributor_count::text \
+                 FROM media_item_query_filter_summary_values \
+                 WHERE virtual_folder_id = $1 AND value_kind = 'has_subtitles'",
+            )
+            .bind(folder.id)
+            .fetch_all(&test.database.pool)
+            .await?;
+            anyhow::ensure!(
+                subtitle_buckets == vec![format!("{loser}|1")],
+                "unexpected final subtitle bucket: {subtitle_buckets:?}"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_query_filter_point_update_only_touches_changed_value_buckets() {
         let Some(test) = IsolatedPostgres::create().await else {
             return;

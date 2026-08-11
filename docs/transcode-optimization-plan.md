@@ -398,8 +398,8 @@ aprobadas, 0 fallidas y 7 ignoradas. La API pasa 353/0/3 usando
 `/usr/bin/ffmpeg` para generar fixtures; el resto del workspace pasa 342/0/4.
 La superficie PostgreSQL real queda además desglosada en `jellyrin-db`
 169/0/4 más doctests, proveedor Xtream 27/27 y migrador 36/36. El objetivo
-`202608080121`, con 25 migraciones embebidas, está validado contra PostgreSQL
-real y **desplegado** en staging (120 el 2026-08-10 y 121 el 2026-08-11). El
+`202608080122`, con 26 migraciones embebidas, está validado contra PostgreSQL
+real y **desplegado** en staging (120 el 2026-08-10, 121 y 122 el 2026-08-11). El
 ensure-current de 117 reconcilia el marker sin reconstruir la
 proyección ni alterar `xmin`/`completed_at` cuando fuentes y valores ya son
 exactos. `check` y `clippy -D warnings` de DB/API/migrador con todos sus targets
@@ -643,12 +643,46 @@ más sobre las tres tablas del resumen, y ambas carpetas reconciliadas con su
 coverage publicada. El primer `PlaybackInfo` de un ítem sin sondeo vigente baja de
 15,8 s a **1,0–5,8 s** y el segundo responde en 0,02 s, sin un solo 500.
 
-Queda un coste residual medible: cuando una bandera escalar cambia
-(`has_subtitles`, `container`, `video_types`…), el bloque escalar materializa las
-filas de la carpeta para recontar contribuyentes —1,35 s sobre 455.585
-episodios—, que es el caso de 5,8 s. Convertirlo también en aritmética de
-diferencias (contador ±1, rederivando el ganador solo cuando el ítem que sale era
-el mínimo) lo dejaría en milisegundos y es el siguiente paso natural.
+#### Esquema 122: los cubos escalares también por diferencias
+
+Tras 121 quedaba un coste residual: cuando cambiaba una bandera escalar
+(`has_subtitles`, `containers`, `media_types`, `video_types`, `has_trailer`), el
+bloque recontaba el cubo materializando las filas de la carpeta —1,35 s sobre
+455.585 episodios—, que era el caso de 5,8 s.
+
+Una pertenencia escalar aparece o desaparece para exactamente un ítem, así que el
+cubo se mueve en uno. La migración 122 lo parchea aritméticamente: al entrar,
+crear o incrementar conservando el id ganador más pequeño; al salir, borrar antes
+de decrementar para respetar el `CHECK (contributor_count > 0)`; y rederivar el
+ganador **solo** para un cubo cuyo ganador acaba de irse, que es la única rama que
+lee la carpeta. Como la aritmética no puede reparar un contador que ya estuviera
+mal, el bloque verifica después el total escalar de contribuciones y cae a la
+reconstrucción completa ante cualquier discrepancia, el mismo escape fail-closed
+que ya usaban los cubos de lista.
+
+La prueba recorre las cuatro transiciones —incrementar, ganador que se va, último
+contribuyente que se va y cubo que reaparece— y tras cada una compara el resumen
+parcheado contra una reconstrucción completa del folder, además de exigir que la
+coverage siga publicada. Inyectando un fallo deliberado en la sustitución de
+ganador, la prueba falla con «winner leaves: the patched summary diverged from a
+full rebuild», así que detecta un delta incorrecto en lugar de describirlo.
+
+Evidencia sobre la base productiva: 122 aplicada por el migrador en 16,0 ms
+(`applied_migrations=1`, 121 → 122), `prosecdef`, `search_path` y los ACL del
+runtime intactos. El primer `PlaybackInfo` de un ítem sin sondeo vigente pasa de
+1,0–5,8 s a **1,0–1,6 s** —y 0,023 s cuando el sondeo no hace falta—, con el
+segundo en 0,02 s; el remanente es el sondeo al proveedor, no trabajo de base de
+datos. `has_subtitles` subió de 2 a 6 contribuyentes siguiendo las escrituras, y
+ambas carpetas quedaron reconciliadas con su coverage publicada.
+
+Lo decisivo: comparado dentro de una transacción con `ROLLBACK`, el resumen que
+produjo la aritmética de diferencias es **idéntico fila a fila** a una
+reconstrucción completa de las dos carpetas productivas —cero filas exclusivas en
+cada sentido—, así que el camino incremental no introduce deriva alguna.
+
+Progresión completa del primer `PlaybackInfo` tras reimportar un ítem: 500 por
+timeout → 15,8 s (120 con presupuesto de worker) → 1,0–5,8 s (121) → 1,0–1,6 s
+(122).
 
 La base bare-metal de staging ya está desplegada en
 `jellyrin.test.kode.live`: PostgreSQL 16.14 y Jellyrin solo escuchan en loopback,
@@ -775,7 +809,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; runtime sin DML directo ni bypass GUC | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms y 120 en 886 ms sobre la base productiva. PostgreSQL 16 aislado valida ACL, rebuild/punto y ataques con GUC/sombras temporales; ACL de solo lectura y `SECURITY DEFINER` reverificados en staging tras el rollout; API 354/0/3 y DB efectiva 169/0/4 | Scope padre+hijos/múltiple, coalescer de grandes lotes y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 200 con total exacto 22.194 en 4,30 s por la página acotada en vivo, con la coverage aún sin publicar; `/Shows/NextUp` 200 con 22.027 exactos en 2,89 s y streams hidratados; Latest exacto por `media_item_catalog_page`; abrir serie/temporada/episodio en milisegundos; `PlaybackInfo` y adelantar sin bucle de fallo; esquema 121 acota la reconciliación puntual a los cubos que cambian y el primer `PlaybackInfo` baja de 15,8 s a 1,0–5,8 s | Convertir el bloque escalar del resumen en aritmética de diferencias para eliminar el 1,35 s residual; E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 200 con total exacto 22.194 en 4,30 s por la página acotada en vivo, con la coverage aún sin publicar; `/Shows/NextUp` 200 con 22.027 exactos en 2,89 s y streams hidratados; Latest exacto por `media_item_catalog_page`; abrir serie/temporada/episodio en milisegundos; `PlaybackInfo` y adelantar sin bucle de fallo; los esquemas 121 y 122 acotan la reconciliación puntual a los cubos que cambian y el primer `PlaybackInfo` baja de 15,8 s a 1,0–1,6 s, idéntico fila a fila a una reconstrucción completa | E2E visual autenticado; E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
 
