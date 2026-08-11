@@ -606,9 +606,30 @@ Dos defectos distintos rompían la reproducción, ninguno en el catálogo:
    la anterior queda `stopped`, siempre hay un único proceso y cero fallos de
    capacidad.
 
-Las carátulas que faltaban no eran un defecto propio: la mayoría responde 200 en
-~90 ms y unas pocas devuelven `Remote image not found` porque el proveedor no las
-tiene.
+#### Carátulas de series: eran un defecto propio, no del proveedor
+
+La primera lectura del journal atribuyó las carátulas ausentes a `Remote image not
+found` del proveedor. Medir los bytes en la app lo desmintió: **todas** las series
+devolvían 200 con un PNG de 67 bytes —el marcador 1×1— mientras las películas
+traían arte real de 34–56 KB.
+
+La causa: `item_image_or_placeholder` resuelve la imagen a partir de un
+`media_item`, y un id de serie o temporada es **sintético**, así que
+`media_item_by_id` daba 404 y la función devolvía el marcador antes de intentar
+nada. Las películas funcionaban porque sí son ítems reales.
+
+Los datos ya estaban: 451.217 de 455.585 episodios llevan `SeriesImageUrl` en sus
+metadatos y `metadata_remote_image_url` ya conocía esas claves. Ahora, cuando el id
+no nombra un ítem, se resuelve como serie o temporada con las búsquedas acotadas
+por id persistido y se sirve la imagen desde los metadatos de un episodio,
+reutilizando el mismo fetch y caché que las imágenes remotas. Solo se consultan las
+claves `Series*`: el `PrimaryImageUrl` de un episodio es su fotograma, y usarlo
+pondría una captura del primer capítulo donde va el póster. Se toma el primer
+episodio con URL utilizable para que un valor ausente no deje la serie en blanco.
+
+Verificado en la app: las ocho primeras series pasan de 67 bytes a pósters webp
+reales de 37.720–114.962 bytes en ~500×750, la segunda petición se sirve de caché
+en 65 ms y la temporada hereda el póster de su serie.
 
 #### Esquema 121: la reconciliación puntual solo toca lo que cambió
 

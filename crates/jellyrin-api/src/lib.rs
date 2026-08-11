@@ -52971,6 +52971,14 @@ async fn item_image_or_placeholder(
     let item = match media_item_by_id(&state.db, item_id).await {
         Ok(item) => item,
         Err(error) if error.status == StatusCode::NOT_FOUND => {
+            // Series and Season ids are synthetic, so no media item holds their artwork and every
+            // request for one used to fall straight through to the placeholder. Their episodes carry
+            // it in metadata.
+            if let Some(response) =
+                virtual_tv_item_image_response(state, item_id, image_type, image_index).await?
+            {
+                return Ok(response);
+            }
             return Ok(placeholder_png_response());
         }
         Err(error) => return Err(error),
@@ -53260,6 +53268,67 @@ async fn remote_metadata_item_image_response(
         }
     }
     Ok(None)
+}
+
+/// Serve the artwork of a synthetic Series or Season from the metadata of one of its episodes.
+///
+/// Only the `Series*` keys are consulted: an episode's own `PrimaryImageUrl` is its still, and using
+/// it would put a frame of the first episode where the poster belongs.
+async fn virtual_tv_item_image_response(
+    state: &AppState,
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<axum::response::Response>, ApiError> {
+    if image_index != 0 {
+        return Ok(None);
+    }
+    let snapshot = match tv_episode_catalog_snapshot_for_series(&state.db, item_id).await? {
+        Some(snapshot) => snapshot,
+        None => match tv_episode_catalog_snapshot_for_season(&state.db, item_id).await? {
+            Some(snapshot) => snapshot,
+            None => return Ok(None),
+        },
+    };
+    // Every episode repeats the same series artwork, so take the first fetchable url rather than
+    // letting one episode with a missing value blank the whole series.
+    let Some(image_url) = snapshot.items.iter().find_map(|item| {
+        snapshot
+            .metadata_by_item
+            .get(&item.id)
+            .and_then(|metadata| metadata_series_remote_image_url(metadata, image_type))
+    }) else {
+        return Ok(None);
+    };
+    if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
+        return stored_image_response(path).await.map(Some);
+    }
+    match fetch_remote_image_payload(&image_url).await {
+        Ok((bytes, _mime_type)) => {
+            let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
+            stored_image_response(path).await.map(Some)
+        }
+        Err(error) => {
+            tracing::warn!(?error, "failed to cache remote series image");
+            Ok(None)
+        }
+    }
+}
+
+fn metadata_series_remote_image_url(
+    metadata: &serde_json::Value,
+    image_type: &str,
+) -> Option<String> {
+    let keys: &[&str] = match normalize_image_type(image_type).as_str() {
+        "primary" => &["SeriesPrimaryImageUrl", "SeriesImageUrl"],
+        "backdrop" => &["SeriesBackdropImageUrl", "SeriesBackgroundImageUrl"],
+        "thumb" => &["SeriesThumbImageUrl"],
+        "logo" => &["SeriesLogoImageUrl"],
+        _ => return None,
+    };
+    metadata_values_from_json(metadata, keys)
+        .into_iter()
+        .find(|url| remote_image_url_is_fetchable(url))
 }
 
 fn metadata_remote_image_url(metadata: &serde_json::Value, image_type: &str) -> Option<String> {
