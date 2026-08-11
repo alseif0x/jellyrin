@@ -1,11 +1,11 @@
 # Handoff de staging
 
-Última actualización: 2026-08-11 16:22 UTC. Sustituye al plan de continuación del
+Última actualización: 2026-08-11 16:42 UTC. Sustituye al plan de continuación del
 rollout 120, que quedó ejecutado; el histórico está en el registro de Git.
 
 ## Estado exacto
 
-- Código desplegado: `b06b648 fix: serialize transcode and TV projection transitions`.
+- Código desplegado: `eac43f5 fix: align resumed HLS segment numbering`.
 - Rama `main` **sincronizada con `origin/main`**: sin commits locales pendientes y
   árbol de trabajo limpio.
 - Esquema aplicado: **`202608080124`**. La migración 124 se aplicó una sola vez en
@@ -13,7 +13,7 @@ rollout 120, que quedó ejecutado; el histórico está en el registro de Git.
   nada. Las anteriores fueron 120 en 23,3 ms, 121 en 20,3 ms, 122 en 16,0 ms y
   123 en 13,0 ms.
 - Binarios instalados:
-  - servidor `956d4c63b60a12afa239dfe8fe46d7213a23f99f0f936704e66f6d216055b2b9`;
+  - servidor `b4f0738277e367bb264aefbe9f48bb506b5cf7d43f28d49a7aa7887d95bb9702`;
   - migrador `1a6de2f5c2527e4b5515e362938ed8e8d2ab803c7453b94318b58a2af3684dfa`.
 - `jellyrin.service` `active/running`, `Result=success`, `NRestarts=0`.
 - PostgreSQL activo. Resumen de filtros reconciliado y publicado: Movies
@@ -65,7 +65,7 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
 
 ## Verificación vigente
 
-- Suites: migrador 34+4, core 19/19, `jellyrin-db` 174/0/4 y API 356/0/3 con
+- Suites: migrador 34+4, core 19/19, `jellyrin-db` 174/0/4 y API 357/0/3 con
   `/usr/bin/ffmpeg`.
   `cargo +1.94 fmt --all --check` y Clippy estricto de DB, migrador y API limpios.
 - La API necesita `/usr/bin/ffmpeg` en el PATH: el binario de `/usr/local/bin` no
@@ -84,6 +84,10 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
   aac estéreo; progreso persistido; adelantar deja una única sesión activa y cero
   fallos de capacidad; película por DirectProxy con `206`, `content-range` exacto
   sobre 1.789.475.245 bytes y magic Matroska.
+- Reanudación HLS comprobada además sobre el ítem Xtream real
+  `12e4aa52762dde5c9d06f6300d9f2c5b` en 1.967,099 s: playlist con
+  `MEDIA-SEQUENCE:655`, `segment_00655.ts` de 1.494.788 bytes, sync byte `0x47`
+  y `ffprobe` h264+aac. Antes el cliente pedía 655 mientras FFmpeg generaba 0.
 - Igualdad del resumen: comparado dentro de una transacción con `ROLLBACK`, el
   resumen que produce la reconciliación incremental es idéntico fila a fila a una
   reconstrucción completa de las dos carpetas productivas, cero filas exclusivas
