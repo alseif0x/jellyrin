@@ -38,7 +38,7 @@ use spec::{
 use value::{TypedValue, parse_uuid};
 
 pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_080_119;
-pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_123;
+pub const TARGET_SCHEMA_VERSION: i64 = 202_608_080_124;
 const MIN_POSTGRES_VERSION_NUM: i64 = 160_000;
 const MIGRATION_BATCH_ROWS: usize = 500;
 const TARGET_APPLICATION_LOCK_TIMEOUT: &str = "10s";
@@ -1905,6 +1905,43 @@ mod tests {
         assert!(
             !sql.contains("grant insert, update, delete on table media_item_query_filter_summary")
         );
+    }
+
+    #[test]
+    fn tv_series_publication_serializes_every_invalidation_trigger() {
+        let migration = POSTGRES_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 202_608_080_124)
+            .expect("TV-series publication-serialization migration must be embedded");
+        let sql = migration.sql.as_ref().to_ascii_lowercase();
+
+        for function_name in [
+            "jellyrin_invalidate_tv_series_after_insert",
+            "jellyrin_invalidate_tv_series_after_delete",
+            "jellyrin_invalidate_tv_series_after_update",
+        ] {
+            assert!(sql.contains(&format!("create or replace function {function_name}")));
+            assert!(sql.contains(&format!(
+                "revoke all on function {function_name}() from public"
+            )));
+        }
+        assert_eq!(
+            sql.matches("jellyrin-tv-series-projection:").count(),
+            3,
+            "every source trigger must use the rebuild's advisory-lock namespace"
+        );
+        assert!(sql.contains("security invoker"));
+        assert!(sql.contains("order by folder_id"));
+        assert_eq!(
+            sql.matches("foreach locked_folder_id in array affected_folder_ids")
+                .count(),
+            3
+        );
+        assert_eq!(
+            sql.matches("if affected_folder_ids is null then").count(),
+            3
+        );
+        assert!(sql.contains("set search_path to pg_catalog, %i, pg_temp"));
     }
 
     #[test]

@@ -126,7 +126,8 @@ use jellyrin_core::{
     AacProfile, DEFAULT_HLS_SEGMENT_TIME_SECONDS, DeviceToken, H264Profile, HlsStreamMode,
     HlsTranscodeRequest, MediaItem, PlaybackState, StartupConfig, TranscodeStreamSelection, User,
     VirtualFolder, build_hls_ffmpeg_command, build_hls_ffmpeg_command_from_stdin,
-    effective_media_item_type, tv_episode_path_info,
+    compare_tv_episode_items, effective_media_item_type, tv_episode_path_info,
+    tv_episode_series_key as core_tv_episode_series_key,
 };
 use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActivityLogEntry, ActivityLogFilter,
@@ -286,6 +287,8 @@ static TV_SERIES_REBUILDS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
 static TRANSCODE_EXECUTIONS: OnceLock<Mutex<HashMap<String, TranscodeExecutionObservation>>> =
     OnceLock::new();
 static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<WeakKeyedLockRegistry<String>>> = OnceLock::new();
+static TRANSCODE_DEVICE_LOCKS: OnceLock<Mutex<WeakKeyedLockRegistry<(Uuid, String)>>> =
+    OnceLock::new();
 static HLS_ON_DEMAND_LOCKS: OnceLock<Mutex<WeakKeyedLockRegistry<String>>> = OnceLock::new();
 static TRANSCODE_WAIT_QUEUE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static FFMPEG_ADMISSION_METRICS: OnceLock<AdmissionMetrics> = OnceLock::new();
@@ -34173,6 +34176,11 @@ async fn playback_transcode_info_response(
     );
     let dedupe_lock = transcode_dedupe_lock(&dedupe_key).await;
     let _dedupe_guard = dedupe_lock.lock().await;
+    // Different seek positions deliberately have different dedupe keys. Serialize the complete
+    // claim/supersede/spawn transition for one user's device as well, otherwise two concurrent
+    // seeks can each mark the other's not-yet-started session stopped and then both spawn FFmpeg.
+    let device_lock = transcode_device_lock(user.id, &token.device_id).await;
+    let _device_guard = device_lock.lock().await;
 
     if let Some(session) = reusable_hls_transcode_session(&state.db, &dedupe_key).await? {
         return playback_transcode_session_info_response(
@@ -34247,8 +34255,13 @@ async fn playback_transcode_info_response(
         .await?;
     let play_session_id = session.play_session_id;
     if claimed_new_session {
-        stop_superseded_device_transcode_sessions(&state.db, &token.device_id, &play_session_id)
-            .await;
+        stop_superseded_device_transcode_sessions(
+            &state.db,
+            user.id,
+            &token.device_id,
+            &play_session_id,
+        )
+        .await;
         spawn_hls_transcode_task(
             state.db.clone(),
             play_session_id.clone(),
@@ -34285,6 +34298,7 @@ async fn playback_transcode_info_response(
 /// a device starts a new encode.
 async fn stop_superseded_device_transcode_sessions(
     db: &Database,
+    user_id: Uuid,
     device_id: &str,
     keep_play_session_id: &str,
 ) {
@@ -34296,9 +34310,14 @@ async fn stop_superseded_device_transcode_sessions(
         }
     };
     for session in sessions {
-        if session.play_session_id == keep_play_session_id
-            || session.device_id.as_deref() != Some(device_id)
-        {
+        if !transcode_session_is_superseded(
+            session.user_id,
+            session.device_id.as_deref(),
+            &session.play_session_id,
+            user_id,
+            device_id,
+            keep_play_session_id,
+        ) {
             continue;
         }
         let stop_sender = transcode_stop_registry()
@@ -34324,6 +34343,19 @@ async fn stop_superseded_device_transcode_sessions(
             cleanup_hls_transcode_files(&session.output_path).await;
         }
     }
+}
+
+fn transcode_session_is_superseded(
+    session_user_id: Uuid,
+    session_device_id: Option<&str>,
+    session_play_session_id: &str,
+    user_id: Uuid,
+    device_id: &str,
+    keep_play_session_id: &str,
+) -> bool {
+    session_user_id == user_id
+        && session_device_id == Some(device_id)
+        && session_play_session_id != keep_play_session_id
 }
 
 fn playback_transcode_session_info_response(
@@ -34789,6 +34821,14 @@ fn hls_stream_mode_key(mode: HlsStreamMode) -> &'static str {
 async fn transcode_dedupe_lock(key: &str) -> Arc<Mutex<()>> {
     let mut locks = transcode_dedupe_registry().lock().await;
     locks.lock_for(key.to_string())
+}
+
+async fn transcode_device_lock(user_id: Uuid, device_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = TRANSCODE_DEVICE_LOCKS
+        .get_or_init(|| Mutex::new(WeakKeyedLockRegistry::new(KEYED_LOCK_REGISTRY_MAX_ENTRIES)))
+        .lock()
+        .await;
+    locks.lock_for((user_id, device_id.to_owned()))
 }
 
 async fn hls_on_demand_generation_lock(play_session_id: &str) -> Arc<Mutex<()>> {
@@ -51710,9 +51750,7 @@ fn tv_episode_info(item: &MediaItem) -> Option<TvEpisodeInfo> {
 }
 
 fn tv_episode_series_key(item: &MediaItem) -> String {
-    tv_episode_info(item)
-        .map(|info| info.series_name.to_ascii_lowercase())
-        .unwrap_or_else(|| item.virtual_folder_id.to_string())
+    core_tv_episode_series_key(item)
 }
 
 fn tv_series_id(series_name: &str) -> String {
@@ -52150,48 +52188,7 @@ fn apply_tv_season_metadata(value: &mut serde_json::Value, metadata: &serde_json
 }
 
 fn compare_tv_episodes(left: &MediaItem, right: &MediaItem) -> Ordering {
-    let left_info = tv_episode_info(left);
-    let right_info = tv_episode_info(right);
-    let left_series = left_info
-        .as_ref()
-        .map(|info| info.series_name.to_ascii_lowercase())
-        .unwrap_or_else(|| left.name.to_ascii_lowercase());
-    let right_series = right_info
-        .as_ref()
-        .map(|info| info.series_name.to_ascii_lowercase())
-        .unwrap_or_else(|| right.name.to_ascii_lowercase());
-    left_series
-        .cmp(&right_series)
-        .then_with(|| {
-            left_info
-                .as_ref()
-                .and_then(|info| info.season_number)
-                .unwrap_or(i32::MAX)
-                .cmp(
-                    &right_info
-                        .as_ref()
-                        .and_then(|info| info.season_number)
-                        .unwrap_or(i32::MAX),
-                )
-        })
-        .then_with(|| {
-            left_info
-                .as_ref()
-                .and_then(|info| info.episode_number)
-                .unwrap_or(i32::MAX)
-                .cmp(
-                    &right_info
-                        .as_ref()
-                        .and_then(|info| info.episode_number)
-                        .unwrap_or(i32::MAX),
-                )
-        })
-        .then_with(|| {
-            left.name
-                .to_ascii_lowercase()
-                .cmp(&right.name.to_ascii_lowercase())
-        })
-        .then_with(|| left.id.cmp(&right.id))
+    compare_tv_episode_items(left, right)
 }
 
 fn compare_tv_episodes_with_metadata(
@@ -55613,11 +55610,12 @@ mod tests {
         set_xtream_remote_media_probe_metadata, spawn_hls_transcode_task, stable_entity_id,
         subscribe_playback_events, subscribe_system_lifecycle_commands,
         subtitle_vtt_to_track_events_json, syncplay_cleanup_stale_participants, syncplay_groups,
-        transcode_dedupe_lock, transcode_temp_root, trickplay_settings, trickplay_tile_cache_path,
-        trickplay_tile_lock, tvmaze_remote_search_series_result,
-        update_plugin_configuration_via_runtime_host_path, validate_hls_cleanup_dir,
-        validate_zip_entry_path, verify_plugin_package_checksum, with_live_tuner_leases,
-        xtream_probe_lock_for, xtream_remote_media_probe_current, xtream_remote_source_revision,
+        transcode_dedupe_lock, transcode_device_lock, transcode_session_is_superseded,
+        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path, trickplay_tile_lock,
+        tvmaze_remote_search_series_result, update_plugin_configuration_via_runtime_host_path,
+        validate_hls_cleanup_dir, validate_zip_entry_path, verify_plugin_package_checksum,
+        with_live_tuner_leases, xtream_probe_lock_for, xtream_remote_media_probe_current,
+        xtream_remote_source_revision,
     };
     use crate::Database;
     use crate::dlna;
@@ -61273,6 +61271,64 @@ done
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[tokio::test]
+    async fn hls_transcode_device_lock_is_scoped_by_user_and_device() {
+        let first_user = Uuid::new_v4();
+        let second_user = Uuid::new_v4();
+        let first = transcode_device_lock(first_user, "living-room").await;
+        let same_scope = transcode_device_lock(first_user, "living-room").await;
+        let other_device = transcode_device_lock(first_user, "bedroom").await;
+        let other_user = transcode_device_lock(second_user, "living-room").await;
+
+        assert!(Arc::ptr_eq(&first, &same_scope));
+        assert!(!Arc::ptr_eq(&first, &other_device));
+        assert!(!Arc::ptr_eq(&first, &other_user));
+        let guard = first.lock().await;
+        assert!(same_scope.try_lock().is_err());
+        assert!(other_device.try_lock().is_ok());
+        assert!(other_user.try_lock().is_ok());
+        drop(guard);
+    }
+
+    #[test]
+    fn superseded_transcodes_never_cross_user_or_device_boundaries() {
+        let first_user = Uuid::new_v4();
+        let second_user = Uuid::new_v4();
+
+        assert!(transcode_session_is_superseded(
+            first_user,
+            Some("living-room"),
+            "old-session",
+            first_user,
+            "living-room",
+            "new-session",
+        ));
+        assert!(!transcode_session_is_superseded(
+            second_user,
+            Some("living-room"),
+            "old-session",
+            first_user,
+            "living-room",
+            "new-session",
+        ));
+        assert!(!transcode_session_is_superseded(
+            first_user,
+            Some("bedroom"),
+            "old-session",
+            first_user,
+            "living-room",
+            "new-session",
+        ));
+        assert!(!transcode_session_is_superseded(
+            first_user,
+            Some("living-room"),
+            "new-session",
+            first_user,
+            "living-room",
+            "new-session",
+        ));
     }
 
     #[tokio::test]

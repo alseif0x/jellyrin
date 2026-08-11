@@ -511,8 +511,12 @@ ejecuta en 556 ms, pero serializar sus 455.520 filas con `media_streams` y
 destoastear y decodificar por fila— frente a 1,2 s con el resto de columnas. La
 selección nunca lee ninguna de las dos.
 
-Así que los candidatos se piden sin `media_streams` ni `metadata`, la selección
-por-serie queda intacta y solo la página retenida se rehidrata con
+Así que los candidatos se piden sin `media_streams` ni `metadata`, se consumen
+como stream y se retiene como máximo un ganador por serie. La memoria del proceso
+queda acotada por las series visibles (~22.000), no por los episodios (~455.000).
+La clave y el comparador viven en `jellyrin-core`, de modo que el fold de DB y la
+ordenación de API comparten exactamente el parser y los mismos desempates. Solo
+la página retenida se rehidrata con
 `media_items_by_ids`, que preserva el orden del llamador. El tipo devuelto llega
 con `media_streams` vacío y ambos drivers lo documentan, porque el JSON no
 compacto deriva `MediaStreams` y los índices de audio/subtítulo por defecto de
@@ -601,8 +605,11 @@ Dos defectos distintos rompían la reproducción, ninguno en el catálogo:
    reclama una sesión nueva mientras el FFmpeg abandonado retiene el único slot
    de admisión hasta su timeout de inactividad de 60 s. La nueva esperaba 15 s y
    moría con `timed out waiting for AudioEncode capacity`. Ahora una sesión nueva
-   detiene las otras sesiones en vuelo **del mismo dispositivo**, que es el mismo
-   contrato de un stream por cliente. Verificado con dos adelantos consecutivos:
+   detiene las otras sesiones en vuelo **del mismo usuario y dispositivo**, que es
+   el mismo contrato de un stream por cliente. Un cerrojo por esa pareja serializa
+   comprobación, reclamación, parada y arranque: dos seeks concurrentes ya no
+   pueden limpiar mutuamente sus salidas, y reutilizar un `DeviceId` entre cuentas
+   no permite interferir con otra cuenta. Verificado con dos adelantos consecutivos:
    la anterior queda `stopped`, siempre hay un único proceso y cero fallos de
    capacidad.
 
@@ -640,6 +647,26 @@ partir de ahí el listado responde en **0,143–0,153 s** con las 100 carátulas
 presentes, y —lo que 123 arregla— **sigue publicada** tras dos `PlaybackInfo`,
 incluido uno que sondeó al proveedor: el listado siguió en 0,175 s y el resumen de
 filtros quedó reconciliado en `2004/2004`.
+
+#### Esquema 124: publicación e invalidación de Series quedan serializadas
+
+El cerrojo del rebuild de Series evitaba dos publicaciones simultáneas, pero los
+triggers de invalidación no participaban en él. Una escritura relevante podía
+confirmar mientras la coverage estaba ausente y antes de que el rebuild la
+publicase; el trigger borraba cero filas y el rebuild publicaba después una vista
+ya obsoleta.
+
+La migración 124 reemplaza los triggers `INSERT`, `DELETE` y `UPDATE`: calculan
+las carpetas afectadas, toman en orden estable el mismo advisory lock transaccional
+que el publicador y solo después invalidan la coverage. El trigger de update
+conserva el scope exacto del esquema 123. Las funciones siguen como `SECURITY
+INVOKER`, sin `EXECUTE` para `PUBLIC` y con `search_path` seguro.
+
+La prueba PostgreSQL real retiene deliberadamente el lock desde otra transacción,
+lanza un cambio de `SeriesName` y demuestra que la escritura espera; tras liberar
+el publicador, la cobertura queda a cero y la reconstrucción expone el nombre
+nuevo. El lote completo pasa API 356/0/3, DB 174/0/4, migrador 38/38 y core 19/19,
+además de formato, `git diff --check` y Clippy estricto.
 
 #### Carátulas de series: eran un defecto propio, no del proveedor
 

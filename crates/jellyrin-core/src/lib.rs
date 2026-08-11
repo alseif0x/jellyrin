@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::OnceLock;
 use time::OffsetDateTime;
@@ -161,6 +162,68 @@ pub fn tv_episode_path_info(name: &str, path: &str) -> TvEpisodePathInfo {
         season_number,
         episode_number,
     }
+}
+
+/// Stable grouping key used when selecting one visible episode per TV series.
+pub fn tv_episode_series_key(item: &MediaItem) -> String {
+    if effective_media_item_type(item) == "Episode" {
+        tv_episode_path_info(&item.name, &item.path)
+            .series_name
+            .to_ascii_lowercase()
+    } else {
+        item.virtual_folder_id.to_string()
+    }
+}
+
+/// Jellyfin-compatible ordering for episodes when metadata is not part of the query.
+///
+/// Keeping this in core makes streamed database selection and API sorting use the exact same
+/// tie-breakers.
+pub fn compare_tv_episode_items(left: &MediaItem, right: &MediaItem) -> Ordering {
+    let left_info = (effective_media_item_type(left) == "Episode")
+        .then(|| tv_episode_path_info(&left.name, &left.path));
+    let right_info = (effective_media_item_type(right) == "Episode")
+        .then(|| tv_episode_path_info(&right.name, &right.path));
+    let left_series = left_info
+        .as_ref()
+        .map(|info| info.series_name.to_ascii_lowercase())
+        .unwrap_or_else(|| left.name.to_ascii_lowercase());
+    let right_series = right_info
+        .as_ref()
+        .map(|info| info.series_name.to_ascii_lowercase())
+        .unwrap_or_else(|| right.name.to_ascii_lowercase());
+    left_series
+        .cmp(&right_series)
+        .then_with(|| {
+            left_info
+                .as_ref()
+                .and_then(|info| info.season_number)
+                .unwrap_or(i32::MAX)
+                .cmp(
+                    &right_info
+                        .as_ref()
+                        .and_then(|info| info.season_number)
+                        .unwrap_or(i32::MAX),
+                )
+        })
+        .then_with(|| {
+            left_info
+                .as_ref()
+                .and_then(|info| info.episode_number)
+                .unwrap_or(i32::MAX)
+                .cmp(
+                    &right_info
+                        .as_ref()
+                        .and_then(|info| info.episode_number)
+                        .unwrap_or(i32::MAX),
+                )
+        })
+        .then_with(|| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        })
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 fn parse_season_component(value: &str) -> Option<i32> {
@@ -1026,8 +1089,9 @@ mod tests {
     use super::{
         AacProfile, FfmpegCommandSpec, FfmpegProgress, FfmpegWorkload, H264Preset, H264Profile,
         HlsEncodingConfig, HlsStreamMode, HlsTranscodeRequest, MediaItem, TranscodeStreamSelection,
-        build_hls_ffmpeg_command, build_hls_ffmpeg_command_from_stdin, effective_media_item_type,
-        is_tv_extra_media_item, parse_ffmpeg_progress, tv_episode_path_info,
+        build_hls_ffmpeg_command, build_hls_ffmpeg_command_from_stdin, compare_tv_episode_items,
+        effective_media_item_type, is_tv_extra_media_item, parse_ffmpeg_progress,
+        tv_episode_path_info, tv_episode_series_key,
     };
 
     #[test]
@@ -1116,6 +1180,40 @@ mod tests {
         assert_eq!(name_fallback.series_name, "Fallback S04E05");
         assert_eq!(name_fallback.season_number, Some(4));
         assert_eq!(name_fallback.episode_number, Some(5));
+    }
+
+    #[test]
+    fn tv_episode_grouping_and_ordering_share_the_path_parser() {
+        let episode = |id, name: &str, path: &str| MediaItem {
+            id,
+            virtual_folder_id: uuid::Uuid::nil(),
+            name: name.to_string(),
+            path: path.to_string(),
+            media_type: "Video".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let first = episode(
+            uuid::Uuid::from_u128(1),
+            "Example S01E02",
+            "/media/Example Show/Season 01/Example S01E02.mkv",
+        );
+        let later = episode(
+            uuid::Uuid::from_u128(2),
+            "Example S02E01",
+            "/media/Example Show/Season 02/Example S02E01.mkv",
+        );
+
+        assert_eq!(tv_episode_series_key(&first), "example show");
+        assert_eq!(tv_episode_series_key(&first), tv_episode_series_key(&later));
+        assert!(compare_tv_episode_items(&first, &later).is_lt());
     }
 
     #[test]

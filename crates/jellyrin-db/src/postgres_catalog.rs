@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::Context;
 use futures_util::TryStreamExt;
-use jellyrin_core::{MediaItem, PlaybackState, VirtualFolder, tv_episode_path_info};
+use jellyrin_core::{
+    MediaItem, PlaybackState, VirtualFolder, compare_tv_episode_items, effective_media_item_type,
+    tv_episode_path_info, tv_episode_series_key,
+};
 use serde_json::Value;
 use sqlx::{Acquire, PgConnection, Postgres, QueryBuilder, Transaction};
 use time::OffsetDateTime;
@@ -2502,6 +2505,8 @@ impl PostgresDatabase {
     /// metadata columns are never read by the selection. Both are large JSONB values that must be
     /// detoasted and decoded per row, which is what made the full candidate fetch exceed the API
     /// statement timeout: on the staging library the same rows cost 7,5 s wide against 1,2 s here.
+    /// Rows are consumed as a stream and folded to one winner per series, so peak application
+    /// memory is bounded by the number of visible series instead of the number of episodes.
     /// Callers must hydrate the page they keep with `media_items_by_ids` before serializing it,
     /// because `media_streams` arrives empty.
     pub async fn tv_next_up_candidate_items(
@@ -2512,8 +2517,9 @@ impl PostgresDatabase {
             DatabaseOperation::CatalogNextUpCandidates,
             DatabasePoolRole::Api,
         );
-        let result = sqlx::query_as::<_, PostgresTvNextUpCandidateRow>(
-            r#"
+        let result = async {
+            let mut rows = sqlx::query_as::<_, PostgresTvNextUpCandidateRow>(
+                r#"
             SELECT item.id, item.virtual_folder_id, item.name, item.path,
                    item.media_type, item.collection_type, item.file_size,
                    item.runtime_ticks, item.bitrate, item.width, item.height,
@@ -2526,12 +2532,28 @@ impl PostgresDatabase {
               AND item.collection_type = 'tvshows'
               AND NOT COALESCE(playback.played, false)
             "#,
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| rows.into_iter().map(Into::into).collect::<Vec<MediaItem>>())
-        .map_err(anyhow::Error::from);
+            )
+            .bind(user_id)
+            .fetch(&self.pool);
+            let mut next_by_series = HashMap::<String, MediaItem>::new();
+            while let Some(row) = rows.try_next().await? {
+                let candidate = MediaItem::from(row);
+                if effective_media_item_type(&candidate) != "Episode" {
+                    continue;
+                }
+                let key = tv_episode_series_key(&candidate);
+                match next_by_series.get(&key) {
+                    Some(existing)
+                        if compare_tv_episode_items(existing, &candidate)
+                            != std::cmp::Ordering::Greater => {}
+                    _ => {
+                        next_by_series.insert(key, candidate);
+                    }
+                }
+            }
+            anyhow::Ok(next_by_series.into_values().collect::<Vec<_>>())
+        }
+        .await;
         observation.finish_result(&result, |items| {
             u64::try_from(items.len()).unwrap_or(u64::MAX)
         });
@@ -9468,6 +9490,9 @@ mod tests {
             let user = test.database.create_user("next-up-postgres", None).await?;
             let played_id = Uuid::new_v4();
             let unplayed_id = Uuid::new_v4();
+            let later_unplayed_id = Uuid::new_v4();
+            let other_series_id = Uuid::new_v4();
+            let extra_id = Uuid::new_v4();
             test.database
                 .replace_remote_media_library_snapshot(
                     "Next Up Shows",
@@ -9486,6 +9511,30 @@ mod tests {
                             unplayed_id,
                             "SQL Show S01E02",
                             "provider://next-up/SQL Show/Season 01/SQL Show S01E02.mp4",
+                            "Video",
+                            "tvshows",
+                            json!({"SeriesName": "SQL Show"}),
+                        ),
+                        remote_item(
+                            later_unplayed_id,
+                            "SQL Show S01E03",
+                            "provider://next-up/SQL Show/Season 01/SQL Show S01E03.mp4",
+                            "Video",
+                            "tvshows",
+                            json!({"SeriesName": "SQL Show"}),
+                        ),
+                        remote_item(
+                            other_series_id,
+                            "Another Show S02E01",
+                            "provider://next-up/Another Show/Season 02/Another Show S02E01.mp4",
+                            "Video",
+                            "tvshows",
+                            json!({"SeriesName": "Another Show"}),
+                        ),
+                        remote_item(
+                            extra_id,
+                            "Behind the scenes",
+                            "provider://next-up/SQL Show/Extras/Behind the scenes.mp4",
                             "Video",
                             "tvshows",
                             json!({"SeriesName": "SQL Show"}),
@@ -9522,10 +9571,25 @@ mod tests {
                 .await?;
 
             let candidates = test.database.tv_next_up_candidates(user.id).await?;
-            assert_eq!(candidates.len(), 1);
-            assert_eq!(candidates[0].item.id, unplayed_id);
-            assert_eq!(candidates[0].metadata["SeriesName"], "SQL Show");
-            assert!(candidates[0].playback_state.is_none());
+            assert_eq!(candidates.len(), 4);
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.item.id == unplayed_id)
+                .expect("unplayed SQL Show candidate");
+            assert_eq!(candidate.metadata["SeriesName"], "SQL Show");
+            assert!(candidate.playback_state.is_none());
+
+            let mut bounded = test
+                .database
+                .tv_next_up_candidate_items(user.id)
+                .await?
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>();
+            bounded.sort_unstable();
+            let mut expected = vec![unplayed_id, other_series_id];
+            expected.sort_unstable();
+            assert_eq!(bounded, expected);
             anyhow::Ok(())
         }
         .await;
@@ -9785,6 +9849,98 @@ mod tests {
                 coverage().await? == 0,
                 "changing SeriesName left the projection published"
             );
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_tv_series_invalidation_waits_for_the_publication_lock() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let series_id = Uuid::new_v4();
+            let episode_id = Uuid::new_v4();
+            let item = remote_item(
+                episode_id,
+                "Serialized S01E01",
+                "provider://serialized/Season 1/Serialized S01E01.mp4",
+                "Video",
+                "tvshows",
+                json!({
+                    "SeriesId": series_id.simple().to_string(),
+                    "SeriesName": "Serialized"
+                }),
+            );
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Serialized Shows",
+                    "tvshows",
+                    "provider://serialized",
+                    vec![item],
+                )
+                .await?;
+
+            let mut publication = test.database.worker_pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("jellyrin-tv-series-projection:{}", folder.id))
+                .execute(&mut *publication)
+                .await?;
+
+            let pool = test.database.pool.clone();
+            let update = tokio::spawn(async move {
+                sqlx::query(
+                    "UPDATE media_items SET metadata = jsonb_set(\
+                         metadata, '{SeriesName}', to_jsonb($2::text)\
+                     ) WHERE id = $1",
+                )
+                .bind(episode_id)
+                .bind("Serialized Changed")
+                .execute(&pool)
+                .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            anyhow::ensure!(
+                !update.is_finished(),
+                "a relevant source write bypassed the TV-series publication lock"
+            );
+
+            publication.commit().await?;
+            tokio::time::timeout(std::time::Duration::from_secs(5), update)
+                .await
+                .context("source write remained blocked after publication committed")??
+                .context("source write failed after acquiring the publication lock")?;
+
+            let coverage = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM media_item_tv_series_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            anyhow::ensure!(
+                coverage == 0,
+                "the serialized source write did not invalidate published coverage"
+            );
+            anyhow::ensure!(
+                test.database
+                    .ensure_tv_series_catalog_projection(folder.id)
+                    .await?,
+                "the invalidated TV-series projection did not republish"
+            );
+            let name = sqlx::query_scalar::<_, String>(
+                "SELECT series_name FROM media_item_tv_series \
+                 WHERE virtual_folder_id = $1 AND series_id = $2",
+            )
+            .bind(folder.id)
+            .bind(series_id.simple().to_string())
+            .fetch_one(&test.database.pool)
+            .await?;
+            anyhow::ensure!(name == "Serialized Changed");
             anyhow::Ok(())
         }
         .await;
