@@ -233,7 +233,6 @@ const MAX_HLS_SEEK_GENERATION_TIMEOUT_SECONDS: u64 = 900;
 const TRANSCODE_PROGRESS_PERSIST_INTERVAL: StdDuration = StdDuration::from_secs(3);
 const KEYED_LOCK_REGISTRY_MAX_ENTRIES: usize = 4_096;
 const KEYED_LOCK_PRUNE_INTERVAL: usize = 64;
-const SUBTITLE_JSON_FALLBACK_WINDOW_TICKS: i64 = 600_000_000;
 const XTREAM_REMOTE_PROBE_FAILED_RETRY_AFTER_SECONDS: i64 = 30 * 60;
 const DLNA_TRANSCODE_DEVICE_ID: &str = "dlna-upnp";
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
@@ -34597,7 +34596,7 @@ fn apply_hls_transcode_stream_contract(
                         );
                         let delivery_url = if is_remote {
                             format!(
-                                "/Videos/{item_id}/{item_id}/Subtitles/{index}/Stream.vtt?PlaySessionId={play_session_id}&api_key={access_token}&StartPositionTicks=0&EndPositionTicks={SUBTITLE_JSON_FALLBACK_WINDOW_TICKS}"
+                                "/Videos/{item_id}/{item_id}/Subtitles/{index}/Stream.vtt?PlaySessionId={play_session_id}&api_key={access_token}"
                             )
                         } else {
                             format!(
@@ -34838,6 +34837,11 @@ async fn hls_on_demand_generation_lock(play_session_id: &str) -> Arc<Mutex<()>> 
         .lock()
         .await;
     locks.lock_for(play_session_id.to_string())
+}
+
+async fn hls_on_demand_generation_active(play_session_id: &str) -> bool {
+    let lock = hls_on_demand_generation_lock(play_session_id).await;
+    lock.try_lock().is_err()
 }
 
 fn transcode_dedupe_registry() -> &'static Mutex<WeakKeyedLockRegistry<String>> {
@@ -38408,35 +38412,50 @@ async fn hls_segment_response_for(
         // clean the continuous writer. Re-read the session after admission so a waiter observes
         // the completed state instead of repeating cleanup from its stale `running` snapshot.
         let generation_lock = hls_on_demand_generation_lock(&session.play_session_id).await;
-        let _generation_guard = generation_lock.lock().await;
-        if !segment_path.exists() {
-            let current_session = state
+        let generation_state = state.clone();
+        let generation_layout = layout.clone();
+        let generation_play_session_id = session.play_session_id.clone();
+        // Jellyfin Web cancels a slow seek request after roughly eight seconds and retries the
+        // same segment. Keep generation independent from the HTTP future; dropping JoinHandle
+        // detaches the task, while the per-session lock coalesces the retry onto the same writer.
+        let generation_task = tokio::spawn(async move {
+            let _generation_guard = generation_lock.lock().await;
+            let segment_path = generation_layout.segment_path(segment_id);
+            if segment_path.exists() {
+                return Ok(false);
+            }
+            let current_session = generation_state
                 .db
-                .transcode_session_by_play_session_id(&session.play_session_id)
+                .transcode_session_by_play_session_id(&generation_play_session_id)
                 .await?
                 .ok_or_else(|| ApiError::not_found("HLS transcode session not found"))?;
             let should_generate =
                 should_generate_hls_segment_on_demand(&current_session, segment_id)
                     || (!wait_for_hls_segment_ready(
                         &segment_path,
-                        &layout.segment_path(segment_id.saturating_add(1)),
+                        &generation_layout.segment_path(segment_id.saturating_add(1)),
                         HLS_SEGMENT_WAIT_TIMEOUT,
                     )
                     .await?
                         && should_generate_hls_segment_on_demand(&current_session, segment_id));
-            if should_generate {
-                let input = hls_transcode_session_input_path(state, &current_session.item).await?;
-                generate_missing_hls_segment(
-                    &state.db,
-                    &current_session,
-                    &layout,
-                    segment_id,
-                    input.as_str(),
-                )
-                .await?;
-                generated_on_demand = true;
+            if !should_generate {
+                return Ok(false);
             }
-        }
+            let input =
+                hls_transcode_session_input_path(&generation_state, &current_session.item).await?;
+            generate_missing_hls_segment(
+                &generation_state.db,
+                &current_session,
+                &generation_layout,
+                segment_id,
+                input.as_str(),
+            )
+            .await?;
+            Ok::<bool, ApiError>(true)
+        });
+        generated_on_demand = generation_task
+            .await
+            .map_err(|error| ApiError::internal(format!("HLS seek task failed: {error}")))??;
     }
     if media_type == "Video"
         && !is_live_tv_channel_id(item_id)
@@ -38483,8 +38502,23 @@ async fn generate_missing_hls_segment(
     }
 
     stop_continuous_hls_for_seek(db, session, layout).await?;
-    let disk_reservation = reserve_transcode_disk_capacity().await?;
-    tokio::fs::create_dir_all(&layout.session_dir).await?;
+    // The continuous writer records `stopped` as it exits. Publish the replacement phase so
+    // ordinary retries can still resolve the session while the detached seek task is running.
+    db.update_transcode_session_status(&session.play_session_id, "starting")
+        .await?;
+    let disk_reservation = match reserve_transcode_disk_capacity().await {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            db.update_transcode_session_status(&session.play_session_id, "failed")
+                .await?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = tokio::fs::create_dir_all(&layout.session_dir).await {
+        db.update_transcode_session_status(&session.play_session_id, "failed")
+            .await?;
+        return Err(error.into());
+    }
     let segment_duration_ticks = if runtime_ticks > 0 {
         let segment_window_ticks =
             hls_segment_ticks().saturating_mul(HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS.saturating_add(1));
@@ -40232,6 +40266,8 @@ async fn subtitle_sidecar_is_within_item_dir(
 struct SubtitlePlaylistQuery {
     #[serde(alias = "api_key", alias = "apiKey", alias = "ApiKey")]
     api_key: Option<String>,
+    #[serde(alias = "PlaySessionId", alias = "playSessionId")]
+    play_session_id: Option<String>,
     #[serde(default, alias = "segmentLength", alias = "SegmentLength")]
     segment_length: Option<i64>,
 }
@@ -40302,6 +40338,14 @@ async fn subtitle_playlist(
         {
             playlist.push_str("&ApiKey=");
             playlist.push_str(api_key);
+        }
+        if let Some(play_session_id) = query
+            .play_session_id
+            .as_deref()
+            .filter(|play_session_id| !play_session_id.trim().is_empty())
+        {
+            playlist.push_str("&PlaySessionId=");
+            playlist.push_str(play_session_id);
         }
         playlist.push('\n');
         position_ticks = position_ticks.saturating_add(segment_length_ticks);
@@ -40395,17 +40439,20 @@ pub(crate) async fn subtitle_stream_response(
         .unwrap_or(route.start_position_ticks)
         .max(0);
     let end_position_ticks = query.end_position_ticks.filter(|ticks| *ticks >= 0);
-    let extraction_end_position_ticks = if requested_format == "json" {
-        end_position_ticks.or_else(|| {
-            Some(start_position_ticks.saturating_add(SUBTITLE_JSON_FALLBACK_WINDOW_TICKS))
-        })
-    } else {
-        end_position_ticks
-    };
+    // Jellyfin Web changes `.vtt` DeliveryUrls to `.js` and downloads one complete TrackEvents
+    // document. A synthetic fallback window silently drops every cue after its end, notably after
+    // rotation recreates the text renderer. Preserve an explicit range but never invent one.
+    let extraction_end_position_ticks = end_position_ticks;
 
     let item = subtitle_media_item(state, item_id, Some(media_source_id)).await?;
     let stream = subtitle_stream_info(&item, index)?;
-    let output = if requested_format == "json"
+    let output = if requested_format == "vtt"
+        && let Some(output) =
+            subtitle_output_from_transcode_vtt_segment(state, &query, index, start_position_ticks)
+                .await?
+    {
+        output
+    } else if requested_format == "json"
         && let Some(output) =
             subtitle_output_from_transcode_vtt_segments(state, &query, index).await?
     {
@@ -40489,6 +40536,66 @@ fn subtitle_vtt_to_track_events_json(output: &[u8]) -> Result<Vec<u8>, ApiError>
     })
 }
 
+fn empty_webvtt() -> Vec<u8> {
+    b"WEBVTT\n\n".to_vec()
+}
+
+async fn subtitle_output_from_transcode_vtt_segment(
+    state: &AppState,
+    query: &SubtitleStreamQuery,
+    index: i64,
+    start_position_ticks: i64,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let Some(play_session_id) = query
+        .play_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|play_session_id| !play_session_id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(session) = state
+        .db
+        .transcode_session_by_play_session_id(play_session_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    // A text-track switch reaches Stream.js before Web replaces the A/V session. Do not queue an
+    // auxiliary FFmpeg behind the active transcode: an empty response lets the client complete the
+    // switch, after which the replacement session produces sidecars for the newly selected track.
+    if session.subtitle_stream_index != Some(index) {
+        return Ok(Some(empty_webvtt()));
+    }
+
+    let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
+    let segment_id = hls_start_segment_number(start_position_ticks);
+    let segment_path = layout.session_dir.join(format!("main{segment_id}.vtt"));
+    let next_segment_path = layout
+        .session_dir
+        .join(format!("main{}.vtt", segment_id.saturating_add(1)));
+    // The remote VOD first segment currently takes 6-8 seconds on staging while Web cancels VTT
+    // requests after roughly ten. Stay below the client deadline and never launch another FFmpeg.
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(8);
+    loop {
+        match tokio::fs::read(&segment_path).await {
+            Ok(bytes) if !bytes.is_empty() => return Ok(Some(bytes)),
+            Ok(_) if next_segment_path.exists() || tokio::time::Instant::now() >= deadline => {
+                return Ok(Some(empty_webvtt()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(Some(empty_webvtt()));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    }
+}
+
 async fn subtitle_output_from_transcode_vtt_segments(
     state: &AppState,
     query: &SubtitleStreamQuery,
@@ -40510,13 +40617,15 @@ async fn subtitle_output_from_transcode_vtt_segments(
         return Ok(None);
     };
     if session.subtitle_stream_index != Some(index) {
-        return Ok(None);
+        return Ok(Some(empty_webvtt()));
     }
 
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
     let mut entries = match tokio::fs::read_dir(&layout.session_dir).await {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(empty_webvtt()));
+        }
         Err(error) => return Err(error.into()),
     };
     let mut paths = Vec::new();
@@ -40528,7 +40637,7 @@ async fn subtitle_output_from_transcode_vtt_segments(
     }
     paths.sort();
     if paths.is_empty() {
-        return Ok(None);
+        return Ok(Some(empty_webvtt()));
     }
 
     let mut combined = String::from("WEBVTT\n\n");
@@ -40548,7 +40657,7 @@ async fn subtitle_output_from_transcode_vtt_segments(
         }
     }
     if seen.is_empty() {
-        return Ok(None);
+        return Ok(Some(empty_webvtt()));
     }
 
     Ok(Some(combined.into_bytes()))
@@ -41393,12 +41502,17 @@ async fn active_hls_transcode_session_for(
         .transcode_session_by_play_session_id(play_session_id)
         .await?
         .ok_or_else(|| ApiError::not_found("HLS transcode session not found"))?;
+    let active_status = matches!(
+        session.status.as_str(),
+        "starting" | "running" | "completed"
+    );
+    let seek_in_flight = !active_status
+        && media_type == "Video"
+        && hls_on_demand_generation_active(play_session_id).await;
     if session.item.id != requested_item_id
         || session.item.media_type != media_type
-        || !matches!(
-            session.status.as_str(),
-            "starting" | "running" | "completed"
-        )
+        || session.user_id != user.id
+        || (!active_status && !seek_in_flight)
     {
         return Err(ApiError::not_found("HLS transcode session not found"));
     }
@@ -55623,14 +55737,14 @@ mod tests {
         HlsCleanupDirValidation, InternalRemoteRelayTarget, ItemsQuery, LiveHlsSessionEntry,
         LiveTunerLease, LiveTunerLeaseKey, LiveTvTimerSchedulerRun,
         PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery, PlaybackInfoOptions,
-        PlaybackOutputConstraints, PlaybackReportOutcome, SUBTITLE_JSON_FALLBACK_WINDOW_TICKS,
-        SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand, TvMazeExternals, TvMazeImage,
-        TvMazeNetwork, TvMazeRating, TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry,
-        activate_dotnet_plugin_with_host_path, activate_rust_wasi_plugin_with_host_path,
-        align_hls_request_segment_timeline, apply_live_hls_ffmpeg_policy,
-        apply_playback_output_constraints, await_package_install_cancelable,
-        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
-        classify_transcode_command, cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
+        PlaybackOutputConstraints, PlaybackReportOutcome, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
+        SystemLifecycleCommand, TvMazeExternals, TvMazeImage, TvMazeNetwork, TvMazeRating,
+        TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry, activate_dotnet_plugin_with_host_path,
+        activate_rust_wasi_plugin_with_host_path, align_hls_request_segment_timeline,
+        apply_live_hls_ffmpeg_policy, apply_playback_output_constraints,
+        await_package_install_cancelable, backup_restore_snapshot_json,
+        cascade_delete_series_timer_timers, classify_transcode_command,
+        cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         codec_condition_matches, codec_condition_property_value, default_audio_stream_index,
         default_live_tv_configuration, default_subtitle_stream_index, default_user_configuration,
@@ -88090,7 +88204,7 @@ done
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2&apiKey={api_key}"
+                        "/Videos/{item_id}/{item_id}/Subtitles/{subtitle_index}/subtitles.m3u8?segmentLength=2&apiKey={api_key}&PlaySessionId=subtitle-test-session"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -88107,6 +88221,7 @@ done
         assert!(playlist.contains("#EXT-X-TARGETDURATION:2"));
         assert!(playlist.contains("stream.vtt?CopyTimestamps=true&AddVttTimeMap=true"));
         assert!(playlist.contains(&format!("ApiKey={api_key}")));
+        assert!(playlist.contains("PlaySessionId=subtitle-test-session"));
 
         let response = app
             .clone()
@@ -94306,6 +94421,12 @@ done
         tokio::fs::write(&media_playlist, b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n")
             .await
             .unwrap();
+        tokio::fs::write(
+            transcode_dir.join("main0.vtt"),
+            b"WEBVTT\n\n00:00.500 --> 00:02.000\nRemote sidecar cue\n\n",
+        )
+        .await
+        .unwrap();
         db.upsert_transcode_session(UpsertTranscodeSession {
             play_session_id: "play-session-xtream-vod".to_string(),
             dedupe_key: Some(dedupe_key),
@@ -94366,7 +94487,7 @@ done
         assert_eq!(
             media_source["MediaStreams"][2]["DeliveryUrl"],
             format!(
-                "/Videos/{item_id}/{item_id}/Subtitles/2/Stream.vtt?PlaySessionId=play-session-xtream-vod&api_key={api_key}&StartPositionTicks=0&EndPositionTicks={SUBTITLE_JSON_FALLBACK_WINDOW_TICKS}"
+                "/Videos/{item_id}/{item_id}/Subtitles/2/Stream.vtt?PlaySessionId=play-session-xtream-vod&api_key={api_key}"
             )
         );
         assert_eq!(media_source["TranscodingSubProtocol"], "hls");
@@ -94376,6 +94497,22 @@ done
                 "/Videos/{item_id}/master.m3u8?PlaySessionId=play-session-xtream-vod&api_key={api_key}"
             )
         );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{item_id}/{item_id}/Subtitles/2/Stream.vtt?PlaySessionId=play-session-xtream-vod&StartPositionTicks=0&EndPositionTicks=30000000"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sidecar = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&sidecar).contains("Remote sidecar cue"));
 
         let response = app
             .oneshot(
