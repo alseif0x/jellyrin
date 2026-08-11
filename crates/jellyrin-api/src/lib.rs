@@ -134,13 +134,13 @@ use jellyrin_db::{
     InstallPluginPackage, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
     LiveTvChannelUpsert, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
     MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore, MediaItemCatalogCounts,
-    MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemCatalogSortField,
-    MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
-    MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
-    NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
-    ProviderSecretReference, QuickConnectSession, ResumeItemsPageQuery, SortDirection,
-    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    MediaItemCatalogEntry, MediaItemCatalogQuery, MediaItemCatalogSearchScope,
+    MediaItemCatalogSortField, MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata,
+    MediaItemQueryFilterSelection, MediaItemQueryFilterValues, MediaList, MediaListItem,
+    MediaListUserPermission, NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD,
+    PluginRuntimeInstanceUpsert, ProviderSecretReference, QuickConnectSession,
+    ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
+    TrickplayInfo, UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
     UpsertTranscodeSession, probe_remote_media_info_admitted,
     provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
     upcoming_media_item_premiere_date,
@@ -24190,7 +24190,8 @@ fn live_tv_channel_is_remote(path: &FsPath) -> bool {
 }
 
 // Returns a stable play_session_id for a live TV channel used in the HLS TranscodingUrl.
-// Deterministic so clients can predict it from the channel_id; changes only when channel_id changes.
+// Deterministic so clients can predict it from the channel_id; changes only when channel_id
+// changes.
 fn live_tv_channel_hls_play_session_id(channel_id: &str) -> String {
     stable_entity_id("LiveTvHls", channel_id)
 }
@@ -25401,7 +25402,8 @@ async fn record_channel_to_file(
         }
     };
 
-    // Build the file path: DataPath/livetv/recordings/<ValidFilename(Name+" "+StartDate yyyy_MM_dd_HH_mm_ss)>.ts
+    // Build the file path: DataPath/livetv/recordings/<ValidFilename(Name+" "+StartDate
+    // yyyy_MM_dd_HH_mm_ss)>.ts
     let recording_file_name = get_valid_filename(&live_tv_recording_name(&name, start_date));
     let recordings_dir = live_tv_recordings_dir(&log_dir);
     let recording_path = recordings_dir.join(format!("{recording_file_name}.ts"));
@@ -25685,7 +25687,8 @@ async fn record_channel_to_file(
                 }
             }
         }
-        // Update the timer status and RecordingPath (paridad upstream timer.RecordingPath + Status=Completed).
+        // Update the timer status and RecordingPath (paridad upstream timer.RecordingPath +
+        // Status=Completed).
         if let Some(timers) = config.get_mut("Timers").and_then(|v| v.as_array_mut()) {
             for t in timers.iter_mut() {
                 if json_string_field(t, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&timer_id)) {
@@ -29481,7 +29484,7 @@ async fn latest_items(
             &[SortField::DateLastMediaAdded, SortField::SortName],
         )
     });
-    let limit = query.limit.unwrap_or(20).min(100);
+    let limit = latest_items_limit(&query);
     Ok(Json(
         items_to_json(
             &state.db,
@@ -29523,7 +29526,7 @@ async fn current_user_latest_items(
             &[SortField::DateLastMediaAdded, SortField::SortName],
         )
     });
-    let limit = query.limit.unwrap_or(20).min(100);
+    let limit = latest_items_limit(&query);
     Ok(Json(
         items_to_json(
             &state.db,
@@ -29561,7 +29564,7 @@ async fn user_latest_items(
             &[SortField::DateLastMediaAdded, SortField::SortName],
         )
     });
-    let limit = query.limit.unwrap_or(20).min(100);
+    let limit = latest_items_limit(&query);
     Ok(Json(
         items_to_json(
             &state.db,
@@ -29579,84 +29582,140 @@ async fn latest_items_candidates(
     query: &ItemsQuery,
     user_id: Option<Uuid>,
 ) -> Result<Vec<MediaItem>, ApiError> {
-    if let Some(folder_ids) = latest_items_fast_path_folder_ids(db, query).await? {
-        let limit = query.limit.unwrap_or(20).min(100);
-        let candidate_limit = ((limit.max(20) * 20).min(2_000)) as i64;
-        return filtered_media_items(
-            db.latest_media_items_for_virtual_folders(&folder_ids, candidate_limit)
-                .await?,
-            query,
-            user_id,
-            db,
-        )
-        .await;
+    if let Some(items) = exact_latest_items_page(db, query, user_id).await? {
+        return Ok(items);
     }
 
     filtered_media_items(db.media_items().await?, query, user_id, db).await
 }
 
-async fn latest_items_fast_path_folder_ids(
+fn latest_items_limit(query: &ItemsQuery) -> usize {
+    query.limit.unwrap_or(20).min(100)
+}
+
+/// Answer Latest from the media-item repository, which applies every filter before its `LIMIT`.
+///
+/// Returns `None` when the request carries a predicate the repository cannot express, so the caller
+/// keeps the exact application-level path. Bounding a candidate window *before* the type, excluded
+/// folder and hide-played filters would silently return fewer than the requested newest items, so
+/// this is deliberately all-or-nothing rather than a best-effort truncation.
+async fn exact_latest_items_page(
     db: &Database,
     query: &ItemsQuery,
-) -> Result<Option<Vec<Uuid>>, ApiError> {
-    let Some(parent_id) = query
+    user_id: Option<Uuid>,
+) -> Result<Option<Vec<MediaItem>>, ApiError> {
+    // Latest imposes its own page size and ordering and ignores paging, so normalize those away
+    // before asking whether the repository can answer the remaining predicates exactly.
+    let limit = latest_items_limit(query);
+    let mut scoped = query.clone();
+    scoped.parent_id = None;
+    scoped.limit = Some(limit);
+    scoped.start_index = None;
+    scoped.sort_by = None;
+    scoped.sort_order = None;
+    let Some(mut db_query) = media_catalog_query_for_items(&scoped, user_id)? else {
+        return Ok(None);
+    };
+
+    let configuration = latest_user_configuration(db, query, user_id).await?;
+    let folders = db.virtual_folders().await?;
+    if let Some(parent_id) = query
         .parent_id
         .as_deref()
         .map(parse_jellyfin_uuid)
         .transpose()?
-    else {
-        return Ok(None);
-    };
-
-    if query.ids.is_some()
-        || query.season_id.is_some()
-        || !query.person_ids.is_empty()
-        || !query.genre_ids.is_empty()
-        || !query.studio_ids.is_empty()
-        || !query.official_ratings.is_empty()
-        || !query.tags.is_empty()
-        || !query.series_status.is_empty()
-        || !query.years.is_empty()
-        || query.search_term.is_some()
-        || query.is_played.is_some()
-        || query.is_favorite.is_some()
-        || query.is_airing.is_some()
-        || query.has_trailer.is_some()
-        || query.has_overview.is_some()
-        || query.has_imdb_id.is_some()
-        || query.has_tmdb_id.is_some()
-        || query.has_tvdb_id.is_some()
-        || query.has_official_rating.is_some()
-        || query.is_locked.is_some()
-        || query.min_community_rating.is_some()
-        || query.max_community_rating.is_some()
-        || query.min_critic_rating.is_some()
-        || query.max_critic_rating.is_some()
-        || query.min_premiere_date.is_some()
-        || query.max_premiere_date.is_some()
-        || query.min_date_created.is_some()
-        || query.max_date_created.is_some()
-        || query.min_date_last_saved.is_some()
-        || query.max_date_last_saved.is_some()
-        || !query.filters.is_empty()
-        || query.name_starts_with.is_some()
-        || query.name_starts_with_or_greater.is_some()
-        || query.name_less_than.is_some()
     {
+        // Latest always includes a library's children, unlike the catalogue scope that expands them
+        // only for `Recursive=true`.
+        let Some(parent) = folders.iter().find(|folder| folder.id == parent_id) else {
+            return Ok(None);
+        };
+        let mut scope = vec![parent.id];
+        scope.extend(
+            child_virtual_folders(parent, &folders)
+                .into_iter()
+                .map(|folder| folder.id),
+        );
+        scope.retain(|id| !configuration.excluded_folder_ids.contains(id));
+        if scope.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        db_query.virtual_folder_ids = scope;
+    } else if !configuration.excluded_folder_ids.is_empty() {
+        // An empty scope means every folder, so the exclusions have to be materialized as the
+        // complement instead.
+        let scope = folders
+            .iter()
+            .map(|folder| folder.id)
+            .filter(|id| !configuration.excluded_folder_ids.contains(id))
+            .collect::<Vec<_>>();
+        if scope.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        db_query.virtual_folder_ids = scope;
+    }
+
+    db_query.start_index = 0;
+    db_query.limit = limit;
+    // Mirror `compare_media_items(right, left, [DateLastMediaAdded, SortName])`: the repository
+    // appends a descending id tie-break for a descending sort, which matters here because a library
+    // sync stamps thousands of rows with the same `updated_at`.
+    db_query.sort = vec![
+        (
+            MediaItemCatalogSortField::DateLastMediaAdded,
+            SortDirection::Descending,
+        ),
+        (
+            MediaItemCatalogSortField::SortName,
+            SortDirection::Descending,
+        ),
+    ];
+    if configuration.hide_played {
+        db_query.is_played = Some(false);
+    }
+    if db_query.is_played.is_some() && db_query.user_id.is_none() {
+        // The repository matches nothing for a user-data filter without a user; the legacy path
+        // instead ignores the filter, so leave this shape to it.
         return Ok(None);
     }
 
-    let folders = db.virtual_folders().await?;
-    let Some(parent) = folders.iter().find(|folder| folder.id == parent_id) else {
-        return Ok(None);
+    let page = MediaCatalogStore::media_item_catalog_page(db, &db_query).await?;
+    Ok(Some(
+        page.items.into_iter().map(|entry| entry.item).collect(),
+    ))
+}
+
+struct LatestUserConfiguration {
+    excluded_folder_ids: HashSet<Uuid>,
+    hide_played: bool,
+}
+
+async fn latest_user_configuration(
+    db: &Database,
+    query: &ItemsQuery,
+    user_id: Option<Uuid>,
+) -> Result<LatestUserConfiguration, ApiError> {
+    let Some(user_id) = user_id else {
+        return Ok(LatestUserConfiguration {
+            excluded_folder_ids: HashSet::new(),
+            hide_played: false,
+        });
     };
-    let mut ids = vec![parent.id];
-    ids.extend(
-        child_virtual_folders(parent, &folders)
-            .into_iter()
-            .map(|folder| folder.id),
-    );
-    Ok(Some(ids))
+    let configuration = db
+        .user_configuration(user_id)
+        .await?
+        .unwrap_or_else(default_user_configuration);
+    let excluded_folder_ids = latest_items_excluded_folder_ids(db, &configuration).await?;
+    let hide_played = configuration
+        .get("HidePlayedInLatest")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+        && query.is_played.is_none()
+        && query_filters_played_value(&query.filters).is_none();
+    Ok(LatestUserConfiguration {
+        excluded_folder_ids,
+        hide_played,
+    })
 }
 
 async fn apply_latest_user_configuration(
@@ -29668,23 +29727,17 @@ async fn apply_latest_user_configuration(
     let Some(user_id) = user_id else {
         return Ok(items);
     };
-    let configuration = db
-        .user_configuration(user_id)
-        .await?
-        .unwrap_or_else(default_user_configuration);
+    let configuration = latest_user_configuration(db, query, Some(user_id)).await?;
 
-    let excluded_folder_ids = latest_items_excluded_folder_ids(db, &configuration).await?;
-    if !excluded_folder_ids.is_empty() {
-        items.retain(|item| !excluded_folder_ids.contains(&item.virtual_folder_id));
+    if !configuration.excluded_folder_ids.is_empty() {
+        items.retain(|item| {
+            !configuration
+                .excluded_folder_ids
+                .contains(&item.virtual_folder_id)
+        });
     }
 
-    let hide_played = configuration
-        .get("HidePlayedInLatest")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let has_explicit_played_filter =
-        query.is_played.is_some() || query_filters_played_value(&query.filters).is_some();
-    if hide_played && !has_explicit_played_filter {
+    if configuration.hide_played {
         let item_ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
         let playback_by_item = MediaCatalogStore::playback_states_for_items(db, user_id, &item_ids)
             .await?
@@ -32628,7 +32681,7 @@ async fn item_ancestors(
         return Ok(Json(vec![root]));
     }
 
-    let tv_snapshot = tv_episode_catalog_snapshot(&state.db).await?;
+    let tv_snapshot = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
 
     if let Some((series_name, series_id)) = tv_season_parent_from_snapshot(&tv_snapshot, &item_id) {
         let folder_id = tv_snapshot
@@ -34193,6 +34246,8 @@ async fn playback_transcode_info_response(
         .await?;
     let play_session_id = session.play_session_id;
     if claimed_new_session {
+        stop_superseded_device_transcode_sessions(&state.db, &token.device_id, &play_session_id)
+            .await;
         spawn_hls_transcode_task(
             state.db.clone(),
             play_session_id.clone(),
@@ -34215,6 +34270,59 @@ async fn playback_transcode_info_response(
         &options,
         &decision,
     )
+}
+
+/// Stop a device's other in-flight transcodes before starting a new one.
+///
+/// The dedupe key includes the start position, so seeking always claims a new play session while
+/// the
+/// abandoned FFmpeg job keeps the single admission slot until its idle timeout. The new session
+/// would
+/// otherwise wait for capacity and fail, which a client shows as an endless spinner. A client plays
+/// one stream per device, so superseding its previous job is the same contract Jellyfin applies
+/// when
+/// a device starts a new encode.
+async fn stop_superseded_device_transcode_sessions(
+    db: &Database,
+    device_id: &str,
+    keep_play_session_id: &str,
+) {
+    let sessions = match db.active_transcode_sessions().await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(%error, "failed to list active transcode sessions");
+            return;
+        }
+    };
+    for session in sessions {
+        if session.play_session_id == keep_play_session_id
+            || session.device_id.as_deref() != Some(device_id)
+        {
+            continue;
+        }
+        let stop_sender = transcode_stop_registry()
+            .lock()
+            .await
+            .remove(&session.play_session_id);
+        if let Some(stop_sender) = stop_sender {
+            if let Err(error) = db
+                .update_transcode_session_status(&session.play_session_id, "stopping")
+                .await
+            {
+                tracing::warn!(%error, "failed to mark a superseded transcode session stopping");
+            }
+            // The task itself records the terminal status, releases capacity and clears its files.
+            let _ = stop_sender.send(());
+        } else {
+            if let Err(error) = db
+                .update_transcode_session_status(&session.play_session_id, "stopped")
+                .await
+            {
+                tracing::warn!(%error, "failed to mark a superseded transcode session stopped");
+            }
+            cleanup_hls_transcode_files(&session.output_path).await;
+        }
+    }
 }
 
 fn playback_transcode_session_info_response(
@@ -42159,7 +42267,7 @@ async fn series_episodes(
     let TvEpisodeCatalogSnapshot {
         items,
         metadata_by_item,
-    } = tv_episode_catalog_snapshot(&state.db).await?;
+    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
     let candidate_episodes =
         filtered_media_items(items, &query, Some(requested_user_id), &state.db).await?;
     let mut episodes = candidate_episodes
@@ -42221,7 +42329,7 @@ async fn series_seasons(
     let TvEpisodeCatalogSnapshot {
         items: candidate_episodes,
         metadata_by_item,
-    } = tv_episode_catalog_snapshot(&state.db).await?;
+    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
     let episodes = candidate_episodes
         .into_iter()
         .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &series_id))
@@ -45433,7 +45541,7 @@ async fn authenticated_similar_show_items(
     let TvEpisodeCatalogSnapshot {
         items,
         metadata_by_item,
-    } = tv_episode_catalog_snapshot(&state.db).await?;
+    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
     let candidate_episodes =
         filtered_media_items(items, &items_query, Some(requested_user_id), &state.db).await?;
     let mut episodes = candidate_episodes
@@ -48957,9 +49065,16 @@ async fn tv_series_summary_by_id(
     user_id: Option<Uuid>,
 ) -> Result<Option<TvSeriesSummary>, ApiError> {
     let mut grouped = BTreeMap::<String, TvSeriesSummary>::new();
-    let items = db.media_items_by_collection_type("tvshows").await?;
-    let metadata_by_item =
-        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    // Resolving one series must not materialize every episode in the library along with its
+    // metadata.
+    // Only rows without a canonical persisted SeriesId can answer to a name-derived synthetic id,
+    // so
+    // that is the exact fallback scope rather than the whole catalogue.
+    let snapshot = match tv_episode_catalog_snapshot_for_series(db, series_id).await? {
+        Some(snapshot) => snapshot,
+        None => tv_episode_catalog_snapshot_without_canonical_series_id(db).await?,
+    };
+    let (items, metadata_by_item) = (snapshot.items, snapshot.metadata_by_item);
     let items = items
         .into_iter()
         .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), series_id))
@@ -48992,9 +49107,20 @@ async fn tv_season_summary_by_id(
     season_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<Option<(String, String, TvSeasonSummary)>, ApiError> {
-    let items = db.media_items_by_collection_type("tvshows").await?;
-    let metadata_by_item =
-        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    // Resolving one season must not materialize every episode in the library along with its
+    // metadata;
+    // the scoped snapshot falls back to the full catalogue only for synthetic ids.
+    let (items, metadata_by_item) = match tv_episode_catalog_snapshot_for_season(db, season_id)
+        .await?
+    {
+        Some(snapshot) => (snapshot.items, snapshot.metadata_by_item),
+        None => {
+            let items = db.media_items_by_collection_type("tvshows").await?;
+            let metadata_by_item =
+                media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+            (items, metadata_by_item)
+        }
+    };
     let items = items
         .into_iter()
         .filter(|item| tv_episode_matches_season(item, metadata_by_item.get(&item.id), season_id))
@@ -49040,9 +49166,21 @@ async fn tv_season_summary_by_id(
 }
 
 async fn virtual_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, ApiError> {
-    let items = db.media_items_by_collection_type("tvshows").await?;
-    let metadata_by_item =
-        media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+    // The persisted-id lookups narrow this to one series or season; the classification below still
+    // decides the answer, so a scope whose rows are all extras keeps returning false.
+    let scoped = match tv_episode_catalog_snapshot_for_series(db, item_id).await? {
+        Some(snapshot) => Some(snapshot),
+        None => tv_episode_catalog_snapshot_for_season(db, item_id).await?,
+    };
+    let (items, metadata_by_item) = match scoped {
+        Some(snapshot) => (snapshot.items, snapshot.metadata_by_item),
+        None => {
+            let items = db.media_items_by_collection_type("tvshows").await?;
+            let metadata_by_item =
+                media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
+            (items, metadata_by_item)
+        }
+    };
     Ok(items.into_iter().any(|item| {
         tv_episode_info(&item).is_some_and(|info| {
             let metadata = metadata_by_item.get(&item.id);
@@ -51632,16 +51770,95 @@ struct TvEpisodeCatalogSnapshot {
 
 async fn tv_episode_catalog_snapshot(db: &Database) -> Result<TvEpisodeCatalogSnapshot, ApiError> {
     let entries = MediaCatalogStore::tv_series_lookup_candidates(db).await?;
+    Ok(tv_episode_catalog_snapshot_from_entries(entries))
+}
+
+fn tv_episode_catalog_snapshot_from_entries(
+    entries: Vec<MediaItemCatalogEntry>,
+) -> TvEpisodeCatalogSnapshot {
     let mut items = Vec::with_capacity(entries.len());
     let mut metadata_by_item = HashMap::with_capacity(entries.len());
     for entry in entries {
         metadata_by_item.insert(entry.item.id, entry.metadata);
         items.push(entry.item);
     }
-    Ok(TvEpisodeCatalogSnapshot {
+    TvEpisodeCatalogSnapshot {
         items,
         metadata_by_item,
-    })
+    }
+}
+
+/// Snapshot restricted to the episodes of one persisted series.
+///
+/// Resolving a single Series id otherwise materializes every episode in the library, which exceeds
+/// the API statement timeout at library scale. Returns `None` when the id is not a canonical
+/// persisted `SeriesId` — the name-derived synthetic ids are hashes that only the full snapshot can
+/// resolve — and when no episode carries it, so both cases keep the caller's existing behaviour.
+async fn tv_episode_catalog_snapshot_for_series(
+    db: &Database,
+    series_id: &str,
+) -> Result<Option<TvEpisodeCatalogSnapshot>, ApiError> {
+    let Ok(canonical) = parse_jellyfin_uuid(series_id) else {
+        return Ok(None);
+    };
+    let entries = MediaCatalogStore::tv_series_lookup_candidates_for_series(
+        db,
+        &canonical.simple().to_string(),
+    )
+    .await?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(tv_episode_catalog_snapshot_from_entries(entries)))
+}
+
+/// Snapshot restricted to the episodes that can carry a name-derived synthetic Series id.
+///
+/// An episode with a canonical persisted `SeriesId` is only ever addressed by it, so a canonical
+/// lookup that finds nothing cannot be answered by those rows either. Narrowing the fallback to the
+/// remainder keeps it exact while leaving a reconciled library with nothing to scan.
+async fn tv_episode_catalog_snapshot_without_canonical_series_id(
+    db: &Database,
+) -> Result<TvEpisodeCatalogSnapshot, ApiError> {
+    let entries =
+        MediaCatalogStore::tv_series_lookup_candidates_without_canonical_series_id(db).await?;
+    Ok(tv_episode_catalog_snapshot_from_entries(entries))
+}
+
+/// Snapshot restricted to the episodes of one persisted season, on the same terms as
+/// `tv_episode_catalog_snapshot_for_series`.
+async fn tv_episode_catalog_snapshot_for_season(
+    db: &Database,
+    season_id: &str,
+) -> Result<Option<TvEpisodeCatalogSnapshot>, ApiError> {
+    let Ok(canonical) = parse_jellyfin_uuid(season_id) else {
+        return Ok(None);
+    };
+    let entries = MediaCatalogStore::tv_series_lookup_candidates_for_season(
+        db,
+        &canonical.simple().to_string(),
+    )
+    .await?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(tv_episode_catalog_snapshot_from_entries(entries)))
+}
+
+/// The scoped snapshot for an id that may name either a series or a season, falling back to the
+/// full
+/// catalogue only when neither persisted id resolves.
+async fn tv_episode_catalog_snapshot_scoped_to_series(
+    db: &Database,
+    series_id: &str,
+) -> Result<TvEpisodeCatalogSnapshot, ApiError> {
+    if let Some(snapshot) = tv_episode_catalog_snapshot_for_series(db, series_id).await? {
+        return Ok(snapshot);
+    }
+    if let Some(snapshot) = tv_episode_catalog_snapshot_for_season(db, series_id).await? {
+        return Ok(snapshot);
+    }
+    tv_episode_catalog_snapshot(db).await
 }
 
 fn tv_season_parent_from_snapshot(
@@ -74432,7 +74649,8 @@ done
         assert!(!media_source.to_string().contains("opaque-reference"));
     }
 
-    // Spec: local (non-remote) channels must NOT expose SupportsTranscoding:true (no HLS for local TS).
+    // Spec: local (non-remote) channels must NOT expose SupportsTranscoding:true (no HLS for local
+    // TS).
     #[test]
     fn live_tv_local_channel_media_source_has_no_hls_transcode() {
         let channel = json!({
@@ -100626,7 +100844,8 @@ done
         );
     }
 
-    // DS5 / Spec (e): DELETE series timer cascades — child timers are removed from config["Timers"].
+    // DS5 / Spec (e): DELETE series timer cascades — child timers are removed from
+    // config["Timers"].
     #[tokio::test]
     async fn series_timer_delete_cascades_to_child_timers() {
         let db = Database::connect("sqlite::memory:").await.unwrap();

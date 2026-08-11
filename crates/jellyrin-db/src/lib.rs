@@ -1569,6 +1569,26 @@ pub trait MediaCatalogStore: DatabaseBackend {
         &self,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
 
+    /// The same candidates restricted to one persisted `SeriesId`, so resolving a single series
+    /// does
+    /// not materialize every episode in the library.
+    fn tv_series_lookup_candidates_for_series<'a>(
+        &'a self,
+        series_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a;
+
+    /// The same candidates restricted to one persisted `SeasonId`.
+    fn tv_series_lookup_candidates_for_season<'a>(
+        &'a self,
+        season_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a;
+
+    /// The same candidates restricted to rows without a canonical persisted `SeriesId`, the exact
+    /// fallback scope for name-derived synthetic ids.
+    fn tv_series_lookup_candidates_without_canonical_series_id(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
+
     fn tv_series_catalog_page(
         &self,
         virtual_folder_id: Option<Uuid>,
@@ -1699,6 +1719,29 @@ impl MediaCatalogStore for PostgresDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         PostgresDatabase::tv_series_lookup_candidates(self)
+    }
+
+    fn tv_series_lookup_candidates_for_series<'a>(
+        &'a self,
+        series_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a
+    {
+        PostgresDatabase::tv_series_lookup_candidates_for_series(self, series_id)
+    }
+
+    fn tv_series_lookup_candidates_for_season<'a>(
+        &'a self,
+        season_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a
+    {
+        PostgresDatabase::tv_series_lookup_candidates_for_season(self, season_id)
+    }
+
+    fn tv_series_lookup_candidates_without_canonical_series_id(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        PostgresDatabase::tv_series_lookup_candidates_without_canonical_series_id(self)
     }
 
     fn tv_series_catalog_page(
@@ -1848,6 +1891,29 @@ impl MediaCatalogStore for SqliteDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         SqliteDatabase::tv_series_lookup_candidates(self)
+    }
+
+    fn tv_series_lookup_candidates_for_series<'a>(
+        &'a self,
+        series_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a
+    {
+        SqliteDatabase::tv_series_lookup_candidates_for_series(self, series_id)
+    }
+
+    fn tv_series_lookup_candidates_for_season<'a>(
+        &'a self,
+        season_id: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + 'a
+    {
+        SqliteDatabase::tv_series_lookup_candidates_for_season(self, season_id)
+    }
+
+    fn tv_series_lookup_candidates_without_canonical_series_id(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
+    {
+        SqliteDatabase::tv_series_lookup_candidates_without_canonical_series_id(self)
     }
 
     fn tv_series_catalog_page(
@@ -8405,6 +8471,137 @@ impl SqliteDatabase {
             WHERE item.missing_since IS NULL
               AND item.media_type = 'Video'
               AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+            ORDER BY item.name COLLATE NOCASE
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// The same candidates restricted to one persisted `SeriesId`.
+    ///
+    /// Opening a series otherwise materializes every episode in the library just to keep the
+    /// handful
+    /// that belong to it. The remaining predicates match `tv_series_lookup_candidates` exactly so
+    /// the
+    /// result is a strict subset of it.
+    pub async fn tv_series_lookup_candidates_for_series(
+        &self,
+        series_id: &str,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let rows = sqlx::query_as::<_, MediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams_json, item.metadata_json,
+                   item.created_at, item.updated_at,
+                   CAST(NULL AS TEXT) AS playback_user_id,
+                   CAST(NULL AS TEXT) AS playback_item_id,
+                   CAST(NULL AS TEXT) AS playback_media_source_id,
+                   CAST(NULL AS INTEGER) AS playback_audio_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_subtitle_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_position_ticks,
+                   CAST(NULL AS INTEGER) AS playback_is_paused,
+                   CAST(NULL AS INTEGER) AS playback_played,
+                   CAST(NULL AS INTEGER) AS playback_is_favorite,
+                   CAST(NULL AS REAL) AS playback_rating,
+                   CAST(NULL AS TEXT) AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+              AND trim(json_extract(item.metadata_json, '$.SeriesId')) = ?1
+            ORDER BY item.name COLLATE NOCASE
+            "#,
+        )
+        .bind(series_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// The same candidates restricted to one persisted `SeasonId`.
+    ///
+    /// Opening a season otherwise materializes every episode in the library just to keep the
+    /// handful
+    /// that belong to it. The remaining predicates match `tv_series_lookup_candidates` exactly so
+    /// the
+    /// result is a strict subset of it.
+    pub async fn tv_series_lookup_candidates_for_season(
+        &self,
+        season_id: &str,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let rows = sqlx::query_as::<_, MediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams_json, item.metadata_json,
+                   item.created_at, item.updated_at,
+                   CAST(NULL AS TEXT) AS playback_user_id,
+                   CAST(NULL AS TEXT) AS playback_item_id,
+                   CAST(NULL AS TEXT) AS playback_media_source_id,
+                   CAST(NULL AS INTEGER) AS playback_audio_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_subtitle_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_position_ticks,
+                   CAST(NULL AS INTEGER) AS playback_is_paused,
+                   CAST(NULL AS INTEGER) AS playback_played,
+                   CAST(NULL AS INTEGER) AS playback_is_favorite,
+                   CAST(NULL AS REAL) AS playback_rating,
+                   CAST(NULL AS TEXT) AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+              AND trim(json_extract(item.metadata_json, '$.SeasonId')) = ?1
+            ORDER BY item.name COLLATE NOCASE
+            "#,
+        )
+        .bind(season_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// The same candidates restricted to rows without a canonical persisted `SeriesId`.
+    ///
+    /// Only those episodes can carry a name-derived synthetic Series id, so this is the exact
+    /// fallback scope when a canonical lookup finds nothing.
+    pub async fn tv_series_lookup_candidates_without_canonical_series_id(
+        &self,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let rows = sqlx::query_as::<_, MediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams_json, item.metadata_json,
+                   item.created_at, item.updated_at,
+                   CAST(NULL AS TEXT) AS playback_user_id,
+                   CAST(NULL AS TEXT) AS playback_item_id,
+                   CAST(NULL AS TEXT) AS playback_media_source_id,
+                   CAST(NULL AS INTEGER) AS playback_audio_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_subtitle_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_position_ticks,
+                   CAST(NULL AS INTEGER) AS playback_is_paused,
+                   CAST(NULL AS INTEGER) AS playback_played,
+                   CAST(NULL AS INTEGER) AS playback_is_favorite,
+                   CAST(NULL AS REAL) AS playback_rating,
+                   CAST(NULL AS TEXT) AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+              AND (
+                  NULLIF(trim(json_extract(item.metadata_json, '$.SeriesId')), '') IS NULL
+                  OR length(trim(json_extract(item.metadata_json, '$.SeriesId'))) <> 32
+                  OR trim(json_extract(item.metadata_json, '$.SeriesId')) <>
+                     lower(trim(json_extract(item.metadata_json, '$.SeriesId')))
+                  OR trim(json_extract(item.metadata_json, '$.SeriesId')) GLOB '*[^0-9a-f]*'
+                  OR NULLIF(trim(json_extract(item.metadata_json, '$.SeriesName')), '') IS NULL
+              )
             ORDER BY item.name COLLATE NOCASE
             "#,
         )

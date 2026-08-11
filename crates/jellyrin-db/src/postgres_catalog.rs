@@ -1659,6 +1659,136 @@ impl PostgresDatabase {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// The same candidates restricted to one persisted `SeriesId`.
+    ///
+    /// Opening a series otherwise materializes every episode in the library just to keep the
+    /// handful
+    /// that belong to it. The partial index on `btrim(metadata->>'SeriesId')` makes this a direct
+    /// lookup, and the remaining predicates match `tv_series_lookup_candidates` exactly so the
+    /// result
+    /// is a strict subset of it.
+    pub async fn tv_series_lookup_candidates_for_series(
+        &self,
+        series_id: &str,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let rows = sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams, item.metadata, item.created_at, item.updated_at,
+                   NULL::uuid AS playback_user_id,
+                   NULL::uuid AS playback_item_id,
+                   NULL::text AS playback_media_source_id,
+                   NULL::bigint AS playback_audio_stream_index,
+                   NULL::bigint AS playback_subtitle_stream_index,
+                   NULL::bigint AS playback_position_ticks,
+                   NULL::boolean AS playback_is_paused,
+                   NULL::boolean AS playback_played,
+                   NULL::boolean AS playback_is_favorite,
+                   NULL::double precision AS playback_rating,
+                   NULL::timestamptz AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+              AND btrim(item.metadata->>'SeriesId') = $1
+            ORDER BY lower(item.name), item.name
+            "#,
+        )
+        .bind(series_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// The same candidates restricted to one persisted `SeasonId`.
+    ///
+    /// Opening a season otherwise materializes every episode in the library just to keep the
+    /// handful
+    /// that belong to it. There is no index on this expression, but evaluating it over the visible
+    /// TV
+    /// rows costs a fraction of transferring their stream payloads, and the remaining predicates
+    /// match
+    /// `tv_series_lookup_candidates` exactly so the result is a strict subset of it.
+    pub async fn tv_series_lookup_candidates_for_season(
+        &self,
+        season_id: &str,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let rows = sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams, item.metadata, item.created_at, item.updated_at,
+                   NULL::uuid AS playback_user_id,
+                   NULL::uuid AS playback_item_id,
+                   NULL::text AS playback_media_source_id,
+                   NULL::bigint AS playback_audio_stream_index,
+                   NULL::bigint AS playback_subtitle_stream_index,
+                   NULL::bigint AS playback_position_ticks,
+                   NULL::boolean AS playback_is_paused,
+                   NULL::boolean AS playback_played,
+                   NULL::boolean AS playback_is_favorite,
+                   NULL::double precision AS playback_rating,
+                   NULL::timestamptz AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+              AND btrim(item.metadata->>'SeasonId') = $1
+            ORDER BY lower(item.name), item.name
+            "#,
+        )
+        .bind(season_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// The same candidates restricted to rows without a canonical persisted `SeriesId`.
+    ///
+    /// Only those episodes can carry a name-derived synthetic Series id, so this is the exact
+    /// fallback scope when a canonical lookup finds nothing. The partial index on the same
+    /// predicate
+    /// makes it an index-only probe, which is empty in a fully reconciled library.
+    pub async fn tv_series_lookup_candidates_without_canonical_series_id(
+        &self,
+    ) -> anyhow::Result<Vec<MediaItemCatalogEntry>> {
+        let rows = sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams, item.metadata, item.created_at, item.updated_at,
+                   NULL::uuid AS playback_user_id,
+                   NULL::uuid AS playback_item_id,
+                   NULL::text AS playback_media_source_id,
+                   NULL::bigint AS playback_audio_stream_index,
+                   NULL::bigint AS playback_subtitle_stream_index,
+                   NULL::bigint AS playback_position_ticks,
+                   NULL::boolean AS playback_is_paused,
+                   NULL::boolean AS playback_played,
+                   NULL::boolean AS playback_is_favorite,
+                   NULL::double precision AS playback_rating,
+                   NULL::timestamptz AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+              AND (
+                  NULLIF(btrim(item.metadata->>'SeriesId'), '') IS NULL
+                  OR btrim(item.metadata->>'SeriesId') !~ '^[0-9a-f]{32}$'
+                  OR NULLIF(btrim(item.metadata->>'SeriesName'), '') IS NULL
+              )
+            ORDER BY lower(item.name), item.name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn tv_series_catalog_page(
         &self,
         virtual_folder_id: Option<Uuid>,
@@ -4954,7 +5084,11 @@ impl PostgresDatabase {
         height: Option<i32>,
         media_streams: Vec<Value>,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        // The point reconciliation re-derives folder-wide winner buckets, which costs seconds on a
+        // large library. Run it on the worker budget: under the API timeout the statement is
+        // cancelled, the whole write rolls back, and an interactive caller such as PlaybackInfo
+        // reprobes and fails again on every attempt.
+        let mut tx = self.worker_pool.begin().await?;
         let summary =
             Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
         let result = sqlx::query(
@@ -4996,7 +5130,11 @@ impl PostgresDatabase {
         media_streams: Vec<Value>,
         metadata: Value,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        // The point reconciliation re-derives folder-wide winner buckets, which costs seconds on a
+        // large library. Run it on the worker budget: under the API timeout the statement is
+        // cancelled, the whole write rolls back, and an interactive caller such as PlaybackInfo
+        // reprobes and fails again on every attempt.
+        let mut tx = self.worker_pool.begin().await?;
         let summary =
             Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
         let media_streams = serde_json::to_value(media_streams)?;
@@ -5053,7 +5191,11 @@ impl PostgresDatabase {
         item_id: Uuid,
         metadata: Value,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        // The point reconciliation re-derives folder-wide winner buckets, which costs seconds on a
+        // large library. Run it on the worker budget: under the API timeout the statement is
+        // cancelled, the whole write rolls back, and an interactive caller such as PlaybackInfo
+        // reprobes and fails again on every attempt.
+        let mut tx = self.worker_pool.begin().await?;
         let summary =
             Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
         let result = sqlx::query(
@@ -5086,7 +5228,11 @@ impl PostgresDatabase {
         metadata: &Value,
     ) -> anyhow::Result<()> {
         let item_id = Uuid::parse_str(item_id).context("invalid media item id")?;
-        let mut tx = self.pool.begin().await?;
+        // The point reconciliation re-derives folder-wide winner buckets, which costs seconds on a
+        // large library. Run it on the worker budget: under the API timeout the statement is
+        // cancelled, the whole write rolls back, and an interactive caller such as PlaybackInfo
+        // reprobes and fails again on every attempt.
+        let mut tx = self.worker_pool.begin().await?;
         let summary =
             Self::begin_media_item_query_filter_summary_point_update(&mut tx, item_id).await?;
         let result = sqlx::query(

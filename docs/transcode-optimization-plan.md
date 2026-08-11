@@ -537,8 +537,78 @@ Evidencia sobre la base productiva:
   anteriores conservados en `/var/backups/jellyrin`; esquema intacto en
   `202608080120`.
 
-Queda `Users/{id}/Items/Latest`, que responde 200 pero de forma consistente en
-8,8 s por un camino igualmente sin acotar.
+#### Latest exacto y acotado
+
+El camino rápido de Latest ya era acotado pero **aproximaba**: cogía una ventana
+de candidatos por `updated_at` y aplicaba después tipos, carpetas excluidas y
+ocultar-vistos, así que si esos filtros descartaban más de `ventana - limit` de
+los más nuevos devolvía menos ítems de los que existen. Sin `ParentId` no había
+camino rápido y materializaba el catálogo completo: 9,02 s sin tipos y 6,47 s con
+`IncludeItemTypes=Movie`.
+
+Ahora Latest se responde con `media_item_catalog_page`, la misma maquinaria de
+paginación exacta del catálogo, que aplica cada filtro **antes** de su `LIMIT`.
+Las carpetas excluidas se resuelven restándolas del ámbito y el ocultar-vistos
+viaja como `is_played`. El orden reproduce el comparador
+(`updated_at DESC, lower(name) DESC, id DESC`), y cualquier predicado que el
+repositorio no exprese **desactiva** el camino en vez de recortar en silencio, de
+modo que la aproximación desaparece en lugar de extenderse.
+
+Medido: 16 ítems en 1,58 s sin `ParentId`, 16 películas en 0,26 s con
+`ParentId`, y 16 películas en 0,25 s con `IncludeItemTypes=Movie` sin `ParentId`
+—esta última forma antes tardaba 6,47 s—. Con miles de filas compartiendo
+`updated_at`, «los 16 más nuevos» es ambiguo y el desempate lo decide ahora SQL
+en lugar de Rust, así que la mezcla concreta de títulos puede diferir de la
+anterior; el conjunto sigue siendo el top-16 exacto bajo un orden total y
+coherente con el resto del catálogo.
+
+#### Abrir una serie y una temporada
+
+Con el listado ya operativo apareció el bloqueo siguiente, también anterior a
+120: `/Items/{serieId}` respondía 500 tras 22–31 s. Resolver un id de serie o
+temporada construía un *snapshot* de **todos** los episodios con sus metadatos.
+
+Ahora hay tres ámbitos, todos subconjuntos estrictos del snapshot completo y con
+los mismos predicados: por `SeriesId` persistido (índice parcial existente), por
+`SeasonId` persistido (726 ms sin índice: evaluar el predicado no requiere
+destoastear, a diferencia de transferir los payloads) y, para los ids sintéticos
+derivados del nombre, solo las filas **sin** `SeriesId` canónico, que es su
+alcance exacto y está vacío en una biblioteca reconciliada. La clasificación en
+Rust sigue decidiendo el resultado, así que un ámbito compuesto solo de extras
+continúa devolviendo falso.
+
+Medido tras el arreglo: listado 0,066 s, `/Items/{serie}` 0,051 s,
+`/Shows/{serie}/Seasons` 0,004 s, `/Users/../Items/{temporada}` 0,83 s,
+`/Shows/{serie}/Episodes` 0,008 s y `/Users/../Items/{episodio}` 0,007 s, todos
+200 y sin un solo 500 en el journal.
+
+#### Reproducción: reconciliación puntual y adelantar
+
+Dos defectos distintos rompían la reproducción, ninguno en el catálogo:
+
+1. `PlaybackInfo` sondea el medio remoto y escribe la info resultante, lo que
+   dispara `jellyrin_reconcile_query_filter_summary_item`. Esa función rederiva
+   los cubos ganadores de toda la carpeta —solo la reagregación escalar cuesta
+   1,35 s sobre 455.585 episodios— y superaba el timeout de 10 s de la API. Al
+   expirar, la transacción revertía, el siguiente intento volvía a sondear y
+   fallaba igual: un bucle permanente que el cliente muestra como carga infinita.
+   Las cuatro escrituras que hacen reconciliación puntual pasan al `worker_pool`,
+   cuyo presupuesto es de 120 s, así que la escritura confirma. El primer
+   `PlaybackInfo` de un ítem recién reimportado tarda 15,8 s y el siguiente
+   0,034 s, con el resumen y su coverage intactos: no se degrada la publicación
+   de filtros.
+2. La clave de dedupe incluye la posición de inicio, así que adelantar siempre
+   reclama una sesión nueva mientras el FFmpeg abandonado retiene el único slot
+   de admisión hasta su timeout de inactividad de 60 s. La nueva esperaba 15 s y
+   moría con `timed out waiting for AudioEncode capacity`. Ahora una sesión nueva
+   detiene las otras sesiones en vuelo **del mismo dispositivo**, que es el mismo
+   contrato de un stream por cliente. Verificado con dos adelantos consecutivos:
+   la anterior queda `stopped`, siempre hay un único proceso y cero fallos de
+   capacidad.
+
+Las carátulas que faltaban no eran un defecto propio: la mayoría responde 200 en
+~90 ms y unas pocas devuelven `Remote image not found` porque el proveedor no las
+tiene.
 
 La base bare-metal de staging ya está desplegada en
 `jellyrin.test.kode.live`: PostgreSQL 16.14 y Jellyrin solo escuchan en loopback,
@@ -665,7 +735,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; runtime sin DML directo ni bypass GUC | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms y 120 en 886 ms sobre la base productiva. PostgreSQL 16 aislado valida ACL, rebuild/punto y ataques con GUC/sombras temporales; ACL de solo lectura y `SECURITY DEFINER` reverificados en staging tras el rollout; API 354/0/3 y DB efectiva 169/0/4 | Scope padre+hijos/múltiple, coalescer de grandes lotes y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 200 con total exacto 22.194 en 4,30 s por la página acotada en vivo, con la coverage aún sin publicar; `/Shows/NextUp` 200 con 22.027 exactos en 2,89 s y streams hidratados | Acotar `Users/{id}/Items/Latest`, que responde 200 pero en 8,8 s; E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 200 con total exacto 22.194 en 4,30 s por la página acotada en vivo, con la coverage aún sin publicar; `/Shows/NextUp` 200 con 22.027 exactos en 2,89 s y streams hidratados; Latest exacto por `media_item_catalog_page`; abrir serie/temporada/episodio en milisegundos; `PlaybackInfo` y adelantar sin bucle de fallo | Abaratar la reconciliación puntual para que el primer `PlaybackInfo` no cueste 15,8 s; E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
 
