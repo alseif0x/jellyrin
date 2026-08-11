@@ -1,214 +1,122 @@
-# Handoff: rollout del esquema 120
+# Handoff de staging
 
-Fecha de corte: 2026-08-10 22:36 UTC.
+Última actualización: 2026-08-11 13:00 UTC. Sustituye al plan de continuación del
+rollout 120, que quedó ejecutado; el histórico está en el registro de Git.
 
-> **Ejecutado el 2026-08-10 22:46 UTC.** El esquema 120 está aplicado y ambos
-> binarios instalados. La evidencia del rollout, el defecto anterior a 120 que
-> dejaba el listado de Series en 500 y la página acotada que lo resuelve están en
-> `docs/transcode-optimization-plan.md`, secciones
-> «Rollout del esquema 120 en staging (2026-08-10)» y «Página de Series acotada
-> sin coverage publicada». Este documento queda como
-> registro del punto de partida y del procedimiento de rollback, que sigue
-> vigente: la base ya está en 120, así que **no** debe arrancarse el binario
-> anterior contra ella.
+## Estado exacto
 
-## Estado exacto al cerrar esta sesión
+- Commit: `a17610a fix: serve artwork for synthetic Series and Season ids`.
+- Rama `main` **sincronizada con `origin/main`**: sin commits locales pendientes y
+  árbol de trabajo limpio.
+- Esquema aplicado: **`202608080122`**. Las tres migraciones de esta tanda las
+  aplicó el migrador, una sola vez cada una: 120 en 23,3 ms, 121 en 20,3 ms y 122
+  en 16,0 ms.
+- Binarios instalados:
+  - servidor `a353c3d19247ef6a4a188a228c3d4aa9806a4ff0340dd37436ce73a71d30e244`;
+  - migrador `7644de2d9fa766934c511e0e75bf06d56e45dad8610097e616d3ba9df6e8a28b`.
+- `jellyrin.service` `active/running`, `Result=success`, `NRestarts=0`.
+- PostgreSQL activo. Resumen de filtros reconciliado y publicado: Movies
+  `1567/1567`, Series `2003/2003`, sin `dirty_at`, dos filas de coverage.
+- `media_item_tv_series_coverage` está en **0**: es lo esperado, cualquier cambio
+  en `media_items` la invalida y solo la repone una sincronización de carpeta. El
+  listado de Series se sirve mientras tanto por la página acotada en vivo, de ahí
+  sus ~4,4 s frente a los ~60 ms con coverage publicada.
 
-- Commit preparado: `c89ccd8 security: protect query-filter summary publication`.
-- Rama local: `main`, 52 commits por delante de `origin/main`.
-- Jellyrin está **detenido intencionadamente** (`inactive/dead`, resultado
-  anterior `success`, `NRestarts=0`). PostgreSQL sigue activo.
-- La base productiva continúa en `202608080119`; la migración 120 todavía no se
-  ha aplicado.
-- Los binarios instalados siguen siendo los anteriores:
-  - servidor: `17667c0d25bcfac639dd720c01fb0adae259376b987ed75527e40ad13f0c5039`;
-  - migrador: `2e161e19b7f4e614371e48e7ea2b444678817ab7576b8a4a348938bd0738f5e2`.
-- Los artefactos release nuevos están listos:
-  - `target/release/jellyrin-server`:
-    `f4124471cd525245aca9ada6bab031fccf190c80a144d3937b8aa1a9465997fd`;
-  - `target/release/jellyrin-migrate`:
-    `954ab2743543900af6e0d4e41bc8d2007cfa256370b403d4c50ffd3495ad7810`.
-- Copias recuperables de los binarios anteriores:
-  - `/var/backups/jellyrin/jellyrin-server-pre-c89ccd8-20260810T223541Z`;
-  - `/var/backups/jellyrin/jellyrin-migrate-pre-c89ccd8-20260810T223541Z`.
-- Snapshot PostgreSQL cifrado pre-120 completado correctamente:
-  `/var/backups/jellyrin-postgres/daily/20260810T223557Z`.
-- No se instalaron binarios nuevos ni se modificó el esquema antes del corte.
+## Qué se cerró en esta tanda
 
-Si el rollout no se reanuda inmediatamente, se puede arrancar temporalmente el
-binario anterior porque la base todavía está en 119. Si se aplica 120, no se
-debe arrancar después el servidor antiguo: su writer esperaba DML directo sobre
-el resumen que 120 revoca.
+Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
+«Rollout del esquema 120 en staging» y las cuatro que le siguen.
 
-## Evidencia ya cerrada
+1. **Rollout 120**: frontera de publicación del resumen. Runtime con `SELECT` y
+   nada más sobre las tres tablas, funciones de publicación `SECURITY DEFINER`
+   con `search_path` fijado, `PUBLIC` sin `EXECUTE`.
+2. **Listado de Series** (defecto anterior a 120): devolvía 500 porque, sin
+   coverage publicada, el fallback materializaba los 455.585 episodios. Ahora
+   ambos drivers recomputan la misma página acotada desde las filas vivas; `None`
+   queda reservado para datos no canónicos, como documenta el contrato.
+3. **`/Shows/NextUp`** y **`Items/Latest`**: el primero pedía candidatos con sus
+   payloads JSONB para descartar todos menos uno por serie; el segundo *aproximaba*
+   —recortaba una ventana antes de filtrar—. NextUp pide candidatos sin JSONB e
+   hidrata solo la página; Latest se responde con `media_item_catalog_page`, que
+   aplica cada filtro antes del `LIMIT`, y cualquier predicado no expresable
+   desactiva el camino en vez de recortar en silencio.
+4. **Abrir serie y temporada**: resolver un id sintético construía un snapshot de
+   todos los episodios. Ahora se acota por `SeriesId` o `SeasonId` persistido, y
+   para ids sintéticos derivados del nombre solo se leen las filas **sin**
+   `SeriesId` canónico, que es su alcance exacto.
+5. **Reproducción**: `PlaybackInfo` fallaba en bucle porque la escritura de la
+   info sondeada arrastraba la reconciliación del resumen y expiraba en el
+   presupuesto de la API, revirtiendo la transacción. Las cuatro escrituras con
+   reconciliación puntual pasan al `worker_pool`, y los esquemas 121 y 122
+   redujeron esa reconciliación a los cubos que realmente cambian (diferencia en
+   vez de unión) y a aritmética de diferencias en los escalares. Además, adelantar
+   ya detiene las sesiones de transcodificación anteriores del mismo dispositivo,
+   que antes retenían el único slot de admisión hasta 60 s.
+6. **Carátulas de series**: devolvían un PNG marcador de 67 bytes porque un id de
+   serie no es un `media_item`. Ahora se resuelven desde los metadatos de un
+   episodio usando solo las claves `Series*`.
 
-- `cargo +1.94 fmt --all -- --check`: verde.
-- Clippy estricto para DB, migrador y API, todos los targets: verde.
-- `git diff --check`: verde.
-- `jellyrin-migrate`: 37/37 (33 librería + 4 CLI) contra PostgreSQL real.
-- `jellyrin-db`: 168 aprobadas y 4 ignoradas en el pase paralelo; el único test
-  afectado por un deadlock de la propia suite pasó aisladamente, dejando 169
-  pruebas efectivamente verdes.
-- Test focal PostgreSQL del resumen: verde.
-- API fuera del sandbox y con `/usr/bin/ffmpeg`: 354 aprobadas, 0 fallidas y 3
-  ignoradas.
-- PostgreSQL 16 aislado: rebuild completo, reconciliación puntual, cambio
-  `Drama`→`Action`, subtítulos, rechazo de proyección anterior falsa, ACL de
-  solo lectura y spoofing de ambos GUC históricos/sombras temporales: verde y
-  fail-closed.
-- Build release conjunto de servidor y migrador terminado correctamente.
+## Verificación vigente
 
-## Plan de continuación
+- Suites: migrador 33+4, `jellyrin-db` 172/0/4, API 354/0/3 con `/usr/bin/ffmpeg`.
+  `cargo +1.94 fmt --all --check` y Clippy estricto de DB, migrador y API limpios.
+- La API necesita `/usr/bin/ffmpeg` en el PATH: el binario de `/usr/local/bin` no
+  trae `lavfi` y ocho pruebas fallan sin él. Ejecutar con
+  `PATH=/usr/bin:$HOME/.cargo/bin:...`.
+- Las pruebas PostgreSQL requieren `JELLYRIN_TEST_POSTGRES_URL`. El rol
+  `jellyrin_test` tuvo su contraseña rotada en esta sesión y **no está almacenada**:
+  hay que fijarla de nuevo antes de usarla. Ese rol no puede conectar a la base
+  productiva.
+- Recorrido en la app por HTTPS, todo 200: web servida, `Views` 76 ms, Series
+  4,46 s, detalle de serie 64 ms, temporadas 38 ms, episodios 46 ms, carátula
+  66 ms, Movies 99 ms, filtros 40 ms, NextUp 3,0 s, Latest 0,47 s, Resume 43 ms,
+  Live TV 39 ms; `readyz` Ready y cero 500 en el journal.
+- Reproducción comprobada con bytes, no solo códigos: segmentos HLS de 157–900 KB
+  con byte de sincronía `0x47` que `ffprobe` decodifica como h264 1920×1080 más
+  aac estéreo; progreso persistido; adelantar deja una única sesión activa y cero
+  fallos de capacidad; película por DirectProxy con `206`, `content-range` exacto
+  sobre 1.789.475.245 bytes y magic Matroska.
+- Igualdad del resumen: comparado dentro de una transacción con `ROLLBACK`, el
+  resumen que produce la reconciliación incremental es idéntico fila a fila a una
+  reconstrucción completa de las dos carpetas productivas, cero filas exclusivas
+  en cada sentido.
 
-### 1. Revalidar el punto de partida
+## Recuperación
 
-Antes de escribir nada:
+- **121 y 122 solo reemplazan una función**, sin cambio de datos: para revertir
+  basta reaplicar la definición de la migración anterior. No hace falta restaurar
+  la base.
+- Binarios anteriores en `/var/backups/jellyrin/` (44 copias `jellyrin-server-pre-*`
+  y `jellyrin-migrate-pre-*`); las inmediatamente anteriores a esta tanda son
+  `*-pre-seriesart-20260811T125001Z`, `*-pre-workerpool-20260811T102847Z` y
+  `*-pre-121/122`.
+- Snapshots cifrados en `/var/backups/jellyrin-postgres/daily/`: el pre-120
+  `20260810T223557Z` y el más reciente `20260811T031228Z`, ambos con `sha256sum -c`
+  correcto.
+- Si se restaura la base a un punto anterior a 120, **no** arrancar después un
+  binario posterior contra ella, ni al contrario: el servidor de 120 en adelante
+  espera la frontera de publicación y no DML directo sobre el resumen.
+- Nunca marcar una migración a mano ni editar `_sqlx_migrations`.
 
-```bash
-git status -sb
-git log -1 --oneline
-sudo systemctl show jellyrin.service -p ActiveState -p SubState -p NRestarts
-sudo -u postgres psql -d jellyrin -Atc \
-  "SELECT max(version) FROM _sqlx_migrations WHERE success"
-sha256sum target/release/jellyrin-server target/release/jellyrin-migrate
-```
+## Pendiente
 
-Exigir `c89ccd8`, servicio detenido, esquema 119 y los hashes anotados arriba.
-No repetir el backup salvo que la base haya recibido escrituras desde este
-corte.
+Por orden de valor:
 
-### 2. Instalar servidor y migrador como una unidad
-
-```bash
-sudo install -o root -g root -m 0755 \
-  target/release/jellyrin-server /usr/local/bin/jellyrin-server
-sudo install -o root -g root -m 0755 \
-  target/release/jellyrin-migrate /usr/local/bin/jellyrin-migrate
-sudo sha256sum /usr/local/bin/jellyrin-server /usr/local/bin/jellyrin-migrate
-```
-
-Los hashes instalados deben coincidir con los release. No iniciar si solo uno
-de los dos coincide.
-
-### 3. Aplicar 120 y arrancar de forma ordenada
-
-```bash
-sudo systemctl start jellyrin.service
-sudo systemctl show jellyrin-migrate.service jellyrin.service \
-  -p Id -p ActiveState -p SubState -p ExecMainStatus -p Result -p NRestarts
-sudo journalctl -u jellyrin-migrate.service -u jellyrin.service \
-  --since "2026-08-10 22:35:00 UTC" --no-pager
-```
-
-`jellyrin.service` tiene `Requires/After=jellyrin-migrate.service`: el migrador
-debe terminar con status 0 antes de que el servidor arranque. Ante fallo, no
-forzar reinicios repetidos ni ejecutar SQL manual de la migración.
-
-### 4. Verificar esquema y frontera de seguridad
-
-Comprobar como administrador, sin mostrar URLs ni credenciales:
-
-```sql
-SELECT max(version) FROM _sqlx_migrations WHERE success;
-
-SELECT table_name, privilege_type
-FROM information_schema.role_table_grants
-WHERE grantee = 'jellyrin_runtime'
-  AND table_name IN (
-    'media_item_query_filter_summary_values',
-    'media_item_query_filter_summary_coverage',
-    'media_item_query_filter_summary_revisions'
-  )
-ORDER BY table_name, privilege_type;
-
-SELECT p.proname, p.prosecdef, p.proconfig
-FROM pg_proc AS p
-JOIN pg_namespace AS n ON n.oid = p.pronamespace
-WHERE n.nspname = 'public'
-  AND p.proname IN (
-    'jellyrin_rebuild_query_filter_summary',
-    'jellyrin_reconcile_query_filter_summary_item',
-    'jellyrin_mark_query_filter_summary_dirty'
-  )
-ORDER BY p.proname;
-```
-
-Gate:
-
-- versión máxima `202608080120`;
-- runtime con `SELECT` solamente sobre las tres tablas del resumen;
-- funciones de publicación `SECURITY DEFINER` y `search_path` equivalente a
-  `pg_catalog, public, pg_temp`;
-- `PUBLIC` sin ejecución y runtime solo con las funciones estrechas previstas;
-- coverage y revisiones existentes siguen reconciliadas o fallan cerrado hacia
-  la proyección exacta.
-
-La prueba destructiva de spoofing ya pasó en una base aislada. Si se repite en
-staging, hacerlo dentro de una transacción explícita y `ROLLBACK`, nunca sobre
-filas sin una selección previa ni dejando la revisión dirty.
-
-### 5. Smokes operacionales
-
-```bash
-curl -fsS http://127.0.0.1:8096/health
-curl -fsS http://127.0.0.1:8096/readyz
-curl -4 -fsS https://jellyrin.test.kode.live/health
-curl -4 -fsS https://jellyrin.test.kode.live/readyz
-sudo systemctl show jellyrin.service -p ActiveState -p SubState -p NRestarts
-```
-
-Después, con una sesión autenticada existente y sin imprimir tokens:
-
-1. abrir Movies y Series y confirmar páginas/totales/filtros;
-2. pedir `PlaybackInfo` de una película compatible y verificar DirectProxy;
-3. comprobar `Range` (`206`) sin proceso FFmpeg;
-4. reproducir un episodio incompatible por HLS y confirmar el límite de un job,
-   dos threads y `CPUQuota=150%`;
-5. comprobar Live TV con un canal conocido sano; mantener como incidencia de
-   upstream el canal que ya fallaba;
-6. confirmar que Xtream y MAGSTV siguen registrados y que ningún log contiene
-   credenciales, URLs autenticadas ni tokens.
-
-Registrar latencia, delivery mode, número de procesos FFmpeg, CPU/RSS y errores
-del journal. No pegar credenciales en terminal, documentación o chat.
-
-### 6. Rollback
-
-- Antes de aplicar 120: restaurar ambos binarios `pre-c89ccd8` y arrancar basta,
-  porque el esquema sigue en 119.
-- Después de aplicar 120: **no** arrancar el binario anterior contra 120. Parar
-  Jellyrin y restaurar como conjunto el snapshot PostgreSQL pre-120 y ambos
-  binarios anteriores usando las credenciales root-only del procedimiento de
-  recuperación. Verificar primero checksums/decryptabilidad; el script
-  `ops/postgres/restore-drill.sh` sirve para validar en una base aislada, no para
-  sobrescribir directamente la base productiva.
-- Mantener el servicio detenido si la restauración no puede demostrarse
-  completa. Nunca marcar manualmente 120 como aplicada ni editar
-  `_sqlx_migrations`.
-
-### 7. Cerrar documentación y Git
-
-Tras los gates:
-
-1. actualizar `docs/transcode-optimization-plan.md` de “120 validado localmente”
-   a “120 desplegado”;
-2. anotar duración de migración, hashes instalados, ruta/checksum del backup,
-   ACL, health/readiness, `NRestarts` y smokes de reproducción;
-3. ejecutar formato, `git diff --check` y revisar que no aparezcan secretos;
-4. crear un commit separado de evidencia operacional;
-5. decidir con el usuario cuándo empujar los 52 commits locales a GitHub.
-
-## Gates de salida
-
-El rollout solo se considera terminado si todos se cumplen:
-
-- esquema 120 aplicado una sola vez por el migrador;
-- servidor y migrador instalados corresponden al mismo commit/hash;
-- runtime sin DML directo sobre el resumen;
-- health/readiness local y HTTPS en 200;
-- `NRestarts=0` después del arranque estable;
-- catálogo Movies/Series y filtros correctos;
-- DirectProxy/Range no inicia FFmpeg;
-- HLS incompatible funciona dentro de los límites de CPU;
-- logs/DB/argv sin secretos;
-- plan principal actualizado y rollback conservado.
+1. **Reponer la coverage de `media_item_tv_series`** para que el listado de Series
+   vuelva a ~60 ms en lugar de ~4,4 s. Hoy solo la escribe una sincronización de
+   carpeta, y cualquier escritura en `media_items` la invalida; el patrón útil
+   sería reconstruirla en segundo plano al detectarla ausente.
+2. **Primer `PlaybackInfo` de un ítem sin sondear**: 1,0–1,6 s, de los que la
+   mayor parte es el sondeo al proveedor por red, no trabajo de base de datos. Si
+   se quiere bajar, el camino es cachear el sondeo de forma más agresiva, no
+   optimizar SQL.
+3. **Caminos que siguen sin acotar** y que solo se recorren en formas de consulta
+   poco frecuentes: la agrupación legacy de Series cuando la petición lleva
+   búsqueda o predicados que el repositorio no expresa, y los refrescos de
+   metadatos que filtran por **nombre** de serie
+   (`apply_manual_series_metadata_update`, `apply_remote_series_search_result`,
+   `refresh_tv_metadata_for_series`), que siguen construyendo el snapshot completo.
+4. **Un flake sin identificar** en la suite de API: falló una prueba en una de
+   varias ejecuciones y no quedó registrado su nombre; no reprodujo después.
+5. E2E visual autenticado con un cliente real, worker externo o hardware para 4K,
+   egress y secretos operativos con E2E de MAGSTV, y backups fuera del host.
