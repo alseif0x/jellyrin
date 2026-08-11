@@ -1586,6 +1586,23 @@ pub trait MediaCatalogStore: DatabaseBackend {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
 
+    /// The same candidates without their `media_streams` payload.
+    ///
+    /// Path-derived selection never reads streams or metadata, so fetching those JSONB columns for
+    /// every episode only to discard all but one per series is what made the candidate fetch exceed
+    /// the API statement timeout. `media_streams` arrives empty, so callers must hydrate the page
+    /// they retain with `media_items_by_ids` before serializing it.
+    fn tv_next_up_candidate_items(
+        &self,
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_;
+
+    /// Exact visible items for a bounded id list, preserving the caller's order.
+    fn media_items_by_ids<'a>(
+        &'a self,
+        item_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + 'a;
+
     /// Visible TV video candidates carrying inline metadata for the common `/Shows/Upcoming`
     /// request. A shared Rust predicate retains effective episode classification and strict
     /// RFC3339 date semantics; the API retains exact total calculation and final ordering.
@@ -1700,6 +1717,20 @@ impl MediaCatalogStore for PostgresDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         PostgresDatabase::tv_next_up_candidates(self, user_id)
+    }
+
+    fn tv_next_up_candidate_items(
+        &self,
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_ {
+        PostgresDatabase::tv_next_up_candidate_items(self, user_id)
+    }
+
+    fn media_items_by_ids<'a>(
+        &'a self,
+        item_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + 'a {
+        PostgresDatabase::media_items_by_ids(self, item_ids)
     }
 
     fn tv_upcoming_candidates(
@@ -1835,6 +1866,20 @@ impl MediaCatalogStore for SqliteDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         SqliteDatabase::tv_next_up_candidates(self, user_id)
+    }
+
+    fn tv_next_up_candidate_items(
+        &self,
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_ {
+        SqliteDatabase::tv_next_up_candidate_items(self, user_id)
+    }
+
+    fn media_items_by_ids<'a>(
+        &'a self,
+        item_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + 'a {
+        SqliteDatabase::media_items_by_ids(self, item_ids)
     }
 
     fn tv_upcoming_candidates(
@@ -8796,6 +8841,97 @@ impl SqliteDatabase {
         Ok(true)
     }
 
+    /// Visible unplayed TV candidates for `/Shows/NextUp` without their `media_streams` payload.
+    ///
+    /// The one-per-series choice is derived from each episode's name and path, so the streams and
+    /// metadata columns are never read by the selection and stay unfetched. Callers must hydrate
+    /// the page they keep with `media_items_by_ids` before serializing it, because `media_streams`
+    /// arrives empty.
+    pub async fn tv_next_up_candidate_items(
+        &self,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogNextUpCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result: anyhow::Result<Vec<MediaItem>> = async {
+            let rows = sqlx::query_as::<_, TvNextUpCandidateRow>(
+                r#"
+                SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                       item.media_type, item.collection_type, item.file_size,
+                       item.runtime_ticks, item.bitrate, item.width, item.height,
+                       item.created_at, item.updated_at
+                FROM media_items AS item
+                LEFT JOIN playback_states AS playback
+                  ON playback.item_id = item.id AND playback.user_id = ?1
+                WHERE item.missing_since IS NULL
+                  AND item.media_type = 'Video'
+                  AND item.collection_type = 'tvshows'
+                  AND COALESCE(playback.played, 0) = 0
+                "#,
+            )
+            .bind(user_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter().map(TryInto::try_into).collect()
+        }
+        .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    /// Exact visible items for a bounded id list, preserving the caller's order.
+    ///
+    /// This hydrates a page whose selection ran on rows without `media_streams`.
+    pub async fn media_items_by_ids(&self, item_ids: &[Uuid]) -> anyhow::Result<Vec<MediaItem>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogItemById, DatabasePoolRole::Api);
+        let result: anyhow::Result<Vec<MediaItem>> = async {
+            let storage_ids = item_ids
+                .iter()
+                .flat_map(|item_id| [item_id.simple().to_string(), item_id.to_string()])
+                .collect::<Vec<_>>();
+            let mut by_id = HashMap::new();
+            for chunk in storage_ids.chunks(500) {
+                let mut query = QueryBuilder::<Sqlite>::new(
+                    "SELECT id, virtual_folder_id, name, path, media_type, collection_type, \
+                     file_size, runtime_ticks, bitrate, width, height, media_streams_json, \
+                     created_at, updated_at FROM media_items \
+                     WHERE missing_since IS NULL AND id IN (",
+                );
+                let mut separated = query.separated(", ");
+                for storage_id in chunk {
+                    separated.push_bind(storage_id);
+                }
+                separated.push_unseparated(")");
+                let rows = query
+                    .build_query_as::<MediaItemRow>()
+                    .fetch_all(&self.pool)
+                    .await?;
+                for row in rows {
+                    let item = MediaItem::try_from(row)?;
+                    by_id.insert(item.id, item);
+                }
+            }
+            Ok(item_ids
+                .iter()
+                .filter_map(|item_id| by_id.remove(item_id))
+                .collect::<Vec<_>>())
+        }
+        .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
     pub async fn tv_next_up_candidates(
         &self,
         user_id: Uuid,
@@ -13434,6 +13570,48 @@ impl TryFrom<VirtualFolderRow> for VirtualFolder {
             collection_type: row.collection_type,
             locations: serde_json::from_str(&row.locations_json)
                 .context("invalid virtual folder locations in database")?,
+            created_at: parse_time(&row.created_at)?,
+            updated_at: parse_time(&row.updated_at)?,
+        })
+    }
+}
+
+/// A NextUp candidate row without `media_streams`; see `tv_next_up_candidate_items`.
+#[derive(sqlx::FromRow)]
+struct TvNextUpCandidateRow {
+    id: String,
+    virtual_folder_id: String,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<TvNextUpCandidateRow> for MediaItem {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TvNextUpCandidateRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: Uuid::parse_str(&row.id).context("invalid media item id in database")?,
+            virtual_folder_id: Uuid::parse_str(&row.virtual_folder_id)
+                .context("invalid media item virtual folder id in database")?,
+            name: row.name,
+            path: row.path,
+            media_type: row.media_type,
+            collection_type: row.collection_type,
+            file_size: row.file_size,
+            runtime_ticks: row.runtime_ticks,
+            bitrate: row.bitrate,
+            width: row.width,
+            height: row.height,
+            media_streams: Vec::new(),
             created_at: parse_time(&row.created_at)?,
             updated_at: parse_time(&row.updated_at)?,
         })

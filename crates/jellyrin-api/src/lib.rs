@@ -30129,8 +30129,15 @@ async fn shows_next_up(
         query.is_played = Some(false);
     }
 
+    let common_next_up_query = is_common_next_up_query(&query);
     let mut prefetched_metadata = HashMap::new();
-    let mut episodes = if is_common_next_up_query(&query) {
+    // Only the SeriesId filter reads candidate metadata. Without it nothing downstream touches the
+    // streams or metadata payloads before paging, so leave both unfetched and hydrate the retained
+    // page below: one-per-series selection is derived from each episode's name and path.
+    let hydrate_page = common_next_up_query && query.series_id.is_none();
+    let mut episodes = if hydrate_page {
+        MediaCatalogStore::tv_next_up_candidate_items(&state.db, requested_user_id).await?
+    } else if common_next_up_query {
         let candidates =
             MediaCatalogStore::tv_next_up_candidates(&state.db, requested_user_id).await?;
         let mut items = Vec::with_capacity(candidates.len());
@@ -30172,15 +30179,15 @@ async fn shows_next_up(
     let mut next_up = next_by_series.into_values().collect::<Vec<_>>();
     next_up.sort_by(compare_tv_episodes);
     let total_record_count = next_up.len();
+    let mut page = paged_media_items(next_up, &query);
+    if hydrate_page {
+        // The candidates carry no `media_streams`, so reload exactly the retained page before it is
+        // serialized. Items deleted since the candidate fetch simply drop out.
+        let page_ids = page.iter().map(|item| item.id).collect::<Vec<_>>();
+        page = MediaCatalogStore::media_items_by_ids(&state.db, &page_ids).await?;
+    }
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let items = items_to_json(
-        &state.db,
-        paged_media_items(next_up, &query),
-        &server_id,
-        Some(requested_user_id),
-        false,
-    )
-    .await?;
+    let items = items_to_json(&state.db, page, &server_id, Some(requested_user_id), false).await?;
     Ok(Json(query_result_with_total(
         items,
         total_record_count,
@@ -85658,6 +85665,24 @@ done
                 .await
                 .unwrap();
         }
+        // NextUp selects its one-per-series winner from rows fetched without `media_streams`, so
+        // the retained page must be hydrated before serialization or these streams go missing.
+        db.update_media_item_media_info(
+            second.id,
+            Some(12_345_000_000),
+            Some(3_000_000),
+            Some(1920),
+            Some(1080),
+            vec![json!({
+                "Type": "Video",
+                "Index": 0,
+                "Codec": "h264",
+                "Width": 1920,
+                "Height": 1080
+            })],
+        )
+        .await
+        .unwrap();
 
         let app = router(AppState {
             db,
@@ -85700,6 +85725,9 @@ done
         assert_eq!(next_up["Items"][0]["ParentIndexNumber"], 1);
         assert_eq!(next_up["Items"][0]["IndexNumber"], 2);
         assert_eq!(next_up["Items"][0]["UserData"]["Played"], false);
+        assert_eq!(next_up["Items"][0]["MediaStreams"][0]["Codec"], "h264");
+        assert_eq!(next_up["Items"][0]["MediaStreams"][0]["Width"], 1920);
+        assert_eq!(next_up["Items"][0]["RunTimeTicks"], 12_345_000_000_i64);
         let series_id = next_up["Items"][0]["SeriesId"].as_str().unwrap();
 
         let response = app

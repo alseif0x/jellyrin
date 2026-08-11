@@ -2323,6 +2323,92 @@ impl PostgresDatabase {
         result
     }
 
+    /// Visible unplayed TV candidates for `/Shows/NextUp` without their `media_streams` payload.
+    ///
+    /// The one-per-series choice is derived from each episode's name and path, so the streams and
+    /// metadata columns are never read by the selection. Both are large JSONB values that must be
+    /// detoasted and decoded per row, which is what made the full candidate fetch exceed the API
+    /// statement timeout: on the staging library the same rows cost 7,5 s wide against 1,2 s here.
+    /// Callers must hydrate the page they keep with `media_items_by_ids` before serializing it,
+    /// because `media_streams` arrives empty.
+    pub async fn tv_next_up_candidate_items(
+        &self,
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogNextUpCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result = sqlx::query_as::<_, PostgresTvNextUpCandidateRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.created_at, item.updated_at
+            FROM media_items AS item
+            LEFT JOIN playback_states AS playback
+              ON playback.item_id = item.id AND playback.user_id = $1
+            WHERE item.missing_since IS NULL
+              AND item.media_type = 'Video'
+              AND item.collection_type = 'tvshows'
+              AND NOT COALESCE(playback.played, false)
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(Into::into).collect::<Vec<MediaItem>>())
+        .map_err(anyhow::Error::from);
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
+    /// Exact visible items for a bounded id list, preserving the caller's order.
+    ///
+    /// This hydrates a page whose selection ran on rows without `media_streams`.
+    pub async fn media_items_by_ids(&self, item_ids: &[Uuid]) -> anyhow::Result<Vec<MediaItem>> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let observation = self
+            .telemetry
+            .start_operation(DatabaseOperation::CatalogItemById, DatabasePoolRole::Api);
+        let result = async {
+            let rows = sqlx::query_as::<_, PostgresMediaItemRow>(
+                r#"
+                SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                       file_size, runtime_ticks, bitrate, width, height, media_streams,
+                       created_at, updated_at
+                FROM media_items
+                WHERE id = ANY($1) AND missing_since IS NULL
+                "#,
+            )
+            .bind(item_ids)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut by_id = rows
+                .into_iter()
+                .map(|row| {
+                    let item = MediaItem::from(row);
+                    (item.id, item)
+                })
+                .collect::<HashMap<_, _>>();
+            anyhow::Ok(
+                item_ids
+                    .iter()
+                    .filter_map(|item_id| by_id.remove(item_id))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        .await;
+        observation.finish_result(&result, |items| {
+            u64::try_from(items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
     pub async fn tv_upcoming_candidates(
         &self,
         now: OffsetDateTime,
@@ -5795,6 +5881,45 @@ impl From<PostgresMediaItemRow> for MediaItem {
             width: row.width,
             height: row.height,
             media_streams,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// A NextUp candidate row without `media_streams`; see `tv_next_up_candidate_items`.
+#[derive(sqlx::FromRow)]
+struct PostgresTvNextUpCandidateRow {
+    id: Uuid,
+    virtual_folder_id: Uuid,
+    name: String,
+    path: String,
+    media_type: String,
+    collection_type: Option<String>,
+    file_size: Option<i64>,
+    runtime_ticks: Option<i64>,
+    bitrate: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+impl From<PostgresTvNextUpCandidateRow> for MediaItem {
+    fn from(row: PostgresTvNextUpCandidateRow) -> Self {
+        Self {
+            id: row.id,
+            virtual_folder_id: row.virtual_folder_id,
+            name: row.name,
+            path: row.path,
+            media_type: row.media_type,
+            collection_type: row.collection_type,
+            file_size: row.file_size,
+            runtime_ticks: row.runtime_ticks,
+            bitrate: row.bitrate,
+            width: row.width,
+            height: row.height,
+            media_streams: Vec::new(),
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
