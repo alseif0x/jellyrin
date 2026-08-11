@@ -51079,12 +51079,28 @@ fn render_seekable_hls_media_playlist(
     route_media_type: &str,
 ) -> Option<String> {
     let runtime_ticks = session.item.runtime_ticks?.max(0);
+    render_seekable_hls_media_playlist_for(
+        session.start_position_ticks,
+        runtime_ticks,
+        item_id,
+        raw_query,
+        route_media_type,
+    )
+}
+
+fn render_seekable_hls_media_playlist_for(
+    start_position_ticks: i64,
+    runtime_ticks: i64,
+    item_id: &str,
+    raw_query: Option<&str>,
+    route_media_type: &str,
+) -> Option<String> {
     if runtime_ticks <= 0 {
         return None;
     }
 
     let start_position_ticks =
-        hls_effective_start_position_ticks(session.start_position_ticks, Some(runtime_ticks));
+        hls_effective_start_position_ticks(start_position_ticks, Some(runtime_ticks));
     let remaining_ticks = runtime_ticks.saturating_sub(start_position_ticks);
     if remaining_ticks <= 0 {
         return None;
@@ -51100,14 +51116,12 @@ fn render_seekable_hls_media_playlist(
         "#EXT-X-TARGETDURATION:{}\n",
         DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)
     ));
-    let initial_segment_id = hls_start_segment_number(start_position_ticks);
-    playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{initial_segment_id}\n"));
+    // Jellyfin clients add StartTimeTicks/segment_duration when resolving these paths. Keep the
+    // manifest relative even though FFmpeg and the segment handler use absolute file numbers.
+    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
     for relative_segment_id in 0..segment_count {
         let Ok(relative_segment_id_u32) = u32::try_from(relative_segment_id) else {
-            break;
-        };
-        let Some(segment_id) = initial_segment_id.checked_add(relative_segment_id_u32) else {
             break;
         };
         let segment_start_ticks = start_position_ticks + relative_segment_id * segment_ticks;
@@ -51119,7 +51133,7 @@ fn render_seekable_hls_media_playlist(
         }
         let segment_duration_seconds = segment_length_ticks as f64 / 10_000_000.0;
         playlist.push_str(&format!("#EXTINF:{segment_duration_seconds:.6}, nodesc\n"));
-        let path = format!("/{route_media_type}/{item_id}/hls1/main/{segment_id}.ts");
+        let path = format!("/{route_media_type}/{item_id}/hls1/main/{relative_segment_id_u32}.ts");
         let query =
             append_hls_segment_timing_query(raw_query, segment_start_ticks, segment_length_ticks);
         playlist.push_str(&append_query(&path, query.as_deref()));
@@ -55645,10 +55659,10 @@ mod tests {
         plugin_configuration_pages_from_runtime_host_path, plugin_image_from_runtime_host_path,
         plugin_package_operation, plugin_packages_root, plugin_scheduled_task_id,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
-        record_channel_to_file, redact_sensitive_log_text, reserve_live_tv_recording_start,
-        resolved_xtream_remote_source_revision, router, run_due_live_tv_timers,
-        run_startup_command_output, scan_all_library_items, selected_aac_output_channels,
-        selected_video_frame_rate_limit, series_timer_child_id,
+        record_channel_to_file, redact_sensitive_log_text, render_seekable_hls_media_playlist_for,
+        reserve_live_tv_recording_start, resolved_xtream_remote_source_revision, router,
+        run_due_live_tv_timers, run_startup_command_output, scan_all_library_items,
+        selected_aac_output_channels, selected_video_frame_rate_limit, series_timer_child_id,
         set_xtream_remote_media_probe_metadata, spawn_hls_transcode_task, stable_entity_id,
         subscribe_playback_events, subscribe_system_lifecycle_commands,
         subtitle_vtt_to_track_events_json, syncplay_cleanup_stale_participants, syncplay_groups,
@@ -95519,6 +95533,21 @@ done
             request.output_ts_offset_ticks,
             Some(i64::from(initial_segment_id) * hls_segment_ticks())
         );
+
+        let playlist = render_seekable_hls_media_playlist_for(
+            start_position_ticks,
+            47_560_430_000,
+            "movie-id",
+            Some("StartTimeTicks=19670990000"),
+            "Videos",
+        )
+        .expect("seekable playlist");
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+        let first_segment_uri = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("first segment URI");
+        assert!(first_segment_uri.starts_with("/Videos/movie-id/hls1/main/0.ts?"));
     }
 
     #[test]
