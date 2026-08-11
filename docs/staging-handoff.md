@@ -1,11 +1,11 @@
 # Handoff de staging
 
-Última actualización: 2026-08-11 17:33 UTC. Sustituye al plan de continuación del
+Última actualización: 2026-08-11 18:38 UTC. Sustituye al plan de continuación del
 rollout 120, que quedó ejecutado; el histórico está en el registro de Git.
 
 ## Estado exacto
 
-- Código desplegado: `e54e06e fix: keep resumed HLS manifests relative`.
+- Código desplegado: `ef240cc fix: preserve seeks and subtitle tracks across player changes`.
 - Rama `main` **sincronizada con `origin/main`** tras publicar el hotfix y esta
   actualización; árbol de trabajo limpio.
 - Esquema aplicado: **`202608080124`**. La migración 124 se aplicó una sola vez en
@@ -13,7 +13,7 @@ rollout 120, que quedó ejecutado; el histórico está en el registro de Git.
   nada. Las anteriores fueron 120 en 23,3 ms, 121 en 20,3 ms, 122 en 16,0 ms y
   123 en 13,0 ms.
 - Binarios instalados:
-  - servidor `81c57d7979c238c6673e384adbd04ffac29e63faed580cfe4762896ef77174fb`;
+  - servidor `313f9cc61a514b906485809fd40beefb7ce2c182ece35b6960f254186764f119`;
   - migrador `1a6de2f5c2527e4b5515e362938ed8e8d2ab803c7453b94318b58a2af3684dfa`.
 - `jellyrin.service` `active/running`, `Result=success`, `NRestarts=0`.
 - PostgreSQL activo. Resumen de filtros reconciliado y publicado: Movies
@@ -92,6 +92,17 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
   1.494.788 bytes, sync byte `0x47` y h264+aac válidos por `ffprobe`, sin reiniciar
   la sesión ni pedir por error `1310.ts`. El segmento VTT 655 también devuelve 200
   y un documento `WEBVTT` válido.
+- Ciclo de vida del reproductor móvil comprobado sobre el mismo ítem: los VTT HLS
+  reutilizan los sidecars `main{segment}.vtt` del transcode principal y propagan
+  `PlaySessionId`, por lo que no abren un FFmpeg auxiliar. La pista 6 y, tras el
+  cambio, la pista 4 devolvieron 200 mientras el único slot global estaba ocupado;
+  `Stream.js` de una pista nueva respondió 200 en 2,6 ms en vez de 503 tras 15 s.
+  Se eliminó además la ventana sintética de 60 s: Web puede reconstruir el renderer
+  al rotar sin perder los eventos posteriores.
+- Seek cancel-safe comprobado: se canceló deliberadamente `main/860.ts` tras 3 s;
+  la generación siguió desacoplada de la petición, la sesión permaneció resoluble
+  y el reintento devolvió 200, 2.733.896 bytes y sync byte `0x47`, sin 404 ni vuelta
+  al segundo cero.
 - Igualdad del resumen: comparado dentro de una transacción con `ROLLBACK`, el
   resumen que produce la reconciliación incremental es idéntico fila a fila a una
   reconstrucción completa de las dos carpetas productivas, cero filas exclusivas
@@ -109,6 +120,8 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
   `jellyrin-{server,migrate}-pre-124-20260811T161734Z`.
   El servidor inmediatamente anterior al manifiesto HLS relativo está en
   `jellyrin-server-pre-hls-relative-20260811T172922Z`.
+  El servidor inmediatamente anterior al ciclo de vida cancel-safe está en
+  `jellyrin-server-pre-player-lifecycle-20260811T183405Z`.
 - Rollback SQL exacto de los triggers 123 en
   `/var/backups/jellyrin-postgres/tv-series-rollback-to-123-20260811T161734Z.sql`
   (SHA-256 `7be7d106d7983a89ceaad17bda55b558936aa87ed985e5a9db5a1c448e730d16`).

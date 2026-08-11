@@ -626,6 +626,24 @@ segmento 655 —no 1310— y recibe 200, 1.494.788 bytes, MPEG-TS `0x47` y strea
 h264+aac válidos por `ffprobe`; el VTT correspondiente también devuelve 200.
 API 357/0/3 y Clippy estricto verdes.
 
+El siguiente E2E móvil expuso dos fallos de ciclo de vida. Primero, la playlist de
+subtítulos no propagaba `PlaySessionId`: cada `stream.vtt` ignoraba los WebVTT que
+ya producía el transcode principal y trataba de abrir otro FFmpeg. Con un único
+slot global, Web cancelaba esas peticiones a los ~10 s y el cambio de pista acababa
+en 503 por capacidad. Ahora cada VTT resuelve su sidecar `main{segment}.vtt`, una
+pista todavía no activa responde sin bloquear mientras Web reemplaza la sesión y
+`Stream.js` ya no inventa una ventana de solo 60 s. Esto conserva los subtítulos al
+rotar y permite cambiar de pista sin aumentar límites de CPU.
+
+Segundo, Web cancela un seek remoto lento y reintenta. La generación on-demand
+vivía dentro del future HTTP: al cancelarlo se perdía el proceso, la sesión quedaba
+`stopped` y el retry recibía 404. La generación ahora es una tarea desacoplada,
+serializada por sesión; el estado `starting` y el cerrojo en vuelo mantienen la
+sesión resoluble y todos los retries convergen sobre el mismo escritor. E2E real:
+cancelación forzada de `860.ts` a los 3 s, seguida por reintento 200 con 2.733.896
+bytes MPEG-TS (`0x47`). El cambio 6→4 produjo vídeo y VTT 200 simultáneamente y
+cero errores auxiliares. Suite API 357/0/3 y Clippy estricto verdes.
+
 #### Esquema 123: la proyección de Series deja de caerse en cada escritura
 
 La página acotada en vivo mantenía el listado usable sin coverage publicada, pero a
