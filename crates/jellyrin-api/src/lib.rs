@@ -34218,6 +34218,7 @@ async fn playback_transcode_info_response(
         selection.clone(),
     );
     request.start_position_ticks = options.start_position_ticks;
+    align_hls_request_segment_timeline(&mut request);
     request.include_video = include_video;
     request.burn_in_subtitle = options.burn_in_subtitle;
     request.video_mode = decision.video;
@@ -34923,7 +34924,10 @@ async fn spawn_hls_transcode_task(
                 .flatten();
             let first_segment_ready = if let Some(session) = &session {
                 let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
-                hls_output_file_is_nonempty(&layout.segment_path(0)).await
+                hls_output_file_is_nonempty(
+                    &layout.segment_path(hls_start_segment_number(session.start_position_ticks)),
+                )
+                .await
             } else {
                 false
             };
@@ -38472,7 +38476,8 @@ async fn generate_missing_hls_segment(
         session.start_position_ticks,
         session.item.runtime_ticks,
     );
-    let segment_start_ticks = start_position_ticks + i64::from(segment_id) * hls_segment_ticks();
+    let segment_start_ticks = hls_segment_start_position_ticks(start_position_ticks, segment_id)
+        .ok_or_else(|| ApiError::not_found("HLS segment not found"))?;
     if runtime_ticks > 0 && segment_start_ticks >= runtime_ticks {
         return Err(ApiError::not_found("HLS segment not found"));
     }
@@ -38846,7 +38851,12 @@ fn should_generate_hls_segment_on_demand(session: &TranscodeSession, segment_id:
     }
 
     let segment_ticks = hls_segment_ticks();
-    let requested_segment_start_ticks = i64::from(segment_id).saturating_mul(segment_ticks);
+    let initial_segment_id = hls_start_segment_number(session.start_position_ticks);
+    let Some(relative_segment_id) = segment_id.checked_sub(initial_segment_id) else {
+        return true;
+    };
+    let requested_segment_start_ticks =
+        i64::from(relative_segment_id).saturating_mul(segment_ticks);
     let continuous_transcode_ticks = session.position_ticks.max(0);
     let seek_ahead_ticks = HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS.saturating_mul(segment_ticks);
     requested_segment_start_ticks > continuous_transcode_ticks.saturating_add(seek_ahead_ticks)
@@ -51090,10 +51100,17 @@ fn render_seekable_hls_media_playlist(
         "#EXT-X-TARGETDURATION:{}\n",
         DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)
     ));
-    playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    let initial_segment_id = hls_start_segment_number(start_position_ticks);
+    playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{initial_segment_id}\n"));
 
-    for segment_id in 0..segment_count {
-        let segment_start_ticks = start_position_ticks + segment_id * segment_ticks;
+    for relative_segment_id in 0..segment_count {
+        let Ok(relative_segment_id_u32) = u32::try_from(relative_segment_id) else {
+            break;
+        };
+        let Some(segment_id) = initial_segment_id.checked_add(relative_segment_id_u32) else {
+            break;
+        };
+        let segment_start_ticks = start_position_ticks + relative_segment_id * segment_ticks;
         let segment_length_ticks = (runtime_ticks - segment_start_ticks)
             .min(segment_ticks)
             .max(0);
@@ -51132,6 +51149,30 @@ fn append_hls_segment_timing_query(
 
 fn hls_segment_ticks() -> i64 {
     i64::from(DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)) * 10_000_000
+}
+
+fn hls_start_segment_number(start_position_ticks: i64) -> u32 {
+    u32::try_from(start_position_ticks.max(0) / hls_segment_ticks()).unwrap_or(u32::MAX)
+}
+
+fn align_hls_request_segment_timeline(request: &mut HlsTranscodeRequest) {
+    let initial_segment_id = hls_start_segment_number(request.start_position_ticks);
+    if initial_segment_id == 0 {
+        return;
+    }
+    request.hls_start_number = Some(initial_segment_id);
+    request.output_ts_offset_ticks =
+        Some(i64::from(initial_segment_id).saturating_mul(hls_segment_ticks()));
+}
+
+fn hls_segment_start_position_ticks(start_position_ticks: i64, segment_id: u32) -> Option<i64> {
+    let initial_segment_id = hls_start_segment_number(start_position_ticks);
+    let relative_segment_id = segment_id.checked_sub(initial_segment_id)?;
+    Some(
+        start_position_ticks
+            .max(0)
+            .saturating_add(i64::from(relative_segment_id).saturating_mul(hls_segment_ticks())),
+    )
 }
 
 fn hls_effective_start_position_ticks(
@@ -55572,10 +55613,10 @@ mod tests {
         SYNCPLAY_DRIFT_THRESHOLD_TICKS, SystemLifecycleCommand, TvMazeExternals, TvMazeImage,
         TvMazeNetwork, TvMazeRating, TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry,
         activate_dotnet_plugin_with_host_path, activate_rust_wasi_plugin_with_host_path,
-        apply_live_hls_ffmpeg_policy, apply_playback_output_constraints,
-        await_package_install_cancelable, backup_restore_snapshot_json,
-        cascade_delete_series_timer_timers, classify_transcode_command,
-        cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
+        align_hls_request_segment_timeline, apply_live_hls_ffmpeg_policy,
+        apply_playback_output_constraints, await_package_install_cancelable,
+        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
+        classify_transcode_command, cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         codec_condition_matches, codec_condition_property_value, default_audio_stream_index,
         default_live_tv_configuration, default_subtitle_stream_index, default_user_configuration,
@@ -55584,12 +55625,13 @@ mod tests {
         external_id_infos_for_item_type, ffmpeg_job_allowed_for_mode, ffmpeg_listing_components,
         filter_package_list, format_time_for_json, generate_missing_hls_segment,
         get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
-        hls_on_demand_generation_lock, hls_segment_ticks, hls_transcode_dedupe_key,
-        hls_transcode_session_input_path, internal_remote_relay_target, is_live_tv_channel_id,
-        json_string_field, json_value_i64, last_system_lifecycle_command,
-        live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
-        live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_m3u_channels_from_payload,
-        live_tv_recording_name, live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
+        hls_on_demand_generation_lock, hls_segment_start_position_ticks, hls_segment_ticks,
+        hls_start_segment_number, hls_transcode_dedupe_key, hls_transcode_session_input_path,
+        internal_remote_relay_target, is_live_tv_channel_id, json_string_field, json_value_i64,
+        last_system_lifecycle_command, live_hls_session_registry, live_tv_channel_is_remote,
+        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
+        live_tv_m3u_channels_from_payload, live_tv_recording_name,
+        live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
         metadata_editor_parental_rating_options, normalize_media_stream,
         package_infos_from_repositories, package_install_task_key, paged_media_items,
@@ -95441,6 +95483,42 @@ done
             0
         );
         assert_eq!(hls_effective_start_position_ticks(55, None), 55);
+    }
+
+    #[test]
+    fn hls_resume_uses_absolute_segment_numbers_without_double_counting_the_seek() {
+        let start_position_ticks = 19_670_990_000;
+        let initial_segment_id = 655;
+        assert_eq!(
+            hls_start_segment_number(start_position_ticks),
+            initial_segment_id
+        );
+        assert_eq!(
+            hls_segment_start_position_ticks(start_position_ticks, initial_segment_id),
+            Some(start_position_ticks)
+        );
+        assert_eq!(
+            hls_segment_start_position_ticks(start_position_ticks, initial_segment_id + 2),
+            Some(start_position_ticks + 2 * hls_segment_ticks())
+        );
+        assert_eq!(
+            hls_segment_start_position_ticks(start_position_ticks, initial_segment_id - 1),
+            None
+        );
+
+        let mut request = HlsTranscodeRequest::new(
+            "input.mkv",
+            "main.m3u8",
+            "segment_%05d.ts",
+            TranscodeStreamSelection::default(),
+        );
+        request.start_position_ticks = start_position_ticks;
+        align_hls_request_segment_timeline(&mut request);
+        assert_eq!(request.hls_start_number, Some(initial_segment_id));
+        assert_eq!(
+            request.output_ts_offset_ticks,
+            Some(i64::from(initial_segment_id) * hls_segment_ticks())
+        );
     }
 
     #[test]
