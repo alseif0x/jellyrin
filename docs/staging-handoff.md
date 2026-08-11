@@ -1,22 +1,23 @@
 # Handoff de staging
 
-Última actualización: 2026-08-11 13:50 UTC. Sustituye al plan de continuación del
+Última actualización: 2026-08-11 16:22 UTC. Sustituye al plan de continuación del
 rollout 120, que quedó ejecutado; el histórico está en el registro de Git.
 
 ## Estado exacto
 
-- Commit: `a17610a fix: serve artwork for synthetic Series and Season ids`.
+- Código desplegado: `b06b648 fix: serialize transcode and TV projection transitions`.
 - Rama `main` **sincronizada con `origin/main`**: sin commits locales pendientes y
   árbol de trabajo limpio.
-- Esquema aplicado: **`202608080123`**. Las cuatro migraciones de esta tanda las
-  aplicó el migrador, una sola vez cada una: 120 en 23,3 ms, 121 en 20,3 ms, 122 en
-  16,0 ms y 123 en 13,0 ms.
+- Esquema aplicado: **`202608080124`**. La migración 124 se aplicó una sola vez en
+  742 ms; el segundo arranque exigido por systemd comprobó el esquema sin aplicar
+  nada. Las anteriores fueron 120 en 23,3 ms, 121 en 20,3 ms, 122 en 16,0 ms y
+  123 en 13,0 ms.
 - Binarios instalados:
-  - servidor `152450b7207e67930942df8372d7b388faede9f904c383abcf4b7cb4580c1af5`;
-  - migrador `311f2494aeeb0af8f318fd6d2aa8dc3d52040e091882458371cdfa24f6f39802`.
+  - servidor `956d4c63b60a12afa239dfe8fe46d7213a23f99f0f936704e66f6d216055b2b9`;
+  - migrador `1a6de2f5c2527e4b5515e362938ed8e8d2ab803c7453b94318b58a2af3684dfa`.
 - `jellyrin.service` `active/running`, `Result=success`, `NRestarts=0`.
 - PostgreSQL activo. Resumen de filtros reconciliado y publicado: Movies
-  `1567/1567`, Series `2003/2003`, sin `dirty_at`, dos filas de coverage.
+  `1567/1567`, Series `2004/2004`, sin `dirty_at`, dos filas de coverage.
 - `media_item_tv_series_coverage` **publicada** (455.585 episodios, 22.201 series).
   El esquema 123 dejó de invalidarla en escrituras que la proyección no lee, y
   `ensure_tv_series_catalog_projection` la republica en segundo plano cuando falta,
@@ -37,7 +38,8 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
 3. **`/Shows/NextUp`** y **`Items/Latest`**: el primero pedía candidatos con sus
    payloads JSONB para descartar todos menos uno por serie; el segundo *aproximaba*
    —recortaba una ventana antes de filtrar—. NextUp pide candidatos sin JSONB e
-   hidrata solo la página; Latest se responde con `media_item_catalog_page`, que
+   consume las filas como stream, conserva solo un ganador por serie e hidrata
+   solo la página; Latest se responde con `media_item_catalog_page`, que
    aplica cada filtro antes del `LIMIT`, y cualquier predicado no expresable
    desactiva el camino en vez de recortar en silencio.
 4. **Abrir serie y temporada**: resolver un id sintético construía un snapshot de
@@ -50,15 +52,21 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
    reconciliación puntual pasan al `worker_pool`, y los esquemas 121 y 122
    redujeron esa reconciliación a los cubos que realmente cambian (diferencia en
    vez de unión) y a aritmética de diferencias en los escalares. Además, adelantar
-   ya detiene las sesiones de transcodificación anteriores del mismo dispositivo,
-   que antes retenían el único slot de admisión hasta 60 s.
+   ya serializa por usuario/dispositivo y detiene solo sus sesiones anteriores;
+   dos seeks concurrentes no se limpian mutuamente y dos usuarios con el mismo
+   `DeviceId` no interfieren.
 6. **Carátulas de series**: devolvían un PNG marcador de 67 bytes porque un id de
    serie no es un `media_item`. Ahora se resuelven desde los metadatos de un
    episodio usando solo las claves `Series*`.
+7. **Publicación de Series**: el esquema 124 hace que los tres triggers de
+   invalidación tomen, en orden estable, el mismo advisory lock del rebuild. Una
+   escritura ya no puede confirmar durante una publicación y dejar coverage
+   obsoleta.
 
 ## Verificación vigente
 
-- Suites: migrador 33+4, `jellyrin-db` 173/0/4, API 354/0/3 con `/usr/bin/ffmpeg`.
+- Suites: migrador 34+4, core 19/19, `jellyrin-db` 174/0/4 y API 356/0/3 con
+  `/usr/bin/ffmpeg`.
   `cargo +1.94 fmt --all --check` y Clippy estricto de DB, migrador y API limpios.
 - La API necesita `/usr/bin/ffmpeg` en el PATH: el binario de `/usr/local/bin` no
   trae `lavfi` y ocho pruebas fallan sin él. Ejecutar con
@@ -67,10 +75,10 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
   `jellyrin_test` tuvo su contraseña rotada en esta sesión y **no está almacenada**:
   hay que fijarla de nuevo antes de usarla. Ese rol no puede conectar a la base
   productiva.
-- Recorrido en la app por HTTPS, todo 200: web servida, `Views` 76 ms, Series
-  0,15 s, detalle de serie 64 ms, temporadas 38 ms, episodios 46 ms, carátula
-  66 ms, Movies 99 ms, filtros 40 ms, NextUp 3,0 s, Latest 0,47 s, Resume 43 ms,
-  Live TV 39 ms; `readyz` Ready y cero 500 en el journal.
+- Smokes posteriores al rollout: health/readiness local y health HTTPS en 200;
+  Series 22.201 exactas en 129 ms; NextUp 22.034 exactas, 24 episodios hidratados,
+  en 2,78–2,88 s. Servicio con 0 reinicios, sin warnings, ~32 MiB actuales y
+  ~33 MiB de pico.
 - Reproducción comprobada con bytes, no solo códigos: segmentos HLS de 157–900 KB
   con byte de sincronía `0x47` que `ffprobe` decodifica como h264 1920×1080 más
   aac estéreo; progreso persistido; adelantar deja una única sesión activa y cero
@@ -83,13 +91,17 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
 
 ## Recuperación
 
-- **121, 122 y 123 solo reemplazan una función**, sin cambio de datos: para
+- **121, 122, 123 y 124 solo reemplazan funciones**, sin cambio de datos: para
   revertir basta reaplicar la definición de la migración anterior. No hace falta
   restaurar la base.
 - Binarios anteriores en `/var/backups/jellyrin/` (44 copias `jellyrin-server-pre-*`
   y `jellyrin-migrate-pre-*`); las inmediatamente anteriores a esta tanda son
   `*-pre-seriesart-20260811T125001Z`, `*-pre-workerpool-20260811T102847Z` y
-  `*-pre-121/122`.
+  `*-pre-121/122`. Las copias pre-124 son
+  `jellyrin-{server,migrate}-pre-124-20260811T161734Z`.
+- Rollback SQL exacto de los triggers 123 en
+  `/var/backups/jellyrin-postgres/tv-series-rollback-to-123-20260811T161734Z.sql`
+  (SHA-256 `7be7d106d7983a89ceaad17bda55b558936aa87ed985e5a9db5a1c448e730d16`).
 - Snapshots cifrados en `/var/backups/jellyrin-postgres/daily/`: el pre-120
   `20260810T223557Z` y el más reciente `20260811T031228Z`, ambos con `sha256sum -c`
   correcto.
@@ -112,7 +124,5 @@ Por orden de valor:
    filtran por **nombre** de serie (`apply_manual_series_metadata_update`,
    `apply_remote_series_search_result`, `refresh_tv_metadata_for_series`), que
    siguen construyendo el snapshot completo.
-3. **Un flake sin identificar** en la suite de API: falló una prueba en una de
-   varias ejecuciones y no quedó registrado su nombre; no reprodujo después.
-4. E2E visual autenticado con un cliente real, worker externo o hardware para 4K,
+3. E2E visual autenticado con un cliente real, worker externo o hardware para 4K,
    egress y secretos operativos con E2E de MAGSTV, y backups fuera del host.
