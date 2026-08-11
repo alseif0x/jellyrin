@@ -8142,6 +8142,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_query_filter_point_update_only_touches_changed_value_buckets() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let target_id = Uuid::new_v4();
+            let sibling_id = Uuid::new_v4();
+            let movie = |id: Uuid, name: &str| {
+                remote_item(
+                    id,
+                    name,
+                    &format!("provider://delta/{name}.mkv"),
+                    "Video",
+                    "movies",
+                    json!({"Genres": ["Drama"], "Tags": ["Keep"]}),
+                )
+            };
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Delta Filters",
+                    "movies",
+                    "provider://delta",
+                    vec![movie(target_id, "Alpha"), movie(sibling_id, "Beta")],
+                )
+                .await?;
+
+            // `xmin` proves whether a bucket row was rewritten, not merely recomputed to the same
+            // value, so an unchanged value bucket must keep its version across a media-info write.
+            let bucket_versions = r#"
+                SELECT value_kind || '|' || normalized_value || '|' || xmin::text
+                FROM media_item_query_filter_summary_values
+                WHERE virtual_folder_id = $1
+                ORDER BY 1
+                "#;
+            let bucket_state = r#"
+                SELECT effective_item_type || '|' || value_kind || '|' || normalized_value
+                       || '|' || display_value || '|' || winner_item_id::text
+                       || '|' || winner_item_sort || '|' || winner_source_priority::text
+                       || '|' || winner_source_position || '|' || contributor_count::text
+                FROM media_item_query_filter_summary_values
+                WHERE virtual_folder_id = $1
+                ORDER BY 1
+                "#;
+            let list_versions = |rows: &[String]| {
+                rows.iter()
+                    .filter(|row| row.starts_with("genres|") || row.starts_with("tags|"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+
+            let before = sqlx::query_scalar::<_, String>(bucket_versions)
+                .bind(folder.id)
+                .fetch_all(&test.database.pool)
+                .await?;
+            anyhow::ensure!(
+                !list_versions(&before).is_empty(),
+                "no list buckets to compare"
+            );
+
+            test.database
+                .update_media_item_media_info(
+                    target_id,
+                    Some(12_345_000_000),
+                    Some(3_000_000),
+                    Some(1920),
+                    Some(1080),
+                    vec![json!({"Type": "Subtitle", "Index": 0, "Codec": "subrip"})],
+                )
+                .await?;
+
+            let after = sqlx::query_scalar::<_, String>(bucket_versions)
+                .bind(folder.id)
+                .fetch_all(&test.database.pool)
+                .await?;
+            anyhow::ensure!(
+                list_versions(&before) == list_versions(&after),
+                "a media-info write rewrote value buckets it did not change"
+            );
+            anyhow::ensure!(
+                after
+                    .iter()
+                    .any(|row| row.starts_with("has_subtitles|true|")),
+                "the changed scalar bucket was not published"
+            );
+            let coverage = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM media_item_query_filter_summary_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            anyhow::ensure!(coverage == 1, "the point update left coverage unpublished");
+
+            // The patched summary must be indistinguishable from one derived in full.
+            let after_point = sqlx::query_scalar::<_, String>(bucket_state)
+                .bind(folder.id)
+                .fetch_all(&test.database.pool)
+                .await?;
+            let published =
+                sqlx::query_scalar::<_, bool>("SELECT jellyrin_rebuild_query_filter_summary($1)")
+                    .bind(folder.id)
+                    .fetch_one(&test.database.pool)
+                    .await?;
+            anyhow::ensure!(published, "the control rebuild did not publish");
+            let after_rebuild = sqlx::query_scalar::<_, String>(bucket_state)
+                .bind(folder.id)
+                .fetch_all(&test.database.pool)
+                .await?;
+            anyhow::ensure!(
+                after_point == after_rebuild,
+                "the point update diverged from a full rebuild"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_query_filter_noop_snapshot_preserves_projection_rows() {
         let Some(test) = IsolatedPostgres::create().await else {
             return;

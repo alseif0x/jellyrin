@@ -398,8 +398,8 @@ aprobadas, 0 fallidas y 7 ignoradas. La API pasa 353/0/3 usando
 `/usr/bin/ffmpeg` para generar fixtures; el resto del workspace pasa 342/0/4.
 La superficie PostgreSQL real queda además desglosada en `jellyrin-db`
 169/0/4 más doctests, proveedor Xtream 27/27 y migrador 36/36. El objetivo
-`202608080120`, con 24 migraciones embebidas, está validado contra PostgreSQL
-real y **desplegado** en staging el 2026-08-10 mediante rollout atómico. El
+`202608080121`, con 25 migraciones embebidas, está validado contra PostgreSQL
+real y **desplegado** en staging (120 el 2026-08-10 y 121 el 2026-08-11). El
 ensure-current de 117 reconcilia el marker sin reconstruir la
 proyección ni alterar `xmin`/`completed_at` cuando fuentes y valores ya son
 exactos. `check` y `clippy -D warnings` de DB/API/migrador con todos sus targets
@@ -610,6 +610,46 @@ Las carátulas que faltaban no eran un defecto propio: la mayoría responde 200 
 ~90 ms y unas pocas devuelven `Remote image not found` porque el proveedor no las
 tiene.
 
+#### Esquema 121: la reconciliación puntual solo toca lo que cambió
+
+Mover la escritura al presupuesto de worker evitaba el fallo pero no el coste. La
+causa concreta estaba en la propia función de 120: construía el conjunto de cubos
+«afectados» como la **unión** de los valores viejos y nuevos del ítem en lugar de
+su **diferencia**, mientras el bloque escalar, unas líneas más abajo, sí usaba la
+diferencia. Consecuencia: una escritura que no tocaba ningún valor —el sondeo de
+media-info detrás de `PlaybackInfo`— rederivaba el ganador de *todos* los valores
+del ítem, y cada uno de esos es un escaneo del ámbito de la carpeta.
+
+La migración 121 sustituye solo esa consulta por la diferencia simétrica sobre la
+**tupla completa** de contribución (`kind`, `display_value`, `source_key`,
+`source_priority`, `source_position`), de modo que un cambio de prioridad o
+posición sigue invalidando su cubo. Validación, cerrojos, reemplazo de la
+proyección, publicación fail-closed de coverage y el bloque escalar se copian
+verbatim, y `search_path` y privilegios se reaplican porque la función se
+reemplaza.
+
+La corrección está fijada por una prueba que la comprueba en ambos sentidos: usa
+`xmin` para demostrar que los cubos de lista **no se reescriben** en una escritura
+de solo media-info, exige que el cubo escalar cambiado sí se publique y que la
+coverage siga publicada, y finalmente compara el resumen parcheado contra una
+reconstrucción completa del mismo folder. Con la migración retirada la prueba
+falla con «a media-info write rewrote value buckets it did not change», así que
+detecta el comportamiento anterior en lugar de describirlo.
+
+Evidencia sobre la base productiva: 121 aplicada por el migrador en 20,3 ms
+(`applied_migrations=1`, 120 → 121), `prosecdef` y
+`search_path=pg_catalog, public, pg_temp` intactos, runtime con `SELECT` y nada
+más sobre las tres tablas del resumen, y ambas carpetas reconciliadas con su
+coverage publicada. El primer `PlaybackInfo` de un ítem sin sondeo vigente baja de
+15,8 s a **1,0–5,8 s** y el segundo responde en 0,02 s, sin un solo 500.
+
+Queda un coste residual medible: cuando una bandera escalar cambia
+(`has_subtitles`, `container`, `video_types`…), el bloque escalar materializa las
+filas de la carpeta para recontar contribuyentes —1,35 s sobre 455.585
+episodios—, que es el caso de 5,8 s. Convertirlo también en aritmética de
+diferencias (contador ±1, rederivando el ganador solo cuando el ítem que sale era
+el mínimo) lo dejaría en milisegundos y es el siguiente paso natural.
+
 La base bare-metal de staging ya está desplegada en
 `jellyrin.test.kode.live`: PostgreSQL 16.14 y Jellyrin solo escuchan en loopback,
 el esquema se aplicó con el rol migrator y el runtime usa su rol separado. El
@@ -735,7 +775,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; runtime sin DML directo ni bypass GUC | 494.613 items/989.226 contribuciones → 96 filas; 119 en 438 ms y 120 en 886 ms sobre la base productiva. PostgreSQL 16 aislado valida ACL, rebuild/punto y ataques con GUC/sombras temporales; ACL de solo lectura y `SECURITY DEFINER` reverificados en staging tras el rollout; API 354/0/3 y DB efectiva 169/0/4 | Scope padre+hijos/múltiple, coalescer de grandes lotes y E2E cliente real |
 | Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
-| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 200 con total exacto 22.194 en 4,30 s por la página acotada en vivo, con la coverage aún sin publicar; `/Shows/NextUp` 200 con 22.027 exactos en 2,89 s y streams hidratados; Latest exacto por `media_item_catalog_page`; abrir serie/temporada/episodio en milisegundos; `PlaybackInfo` y adelantar sin bucle de fallo | Abaratar la reconciliación puntual para que el primer `PlaybackInfo` no cueste 15,8 s; E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
+| Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `c89ccd8`; esquema 120 desplegado el 2026-08-10 a las 22:46 UTC en 886 ms; health/readiness local/HTTPS verdes y 0 reinicios; 757 canales, 39.093 películas, 22.194 series y 455.520 episodios. VOD compatible directo 206 con `Range` exacto y sin FFmpeg; HLS incompatible con un job, `-threads:v 2` y 150% de CPU, y segundo job concurrente rechazado fail-closed. Live TV 2958/2961/2965 verde y 2966 sigue caído en upstream (503); MAGSTV 0.1.1 activo. Listado de Series 200 con total exacto 22.194 en 4,30 s por la página acotada en vivo, con la coverage aún sin publicar; `/Shows/NextUp` 200 con 22.027 exactos en 2,89 s y streams hidratados; Latest exacto por `media_item_catalog_page`; abrir serie/temporada/episodio en milisegundos; `PlaybackInfo` y adelantar sin bucle de fallo; esquema 121 acota la reconciliación puntual a los cubos que cambian y el primer `PlaybackInfo` baja de 15,8 s a 1,0–5,8 s | Convertir el bloque escalar del resumen en aritmética de diferencias para eliminar el 1,35 s residual; E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
 ### Trabajo restante y gates de salida
 
