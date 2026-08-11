@@ -40571,29 +40571,91 @@ async fn subtitle_output_from_transcode_vtt_segment(
 
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
     let segment_id = hls_start_segment_number(start_position_ticks);
-    let segment_path = layout.session_dir.join(format!("main{segment_id}.vtt"));
-    let next_segment_path = layout
-        .session_dir
-        .join(format!("main{}.vtt", segment_id.saturating_add(1)));
     // The remote VOD first segment currently takes 6-8 seconds on staging while Web cancels VTT
     // requests after roughly ten. Stay below the client deadline and never launch another FFmpeg.
     let deadline = tokio::time::Instant::now() + StdDuration::from_secs(8);
     loop {
-        match tokio::fs::read(&segment_path).await {
-            Ok(bytes) if !bytes.is_empty() => return Ok(Some(bytes)),
-            Ok(_) if next_segment_path.exists() || tokio::time::Instant::now() >= deadline => {
-                return Ok(Some(empty_webvtt()));
+        if let Some(segment_path) =
+            transcode_vtt_segment_path(&layout.session_dir, segment_id).await?
+        {
+            match tokio::fs::read(segment_path).await {
+                Ok(bytes) if !bytes.is_empty() => return Ok(Some(bytes)),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Ok(Some(empty_webvtt()));
-                }
-            }
-            Err(error) => return Err(error.into()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(Some(empty_webvtt()));
         }
         tokio::time::sleep(StdDuration::from_millis(50)).await;
     }
+}
+
+async fn transcode_vtt_segment_path(
+    session_dir: &FsPath,
+    segment_id: u32,
+) -> Result<Option<PathBuf>, ApiError> {
+    let continuous_path = session_dir.join(format!("main{segment_id}.vtt"));
+    if continuous_path.exists() {
+        return Ok(Some(continuous_path));
+    }
+
+    // FFmpeg derives WebVTT filenames from the media-playlist basename. The continuous writer
+    // therefore emits `main683.vtt`, while an on-demand seek whose playlist is
+    // `segment_00812.m3u8` emits `segment_00812812.vtt`. Resolve the URI from FFmpeg's subtitle
+    // playlist instead of duplicating that naming rule.
+    let mut entries = match tokio::fs::read_dir(session_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut playlist_paths = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let is_vtt_playlist = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with("_vtt.m3u8"));
+        if is_vtt_playlist {
+            playlist_paths.push(path);
+        }
+    }
+    // Prefer the newest seek playlist if overlapping windows contain the requested sequence.
+    playlist_paths.sort();
+    playlist_paths.reverse();
+    for playlist_path in playlist_paths {
+        let playlist = match tokio::fs::read_to_string(&playlist_path).await {
+            Ok(playlist) => playlist,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let mut sequence = playlist.lines().find_map(|line| {
+            line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        });
+        for line in playlist.lines() {
+            let uri = line.trim();
+            if uri.is_empty() || uri.starts_with('#') {
+                continue;
+            }
+            let Some(current_sequence) = sequence else {
+                break;
+            };
+            if current_sequence == segment_id {
+                let uri = uri.split_once('?').map_or(uri, |(path, _)| path);
+                let uri_path = FsPath::new(uri);
+                if uri_path.components().count() == 1
+                    && uri_path.extension().and_then(OsStr::to_str) == Some("vtt")
+                {
+                    return Ok(Some(session_dir.join(uri_path)));
+                }
+                break;
+            }
+            sequence = current_sequence.checked_add(1);
+        }
+    }
+    Ok(None)
 }
 
 async fn subtitle_output_from_transcode_vtt_segments(
@@ -40870,7 +40932,9 @@ fn subtitle_add_vtt_time_map(output: Vec<u8>) -> Vec<u8> {
         return text
             .replacen(
                 "WEBVTT",
-                "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000",
+                // Jellyrin preserves absolute timestamps in both MPEG-TS and WebVTT. Mapping
+                // LOCAL zero to MPEGTS 900000 (ten seconds) shifts every cue ten seconds late.
+                "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000",
                 1,
             )
             .into_bytes();
@@ -55778,14 +55842,14 @@ mod tests {
         run_due_live_tv_timers, run_startup_command_output, scan_all_library_items,
         selected_aac_output_channels, selected_video_frame_rate_limit, series_timer_child_id,
         set_xtream_remote_media_probe_metadata, spawn_hls_transcode_task, stable_entity_id,
-        subscribe_playback_events, subscribe_system_lifecycle_commands,
+        subscribe_playback_events, subscribe_system_lifecycle_commands, subtitle_add_vtt_time_map,
         subtitle_vtt_to_track_events_json, syncplay_cleanup_stale_participants, syncplay_groups,
         transcode_dedupe_lock, transcode_device_lock, transcode_session_is_superseded,
-        transcode_temp_root, trickplay_settings, trickplay_tile_cache_path, trickplay_tile_lock,
-        tvmaze_remote_search_series_result, update_plugin_configuration_via_runtime_host_path,
-        validate_hls_cleanup_dir, validate_zip_entry_path, verify_plugin_package_checksum,
-        with_live_tuner_leases, xtream_probe_lock_for, xtream_remote_media_probe_current,
-        xtream_remote_source_revision,
+        transcode_temp_root, transcode_vtt_segment_path, trickplay_settings,
+        trickplay_tile_cache_path, trickplay_tile_lock, tvmaze_remote_search_series_result,
+        update_plugin_configuration_via_runtime_host_path, validate_hls_cleanup_dir,
+        validate_zip_entry_path, verify_plugin_package_checksum, with_live_tuner_leases,
+        xtream_probe_lock_for, xtream_remote_media_probe_current, xtream_remote_source_revision,
     };
     use crate::Database;
     use crate::dlna;
@@ -88243,7 +88307,7 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let vtt = String::from_utf8(body.to_vec()).unwrap();
         assert!(vtt.starts_with("WEBVTT"));
-        assert!(vtt.contains("X-TIMESTAMP-MAP=MPEGTS:900000"));
+        assert!(vtt.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"));
         assert!(vtt.contains("Hello from Jellyrin"));
 
         let response = app
@@ -95634,6 +95698,49 @@ done
             0
         );
         assert_eq!(hls_effective_start_position_ticks(55, None), 55);
+    }
+
+    #[test]
+    fn subtitle_time_map_preserves_the_absolute_mpegts_timeline() {
+        let output = subtitle_add_vtt_time_map(
+            b"WEBVTT\n\n40:34.404 --> 40:36.656\nSeek subtitle\n\n".to_vec(),
+        );
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"));
+        assert!(!output.contains("MPEGTS:900000"));
+        assert!(output.contains("40:34.404 --> 40:36.656"));
+    }
+
+    #[tokio::test]
+    async fn subtitle_seek_resolves_ffmpeg_on_demand_vtt_playlist_uri() {
+        let transcode_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            transcode_dir.path().join("segment_00812_vtt.m3u8"),
+            b"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:812\n#EXTINF:7.008,\nsegment_00812812.vtt\n#EXTINF:5.337,\nsegment_00812813.vtt\n",
+        )
+        .await
+        .unwrap();
+        let expected = transcode_dir.path().join("segment_00812812.vtt");
+        tokio::fs::write(
+            &expected,
+            b"WEBVTT\n\n40:34.404 --> 40:36.656\nSeek subtitle\n\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            transcode_vtt_segment_path(transcode_dir.path(), 812)
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            transcode_vtt_segment_path(transcode_dir.path(), 814)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
