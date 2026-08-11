@@ -617,12 +617,14 @@ El E2E con Jellyfin Web reveló otro defecto independiente al reanudar: para una
 posición de 1.967,099 s el cliente pide el segmento absoluto 655, mientras el
 transcode continuo buscaba en el tiempo correcto pero numeraba desde cero. Web
 esperaba `655.ts`, el servidor producía `segment_00000.ts` y finalmente reiniciaba
-la sesión. Ahora la petición inicial fija `-start_number`, `output_ts_offset`, el
-primer archivo esperado y `MEDIA-SEQUENCE` sobre una misma línea temporal; el
-generador bajo demanda resta la base antes de calcular el seek y no lo suma dos
-veces. Verificado en el ítem Xtream real: segmento 655 en 6,68 s, 1.494.788 bytes,
-MPEG-TS `0x47` y streams h264+aac válidos por `ffprobe`. API 357/0/3 y Clippy
-estricto verdes.
+la sesión. Ahora la petición inicial fija `-start_number`, `output_ts_offset` y el
+primer archivo esperado sobre la línea temporal absoluta de FFmpeg, mientras el
+manifiesto conserva `MEDIA-SEQUENCE:0` y URIs relativas: Jellyfin Web ya suma la
+base de reanudación. El generador bajo demanda resta esa base antes de calcular el
+seek y no la suma dos veces. Verificado en el ítem Xtream real: Web pide el
+segmento 655 —no 1310— y recibe 200, 1.494.788 bytes, MPEG-TS `0x47` y streams
+h264+aac válidos por `ffprobe`; el VTT correspondiente también devuelve 200.
+API 357/0/3 y Clippy estricto verdes.
 
 #### Esquema 123: la proyección de Series deja de caerse en cada escritura
 

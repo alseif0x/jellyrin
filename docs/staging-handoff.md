@@ -1,19 +1,19 @@
 # Handoff de staging
 
-Última actualización: 2026-08-11 16:42 UTC. Sustituye al plan de continuación del
+Última actualización: 2026-08-11 17:33 UTC. Sustituye al plan de continuación del
 rollout 120, que quedó ejecutado; el histórico está en el registro de Git.
 
 ## Estado exacto
 
-- Código desplegado: `eac43f5 fix: align resumed HLS segment numbering`.
-- Rama `main` **sincronizada con `origin/main`**: sin commits locales pendientes y
-  árbol de trabajo limpio.
+- Código desplegado: `e54e06e fix: keep resumed HLS manifests relative`.
+- Rama `main` **sincronizada con `origin/main`** tras publicar el hotfix y esta
+  actualización; árbol de trabajo limpio.
 - Esquema aplicado: **`202608080124`**. La migración 124 se aplicó una sola vez en
   742 ms; el segundo arranque exigido por systemd comprobó el esquema sin aplicar
   nada. Las anteriores fueron 120 en 23,3 ms, 121 en 20,3 ms, 122 en 16,0 ms y
   123 en 13,0 ms.
 - Binarios instalados:
-  - servidor `b4f0738277e367bb264aefbe9f48bb506b5cf7d43f28d49a7aa7887d95bb9702`;
+  - servidor `81c57d7979c238c6673e384adbd04ffac29e63faed580cfe4762896ef77174fb`;
   - migrador `1a6de2f5c2527e4b5515e362938ed8e8d2ab803c7453b94318b58a2af3684dfa`.
 - `jellyrin.service` `active/running`, `Result=success`, `NRestarts=0`.
 - PostgreSQL activo. Resumen de filtros reconciliado y publicado: Movies
@@ -85,9 +85,13 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
   fallos de capacidad; película por DirectProxy con `206`, `content-range` exacto
   sobre 1.789.475.245 bytes y magic Matroska.
 - Reanudación HLS comprobada además sobre el ítem Xtream real
-  `12e4aa52762dde5c9d06f6300d9f2c5b` en 1.967,099 s: playlist con
-  `MEDIA-SEQUENCE:655`, `segment_00655.ts` de 1.494.788 bytes, sync byte `0x47`
-  y `ffprobe` h264+aac. Antes el cliente pedía 655 mientras FFmpeg generaba 0.
+  `12e4aa52762dde5c9d06f6300d9f2c5b` en 1.967,099 s: el manifiesto se mantiene
+  relativo (`MEDIA-SEQUENCE:0`, primera URI `main/0.ts`) porque Jellyfin Web suma
+  la base de reanudación; FFmpeg y el servidor producen el segmento absoluto
+  `segment_00655.ts`. La petición Web equivalente a `main/655.ts` devuelve 200,
+  1.494.788 bytes, sync byte `0x47` y h264+aac válidos por `ffprobe`, sin reiniciar
+  la sesión ni pedir por error `1310.ts`. El segmento VTT 655 también devuelve 200
+  y un documento `WEBVTT` válido.
 - Igualdad del resumen: comparado dentro de una transacción con `ROLLBACK`, el
   resumen que produce la reconciliación incremental es idéntico fila a fila a una
   reconstrucción completa de las dos carpetas productivas, cero filas exclusivas
@@ -103,6 +107,8 @@ Detalle completo y evidencia en `docs/transcode-optimization-plan.md`, secciones
   `*-pre-seriesart-20260811T125001Z`, `*-pre-workerpool-20260811T102847Z` y
   `*-pre-121/122`. Las copias pre-124 son
   `jellyrin-{server,migrate}-pre-124-20260811T161734Z`.
+  El servidor inmediatamente anterior al manifiesto HLS relativo está en
+  `jellyrin-server-pre-hls-relative-20260811T172922Z`.
 - Rollback SQL exacto de los triggers 123 en
   `/var/backups/jellyrin-postgres/tv-series-rollback-to-123-20260811T161734Z.sql`
   (SHA-256 `7be7d106d7983a89ceaad17bda55b558936aa87ed985e5a9db5a1c448e730d16`).
