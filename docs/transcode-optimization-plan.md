@@ -606,6 +606,41 @@ Dos defectos distintos rompían la reproducción, ninguno en el catálogo:
    la anterior queda `stopped`, siempre hay un único proceso y cero fallos de
    capacidad.
 
+#### Esquema 123: la proyección de Series deja de caerse en cada escritura
+
+La página acotada en vivo mantenía el listado usable sin coverage publicada, pero a
+~4,4 s en vez de ~0,15 s, y la coverage estaba permanentemente ausente. La causa no
+era que costara reconstruirla, sino que **cualquier** escritura la tiraba: el
+trigger era `AFTER UPDATE ON media_items FOR EACH STATEMENT` sin condición, así que
+la info de medios que guarda cada `PlaybackInfo` la desechaba. Reponerla habría
+durado hasta la siguiente reproducción.
+
+La proyección solo lee pertenencia a carpeta, visibilidad, tipo de medio y de
+colección, y el `SeriesId`/`SeriesName` persistidos. La migración 123 compara
+exactamente esos campos entre las tablas de transición, igual que el esquema 120
+había hecho ya con el trigger del resumen, e invalida el lado viejo y el nuevo para
+que mover un ítem republique en ambos. La prueba fija el contrato en las dos
+direcciones: escribir info de medios o renombrar un episodio **no** despublica, y
+cambiar `SeriesName` sí. Sin la migración falla con «a media-info write unpublished
+the projection».
+
+Faltaba pasar de 0 a publicada sin esperar una sincronización, que era el único
+camino que escribía esa fila. `ensure_tv_series_catalog_projection` la publica bajo
+demanda: cerrojo consultivo por carpeta, comprobación de coverage dentro del
+cerrojo —lo que hace trivial a todo llamante posterior al primero— y reconstrucción
+en el `worker_pool`, porque derivarla en una carpeta grande excede lo que una
+petición interactiva puede sostener. El listado la programa en segundo plano y
+nunca espera por ella; un guard mantiene una sola reconstrucción en vuelo por
+carpeta para que una ráfaga de cargas no encole una cada una.
+
+Evidencia sobre la base productiva: 123 aplicada en 13,0 ms. Con la coverage en 0,
+la primera petición al listado respondió en 4,50 s por la página en vivo y publicó
+la proyección en segundo plano en ~27 s (455.585 episodios, 22.201 series). A
+partir de ahí el listado responde en **0,143–0,153 s** con las 100 carátulas
+presentes, y —lo que 123 arregla— **sigue publicada** tras dos `PlaybackInfo`,
+incluido uno que sondeó al proveedor: el listado siguió en 0,175 s y el resumen de
+filtros quedó reconciliado en `2004/2004`.
+
 #### Carátulas de series: eran un defecto propio, no del proveedor
 
 La primera lectura del journal atribuyó las carátulas ausentes a `Remote image not

@@ -282,6 +282,7 @@ static SYSTEM_LIFECYCLE_LAST: AtomicU8 = AtomicU8::new(0);
 static RUNTIME_SHUTDOWN_SIGNAL: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
 static RUNTIME_SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 static TRANSCODE_STOPS: OnceLock<Mutex<HashMap<String, oneshot::Sender<()>>>> = OnceLock::new();
+static TV_SERIES_REBUILDS: OnceLock<Mutex<HashSet<Uuid>>> = OnceLock::new();
 static TRANSCODE_EXECUTIONS: OnceLock<Mutex<HashMap<String, TranscodeExecutionObservation>>> =
     OnceLock::new();
 static TRANSCODE_DEDUPE_LOCKS: OnceLock<Mutex<WeakKeyedLockRegistry<String>>> = OnceLock::new();
@@ -47429,6 +47430,13 @@ async fn tv_series_items_result(
         )
         .await?
     {
+        // The page above is served either from the durable projection or, while that is unpublished,
+        // from the bounded live grouping. Publishing it costs seconds, so it happens in the background
+        // and the request is never delayed by it; a folder that is already published makes this a
+        // single indexed lookup.
+        if let Some(virtual_folder_id) = virtual_folder_id {
+            schedule_tv_series_projection_rebuild(db, virtual_folder_id);
+        }
         let episode_ids = page
             .episodes
             .iter()
@@ -51766,6 +51774,37 @@ fn tv_episode_matches_season(
 struct TvEpisodeCatalogSnapshot {
     items: Vec<MediaItem>,
     metadata_by_item: HashMap<Uuid, serde_json::Value>,
+}
+
+/// Publish a folder's TV series projection in the background.
+///
+/// While its coverage row is missing the Series listing answers from the bounded live page, which
+/// costs seconds on a large library, and only a folder sync used to republish it. The guard keeps one
+/// rebuild per folder in flight so a burst of page loads cannot queue one each, and a folder whose
+/// data is not projectable is simply left alone until its contents change.
+fn schedule_tv_series_projection_rebuild(db: &Database, virtual_folder_id: Uuid) {
+    let db = db.clone();
+    tokio::spawn(async move {
+        let registry = TV_SERIES_REBUILDS.get_or_init(|| Mutex::new(HashSet::new()));
+        if !registry.lock().await.insert(virtual_folder_id) {
+            return;
+        }
+        let outcome =
+            MediaCatalogStore::ensure_tv_series_catalog_projection(&db, virtual_folder_id).await;
+        registry.lock().await.remove(&virtual_folder_id);
+        match outcome {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                %virtual_folder_id,
+                "tv series projection is not publishable for this folder"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                %virtual_folder_id,
+                "failed to publish the tv series projection"
+            ),
+        }
+    });
 }
 
 async fn tv_episode_catalog_snapshot(db: &Database) -> Result<TvEpisodeCatalogSnapshot, ApiError> {

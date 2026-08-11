@@ -1589,6 +1589,13 @@ pub trait MediaCatalogStore: DatabaseBackend {
         &self,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_;
 
+    /// Publish the TV series projection for a folder whose coverage row is missing, so the catalogue
+    /// stops answering from the bounded live page. `false` means the data is not projectable.
+    fn ensure_tv_series_catalog_projection(
+        &self,
+        virtual_folder_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send + '_;
+
     fn tv_series_catalog_page(
         &self,
         virtual_folder_id: Option<Uuid>,
@@ -1742,6 +1749,13 @@ impl MediaCatalogStore for PostgresDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         PostgresDatabase::tv_series_lookup_candidates_without_canonical_series_id(self)
+    }
+
+    fn ensure_tv_series_catalog_projection(
+        &self,
+        virtual_folder_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send + '_ {
+        PostgresDatabase::ensure_tv_series_catalog_projection(self, virtual_folder_id)
     }
 
     fn tv_series_catalog_page(
@@ -1914,6 +1928,13 @@ impl MediaCatalogStore for SqliteDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemCatalogEntry>>> + Send + '_
     {
         SqliteDatabase::tv_series_lookup_candidates_without_canonical_series_id(self)
+    }
+
+    fn ensure_tv_series_catalog_projection(
+        &self,
+        virtual_folder_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send + '_ {
+        SqliteDatabase::ensure_tv_series_catalog_projection(self, virtual_folder_id)
     }
 
     fn tv_series_catalog_page(
@@ -8924,6 +8945,52 @@ impl SqliteDatabase {
             total_record_count: usize::try_from(total)?,
             start_index,
         }))
+    }
+
+    /// Publish the TV series projection for a folder when its coverage row is missing.
+    ///
+    /// Returns whether the projection is published; `false` means the folder's data is not
+    /// projectable, which the caller must not retry in a loop.
+    pub async fn ensure_tv_series_catalog_projection(
+        &self,
+        virtual_folder_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let simple = virtual_folder_id.simple().to_string();
+        let dashed = virtual_folder_id.to_string();
+        let mut tx = self.pool.begin().await?;
+        let published: i64 = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM media_item_tv_series_coverage AS coverage
+                WHERE coverage.virtual_folder_id IN (?1, ?2)
+                  AND coverage.projection_version = ?3
+            )
+            "#,
+        )
+        .bind(&simple)
+        .bind(&dashed)
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+        .fetch_one(&mut *tx)
+        .await?;
+        if published != 0 {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        let stored_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM virtual_folders WHERE id IN (?1, ?2)")
+                .bind(&simple)
+                .bind(&dashed)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(stored_id) = stored_id else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let rebuilt =
+            Self::rebuild_tv_series_catalog_projection_in_transaction(&mut tx, &stored_id).await?;
+        tx.commit().await?;
+        Ok(rebuilt)
     }
 
     async fn rebuild_tv_series_catalog_projection_in_transaction(

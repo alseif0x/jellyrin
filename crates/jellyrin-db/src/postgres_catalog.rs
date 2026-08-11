@@ -2292,6 +2292,49 @@ impl PostgresDatabase {
         .await
     }
 
+    /// Publish the TV series projection for a folder when its coverage row is missing.
+    ///
+    /// Only a folder sync used to write that row, so an invalidation left the Series listing on the
+    /// bounded live page until the next sync. Returns whether the projection is published: `false`
+    /// means the folder's data is not projectable, which the caller must not retry in a loop.
+    ///
+    /// The advisory lock serializes concurrent callers, and the coverage check inside it makes every
+    /// caller after the first cheap. This runs on the worker pool because deriving the projection for
+    /// a large folder takes far longer than an interactive request may hold a statement.
+    pub async fn ensure_tv_series_catalog_projection(
+        &self,
+        virtual_folder_id: Uuid,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.worker_pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("jellyrin-tv-series-projection:{virtual_folder_id}"))
+            .execute(&mut *tx)
+            .await?;
+        let published: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM media_item_tv_series_coverage AS coverage
+                WHERE coverage.virtual_folder_id = $1
+                  AND coverage.projection_version = $2
+            )
+            "#,
+        )
+        .bind(virtual_folder_id)
+        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+        .fetch_one(&mut *tx)
+        .await?;
+        if published {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        let rebuilt =
+            Self::rebuild_tv_series_catalog_projection_in_transaction(&mut tx, virtual_folder_id)
+                .await?;
+        tx.commit().await?;
+        Ok(rebuilt)
+    }
+
     async fn rebuild_tv_series_catalog_projection_in_transaction(
         tx: &mut Transaction<'_, Postgres>,
         virtual_folder_id: Uuid,
@@ -9671,6 +9714,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_tv_series_coverage_survives_writes_the_projection_does_not_read() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let series_id = Uuid::new_v4();
+            let episode_id = Uuid::new_v4();
+            let item = remote_item(
+                episode_id,
+                "Kept S01E01",
+                "provider://kept/Kept S01E01.mp4",
+                "Video",
+                "tvshows",
+                json!({"SeriesId": series_id.simple().to_string(), "SeriesName": "Kept"}),
+            );
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Kept Shows",
+                    "tvshows",
+                    "provider://kept",
+                    vec![item],
+                )
+                .await?;
+            let coverage = || {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM media_item_tv_series_coverage WHERE virtual_folder_id = $1",
+                )
+                .bind(folder.id)
+                .fetch_one(&test.database.pool)
+            };
+            anyhow::ensure!(coverage().await? == 1, "the snapshot did not publish coverage");
+
+            // The projection reads folder membership, visibility, media and collection type and the
+            // persisted SeriesId/SeriesName. Probed media info and the item name are none of those, so
+            // writing them must leave the projection published; otherwise every PlaybackInfo would
+            // unpublish the Series listing until the next folder sync.
+            test.database
+                .update_media_item_media_info(
+                    episode_id,
+                    Some(12_345_000_000),
+                    Some(3_000_000),
+                    Some(1920),
+                    Some(1080),
+                    vec![json!({"Type": "Video", "Index": 0, "Codec": "h264"})],
+                )
+                .await?;
+            anyhow::ensure!(
+                coverage().await? == 1,
+                "a media-info write unpublished the projection"
+            );
+            sqlx::query("UPDATE media_items SET name = name || ' renamed' WHERE id = $1")
+                .bind(episode_id)
+                .execute(&test.database.pool)
+                .await?;
+            anyhow::ensure!(
+                coverage().await? == 1,
+                "renaming an episode unpublished the projection"
+            );
+
+            // A grouping input, on the other hand, must unpublish it.
+            test.database
+                .update_media_item_metadata(
+                    episode_id,
+                    json!({"SeriesId": series_id.simple().to_string(), "SeriesName": "Renamed"}),
+                )
+                .await?;
+            anyhow::ensure!(
+                coverage().await? == 0,
+                "changing SeriesName left the projection published"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_tv_series_projection_is_invalidated_and_rebuilt_atomically() {
         let Some(test) = IsolatedPostgres::create().await else {
             return;
@@ -9711,20 +9833,14 @@ mod tests {
             .await?;
             assert_eq!(counts, (1, 1, 1));
 
-            sqlx::query("UPDATE media_items SET name = name || ' changed' WHERE id = $1")
-                .bind(episode_id)
+            // Unpublish the projection the way the invalidation trigger does. Which writes trigger it
+            // is pinned separately; the subject here is that an unpublished projection still serves a
+            // bounded page from the live rows instead of pushing the caller onto the legacy path that
+            // materializes every episode.
+            sqlx::query("DELETE FROM media_item_tv_series_coverage WHERE virtual_folder_id = $1")
+                .bind(folder.id)
                 .execute(&test.database.pool)
                 .await?;
-            // The invalidation trigger drops the coverage row on any media_items change. A stale
-            // projection must still serve a bounded page computed from the live rows instead of
-            // pushing the caller onto the legacy path that materializes every episode.
-            let coverage_rows = sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM media_item_tv_series_coverage WHERE virtual_folder_id = $1",
-            )
-            .bind(folder.id)
-            .fetch_one(&test.database.pool)
-            .await?;
-            assert_eq!(coverage_rows, 0);
             let stale = test
                 .database
                 .tv_series_catalog_page(Some(folder.id), 0, 20)
