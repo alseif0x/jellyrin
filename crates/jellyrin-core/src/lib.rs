@@ -844,6 +844,14 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         args.push(format_ticks_as_seconds(output_ts_offset_ticks));
     }
 
+    // MPEG-TS otherwise applies its historical 1.4-second mux delay. WebVTT uses the original
+    // media timeline, so keeping that delay would make every subtitle appear about 1.4 seconds
+    // late and would compound after an HLS seek. Start both streams on the same clock instead.
+    args.push("-muxdelay".to_string());
+    args.push("0".to_string());
+    args.push("-muxpreload".to_string());
+    args.push("0".to_string());
+
     args.push("-f".to_string());
     args.push("hls".to_string());
     args.push("-hls_time".to_string());
@@ -1304,6 +1312,10 @@ mod tests {
                 "2",
                 "-b:a",
                 "192000",
+                "-muxdelay",
+                "0",
+                "-muxpreload",
+                "0",
                 "-f",
                 "hls",
                 "-hls_time",

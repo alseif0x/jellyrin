@@ -226,6 +226,7 @@ const REMOTE_MEDIA_MAX_REDIRECTS: usize = 5;
 const LIVE_HLS_SESSION_REGISTRY_MAX_ENTRIES: usize = 4_096;
 const HLS_SEGMENT_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const HLS_SEGMENT_WAIT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
+const DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS: i64 = 15;
 const HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS: i64 = 8;
 const DEFAULT_HLS_SEEK_GENERATION_TIMEOUT_SECONDS: u64 = 180;
 const MIN_HLS_SEEK_GENERATION_TIMEOUT_SECONDS: u64 = 30;
@@ -33199,6 +33200,7 @@ struct PlaybackInfoOptions {
     start_position_ticks_provided: bool,
     direct_play_profiles: Option<Vec<DirectPlayProfileMatcher>>,
     transcoding_profiles: Option<Vec<TranscodingProfileMatcher>>,
+    subtitle_profiles: Option<Vec<SubtitleProfileMatcher>>,
     codec_profiles: Vec<CodecProfileMatcher>,
 }
 
@@ -33222,6 +33224,12 @@ struct TranscodingProfileMatcher {
     max_height: Option<u32>,
     video_bitrate: Option<u32>,
     audio_bitrate: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct SubtitleProfileMatcher {
+    format: Option<String>,
+    method: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -33433,6 +33441,7 @@ impl Default for PlaybackInfoOptions {
             start_position_ticks_provided: false,
             direct_play_profiles: None,
             transcoding_profiles: None,
+            subtitle_profiles: None,
             codec_profiles: Vec::new(),
         }
     }
@@ -33529,6 +33538,7 @@ fn playback_info_options_from_body(body: &serde_json::Value) -> PlaybackInfoOpti
     }
     options.direct_play_profiles = parse_direct_play_profiles(body);
     options.transcoding_profiles = parse_transcoding_profiles(body);
+    options.subtitle_profiles = parse_subtitle_profiles(body);
     options.codec_profiles = parse_codec_profiles(body);
     options
 }
@@ -33611,6 +33621,20 @@ fn parse_transcoding_profiles(body: &serde_json::Value) -> Option<Vec<Transcodin
         .iter()
         .filter_map(parse_transcoding_profile)
         .collect::<Vec<_>>();
+    Some(profiles)
+}
+
+fn parse_subtitle_profiles(body: &serde_json::Value) -> Option<Vec<SubtitleProfileMatcher>> {
+    let device_profile = json_field_case_insensitive(body, "DeviceProfile")?;
+    let profiles = json_field_case_insensitive(device_profile, "SubtitleProfiles")?
+        .as_array()?
+        .iter()
+        .filter(|profile| profile.is_object())
+        .map(|profile| SubtitleProfileMatcher {
+            format: json_string_field(profile, "Format").map(|value| value.to_ascii_lowercase()),
+            method: json_string_field(profile, "Method").map(|value| value.to_ascii_lowercase()),
+        })
+        .collect();
     Some(profiles)
 }
 
@@ -33999,6 +34023,14 @@ async fn playback_info_response(
             media_source.remove("DirectStreamUrl");
         }
         apply_playback_stream_selection(media_source, &options);
+        if selected_text_subtitle_can_use_hls(&item, &options) {
+            apply_direct_hls_text_subtitle_contract(
+                media_source,
+                &token.access_token,
+                &item.id.simple().to_string(),
+                &play_session_id,
+            );
+        }
     }
 
     Ok(Json(serde_json::json!({
@@ -34428,6 +34460,54 @@ fn encoded_audio_channel_layout(channels: u8) -> &'static str {
         7 => "6.1",
         8 => "7.1",
         _ => "stereo",
+    }
+}
+
+fn apply_direct_hls_text_subtitle_contract(
+    media_source: &mut serde_json::Map<String, serde_json::Value>,
+    access_token: &str,
+    item_id: &str,
+    play_session_id: &str,
+) {
+    let Some(streams) = media_source
+        .get_mut("MediaStreams")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for stream in streams {
+        let Some(stream) = stream.as_object_mut() else {
+            continue;
+        };
+        let is_text_subtitle = stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+            && stream
+                .get("Codec")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_text_subtitle_codec);
+        if !is_text_subtitle {
+            continue;
+        }
+        let Some(index) = stream.get("Index").and_then(json_value_i64) else {
+            continue;
+        };
+        stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
+        stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
+        stream.insert("DeliveryMethod".to_string(), serde_json::json!("Hls"));
+        stream.insert("IsExternal".to_string(), serde_json::json!(false));
+        stream.insert(
+            "SupportsExternalStream".to_string(),
+            serde_json::json!(true),
+        );
+        stream.insert(
+            "DeliveryUrl".to_string(),
+            serde_json::json!(format!(
+                "/Videos/{item_id}/{item_id}/Subtitles/{index}/subtitles.m3u8?api_key={access_token}&PlaySessionId={play_session_id}&segmentLength={}",
+                DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS
+            )),
+        );
     }
 }
 
@@ -36563,6 +36643,30 @@ fn selected_audio_codec(item: &MediaItem, options: &PlaybackInfoOptions) -> Opti
         .and_then(|index| media_item_stream_codec_by_index(item, "Audio", index))
 }
 
+fn selected_text_subtitle_can_use_hls(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
+    let Some(index) = options.subtitle_stream_index.filter(|index| *index >= 0) else {
+        return false;
+    };
+    let selected_is_text = media_item_streams(item).iter().any(|stream| {
+        stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+            && stream.get("Index").and_then(json_value_i64) == Some(index)
+            && stream
+                .get("Codec")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_text_subtitle_codec)
+    });
+    selected_is_text
+        && options.subtitle_profiles.as_ref().is_some_and(|profiles| {
+            profiles.iter().any(|profile| {
+                profile.method.as_deref() == Some("hls")
+                    && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
+            })
+        })
+}
+
 fn hls_transcoding_profile_matches(
     item: &MediaItem,
     options: &PlaybackInfoOptions,
@@ -37174,7 +37278,8 @@ fn playback_delivery_decision_with_ffmpeg_mode(
     let selected_audio_needs_transcode = selected_audio_stream_needs_transcode(item, options);
     let selected_subtitle_requires_processing = options
         .subtitle_stream_index
-        .is_some_and(|index| index >= 0);
+        .is_some_and(|index| index >= 0)
+        && !selected_text_subtitle_can_use_hls(item, options);
     let profile_compatible = playback_profile_compatible(item, options);
     let profile_codecs_compatible = playback_profile_codecs_compatible(item, options);
     let profile_video_codec_compatible = playback_profile_video_codec_compatible(item, options);
@@ -55805,10 +55910,10 @@ mod tests {
         SystemLifecycleCommand, TvMazeExternals, TvMazeImage, TvMazeNetwork, TvMazeRating,
         TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry, activate_dotnet_plugin_with_host_path,
         activate_rust_wasi_plugin_with_host_path, align_hls_request_segment_timeline,
-        apply_live_hls_ffmpeg_policy, apply_playback_output_constraints,
-        await_package_install_cancelable, backup_restore_snapshot_json,
-        cascade_delete_series_timer_timers, classify_transcode_command,
-        cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
+        apply_direct_hls_text_subtitle_contract, apply_live_hls_ffmpeg_policy,
+        apply_playback_output_constraints, await_package_install_cancelable,
+        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
+        classify_transcode_command, cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         codec_condition_matches, codec_condition_property_value, default_audio_stream_index,
         default_live_tv_configuration, default_subtitle_stream_index, default_user_configuration,
@@ -95629,6 +95734,70 @@ done
         assert_eq!(video_only.delivery, DeliveryMode::HlsTranscode);
         assert_eq!(video_only.video, HlsStreamMode::Encode);
         assert_eq!(video_only.audio, HlsStreamMode::Copy);
+
+        item.media_streams.push(json!({
+            "Type": "Subtitle",
+            "Index": 2,
+            "Codec": "subrip"
+        }));
+        let hevc_subtitle_options = playback_info_options_from_body(&json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "SubtitleStreamIndex": 2,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mkv",
+                    "VideoCodec": "hevc",
+                    "AudioCodec": "aac"
+                }],
+                "TranscodingProfiles": [{
+                    "Type": "Video",
+                    "Context": "Streaming",
+                    "Protocol": "hls",
+                    "Container": "ts",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac"
+                }],
+                "SubtitleProfiles": [{
+                    "Format": "vtt",
+                    "Method": "Hls"
+                }]
+            }
+        }));
+        let subtitle_only =
+            playback_delivery_decision(&item, Some(&metadata), &hevc_subtitle_options);
+        assert_eq!(subtitle_only.delivery, DeliveryMode::DirectProxy);
+        assert_eq!(subtitle_only.video, HlsStreamMode::Copy);
+        assert_eq!(subtitle_only.audio, HlsStreamMode::Copy);
+        assert!(subtitle_only.reasons.is_empty());
+
+        let mut media_source = json!({
+            "MediaStreams": item.media_streams.clone()
+        });
+        apply_direct_hls_text_subtitle_contract(
+            media_source.as_object_mut().unwrap(),
+            "secret-token",
+            "episode-id",
+            "play-session",
+        );
+        let subtitle = &media_source["MediaStreams"][2];
+        assert_eq!(subtitle["Codec"], "webvtt");
+        assert_eq!(subtitle["DeliveryMethod"], "Hls");
+        assert_eq!(subtitle["SupportsExternalStream"], true);
+        assert_eq!(
+            subtitle["DeliveryUrl"],
+            "/Videos/episode-id/episode-id/Subtitles/2/subtitles.m3u8?api_key=secret-token&PlaySessionId=play-session&segmentLength=15"
+        );
+
+        let no_hls_subtitles = PlaybackInfoOptions {
+            subtitle_profiles: None,
+            ..hevc_subtitle_options
+        };
+        let fallback = playback_delivery_decision(&item, Some(&metadata), &no_hls_subtitles);
+        assert_eq!(fallback.delivery, DeliveryMode::HlsTranscode);
+        assert_eq!(fallback.video, HlsStreamMode::Encode);
     }
 
     #[test]
