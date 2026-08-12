@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_HLS_SEGMENT_TIME_SECONDS: u32 = 3;
 pub const DEFAULT_HLS_SEGMENT_PATTERN: &str = "segment_%05d.ts";
+const HLS_TEXT_SUBTITLE_MAX_INTERLEAVE_DELTA_US: u32 = 1_000_000;
 
 pub const LIVE_TV_REMOTE_USER_AGENT: &str = "VLC/3.0.20 LibVLC/3.0.20";
 pub const LIVE_TV_XTREAM_DEFAULT_EPG_LIMIT: usize = 6;
@@ -822,6 +823,20 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         HlsStreamMode::Drop => {}
     }
 
+    if !should_burn_subtitle
+        && request
+            .selection
+            .subtitle_stream_index
+            .is_some_and(|index| index >= 0)
+    {
+        // FFmpeg otherwise buffers encoded video until every mapped stream has produced a packet
+        // or its ten-second interleave window expires. Sparse text tracks whose first cue appears
+        // later make the first HLS segment miss the player's deadline. A one-second mux window
+        // publishes empty WebVTT segments normally and does not change the media timestamps.
+        args.push("-max_interleave_delta".to_string());
+        args.push(HLS_TEXT_SUBTITLE_MAX_INTERLEAVE_DELTA_US.to_string());
+    }
+
     if let Some(output_ts_offset_ticks) = request.output_ts_offset_ticks
         && output_ts_offset_ticks > 0
     {
@@ -1372,6 +1387,12 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["-c:s", "webvtt"])
         );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-max_interleave_delta", "1000000"])
+        );
     }
 
     #[test]
@@ -1405,6 +1426,12 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|pair| pair == ["-c:s", "webvtt"])
+        );
+        assert!(
+            !command
+                .args
+                .iter()
+                .any(|arg| arg == "-max_interleave_delta")
         );
     }
 
