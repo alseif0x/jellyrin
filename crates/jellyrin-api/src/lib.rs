@@ -36661,7 +36661,7 @@ fn selected_text_subtitle_can_use_hls(item: &MediaItem, options: &PlaybackInfoOp
     selected_is_text
         && options.subtitle_profiles.as_ref().is_some_and(|profiles| {
             profiles.iter().any(|profile| {
-                profile.method.as_deref() == Some("hls")
+                matches!(profile.method.as_deref(), Some("external" | "hls"))
                     && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
             })
         })
@@ -95762,7 +95762,7 @@ done
                 }],
                 "SubtitleProfiles": [{
                     "Format": "vtt",
-                    "Method": "Hls"
+                    "Method": "External"
                 }]
             }
         }));
