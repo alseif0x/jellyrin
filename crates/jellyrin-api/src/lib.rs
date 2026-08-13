@@ -227,6 +227,8 @@ const LIVE_HLS_SESSION_REGISTRY_MAX_ENTRIES: usize = 4_096;
 const HLS_SEGMENT_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const HLS_SEGMENT_WAIT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
 const DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS: i64 = 15;
+const MIN_VIDEO_TRANSCODE_BITRATE: u32 = 2_000_000;
+const MAX_VIDEO_TRANSCODE_BITRATE: u32 = 8_000_000;
 const HLS_ON_DEMAND_SEEK_AHEAD_SEGMENTS: i64 = 8;
 const DEFAULT_HLS_SEEK_GENERATION_TIMEOUT_SECONDS: u64 = 180;
 const MIN_HLS_SEEK_GENERATION_TIMEOUT_SECONDS: u64 = 30;
@@ -37177,6 +37179,23 @@ fn playback_output_constraints(
                 );
             }
         }
+    }
+    if video_mode == HlsStreamMode::Encode
+        && let Some(source_bitrate) = item.bitrate.and_then(positive_u32)
+    {
+        // MaxStreamingBitrate is a transport ceiling, not a desired encoder bitrate. Browsers
+        // commonly advertise values around 140 Mbps; using that directly turned a 2.1 Mbps source
+        // into 30-50 MiB HLS segments. Bound software H.264 relative to the source while retaining
+        // enough headroom for HEVC-to-AVC efficiency differences.
+        let source_relative_ceiling = source_bitrate
+            .saturating_mul(2)
+            .clamp(MIN_VIDEO_TRANSCODE_BITRATE, MAX_VIDEO_TRANSCODE_BITRATE);
+        output.video_bitrate = Some(
+            output
+                .video_bitrate
+                .unwrap_or(source_relative_ceiling)
+                .min(source_relative_ceiling),
+        );
     }
     if video_mode == HlsStreamMode::Encode
         && !encoded_output_codec_conditions_compatible(item, options, "Video", "h264", output)
@@ -95798,6 +95817,7 @@ done
         let fallback = playback_delivery_decision(&item, Some(&metadata), &no_hls_subtitles);
         assert_eq!(fallback.delivery, DeliveryMode::HlsTranscode);
         assert_eq!(fallback.video, HlsStreamMode::Encode);
+        assert_eq!(fallback.output.video_bitrate, Some(8_000_000));
     }
 
     #[test]
