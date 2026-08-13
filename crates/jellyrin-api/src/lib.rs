@@ -53648,19 +53648,21 @@ async fn remote_metadata_item_image_response(
         return Ok(None);
     }
     let metadata = metadata_payload_for_item(&state.db, item.id).await?;
-    let Some(image_url) = metadata_remote_image_url(&metadata, image_type) else {
-        return Ok(None);
-    };
-    if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
-        return stored_image_response(path).await.map(Some);
-    }
-    match fetch_remote_image_payload(&image_url).await {
-        Ok((bytes, _mime_type)) => {
-            let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
+    for image_url in metadata_remote_image_urls(&metadata, image_type) {
+        if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
             return stored_image_response(path).await.map(Some);
         }
-        Err(error) => {
-            tracing::warn!(?error, "failed to cache remote metadata item image");
+        match fetch_remote_image_payload(&image_url).await {
+            Ok((bytes, _mime_type)) => {
+                let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
+                return stored_image_response(path).await.map(Some);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "failed to cache remote metadata item image candidate"
+                );
+            }
         }
     }
     Ok(None)
@@ -53688,46 +53690,50 @@ async fn virtual_tv_item_image_response(
     };
     // Every episode repeats the same series artwork, so take the first fetchable url rather than
     // letting one episode with a missing value blank the whole series.
-    let Some(image_url) = snapshot.items.iter().find_map(|item| {
-        snapshot
-            .metadata_by_item
-            .get(&item.id)
-            .and_then(|metadata| metadata_series_remote_image_url(metadata, image_type))
-    }) else {
-        return Ok(None);
-    };
-    if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
-        return stored_image_response(path).await.map(Some);
-    }
-    match fetch_remote_image_payload(&image_url).await {
-        Ok((bytes, _mime_type)) => {
-            let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
-            stored_image_response(path).await.map(Some)
+    let mut seen = HashSet::new();
+    for item in &snapshot.items {
+        let Some(metadata) = snapshot.metadata_by_item.get(&item.id) else {
+            continue;
+        };
+        for image_url in metadata_series_remote_image_urls(metadata, image_type) {
+            if !seen.insert(image_url.clone()) {
+                continue;
+            }
+            if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
+                return stored_image_response(path).await.map(Some);
+            }
+            match fetch_remote_image_payload(&image_url).await {
+                Ok((bytes, _mime_type)) => {
+                    let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
+                    return stored_image_response(path).await.map(Some);
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "failed to cache remote series image candidate");
+                }
+            }
         }
-        Err(error) => {
-            tracing::warn!(?error, "failed to cache remote series image");
-            Ok(None)
-        }
     }
+    Ok(None)
 }
 
-fn metadata_series_remote_image_url(
+fn metadata_series_remote_image_urls(
     metadata: &serde_json::Value,
     image_type: &str,
-) -> Option<String> {
+) -> Vec<String> {
     let keys: &[&str] = match normalize_image_type(image_type).as_str() {
         "primary" => &["SeriesPrimaryImageUrl", "SeriesImageUrl"],
         "backdrop" => &["SeriesBackdropImageUrl", "SeriesBackgroundImageUrl"],
         "thumb" => &["SeriesThumbImageUrl"],
         "logo" => &["SeriesLogoImageUrl"],
-        _ => return None,
+        _ => return Vec::new(),
     };
     metadata_values_from_json(metadata, keys)
         .into_iter()
-        .find(|url| remote_image_url_is_fetchable(url))
+        .filter(|url| remote_image_url_is_fetchable(url))
+        .collect()
 }
 
-fn metadata_remote_image_url(metadata: &serde_json::Value, image_type: &str) -> Option<String> {
+fn metadata_remote_image_urls(metadata: &serde_json::Value, image_type: &str) -> Vec<String> {
     let keys: &[&str] = match normalize_image_type(image_type).as_str() {
         "primary" => &[
             "PrimaryImageUrl",
@@ -53743,11 +53749,12 @@ fn metadata_remote_image_url(metadata: &serde_json::Value, image_type: &str) -> 
         ],
         "thumb" => &["ThumbImageUrl", "SeriesThumbImageUrl", "BannerImageUrl"],
         "logo" => &["LogoImageUrl", "SeriesLogoImageUrl"],
-        _ => return None,
+        _ => return Vec::new(),
     };
     metadata_values_from_json(metadata, keys)
         .into_iter()
-        .find(|url| remote_image_url_is_fetchable(url))
+        .filter(|url| remote_image_url_is_fetchable(url))
+        .collect()
 }
 
 async fn generated_video_image_is_usable(path: &std::path::Path) -> bool {
