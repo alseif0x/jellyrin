@@ -20544,8 +20544,9 @@ fn live_tv_channel_record_to_json(
     }
     apply_live_tv_image_metadata(&mut base);
     if (live_tv_channel_path(&base).is_ok() || live_tv_channel_provider_reference(&base).is_some())
-        && let Ok(media_source) = live_tv_channel_media_source(&base)
+        && let Ok(mut media_source) = live_tv_channel_media_source(&base)
     {
+        suppress_remote_live_tv_direct_stream_for_item_detail(&mut media_source);
         base["MediaSources"] = serde_json::json!([media_source]);
     }
     base
@@ -24164,11 +24165,31 @@ fn live_tv_channel_item(
     base["CurrentProgram"] = serde_json::Value::Null;
     apply_live_tv_image_metadata(&mut base);
     if live_tv_channel_path(&base).is_ok()
-        && let Ok(media_source) = live_tv_channel_media_source(&base)
+        && let Ok(mut media_source) = live_tv_channel_media_source(&base)
     {
+        suppress_remote_live_tv_direct_stream_for_item_detail(&mut media_source);
         base["MediaSources"] = serde_json::json!([media_source]);
     }
     Some(base)
+}
+
+fn suppress_remote_live_tv_direct_stream_for_item_detail(media_source: &mut serde_json::Value) {
+    let Some(media_source) = media_source.as_object_mut() else {
+        return;
+    };
+    if !media_source
+        .get("IsRemote")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // Jellyfin Web makes its initial play-method choice from the media source embedded in the
+    // item detail before it applies PlaybackInfo. Advertising raw MPEG-TS here makes the browser
+    // synthesize /Videos/{id}/stream.ts even when PlaybackInfo correctly selects HLS. Keep the
+    // raw TS capability private to PlaybackInfo's explicit native-client fallback.
+    media_source.insert("SupportsDirectStream".to_string(), serde_json::json!(false));
+    media_source.remove("DirectStreamUrl");
 }
 
 fn live_tv_channel_path(channel: &serde_json::Value) -> Result<PathBuf, ApiError> {
@@ -24358,7 +24379,11 @@ fn live_tv_channel_media_source(
         "IsInfiniteStream": true,
         "CanSeek": false,
         "UseMostCompatibleTranscodingProfile": false,
-        "RequiresOpening": is_legacy_hdhomerun || opaque_provider,
+        // Opaque providers resolve their source lazily when the selected direct/HLS URL is
+        // requested. Marking them RequiresOpening makes Jellyfin Web call /LiveStreams/Open;
+        // that legacy endpoint has no DeviceProfile and replaces the negotiated HLS source with
+        // the raw TS base source. Only legacy HDHomeRun needs an explicit open lifecycle.
+        "RequiresOpening": is_legacy_hdhomerun,
         "RequiresClosing": true,
         "RequiresLooping": false,
         "SupportsProbing": false,
@@ -69178,9 +69203,15 @@ done
         assert_eq!(channel_detail["Id"], "xtream_2");
         assert_eq!(channel_detail["Type"], "TvChannel");
         assert_eq!(
-            channel_detail["MediaSources"][0]["DirectStreamUrl"],
-            "/LiveTv/LiveStreamFiles/xtream_2/stream.ts"
+            channel_detail["MediaSources"][0]["SupportsDirectStream"],
+            false
         );
+        assert!(
+            channel_detail["MediaSources"][0]
+                .get("DirectStreamUrl")
+                .is_none()
+        );
+        assert_eq!(channel_detail["MediaSources"][0]["RequiresOpening"], false);
 
         for endpoint in [
             format!("/Items/xtream_2/PlaybackInfo?UserId={}", user.id),
@@ -75231,6 +75262,7 @@ done
         assert_eq!(media_source["Path"], serde_json::Value::Null);
         assert_eq!(media_source["SupportsDirectStream"], true);
         assert_eq!(media_source["SupportsTranscoding"], true);
+        assert_eq!(media_source["RequiresOpening"], false);
         assert_eq!(media_source["TranscodingSubProtocol"], "hls");
         assert_eq!(media_source["TranscodingContainer"], "ts");
         let direct_url = media_source["DirectStreamUrl"].as_str().unwrap();
