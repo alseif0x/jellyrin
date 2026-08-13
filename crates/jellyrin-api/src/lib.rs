@@ -34656,7 +34656,10 @@ fn playback_transcode_session_info_response(
         media_source.insert("SupportsDirectPlay".to_string(), serde_json::json!(false));
         media_source.insert(
             "SupportsDirectStream".to_string(),
-            serde_json::json!(decision.delivery == DeliveryMode::HlsRemux),
+            serde_json::json!(
+                decision.delivery == DeliveryMode::HlsRemux
+                    && !selected_text_subtitle_prefers_hls(options)
+            ),
         );
         media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(true));
         media_source.insert(
@@ -96620,6 +96623,60 @@ done
                 .as_str()
                 .unwrap()
                 .contains("/Subtitles/2/subtitles.m3u8?")
+        );
+        let android_response = super::playback_transcode_session_info_response(
+            json!({
+                "MediaSources": [{
+                    "IsRemote": true,
+                    "MediaStreams": item.media_streams.clone()
+                }]
+            }),
+            "Video",
+            "secret-token",
+            "episode-id",
+            "play-session",
+            &android_options,
+            &android,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(
+            android_response["MediaSources"][0]["SupportsDirectStream"],
+            false
+        );
+        assert!(
+            android_response["MediaSources"][0]["TranscodingUrl"]
+                .as_str()
+                .unwrap()
+                .contains("/master.m3u8?")
+        );
+
+        let selection_two = TranscodeStreamSelection {
+            video_stream_index: Some(0),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(2),
+        };
+        let selection_three = TranscodeStreamSelection {
+            subtitle_stream_index: Some(3),
+            ..selection_two.clone()
+        };
+        assert_ne!(
+            playback_hls_transcode_dedupe_key(
+                Uuid::nil(),
+                &item,
+                &selection_two,
+                0,
+                android.video,
+                android.audio,
+            ),
+            playback_hls_transcode_dedupe_key(
+                Uuid::nil(),
+                &item,
+                &selection_three,
+                0,
+                android.video,
+                android.audio,
+            )
         );
 
         let no_hls_subtitles = PlaybackInfoOptions {
