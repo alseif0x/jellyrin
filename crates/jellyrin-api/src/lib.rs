@@ -38604,7 +38604,7 @@ async fn hls_master_playlist_response_for(
                     .height
                     .and_then(|value| positive_u32(i64::from(value))),
             ),
-        codecs: transcoded_hls_codecs(media_type),
+        codecs: hls_transcode_session_codecs(&session, media_type),
     };
     let playlist = if media_type == "Video" {
         render_video_hls_master_playlist(&session, item_id, raw_query, variant)
@@ -38808,8 +38808,17 @@ async fn hls_segment_response_for(
         active_hls_transcode_session_for(state, headers, item_id, &query, media_type).await?;
     touch_transcode_session(&session.play_session_id).await;
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
-    let segment_id = u32::try_from(segment.segment_id)
+    let requested_segment_id = u32::try_from(segment.segment_id)
         .map_err(|_| ApiError::not_found("HLS segment not found"))?;
+    // Seekable VOD playlists deliberately expose segment numbers relative to the requested
+    // playback position (0, 1, ...), while FFmpeg writes absolute sequence numbers so timestamp
+    // continuity survives seeks. Translate at the route boundary before resolving the file.
+    let segment_id = hls_storage_segment_id(
+        session.start_position_ticks,
+        session.item.runtime_ticks,
+        requested_segment_id,
+    )
+    .ok_or_else(|| ApiError::not_found("HLS segment not found"))?;
     let segment_path = layout.segment_path(segment_id);
     let mut generated_on_demand = false;
     if !segment_path.exists() && media_type == "Video" && !is_live_tv_channel_id(item_id) {
@@ -40708,7 +40717,7 @@ async fn subtitle_playlist(
     RawQuery(raw_query): RawQuery,
     Query(query): Query<SubtitlePlaylistQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     if is_live_tv_channel_id(&item_id) {
         return live_tv_subtitle_playlist_response(
             &item_id,
@@ -40733,6 +40742,28 @@ async fn subtitle_playlist(
         .checked_mul(10_000_000)
         .ok_or_else(|| ApiError::bad_request("segmentLength is invalid"))?;
 
+    let start_position_ticks = if let Some(play_session_id) = query
+        .play_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state
+            .db
+            .transcode_session_by_play_session_id(play_session_id)
+            .await?
+            .filter(|session| {
+                session.user_id == user.id
+                    && session.item.id == item.id
+                    && session.subtitle_stream_index == Some(index)
+            })
+            .map_or(0, |session| {
+                hls_effective_start_position_ticks(session.start_position_ticks, item.runtime_ticks)
+            })
+    } else {
+        0
+    };
+
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{segment_length}\n"));
@@ -40740,7 +40771,7 @@ async fn subtitle_playlist(
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
-    let mut position_ticks = 0_i64;
+    let mut position_ticks = start_position_ticks;
     while position_ticks < runtime_ticks {
         let end_ticks = runtime_ticks.min(position_ticks.saturating_add(segment_length_ticks));
         let duration = (end_ticks - position_ticks) as f64 / 10_000_000.0;
@@ -52020,6 +52051,21 @@ fn transcoded_hls_codecs(media_type: &str) -> Option<String> {
     }
 }
 
+fn hls_transcode_session_codecs(session: &TranscodeSession, media_type: &str) -> Option<String> {
+    if media_type == "Video"
+        && playback_hls_modes_from_dedupe_key(session.dedupe_key.as_deref())
+            .is_some_and(|(video, _)| video == HlsStreamMode::Copy)
+        && media_item_stream_codec(&session.item, "Video")
+            .is_some_and(|codec| !codec.eq_ignore_ascii_case("h264"))
+    {
+        // A copied HEVC/MPEG-2 stream must not be advertised as AVC. Omitting CODECS is safer than
+        // inventing an RFC 6381 profile string without all constraint flags; Media3 probes the TS
+        // PMT and initializes the correct hardware decoder from the actual stream.
+        return None;
+    }
+    transcoded_hls_codecs(media_type)
+}
+
 fn rewrite_hls_media_playlist(
     playlist: &str,
     item_id: &str,
@@ -52138,6 +52184,22 @@ fn hls_segment_ticks() -> i64 {
 
 fn hls_start_segment_number(start_position_ticks: i64) -> u32 {
     u32::try_from(start_position_ticks.max(0) / hls_segment_ticks()).unwrap_or(u32::MAX)
+}
+
+fn hls_storage_segment_id(
+    start_position_ticks: i64,
+    runtime_ticks: Option<i64>,
+    playlist_segment_id: u32,
+) -> Option<u32> {
+    if runtime_ticks.is_some_and(|ticks| ticks > 0) {
+        hls_start_segment_number(hls_effective_start_position_ticks(
+            start_position_ticks,
+            runtime_ticks,
+        ))
+        .checked_add(playlist_segment_id)
+    } else {
+        Some(playlist_segment_id)
+    }
 }
 
 fn align_hls_request_segment_timeline(request: &mut HlsTranscodeRequest) {
@@ -56626,10 +56688,11 @@ mod tests {
         filter_package_list, format_time_for_json, generate_missing_hls_segment,
         get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
         hls_on_demand_generation_lock, hls_segment_start_position_ticks, hls_segment_ticks,
-        hls_start_segment_number, hls_transcode_dedupe_key, hls_transcode_session_input_path,
-        internal_remote_relay_target, is_live_tv_channel_id, json_string_field, json_value_i64,
-        last_system_lifecycle_command, live_hls_session_registry, live_tv_channel_is_remote,
-        live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
+        hls_start_segment_number, hls_storage_segment_id, hls_transcode_dedupe_key,
+        hls_transcode_session_input_path, internal_remote_relay_target, is_live_tv_channel_id,
+        json_string_field, json_value_i64, last_system_lifecycle_command,
+        live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
+        live_tv_channel_stable_uuid, live_tv_configuration_json,
         live_tv_hls_transcoding_profile_supported, live_tv_m3u_channels_from_payload,
         live_tv_playback_info_response, live_tv_recording_name,
         live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
@@ -96821,6 +96884,15 @@ done
             hls_segment_start_position_ticks(start_position_ticks, initial_segment_id - 1),
             None
         );
+        assert_eq!(
+            hls_storage_segment_id(start_position_ticks, Some(47_560_430_000), 0),
+            Some(initial_segment_id)
+        );
+        assert_eq!(
+            hls_storage_segment_id(start_position_ticks, Some(47_560_430_000), 2),
+            Some(initial_segment_id + 2)
+        );
+        assert_eq!(hls_storage_segment_id(0, None, 2), Some(2));
 
         let mut request = HlsTranscodeRequest::new(
             "input.mkv",
