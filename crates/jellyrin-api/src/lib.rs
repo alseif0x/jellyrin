@@ -34067,6 +34067,7 @@ async fn playback_info_response(
         item = resolved.item;
     }
     let metadata = metadata.as_ref();
+    apply_android_remote_subtitle_hls_policy(&item, metadata, &token.client, &mut options);
     let item_json = media_item_to_json_with_playback_and_metadata(
         &item,
         &server_id,
@@ -34170,6 +34171,51 @@ async fn playback_info_response(
         "MediaSources": media_sources,
         "PlaySessionId": play_session_id,
     })))
+}
+
+// Android Media3 downloads External WebVTT as one finite document. Some Xtream origins expose
+// remote MKV files in bounded chunks, so a full-file subtitle extraction either truncates at the
+// first chunk or delays playback while the server reads the entire episode. Prefer the existing
+// synchronized HLS WebVTT sidecar for this client: A/V remain stream-copy whenever its HLS profile
+// accepts their codecs.
+fn apply_android_remote_subtitle_hls_policy(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+    client: &str,
+    options: &mut PlaybackInfoOptions,
+) {
+    if !is_xtream_remote_media(metadata)
+        || !client.eq_ignore_ascii_case("Jellyfin for Android")
+        || !options
+            .subtitle_stream_index
+            .is_some_and(|index| index >= 0)
+    {
+        return;
+    }
+
+    if playback_profile_video_codec_compatible(item, options)
+        && let Some(codec) = media_item_stream_codec(item, "Video")
+        && let Some(profiles) = options.transcoding_profiles.as_mut()
+    {
+        for profile in profiles.iter_mut().filter(|profile| {
+            profile
+                .protocols
+                .iter()
+                .any(|protocol| protocol.eq_ignore_ascii_case("hls"))
+        }) {
+            if !profile
+                .video_codecs
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&codec))
+            {
+                profile.video_codecs.push(codec.clone());
+            }
+        }
+    }
+    options.subtitle_profiles = Some(vec![SubtitleProfileMatcher {
+        format: Some("webvtt".to_string()),
+        method: Some("hls".to_string()),
+    }]);
 }
 
 fn live_tv_playback_info_response(
@@ -34867,16 +34913,20 @@ fn apply_hls_transcode_stream_contract(
                         let index = index.unwrap_or_default();
                         stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
                         stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
+                        let use_hls = !is_remote || selected_text_subtitle_prefers_hls(options);
                         stream.insert(
                             "DeliveryMethod".to_string(),
-                            serde_json::json!(if is_remote { "External" } else { "Hls" }),
+                            serde_json::json!(if use_hls { "Hls" } else { "External" }),
                         );
-                        stream.insert("IsExternal".to_string(), serde_json::json!(is_remote));
+                        stream.insert(
+                            "IsExternal".to_string(),
+                            serde_json::json!(is_remote && !use_hls),
+                        );
                         stream.insert(
                             "SupportsExternalStream".to_string(),
                             serde_json::json!(true),
                         );
-                        let delivery_url = if is_remote {
+                        let delivery_url = if !use_hls {
                             format!(
                                 "/Videos/{item_id}/{item_id}/Subtitles/{index}/Stream.vtt?PlaySessionId={play_session_id}&api_key={access_token}"
                             )
@@ -36889,6 +36939,15 @@ fn selected_text_subtitle_can_use_external(
         })
 }
 
+fn selected_text_subtitle_prefers_hls(options: &PlaybackInfoOptions) -> bool {
+    options.subtitle_profiles.as_ref().is_some_and(|profiles| {
+        profiles.iter().any(|profile| {
+            profile.method.as_deref() == Some("hls")
+                && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
+        })
+    })
+}
+
 fn hls_transcoding_profile_matches(
     item: &MediaItem,
     options: &PlaybackInfoOptions,
@@ -37573,8 +37632,8 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         && audio_codec_conditions_compatible
         && !max_streaming_bitrate_exceeded
         && !selected_audio_needs_transcode
-        && !selected_subtitle_requires_processing
-        && hls_video_stream_copy_supported(item)
+        && (!selected_subtitle_requires_processing || selected_text_subtitle_prefers_hls(options))
+        && (hls_video_stream_copy_supported(item) || selected_text_subtitle_prefers_hls(options))
         && hls_audio_stream_copy_supported(item, options)
         && hls_transcoding_profile_supported(item, options, remux_video_mode, HlsStreamMode::Copy)
     {
@@ -56549,7 +56608,8 @@ mod tests {
         SystemLifecycleCommand, TranscodingProfileMatcher, TvMazeExternals, TvMazeImage,
         TvMazeNetwork, TvMazeRating, TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry,
         activate_dotnet_plugin_with_host_path, activate_rust_wasi_plugin_with_host_path,
-        align_hls_request_segment_timeline, apply_direct_external_text_subtitle_contract,
+        align_hls_request_segment_timeline, apply_android_remote_subtitle_hls_policy,
+        apply_direct_external_text_subtitle_contract, apply_hls_transcode_stream_contract,
         apply_live_hls_ffmpeg_policy, apply_playback_output_constraints,
         await_package_install_cancelable, backup_restore_snapshot_json,
         cascade_delete_series_timer_timers, classify_transcode_command,
@@ -56586,7 +56646,8 @@ mod tests {
         record_channel_to_file, redact_sensitive_log_text, render_seekable_hls_media_playlist_for,
         reserve_live_tv_recording_start, resolved_xtream_remote_source_revision, router,
         run_due_live_tv_timers, run_startup_command_output, scan_all_library_items,
-        selected_aac_output_channels, selected_video_frame_rate_limit, series_timer_child_id,
+        selected_aac_output_channels, selected_text_subtitle_prefers_hls,
+        selected_video_frame_rate_limit, series_timer_child_id,
         set_xtream_remote_media_probe_metadata, spawn_hls_transcode_task, stable_entity_id,
         subscribe_playback_events, subscribe_system_lifecycle_commands, subtitle_add_vtt_time_map,
         subtitle_vtt_to_track_events_json, syncplay_cleanup_stale_participants, syncplay_groups,
@@ -96515,6 +96576,50 @@ done
         assert_eq!(
             subtitle["DeliveryUrl"],
             "/Videos/episode-id/episode-id/Subtitles/2/Stream.vtt?api_key=secret-token&PlaySessionId=play-session&JellyrinSegmented=true&StartPositionTicks=0&EndPositionTicks=300000000"
+        );
+
+        let mut android_options = hevc_subtitle_options.clone();
+        apply_android_remote_subtitle_hls_policy(
+            &item,
+            Some(&metadata),
+            "Jellyfin for Android",
+            &mut android_options,
+        );
+        let android = playback_delivery_decision(&item, Some(&metadata), &android_options);
+        assert_eq!(android.delivery, DeliveryMode::HlsRemux);
+        assert_eq!(android.video, HlsStreamMode::Copy);
+        assert_eq!(android.audio, HlsStreamMode::Copy);
+        assert!(selected_text_subtitle_prefers_hls(&android_options));
+        assert!(
+            android_options
+                .transcoding_profiles
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|profile| profile.video_codecs.iter().any(|codec| codec == "hevc"))
+        );
+
+        let mut android_media_source = json!({
+            "IsRemote": true,
+            "MediaStreams": item.media_streams.clone()
+        });
+        apply_hls_transcode_stream_contract(
+            android_media_source.as_object_mut().unwrap(),
+            "Video",
+            "secret-token",
+            "episode-id",
+            "play-session",
+            &android_options,
+            &android,
+        );
+        let android_subtitle = &android_media_source["MediaStreams"][2];
+        assert_eq!(android_subtitle["DeliveryMethod"], "Hls");
+        assert_eq!(android_subtitle["IsExternal"], false);
+        assert!(
+            android_subtitle["DeliveryUrl"]
+                .as_str()
+                .unwrap()
+                .contains("/Subtitles/2/subtitles.m3u8?")
         );
 
         let no_hls_subtitles = PlaybackInfoOptions {
