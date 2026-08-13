@@ -62,27 +62,28 @@
     }
 
     function addNativeCues(events) {
+        // The custom Jellyfin renderer consumes the shared TrackEvents array directly. Feeding a
+        // native text track at the same time makes the browser draw the same subtitle twice.
+        if (document.querySelector('.videoSubtitlesInner')) return;
         const video = currentVideo();
         if (!video || !video.textTracks) return;
-        const tracks = Array.from(video.textTracks).filter(track => track.mode !== 'disabled');
-        for (const track of tracks) {
-            if (!track.cues) continue;
-            const existing = new Set(Array.from(track.cues).map(cue => (
-                `${Math.round(cue.startTime * ticksPerSecond)}:`
-                + `${Math.round(cue.endTime * ticksPerSecond)}:${cue.text || ''}`
-            )));
-            for (const event of events) {
-                if (existing.has(eventKey(event))) continue;
-                try {
-                    const Cue = window.VTTCue || window.TextTrackCue;
-                    track.addCue(new Cue(
-                        event.StartPositionTicks / ticksPerSecond,
-                        event.EndPositionTicks / ticksPerSecond,
-                        event.Text || ''
-                    ));
-                } catch (error) {
-                    console.debug('[Jellyrin] Could not append a native subtitle cue', error);
-                }
+        const track = Array.from(video.textTracks).find(candidate => candidate.mode === 'showing');
+        if (!track || !track.cues) return;
+        const existing = new Set(Array.from(track.cues).map(cue => (
+            `${Math.round(cue.startTime * ticksPerSecond)}:`
+            + `${Math.round(cue.endTime * ticksPerSecond)}:${cue.text || ''}`
+        )));
+        for (const event of events) {
+            if (existing.has(eventKey(event))) continue;
+            try {
+                const Cue = window.VTTCue || window.TextTrackCue;
+                track.addCue(new Cue(
+                    event.StartPositionTicks / ticksPerSecond,
+                    event.EndPositionTicks / ticksPerSecond,
+                    event.Text || ''
+                ));
+            } catch (error) {
+                console.debug('[Jellyrin] Could not append a native subtitle cue', error);
             }
         }
     }
@@ -130,7 +131,6 @@
         function restoreCurrentCues() {
             const current = currentVideo();
             if (!current) return;
-            addNativeCues(events);
             // Jellyfin's custom subtitle renderer normally repaints on a media timeupdate. Browsers
             // can suppress that event while a tab is hidden, especially when playback is paused.
             current.dispatchEvent(new Event('timeupdate'));
