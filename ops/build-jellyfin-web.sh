@@ -183,7 +183,7 @@ const offset = source.indexOf(marker);
 if (offset < 0) {
   throw new Error('Jellyfin Web index does not contain the runtime bundle marker');
 }
-const adapter = '<script defer="defer" src="jellyrin-segmented-subtitles.js?v=1"></script>';
+const adapter = '<script defer="defer" src="jellyrin-segmented-subtitles.js?v=2"></script>';
 if (source.includes(adapter)) {
   throw new Error('Jellyrin segmented subtitle adapter was already injected');
 }

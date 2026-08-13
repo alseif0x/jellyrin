@@ -99,7 +99,8 @@
         async function loadCurrentWindow() {
             if (stopped) return;
             const start = windowStartSeconds(currentVideo());
-            if (loadedStarts.has(start) || loadingStarts.has(start)) return;
+            if (loadedStarts.has(start)) return;
+            if (loadingStarts.has(start)) return;
             loadingStarts.add(start);
             try {
                 const data = await fetchWindow(url, init, start);
@@ -118,6 +119,7 @@
                 // Native text tracks need later windows appended explicitly.
                 addNativeCues(added);
                 loadedStarts.add(start);
+                restoreCurrentCues();
             } catch (error) {
                 console.warn('[Jellyrin] Failed to load a subtitle window', error);
             } finally {
@@ -125,10 +127,28 @@
             }
         }
 
+        function restoreCurrentCues() {
+            const current = currentVideo();
+            if (!current) return;
+            addNativeCues(events);
+            // Jellyfin's custom subtitle renderer normally repaints on a media timeupdate. Browsers
+            // can suppress that event while a tab is hidden, especially when playback is paused.
+            current.dispatchEvent(new Event('timeupdate'));
+        }
+
+        const onResume = () => {
+            if (document.visibilityState === 'hidden') return;
+            void loadCurrentWindow();
+            restoreCurrentCues();
+        };
+
         const timer = window.setInterval(loadCurrentWindow, 2000);
         const onSeek = () => void loadCurrentWindow();
         const video = currentVideo();
         if (video) video.addEventListener('seeking', onSeek);
+        document.addEventListener('visibilitychange', onResume);
+        window.addEventListener('pageshow', onResume);
+        window.addEventListener('focus', onResume);
 
         const controller = {
             events,
@@ -136,6 +156,9 @@
                 stopped = true;
                 window.clearInterval(timer);
                 if (video) video.removeEventListener('seeking', onSeek);
+                document.removeEventListener('visibilitychange', onResume);
+                window.removeEventListener('pageshow', onResume);
+                window.removeEventListener('focus', onResume);
             }
         };
         activeController = controller;
