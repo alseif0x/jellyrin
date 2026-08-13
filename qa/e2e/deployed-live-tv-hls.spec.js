@@ -23,6 +23,8 @@ test.describe('deployed Live TV HLS compatibility', () => {
         expect(playbackInfo.PlaySessionId, `${channel.Id} PlaySessionId`).toBeTruthy();
         expect(mediaSource?.Id, `${channel.Id} MediaSource.Id`).toBe(channel.Id);
         expect(mediaSource?.SupportsTranscoding, `${channel.Id} SupportsTranscoding`).toBe(true);
+        expect(mediaSource?.SupportsDirectStream, `${channel.Id} raw TS is not selected for Web`).toBe(false);
+        expect(mediaSource?.DirectStreamUrl, `${channel.Id} does not expose a competing Web TS URL`).toBeFalsy();
         expect(mediaSource?.TranscodingUrl, `${channel.Id} TranscodingUrl`).toBeTruthy();
 
         const { mainUrl, mainText } = await loadHlsPlaylists(request, baseURL, mediaSource.TranscodingUrl);
@@ -106,8 +108,37 @@ async function resolveLiveTvChannels(request, auth) {
 }
 
 async function requestPlaybackInfo(request, auth, itemId) {
-  const response = await request.get(`/Items/${itemId}/PlaybackInfo?UserId=${auth.User.Id}`, {
+  const response = await request.post(`/Items/${itemId}/PlaybackInfo`, {
     headers: { 'X-Emby-Token': auth.AccessToken },
+    data: {
+      UserId: auth.User.Id,
+      IsPlayback: true,
+      AutoOpenLiveStream: true,
+      EnableDirectPlay: true,
+      EnableDirectStream: true,
+      EnableTranscoding: true,
+      DeviceProfile: {
+        Name: 'Jellyfin Web',
+        MaxStreamingBitrate: 120_000_000,
+        DirectPlayProfiles: [
+          { Container: 'webm', Type: 'Video', VideoCodec: 'vp8,vp9,av1', AudioCodec: 'vorbis,opus' },
+          { Container: 'mp4,m4v', Type: 'Video', VideoCodec: 'h264,av1', AudioCodec: 'aac,mp3,opus,flac,vorbis' },
+        ],
+        TranscodingProfiles: [{
+          Container: 'ts',
+          Type: 'Video',
+          VideoCodec: 'h264',
+          AudioCodec: 'aac',
+          Protocol: 'hls',
+          Context: 'Streaming',
+          EnableMpegtsM2TsMode: true,
+          CopyTimestamps: true,
+        }],
+        ContainerProfiles: [],
+        CodecProfiles: [],
+        SubtitleProfiles: [],
+      },
+    },
   });
   expect(response.status(), `${itemId} PlaybackInfo`).toBe(200);
   return response.json();

@@ -34058,14 +34058,24 @@ fn live_tv_playback_info_response(
                 .get("SupportsDirectPlay")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-        let direct_stream_supported = options.enable_direct_stream
-            && media_source
-                .get("SupportsDirectStream")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
         let transcode_supported = options.enable_transcoding
             && media_source
                 .get("SupportsTranscoding")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            && configured_ffmpeg_mode() != FfmpegMode::Disabled
+            && live_tv_hls_transcoding_profile_supported(&options);
+        // Jellyfin's "DirectStream" normally means that the server may remux the source into a
+        // client-compatible container.  This endpoint is a CPU-free byte proxy and therefore
+        // preserves the provider's MPEG-TS container.  Advertising it alongside HLS makes
+        // Jellyfin Web choose the raw TS URL, which HTMLMediaElement cannot play and leaves the
+        // UI loading forever.  Prefer the compatible HLS remux whenever the client offers an HLS
+        // streaming profile; retain raw TS as a fallback for native clients that explicitly
+        // disable (or do not advertise) HLS.
+        let direct_stream_supported = options.enable_direct_stream
+            && !transcode_supported
+            && media_source
+                .get("SupportsDirectStream")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
         media_source.insert(
@@ -34096,12 +34106,48 @@ fn live_tv_playback_info_response(
         if !direct_stream_supported {
             media_source.remove("DirectStreamUrl");
         }
+        tracing::info!(
+            channel_id = %playback_channel_id,
+            delivery_mode = if transcode_supported { "hls-remux" } else { "direct-ts-fallback" },
+            supports_direct_stream = direct_stream_supported,
+            supports_transcoding = transcode_supported,
+            ffmpeg_mode = ffmpeg_mode_name(configured_ffmpeg_mode()),
+            "selected live TV playback delivery mode"
+        );
         apply_playback_stream_selection(media_source, &options);
     }
     Ok(Json(serde_json::json!({
         "MediaSources": [media_source],
         "PlaySessionId": play_session_id,
     })))
+}
+
+fn live_tv_hls_transcoding_profile_supported(options: &PlaybackInfoOptions) -> bool {
+    options
+        .transcoding_profiles
+        .as_ref()
+        .is_none_or(|profiles| {
+            profiles.iter().any(|profile| {
+                profile
+                    .profile_type
+                    .as_deref()
+                    .is_none_or(|profile_type| profile_type.eq_ignore_ascii_case("Video"))
+                    && profile
+                        .context
+                        .as_deref()
+                        .is_none_or(|context| context.eq_ignore_ascii_case("Streaming"))
+                    && (profile.protocols.is_empty()
+                        || profile
+                            .protocols
+                            .iter()
+                            .any(|protocol| protocol.eq_ignore_ascii_case("hls")))
+                    && (profile.containers.is_empty()
+                        || profile
+                            .containers
+                            .iter()
+                            .any(|container| matches!(container.as_str(), "ts" | "mpegts")))
+            })
+        })
 }
 
 async fn active_playback_session_for_user_item(
@@ -41962,6 +42008,17 @@ async fn direct_stream_media(
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, headers, api_key).await?;
+    // Some Jellyfin clients ignore DirectStreamUrl and synthesize /Videos/{id}/stream.* from the
+    // media-source id. Keep that native-client fallback working for opaque Live TV ids as well.
+    if media_type == "Video"
+        && let Some(channel) = live_tv_channel_json_for_playable_item(&state.db, item_id).await?
+    {
+        let mut response = stream_live_tv_channel(channel, headers, &state.db).await?;
+        if !include_body {
+            *response.body_mut() = Body::empty();
+        }
+        return Ok(response);
+    }
     let requested_item = media_item_by_id(&state.db, item_id).await?;
     let item = resolve_media_source_item(&state.db, requested_item, media_source_id)
         .await?
@@ -55936,13 +55993,14 @@ mod tests {
         LiveTunerLease, LiveTunerLeaseKey, LiveTvTimerSchedulerRun,
         PACKAGE_REPOSITORIES_REFRESH_TASK_KEY, PackageListQuery, PlaybackInfoOptions,
         PlaybackOutputConstraints, PlaybackReportOutcome, SYNCPLAY_DRIFT_THRESHOLD_TICKS,
-        SystemLifecycleCommand, TvMazeExternals, TvMazeImage, TvMazeNetwork, TvMazeRating,
-        TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry, activate_dotnet_plugin_with_host_path,
-        activate_rust_wasi_plugin_with_host_path, align_hls_request_segment_timeline,
-        apply_direct_external_text_subtitle_contract, apply_live_hls_ffmpeg_policy,
-        apply_playback_output_constraints, await_package_install_cancelable,
-        backup_restore_snapshot_json, cascade_delete_series_timer_timers,
-        classify_transcode_command, cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
+        SystemLifecycleCommand, TranscodingProfileMatcher, TvMazeExternals, TvMazeImage,
+        TvMazeNetwork, TvMazeRating, TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry,
+        activate_dotnet_plugin_with_host_path, activate_rust_wasi_plugin_with_host_path,
+        align_hls_request_segment_timeline, apply_direct_external_text_subtitle_contract,
+        apply_live_hls_ffmpeg_policy, apply_playback_output_constraints,
+        await_package_install_cancelable, backup_restore_snapshot_json,
+        cascade_delete_series_timer_timers, classify_transcode_command,
+        cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
         cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
         codec_condition_matches, codec_condition_property_value, default_audio_stream_index,
         default_live_tv_configuration, default_subtitle_stream_index, default_user_configuration,
@@ -55956,7 +56014,8 @@ mod tests {
         internal_remote_relay_target, is_live_tv_channel_id, json_string_field, json_value_i64,
         last_system_lifecycle_command, live_hls_session_registry, live_tv_channel_is_remote,
         live_tv_channel_media_source, live_tv_channel_stable_uuid, live_tv_configuration_json,
-        live_tv_m3u_channels_from_payload, live_tv_recording_name,
+        live_tv_hls_transcoding_profile_supported, live_tv_m3u_channels_from_payload,
+        live_tv_playback_info_response, live_tv_recording_name,
         live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
         metadata_editor_parental_rating_options, normalize_media_stream,
@@ -69150,7 +69209,7 @@ done
             );
             assert_eq!(
                 playback_info["MediaSources"][0]["DirectStreamUrl"],
-                "/LiveTv/LiveStreamFiles/xtream_2/stream.ts",
+                Value::Null,
                 "{endpoint}"
             );
             assert_eq!(
@@ -69158,7 +69217,7 @@ done
                 "{endpoint}"
             );
             assert_eq!(
-                playback_info["MediaSources"][0]["SupportsDirectStream"], true,
+                playback_info["MediaSources"][0]["SupportsDirectStream"], false,
                 "{endpoint}"
             );
             assert_eq!(
@@ -75179,6 +75238,78 @@ done
         assert!(direct_url.starts_with("/LiveTv/LiveStreamFiles/xtream_opaque_42/"));
         assert!(transcode_url.starts_with("/Videos/xtream_opaque_42/master.m3u8?"));
         assert!(!media_source.to_string().contains("opaque-reference"));
+    }
+
+    #[test]
+    fn live_tv_playback_prefers_hls_for_web_and_retains_native_ts_fallback() {
+        let channel = json!({
+            "Id": "xtream_opaque_42",
+            "Name": "Opaque News",
+            "ProviderType": "xtream",
+            "ProviderReference": "xtream:v1:opaque-reference"
+        });
+        let hls_profile = TranscodingProfileMatcher {
+            profile_type: Some("Video".to_string()),
+            context: Some("Streaming".to_string()),
+            containers: vec!["ts".to_string()],
+            protocols: vec!["hls".to_string()],
+            video_codecs: vec!["h264".to_string()],
+            audio_codecs: vec!["aac".to_string()],
+            max_width: None,
+            max_height: None,
+            video_bitrate: None,
+            audio_bitrate: None,
+        };
+        let web_options = PlaybackInfoOptions {
+            transcoding_profiles: Some(vec![hls_profile]),
+            ..PlaybackInfoOptions::default()
+        };
+        let web = live_tv_playback_info_response(&channel, "secret", web_options)
+            .unwrap()
+            .0;
+        assert_eq!(web["MediaSources"][0]["SupportsTranscoding"], true);
+        assert_eq!(web["MediaSources"][0]["SupportsDirectStream"], false);
+        assert!(web["MediaSources"][0].get("DirectStreamUrl").is_none());
+        assert!(
+            web["MediaSources"][0]["TranscodingUrl"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("/Videos/xtream_opaque_42/master.m3u8?"))
+        );
+
+        let native_options = PlaybackInfoOptions {
+            enable_transcoding: false,
+            ..PlaybackInfoOptions::default()
+        };
+        let native = live_tv_playback_info_response(&channel, "secret", native_options)
+            .unwrap()
+            .0;
+        assert_eq!(native["MediaSources"][0]["SupportsTranscoding"], false);
+        assert_eq!(native["MediaSources"][0]["SupportsDirectStream"], true);
+        assert_eq!(
+            native["MediaSources"][0]["DirectStreamUrl"],
+            "/LiveTv/LiveStreamFiles/xtream_opaque_42/stream.ts"
+        );
+        assert!(native["MediaSources"][0].get("TranscodingUrl").is_none());
+    }
+
+    #[test]
+    fn live_tv_playback_rejects_non_hls_transcoding_profile() {
+        let options = PlaybackInfoOptions {
+            transcoding_profiles: Some(vec![TranscodingProfileMatcher {
+                profile_type: Some("Video".to_string()),
+                context: Some("Streaming".to_string()),
+                containers: vec!["mp4".to_string()],
+                protocols: vec!["http".to_string()],
+                video_codecs: vec![],
+                audio_codecs: vec![],
+                max_width: None,
+                max_height: None,
+                video_bitrate: None,
+                audio_bitrate: None,
+            }]),
+            ..PlaybackInfoOptions::default()
+        };
+        assert!(!live_tv_hls_transcoding_profile_supported(&options));
     }
 
     // Spec: local (non-remote) channels must NOT expose SupportsTranscoding:true (no HLS for local
