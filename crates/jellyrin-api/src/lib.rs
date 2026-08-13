@@ -133,15 +133,16 @@ use jellyrin_db::{
     ActivePlaybackSession, ActiveSessionUser, ActivityLogEntry, ActivityLogFilter,
     ActivityLogSortField, BackupManifest, BrandingConfig, DeviceSession, DiscoveredPluginPackage,
     InstallPluginPackage, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
-    LiveTvChannelUpsert, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
-    MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore, MediaItemCatalogCounts,
-    MediaItemCatalogEntry, MediaItemCatalogQuery, MediaItemCatalogSearchScope,
-    MediaItemCatalogSortField, MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata,
-    MediaItemQueryFilterSelection, MediaItemQueryFilterValues, MediaList, MediaListItem,
-    MediaListUserPermission, NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD,
-    PluginRuntimeInstanceUpsert, ProviderSecretReference, QuickConnectSession,
-    ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
-    TrickplayInfo, UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    LiveTvChannelUpsert, LiveTvStreamProbeOutcome, LiveTvStreamProbeUpsert, LiveTvTunerUpsert,
+    MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore,
+    MediaItemCatalogCounts, MediaItemCatalogEntry, MediaItemCatalogQuery,
+    MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetKind,
+    MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
+    MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
+    NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
+    ProviderSecretReference, QuickConnectSession, ResumeItemsPageQuery, SortDirection,
+    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
     UpsertTranscodeSession, probe_remote_media_info_admitted,
     provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
     upcoming_media_item_premiere_date,
@@ -1253,6 +1254,8 @@ struct LiveHlsSessionEntry {
     dedupe_key: String,
     channel_id: String,
     channel_url: String,
+    media_streams: Vec<serde_json::Value>,
+    subtitle_stream_index: Option<i64>,
     output_path: String,
     user_id: Uuid,
     device_id: Option<String>,
@@ -2870,6 +2873,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/subtitles.m3u8",
             get(subtitle_playlist),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{index}/live/{file}",
+            get(live_tv_subtitle_segment),
         )
         .route(
             "/subtitle/videos/{item_id}/{media_source_id}/subtitles/{index}/subtitles.m3u8",
@@ -20491,6 +20498,7 @@ fn live_tv_channel_record_to_json(
     base["Id"] = serde_json::json!(public_channel_id);
     base["ChannelId"] = base["Id"].clone();
     base["JellyrinChannelId"] = serde_json::json!(raw_channel_id);
+    base["RemoteId"] = serde_json::json!(record.remote_id);
     base["ServerId"] = serde_json::json!(server_id);
     base["Name"] = serde_json::json!(record.name);
     base["SortName"] = serde_json::json!(record.sort_name);
@@ -24220,12 +24228,30 @@ fn live_tv_channel_is_remote(path: &FsPath) -> bool {
 // Deterministic so clients can predict it from the channel_id; changes only when channel_id
 // changes.
 fn live_tv_channel_hls_play_session_id(channel_id: &str) -> String {
-    stable_entity_id("LiveTvHls", channel_id)
+    live_tv_channel_hls_play_session_id_for_selection(channel_id, None)
 }
 
-// Returns a dedupe key used to claim/find a live transcode session for a channel.
-fn live_tv_channel_hls_dedupe_key(channel_id: &str) -> String {
-    format!("livetv:hls:{channel_id}")
+fn live_tv_channel_hls_play_session_id_for_selection(
+    channel_id: &str,
+    subtitle_stream_index: Option<i64>,
+) -> String {
+    stable_entity_id(
+        "LiveTvHls",
+        &format!(
+            "{channel_id}:subtitle:{}",
+            subtitle_stream_index.map_or_else(|| "off".to_string(), |index| index.to_string())
+        ),
+    )
+}
+
+fn live_tv_channel_hls_dedupe_key_for_selection(
+    channel_id: &str,
+    subtitle_stream_index: Option<i64>,
+) -> String {
+    format!(
+        "livetv:hls:{channel_id}:subtitle:{}",
+        subtitle_stream_index.map_or_else(|| "off".to_string(), |index| index.to_string())
+    )
 }
 
 fn live_tv_channel_playback_id(channel: &serde_json::Value) -> Option<String> {
@@ -24295,6 +24321,18 @@ fn apply_live_tv_image_metadata(item: &mut serde_json::Value) {
 fn live_tv_channel_media_source(
     channel: &serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
+    let detected_streams = channel
+        .get("MediaStreams")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    live_tv_channel_media_source_with_streams(channel, &detected_streams)
+}
+
+fn live_tv_channel_media_source_with_streams(
+    channel: &serde_json::Value,
+    detected_streams: &[serde_json::Value],
+) -> Result<serde_json::Value, ApiError> {
     let public_channel_id = json_string_field(channel, "Id")
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
     let playback_channel_id =
@@ -24355,6 +24393,56 @@ fn live_tv_channel_media_source(
     let supports_direct_stream = true;
     let supports_direct_play = !is_remote;
 
+    let mut media_streams = detected_streams
+        .iter()
+        .cloned()
+        .map(normalize_media_stream)
+        .collect::<Vec<_>>();
+    if media_streams.is_empty() {
+        media_streams = vec![
+            normalize_media_stream(serde_json::json!({
+                "Codec": container,
+                "Type": "Video",
+                "Index": 0,
+                "IsDefault": true,
+                "IsForced": false,
+                "IsInterlaced": false,
+                "IsExternal": false
+            })),
+            normalize_media_stream(serde_json::json!({
+                "Codec": "aac",
+                "Type": "Audio",
+                "Index": 1,
+                "Channels": 2,
+                "ChannelLayout": "stereo",
+                "BitRate": 192000,
+                "IsDefault": true,
+                "IsForced": false,
+                "IsExternal": false
+            })),
+        ];
+    }
+    for stream in &mut media_streams {
+        let Some(stream) = stream.as_object_mut() else {
+            continue;
+        };
+        if stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+        {
+            // Web's playback manager restarts PlaybackInfo for Encode tracks, which lets the
+            // server select exactly one sparse teletext service in the shared A/V FFmpeg process.
+            stream.insert("DeliveryMethod".to_string(), serde_json::json!("Encode"));
+            stream.insert("IsExternal".to_string(), serde_json::json!(false));
+            stream.insert(
+                "SupportsExternalStream".to_string(),
+                serde_json::json!(false),
+            );
+        }
+    }
+    let default_audio_stream_index = default_audio_stream_index(&media_streams).unwrap_or(1);
+
     Ok(serde_json::json!({
         "Protocol": protocol,
         "Id": playback_channel_id,
@@ -24388,35 +24476,52 @@ fn live_tv_channel_media_source(
         "RequiresLooping": false,
         "SupportsProbing": false,
         "VideoType": "VideoFile",
-        "MediaStreams": [
-            normalize_media_stream(serde_json::json!({
-                "Codec": container,
-                "Type": "Video",
-                "Index": 0,
-                "IsDefault": true,
-                "IsForced": false,
-                "IsInterlaced": false,
-                "IsExternal": false
-            })),
-            normalize_media_stream(serde_json::json!({
-                "Codec": "aac",
-                "Type": "Audio",
-                "Index": 1,
-                "Channels": 2,
-                "ChannelLayout": "stereo",
-                "BitRate": 192000,
-                "IsDefault": true,
-                "IsForced": false,
-                "IsExternal": false
-            }))
-        ],
-        "DefaultAudioStreamIndex": 1,
+        "MediaStreams": media_streams,
+        "DefaultAudioStreamIndex": default_audio_stream_index,
         "MediaAttachments": [],
         "Formats": [],
         "RequiredHttpHeaders": {},
         "HasSegments": false,
         "Bitrate": null
     }))
+}
+
+fn live_tv_subtitle_source_index(
+    media_streams: &[serde_json::Value],
+    public_index: Option<i64>,
+) -> Option<i64> {
+    let public_index = public_index.filter(|index| *index >= 0)?;
+    media_streams.iter().find_map(|stream| {
+        let stream = stream.as_object()?;
+        let is_subtitle = stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Subtitle"));
+        (is_subtitle && stream.get("Index").and_then(json_value_i64) == Some(public_index)).then(
+            || {
+                stream
+                    .get("JellyrinSourceStreamIndex")
+                    .and_then(json_value_i64)
+                    .unwrap_or(public_index)
+            },
+        )
+    })
+}
+
+fn live_tv_subtitle_teletext_page(
+    media_streams: &[serde_json::Value],
+    public_index: Option<i64>,
+) -> Option<u16> {
+    let public_index = public_index.filter(|index| *index >= 0)?;
+    media_streams.iter().find_map(|stream| {
+        (json_string_field(stream, "Type")
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Subtitle"))
+            && json_i64_field(stream, "Index") == Some(public_index))
+        .then(|| json_i64_field(stream, "JellyrinTeletextPage"))
+        .flatten()
+        .and_then(|page| u16::try_from(page).ok())
+        .filter(|page| (100..=899).contains(page))
+    })
 }
 
 fn live_tv_program_items(config: &serde_json::Value, server_id: &str) -> Vec<serde_json::Value> {
@@ -33928,6 +34033,7 @@ async fn playback_info_response(
     mut options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(channel) = live_tv_channel_json_for_playable_item(&state.db, item_id).await? {
+        let channel = ensure_live_tv_stream_probe(state, channel).await?;
         return live_tv_playback_info_response(&channel, &token.access_token, options);
     }
     let requested_item = media_item_by_id(&state.db, item_id).await?;
@@ -34069,14 +34175,31 @@ async fn playback_info_response(
 fn live_tv_playback_info_response(
     channel: &serde_json::Value,
     access_token: &str,
-    options: PlaybackInfoOptions,
+    mut options: PlaybackInfoOptions,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let public_channel_id = json_string_field(channel, "Id")
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
     let playback_channel_id =
         live_tv_channel_playback_id(channel).unwrap_or_else(|| public_channel_id.clone());
-    let play_session_id = live_tv_channel_hls_play_session_id(&playback_channel_id);
     let mut media_source = live_tv_channel_media_source(channel)?;
+    let selected_subtitle_stream_index = options
+        .subtitle_stream_index
+        .filter(|index| *index >= 0)
+        .filter(|index| {
+            media_source["MediaStreams"]
+                .as_array()
+                .is_some_and(|streams| {
+                    streams.iter().any(|stream| {
+                        json_string_field(stream, "Type")
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("Subtitle"))
+                            && json_i64_field(stream, "Index") == Some(*index)
+                    })
+                })
+        });
+    let play_session_id = live_tv_channel_hls_play_session_id_for_selection(
+        &playback_channel_id,
+        selected_subtitle_stream_index,
+    );
     if let Some(media_source) = media_source.as_object_mut() {
         let direct_play_supported = options.enable_direct_play
             && media_source
@@ -34116,15 +34239,16 @@ fn live_tv_playback_info_response(
             serde_json::json!(transcode_supported),
         );
         if transcode_supported {
-            media_source.insert(
-                "TranscodingUrl".to_string(),
-                serde_json::json!(hls_master_url(
-                    "Video",
-                    &playback_channel_id,
-                    &play_session_id,
-                    access_token
-                )),
+            let mut url = hls_master_url(
+                "Video",
+                &playback_channel_id,
+                &play_session_id,
+                access_token,
             );
+            if let Some(index) = selected_subtitle_stream_index {
+                url.push_str(&format!("&SubtitleStreamIndex={index}"));
+            }
+            media_source.insert("TranscodingUrl".to_string(), serde_json::json!(url));
         } else {
             media_source.remove("TranscodingUrl");
         }
@@ -34139,6 +34263,11 @@ fn live_tv_playback_info_response(
             ffmpeg_mode = ffmpeg_mode_name(configured_ffmpeg_mode()),
             "selected live TV playback delivery mode"
         );
+        options.subtitle_stream_index = selected_subtitle_stream_index.or_else(|| {
+            options
+                .subtitle_stream_index
+                .filter(|subtitle_stream_index| *subtitle_stream_index < 0)
+        });
         apply_playback_stream_selection(media_source, &options);
     }
     Ok(Json(serde_json::json!({
@@ -35749,7 +35878,11 @@ async fn register_live_hls_session(entry: LiveHlsSessionEntry) -> Result<(), Api
 
 // Constructs a synthetic MediaItem for a live TV channel so it can be embedded inside a
 // TranscodeSession without requiring a real media_items DB row.
-fn live_tv_channel_synthetic_media_item(channel_id: &str, channel_url: &str) -> MediaItem {
+fn live_tv_channel_synthetic_media_item(
+    channel_id: &str,
+    channel_url: &str,
+    media_streams: &[serde_json::Value],
+) -> MediaItem {
     let id = live_tv_channel_stable_uuid(channel_id).unwrap_or_else(Uuid::new_v4);
     let now = OffsetDateTime::now_utc();
     MediaItem {
@@ -35764,7 +35897,7 @@ fn live_tv_channel_synthetic_media_item(channel_id: &str, channel_url: &str) -> 
         bitrate: None,
         width: None,
         height: None,
-        media_streams: vec![],
+        media_streams: media_streams.to_vec(),
         created_at: now,
         updated_at: now,
     }
@@ -35772,7 +35905,11 @@ fn live_tv_channel_synthetic_media_item(channel_id: &str, channel_url: &str) -> 
 
 // Builds a synthetic TranscodeSession from a LiveHlsSessionEntry for handlers that need one.
 fn live_hls_entry_to_transcode_session(entry: &LiveHlsSessionEntry) -> TranscodeSession {
-    let item = live_tv_channel_synthetic_media_item(&entry.channel_id, &entry.channel_url);
+    let item = live_tv_channel_synthetic_media_item(
+        &entry.channel_id,
+        &entry.channel_url,
+        &entry.media_streams,
+    );
     TranscodeSession {
         play_session_id: entry.play_session_id.clone(),
         dedupe_key: Some(entry.dedupe_key.clone()),
@@ -35781,7 +35918,7 @@ fn live_hls_entry_to_transcode_session(entry: &LiveHlsSessionEntry) -> Transcode
         item,
         media_source_id: Some(entry.channel_id.clone()),
         audio_stream_index: None,
-        subtitle_stream_index: None,
+        subtitle_stream_index: entry.subtitle_stream_index,
         video_stream_index: Some(0),
         output_path: entry.output_path.clone(),
         process_id: entry.process_id,
@@ -35819,7 +35956,7 @@ fn live_hls_session_json(entry: &LiveHlsSessionEntry) -> serde_json::Value {
         "Bitrate": null,
         "VideoStreamIndex": 0,
         "AudioStreamIndex": null,
-        "SubtitleStreamIndex": null,
+        "SubtitleStreamIndex": entry.subtitle_stream_index,
         "TranscodeReasons": [],
         "IsAudioDirect": false,
         "IsVideoDirect": false,
@@ -35834,6 +35971,8 @@ struct LiveHlsTranscodeStart {
     play_session_id: String,
     channel_id: String,
     channel_url: String,
+    media_streams: Vec<serde_json::Value>,
+    subtitle_stream_index: Option<i64>,
     device_id: Option<String>,
     user_id: Uuid,
     plan: HlsTranscodePlan,
@@ -35878,6 +36017,8 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) -> Result<(
         play_session_id,
         channel_id,
         channel_url,
+        media_streams,
+        subtitle_stream_index,
         device_id,
         user_id,
         plan,
@@ -35891,9 +36032,14 @@ async fn spawn_live_hls_transcode_task(start: LiveHlsTranscodeStart) -> Result<(
     let now = OffsetDateTime::now_utc();
     register_live_hls_session(LiveHlsSessionEntry {
         play_session_id: play_session_id.clone(),
-        dedupe_key: live_tv_channel_hls_dedupe_key(&channel_id),
+        dedupe_key: live_tv_channel_hls_dedupe_key_for_selection(
+            &channel_id,
+            subtitle_stream_index,
+        ),
         channel_id: channel_id.clone(),
         channel_url: channel_url.clone(),
+        media_streams,
+        subtitle_stream_index,
         output_path: output_path.clone(),
         user_id,
         device_id,
@@ -40497,9 +40643,20 @@ async fn subtitle_playlist(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((item_id, media_source_id, index)): Path<(String, String, i64)>,
+    RawQuery(raw_query): RawQuery,
     Query(query): Query<SubtitlePlaylistQuery>,
 ) -> Result<axum::response::Response, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if is_live_tv_channel_id(&item_id) {
+        return live_tv_subtitle_playlist_response(
+            &item_id,
+            &media_source_id,
+            index,
+            query.play_session_id.as_deref(),
+            raw_query.as_deref(),
+        )
+        .await;
+    }
     let item = subtitle_media_item(&state, &item_id, Some(&media_source_id)).await?;
     subtitle_stream_info(&item, index)?;
     let runtime_ticks = item
@@ -40551,6 +40708,107 @@ async fn subtitle_playlist(
     playlist.push_str("#EXT-X-ENDLIST\n");
 
     playlist_response(playlist, true)
+}
+
+async fn live_tv_subtitle_playlist_response(
+    item_id: &str,
+    media_source_id: &str,
+    index: i64,
+    play_session_id: Option<&str>,
+    raw_query: Option<&str>,
+) -> Result<axum::response::Response, ApiError> {
+    if item_id != media_source_id {
+        return Err(ApiError::not_found("Live TV subtitle stream not found"));
+    }
+    let play_session_id = play_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
+    let entry = live_hls_session_registry()
+        .lock()
+        .await
+        .get(play_session_id)
+        .filter(|entry| entry.channel_id == item_id && entry.subtitle_stream_index == Some(index))
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("Live TV subtitle stream not found"))?;
+    let session_dir = HlsTranscodeLayout::from_media_playlist_path(&entry.output_path).session_dir;
+    let playlist_path = session_dir.join("main_vtt.m3u8");
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(8);
+    let playlist = loop {
+        match tokio::fs::read_to_string(&playlist_path).await {
+            Ok(playlist) if !playlist.trim().is_empty() => break playlist,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::not_found(
+                "Live TV subtitle playlist is not ready",
+            ));
+        }
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    };
+    let mut rewritten = String::with_capacity(playlist.len() + 256);
+    for line in playlist.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            rewritten.push_str(line);
+        } else {
+            let file = FsPath::new(line.split_once('?').map_or(line, |(path, _)| path))
+                .file_name()
+                .and_then(OsStr::to_str)
+                .filter(|file| live_tv_subtitle_file_name_is_safe(file))
+                .ok_or_else(|| ApiError::not_found("Live TV subtitle segment not found"))?;
+            rewritten.push_str(&append_query(
+                &format!("/Videos/{item_id}/{media_source_id}/Subtitles/{index}/live/{file}"),
+                raw_query,
+            ));
+        }
+        rewritten.push('\n');
+    }
+    playlist_response(rewritten, true)
+}
+
+fn live_tv_subtitle_file_name_is_safe(file: &str) -> bool {
+    !file.is_empty()
+        && file.len() <= 128
+        && file
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && file.to_ascii_lowercase().ends_with(".vtt")
+}
+
+async fn live_tv_subtitle_segment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((item_id, media_source_id, index, file)): Path<(String, String, i64, String)>,
+    Query(query): Query<SubtitlePlaylistQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if item_id != media_source_id || !live_tv_subtitle_file_name_is_safe(&file) {
+        return Err(ApiError::not_found("Live TV subtitle segment not found"));
+    }
+    let play_session_id = query
+        .play_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
+    let entry = live_hls_session_registry()
+        .lock()
+        .await
+        .get(play_session_id)
+        .filter(|entry| entry.channel_id == item_id && entry.subtitle_stream_index == Some(index))
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("Live TV subtitle segment not found"))?;
+    let session_dir = HlsTranscodeLayout::from_media_playlist_path(&entry.output_path).session_dir;
+    stream_path(
+        session_dir.join(file),
+        "text/vtt; charset=utf-8".to_string(),
+        &headers,
+        true,
+    )
+    .await
 }
 
 async fn subtitle_stream(
@@ -41752,6 +42010,7 @@ async fn active_hls_transcode_session_for(
             state,
             item_id,
             play_session_id,
+            query.subtitle_stream_index,
             media_type,
             user.id,
         )
@@ -41789,6 +42048,7 @@ async fn active_hls_transcode_session_for_live_tv(
     state: &AppState,
     channel_id: &str,
     play_session_id: &str,
+    subtitle_stream_index: Option<i64>,
     media_type: &str,
     user_id: Uuid,
 ) -> Result<TranscodeSession, ApiError> {
@@ -41797,13 +42057,34 @@ async fn active_hls_transcode_session_for_live_tv(
     }
 
     let channel = live_tv_channel_by_id(&state.db, channel_id).await?;
+    let channel = ensure_live_tv_stream_probe(state, channel).await?;
+    let media_streams = channel
+        .get("MediaStreams")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(normalize_media_stream)
+        .collect::<Vec<_>>();
+    let subtitle_source_index = if let Some(index) = subtitle_stream_index {
+        Some(
+            live_tv_subtitle_source_index(&media_streams, Some(index))
+                .ok_or_else(|| ApiError::bad_request("Invalid Live TV subtitle stream index"))?,
+        )
+    } else {
+        None
+    };
+    let teletext_page = live_tv_subtitle_teletext_page(&media_streams, subtitle_stream_index);
     let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(&state.db, &channel).await;
 
     // Check for an existing active session by play_session_id.
     {
         let mut registry = live_hls_session_registry().lock().await;
         if let Some(entry) = registry.get_mut(play_session_id) {
-            if entry.channel_id != channel_id || entry.user_id != user_id {
+            if entry.channel_id != channel_id
+                || entry.user_id != user_id
+                || entry.subtitle_stream_index != subtitle_stream_index
+            {
                 return Err(ApiError::forbidden("Live HLS session mismatch"));
             }
             if matches!(entry.status.as_str(), "starting" | "running" | "completed") {
@@ -41817,7 +42098,8 @@ async fn active_hls_transcode_session_for_live_tv(
     }
 
     // No active session found. Check by dedupe_key to avoid starting a duplicate.
-    let dedupe_key = live_tv_channel_hls_dedupe_key(channel_id);
+    let dedupe_key =
+        live_tv_channel_hls_dedupe_key_for_selection(channel_id, subtitle_stream_index);
     {
         let registry = live_hls_session_registry().lock().await;
         if let Some(entry) = registry.values().find(|e| {
@@ -41891,10 +42173,11 @@ async fn active_hls_transcode_session_for_live_tv(
         TranscodeStreamSelection {
             video_stream_index: None,
             audio_stream_index: None,
-            subtitle_stream_index: None,
+            subtitle_stream_index: subtitle_source_index,
         },
     );
     apply_live_hls_ffmpeg_policy(&mut request, configured_ffmpeg_mode());
+    request.teletext_page = teletext_page;
     request.event_playlist = true;
     let (list_size, delete_threshold) = live_hls_window();
     request.hls_list_size = list_size;
@@ -41909,6 +42192,8 @@ async fn active_hls_transcode_session_for_live_tv(
         play_session_id: new_play_session_id.clone(),
         channel_id: channel_id.to_string(),
         channel_url,
+        media_streams,
+        subtitle_stream_index,
         device_id: None,
         user_id,
         plan,
@@ -50682,6 +50967,8 @@ fn is_xtream_remote_media(metadata: Option<&serde_json::Value>) -> bool {
 /// instead of all racing (thundering herd) before the first probe persists.
 static XTREAM_PROBE_LOCKS: std::sync::OnceLock<std::sync::Mutex<WeakKeyedLockRegistry<Uuid>>> =
     std::sync::OnceLock::new();
+static LIVE_TV_PROBE_LOCKS: std::sync::OnceLock<std::sync::Mutex<WeakKeyedLockRegistry<String>>> =
+    std::sync::OnceLock::new();
 static XTREAM_PROBE_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static XTREAM_PROBE_WAIT_QUEUE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static REMOTE_PROBE_ADMISSION_METRICS: OnceLock<AdmissionMetrics> = OnceLock::new();
@@ -50694,6 +50981,16 @@ fn xtream_probe_lock_for(item_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.lock_for(item_id)
+}
+
+fn live_tv_probe_lock_for(cache_key: String) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let registry = LIVE_TV_PROBE_LOCKS.get_or_init(|| {
+        std::sync::Mutex::new(WeakKeyedLockRegistry::new(KEYED_LOCK_REGISTRY_MAX_ENTRIES))
+    });
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .lock_for(cache_key)
 }
 
 fn xtream_probe_limiter() -> &'static Arc<tokio::sync::Semaphore> {
@@ -51041,6 +51338,231 @@ async fn resolve_xtream_remote_source(
     Ok(resolve_xtream_remote_source_with_revision(db, metadata)
         .await?
         .map(|resolved| resolved.source_url))
+}
+
+const LIVE_TV_STREAM_PROBE_VERSION: i16 = 1;
+
+fn live_tv_probe_source_revision(
+    channel: &serde_json::Value,
+    tuner_configuration: &serde_json::Value,
+) -> Option<String> {
+    let provider_reference = json_string_field(channel, "ProviderReference")
+        .or_else(|| json_string_field(channel, "Path"))?;
+    let configuration_revision =
+        json_string_field(tuner_configuration, "JellyrinConfigurationRevision")
+            .unwrap_or_else(|| "unversioned".to_string());
+    let provider_type = json_string_field(channel, "ProviderType").unwrap_or_default();
+    Some(stable_entity_id(
+        "LiveTvStreamProbe",
+        &format!(
+            "v{LIVE_TV_STREAM_PROBE_VERSION}:{provider_type}:{provider_reference}:{configuration_revision}"
+        ),
+    ))
+}
+
+fn expand_live_tv_teletext_streams(streams: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut next_index = streams
+        .iter()
+        .filter_map(|stream| json_i64_field(stream, "Index"))
+        .max()
+        .unwrap_or(-1)
+        .saturating_add(1);
+    let mut expanded = Vec::new();
+    for stream in streams.into_iter().take(32) {
+        let is_teletext = json_string_field(&stream, "Codec")
+            .is_some_and(|codec| codec.eq_ignore_ascii_case("dvb_teletext"));
+        let services = stream
+            .get("TeletextServices")
+            .and_then(serde_json::Value::as_array);
+        if !is_teletext || services.is_none_or(Vec::is_empty) {
+            expanded.push(stream);
+            continue;
+        }
+        let source_index = json_i64_field(&stream, "Index").unwrap_or(-1);
+        for service in services.into_iter().flatten().take(16) {
+            let Some(page) =
+                json_i64_field(service, "Page").filter(|page| (100..=899).contains(page))
+            else {
+                continue;
+            };
+            let language = json_string_field(service, "Language").unwrap_or_else(|| "und".into());
+            let hearing_impaired = json_bool_field(service, "IsHearingImpaired").unwrap_or(false);
+            expanded.push(normalize_media_stream(serde_json::json!({
+                "Codec": "webvtt",
+                "Language": language,
+                "Title": format!("Teletext {page}"),
+                "DisplayTitle": format!("{} - Teletext {page}", language_display_name(Some(&language)).unwrap_or(language)),
+                "Type": "Subtitle",
+                "Index": next_index,
+                "JellyrinSourceStreamIndex": source_index,
+                "JellyrinTeletextPage": page,
+                "IsDefault": false,
+                "IsForced": false,
+                "IsHearingImpaired": hearing_impaired,
+                "IsExternal": false,
+                "IsTextSubtitleStream": true,
+                "SupportsExternalStream": false
+            })));
+            next_index = next_index.saturating_add(1);
+        }
+    }
+    expanded.truncate(32);
+    expanded
+}
+
+#[cfg(test)]
+mod live_tv_teletext_contract_tests {
+    use super::*;
+
+    #[test]
+    fn expands_one_dvb_pid_into_selectable_language_pages() {
+        let streams = expand_live_tv_teletext_streams(vec![
+            serde_json::json!({"Type":"Video","Codec":"h264","Index":0}),
+            serde_json::json!({"Type":"Audio","Codec":"aac","Index":1}),
+            serde_json::json!({
+                "Type":"Subtitle",
+                "Codec":"dvb_teletext",
+                "Index":2,
+                "TeletextServices":[
+                    {"Page":801,"Language":"spa","IsHearingImpaired":false},
+                    {"Page":802,"Language":"eng","IsHearingImpaired":false}
+                ]
+            }),
+        ]);
+        let subtitles = streams
+            .iter()
+            .filter(|stream| json_string_field(stream, "Type").as_deref() == Some("Subtitle"))
+            .collect::<Vec<_>>();
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(
+            json_i64_field(subtitles[0], "JellyrinSourceStreamIndex"),
+            Some(2)
+        );
+        assert_eq!(
+            json_i64_field(subtitles[0], "JellyrinTeletextPage"),
+            Some(801)
+        );
+        assert_eq!(live_tv_subtitle_source_index(&streams, Some(3)), Some(2));
+        assert_eq!(live_tv_subtitle_teletext_page(&streams, Some(3)), Some(801));
+        assert_eq!(live_tv_subtitle_teletext_page(&streams, Some(4)), Some(802));
+    }
+}
+
+async fn ensure_live_tv_stream_probe(
+    state: &AppState,
+    mut channel: serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    if !live_tv_channel_uses_opaque_provider(&channel) {
+        return Ok(channel);
+    }
+    let channel_id = live_tv_channel_playback_id(&channel)
+        .or_else(|| json_string_field(&channel, "Id"))
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    let tuner_id = json_string_field(&channel, "TunerHostId")
+        .ok_or_else(|| ApiError::service_unavailable("Live TV tuner is unavailable"))?;
+    let remote_id = json_string_field(&channel, "RemoteId").unwrap_or_else(|| channel_id.clone());
+    let tuner_configuration = state
+        .db
+        .live_tv_tuner_configuration_by_id(&tuner_id)
+        .await?
+        .ok_or_else(|| ApiError::service_unavailable("Live TV tuner is unavailable"))?;
+    let source_revision = live_tv_probe_source_revision(&channel, &tuner_configuration)
+        .ok_or_else(|| ApiError::service_unavailable("Live TV source identity is unavailable"))?;
+    let now = OffsetDateTime::now_utc();
+    if let Some(probe) = state
+        .db
+        .live_tv_stream_probe(
+            &channel_id,
+            &source_revision,
+            LIVE_TV_STREAM_PROBE_VERSION,
+            now,
+        )
+        .await?
+    {
+        channel["MediaStreams"] = probe.streams;
+        return Ok(channel);
+    }
+
+    let lock = live_tv_probe_lock_for(format!("{channel_id}:{source_revision}"));
+    let _guard = lock.lock().await;
+    let now = OffsetDateTime::now_utc();
+    if let Some(probe) = state
+        .db
+        .live_tv_stream_probe(
+            &channel_id,
+            &source_revision,
+            LIVE_TV_STREAM_PROBE_VERSION,
+            now,
+        )
+        .await?
+    {
+        channel["MediaStreams"] = probe.streams;
+        return Ok(channel);
+    }
+
+    let remote_permit = match acquire_remote_probe_capacity_with_queue(
+        xtream_probe_limiter().clone(),
+        xtream_probe_wait_queue().clone(),
+        xtream_probe_queue_timeout(),
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(_) => return Ok(channel),
+    };
+    let process_permit = match acquire_multimedia_probe().await {
+        Ok(permit) => permit,
+        Err(_) => return Ok(channel),
+    };
+    let relay = register_internal_remote_relay(
+        state,
+        InternalRemoteRelayTarget::LiveTvChannel(channel_id.clone()),
+        INTERNAL_REMOTE_RELAY_PROBE_TTL,
+    )?;
+    let observed_at = OffsetDateTime::now_utc();
+    let media_info = probe_remote_media_info_admitted(relay.url(), "Video", process_permit).await;
+    drop(relay);
+    drop(remote_permit);
+    let completed_at = OffsetDateTime::now_utc();
+    let streams = expand_live_tv_teletext_streams(media_info.media_streams);
+    let has_probe_data = media_info.runtime_ticks.is_some()
+        || media_info.bitrate.is_some()
+        || media_info.width.is_some()
+        || media_info.height.is_some()
+        || !streams.is_empty();
+    let outcome = if !has_probe_data {
+        LiveTvStreamProbeOutcome::Failed
+    } else if streams.iter().any(|stream| {
+        json_string_field(stream, "Type").is_some_and(|kind| kind.eq_ignore_ascii_case("Subtitle"))
+    }) {
+        LiveTvStreamProbeOutcome::Tracks
+    } else {
+        LiveTvStreamProbeOutcome::Empty
+    };
+    let ttl = match outcome {
+        LiveTvStreamProbeOutcome::Tracks => Duration::minutes(30),
+        LiveTvStreamProbeOutcome::Empty => Duration::minutes(5),
+        LiveTvStreamProbeOutcome::Failed | LiveTvStreamProbeOutcome::Unsupported => {
+            Duration::minutes(1)
+        }
+    };
+    state
+        .db
+        .upsert_live_tv_stream_probe(LiveTvStreamProbeUpsert {
+            channel_id,
+            tuner_id,
+            remote_id,
+            source_revision,
+            probe_version: LIVE_TV_STREAM_PROBE_VERSION,
+            outcome,
+            streams: serde_json::Value::Array(streams.clone()),
+            observed_at,
+            completed_at,
+            expires_at: completed_at + ttl,
+        })
+        .await?;
+    channel["MediaStreams"] = serde_json::Value::Array(streams);
+    Ok(channel)
 }
 
 async fn ensure_xtream_remote_media_info(
@@ -55871,6 +56393,12 @@ struct HlsQuery {
         alias = "play_session_id"
     )]
     play_session_id: Option<String>,
+    #[serde(
+        alias = "SubtitleStreamIndex",
+        alias = "subtitleStreamIndex",
+        alias = "subtitlestreamindex"
+    )]
+    subtitle_stream_index: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69311,6 +69839,8 @@ done
                 dedupe_key: "livetv:hls:xtream_2".to_string(),
                 channel_id: "xtream_2".to_string(),
                 channel_url: "http://example.invalid/live/2.ts".to_string(),
+                media_streams: Vec::new(),
+                subtitle_stream_index: None,
                 output_path: "/tmp/jellyrin-live-tv-report-stop-session/main.m3u8".to_string(),
                 user_id: user.id,
                 device_id: None,
@@ -94079,6 +94609,8 @@ done
                     dedupe_key: format!("livetv:hls:{id}"),
                     channel_id: format!("channel-{id}"),
                     channel_url: "http://example.invalid/live.ts".to_string(),
+                    media_streams: Vec::new(),
+                    subtitle_stream_index: None,
                     output_path: dir.join("main.m3u8").to_string_lossy().to_string(),
                     user_id,
                     device_id: None,
@@ -94116,6 +94648,8 @@ done
             dedupe_key: format!("livetv:hls:{id}"),
             channel_id: format!("channel-{id}"),
             channel_url: "http://example.invalid/live.ts".to_string(),
+            media_streams: Vec::new(),
+            subtitle_stream_index: None,
             output_path: format!("/tmp/{id}/main.m3u8"),
             user_id: Uuid::nil(),
             device_id: None,
@@ -101376,6 +101910,7 @@ done
                 &state,
                 "hdhr_5.1",
                 "play-session-hls-limit",
+                None,
                 "Video",
                 uuid::Uuid::nil(),
             )

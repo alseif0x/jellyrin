@@ -462,6 +462,12 @@ pub struct HlsTranscodeRequest {
     pub audio_channels: Option<u8>,
     pub segment_time_seconds: u32,
     pub burn_in_subtitle: bool,
+    /// DVB teletext page decoded as text for the selected subtitle stream.
+    ///
+    /// FFmpeg treats this as an input decoder option, so the command builder must place it before
+    /// `-i`. Keeping the value numeric and validating the broadcast page range prevents callers
+    /// from injecting libzvbi's comma-separated page expression into the process arguments.
+    pub teletext_page: Option<u16>,
     /// Percentage of native input rate used for a finite remote VOD source (110 = 1.10x).
     pub input_readrate_percent: Option<u16>,
     pub input_readrate_initial_burst_seconds: Option<u16>,
@@ -521,6 +527,7 @@ impl HlsTranscodeRequest {
             audio_channels: None,
             segment_time_seconds: DEFAULT_HLS_SEGMENT_TIME_SECONDS,
             burn_in_subtitle: false,
+            teletext_page: None,
             input_readrate_percent: None,
             input_readrate_initial_burst_seconds: None,
         }
@@ -637,6 +644,14 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     } else {
         request.video_mode
     };
+    let decodes_teletext_page = request
+        .teletext_page
+        .is_some_and(|page| (100..=899).contains(&page))
+        && request
+            .selection
+            .subtitle_stream_index
+            .is_some_and(|index| index >= 0)
+        && !should_burn_subtitle;
 
     let mut args = vec![
         "-hide_banner".to_string(),
@@ -680,6 +695,16 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
             args.push("-readrate_initial_burst".to_string());
             args.push(initial_burst_seconds.to_string());
         }
+    }
+
+    if decodes_teletext_page {
+        // These private decoder options must precede the input. Text output is substantially
+        // cheaper than bitmap teletext and can be encoded directly as WebVTT without touching the
+        // video stream.
+        args.push("-txt_page".to_string());
+        args.push(request.teletext_page.unwrap_or_default().to_string());
+        args.push("-txt_format".to_string());
+        args.push("text".to_string());
     }
 
     args.push("-i".to_string());
@@ -726,6 +751,10 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
         );
         args.push("-c:s".to_string());
         args.push("webvtt".to_string());
+        if decodes_teletext_page {
+            args.push("-threads:s".to_string());
+            args.push("1".to_string());
+        }
     } else {
         args.push("-sn".to_string());
     }
@@ -898,10 +927,11 @@ pub fn build_hls_ffmpeg_command(request: &HlsTranscodeRequest) -> FfmpegCommandS
     let workload = if request.include_video && video_mode == HlsStreamMode::Encode {
         FfmpegWorkload::VideoEncode
     } else if request.audio_mode == HlsStreamMode::Encode
-        || request
+        || (request
             .selection
             .subtitle_stream_index
             .is_some_and(|index| index >= 0)
+            && !decodes_teletext_page)
     {
         FfmpegWorkload::AudioEncode
     } else {
@@ -1405,6 +1435,77 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["-max_interleave_delta", "1000000"])
         );
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_decodes_one_valid_teletext_page_as_bounded_webvtt() {
+        let mut request = HlsTranscodeRequest::new(
+            "https://provider.invalid/live.ts",
+            "/tmp/main.m3u8",
+            "/tmp/segment_%05d.ts",
+            TranscodeStreamSelection {
+                video_stream_index: None,
+                audio_stream_index: None,
+                subtitle_stream_index: Some(2),
+            },
+        );
+        request.video_mode = HlsStreamMode::Copy;
+        request.audio_mode = HlsStreamMode::Copy;
+        request.teletext_page = Some(801);
+
+        let command = build_hls_ffmpeg_command(&request);
+        let input_position = command.args.iter().position(|arg| arg == "-i").unwrap();
+        let page_position = command
+            .args
+            .windows(2)
+            .position(|pair| pair == ["-txt_page", "801"])
+            .unwrap();
+        let format_position = command
+            .args
+            .windows(2)
+            .position(|pair| pair == ["-txt_format", "text"])
+            .unwrap();
+
+        assert!(page_position < input_position);
+        assert!(format_position < input_position);
+        assert!(command.args.windows(2).any(|pair| pair == ["-map", "0:2"]));
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-c:s", "webvtt"])
+        );
+        assert!(
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-threads:s", "1"])
+        );
+        // Video/audio remain stream-copy and libzvbi's single-page text decoding is bounded to one
+        // subtitle thread, so this stays admissible under Jellyrin's production remux-only mode.
+        assert_eq!(command.workload(), Some(FfmpegWorkload::Remux));
+    }
+
+    #[test]
+    fn hls_ffmpeg_command_ignores_invalid_or_unselected_teletext_page() {
+        for (page, subtitle_stream_index) in
+            [(Some(99), Some(2)), (Some(900), Some(2)), (Some(801), None)]
+        {
+            let mut request = HlsTranscodeRequest::new(
+                "/media/live.ts",
+                "/tmp/main.m3u8",
+                "/tmp/segment_%05d.ts",
+                TranscodeStreamSelection {
+                    video_stream_index: None,
+                    audio_stream_index: None,
+                    subtitle_stream_index,
+                },
+            );
+            request.teletext_page = page;
+            let command = build_hls_ffmpeg_command(&request);
+            assert!(!command.args.iter().any(|arg| arg == "-txt_page"));
+            assert!(!command.args.iter().any(|arg| arg == "-txt_format"));
+        }
     }
 
     #[test]

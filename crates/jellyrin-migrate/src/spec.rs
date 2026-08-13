@@ -792,6 +792,11 @@ pub static OMITTED_TABLES: &[OmittedTableSpec] = &[
         reason: "EPG data",
     },
     OmittedTableSpec {
+        table: "live_tv_channel_stream_probes",
+        strategy: "rebuild",
+        reason: "derived Live TV stream probe cache",
+    },
+    OmittedTableSpec {
         table: "active_playback_sessions",
         strategy: "omit_ephemeral",
         reason: "active session",

@@ -1490,6 +1490,119 @@ pub struct LiveTvChannelRecord {
     pub metadata: Value,
 }
 
+/// Versioned outcome of a bounded Live TV stream probe.
+///
+/// This intentionally contains no diagnostic text: provider errors and raw ffprobe output can
+/// include credential-bearing source URLs and must remain outside durable storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveTvStreamProbeOutcome {
+    Tracks,
+    Empty,
+    Failed,
+    Unsupported,
+}
+
+impl LiveTvStreamProbeOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tracks => "tracks",
+            Self::Empty => "empty",
+            Self::Failed => "failed",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    fn from_stored(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "tracks" => Ok(Self::Tracks),
+            "empty" => Ok(Self::Empty),
+            "failed" => Ok(Self::Failed),
+            "unsupported" => Ok(Self::Unsupported),
+            _ => anyhow::bail!("invalid persisted Live TV stream probe outcome"),
+        }
+    }
+}
+
+/// Sanitized, derived cache entry written after probing one revision of a live stream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveTvStreamProbeUpsert {
+    pub channel_id: String,
+    pub tuner_id: String,
+    pub remote_id: String,
+    /// Credential-free stable digest of provider reference, configuration revision and probe ABI.
+    pub source_revision: String,
+    pub probe_version: i16,
+    pub outcome: LiveTvStreamProbeOutcome,
+    /// A bounded array of typed stream descriptors, never raw ffprobe JSON.
+    pub streams: Value,
+    pub observed_at: OffsetDateTime,
+    pub completed_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveTvStreamProbeRecord {
+    pub channel_id: String,
+    pub tuner_id: String,
+    pub remote_id: String,
+    pub source_revision: String,
+    pub probe_version: i16,
+    pub outcome: LiveTvStreamProbeOutcome,
+    pub streams: Value,
+    pub observed_at: OffsetDateTime,
+    pub completed_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
+const LIVE_TV_STREAM_PROBE_MAX_STREAMS: usize = 32;
+const LIVE_TV_STREAM_PROBE_MAX_JSON_BYTES: usize = 64 * 1024;
+
+fn validate_live_tv_stream_probe(probe: &LiveTvStreamProbeUpsert) -> anyhow::Result<()> {
+    for (name, value) in [
+        ("channel id", probe.channel_id.trim()),
+        ("tuner id", probe.tuner_id.trim()),
+        ("remote id", probe.remote_id.trim()),
+    ] {
+        anyhow::ensure!(
+            !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control),
+            "Live TV stream probe {name} is invalid"
+        );
+    }
+    let revision = probe.source_revision.trim();
+    anyhow::ensure!(
+        (16..=128).contains(&revision.len())
+            && revision
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "Live TV stream probe source revision is invalid"
+    );
+    anyhow::ensure!(
+        probe.probe_version > 0,
+        "Live TV stream probe version must be positive"
+    );
+    let streams = probe
+        .streams
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Live TV stream probe streams must be an array"))?;
+    anyhow::ensure!(
+        streams.len() <= LIVE_TV_STREAM_PROBE_MAX_STREAMS,
+        "Live TV stream probe contains too many streams"
+    );
+    anyhow::ensure!(
+        serde_json::to_vec(&probe.streams)?.len() <= LIVE_TV_STREAM_PROBE_MAX_JSON_BYTES,
+        "Live TV stream probe streams payload is too large"
+    );
+    anyhow::ensure!(
+        probe.completed_at >= probe.observed_at,
+        "Live TV stream probe completed before it was observed"
+    );
+    anyhow::ensure!(
+        probe.expires_at > probe.completed_at,
+        "Live TV stream probe expiry must follow completion"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveTvCategoryRecord {
     pub category_id: String,
@@ -4027,6 +4140,24 @@ impl SqliteDatabase {
             .await?;
         }
 
+        // Probe rows deliberately do not reference channels because this snapshot replaces those
+        // rows. Remove only identities no longer present after the replacement is published.
+        sqlx::query(
+            r#"
+            DELETE FROM live_tv_channel_stream_probes AS probe
+            WHERE probe.tuner_id = ?1
+              AND NOT EXISTS (
+                  SELECT 1 FROM live_tv_channels AS channel
+                  WHERE channel.channel_id = probe.channel_id
+                    AND channel.tuner_id = probe.tuner_id
+                    AND channel.remote_id = probe.remote_id
+              )
+            "#,
+        )
+        .bind(tuner.tuner_id.trim())
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(tuner.configuration)
     }
@@ -4080,6 +4211,142 @@ impl SqliteDatabase {
         builder.push_bind(channel_id.trim().to_string());
         let row = builder.build().fetch_optional(&self.pool).await?;
         row.map(live_tv_channel_record_from_row).transpose()
+    }
+
+    /// Returns only a current, exact-revision probe belonging to the channel still in the
+    /// published catalogue. Expired and orphaned cache rows are indistinguishable from a miss.
+    pub async fn live_tv_stream_probe(
+        &self,
+        channel_id: &str,
+        source_revision: &str,
+        probe_version: i16,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<Option<LiveTvStreamProbeRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT probe.channel_id, probe.tuner_id, probe.remote_id,
+                   probe.source_revision, probe.probe_version, probe.outcome,
+                   probe.streams_json, probe.observed_at, probe.completed_at, probe.expires_at
+            FROM live_tv_channel_stream_probes AS probe
+            JOIN live_tv_channels AS channel
+              ON channel.channel_id = probe.channel_id
+             AND channel.tuner_id = probe.tuner_id
+             AND channel.remote_id = probe.remote_id
+            WHERE channel.enabled = 1
+              AND probe.channel_id = ?1
+              AND probe.source_revision = ?2
+              AND probe.probe_version = ?3
+              AND probe.expires_at > ?4
+            "#,
+        )
+        .bind(channel_id.trim())
+        .bind(source_revision.trim())
+        .bind(i64::from(probe_version))
+        .bind(format_time(now)?)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(live_tv_stream_probe_record_from_sqlite_row)
+            .transpose()
+    }
+
+    /// Stores a sanitized probe only if its channel identity is currently published.
+    pub async fn upsert_live_tv_stream_probe(
+        &self,
+        probe: LiveTvStreamProbeUpsert,
+    ) -> anyhow::Result<()> {
+        validate_live_tv_stream_probe(&probe)?;
+        let streams_json = serde_json::to_string(&probe.streams)?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO live_tv_channel_stream_probes (
+                channel_id, tuner_id, remote_id, source_revision, probe_version, outcome,
+                streams_json, observed_at, completed_at, expires_at
+            )
+            SELECT channel.channel_id, channel.tuner_id, channel.remote_id, ?4, ?5, ?6,
+                   ?7, ?8, ?9, ?10
+            FROM live_tv_channels AS channel
+            WHERE channel.enabled = 1
+              AND channel.channel_id = ?1
+              AND channel.tuner_id = ?2
+              AND channel.remote_id = ?3
+            ON CONFLICT(channel_id, source_revision, probe_version) DO UPDATE SET
+                tuner_id = excluded.tuner_id,
+                remote_id = excluded.remote_id,
+                outcome = CASE
+                    WHEN excluded.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN excluded.outcome ELSE live_tv_channel_stream_probes.outcome END,
+                streams_json = CASE
+                    WHEN excluded.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN excluded.streams_json ELSE live_tv_channel_stream_probes.streams_json END,
+                observed_at = max(excluded.observed_at, live_tv_channel_stream_probes.observed_at),
+                completed_at = CASE
+                    WHEN excluded.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN excluded.completed_at ELSE live_tv_channel_stream_probes.completed_at END,
+                expires_at = CASE
+                    WHEN excluded.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN excluded.expires_at ELSE live_tv_channel_stream_probes.expires_at END
+            "#,
+        )
+        .bind(probe.channel_id.trim())
+        .bind(probe.tuner_id.trim())
+        .bind(probe.remote_id.trim())
+        .bind(probe.source_revision.trim())
+        .bind(i64::from(probe.probe_version))
+        .bind(probe.outcome.as_str())
+        .bind(streams_json)
+        .bind(format_time(probe.observed_at)?)
+        .bind(format_time(probe.completed_at)?)
+        .bind(format_time(probe.expires_at)?)
+        .execute(&self.pool)
+        .await?;
+        anyhow::ensure!(
+            result.rows_affected() == 1,
+            "Live TV stream probe channel identity is not published"
+        );
+        Ok(())
+    }
+
+    pub async fn delete_live_tv_stream_probes_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM live_tv_channel_stream_probes WHERE channel_id = ?1")
+                .bind(channel_id.trim())
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    /// Removes a bounded batch of expired or orphaned derived rows.
+    pub async fn cleanup_live_tv_stream_probes(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        let limit = limit.clamp(1, 10_000) as i64;
+        Ok(sqlx::query(
+            r#"
+            DELETE FROM live_tv_channel_stream_probes
+            WHERE rowid IN (
+                SELECT probe.rowid
+                FROM live_tv_channel_stream_probes AS probe
+                LEFT JOIN live_tv_channels AS channel
+                  ON channel.channel_id = probe.channel_id
+                 AND channel.tuner_id = probe.tuner_id
+                 AND channel.remote_id = probe.remote_id
+                WHERE probe.expires_at <= ?1 OR channel.channel_id IS NULL
+                ORDER BY probe.expires_at, probe.channel_id
+                LIMIT ?2
+            )
+            "#,
+        )
+        .bind(format_time(now)?)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     pub async fn live_tv_categories(&self) -> anyhow::Result<Vec<LiveTvCategoryRecord>> {
@@ -14629,6 +14896,10 @@ async fn probe_media_info_input(
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
+        // MPEG-TS exposes DVB teletext page/type descriptors through codec extradata. The probe
+        // output is already bounded to 8 MiB and the parser below retains at most 64 two-byte
+        // service descriptors; no arbitrary binary data is persisted.
+        .arg("-show_data")
         .arg("-show_chapters");
     for arg in input_args {
         command.arg(arg);
@@ -15297,6 +15568,91 @@ fn is_text_subtitle_codec(codec: &str) -> bool {
     )
 }
 
+const MAX_TELETEXT_SERVICES: usize = 64;
+
+fn ffprobe_hex_dump_bytes(value: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    if max_bytes == 0 || value.len() > 16 * 1024 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for line in value.lines().filter(|line| !line.trim().is_empty()) {
+        let (_, columns) = line.split_once(':')?;
+        // `-show_data` separates its hexadecimal column from the printable rendering with two
+        // spaces. Never parse the rendering: text such as "dead" could otherwise look like data.
+        let hexadecimal = columns.split("  ").next()?.trim();
+        for group in hexadecimal.split_ascii_whitespace() {
+            if group.is_empty() || group.len() > 8 || group.len() % 2 != 0 {
+                return None;
+            }
+            for pair in group.as_bytes().chunks_exact(2) {
+                let pair = std::str::from_utf8(pair).ok()?;
+                bytes.push(u8::from_str_radix(pair, 16).ok()?);
+                if bytes.len() > max_bytes {
+                    return None;
+                }
+            }
+        }
+    }
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+fn normalized_teletext_languages(stream: &Value) -> Vec<Option<String>> {
+    stream
+        .get("tags")
+        .and_then(|tags| tags.get("language"))
+        .and_then(Value::as_str)
+        .into_iter()
+        .flat_map(|languages| languages.split(','))
+        .take(MAX_TELETEXT_SERVICES)
+        .map(|language| {
+            let language = language.trim();
+            (language.len() == 3 && language.bytes().all(|byte| byte.is_ascii_alphabetic()))
+                .then(|| language.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn ffprobe_teletext_services(stream: &Value) -> Vec<Value> {
+    let Some(extradata) = stream.get("extradata").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let Some(descriptors) =
+        ffprobe_hex_dump_bytes(extradata, MAX_TELETEXT_SERVICES.saturating_mul(2))
+    else {
+        return Vec::new();
+    };
+    if descriptors.len() % 2 != 0 {
+        return Vec::new();
+    }
+    let languages = normalized_teletext_languages(stream);
+    descriptors
+        .chunks_exact(2)
+        .take(MAX_TELETEXT_SERVICES)
+        .enumerate()
+        .filter_map(|(index, descriptor)| {
+            let teletext_type = descriptor[0] >> 3;
+            let magazine = match descriptor[0] & 0x07 {
+                0 => 8,
+                value => value,
+            };
+            let page_tens = descriptor[1] >> 4;
+            let page_ones = descriptor[1] & 0x0f;
+            if page_tens > 9 || page_ones > 9 || !(1..=8).contains(&magazine) {
+                return None;
+            }
+            let page = u16::from(magazine) * 100 + u16::from(page_tens) * 10 + u16::from(page_ones);
+            let language = languages.get(index).cloned().flatten();
+            Some(serde_json::json!({
+                "Page": page,
+                "Language": language,
+                "TeletextType": teletext_type,
+                "IsSubtitle": matches!(teletext_type, 2 | 5),
+                "IsHearingImpaired": teletext_type == 5,
+            }))
+        })
+        .collect()
+}
+
 fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
     let codec_type = stream.get("codec_type")?.as_str()?;
     let index = stream.get("index").and_then(json_number_or_string_i64)?;
@@ -15367,29 +15723,37 @@ fn ffprobe_stream_to_media_stream(stream: &Value) -> Option<Value> {
             "IsExternal": false,
             "Path": null
         })),
-        "subtitle" => Some(serde_json::json!({
-            "Codec": codec,
-            "Language": language,
-            "Title": title,
-            "DisplayTitle": media_stream_display_title(
-                "Subtitle",
-                codec,
-                language,
-                title.as_deref(),
-                None,
-                None,
-                is_default,
-                is_forced,
-            ),
-            "IsDefault": is_default,
-            "IsForced": is_forced,
-            "Type": "Subtitle",
-            "Index": index,
-            "IsExternal": false,
-            "Path": null,
-            "IsTextSubtitleStream": is_text_subtitle_codec(codec),
-            "SupportsExternalStream": false
-        })),
+        "subtitle" => {
+            let teletext_services = if codec.eq_ignore_ascii_case("dvb_teletext") {
+                ffprobe_teletext_services(stream)
+            } else {
+                Vec::new()
+            };
+            Some(serde_json::json!({
+                "Codec": codec,
+                "Language": language,
+                "Title": title,
+                "DisplayTitle": media_stream_display_title(
+                    "Subtitle",
+                    codec,
+                    language,
+                    title.as_deref(),
+                    None,
+                    None,
+                    is_default,
+                    is_forced,
+                ),
+                "IsDefault": is_default,
+                "IsForced": is_forced,
+                "Type": "Subtitle",
+                "Index": index,
+                "IsExternal": false,
+                "Path": null,
+                "IsTextSubtitleStream": is_text_subtitle_codec(codec),
+                "SupportsExternalStream": false,
+                "TeletextServices": teletext_services
+            }))
+        }
         _ => None,
     }
 }
@@ -16000,6 +16364,26 @@ fn live_tv_channel_record_from_row(
 }
 
 #[cfg(any(test, feature = "sqlite"))]
+fn live_tv_stream_probe_record_from_sqlite_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<LiveTvStreamProbeRecord> {
+    Ok(LiveTvStreamProbeRecord {
+        channel_id: row.get("channel_id"),
+        tuner_id: row.get("tuner_id"),
+        remote_id: row.get("remote_id"),
+        source_revision: row.get("source_revision"),
+        probe_version: i16::try_from(row.get::<i64, _>("probe_version"))
+            .context("invalid Live TV stream probe version")?,
+        outcome: LiveTvStreamProbeOutcome::from_stored(&row.get::<String, _>("outcome"))?,
+        streams: serde_json::from_str(&row.get::<String, _>("streams_json"))
+            .context("invalid Live TV stream probe streams")?,
+        observed_at: parse_time(&row.get::<String, _>("observed_at"))?,
+        completed_at: parse_time(&row.get::<String, _>("completed_at"))?,
+        expires_at: parse_time(&row.get::<String, _>("expires_at"))?,
+    })
+}
+
+#[cfg(any(test, feature = "sqlite"))]
 async fn enrich_plugin_runtime_state(pool: &SqlitePool, plugin: &mut Value) -> anyhow::Result<()> {
     let Some(plugin_id) = plugin.get("Id").and_then(Value::as_str).map(str::to_string) else {
         return Ok(());
@@ -16177,7 +16561,8 @@ mod tests {
 
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, DatabaseDriver, DatabasePoolRole,
-        InstallPluginPackage, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
+        InstallPluginPackage, LiveTvChannelUpsert, LiveTvStreamProbeOutcome,
+        LiveTvStreamProbeUpsert, LiveTvTunerUpsert, MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS,
         MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MEDIA_ITEM_FACET_PROJECTION_NAME,
         MEDIA_ITEM_FACET_PROJECTION_VERSION, MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME,
         MediaItemCatalogQuery, MediaItemCatalogSearchScope, MediaItemFacetCandidateQuery,
@@ -16251,6 +16636,87 @@ mod tests {
 
         assert_eq!(busy_timeout, 5_000);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_live_tv_stream_probe_cache_is_revisioned_bounded_and_snapshot_safe() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let tuner_id = "probe-tuner";
+        let channel_id = "probe-channel";
+        let remote_id = "42";
+        let tuner = || LiveTvTunerUpsert {
+            tuner_id: tuner_id.to_string(),
+            provider_type: "xtream".to_string(),
+            name: "Probe tuner".to_string(),
+            source_url: None,
+            configuration: json!({"Id": tuner_id, "Type": "xtream"}),
+        };
+        let channel = || LiveTvChannelUpsert {
+            channel_id: channel_id.to_string(),
+            tuner_id: tuner_id.to_string(),
+            remote_id: remote_id.to_string(),
+            category_id: None,
+            name: "Probe channel".to_string(),
+            sort_name: "probe channel".to_string(),
+            number: None,
+            stream_url: "https://example.invalid/live.ts".to_string(),
+            logo_url: None,
+            channel_type: "TV".to_string(),
+            metadata: json!({}),
+        };
+        db.replace_live_tv_tuner_snapshot(tuner(), Vec::new(), vec![channel()])
+            .await
+            .unwrap();
+        let observed_at = OffsetDateTime::parse("2026-08-13T10:00:00Z", &Rfc3339).unwrap();
+        let revision = "abcdef0123456789abcdef0123456789";
+        let probe = LiveTvStreamProbeUpsert {
+            channel_id: channel_id.to_string(),
+            tuner_id: tuner_id.to_string(),
+            remote_id: remote_id.to_string(),
+            source_revision: revision.to_string(),
+            probe_version: 1,
+            outcome: LiveTvStreamProbeOutcome::Tracks,
+            streams: json!([{"Index": 2, "Codec": "dvb_teletext", "Language": "spa"}]),
+            observed_at,
+            completed_at: observed_at + Duration::seconds(1),
+            expires_at: observed_at + Duration::minutes(30),
+        };
+        db.upsert_live_tv_stream_probe(probe).await.unwrap();
+        assert!(
+            db.live_tv_stream_probe(channel_id, revision, 1, observed_at)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.live_tv_stream_probe(channel_id, "0000000000000000", 1, observed_at)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Publishing the same channel identity must preserve the derived cache row.
+        db.replace_live_tv_tuner_snapshot(tuner(), Vec::new(), vec![channel()])
+            .await
+            .unwrap();
+        assert!(
+            db.live_tv_stream_probe(channel_id, revision, 1, observed_at)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            db.cleanup_live_tv_stream_probes(observed_at + Duration::hours(1), 100)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.live_tv_stream_probe(channel_id, revision, 1, observed_at)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -20557,6 +21023,57 @@ mod tests {
             info.metadata["Chapters"][1]["StartPositionTicks"],
             1_824_320_000
         );
+    }
+
+    #[test]
+    fn parses_bounded_dvb_teletext_services_from_ffprobe_descriptor() {
+        let value = json!({
+            "streams": [{
+                "index": 2,
+                "codec_name": "dvb_teletext",
+                "codec_type": "subtitle",
+                "extradata": "\n00000000: 1001 1002 2858 1003 1004                 ....(X....\n",
+                "tags": { "language": "spa,eng,esl,cat,eus" },
+                "disposition": {}
+            }],
+            "format": {}
+        });
+
+        let info = parse_ffprobe_media_info(&value);
+        let stream = &info.media_streams[0];
+        assert_eq!(stream["Codec"], "dvb_teletext");
+        assert_eq!(stream["TeletextServices"].as_array().unwrap().len(), 5);
+        assert_eq!(stream["TeletextServices"][0]["Page"], 801);
+        assert_eq!(stream["TeletextServices"][0]["Language"], "spa");
+        assert_eq!(stream["TeletextServices"][0]["TeletextType"], 2);
+        assert_eq!(stream["TeletextServices"][0]["IsSubtitle"], true);
+        assert_eq!(stream["TeletextServices"][0]["IsHearingImpaired"], false);
+        assert_eq!(stream["TeletextServices"][2]["Page"], 858);
+        assert_eq!(stream["TeletextServices"][2]["Language"], "esl");
+        assert_eq!(stream["TeletextServices"][2]["TeletextType"], 5);
+        assert_eq!(stream["TeletextServices"][2]["IsHearingImpaired"], true);
+        assert_eq!(stream["TeletextServices"][4]["Page"], 804);
+        // The parser retains only the explicit normalized structure, never ffprobe's formatted
+        // binary dump.
+        assert!(stream.get("extradata").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_or_oversized_teletext_descriptors() {
+        let invalid_bcd = json!({
+            "extradata": "00000000: 10fa  ....",
+            "tags": { "language": "spa" }
+        });
+        assert!(super::ffprobe_teletext_services(&invalid_bcd).is_empty());
+
+        let odd = json!({
+            "extradata": "00000000: 100  ...",
+            "tags": { "language": "spa" }
+        });
+        assert!(super::ffprobe_teletext_services(&odd).is_empty());
+
+        let oversized = format!("00000000: {}  data", "1001".repeat(65));
+        assert!(super::ffprobe_teletext_services(&json!({"extradata": oversized})).is_empty());
     }
 
     #[test]

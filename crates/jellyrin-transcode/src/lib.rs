@@ -1001,6 +1001,16 @@ fn classify_ffmpeg_args(args: &[String]) -> TranscodeJobKind {
     let mut mapped_audio = false;
     let mut mapped_subtitle = false;
     let mut mapped_unknown = false;
+    // A trusted core command may decode one numeric DVB teletext page to WebVTT while copying A/V.
+    // Keep it in the remux lane only when every bounding option is present; arbitrary command
+    // specs still fail closed before this classifier because they have no declared workload.
+    let bounded_teletext_webvtt = args.windows(2).any(|pair| {
+        pair[0] == "-txt_page"
+            && pair[1]
+                .parse::<u16>()
+                .is_ok_and(|page| (100..=899).contains(&page))
+    }) && args.windows(2).any(|pair| pair == ["-txt_format", "text"])
+        && args.windows(2).any(|pair| pair == ["-threads:s", "1"]);
 
     for (index, arg) in args.iter().enumerate() {
         if let Some(kind) = filter_job_kind(arg) {
@@ -1024,7 +1034,11 @@ fn classify_ffmpeg_args(args: &[String]) -> TranscodeJobKind {
         let Some(codec) = args.get(index + 1) else {
             return TranscodeJobKind::VideoEncode;
         };
-        if codec_is_copy_or_disabled(codec) {
+        if codec_is_copy_or_disabled(codec)
+            || (target == CodecTarget::Subtitle
+                && codec.eq_ignore_ascii_case("webvtt")
+                && bounded_teletext_webvtt)
+        {
             match target {
                 CodecTarget::Video => video_copy = true,
                 CodecTarget::Audio => audio_copy = true,
@@ -1048,7 +1062,11 @@ fn classify_ffmpeg_args(args: &[String]) -> TranscodeJobKind {
     if observed != TranscodeJobKind::Remux || global_copy {
         return observed;
     }
-    if mapped_unknown || mapped_video && !video_copy {
+    // A selected teletext service is mapped by its global ffprobe index (`0:2`), which is
+    // intentionally type-agnostic at the CLI level. The trusted builder has already declared a
+    // remux workload and the bounded contract above proves the only encoder is single-threaded
+    // WebVTT, so that numeric map does not imply video encoding.
+    if (mapped_unknown && !bounded_teletext_webvtt) || mapped_video && !video_copy {
         return TranscodeJobKind::VideoEncode;
     }
     if mapped_audio && !audio_copy || mapped_subtitle && !subtitle_copy {
@@ -1060,7 +1078,7 @@ fn classify_ffmpeg_args(args: &[String]) -> TranscodeJobKind {
     TranscodeJobKind::Remux
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodecTarget {
     Video,
     Audio,
@@ -2030,7 +2048,10 @@ fn parse_ffmpeg_progress_line_has_snapshot(progress: &mut FfmpegProgress, line: 
 
 #[cfg(test)]
 mod tests {
-    use jellyrin_core::FfmpegCommandSpec;
+    use jellyrin_core::{
+        FfmpegCommandSpec, HlsStreamMode, HlsTranscodeRequest, TranscodeStreamSelection,
+        build_hls_ffmpeg_command,
+    };
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
     use tokio::time::{Duration, timeout};
@@ -2976,6 +2997,35 @@ mod tests {
                 "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "copy",
             ])),
             TranscodeJobKind::Remux
+        );
+    }
+
+    #[test]
+    fn bounded_single_page_teletext_webvtt_stays_in_remux_lane() {
+        let mut request = HlsTranscodeRequest::new(
+            "https://provider.invalid/live.ts",
+            "/tmp/main.m3u8",
+            "/tmp/segment_%05d.ts",
+            TranscodeStreamSelection {
+                video_stream_index: None,
+                audio_stream_index: None,
+                subtitle_stream_index: Some(2),
+            },
+        );
+        request.video_mode = HlsStreamMode::Copy;
+        request.audio_mode = HlsStreamMode::Copy;
+        request.teletext_page = Some(801);
+        let command = build_hls_ffmpeg_command(&request);
+        assert_eq!(
+            classify_transcode_command(&command),
+            TranscodeJobKind::Remux
+        );
+
+        let mut unbounded = command.args().to_vec();
+        unbounded.retain(|arg| arg != "-threads:s" && arg != "1");
+        assert_eq!(
+            classify_ffmpeg_args(&unbounded),
+            TranscodeJobKind::AudioEncode
         );
     }
 

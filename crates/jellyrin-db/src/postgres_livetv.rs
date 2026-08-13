@@ -5,7 +5,9 @@ use time::OffsetDateTime;
 
 use super::{
     LiveTvCategoryRecord, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
-    LiveTvChannelUpsert, LiveTvPage, LiveTvTunerUpsert, postgres::PostgresDatabase,
+    LiveTvChannelUpsert, LiveTvPage, LiveTvStreamProbeOutcome, LiveTvStreamProbeRecord,
+    LiveTvStreamProbeUpsert, LiveTvTunerUpsert, postgres::PostgresDatabase,
+    validate_live_tv_stream_probe,
 };
 
 // Keep every statement comfortably below PostgreSQL's bind-parameter limit while avoiding one
@@ -158,6 +160,24 @@ impl PostgresDatabase {
             builder.build().execute(&mut *transaction).await?;
         }
 
+        // Probe rows deliberately survive the delete/reinsert snapshot boundary. Prune only
+        // channel identities that are absent from the newly published tuner snapshot.
+        sqlx::query(
+            r#"
+            DELETE FROM live_tv_channel_stream_probes AS probe
+            WHERE probe.tuner_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM live_tv_channels AS channel
+                  WHERE channel.channel_id = probe.channel_id
+                    AND channel.tuner_id = probe.tuner_id
+                    AND channel.remote_id = probe.remote_id
+              )
+            "#,
+        )
+        .bind(&tuner_id)
+        .execute(&mut *transaction)
+        .await?;
+
         transaction.commit().await?;
         Ok(protected_configuration)
     }
@@ -240,6 +260,144 @@ impl PostgresDatabase {
         .await?;
 
         Ok(row.map(Into::into))
+    }
+
+    /// Returns only an unexpired exact revision whose channel identity is still published.
+    pub async fn live_tv_stream_probe(
+        &self,
+        channel_id: &str,
+        source_revision: &str,
+        probe_version: i16,
+        now: OffsetDateTime,
+    ) -> anyhow::Result<Option<LiveTvStreamProbeRecord>> {
+        sqlx::query_as::<_, PostgresLiveTvStreamProbeRow>(
+            r#"
+            SELECT probe.channel_id, probe.tuner_id, probe.remote_id,
+                   probe.source_revision, probe.probe_version, probe.outcome,
+                   probe.streams, probe.observed_at, probe.completed_at, probe.expires_at
+            FROM live_tv_channel_stream_probes AS probe
+            JOIN live_tv_channels AS channel
+              ON channel.channel_id = probe.channel_id
+             AND channel.tuner_id = probe.tuner_id
+             AND channel.remote_id = probe.remote_id
+            WHERE channel.enabled
+              AND probe.channel_id = $1
+              AND probe.source_revision = $2
+              AND probe.probe_version = $3
+              AND probe.expires_at > $4
+            "#,
+        )
+        .bind(channel_id.trim())
+        .bind(source_revision.trim())
+        .bind(probe_version)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    /// Stores a bounded, sanitized probe only while its exact channel identity is published.
+    pub async fn upsert_live_tv_stream_probe(
+        &self,
+        probe: LiveTvStreamProbeUpsert,
+    ) -> anyhow::Result<()> {
+        validate_live_tv_stream_probe(&probe)?;
+        let result = sqlx::query(
+            r#"
+            INSERT INTO live_tv_channel_stream_probes (
+                channel_id, tuner_id, remote_id, source_revision, probe_version, outcome,
+                streams, observed_at, completed_at, expires_at
+            )
+            SELECT channel.channel_id, channel.tuner_id, channel.remote_id, $4, $5, $6,
+                   $7, $8, $9, $10
+            FROM live_tv_channels AS channel
+            WHERE channel.enabled
+              AND channel.channel_id = $1
+              AND channel.tuner_id = $2
+              AND channel.remote_id = $3
+            ON CONFLICT (channel_id, source_revision, probe_version) DO UPDATE SET
+                tuner_id = EXCLUDED.tuner_id,
+                remote_id = EXCLUDED.remote_id,
+                outcome = CASE
+                    WHEN EXCLUDED.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN EXCLUDED.outcome ELSE live_tv_channel_stream_probes.outcome END,
+                streams = CASE
+                    WHEN EXCLUDED.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN EXCLUDED.streams ELSE live_tv_channel_stream_probes.streams END,
+                observed_at = GREATEST(
+                    EXCLUDED.observed_at, live_tv_channel_stream_probes.observed_at
+                ),
+                completed_at = CASE
+                    WHEN EXCLUDED.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN EXCLUDED.completed_at ELSE live_tv_channel_stream_probes.completed_at END,
+                expires_at = CASE
+                    WHEN EXCLUDED.observed_at >= live_tv_channel_stream_probes.observed_at
+                    THEN EXCLUDED.expires_at ELSE live_tv_channel_stream_probes.expires_at END
+            "#,
+        )
+        .bind(probe.channel_id.trim())
+        .bind(probe.tuner_id.trim())
+        .bind(probe.remote_id.trim())
+        .bind(probe.source_revision.trim())
+        .bind(probe.probe_version)
+        .bind(probe.outcome.as_str())
+        .bind(probe.streams)
+        .bind(probe.observed_at)
+        .bind(probe.completed_at)
+        .bind(probe.expires_at)
+        .execute(&self.pool)
+        .await?;
+        ensure!(
+            result.rows_affected() == 1,
+            "Live TV stream probe channel identity is not published"
+        );
+        Ok(())
+    }
+
+    pub async fn delete_live_tv_stream_probes_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> anyhow::Result<u64> {
+        Ok(
+            sqlx::query("DELETE FROM live_tv_channel_stream_probes WHERE channel_id = $1")
+                .bind(channel_id.trim())
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    /// Deletes a bounded batch of expired or orphaned derived probe rows.
+    pub async fn cleanup_live_tv_stream_probes(
+        &self,
+        now: OffsetDateTime,
+        limit: usize,
+    ) -> anyhow::Result<u64> {
+        let limit = i64::try_from(limit.clamp(1, 10_000)).unwrap_or(10_000);
+        Ok(sqlx::query(
+            r#"
+            WITH stale AS (
+                SELECT probe.ctid
+                FROM live_tv_channel_stream_probes AS probe
+                LEFT JOIN live_tv_channels AS channel
+                  ON channel.channel_id = probe.channel_id
+                 AND channel.tuner_id = probe.tuner_id
+                 AND channel.remote_id = probe.remote_id
+                WHERE probe.expires_at <= $1 OR channel.channel_id IS NULL
+                ORDER BY probe.expires_at, probe.channel_id
+                LIMIT $2
+            )
+            DELETE FROM live_tv_channel_stream_probes AS probe
+            USING stale
+            WHERE probe.ctid = stale.ctid
+            "#,
+        )
+        .bind(now)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     pub async fn live_tv_categories(&self) -> anyhow::Result<Vec<LiveTvCategoryRecord>> {
@@ -503,6 +661,39 @@ impl From<PostgresLiveTvChannelRow> for LiveTvChannelRecord {
             channel_type: row.channel_type,
             metadata: row.metadata,
         }
+    }
+}
+
+#[derive(FromRow)]
+struct PostgresLiveTvStreamProbeRow {
+    channel_id: String,
+    tuner_id: String,
+    remote_id: String,
+    source_revision: String,
+    probe_version: i16,
+    outcome: String,
+    streams: Value,
+    observed_at: OffsetDateTime,
+    completed_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+}
+
+impl TryFrom<PostgresLiveTvStreamProbeRow> for LiveTvStreamProbeRecord {
+    type Error = anyhow::Error;
+
+    fn try_from(row: PostgresLiveTvStreamProbeRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            channel_id: row.channel_id,
+            tuner_id: row.tuner_id,
+            remote_id: row.remote_id,
+            source_revision: row.source_revision,
+            probe_version: row.probe_version,
+            outcome: LiveTvStreamProbeOutcome::from_stored(&row.outcome)?,
+            streams: row.streams,
+            observed_at: row.observed_at,
+            completed_at: row.completed_at,
+            expires_at: row.expires_at,
+        })
     }
 }
 
