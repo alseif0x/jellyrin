@@ -34067,6 +34067,7 @@ async fn playback_info_response(
         item = resolved.item;
     }
     let metadata = metadata.as_ref();
+    normalize_completed_remote_resume_position(&item, metadata, &mut options);
     apply_android_remote_subtitle_hls_policy(&item, metadata, &token.client, &mut options);
     let item_json = media_item_to_json_with_playback_and_metadata(
         &item,
@@ -34171,6 +34172,34 @@ async fn playback_info_response(
         "MediaSources": media_sources,
         "PlaySessionId": play_session_id,
     })))
+}
+
+/// Do not ask a remote origin to seek into the tiny tail of an item that Jellyfin already
+/// considers completed. Remote Matroska sources may need several range requests to find that
+/// final cluster; Android cancels the first HLS segment while the seek is still warming up and
+/// appears to require several play attempts. This mirrors `playback_report_outcome`'s completion
+/// threshold while preserving ordinary resume positions and explicit seeks below it.
+fn normalize_completed_remote_resume_position(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+    options: &mut PlaybackInfoOptions,
+) {
+    if !is_xtream_remote_media(metadata)
+        || !playback_position_reached_played_threshold(
+            item.runtime_ticks,
+            options.start_position_ticks,
+        )
+    {
+        return;
+    }
+
+    tracing::info!(
+        item_id = %item.id,
+        requested_start_position_ticks = options.start_position_ticks,
+        runtime_ticks = item.runtime_ticks,
+        "resetting completed remote playback resume position"
+    );
+    options.start_position_ticks = 0;
 }
 
 // Android Media3 downloads External WebVTT as one finite document. Some Xtream origins expose
@@ -56697,15 +56726,16 @@ mod tests {
         live_tv_playback_info_response, live_tv_recording_name,
         live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
-        metadata_editor_parental_rating_options, normalize_media_stream,
-        package_infos_from_repositories, package_install_task_key, paged_media_items,
-        parse_authorization_token, parse_codec_condition, parse_ffmpeg_mode, parse_jellyfin_uuid,
-        parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs,
-        parse_media_browser_pairs, parse_playback_info_options, playback_delivery_decision,
-        playback_delivery_decision_with_ffmpeg_mode, playback_hls_modes_from_dedupe_key,
-        playback_hls_transcode_dedupe_key, playback_hls_transcode_dedupe_key_with_output,
-        playback_info_options_from_body, playback_output_constraints_from_dedupe_key,
-        playback_report_outcome, plugin_configuration_from_runtime_host_path,
+        metadata_editor_parental_rating_options, normalize_completed_remote_resume_position,
+        normalize_media_stream, package_infos_from_repositories, package_install_task_key,
+        paged_media_items, parse_authorization_token, parse_codec_condition, parse_ffmpeg_mode,
+        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
+        parse_live_tv_xmltv_programs, parse_media_browser_pairs, parse_playback_info_options,
+        playback_delivery_decision, playback_delivery_decision_with_ffmpeg_mode,
+        playback_hls_modes_from_dedupe_key, playback_hls_transcode_dedupe_key,
+        playback_hls_transcode_dedupe_key_with_output, playback_info_options_from_body,
+        playback_output_constraints_from_dedupe_key, playback_report_outcome,
+        plugin_configuration_from_runtime_host_path,
         plugin_configuration_pages_from_runtime_host_path, plugin_image_from_runtime_host_path,
         plugin_package_operation, plugin_packages_root, plugin_scheduled_task_id,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
@@ -96947,6 +96977,58 @@ done
                 played: false,
             }
         );
+    }
+
+    #[test]
+    fn completed_remote_resume_position_restarts_without_an_expensive_tail_seek() {
+        let now = OffsetDateTime::now_utc();
+        let item = MediaItem {
+            id: Uuid::new_v4(),
+            virtual_folder_id: Uuid::new_v4(),
+            name: "Remote episode".to_string(),
+            path: "xtream://series/episode.mkv".to_string(),
+            media_type: "Video".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            file_size: None,
+            runtime_ticks: Some(1_420_000_000),
+            bitrate: Some(2_000_000),
+            width: Some(1920),
+            height: Some(1080),
+            media_streams: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let remote_metadata = json!({
+            "Provider": "xtream",
+            "RemoteSourceRef": {
+                "Version": 1,
+                "Provider": "xtream",
+                "TunerId": "test-tuner",
+                "Kind": "series-episode",
+                "RemoteId": "42",
+                "Extension": "mkv"
+            }
+        });
+        let mut completed = PlaybackInfoOptions {
+            start_position_ticks: 1_417_132_000,
+            start_position_ticks_provided: true,
+            ..PlaybackInfoOptions::default()
+        };
+        normalize_completed_remote_resume_position(&item, Some(&remote_metadata), &mut completed);
+        assert_eq!(completed.start_position_ticks, 0);
+
+        let mut resumable = PlaybackInfoOptions {
+            start_position_ticks: 1_000_000_000,
+            start_position_ticks_provided: true,
+            ..PlaybackInfoOptions::default()
+        };
+        normalize_completed_remote_resume_position(&item, Some(&remote_metadata), &mut resumable);
+        assert_eq!(resumable.start_position_ticks, 1_000_000_000);
+
+        let mut local = completed.clone();
+        local.start_position_ticks = 1_417_132_000;
+        normalize_completed_remote_resume_position(&item, None, &mut local);
+        assert_eq!(local.start_position_ticks, 1_417_132_000);
     }
 
     #[tokio::test]
