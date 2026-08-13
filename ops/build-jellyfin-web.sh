@@ -51,7 +51,7 @@ printf '%s\n' "${JELLYFIN_WEB_SWIPER_PATCH_SHA256}" | grep -Eq '^[a-f0-9]{64}$' 
     exit 65
 }
 
-for command_name in awk curl find grep mktemp mv node npm patch sed sha256sum sort tar tr; do
+for command_name in awk cp curl find grep mktemp mv node npm patch sed sha256sum sort tar tr; do
     command -v "${command_name}" >/dev/null 2>&1 || {
         echo "${command_name} is required" >&2
         exit 69
@@ -164,6 +164,31 @@ if ! find "${source_dir}/dist" -type f ! -name index.html -print -quit | grep -q
     echo "Jellyfin Web build did not produce any assets" >&2
     exit 70
 fi
+
+# Jellyfin Web only consumes complete External subtitle documents. Jellyrin's adapter preserves
+# that contract while fetching remote embedded text tracks in bounded windows around currentTime.
+subtitle_adapter="${script_dir}/web/jellyrin-segmented-subtitles.js"
+if [ ! -f "${subtitle_adapter}" ] || [ -L "${subtitle_adapter}" ]; then
+    echo "missing regular Jellyrin segmented subtitle adapter: ${subtitle_adapter}" >&2
+    exit 66
+fi
+cp -- "${subtitle_adapter}" "${source_dir}/dist/jellyrin-segmented-subtitles.js"
+WEB_INDEX="${source_dir}/dist/index.html" node <<'NODE'
+const fs = require('node:fs');
+
+const indexPath = process.env.WEB_INDEX;
+const source = fs.readFileSync(indexPath, 'utf8');
+const marker = '<script defer="defer" src="runtime.bundle.js';
+const offset = source.indexOf(marker);
+if (offset < 0) {
+  throw new Error('Jellyfin Web index does not contain the runtime bundle marker');
+}
+const adapter = '<script defer="defer" src="jellyrin-segmented-subtitles.js?v=1"></script>';
+if (source.includes(adapter)) {
+  throw new Error('Jellyrin segmented subtitle adapter was already injected');
+}
+fs.writeFileSync(indexPath, source.slice(0, offset) + adapter + source.slice(offset));
+NODE
 
 mv -- "${source_dir}/dist" "${publish_dir}"
 if [ -e "${output_dir}" ] || [ -L "${output_dir}" ]; then

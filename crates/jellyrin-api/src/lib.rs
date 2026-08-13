@@ -34025,8 +34025,8 @@ async fn playback_info_response(
             media_source.remove("DirectStreamUrl");
         }
         apply_playback_stream_selection(media_source, &options);
-        if selected_text_subtitle_can_use_hls(&item, &options) {
-            apply_direct_hls_text_subtitle_contract(
+        if selected_text_subtitle_can_use_external(&item, &options) {
+            apply_direct_external_text_subtitle_contract(
                 media_source,
                 &token.access_token,
                 &item.id.simple().to_string(),
@@ -34465,7 +34465,7 @@ fn encoded_audio_channel_layout(channels: u8) -> &'static str {
     }
 }
 
-fn apply_direct_hls_text_subtitle_contract(
+fn apply_direct_external_text_subtitle_contract(
     media_source: &mut serde_json::Map<String, serde_json::Value>,
     access_token: &str,
     item_id: &str,
@@ -34497,7 +34497,7 @@ fn apply_direct_hls_text_subtitle_contract(
         };
         stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
         stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
-        stream.insert("DeliveryMethod".to_string(), serde_json::json!("Hls"));
+        stream.insert("DeliveryMethod".to_string(), serde_json::json!("External"));
         stream.insert("IsExternal".to_string(), serde_json::json!(false));
         stream.insert(
             "SupportsExternalStream".to_string(),
@@ -34506,8 +34506,8 @@ fn apply_direct_hls_text_subtitle_contract(
         stream.insert(
             "DeliveryUrl".to_string(),
             serde_json::json!(format!(
-                "/Videos/{item_id}/{item_id}/Subtitles/{index}/subtitles.m3u8?api_key={access_token}&PlaySessionId={play_session_id}&segmentLength={}",
-                DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS
+                "/Videos/{item_id}/{item_id}/Subtitles/{index}/Stream.vtt?api_key={access_token}&PlaySessionId={play_session_id}&JellyrinSegmented=true&StartPositionTicks=0&EndPositionTicks={}",
+                DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS * 2 * 10_000_000
             )),
         );
     }
@@ -36645,7 +36645,10 @@ fn selected_audio_codec(item: &MediaItem, options: &PlaybackInfoOptions) -> Opti
         .and_then(|index| media_item_stream_codec_by_index(item, "Audio", index))
 }
 
-fn selected_text_subtitle_can_use_hls(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
+fn selected_text_subtitle_can_use_external(
+    item: &MediaItem,
+    options: &PlaybackInfoOptions,
+) -> bool {
     let Some(index) = options.subtitle_stream_index.filter(|index| *index >= 0) else {
         return false;
     };
@@ -36663,7 +36666,7 @@ fn selected_text_subtitle_can_use_hls(item: &MediaItem, options: &PlaybackInfoOp
     selected_is_text
         && options.subtitle_profiles.as_ref().is_some_and(|profiles| {
             profiles.iter().any(|profile| {
-                matches!(profile.method.as_deref(), Some("external" | "hls"))
+                profile.method.as_deref() == Some("external")
                     && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
             })
         })
@@ -37298,7 +37301,7 @@ fn playback_delivery_decision_with_ffmpeg_mode(
     let selected_subtitle_requires_processing = options
         .subtitle_stream_index
         .is_some_and(|index| index >= 0)
-        && !selected_text_subtitle_can_use_hls(item, options);
+        && !selected_text_subtitle_can_use_external(item, options);
     let profile_compatible = playback_profile_compatible(item, options);
     let profile_codecs_compatible = playback_profile_codecs_compatible(item, options);
     let profile_video_codec_compatible = playback_profile_video_codec_compatible(item, options);
@@ -55929,7 +55932,7 @@ mod tests {
         SystemLifecycleCommand, TvMazeExternals, TvMazeImage, TvMazeNetwork, TvMazeRating,
         TvMazeSchedule, TvMazeShow, WeakKeyedLockRegistry, activate_dotnet_plugin_with_host_path,
         activate_rust_wasi_plugin_with_host_path, align_hls_request_segment_timeline,
-        apply_direct_hls_text_subtitle_contract, apply_live_hls_ffmpeg_policy,
+        apply_direct_external_text_subtitle_contract, apply_live_hls_ffmpeg_policy,
         apply_playback_output_constraints, await_package_install_cancelable,
         backup_restore_snapshot_json, cascade_delete_series_timer_timers,
         classify_transcode_command, cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
@@ -95795,7 +95798,7 @@ done
         let mut media_source = json!({
             "MediaStreams": item.media_streams.clone()
         });
-        apply_direct_hls_text_subtitle_contract(
+        apply_direct_external_text_subtitle_contract(
             media_source.as_object_mut().unwrap(),
             "secret-token",
             "episode-id",
@@ -95803,11 +95806,11 @@ done
         );
         let subtitle = &media_source["MediaStreams"][2];
         assert_eq!(subtitle["Codec"], "webvtt");
-        assert_eq!(subtitle["DeliveryMethod"], "Hls");
+        assert_eq!(subtitle["DeliveryMethod"], "External");
         assert_eq!(subtitle["SupportsExternalStream"], true);
         assert_eq!(
             subtitle["DeliveryUrl"],
-            "/Videos/episode-id/episode-id/Subtitles/2/subtitles.m3u8?api_key=secret-token&PlaySessionId=play-session&segmentLength=15"
+            "/Videos/episode-id/episode-id/Subtitles/2/Stream.vtt?api_key=secret-token&PlaySessionId=play-session&JellyrinSegmented=true&StartPositionTicks=0&EndPositionTicks=300000000"
         );
 
         let no_hls_subtitles = PlaybackInfoOptions {
