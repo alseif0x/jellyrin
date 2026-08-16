@@ -13661,9 +13661,10 @@ async fn plugin_web_page_content(
             .body(Body::from(XTREAM_CONFIG_HTML))
             .unwrap());
     }
-    if let Some(bytes) = installed_plugin_web_page(&state.db, &plugin_id, &page_name, false).await?
+    if let Some(content) =
+        installed_plugin_web_page(&state.db, &plugin_id, &page_name, false).await?
     {
-        return Ok(plugin_web_page_response(bytes));
+        return Ok(plugin_web_page_response(content));
     }
     Err(ApiError::not_found("Web page not found"))
 }
@@ -15250,7 +15251,7 @@ fn safe_plugin_web_page_file(path: &str) -> Option<&OsStr> {
                 .and_then(OsStr::to_str)
                 .map(str::to_ascii_lowercase)
                 .as_deref(),
-            Some("html" | "htm")
+            Some("html" | "htm" | "js" | "mjs")
         )
     {
         return None;
@@ -15278,7 +15279,7 @@ fn manifest_plugin_web_page_path(
 async fn installed_plugin_web_page_by_name(
     db: &Database,
     name: &str,
-) -> Result<Option<Vec<u8>>, ApiError> {
+) -> Result<Option<PluginWebPageContent>, ApiError> {
     for plugin in db.installed_plugins_json().await? {
         if !json_string_field(&plugin, "Status")
             .is_some_and(|status| status.eq_ignore_ascii_case("Active"))
@@ -15301,7 +15302,7 @@ async fn installed_plugin_web_page(
     plugin_id: &str,
     selector: &str,
     select_by_name: bool,
-) -> Result<Option<Vec<u8>>, ApiError> {
+) -> Result<Option<PluginWebPageContent>, ApiError> {
     let security_slot = external_plugin_security_slot(plugin_id).await;
     let _security_guard = security_slot.read_owned().await;
     let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
@@ -15324,7 +15325,7 @@ async fn installed_plugin_web_page(
     let install_path = tokio::fs::canonicalize(install_path)
         .await
         .map_err(|_| ApiError::not_found("Plugin web page not found"))?;
-    let page_path = install_path.join(relative_path);
+    let page_path = install_path.join(&relative_path);
     let metadata = tokio::fs::symlink_metadata(&page_path)
         .await
         .map_err(|error| match error.kind() {
@@ -15355,15 +15356,32 @@ async fn installed_plugin_web_page(
             "Plugin web page exceeds the size limit",
         ));
     }
-    Ok(Some(bytes))
+    let content_type = match relative_path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        _ => "text/html; charset=utf-8",
+    };
+    Ok(Some(PluginWebPageContent {
+        bytes,
+        content_type,
+    }))
 }
 
-fn plugin_web_page_response(bytes: Vec<u8>) -> Response<Body> {
+struct PluginWebPageContent {
+    bytes: Vec<u8>,
+    content_type: &'static str,
+}
+
+fn plugin_web_page_response(content: PluginWebPageContent) -> Response<Body> {
     Response::builder()
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_TYPE, content.content_type)
         .header(header::CACHE_CONTROL, "no-cache, no-store")
         .header("x-content-type-options", "nosniff")
-        .body(Body::from(bytes))
+        .body(Body::from(content.bytes))
         .unwrap()
 }
 
@@ -15389,13 +15407,24 @@ async fn dashboard_configuration_page(
     headers: HeaderMap,
     Query(query): Query<DashboardConfigurationPageQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let name = query
         .name
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| ApiError::bad_request("Configuration page name is required"))?;
+
+    // Jellyfin Web loads plugin controllers with a native dynamic `import()`. Unlike the
+    // authenticated request used to fetch the configuration HTML, that module request cannot
+    // attach an X-Emby-Token header. JavaScript controllers are static plugin assets, so make
+    // them publicly readable while keeping HTML configuration pages admin-only below.
+    if let Some(content) = installed_plugin_web_page_by_name(&state.db, name).await?
+        && content.content_type == "text/javascript; charset=utf-8"
+    {
+        return Ok(plugin_web_page_response(content));
+    }
+
+    require_admin(&state.db, &headers, query.auth.api_key.as_deref()).await?;
 
     // Check if this is a built-in plugin configuration page
     if let Some(html) = builtin_plugin_web_page_by_name(&state.db, name).await? {
@@ -15406,8 +15435,8 @@ async fn dashboard_configuration_page(
             .unwrap());
     }
 
-    if let Some(bytes) = installed_plugin_web_page_by_name(&state.db, name).await? {
-        return Ok(plugin_web_page_response(bytes));
+    if let Some(content) = installed_plugin_web_page_by_name(&state.db, name).await? {
+        return Ok(plugin_web_page_response(content));
     }
 
     // Fall back to web directory files
@@ -59850,7 +59879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_process_manifest_page_is_discovered_and_served_only_to_admins() {
+    async fn external_process_manifest_page_serves_admin_html_and_public_controller_module() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("admin".to_string(), "secret")
@@ -59875,7 +59904,11 @@ mod tests {
             std::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let html = b"<div data-role=\"page\"><script>window.magstvLoaded=true;</script></div>";
+        let controller = b"export default class MagstvController {}";
         tokio::fs::write(plugin_dir.join("configuration.html"), html)
+            .await
+            .unwrap();
+        tokio::fs::write(plugin_dir.join("configuration.js"), controller)
             .await
             .unwrap();
         tokio::fs::write(plugin_dir.join("undeclared.html"), b"secret")
@@ -59904,6 +59937,12 @@ mod tests {
                             "Name": "magstv-config",
                             "Path": "configuration.html",
                             "DisplayName": "MAGSTV Configuration",
+                            "EnableInMainMenu": false
+                        },
+                        {
+                            "Name": "magstv-controller",
+                            "Path": "configuration.js",
+                            "DisplayName": "MAGSTV Controller",
                             "EnableInMainMenu": false
                         },
                         {
@@ -59939,6 +59978,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let public_controller = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web/ConfigurationPage?name=magstv-controller")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_controller.status(), StatusCode::OK);
+        assert_eq!(
+            public_controller
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            &public_controller
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()[..],
+            controller
+        );
 
         let pages = app
             .clone()
@@ -60001,6 +60068,36 @@ mod tests {
             assert_eq!(
                 &response.into_body().collect().await.unwrap().to_bytes()[..],
                 html
+            );
+        }
+
+        for uri in [
+            "/web/ConfigurationPage?name=magstv-controller".to_string(),
+            format!("/Plugins/{plugin_id}/WebPages/configuration.js"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/javascript; charset=utf-8"
+            );
+            assert_eq!(
+                response.headers().get("x-content-type-options").unwrap(),
+                "nosniff"
+            );
+            assert_eq!(
+                &response.into_body().collect().await.unwrap().to_bytes()[..],
+                controller
             );
         }
 
