@@ -24,16 +24,17 @@ use super::{
     MediaItemFacetValue, MediaItemFavoriteFilter, MediaItemFilterSummary, MediaItemForImageTag,
     MediaItemMetadata, MediaItemQueryFilterProjection, MediaItemQueryFilterProjectionSource,
     MediaItemQueryFilterSelection, MediaItemQueryFilterValues, PostgresDatabase,
-    REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, RemoteMediaCatalogStage, RemoteMediaItemUpsert,
-    RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, SortDirection,
-    TV_SERIES_CATALOG_PROJECTION_VERSION, TvSeriesCatalogKey, TvSeriesCatalogPage,
+    REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, ReadyRemoteMediaCatalogStage,
+    RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot,
+    RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION,
+    TvSeriesCatalogKey, TvSeriesCatalogNameFilter, TvSeriesCatalogPage,
     catalog_sync_duration_millis, encode_media_item_query_filter_position,
     extract_media_item_facets, extract_media_item_filter_selectors,
     extract_media_item_genre_selectors, extract_media_item_query_filter_projection,
     is_upcoming_media_item_entry, nonnegative_count, normalized_facet_query_values,
-    prepare_remote_media_library_stage_specs, retain_entries_with_effective_types,
-    telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
-    validate_remote_media_catalog_stage_append,
+    prepare_remote_media_library_stage_specs, remote_media_stage_source_revision,
+    retain_entries_with_effective_types, telemetry::DatabaseOperation,
+    upcoming_media_item_premiere_parts, validate_remote_media_catalog_stage_append,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -43,7 +44,7 @@ pub const MEDIA_ITEM_QUERY_FILTER_PROJECTION_NAME: &str = "media_item_query_filt
 const MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION: i32 = 1;
 
 pub const MEDIA_ITEM_FACET_PROJECTION_NAME: &str = "media_item_facets";
-pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 4;
+pub const MEDIA_ITEM_FACET_PROJECTION_VERSION: i32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaItemFacetProjectionMode {
@@ -1798,6 +1799,56 @@ impl PostgresDatabase {
         start_index: usize,
         limit: usize,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
+        self.tv_series_catalog_search_page(
+            virtual_folder_id,
+            start_index,
+            limit,
+            TvSeriesCatalogNameFilter::default(),
+        )
+        .await
+    }
+
+    pub async fn tv_series_catalog_search_page(
+        &self,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        filter: TvSeriesCatalogNameFilter,
+    ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
+        let search_pattern = filter
+            .search_term
+            .as_deref()
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .map(|term| {
+                format!(
+                    "%{}%",
+                    escape_catalog_like_value(&term.to_ascii_lowercase())
+                )
+            });
+        let starts_with_pattern = filter
+            .starts_with
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| {
+                format!(
+                    "{}%",
+                    escape_catalog_like_value(&prefix.to_ascii_lowercase())
+                )
+            });
+        let lower_bound = filter
+            .starts_with_or_greater
+            .as_deref()
+            .map(str::trim)
+            .filter(|bound| !bound.is_empty())
+            .map(str::to_ascii_lowercase);
+        let upper_bound = filter
+            .less_than
+            .as_deref()
+            .map(str::trim)
+            .filter(|bound| !bound.is_empty())
+            .map(str::to_ascii_lowercase);
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
@@ -1855,6 +1906,10 @@ impl PostgresDatabase {
                 virtual_folder_id,
                 start_index,
                 limit,
+                search_pattern.as_deref(),
+                starts_with_pattern.as_deref(),
+                lower_bound.as_deref(),
+                upper_bound.as_deref(),
             )
             .await?;
             transaction.commit().await?;
@@ -1872,6 +1927,10 @@ impl PostgresDatabase {
              AND coverage.projection_version = $4
             WHERE true
               AND ($1::uuid IS NULL OR series.virtual_folder_id = $1)
+              AND ($5::text IS NULL OR lower(series.series_name) LIKE $5 ESCAPE '\')
+              AND ($6::text IS NULL OR lower(series.series_name) LIKE $6 ESCAPE '\')
+              AND ($7::text IS NULL OR lower(series.series_name) >= $7)
+              AND ($8::text IS NULL OR lower(series.series_name) < $8)
             GROUP BY series_id
             ORDER BY lower(min(series_name)), min(series_name), series_id
             LIMIT $2 OFFSET $3
@@ -1881,6 +1940,10 @@ impl PostgresDatabase {
         .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
         .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+        .bind(search_pattern.as_deref())
+        .bind(starts_with_pattern.as_deref())
+        .bind(lower_bound.as_deref())
+        .bind(upper_bound.as_deref())
         .fetch_all(&mut *transaction)
         .await?;
         let total = if let Some((_, _, total)) = series.first() {
@@ -1889,10 +1952,14 @@ impl PostgresDatabase {
             0
         } else {
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(DISTINCT series.series_id) FROM media_item_tv_series AS series JOIN media_item_tv_series_coverage AS coverage ON coverage.virtual_folder_id = series.virtual_folder_id AND coverage.projection_version = $2 WHERE ($1::uuid IS NULL OR series.virtual_folder_id = $1)",
+                "SELECT COUNT(DISTINCT series.series_id) FROM media_item_tv_series AS series JOIN media_item_tv_series_coverage AS coverage ON coverage.virtual_folder_id = series.virtual_folder_id AND coverage.projection_version = $2 WHERE ($1::uuid IS NULL OR series.virtual_folder_id = $1) AND ($3::text IS NULL OR lower(series.series_name) LIKE $3 ESCAPE '\\') AND ($4::text IS NULL OR lower(series.series_name) LIKE $4 ESCAPE '\\') AND ($5::text IS NULL OR lower(series.series_name) >= $5) AND ($6::text IS NULL OR lower(series.series_name) < $6)",
             )
             .bind(virtual_folder_id)
             .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+            .bind(search_pattern.as_deref())
+            .bind(starts_with_pattern.as_deref())
+            .bind(lower_bound.as_deref())
+            .bind(upper_bound.as_deref())
             .fetch_one(&mut *transaction)
             .await?
         };
@@ -1967,6 +2034,10 @@ impl PostgresDatabase {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
+        search_pattern: Option<&str>,
+        starts_with_pattern: Option<&str>,
+        lower_bound: Option<&str>,
+        upper_bound: Option<&str>,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let canonical: bool = sqlx::query_scalar(
             r#"
@@ -2027,7 +2098,14 @@ impl PostgresDatabase {
                   AND ($1::uuid IS NULL OR item.virtual_folder_id = $1)
                 GROUP BY btrim(item.metadata->>'SeriesId')
             ), stats AS (
-                SELECT count(*)::bigint AS total,
+                SELECT count(*) FILTER (
+                           WHERE ($4::text IS NULL
+                              OR lower(series_name) LIKE $4 ESCAPE '\')
+                             AND ($5::text IS NULL
+                              OR lower(series_name) LIKE $5 ESCAPE '\')
+                             AND ($6::text IS NULL OR lower(series_name) >= $6)
+                             AND ($7::text IS NULL OR lower(series_name) < $7)
+                       )::bigint AS total,
                        coalesce(bool_or(series_name <> series_name_last), FALSE) AS name_conflict,
                        coalesce(bool_or(folder_first <> folder_last), FALSE) AS folder_conflict,
                        coalesce(bool_or(foreign_folder), FALSE) AS foreign_folder
@@ -2035,6 +2113,10 @@ impl PostgresDatabase {
             ), page AS (
                 SELECT series_id, series_name
                 FROM grouped
+                WHERE ($4::text IS NULL OR lower(series_name) LIKE $4 ESCAPE '\')
+                  AND ($5::text IS NULL OR lower(series_name) LIKE $5 ESCAPE '\')
+                  AND ($6::text IS NULL OR lower(series_name) >= $6)
+                  AND ($7::text IS NULL OR lower(series_name) < $7)
                 ORDER BY lower(series_name), series_name, series_id
                 LIMIT $2 OFFSET $3
             )
@@ -2048,6 +2130,10 @@ impl PostgresDatabase {
         .bind(virtual_folder_id)
         .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
+        .bind(search_pattern)
+        .bind(starts_with_pattern)
+        .bind(lower_bound)
+        .bind(upper_bound)
         .fetch_all(&mut **tx)
         .await?;
         let Some(first) = grouped.first() else {
@@ -2419,8 +2505,22 @@ impl PostgresDatabase {
         .await?;
         sqlx::query(
             r#"
-            INSERT INTO media_item_tv_series_members (item_id, virtual_folder_id, series_id)
-            SELECT item.id, item.virtual_folder_id, btrim(item.metadata->>'SeriesId')
+            INSERT INTO media_item_tv_series_members (
+                item_id, virtual_folder_id, series_id,
+                season_number, episode_number, sort_name, item_name, item_path
+            )
+            SELECT item.id, item.virtual_folder_id, btrim(item.metadata->>'SeriesId'),
+                   COALESCE(
+                       CASE WHEN btrim(item.metadata->>'ParentIndexNumber') ~ '^[0-9]+$'
+                            THEN (item.metadata->>'ParentIndexNumber')::integer END,
+                       2147483647
+                   ),
+                   COALESCE(
+                       CASE WHEN btrim(item.metadata->>'IndexNumber') ~ '^[0-9]+$'
+                            THEN (item.metadata->>'IndexNumber')::integer END,
+                       2147483647
+                   ),
+                   lower(item.name), item.name, item.path
             FROM media_items AS item
             WHERE item.virtual_folder_id = $1
               AND item.missing_since IS NULL
@@ -2518,6 +2618,48 @@ impl PostgresDatabase {
             DatabasePoolRole::Api,
         );
         let result = async {
+            let projection_covered: bool = sqlx::query_scalar(
+                r#"
+                SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_folders AS folder
+                    LEFT JOIN media_item_tv_series_coverage AS coverage
+                      ON coverage.virtual_folder_id = folder.id
+                     AND coverage.projection_version = $1
+                    WHERE lower(coalesce(folder.collection_type, '')) = ANY(
+                              ARRAY['tvshows', 'tvshow', 'series']::text[]
+                          )
+                      AND coverage.virtual_folder_id IS NULL
+                )
+                "#,
+            )
+            .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+            .fetch_one(&self.pool)
+            .await?;
+            if projection_covered {
+                let rows = sqlx::query_as::<_, PostgresProjectedNextUpCandidateRow>(
+                    r#"
+                    SELECT DISTINCT ON (member.series_id)
+                           member.item_id, member.virtual_folder_id,
+                           member.item_name, member.item_path
+                    FROM media_item_tv_series_members AS member
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM playback_states AS playback
+                        WHERE playback.item_id = member.item_id
+                          AND playback.user_id = $1
+                          AND playback.played
+                    )
+                    ORDER BY member.series_id, member.season_number,
+                             member.episode_number, member.sort_name, member.item_id
+                    "#,
+                )
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+                return anyhow::Ok(rows.into_iter().map(MediaItem::from).collect::<Vec<_>>());
+            }
+
             let mut rows = sqlx::query_as::<_, PostgresTvNextUpCandidateRow>(
                 r#"
             SELECT item.id, item.virtual_folder_id, item.name, item.path,
@@ -2965,14 +3107,16 @@ impl PostgresDatabase {
             r#"
             SELECT facet.normalized_value, facet.display_value, facet.stable_id, facet.payload
             FROM media_item_facets AS facet
-            JOIN media_item_facet_aliases AS alias
-              ON alias.item_id = facet.item_id
-             AND alias.facet_kind = facet.facet_kind
-             AND alias.normalized_value = facet.normalized_value
             JOIN media_items AS item ON item.id = facet.item_id
             WHERE item.missing_since IS NULL
               AND facet.facet_kind = $1
-              AND alias.entity_id = $2
+              AND (facet.stable_id = $2 OR EXISTS (
+                  SELECT 1 FROM media_item_facet_aliases AS alias
+                  WHERE alias.item_id = facet.item_id
+                    AND alias.facet_kind = facet.facet_kind
+                    AND alias.normalized_value = facet.normalized_value
+                    AND alias.entity_id = $2
+              ))
             ORDER BY item.created_at, facet.position, facet.item_id
             LIMIT 1
             "#,
@@ -3048,10 +3192,6 @@ impl PostgresDatabase {
             SELECT DISTINCT facet.item_id
             FROM media_item_facets AS facet
             JOIN media_items AS item ON item.id = facet.item_id
-            LEFT JOIN media_item_facet_aliases AS alias
-              ON alias.item_id = facet.item_id
-             AND alias.facet_kind = facet.facet_kind
-             AND alias.normalized_value = facet.normalized_value
             WHERE item.missing_since IS NULL
             "#,
         );
@@ -3082,12 +3222,17 @@ impl PostgresDatabase {
                 query.push(" OR ");
             }
             if !entity_ids.is_empty() {
-                query.push("alias.entity_id IN (");
+                query.push("(facet.stable_id IN (");
                 let mut separated = query.separated(", ");
                 for entity_id in &entity_ids {
                     separated.push_bind(entity_id);
                 }
-                separated.push_unseparated(")");
+                separated.push_unseparated(") OR EXISTS (SELECT 1 FROM media_item_facet_aliases AS alias WHERE alias.item_id = facet.item_id AND alias.facet_kind = facet.facet_kind AND alias.normalized_value = facet.normalized_value AND alias.entity_id IN (");
+                let mut separated = query.separated(", ");
+                for entity_id in &entity_ids {
+                    separated.push_bind(entity_id);
+                }
+                separated.push_unseparated(")))");
             }
             query.push(")");
         }
@@ -3109,7 +3254,17 @@ impl PostgresDatabase {
         &self,
         libraries: Vec<RemoteMediaLibraryStageSpec>,
     ) -> anyhow::Result<RemoteMediaCatalogStage> {
+        self.begin_remote_media_catalog_stage_for_revision(libraries, "")
+            .await
+    }
+
+    pub async fn begin_remote_media_catalog_stage_for_revision(
+        &self,
+        libraries: Vec<RemoteMediaLibraryStageSpec>,
+        source_revision: &str,
+    ) -> anyhow::Result<RemoteMediaCatalogStage> {
         let libraries = prepare_remote_media_library_stage_specs(libraries)?;
+        let source_revision = remote_media_stage_source_revision(source_revision)?;
         let stage = RemoteMediaCatalogStage::new(Uuid::new_v4());
         let stage_id = stage.parsed_id()?;
         let mut tx = self.worker_pool.begin().await?;
@@ -3117,14 +3272,15 @@ impl PostgresDatabase {
             r#"
             INSERT INTO remote_media_catalog_stages (
                 id, status, extractor_version, query_filter_extractor_version,
-                created_at, updated_at
+                source_revision, created_at, updated_at
             )
-            VALUES ($1, 'open', $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES ($1, 'open', $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             "#,
         )
         .bind(stage_id)
         .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
         .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .bind(source_revision)
         .execute(&mut *tx)
         .await?;
         for library in libraries {
@@ -3167,9 +3323,9 @@ impl PostgresDatabase {
             .map(PreparedRemoteMediaItem::try_from)
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut tx = self.worker_pool.begin().await?;
-        let (status, extractor_version, query_filter_version) =
-            sqlx::query_as::<_, (String, i32, i32)>(
-                "SELECT status, extractor_version, query_filter_extractor_version \
+        let (status, ready_at, extractor_version, query_filter_version) =
+            sqlx::query_as::<_, (String, Option<OffsetDateTime>, i32, i32)>(
+                "SELECT status, ready_at, extractor_version, query_filter_extractor_version \
              FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
             )
             .bind(stage_id)
@@ -3177,6 +3333,10 @@ impl PostgresDatabase {
             .await?
             .context("remote media catalogue stage not found")?;
         anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
+        anyhow::ensure!(
+            ready_at.is_none(),
+            "remote media catalogue stage is already complete"
+        );
         anyhow::ensure!(
             extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
             "remote media catalogue stage extractor version is stale"
@@ -3434,6 +3594,99 @@ impl PostgresDatabase {
         Ok(())
     }
 
+    pub async fn complete_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+    ) -> anyhow::Result<()> {
+        let stage_id = stage.parsed_id()?;
+        let completed = sqlx::query(
+            r#"
+            UPDATE remote_media_catalog_stages AS stage
+            SET ready_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE stage.id = $1 AND stage.status = 'open' AND stage.ready_at IS NULL
+              AND stage.extractor_version = $2
+              AND stage.query_filter_extractor_version = $3
+              AND (SELECT count(*) FROM remote_media_catalog_stage_libraries
+                   WHERE stage_id = stage.id) = 2
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM remote_media_catalog_stage_libraries AS library
+                  WHERE library.stage_id = stage.id
+                    AND library.item_count <> (
+                        SELECT count(*)
+                        FROM remote_media_catalog_stage_items AS item
+                        WHERE item.stage_id = library.stage_id
+                          AND item.library_key = library.library_key
+                    )
+              )
+            "#,
+        )
+        .bind(stage_id)
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .execute(&self.worker_pool)
+        .await?;
+        anyhow::ensure!(
+            completed.rows_affected() == 1,
+            "remote media catalogue stage is incomplete, stale, or not open"
+        );
+        Ok(())
+    }
+
+    pub async fn ready_remote_media_catalog_stage(
+        &self,
+        libraries: Vec<RemoteMediaLibraryStageSpec>,
+        source_revision: &str,
+    ) -> anyhow::Result<Option<ReadyRemoteMediaCatalogStage>> {
+        let libraries = prepare_remote_media_library_stage_specs(libraries)?;
+        let source_revision = remote_media_stage_source_revision(source_revision)?;
+        let movies = &libraries[0];
+        let series = &libraries[1];
+        let row = sqlx::query_as::<_, (Uuid, i64, i64)>(
+            r#"
+            SELECT stage.id, movies.item_count, series.item_count
+            FROM remote_media_catalog_stages AS stage
+            JOIN remote_media_catalog_stage_libraries AS movies
+              ON movies.stage_id = stage.id AND movies.library_key = 'movies'
+            JOIN remote_media_catalog_stage_libraries AS series
+              ON series.stage_id = stage.id AND series.library_key = 'series'
+            WHERE stage.status = 'open' AND stage.ready_at IS NOT NULL
+              AND stage.extractor_version = $1
+              AND stage.query_filter_extractor_version = $2
+              AND stage.source_revision = $3
+              AND lower(movies.library_name) = lower($4)
+              AND movies.collection_type = $5 AND movies.source_location = $6
+              AND lower(series.library_name) = lower($7)
+              AND series.collection_type = $8 AND series.source_location = $9
+              AND (SELECT count(*) FROM remote_media_catalog_stage_libraries AS library
+                   WHERE library.stage_id = stage.id) = 2
+            ORDER BY stage.ready_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .bind(source_revision)
+        .bind(&movies.library_name)
+        .bind(&movies.collection_type)
+        .bind(&movies.source_location)
+        .bind(&series.library_name)
+        .bind(&series.collection_type)
+        .bind(&series.source_location)
+        .fetch_optional(&self.worker_pool)
+        .await?;
+        row.map(|(id, movie_count, series_item_count)| {
+            Ok(ReadyRemoteMediaCatalogStage {
+                stage: RemoteMediaCatalogStage::try_from_id(id.to_string())?,
+                movie_count: usize::try_from(movie_count)
+                    .context("ready movie stage count overflow")?,
+                series_item_count: usize::try_from(series_item_count)
+                    .context("ready series stage count overflow")?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn abort_remote_media_catalog_stage(
         &self,
         stage: &RemoteMediaCatalogStage,
@@ -3475,7 +3728,8 @@ impl PostgresDatabase {
         let result = sqlx::query(
             r#"
             DELETE FROM remote_media_catalog_stages
-            WHERE status IN ('open', 'aborted') AND updated_at < $1
+            WHERE ((status = 'open' AND ready_at IS NULL) OR status = 'aborted')
+              AND updated_at < $1
             "#,
         )
         .bind(older_than)
@@ -3490,16 +3744,39 @@ impl PostgresDatabase {
     ) -> anyhow::Result<Vec<VirtualFolder>> {
         let stage_id = stage.parsed_id()?;
         let mut tx = self.worker_pool.begin().await?;
-        let (status, extractor_version, query_filter_version) =
-            sqlx::query_as::<_, (String, i32, i32)>(
-                "SELECT status, extractor_version, query_filter_extractor_version \
+        // Publishing a remote snapshot intentionally writes an entire library in one atomic
+        // transaction. Large Xtream catalogues can exceed the worker pool's general-purpose
+        // statement timeout while PostgreSQL maintains indexes and statement-level transition
+        // table triggers. Keep this operation bounded, but give it enough time to finish without
+        // forcing the provider catalogue to be downloaded again.
+        sqlx::query("SET LOCAL statement_timeout = '15min'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
+        sqlx::query("SET LOCAL work_mem = '64MB'")
+            .execute(&mut *tx)
+            .await?;
+        // A newly-created remote folder has no committed column statistics until this transaction
+        // finishes. Nested-loop plans therefore underestimate the just-inserted catalogue and can
+        // execute hundreds of thousands of point lookups while rebuilding filter summaries. The
+        // publication queries are all whole-snapshot joins, for which hash/merge joins are bounded
+        // and consistently faster even before autovacuum can analyze the new folder.
+        sqlx::query("SET LOCAL enable_nestloop = off")
+            .execute(&mut *tx)
+            .await?;
+        let (status, ready_at, extractor_version, query_filter_version) =
+            sqlx::query_as::<_, (String, Option<OffsetDateTime>, i32, i32)>(
+                "SELECT status, ready_at, extractor_version, query_filter_extractor_version \
              FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
             )
             .bind(stage_id)
             .fetch_optional(&mut *tx)
             .await?
             .context("remote media catalogue stage not found")?;
-        anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
+        anyhow::ensure!(
+            status == "open" && ready_at.is_some(),
+            "remote media catalogue stage is not ready"
+        );
         anyhow::ensure!(
             extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
             "remote media catalogue stage extractor version is stale"
@@ -3609,14 +3886,15 @@ impl PostgresDatabase {
             .bind(i64::try_from(item_count).context("remote snapshot item count overflow")?)
             .execute(&mut *tx)
             .await?;
-            folders.push(
-                self.publish_prepared_remote_media_library_stage_in_transaction(
+            let folder = self
+                .publish_prepared_remote_media_library_stage_in_transaction(
                     &mut tx,
                     folder_row,
                     sync_run_id,
                 )
-                .await?,
-            );
+                .await?;
+            Self::drop_durable_remote_media_stage_views_in_transaction(&mut tx).await?;
+            folders.push(folder);
         }
         sqlx::query("DELETE FROM remote_media_catalog_stages WHERE id = $1")
             .bind(stage_id)
@@ -3637,280 +3915,120 @@ impl PostgresDatabase {
         stage_id: Uuid,
         library_key: &str,
     ) -> anyhow::Result<u64> {
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_remote_snapshot_stage (
-                id uuid PRIMARY KEY,
-                name text NOT NULL,
-                path text NOT NULL UNIQUE,
-                media_type text NOT NULL,
-                collection_type text,
-                runtime_ticks bigint,
-                bitrate bigint,
-                width integer,
-                height integer,
-                media_streams jsonb NOT NULL,
-                metadata jsonb NOT NULL
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_facet_stage (
-                item_id uuid NOT NULL,
-                facet_kind text NOT NULL,
-                normalized_value text NOT NULL,
-                display_value text NOT NULL,
-                stable_id text NOT NULL,
-                position integer NOT NULL,
-                payload jsonb NOT NULL,
-                PRIMARY KEY (item_id, facet_kind, normalized_value)
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_facet_alias_stage (
-                item_id uuid NOT NULL,
-                facet_kind text NOT NULL,
-                normalized_value text NOT NULL,
-                entity_id text NOT NULL,
-                PRIMARY KEY (item_id, facet_kind, normalized_value, entity_id)
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_genre_selector_stage (
-                item_id uuid NOT NULL,
-                selector text NOT NULL,
-                PRIMARY KEY (item_id, selector)
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_filter_selector_stage (
-                item_id uuid NOT NULL,
-                selector_kind text NOT NULL,
-                selector text NOT NULL,
-                PRIMARY KEY (item_id, selector_kind, selector)
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_media_item_upcoming_date_stage (
-                item_id uuid PRIMARY KEY,
-                unix_seconds bigint NOT NULL,
-                nanosecond integer NOT NULL
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_query_filter_source_stage (
-                item_id uuid PRIMARY KEY,
-                container_present boolean NOT NULL,
-                container_value text,
-                media_type text NOT NULL,
-                is_video boolean NOT NULL,
-                has_subtitles boolean NOT NULL,
-                has_trailer boolean NOT NULL,
-                projected_value_count integer NOT NULL
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            CREATE TEMPORARY TABLE IF NOT EXISTS jellyrin_query_filter_value_stage (
-                item_id uuid NOT NULL,
-                value_kind text NOT NULL,
-                display_value text NOT NULL,
-                source_key text NOT NULL,
-                source_priority integer NOT NULL,
-                source_position text NOT NULL,
-                PRIMARY KEY (item_id, value_kind, source_key, source_position)
-            ) ON COMMIT DROP
-            "#,
-        )
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            "TRUNCATE jellyrin_remote_snapshot_stage, \
-             jellyrin_media_item_facet_alias_stage, jellyrin_media_item_facet_stage, \
-             jellyrin_media_item_genre_selector_stage, \
-             jellyrin_media_item_filter_selector_stage, \
-             jellyrin_media_item_upcoming_date_stage, jellyrin_query_filter_value_stage, \
-             jellyrin_query_filter_source_stage",
-        )
-        .execute(&mut **tx)
-        .await?;
-        let inserted = sqlx::query(
-            r#"
-            INSERT INTO jellyrin_remote_snapshot_stage (
-                id, name, path, media_type, collection_type, runtime_ticks, bitrate,
-                width, height, media_streams, metadata
-            )
-            SELECT id, name, path, media_type, collection_type, runtime_ticks, bitrate,
-                   width, height, media_streams, metadata
-            FROM remote_media_catalog_stage_items
-            WHERE stage_id = $1 AND library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO jellyrin_media_item_facet_stage (
-                item_id, facet_kind, normalized_value, display_value, stable_id, position, payload
-            )
-            SELECT facet.item_id, facet.facet_kind, facet.normalized_value,
-                   facet.display_value, facet.stable_id, facet.position, facet.payload
-            FROM remote_media_catalog_stage_facets AS facet
-            JOIN remote_media_catalog_stage_items AS item
-              ON item.stage_id = facet.stage_id AND item.id = facet.item_id
-            WHERE facet.stage_id = $1 AND item.library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO jellyrin_media_item_facet_alias_stage (
-                item_id, facet_kind, normalized_value, entity_id
-            )
-            SELECT alias.item_id, alias.facet_kind, alias.normalized_value, alias.entity_id
-            FROM remote_media_catalog_stage_facet_aliases AS alias
-            JOIN remote_media_catalog_stage_items AS item
-              ON item.stage_id = alias.stage_id AND item.id = alias.item_id
-            WHERE alias.stage_id = $1 AND item.library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO jellyrin_media_item_genre_selector_stage (item_id, selector)
-            SELECT selector.item_id, selector.selector
-            FROM remote_media_catalog_stage_genre_selectors AS selector
-            JOIN remote_media_catalog_stage_items AS item
-              ON item.stage_id = selector.stage_id AND item.id = selector.item_id
-            WHERE selector.stage_id = $1 AND item.library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO jellyrin_media_item_filter_selector_stage (
-                item_id, selector_kind, selector
-            )
-            SELECT selector.item_id, selector.selector_kind, selector.selector
-            FROM remote_media_catalog_stage_filter_selectors AS selector
-            JOIN remote_media_catalog_stage_items AS item
-              ON item.stage_id = selector.stage_id AND item.id = selector.item_id
-            WHERE selector.stage_id = $1 AND item.library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO jellyrin_media_item_upcoming_date_stage (
-                item_id, unix_seconds, nanosecond
-            )
-            SELECT upcoming.item_id, upcoming.unix_seconds, upcoming.nanosecond
-            FROM remote_media_catalog_stage_upcoming_dates AS upcoming
-            JOIN remote_media_catalog_stage_items AS item
-              ON item.stage_id = upcoming.stage_id AND item.id = upcoming.item_id
-            WHERE upcoming.stage_id = $1 AND item.library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
-        let projected_sources = sqlx::query(
-            r#"
-            INSERT INTO jellyrin_query_filter_source_stage (
-                item_id, container_present, container_value, media_type, is_video,
-                has_subtitles, has_trailer, projected_value_count
-            )
-            SELECT source.item_id, source.container_present, source.container_value,
-                   source.media_type, source.is_video, source.has_subtitles,
-                   source.has_trailer, source.projected_value_count
-            FROM remote_media_catalog_stage_query_filter_sources AS source
-            JOIN remote_media_catalog_stage_items AS item
-              ON item.stage_id = source.stage_id AND item.id = source.item_id
-            WHERE source.stage_id = $1 AND item.library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO jellyrin_query_filter_value_stage (
-                item_id, value_kind, display_value, source_key, source_priority, source_position
-            )
-            SELECT value.item_id, value.value_kind, value.display_value, value.source_key,
-                   value.source_priority, value.source_position
-            FROM remote_media_catalog_stage_query_filter_values AS value
-            JOIN remote_media_catalog_stage_items AS item
-              ON item.stage_id = value.stage_id AND item.id = value.item_id
-            WHERE value.stage_id = $1 AND item.library_key = $2
-            "#,
-        )
-        .bind(stage_id)
-        .bind(library_key)
-        .execute(&mut **tx)
-        .await?;
         anyhow::ensure!(
-            projected_sources.rows_affected() == inserted.rows_affected(),
-            "remote media catalogue stage query-filter source coverage is incomplete"
+            matches!(library_key, "movies" | "series"),
+            "remote media catalogue stage library key must be movies or series"
         );
-        let projection_counts = sqlx::query_as::<_, (i64, i64, i64)>(
-            "SELECT coalesce(sum(projected_value_count), 0), \
-                    (SELECT count(*) FROM jellyrin_query_filter_value_stage), \
-                    (SELECT count(*) FROM jellyrin_query_filter_source_stage AS source \
-                     WHERE source.projected_value_count <> (SELECT count(*) \
-                       FROM jellyrin_query_filter_value_stage AS value \
-                       WHERE value.item_id = source.item_id)) \
-             FROM jellyrin_query_filter_source_stage",
+        Self::drop_durable_remote_media_stage_views_in_transaction(tx).await?;
+        // Transaction-local settings keep every view definition static and parameterized. The
+        // shared publication path can then read durable rows in place instead of writing several
+        // gigabytes to temporary tables and reading them back before the live merge.
+        sqlx::query(
+            "SELECT set_config('jellyrin.remote_media_stage_id', $1::text, true), \
+                    set_config('jellyrin.remote_media_library_key', $2, true)",
+        )
+        .bind(stage_id)
+        .bind(library_key)
+        .execute(&mut **tx)
+        .await?;
+        let views = [
+            r#"CREATE TEMPORARY VIEW jellyrin_remote_snapshot_stage AS
+               SELECT id, name, path, media_type, collection_type, runtime_ticks, bitrate,
+                      width, height, media_streams, metadata
+               FROM remote_media_catalog_stage_items AS item
+               WHERE item.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+            r#"CREATE TEMPORARY VIEW jellyrin_media_item_facet_stage AS
+               SELECT facet.item_id, facet.facet_kind, facet.normalized_value,
+                      facet.display_value, facet.stable_id, facet.position, facet.payload
+               FROM remote_media_catalog_stage_facets AS facet
+               JOIN remote_media_catalog_stage_items AS item
+                 ON item.stage_id = facet.stage_id AND item.id = facet.item_id
+               WHERE facet.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+            r#"CREATE TEMPORARY VIEW jellyrin_media_item_facet_alias_stage AS
+               SELECT alias.item_id, alias.facet_kind, alias.normalized_value, alias.entity_id
+               FROM remote_media_catalog_stage_facet_aliases AS alias
+               JOIN remote_media_catalog_stage_items AS item
+                 ON item.stage_id = alias.stage_id AND item.id = alias.item_id
+               WHERE alias.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+            r#"CREATE TEMPORARY VIEW jellyrin_media_item_genre_selector_stage AS
+               SELECT selector.item_id, selector.selector
+               FROM remote_media_catalog_stage_genre_selectors AS selector
+               JOIN remote_media_catalog_stage_items AS item
+                 ON item.stage_id = selector.stage_id AND item.id = selector.item_id
+               WHERE selector.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+            r#"CREATE TEMPORARY VIEW jellyrin_media_item_filter_selector_stage AS
+               SELECT selector.item_id, selector.selector_kind, selector.selector
+               FROM remote_media_catalog_stage_filter_selectors AS selector
+               JOIN remote_media_catalog_stage_items AS item
+                 ON item.stage_id = selector.stage_id AND item.id = selector.item_id
+               WHERE selector.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+            r#"CREATE TEMPORARY VIEW jellyrin_media_item_upcoming_date_stage AS
+               SELECT upcoming.item_id, upcoming.unix_seconds, upcoming.nanosecond
+               FROM remote_media_catalog_stage_upcoming_dates AS upcoming
+               JOIN remote_media_catalog_stage_items AS item
+                 ON item.stage_id = upcoming.stage_id AND item.id = upcoming.item_id
+               WHERE upcoming.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+            r#"CREATE TEMPORARY VIEW jellyrin_query_filter_source_stage AS
+               SELECT source.item_id, source.container_present, source.container_value,
+                      source.media_type, source.is_video, source.has_subtitles,
+                      source.has_trailer, source.projected_value_count
+               FROM remote_media_catalog_stage_query_filter_sources AS source
+               JOIN remote_media_catalog_stage_items AS item
+                 ON item.stage_id = source.stage_id AND item.id = source.item_id
+               WHERE source.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+            r#"CREATE TEMPORARY VIEW jellyrin_query_filter_value_stage AS
+               SELECT value.item_id, value.value_kind, value.display_value,
+                      value.source_key, value.source_priority, value.source_position
+               FROM remote_media_catalog_stage_query_filter_values AS value
+               JOIN remote_media_catalog_stage_items AS item
+                 ON item.stage_id = value.stage_id AND item.id = value.item_id
+               WHERE value.stage_id = current_setting('jellyrin.remote_media_stage_id')::uuid
+                 AND item.library_key = current_setting('jellyrin.remote_media_library_key')"#,
+        ];
+        for create_view in views {
+            sqlx::query(create_view).execute(&mut **tx).await?;
+        }
+
+        let coverage = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM jellyrin_remote_snapshot_stage), \
+                    (SELECT count(*) FROM jellyrin_query_filter_source_stage), \
+                    coalesce(sum(source.projected_value_count), 0), \
+                    (SELECT count(*) FROM jellyrin_query_filter_value_stage) \
+             FROM jellyrin_query_filter_source_stage AS source",
         )
         .fetch_one(&mut **tx)
         .await?;
         anyhow::ensure!(
-            projection_counts.0 == projection_counts.1 && projection_counts.2 == 0,
+            coverage.0 == coverage.1,
+            "remote media catalogue stage query-filter source coverage is incomplete"
+        );
+        anyhow::ensure!(
+            coverage.2 == coverage.3,
             "remote media catalogue stage query-filter value coverage is incomplete"
         );
-        Ok(inserted.rows_affected())
+        u64::try_from(coverage.0).context("remote media catalogue stage item count overflow")
+    }
+
+    async fn drop_durable_remote_media_stage_views_in_transaction(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "DROP VIEW IF EXISTS jellyrin_media_item_facet_alias_stage, \
+             jellyrin_media_item_facet_stage, jellyrin_media_item_genre_selector_stage, \
+             jellyrin_media_item_filter_selector_stage, \
+             jellyrin_media_item_upcoming_date_stage, jellyrin_query_filter_value_stage, \
+             jellyrin_query_filter_source_stage, jellyrin_remote_snapshot_stage",
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     /// Atomically publishes a complete remote library snapshot.
@@ -4517,7 +4635,13 @@ impl PostgresDatabase {
                 width = excluded.width,
                 height = excluded.height,
                 media_streams = excluded.media_streams,
-                metadata = excluded.metadata,
+                metadata = CASE
+                    WHEN media_items.metadata->>'XtreamKind' = 'vod'
+                     AND media_items.metadata->'XtreamVodInfo'->>'Status' = 'Complete'
+                     AND NOT (excluded.metadata ? 'XtreamVodInfo')
+                    THEN media_items.metadata || excluded.metadata
+                    ELSE excluded.metadata
+                END,
                 updated_at = excluded.updated_at
             WHERE media_items.missing_since IS NOT NULL
                OR ROW(
@@ -4543,7 +4667,13 @@ impl PostgresDatabase {
                     excluded.width,
                     excluded.height,
                     excluded.media_streams,
-                    excluded.metadata
+                    CASE
+                        WHEN media_items.metadata->>'XtreamKind' = 'vod'
+                         AND media_items.metadata->'XtreamVodInfo'->>'Status' = 'Complete'
+                         AND NOT (excluded.metadata ? 'XtreamVodInfo')
+                        THEN media_items.metadata || excluded.metadata
+                        ELSE excluded.metadata
+                    END
                )
             "#,
         )
@@ -4802,6 +4932,14 @@ impl PostgresDatabase {
             || query_filter_value_upsert.rows_affected() > 0;
         let incomplete = sqlx::query_scalar::<_, bool>(
             r#"
+            WITH published_value_counts AS MATERIALIZED (
+                SELECT value.item_id, count(*)::integer AS value_count
+                FROM media_item_query_filter_values AS value
+                JOIN jellyrin_query_filter_source_stage AS staged
+                  ON staged.item_id = value.item_id
+                WHERE value.virtual_folder_id = $1
+                GROUP BY value.item_id
+            )
             SELECT EXISTS (
                 SELECT 1
                 FROM jellyrin_query_filter_source_stage AS staged
@@ -4810,14 +4948,10 @@ impl PostgresDatabase {
                  AND source.virtual_folder_id = $1
                  AND source.extractor_version = $2
                  AND source.projected_value_count = staged.projected_value_count
-                LEFT JOIN LATERAL (
-                    SELECT count(*)::integer AS value_count
-                    FROM media_item_query_filter_values AS value
-                    WHERE value.item_id = staged.item_id
-                      AND value.virtual_folder_id = $1
-                ) AS value_count ON TRUE
+                LEFT JOIN published_value_counts AS value_count
+                  ON value_count.item_id = staged.item_id
                 WHERE source.item_id IS NULL
-                   OR value_count.value_count <> staged.projected_value_count
+                   OR coalesce(value_count.value_count, 0) <> staged.projected_value_count
             )
             "#,
         )
@@ -5594,6 +5728,14 @@ fn push_postgres_catalog_filters(
     );
     push_postgres_ci_any_filter(builder, "item.media_type", &query.media_types, false);
 
+    for (kind, values) in [
+        ("official_ratings", &query.official_ratings),
+        ("series_statuses", &query.series_statuses),
+        ("years", &query.years),
+    ] {
+        push_postgres_projected_value_filter(builder, kind, values);
+    }
+
     let mut genre_selectors = normalized_catalog_values(&query.genre_ids);
     genre_selectors.sort_unstable();
     genre_selectors.dedup();
@@ -5650,6 +5792,48 @@ fn push_postgres_catalog_filters(
         );
         builder.push_bind(has_subtitles);
     }
+    if let Some(has_trailer) = query.has_trailer {
+        builder
+            .push(
+                " AND COALESCE((SELECT source.has_trailer \
+                   FROM media_item_query_filter_sources AS source \
+                  WHERE source.item_id = item.id), FALSE) = ",
+            )
+            .push_bind(has_trailer);
+    }
+    push_postgres_metadata_boolean_filter(
+        builder,
+        "public.jellyrin_metadata_has_text(item.metadata, ARRAY['Overview', 'SeriesOverview'])",
+        query.has_overview,
+    );
+    for (provider, expected) in [
+        ("Imdb", query.has_imdb_id),
+        ("Tmdb", query.has_tmdb_id),
+        ("Tvdb", query.has_tvdb_id),
+    ] {
+        if let Some(expected) = expected {
+            builder
+                .push(" AND public.jellyrin_metadata_has_provider_id(item.metadata, ")
+                .push_bind(provider)
+                .push(") = ")
+                .push_bind(expected);
+        }
+    }
+    if let Some(expected) = query.has_official_rating {
+        builder
+            .push(
+                " AND EXISTS (SELECT 1 FROM media_item_query_filter_values AS rating_value \
+                  WHERE rating_value.item_id = item.id \
+                    AND rating_value.value_kind = 'official_ratings' \
+                    AND btrim(rating_value.display_value) <> '') = ",
+            )
+            .push_bind(expected);
+    }
+    push_postgres_metadata_boolean_filter(
+        builder,
+        "public.jellyrin_metadata_boolean(item.metadata, ARRAY['LockData'])",
+        query.is_locked,
+    );
 
     if catalog_static_filters_are_impossible(query) {
         builder.push(" AND FALSE");
@@ -5657,28 +5841,30 @@ fn push_postgres_catalog_filters(
 
     if let Some(search_term) = normalized_catalog_scalar(query.search_term.as_deref()) {
         let pattern = format!("%{}%", escape_catalog_like_value(&search_term));
-        builder
-            .push(" AND (lower(item.name) LIKE ")
-            .push_bind(pattern.clone())
-            .push(" ESCAPE '\\'");
         match query.search_scope {
-            MediaItemCatalogSearchScope::Name => {}
+            MediaItemCatalogSearchScope::Name => {
+                builder
+                    .push(" AND lower(item.name) LIKE ")
+                    .push_bind(pattern)
+                    .push(" ESCAPE '\\'");
+            }
             MediaItemCatalogSearchScope::AllMetadataScalars => {
                 builder
+                    .push(" AND (lower(item.name) LIKE ")
+                    .push_bind(pattern.clone())
                     .push(
-                        " OR EXISTS (SELECT 1 \
+                        " ESCAPE '\\' OR EXISTS (SELECT 1 \
                            FROM jsonb_path_query(item.metadata, '$.**') AS metadata_scalar(value) \
                            WHERE jsonb_typeof(metadata_scalar.value) IN ('string', 'number') \
                              AND lower(metadata_scalar.value #>> '{}') LIKE ",
                     )
                     .push_bind(pattern)
-                    .push(" ESCAPE '\\')");
+                    .push(" ESCAPE '\\'))");
             }
             MediaItemCatalogSearchScope::SearchHintFields => {
-                push_postgres_search_hint_metadata_filter(builder, &pattern);
+                push_postgres_search_hint_filter(builder, &pattern);
             }
         }
-        builder.push(")");
     }
 
     if let Some(is_hd) = query.is_hd {
@@ -5695,6 +5881,43 @@ fn push_postgres_catalog_filters(
     push_postgres_optional_i64_bound(builder, "item.width", query.max_width, "<=");
     push_postgres_optional_i64_bound(builder, "item.height", query.min_height, ">=");
     push_postgres_optional_i64_bound(builder, "item.height", query.max_height, "<=");
+
+    push_postgres_optional_f64_bound(
+        builder,
+        "public.jellyrin_metadata_number(item.metadata, ARRAY['CommunityRating', 'Rating'])",
+        query.min_community_rating,
+        ">=",
+    );
+    push_postgres_optional_f64_bound(
+        builder,
+        "public.jellyrin_metadata_number(item.metadata, ARRAY['CommunityRating', 'Rating'])",
+        query.max_community_rating,
+        "<=",
+    );
+    push_postgres_optional_f64_bound(
+        builder,
+        "public.jellyrin_metadata_number(item.metadata, ARRAY['CriticRating'])",
+        query.min_critic_rating,
+        ">=",
+    );
+    push_postgres_optional_f64_bound(
+        builder,
+        "public.jellyrin_metadata_number(item.metadata, ARRAY['CriticRating'])",
+        query.max_critic_rating,
+        "<=",
+    );
+    push_postgres_optional_time_bound(
+        builder,
+        "public.jellyrin_metadata_timestamp(item.metadata, ARRAY['PremiereDate', 'AirDate', 'DateCreated'])",
+        query.min_premiere_date,
+        ">=",
+    );
+    push_postgres_optional_time_bound(
+        builder,
+        "public.jellyrin_metadata_timestamp(item.metadata, ARRAY['PremiereDate', 'AirDate', 'DateCreated'])",
+        query.max_premiere_date,
+        "<=",
+    );
 
     push_postgres_optional_time_bound(builder, "item.created_at", query.min_date_created, ">=");
     push_postgres_optional_time_bound(builder, "item.created_at", query.max_date_created, "<=");
@@ -5802,41 +6025,22 @@ fn push_postgres_include_item_types_filter(
     builder.push(")");
 }
 
-fn push_postgres_search_hint_metadata_filter(builder: &mut QueryBuilder<Postgres>, pattern: &str) {
+fn push_postgres_search_hint_filter(builder: &mut QueryBuilder<Postgres>, pattern: &str) {
     builder
         .push(
-            " OR EXISTS (\
-           WITH RECURSIVE hint_values(value) AS (\
-             SELECT hint_field.value \
-             FROM jsonb_each(item.metadata) AS hint_field(key, value) \
-             WHERE hint_field.key = ANY(ARRAY[\
-               'Album', 'AlbumName', 'AlbumArtist', 'AlbumArtists', \
-               'SeriesName', 'Series', 'Artists'\
-             ]::text[]) \
-             UNION ALL \
-             SELECT array_value.value \
-             FROM hint_values \
-             CROSS JOIN LATERAL jsonb_array_elements(\
-               CASE WHEN jsonb_typeof(hint_values.value) = 'array' \
-                    THEN hint_values.value ELSE '[]'::jsonb END\
-             ) AS array_value(value)\
-           ) \
-           SELECT 1 FROM hint_values \
-           WHERE (jsonb_typeof(hint_values.value) IN ('string', 'number') \
-                  AND lower(hint_values.value #>> '{}') LIKE ",
+            " AND lower(\
+               COALESCE(item.name, '') || ' ' ||\
+               COALESCE(item.metadata ->> 'Album', '') || ' ' ||\
+               COALESCE(item.metadata ->> 'AlbumName', '') || ' ' ||\
+               COALESCE(item.metadata ->> 'AlbumArtist', '') || ' ' ||\
+               COALESCE(item.metadata ->> 'AlbumArtists', '') || ' ' ||\
+               COALESCE(item.metadata ->> 'SeriesName', '') || ' ' ||\
+               COALESCE(item.metadata ->> 'Series', '') || ' ' ||\
+               COALESCE(item.metadata ->> 'Artists', '')\
+             ) LIKE ",
         )
         .push_bind(pattern.to_owned())
-        .push(
-            " ESCAPE '\\') \
-              OR (jsonb_typeof(hint_values.value) = 'object' \
-                  AND jsonb_typeof(hint_values.value -> 'Name') = 'string' \
-                  AND lower(hint_values.value ->> 'Name') LIKE ",
-        )
-        .push_bind(pattern.to_owned())
-        .push(
-            " ESCAPE '\\')\
-         )",
-        );
+        .push(" ESCAPE '\\'");
 }
 
 fn push_postgres_catalog_order(
@@ -5894,6 +6098,41 @@ fn push_postgres_ci_any_filter(
         .push(if negate { "))" } else { ")" });
 }
 
+fn push_postgres_projected_value_filter(
+    builder: &mut QueryBuilder<Postgres>,
+    value_kind: &str,
+    values: &[String],
+) {
+    let values = normalized_catalog_values(values);
+    if values.is_empty() {
+        return;
+    }
+    builder
+        .push(
+            " AND EXISTS (SELECT 1 FROM media_item_query_filter_values AS projected_value \
+              WHERE projected_value.item_id = item.id \
+                AND projected_value.value_kind = ",
+        )
+        .push_bind(value_kind.to_owned())
+        .push(" AND lower(btrim(projected_value.display_value)) = ANY(")
+        .push_bind(values)
+        .push("))");
+}
+
+fn push_postgres_metadata_boolean_filter(
+    builder: &mut QueryBuilder<Postgres>,
+    expression: &str,
+    expected: Option<bool>,
+) {
+    if let Some(expected) = expected {
+        builder
+            .push(" AND ")
+            .push(expression)
+            .push(" = ")
+            .push_bind(expected);
+    }
+}
+
 fn push_postgres_stream_language_filter(
     builder: &mut QueryBuilder<Postgres>,
     stream_type: &str,
@@ -5927,6 +6166,23 @@ fn push_postgres_optional_i64_bound(
         builder
             .push(" AND ")
             .push(column)
+            .push(" ")
+            .push(operator)
+            .push(" ")
+            .push_bind(value);
+    }
+}
+
+fn push_postgres_optional_f64_bound(
+    builder: &mut QueryBuilder<Postgres>,
+    expression: &str,
+    value: Option<f64>,
+    operator: &str,
+) {
+    if let Some(value) = value {
+        builder
+            .push(" AND ")
+            .push(expression)
             .push(" ")
             .push(operator)
             .push(" ")
@@ -6094,6 +6350,36 @@ impl From<PostgresMediaItemRow> for MediaItem {
             media_streams,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+/// A NextUp candidate row without `media_streams`; see `tv_next_up_candidate_items`.
+#[derive(sqlx::FromRow)]
+struct PostgresProjectedNextUpCandidateRow {
+    item_id: Uuid,
+    virtual_folder_id: Uuid,
+    item_name: String,
+    item_path: String,
+}
+
+impl From<PostgresProjectedNextUpCandidateRow> for MediaItem {
+    fn from(row: PostgresProjectedNextUpCandidateRow) -> Self {
+        Self {
+            id: row.item_id,
+            virtual_folder_id: row.virtual_folder_id,
+            name: row.item_name,
+            path: row.item_path,
+            media_type: "Video".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
         }
     }
 }
@@ -7787,6 +8073,9 @@ mod tests {
                     )],
                 )
                 .await?;
+            test.database
+                .complete_remote_media_catalog_stage(&failed_stage)
+                .await?;
             assert!(
                 test.database
                     .publish_remote_media_catalog_stage(&failed_stage)
@@ -7807,6 +8096,15 @@ mod tests {
                 .fetch_one(&test.database.worker_pool)
                 .await?,
                 "open"
+            );
+            assert!(
+                sqlx::query_scalar::<_, Option<OffsetDateTime>>(
+                    "SELECT ready_at FROM remote_media_catalog_stages WHERE id = $1",
+                )
+                .bind(failed_stage.parsed_id()?)
+                .fetch_one(&test.database.worker_pool)
+                .await?
+                .is_some()
             );
             test.database
                 .abort_remote_media_catalog_stage(&failed_stage)
@@ -7853,6 +8151,9 @@ mod tests {
                 )
                 .await?;
             assert!(test.database.media_item_by_id(movie_id).await.is_err());
+            test.database
+                .complete_remote_media_catalog_stage(&stage)
+                .await?;
             let folders = test
                 .database
                 .publish_remote_media_catalog_stage(&stage)
@@ -8199,6 +8500,123 @@ mod tests {
             let debug = format!("{telemetry:?}");
             assert!(!debug.contains("provider://paged"));
             assert!(!debug.contains(&alpha_id.to_string()));
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_catalog_advanced_metadata_filters_are_sql_pushed_down() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let matching_id = Uuid::new_v4();
+            test.database
+                .replace_remote_media_library_snapshot(
+                    "Advanced Filters",
+                    "movies",
+                    "provider://advanced-filters",
+                    vec![
+                        remote_item(
+                            matching_id,
+                            "Matching Movie",
+                            "provider://advanced-filters/matching.mkv",
+                            "Video",
+                            "movies",
+                            json!({
+                                "OfficialRating": "PG-13",
+                                "SeriesStatus": "Continuing",
+                                "ProductionYear": 2025,
+                                "RemoteTrailers": [{"Url": "https://example.invalid/trailer"}],
+                                "sErIeSoVeRvIeW": "Present",
+                                "ProviderIds": {"IMDb": "tt123", "Tmdb": "456"},
+                                "SeriesProviderIds": {"TVDB": "789"},
+                                "LockData": true,
+                                "CommunityRating": 8.5,
+                                "CriticRating": "75",
+                                "PremiereDate": "2025-02-03T04:05:06Z"
+                            }),
+                        ),
+                        remote_item(
+                            Uuid::new_v4(),
+                            "Non Matching Movie",
+                            "provider://advanced-filters/other.mkv",
+                            "Video",
+                            "movies",
+                            json!({
+                                "SeriesStatus": "Ended",
+                                "ProductionYear": 2020,
+                                "CommunityRating": 5.0,
+                                "CriticRating": 40,
+                                "PremiereDate": "2020-01-01T00:00:00Z"
+                            }),
+                        ),
+                    ],
+                )
+                .await?;
+
+            let threshold = OffsetDateTime::parse(
+                "2025-01-01T00:00:00Z",
+                &time::format_description::well_known::Rfc3339,
+            )?;
+            let filters = [
+                MediaItemCatalogQuery {
+                    official_ratings: vec!["pg-13".to_string()],
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    series_statuses: vec!["continuing".to_string()],
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    years: vec!["2025".to_string()],
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    has_trailer: Some(true),
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    has_overview: Some(true),
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    has_imdb_id: Some(true),
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    has_tmdb_id: Some(true),
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    has_tvdb_id: Some(true),
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    has_official_rating: Some(true),
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    is_locked: Some(true),
+                    ..MediaItemCatalogQuery::default()
+                },
+                MediaItemCatalogQuery {
+                    min_community_rating: Some(8.0),
+                    max_community_rating: Some(9.0),
+                    min_critic_rating: Some(70.0),
+                    max_critic_rating: Some(80.0),
+                    min_premiere_date: Some(threshold),
+                    ..MediaItemCatalogQuery::default()
+                },
+            ];
+            for filter in filters {
+                let page = test.database.media_item_catalog_page(&filter).await?;
+                assert_eq!(page.total_record_count, 1, "filter={filter:?}");
+                assert_eq!(page.items[0].item.id, matching_id, "filter={filter:?}");
+            }
             anyhow::Ok(())
         }
         .await;
@@ -9762,6 +10180,55 @@ mod tests {
             assert_eq!(page.series[0].name, "Example Show");
             assert_eq!(page.episodes.len(), 1);
             assert_eq!(page.episodes[0].item.id, episode_id);
+            let searched = test
+                .database
+                .tv_series_catalog_search_page(
+                    None,
+                    0,
+                    20,
+                    TvSeriesCatalogNameFilter {
+                        search_term: Some("example".to_string()),
+                        ..TvSeriesCatalogNameFilter::default()
+                    },
+                )
+                .await?
+                .unwrap();
+            assert_eq!(searched.total_record_count, 1);
+            assert_eq!(searched.series.len(), 1);
+            assert_eq!(searched.series[0].name, "Example Show");
+            let letter_page = test
+                .database
+                .tv_series_catalog_search_page(
+                    None,
+                    0,
+                    20,
+                    TvSeriesCatalogNameFilter {
+                        starts_with: Some("E".to_string()),
+                        starts_with_or_greater: Some("E".to_string()),
+                        less_than: Some("F".to_string()),
+                        ..TvSeriesCatalogNameFilter::default()
+                    },
+                )
+                .await?
+                .unwrap();
+            assert_eq!(letter_page.total_record_count, 1);
+            assert_eq!(letter_page.series[0].name, "Example Show");
+            let no_match = test
+                .database
+                .tv_series_catalog_search_page(
+                    None,
+                    0,
+                    20,
+                    TvSeriesCatalogNameFilter {
+                        search_term: Some("missing".to_string()),
+                        ..TvSeriesCatalogNameFilter::default()
+                    },
+                )
+                .await?
+                .unwrap();
+            assert_eq!(no_match.total_record_count, 0);
+            assert!(no_match.series.is_empty());
+            assert!(no_match.episodes.is_empty());
             let empty = test
                 .database
                 .tv_series_catalog_page(None, 1, 1)

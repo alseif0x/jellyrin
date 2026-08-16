@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG RUST_IMAGE=docker.io/library/rust:1.94.0-bookworm@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 ARG DISTROLESS_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
@@ -36,7 +37,7 @@ RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
       > /etc/apt/sources.list.d/jellyrin-snapshot.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates curl git libssl-dev pkg-config zlib1g-dev
+      build-essential ca-certificates curl git libssl-dev libx264-dev nasm pkg-config zlib1g-dev
 
 COPY ops/ffmpeg-security-baseline.txt /tmp/ffmpeg-security-baseline.txt
 RUN curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --fail \
@@ -78,15 +79,23 @@ RUN cd /tmp/ffmpeg-source \
       --enable-ffmpeg \
       --enable-ffprobe \
       --enable-avcodec \
+      --enable-avfilter \
       --enable-avformat \
       --enable-avutil \
+      --enable-swresample \
+      --enable-swscale \
       --enable-network \
       --enable-openssl \
       --enable-zlib \
+      --enable-gpl \
+      --enable-version3 \
+      --enable-libx264 \
       --enable-protocol=file,pipe,http,https,tcp,tls,udp,crypto \
-      --enable-demuxer=mpegts,mov,matroska,avi,asf,mp3,flac,aac,ogg,wav,flv,mpeg,hls \
-      --enable-muxer=hls,mpegts,mov,mp4 \
-      --enable-decoder=aac \
+      --enable-demuxer=mpegts,mov,matroska,avi,asf,mp3,flac,aac,ac3,eac3,ogg,wav,flv,mpeg,hls \
+      --enable-muxer=hls,mpegts,mov,mp4,adts,latm,webvtt,image2 \
+      --enable-decoder=h264,hevc,mpeg2video,mpeg4,vc1,wmv3,vp8,vp9,av1,mjpeg,aac,ac3,eac3,mp3,mp3float,flac,opus,vorbis,ass,dvbsub,dvdsub,mov_text,pgssub,srt,ssa,subrip,webvtt \
+      --enable-encoder=libx264,aac,mjpeg,subrip,webvtt \
+      --enable-filter=anull,aresample,format,fps,overlay,scale \
       --enable-parser=h264,hevc,mpeg4video,mpegvideo,aac,aac_latm,ac3,dca,mpegaudio,opus,vorbis,av1 \
       --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,extract_extradata,aac_adtstoasc \
       --cpu=generic \
@@ -103,13 +112,21 @@ RUN cd /tmp/ffmpeg-source \
 
 FROM ${RUST_IMAGE} AS builder
 
-ARG CARGO_BUILD_JOBS=2
+ARG CARGO_BUILD_JOBS=1
+# Rust 1.94/LLVM 21 needs a larger virtual compiler-thread stack for the broad API crate even at
+# O1. This reserves address space during builds; it does not commit 8 GiB of resident memory.
+ARG RUST_MIN_STACK=8589934592
 WORKDIR /src
 # Keep documentation, deployment and security-policy edits from invalidating the expensive Rust
 # layer. The workspace build needs only the locked root manifests and crate sources.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build --locked --release -p jellyrin-server -p jellyrin-migrate
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=jellyrin-target-rust194-o2-v1,target=/src/target,sharing=locked \
+    RUST_MIN_STACK=${RUST_MIN_STACK} CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
+      cargo build --locked --release -p jellyrin-server -p jellyrin-migrate \
+    && install -D /src/target/release/jellyrin-server /out/jellyrin-server \
+    && install -D /src/target/release/jellyrin-migrate /out/jellyrin-migrate
 
 FROM ${RUNTIME_IMAGE} AS runtime-layout
 
@@ -124,10 +141,11 @@ RUN install -d -o 10001 -g 10001 \
 
 FROM ${DISTROLESS_IMAGE} AS runtime-smoke
 
-COPY --from=builder /src/target/release/jellyrin-server /usr/local/bin/jellyrin-server
-COPY --from=builder /src/target/release/jellyrin-migrate /usr/local/bin/jellyrin-migrate
+COPY --from=builder /out/jellyrin-server /usr/local/bin/jellyrin-server
+COPY --from=builder /out/jellyrin-migrate /usr/local/bin/jellyrin-migrate
 COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffmpeg /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-builder /opt/jellyrin-ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
+COPY --from=ffmpeg-builder /usr/lib/x86_64-linux-gnu/libx264.so.* /usr/lib/x86_64-linux-gnu/
 
 # Exec-form RUN works without a shell and proves the distroless glibc/OpenSSL/zlib closure can
 # load both media binaries. Exact versions and capabilities were already verified in the builder.
@@ -167,7 +185,7 @@ ENV JELLYRIN_HOST=0.0.0.0 \
     JELLYRIN_CACHE_DIR=/var/cache/jellyrin \
     JELLYRIN_LOG_DIR=/var/log/jellyrin \
     JELLYRIN_WEB_DIR=/srv/jellyrin/web \
-    JELLYRIN_FFMPEG_MODE=remux-only \
+    JELLYRIN_FFMPEG_MODE=enabled \
     RUST_LOG=jellyrin=info,tower_http=info
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["/usr/local/bin/jellyrin-server", "--healthcheck"]

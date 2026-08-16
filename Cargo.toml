@@ -55,3 +55,11 @@ tempfile = "3.23"
 serial_test = "3"
 notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
 notify-debouncer-mini = "0.5"
+
+# The API crate is intentionally broad and currently lives in one large compilation unit. Rust
+# 1.94/LLVM 21 can exhaust its optimizer stack at O3 and spend unbounded time at O2 while inlining
+# that unit. O1 plus additional codegen partitions keeps release builds deterministic without
+# changing runtime semantics; hot media work remains delegated to optimized FFmpeg.
+[profile.release]
+opt-level = 1
+codegen-units = 64

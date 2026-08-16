@@ -69,8 +69,11 @@ Release artifacts live under `ops/` plus the root Docker files:
   patch and the SBOM tool. `ops/supply-chain.md` documents the verified
   lock-refresh, build, SBOM and digest-promotion workflow.
 
-For Compose, create untracked configuration and fill every required secret
-before the first start (empty database secrets fail configuration validation).
+For Compose, create untracked configuration and fill every required database
+secret before the first start (empty database secrets fail configuration
+validation). Then run `ops/bootstrap-compose.sh`; it creates the provider
+keyring once, preserves it across restarts, applies the fixed `root:10001`
+`0440` permissions and enables the provider-secrets overlay in `.env`.
 The repository does not vendor generated Jellyfin Web assets. Build the exact
 reviewed source and checksum from `ops/supply-chain.lock.env`; the builder
 verifies and applies the official PR #7617 patch to Swiper 12.1.2, omits the
@@ -82,6 +85,7 @@ ops/build-jellyfin-web.sh ./web
 cp ops/compose.env.example .env
 cp ops/jellyrin.env.example ops/jellyrin.env
 chmod 600 .env ops/jellyrin.env
+ops/bootstrap-compose.sh
 ops/deployment-preflight.sh
 docker compose up -d --build
 ```
@@ -117,13 +121,12 @@ For a node that indexes external providers, use the default Compose deployment:
 - Redis stays disabled. The measured decision and the conditions that would
   justify enabling it are recorded in
   [`docs/redis-decision.md`](docs/redis-decision.md).
-- The safe default is `JELLYRIN_FFMPEG_MODE=remux-only`: it permits stream-copy remuxing but rejects
-  video and audio encoding. Set it to `disabled` when every client can direct
-  play; use `enabled` only when transcoding is deliberately required. Live HLS
-  also uses `-c:v copy -c:a copy` in this mode, so opening a live channel cannot
-  silently start `libx264` or AAC on the low-resource profile. With `enabled`,
-  VOD and Live HLS still try remux first and make at most one encode fallback
-  only when no first segment was produced.
+- The default is `JELLYRIN_FFMPEG_MODE=enabled` because browser, Android and
+  Android TV profiles can require AC3-to-AAC or H.264 transcoding. VOD and Live
+  HLS still try direct play/remux first and make at most one encode fallback
+  only when needed. Set it to `remux-only` only when every deployed client is
+  known to support every source codec, or to `disabled` for direct-play-only
+  installations.
 - The container CPU limit includes FFmpeg children. Start with 1.5 CPU, one
   total FFmpeg job across all lanes, one remux, one auxiliary FFmpeg job, at
   most eight queued FFmpeg requests, one

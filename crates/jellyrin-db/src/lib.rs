@@ -99,7 +99,7 @@ use telemetry::{DatabaseOperation, DatabaseTelemetry};
 /// concrete until another backend has a complete native implementation and conformance suite.
 pub type ProductionDatabase = PostgresDatabase;
 
-const TV_SERIES_CATALOG_PROJECTION_VERSION: i32 = 1;
+const TV_SERIES_CATALOG_PROJECTION_VERSION: i32 = 2;
 use query_filter_projection::{
     MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION, MediaItemQueryFilterProjection,
     MediaItemQueryFilterProjectionSource, encode_media_item_query_filter_position,
@@ -531,6 +531,9 @@ fn validate_media_item_catalog_query(query: &MediaItemCatalogQuery) -> anyhow::R
         ("person", &query.person_ids),
         ("studio", &query.studio_ids),
         ("tag", &query.tags),
+        ("official rating", &query.official_ratings),
+        ("series status", &query.series_statuses),
+        ("year", &query.years),
     ] {
         let selector_count = values
             .iter()
@@ -604,17 +607,36 @@ pub struct MediaItemCatalogQuery {
     pub studio_ids: Vec<String>,
     /// Raw tag values. Any selector may match.
     pub tags: Vec<String>,
+    /// Official rating values projected from item and inherited series metadata.
+    pub official_ratings: Vec<String>,
+    /// Series status values projected from item metadata.
+    pub series_statuses: Vec<String>,
+    /// Production years projected from item metadata.
+    pub years: Vec<String>,
     pub location_types: Vec<String>,
     pub exclude_location_types: Vec<String>,
     pub search_term: Option<String>,
     pub search_scope: MediaItemCatalogSearchScope,
     pub has_subtitles: Option<bool>,
+    pub has_trailer: Option<bool>,
+    pub has_overview: Option<bool>,
+    pub has_imdb_id: Option<bool>,
+    pub has_tmdb_id: Option<bool>,
+    pub has_tvdb_id: Option<bool>,
+    pub has_official_rating: Option<bool>,
+    pub is_locked: Option<bool>,
     pub is_hd: Option<bool>,
     pub is_4k: Option<bool>,
     pub min_width: Option<i64>,
     pub max_width: Option<i64>,
     pub min_height: Option<i64>,
     pub max_height: Option<i64>,
+    pub min_community_rating: Option<f64>,
+    pub max_community_rating: Option<f64>,
+    pub min_critic_rating: Option<f64>,
+    pub max_critic_rating: Option<f64>,
+    pub min_premiere_date: Option<OffsetDateTime>,
+    pub max_premiere_date: Option<OffsetDateTime>,
     pub is_missing: Option<bool>,
     pub is_unaired: Option<bool>,
     pub is_folder: Option<bool>,
@@ -651,17 +673,33 @@ impl Default for MediaItemCatalogQuery {
             person_ids: Vec::new(),
             studio_ids: Vec::new(),
             tags: Vec::new(),
+            official_ratings: Vec::new(),
+            series_statuses: Vec::new(),
+            years: Vec::new(),
             location_types: Vec::new(),
             exclude_location_types: Vec::new(),
             search_term: None,
             search_scope: MediaItemCatalogSearchScope::Name,
             has_subtitles: None,
+            has_trailer: None,
+            has_overview: None,
+            has_imdb_id: None,
+            has_tmdb_id: None,
+            has_tvdb_id: None,
+            has_official_rating: None,
+            is_locked: None,
             is_hd: None,
             is_4k: None,
             min_width: None,
             max_width: None,
             min_height: None,
             max_height: None,
+            min_community_rating: None,
+            max_community_rating: None,
+            min_critic_rating: None,
+            max_critic_rating: None,
+            min_premiere_date: None,
+            max_premiere_date: None,
             is_missing: None,
             is_unaired: None,
             is_folder: None,
@@ -806,6 +844,15 @@ pub struct TvSeriesCatalogPage {
 pub struct TvSeriesCatalogKey {
     pub id: String,
     pub name: String,
+}
+
+/// Name predicates applied before counting and paging the synthetic TV-Series projection.
+#[derive(Debug, Clone, Default)]
+pub struct TvSeriesCatalogNameFilter {
+    pub search_term: Option<String>,
+    pub starts_with: Option<String>,
+    pub starts_with_or_greater: Option<String>,
+    pub less_than: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -973,6 +1020,14 @@ impl RemoteMediaCatalogStage {
     }
 }
 
+/// A complete durable stage that can be published without contacting its provider again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyRemoteMediaCatalogStage {
+    pub stage: RemoteMediaCatalogStage,
+    pub movie_count: usize,
+    pub series_item_count: usize,
+}
+
 /// One named library slot belonging to a durable remote media catalogue stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteMediaLibraryStageSpec {
@@ -1036,6 +1091,15 @@ fn prepare_remote_media_library_stage_specs(
     );
     prepared.sort_unstable_by_key(|spec| spec.position);
     Ok(prepared)
+}
+
+fn remote_media_stage_source_revision(value: &str) -> anyhow::Result<&str> {
+    let value = value.trim();
+    anyhow::ensure!(
+        value.len() <= 256 && !value.chars().any(char::is_control),
+        "remote media catalogue source revision is invalid"
+    );
+    Ok(value)
 }
 
 fn validate_remote_media_catalog_stage_append(
@@ -1716,6 +1780,16 @@ pub trait MediaCatalogStore: DatabaseBackend {
         limit: usize,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_;
 
+    /// The bounded synthetic-Series page with case-insensitive name predicates applied in the
+    /// database projection before counting and paging.
+    fn tv_series_catalog_search_page(
+        &self,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        filter: TvSeriesCatalogNameFilter,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_;
+
     /// Visible TV candidates whose user-data row is either absent or unplayed.
     ///
     /// This is the SQL-prefiltered input for Jellyfin's common `/Shows/NextUp` request. The API
@@ -1879,6 +1953,23 @@ impl MediaCatalogStore for PostgresDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_
     {
         PostgresDatabase::tv_series_catalog_page(self, virtual_folder_id, start_index, limit)
+    }
+
+    fn tv_series_catalog_search_page(
+        &self,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        filter: TvSeriesCatalogNameFilter,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_
+    {
+        PostgresDatabase::tv_series_catalog_search_page(
+            self,
+            virtual_folder_id,
+            start_index,
+            limit,
+            filter,
+        )
     }
 
     fn tv_next_up_candidates(
@@ -2060,6 +2151,23 @@ impl MediaCatalogStore for SqliteDatabase {
         SqliteDatabase::tv_series_catalog_page(self, virtual_folder_id, start_index, limit)
     }
 
+    fn tv_series_catalog_search_page(
+        &self,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        filter: TvSeriesCatalogNameFilter,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_
+    {
+        SqliteDatabase::tv_series_catalog_search_page(
+            self,
+            virtual_folder_id,
+            start_index,
+            limit,
+            filter,
+        )
+    }
+
     fn tv_next_up_candidates(
         &self,
         user_id: Uuid,
@@ -2148,12 +2256,38 @@ pub trait XtreamCatalogStore: DatabaseBackend {
         async { anyhow::bail!("durable remote media catalogue staging is not supported") }
     }
 
+    fn begin_remote_media_catalog_stage_for_revision<'a>(
+        &'a self,
+        _libraries: Vec<RemoteMediaLibraryStageSpec>,
+        _source_revision: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<RemoteMediaCatalogStage>> + Send + 'a
+    {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
     fn append_remote_media_catalog_stage<'a>(
         &'a self,
         _stage: &'a RemoteMediaCatalogStage,
         _library_key: &'a str,
         _items: Vec<RemoteMediaItemUpsert>,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
+    fn complete_remote_media_catalog_stage<'a>(
+        &'a self,
+        _stage: &'a RemoteMediaCatalogStage,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+        async { anyhow::bail!("durable remote media catalogue staging is not supported") }
+    }
+
+    fn ready_remote_media_catalog_stage<'a>(
+        &'a self,
+        _libraries: Vec<RemoteMediaLibraryStageSpec>,
+        _source_revision: &'a str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<ReadyRemoteMediaCatalogStage>>>
+    + Send
+    + 'a {
         async { anyhow::bail!("durable remote media catalogue staging is not supported") }
     }
 
@@ -2202,6 +2336,19 @@ macro_rules! impl_xtream_catalog_store {
                 <$database>::begin_remote_media_catalog_stage(self, libraries)
             }
 
+            fn begin_remote_media_catalog_stage_for_revision<'a>(
+                &'a self,
+                libraries: Vec<RemoteMediaLibraryStageSpec>,
+                source_revision: &'a str,
+            ) -> impl std::future::Future<Output = anyhow::Result<RemoteMediaCatalogStage>> + Send + 'a
+            {
+                <$database>::begin_remote_media_catalog_stage_for_revision(
+                    self,
+                    libraries,
+                    source_revision,
+                )
+            }
+
             fn append_remote_media_catalog_stage<'a>(
                 &'a self,
                 stage: &'a RemoteMediaCatalogStage,
@@ -2209,6 +2356,22 @@ macro_rules! impl_xtream_catalog_store {
                 items: Vec<RemoteMediaItemUpsert>,
             ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
                 <$database>::append_remote_media_catalog_stage(self, stage, library_key, items)
+            }
+
+            fn complete_remote_media_catalog_stage<'a>(
+                &'a self,
+                stage: &'a RemoteMediaCatalogStage,
+            ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+                <$database>::complete_remote_media_catalog_stage(self, stage)
+            }
+
+            fn ready_remote_media_catalog_stage<'a>(
+                &'a self,
+                libraries: Vec<RemoteMediaLibraryStageSpec>,
+                source_revision: &'a str,
+            ) -> impl std::future::Future<Output = anyhow::Result<Option<ReadyRemoteMediaCatalogStage>>> + Send + 'a
+            {
+                <$database>::ready_remote_media_catalog_stage(self, libraries, source_revision)
             }
 
             fn publish_remote_media_catalog_stage<'a>(
@@ -2332,6 +2495,14 @@ fn push_sqlite_catalog_filters(
     push_sqlite_ci_in_filter(builder, "item.collection_type", &query.collection_types);
     push_sqlite_ci_in_filter(builder, "item.media_type", &query.media_types);
 
+    for (kind, values) in [
+        ("official_ratings", &query.official_ratings),
+        ("series_statuses", &query.series_statuses),
+        ("years", &query.years),
+    ] {
+        push_sqlite_projected_value_filter(builder, kind, values);
+    }
+
     let mut genre_selectors = sqlite_normalized_catalog_values(&query.genre_ids);
     genre_selectors.sort_unstable();
     genre_selectors.dedup();
@@ -2418,6 +2589,46 @@ fn push_sqlite_catalog_filters(
             )
             .push_bind(has_subtitles);
     }
+    if let Some(has_trailer) = query.has_trailer {
+        builder
+            .push(
+                " AND COALESCE((SELECT source.has_trailer \
+                   FROM media_item_query_filter_sources AS source \
+                  WHERE source.item_id = item.id), 0) = ",
+            )
+            .push_bind(has_trailer);
+    }
+    push_sqlite_metadata_presence_filter(
+        builder,
+        &["overview", "seriesoverview"],
+        query.has_overview,
+    );
+    for (provider, expected) in [
+        ("imdb", query.has_imdb_id),
+        ("tmdb", query.has_tmdb_id),
+        ("tvdb", query.has_tvdb_id),
+    ] {
+        push_sqlite_provider_id_filter(builder, provider, expected);
+    }
+    if let Some(expected) = query.has_official_rating {
+        builder
+            .push(
+                " AND EXISTS (SELECT 1 FROM media_item_query_filter_values AS rating_value \
+                  WHERE rating_value.item_id = item.id \
+                    AND rating_value.value_kind = 'official_ratings' \
+                    AND trim(rating_value.display_value) <> '') = ",
+            )
+            .push_bind(expected);
+    }
+    if let Some(expected) = query.is_locked {
+        builder
+            .push(
+                " AND COALESCE((SELECT CASE locked.type WHEN 'true' THEN 1 ELSE 0 END \
+                   FROM json_each(item.metadata_json) AS locked \
+                  WHERE lower(locked.key) = 'lockdata' LIMIT 1), 0) = ",
+            )
+            .push_bind(expected);
+    }
 
     if sqlite_catalog_static_filters_are_impossible(query) {
         builder.push(" AND 0");
@@ -2462,6 +2673,15 @@ fn push_sqlite_catalog_filters(
     push_sqlite_optional_i64_bound(builder, "item.width", query.max_width, "<=");
     push_sqlite_optional_i64_bound(builder, "item.height", query.min_height, ">=");
     push_sqlite_optional_i64_bound(builder, "item.height", query.max_height, "<=");
+
+    let community_rating = sqlite_metadata_number_expression(&["communityrating", "rating"]);
+    let critic_rating = sqlite_metadata_number_expression(&["criticrating"]);
+    push_sqlite_optional_f64_bound(builder, &community_rating, query.min_community_rating, ">=");
+    push_sqlite_optional_f64_bound(builder, &community_rating, query.max_community_rating, "<=");
+    push_sqlite_optional_f64_bound(builder, &critic_rating, query.min_critic_rating, ">=");
+    push_sqlite_optional_f64_bound(builder, &critic_rating, query.max_critic_rating, "<=");
+    push_sqlite_optional_metadata_time_bound(builder, query.min_premiere_date, ">=")?;
+    push_sqlite_optional_metadata_time_bound(builder, query.max_premiere_date, "<=")?;
 
     push_sqlite_optional_time_bound(builder, "item.created_at", query.min_date_created, ">=")?;
     push_sqlite_optional_time_bound(builder, "item.created_at", query.max_date_created, "<=")?;
@@ -2620,6 +2840,83 @@ fn push_sqlite_ci_in_filter(builder: &mut QueryBuilder<Sqlite>, column: &str, va
 }
 
 #[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_projected_value_filter(
+    builder: &mut QueryBuilder<Sqlite>,
+    value_kind: &str,
+    values: &[String],
+) {
+    let values = sqlite_normalized_catalog_values(values);
+    if values.is_empty() {
+        return;
+    }
+    builder
+        .push(
+            " AND EXISTS (SELECT 1 FROM media_item_query_filter_values AS projected_value \
+              WHERE projected_value.item_id = item.id \
+                AND projected_value.value_kind = ",
+        )
+        .push_bind(value_kind.to_owned())
+        .push(" AND lower(trim(projected_value.display_value)) IN (");
+    let mut separated = builder.separated(", ");
+    for value in values {
+        separated.push_bind(value);
+    }
+    separated.push_unseparated("))");
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_metadata_presence_filter(
+    builder: &mut QueryBuilder<Sqlite>,
+    keys: &[&str],
+    expected: Option<bool>,
+) {
+    let Some(expected) = expected else {
+        return;
+    };
+    builder.push(
+        " AND EXISTS (SELECT 1 FROM json_each(item.metadata_json) AS metadata_value \
+          WHERE lower(metadata_value.key) IN (",
+    );
+    {
+        let mut separated = builder.separated(", ");
+        for key in keys {
+            separated.push_bind((*key).to_owned());
+        }
+        separated.push_unseparated(
+            ") AND metadata_value.type = 'text' \
+                           AND trim(CAST(metadata_value.value AS TEXT)) <> '') = ",
+        );
+    }
+    builder.push_bind(expected);
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_provider_id_filter(
+    builder: &mut QueryBuilder<Sqlite>,
+    provider: &str,
+    expected: Option<bool>,
+) {
+    let Some(expected) = expected else {
+        return;
+    };
+    builder
+        .push(
+            " AND EXISTS (SELECT 1 \
+              FROM json_each(item.metadata_json) AS provider_parent \
+              JOIN json_each(CASE WHEN provider_parent.type = 'object' \
+                                  THEN provider_parent.value ELSE '{}' END) AS provider_value \
+             WHERE lower(provider_parent.key) IN ('providerids', 'seriesproviderids') \
+               AND lower(provider_value.key) = ",
+        )
+        .push_bind(provider.to_owned())
+        .push(
+            " AND provider_value.type = 'text' \
+                AND trim(CAST(provider_value.value AS TEXT)) <> '') = ",
+        )
+        .push_bind(expected);
+}
+
+#[cfg(any(test, feature = "sqlite"))]
 fn push_sqlite_stream_language_filter(
     builder: &mut QueryBuilder<Sqlite>,
     stream_type: &str,
@@ -2663,6 +2960,76 @@ fn push_sqlite_optional_i64_bound(
             .push(" ")
             .push_bind(value);
     }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_optional_f64_bound(
+    builder: &mut QueryBuilder<Sqlite>,
+    expression: &str,
+    value: Option<f64>,
+    operator: &str,
+) {
+    if let Some(value) = value {
+        builder
+            .push(" AND ")
+            .push(expression)
+            .push(" ")
+            .push(operator)
+            .push(" ")
+            .push_bind(value);
+    }
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn sqlite_metadata_number_expression(keys: &[&str]) -> String {
+    let fallback_priority = keys.len();
+    let order = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| format!("WHEN '{key}' THEN {index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let keys = keys
+        .iter()
+        .map(|key| format!("'{key}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "(SELECT CASE \
+                      WHEN metadata_number.type IN ('integer', 'real') \
+                      THEN CAST(metadata_number.atom AS REAL) \
+                      WHEN metadata_number.type = 'text' \
+                       AND json_valid(trim(CAST(metadata_number.atom AS TEXT))) \
+                       AND json_type(trim(CAST(metadata_number.atom AS TEXT))) IN ('integer', 'real') \
+                      THEN CAST(metadata_number.atom AS REAL) END \
+           FROM json_each(item.metadata_json) AS metadata_number \
+          WHERE lower(metadata_number.key) IN ({keys}) \
+          ORDER BY CASE lower(metadata_number.key) {order} ELSE {} END LIMIT 1)",
+        fallback_priority
+    )
+}
+
+#[cfg(any(test, feature = "sqlite"))]
+fn push_sqlite_optional_metadata_time_bound(
+    builder: &mut QueryBuilder<Sqlite>,
+    value: Option<OffsetDateTime>,
+    operator: &str,
+) -> anyhow::Result<()> {
+    if let Some(value) = value {
+        builder
+            .push(
+                " AND julianday((SELECT CASE WHEN premiere.type = 'text' THEN premiere.value END \
+                   FROM json_each(item.metadata_json) AS premiere \
+                  WHERE lower(premiere.key) IN ('premieredate', 'airdate', 'datecreated') \
+                  ORDER BY CASE lower(premiere.key) \
+                      WHEN 'premieredate' THEN 0 WHEN 'airdate' THEN 1 ELSE 2 END LIMIT 1)) ",
+            )
+            .push(operator)
+            .push(" julianday(")
+            .push_bind(format_time(value)?)
+            .push(")");
+    }
+    Ok(())
 }
 
 #[cfg(any(test, feature = "sqlite"))]
@@ -8904,6 +9271,56 @@ impl SqliteDatabase {
         start_index: usize,
         limit: usize,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
+        self.tv_series_catalog_search_page(
+            virtual_folder_id,
+            start_index,
+            limit,
+            TvSeriesCatalogNameFilter::default(),
+        )
+        .await
+    }
+
+    pub async fn tv_series_catalog_search_page(
+        &self,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        filter: TvSeriesCatalogNameFilter,
+    ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
+        let search_pattern = filter
+            .search_term
+            .as_deref()
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .map(|term| {
+                format!(
+                    "%{}%",
+                    sqlite_escape_catalog_like_value(&term.to_ascii_lowercase())
+                )
+            });
+        let starts_with_pattern = filter
+            .starts_with
+            .as_deref()
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| {
+                format!(
+                    "{}%",
+                    sqlite_escape_catalog_like_value(&prefix.to_ascii_lowercase())
+                )
+            });
+        let lower_bound = filter
+            .starts_with_or_greater
+            .as_deref()
+            .map(str::trim)
+            .filter(|bound| !bound.is_empty())
+            .map(str::to_ascii_lowercase);
+        let upper_bound = filter
+            .less_than
+            .as_deref()
+            .map(str::trim)
+            .filter(|bound| !bound.is_empty())
+            .map(str::to_ascii_lowercase);
         let mut transaction = self.pool.begin().await?;
         let virtual_folder_ids =
             virtual_folder_id.map(|id| (id.simple().to_string(), id.to_string()));
@@ -8965,6 +9382,10 @@ impl SqliteDatabase {
                 virtual_folder_ids.as_ref(),
                 start_index,
                 limit,
+                search_pattern.as_deref(),
+                starts_with_pattern.as_deref(),
+                lower_bound.as_deref(),
+                upper_bound.as_deref(),
             )
             .await?;
             transaction.commit().await?;
@@ -8983,6 +9404,10 @@ impl SqliteDatabase {
               ON coverage.virtual_folder_id = series.virtual_folder_id
              AND coverage.projection_version = ?5
             WHERE (?1 IS NULL OR series.virtual_folder_id IN (?1, ?2))
+              AND (?6 IS NULL OR lower(series.series_name) LIKE ?6 ESCAPE '\')
+              AND (?7 IS NULL OR lower(series.series_name) LIKE ?7 ESCAPE '\')
+              AND (?8 IS NULL OR lower(series.series_name) >= ?8)
+              AND (?9 IS NULL OR lower(series.series_name) < ?9)
             GROUP BY series.series_id
             ORDER BY series_name COLLATE NOCASE, series_name, series_id
             LIMIT ?3 OFFSET ?4
@@ -9001,6 +9426,10 @@ impl SqliteDatabase {
         .bind(limit)
         .bind(offset)
         .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+        .bind(search_pattern.as_deref())
+        .bind(starts_with_pattern.as_deref())
+        .bind(lower_bound.as_deref())
+        .bind(upper_bound.as_deref())
         .fetch_all(&mut *transaction)
         .await?;
         let total = if let Some((_, _, total)) = series.first() {
@@ -9009,11 +9438,15 @@ impl SqliteDatabase {
             0
         } else {
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(DISTINCT series.series_id) FROM media_item_tv_series AS series JOIN media_item_tv_series_coverage AS coverage ON coverage.virtual_folder_id = series.virtual_folder_id AND coverage.projection_version = ?3 WHERE (?1 IS NULL OR series.virtual_folder_id IN (?1, ?2))",
+                "SELECT COUNT(DISTINCT series.series_id) FROM media_item_tv_series AS series JOIN media_item_tv_series_coverage AS coverage ON coverage.virtual_folder_id = series.virtual_folder_id AND coverage.projection_version = ?3 WHERE (?1 IS NULL OR series.virtual_folder_id IN (?1, ?2)) AND (?4 IS NULL OR lower(series.series_name) LIKE ?4 ESCAPE '\\') AND (?5 IS NULL OR lower(series.series_name) LIKE ?5 ESCAPE '\\') AND (?6 IS NULL OR lower(series.series_name) >= ?6) AND (?7 IS NULL OR lower(series.series_name) < ?7)",
             )
             .bind(virtual_folder_ids.as_ref().map(|(simple, _)| simple.as_str()))
             .bind(virtual_folder_ids.as_ref().map(|(_, dashed)| dashed.as_str()))
             .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+            .bind(search_pattern.as_deref())
+            .bind(starts_with_pattern.as_deref())
+            .bind(lower_bound.as_deref())
+            .bind(upper_bound.as_deref())
             .fetch_one(&mut *transaction)
             .await?
         };
@@ -9072,6 +9505,10 @@ impl SqliteDatabase {
         virtual_folder_ids: Option<&(String, String)>,
         start_index: usize,
         limit: usize,
+        search_pattern: Option<&str>,
+        starts_with_pattern: Option<&str>,
+        lower_bound: Option<&str>,
+        upper_bound: Option<&str>,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let simple = virtual_folder_ids.map(|(simple, _)| simple.as_str());
         let dashed = virtual_folder_ids.map(|(_, dashed)| dashed.as_str());
@@ -9131,7 +9568,15 @@ impl SqliteDatabase {
                   AND (?1 IS NULL OR item.virtual_folder_id IN (?1, ?2))
                 GROUP BY trim(json_extract(item.metadata_json, '$.SeriesId'))
             ), stats AS (
-                SELECT count(*) AS total,
+                SELECT coalesce(sum(CASE
+                           WHEN (?5 IS NULL
+                             OR lower(series_name) LIKE ?5 ESCAPE '\')
+                            AND (?6 IS NULL
+                             OR lower(series_name) LIKE ?6 ESCAPE '\')
+                            AND (?7 IS NULL OR lower(series_name) >= ?7)
+                            AND (?8 IS NULL OR lower(series_name) < ?8) THEN 1
+                           ELSE 0
+                       END), 0) AS total,
                        coalesce(max(CASE WHEN series_name <> series_name_last THEN 1 ELSE 0 END), 0)
                            AS name_conflict,
                        coalesce(max(CASE WHEN folder_first <> folder_last THEN 1 ELSE 0 END), 0)
@@ -9141,6 +9586,10 @@ impl SqliteDatabase {
             ), page AS (
                 SELECT series_id, series_name
                 FROM grouped
+                WHERE (?5 IS NULL OR lower(series_name) LIKE ?5 ESCAPE '\')
+                  AND (?6 IS NULL OR lower(series_name) LIKE ?6 ESCAPE '\')
+                  AND (?7 IS NULL OR lower(series_name) >= ?7)
+                  AND (?8 IS NULL OR lower(series_name) < ?8)
                 ORDER BY series_name COLLATE NOCASE, series_name, series_id
                 LIMIT ?3 OFFSET ?4
             )
@@ -9155,6 +9604,10 @@ impl SqliteDatabase {
         .bind(dashed)
         .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
+        .bind(search_pattern)
+        .bind(starts_with_pattern)
+        .bind(lower_bound)
+        .bind(upper_bound)
         .fetch_all(&mut **tx)
         .await?;
         let Some(first) = grouped.first() else {
@@ -9878,14 +10331,16 @@ impl SqliteDatabase {
             r#"
             SELECT facet.normalized_value, facet.display_value, facet.stable_id, facet.payload_json
             FROM media_item_facets AS facet
-            JOIN media_item_facet_aliases AS alias
-              ON alias.item_id = facet.item_id
-             AND alias.facet_kind = facet.facet_kind
-             AND alias.normalized_value = facet.normalized_value
             JOIN media_items AS item ON item.id = facet.item_id
             WHERE item.missing_since IS NULL
               AND facet.facet_kind = ?1
-              AND alias.entity_id = ?2
+              AND (facet.stable_id = ?2 OR EXISTS (
+                  SELECT 1 FROM media_item_facet_aliases AS alias
+                  WHERE alias.item_id = facet.item_id
+                    AND alias.facet_kind = facet.facet_kind
+                    AND alias.normalized_value = facet.normalized_value
+                    AND alias.entity_id = ?2
+              ))
             ORDER BY item.created_at, facet.position, facet.item_id
             LIMIT 1
             "#,
@@ -9969,10 +10424,6 @@ impl SqliteDatabase {
             SELECT DISTINCT facet.item_id
             FROM media_item_facets AS facet
             JOIN media_items AS item ON item.id = facet.item_id
-            LEFT JOIN media_item_facet_aliases AS alias
-              ON alias.item_id = facet.item_id
-             AND alias.facet_kind = facet.facet_kind
-             AND alias.normalized_value = facet.normalized_value
             WHERE item.missing_since IS NULL
             "#,
         );
@@ -10003,12 +10454,17 @@ impl SqliteDatabase {
                 query.push(" OR ");
             }
             if !entity_ids.is_empty() {
-                query.push("alias.entity_id IN (");
+                query.push("(facet.stable_id IN (");
                 let mut separated = query.separated(", ");
                 for entity_id in &entity_ids {
                     separated.push_bind(entity_id);
                 }
-                separated.push_unseparated(")");
+                separated.push_unseparated(") OR EXISTS (SELECT 1 FROM media_item_facet_aliases AS alias WHERE alias.item_id = facet.item_id AND alias.facet_kind = facet.facet_kind AND alias.normalized_value = facet.normalized_value AND alias.entity_id IN (");
+                let mut separated = query.separated(", ");
+                for entity_id in &entity_ids {
+                    separated.push_bind(entity_id);
+                }
+                separated.push_unseparated(")))");
             }
             query.push(")");
         }
@@ -10179,7 +10635,17 @@ impl SqliteDatabase {
         &self,
         libraries: Vec<RemoteMediaLibraryStageSpec>,
     ) -> anyhow::Result<RemoteMediaCatalogStage> {
+        self.begin_remote_media_catalog_stage_for_revision(libraries, "")
+            .await
+    }
+
+    pub async fn begin_remote_media_catalog_stage_for_revision(
+        &self,
+        libraries: Vec<RemoteMediaLibraryStageSpec>,
+        source_revision: &str,
+    ) -> anyhow::Result<RemoteMediaCatalogStage> {
         let libraries = prepare_remote_media_library_stage_specs(libraries)?;
+        let source_revision = remote_media_stage_source_revision(source_revision)?;
         let stage = RemoteMediaCatalogStage::new(Uuid::new_v4());
         let now = format_time(OffsetDateTime::now_utc())?;
         let mut tx = self.pool.begin().await?;
@@ -10187,14 +10653,15 @@ impl SqliteDatabase {
             r#"
             INSERT INTO remote_media_catalog_stages (
                 id, status, extractor_version, query_filter_extractor_version,
-                created_at, updated_at
+                source_revision, created_at, updated_at
             )
-            VALUES (?1, 'open', ?2, ?3, ?4, ?4)
+            VALUES (?1, 'open', ?2, ?3, ?4, ?5, ?5)
             "#,
         )
         .bind(stage.id())
         .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
         .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .bind(source_revision)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
@@ -10249,15 +10716,19 @@ impl SqliteDatabase {
             locked.rows_affected() == 1,
             "remote media catalogue stage not found"
         );
-        let (status, extractor_version, query_filter_version) =
-            sqlx::query_as::<_, (String, i32, i32)>(
-                "SELECT status, extractor_version, query_filter_extractor_version \
+        let (status, ready_at, extractor_version, query_filter_version) =
+            sqlx::query_as::<_, (String, Option<String>, i32, i32)>(
+                "SELECT status, ready_at, extractor_version, query_filter_extractor_version \
              FROM remote_media_catalog_stages WHERE id = ?1",
             )
             .bind(stage.id())
             .fetch_one(&mut *tx)
             .await?;
         anyhow::ensure!(status == "open", "remote media catalogue stage is not open");
+        anyhow::ensure!(
+            ready_at.is_none(),
+            "remote media catalogue stage is already complete"
+        );
         anyhow::ensure!(
             extractor_version == MEDIA_ITEM_FACET_PROJECTION_VERSION,
             "remote media catalogue stage extractor version is stale"
@@ -10448,6 +10919,91 @@ impl SqliteDatabase {
         Ok(())
     }
 
+    pub async fn complete_remote_media_catalog_stage(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+    ) -> anyhow::Result<()> {
+        stage.parsed_id()?;
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let completed = sqlx::query(
+            "UPDATE remote_media_catalog_stages SET ready_at = ?1, updated_at = ?1 \
+             WHERE id = ?2 AND status = 'open' AND ready_at IS NULL \
+               AND extractor_version = ?3 AND query_filter_extractor_version = ?4 \
+               AND (SELECT count(*) FROM remote_media_catalog_stage_libraries \
+                    WHERE stage_id = ?2) = 2 \
+               AND NOT EXISTS (SELECT 1 FROM remote_media_catalog_stage_libraries AS library \
+                    WHERE library.stage_id = ?2 AND library.item_count <> \
+                      (SELECT count(*) FROM remote_media_catalog_stage_items AS item \
+                       WHERE item.stage_id = library.stage_id \
+                         AND item.library_key = library.library_key))",
+        )
+        .bind(&now)
+        .bind(stage.id())
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .execute(&self.pool)
+        .await?;
+        anyhow::ensure!(
+            completed.rows_affected() == 1,
+            "remote media catalogue stage is incomplete, stale, or not open"
+        );
+        Ok(())
+    }
+
+    pub async fn ready_remote_media_catalog_stage(
+        &self,
+        libraries: Vec<RemoteMediaLibraryStageSpec>,
+        source_revision: &str,
+    ) -> anyhow::Result<Option<ReadyRemoteMediaCatalogStage>> {
+        let libraries = prepare_remote_media_library_stage_specs(libraries)?;
+        let source_revision = remote_media_stage_source_revision(source_revision)?;
+        let movies = &libraries[0];
+        let series = &libraries[1];
+        let row = sqlx::query_as::<_, (String, i64, i64)>(
+            r#"
+            SELECT stage.id, movies.item_count, series.item_count
+            FROM remote_media_catalog_stages AS stage
+            JOIN remote_media_catalog_stage_libraries AS movies
+              ON movies.stage_id = stage.id AND movies.library_key = 'movies'
+            JOIN remote_media_catalog_stage_libraries AS series
+              ON series.stage_id = stage.id AND series.library_key = 'series'
+            WHERE stage.status = 'open' AND stage.ready_at IS NOT NULL
+              AND stage.extractor_version = ?1
+              AND stage.query_filter_extractor_version = ?2
+              AND stage.source_revision = ?3
+              AND lower(movies.library_name) = lower(?4)
+              AND movies.collection_type = ?5 AND movies.source_location = ?6
+              AND lower(series.library_name) = lower(?7)
+              AND series.collection_type = ?8 AND series.source_location = ?9
+              AND (SELECT count(*) FROM remote_media_catalog_stage_libraries AS library
+                   WHERE library.stage_id = stage.id) = 2
+            ORDER BY stage.ready_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(MEDIA_ITEM_FACET_PROJECTION_VERSION)
+        .bind(MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION)
+        .bind(source_revision)
+        .bind(&movies.library_name)
+        .bind(&movies.collection_type)
+        .bind(&movies.source_location)
+        .bind(&series.library_name)
+        .bind(&series.collection_type)
+        .bind(&series.source_location)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(id, movie_count, series_item_count)| {
+            Ok(ReadyRemoteMediaCatalogStage {
+                stage: RemoteMediaCatalogStage::try_from_id(id)?,
+                movie_count: usize::try_from(movie_count)
+                    .context("ready movie stage count overflow")?,
+                series_item_count: usize::try_from(series_item_count)
+                    .context("ready series stage count overflow")?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn abort_remote_media_catalog_stage(
         &self,
         stage: &RemoteMediaCatalogStage,
@@ -10496,7 +11052,8 @@ impl SqliteDatabase {
     ) -> anyhow::Result<u64> {
         let result = sqlx::query(
             "DELETE FROM remote_media_catalog_stages \
-             WHERE status IN ('open', 'aborted') AND updated_at < ?1",
+             WHERE ((status = 'open' AND ready_at IS NULL) OR status = 'aborted') \
+               AND updated_at < ?1",
         )
         .bind(format_time(older_than)?)
         .execute(&self.pool)
@@ -10514,7 +11071,8 @@ impl SqliteDatabase {
         let locked = sqlx::query(
             "UPDATE remote_media_catalog_stages \
              SET status = 'publishing', updated_at = ?1 \
-             WHERE id = ?2 AND status = 'open' AND extractor_version = ?3 \
+             WHERE id = ?2 AND status = 'open' AND ready_at IS NOT NULL \
+               AND extractor_version = ?3 \
                AND query_filter_extractor_version = ?4",
         )
         .bind(&now)
@@ -10525,7 +11083,7 @@ impl SqliteDatabase {
         .await?;
         anyhow::ensure!(
             locked.rows_affected() == 1,
-            "remote media catalogue stage was not open or its extractor version is stale"
+            "remote media catalogue stage was not ready or its extractor version is stale"
         );
         let rows = sqlx::query_as::<_, (String, i16, String, String, String, i64)>(
             r#"
@@ -10708,7 +11266,13 @@ impl SqliteDatabase {
                     width = excluded.width,
                     height = excluded.height,
                     media_streams_json = excluded.media_streams_json,
-                    metadata_json = excluded.metadata_json
+                    metadata_json = CASE
+                        WHEN json_extract(media_items.metadata_json, '$.XtreamKind') = 'vod'
+                         AND json_extract(media_items.metadata_json, '$.XtreamVodInfo.Status') = 'Complete'
+                         AND json_type(excluded.metadata_json, '$.XtreamVodInfo') IS NULL
+                        THEN json_patch(media_items.metadata_json, excluded.metadata_json)
+                        ELSE excluded.metadata_json
+                    END
                 WHERE media_items.missing_since IS NOT NULL
                    OR media_items.virtual_folder_id IS NOT excluded.virtual_folder_id
                    OR media_items.name IS NOT excluded.name
@@ -10720,7 +11284,13 @@ impl SqliteDatabase {
                    OR media_items.width IS NOT excluded.width
                    OR media_items.height IS NOT excluded.height
                    OR media_items.media_streams_json IS NOT excluded.media_streams_json
-                   OR media_items.metadata_json IS NOT excluded.metadata_json
+                   OR media_items.metadata_json IS NOT CASE
+                        WHEN json_extract(media_items.metadata_json, '$.XtreamKind') = 'vod'
+                         AND json_extract(media_items.metadata_json, '$.XtreamVodInfo.Status') = 'Complete'
+                         AND json_type(excluded.metadata_json, '$.XtreamVodInfo') IS NULL
+                        THEN json_patch(media_items.metadata_json, excluded.metadata_json)
+                        ELSE excluded.metadata_json
+                    END
                 "#,
             )
             .bind(&folder_id)
@@ -11168,7 +11738,13 @@ impl SqliteDatabase {
                     width = excluded.width,
                     height = excluded.height,
                     media_streams_json = excluded.media_streams_json,
-                    metadata_json = excluded.metadata_json
+                    metadata_json = CASE
+                        WHEN json_extract(media_items.metadata_json, '$.XtreamKind') = 'vod'
+                         AND json_extract(media_items.metadata_json, '$.XtreamVodInfo.Status') = 'Complete'
+                         AND json_type(excluded.metadata_json, '$.XtreamVodInfo') IS NULL
+                        THEN json_patch(media_items.metadata_json, excluded.metadata_json)
+                        ELSE excluded.metadata_json
+                    END
                 WHERE media_items.missing_since IS NOT NULL
                    OR media_items.virtual_folder_id IS NOT excluded.virtual_folder_id
                    OR media_items.name IS NOT excluded.name
@@ -11180,7 +11756,13 @@ impl SqliteDatabase {
                    OR media_items.width IS NOT excluded.width
                    OR media_items.height IS NOT excluded.height
                    OR media_items.media_streams_json IS NOT excluded.media_streams_json
-                   OR media_items.metadata_json IS NOT excluded.metadata_json
+                   OR media_items.metadata_json IS NOT CASE
+                        WHEN json_extract(media_items.metadata_json, '$.XtreamKind') = 'vod'
+                         AND json_extract(media_items.metadata_json, '$.XtreamVodInfo.Status') = 'Complete'
+                         AND json_type(excluded.metadata_json, '$.XtreamVodInfo') IS NULL
+                        THEN json_patch(media_items.metadata_json, excluded.metadata_json)
+                        ELSE excluded.metadata_json
+                    END
                     "#,
                 )
                 .bind(&item.id)
@@ -14886,6 +15468,7 @@ async fn probe_media_info_input(
         },
     };
 
+    let input = input.as_ref();
     let mut command = Command::new("ffprobe");
     command
         .arg("-v")
@@ -14896,10 +15479,6 @@ async fn probe_media_info_input(
         .arg("json")
         .arg("-show_format")
         .arg("-show_streams")
-        // MPEG-TS exposes DVB teletext page/type descriptors through codec extradata. The probe
-        // output is already bounded to 8 MiB and the parser below retains at most 64 two-byte
-        // service descriptors; no arbitrary binary data is persisted.
-        .arg("-show_data")
         .arg("-show_chapters");
     for arg in input_args {
         command.arg(arg);
@@ -14913,13 +15492,84 @@ async fn probe_media_info_input(
         }
     };
     match serde_json::from_slice::<Value>(&output) {
-        Ok(value) => {
+        Ok(mut value) => {
+            // `-show_data` applies to every stream. On Matroska files with embedded fonts that
+            // can dump many megabytes of attachment data and make an otherwise valid probe hit
+            // the bounded-output limit before its audio/subtitle inventory can be persisted.
+            // Only request binary stream data in a second, subtitle-only pass when the primary
+            // inventory proves that DVB teletext descriptors are actually needed.
+            if ffprobe_has_dvb_teletext_stream(&value) {
+                let mut data_command = Command::new("ffprobe");
+                data_command
+                    .arg("-v")
+                    .arg("error")
+                    .arg("-threads")
+                    .arg("1")
+                    .arg("-print_format")
+                    .arg("json")
+                    .arg("-select_streams")
+                    .arg("s")
+                    .arg("-show_entries")
+                    .arg("stream=index,extradata")
+                    .arg("-show_data");
+                for arg in input_args {
+                    data_command.arg(arg);
+                }
+                data_command.arg(input);
+                if let Ok(data_output) =
+                    run_ffprobe_command(data_command, configured_ffprobe_timeout()).await
+                    && let Ok(data) = serde_json::from_slice::<Value>(&data_output)
+                {
+                    merge_ffprobe_stream_extradata(&mut value, &data);
+                }
+            }
             attempt.finish(FfprobeOutcome::Succeeded);
             parse_ffprobe_media_info(&value)
         }
         Err(_) => {
             attempt.finish(FfprobeOutcome::InvalidJson);
             MediaInfo::default()
+        }
+    }
+}
+
+fn ffprobe_has_dvb_teletext_stream(value: &Value) -> bool {
+    value
+        .get("streams")
+        .and_then(Value::as_array)
+        .is_some_and(|streams| {
+            streams.iter().any(|stream| {
+                stream
+                    .get("codec_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|codec| codec.eq_ignore_ascii_case("dvb_teletext"))
+            })
+        })
+}
+
+fn merge_ffprobe_stream_extradata(primary: &mut Value, supplemental: &Value) {
+    let Some(primary_streams) = primary.get_mut("streams").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(supplemental_streams) = supplemental.get("streams").and_then(Value::as_array) else {
+        return;
+    };
+    for supplemental_stream in supplemental_streams {
+        let Some(index) = supplemental_stream.get("index").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(extradata) = supplemental_stream.get("extradata").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(primary_stream) = primary_streams
+            .iter_mut()
+            .find(|stream| stream.get("index").and_then(Value::as_i64) == Some(index))
+            && let Some(primary_stream) = primary_stream.as_object_mut()
+        {
+            primary_stream.insert(
+                "extradata".to_string(),
+                Value::String(extradata.to_string()),
+            );
         }
     }
 }
@@ -16570,9 +17220,9 @@ mod tests {
         PluginRuntimeInstanceUpsert, ProviderSecretReference, ProviderSecretVault,
         REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS, RemoteMediaItemUpsert,
         RemoteMediaLibrarySnapshot, RemoteMediaLibraryStageSpec, ResumeItemsPageQuery,
-        SortDirection, SystemConfigurationPayloads, UpsertActivePlaybackSession,
-        UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
-        parse_ffprobe_media_info, parse_local_nfo_metadata,
+        SortDirection, SystemConfigurationPayloads, TvSeriesCatalogNameFilter,
+        UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+        UpsertTranscodeSession, parse_ffprobe_media_info, parse_local_nfo_metadata,
     };
     use serde_json::{Value, json};
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -18470,6 +19120,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_catalog_advanced_metadata_filters_are_sql_pushed_down() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let matching_id = Uuid::new_v4();
+        db.replace_remote_media_library_snapshot(
+            "Advanced Filters",
+            "movies",
+            "provider://advanced-filters",
+            vec![
+                RemoteMediaItemUpsert {
+                    id: matching_id.to_string(),
+                    name: "Matching Movie".to_string(),
+                    path: "provider://advanced-filters/matching.mkv".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: Some(1920),
+                    height: Some(1080),
+                    media_streams: Vec::new(),
+                    metadata: json!({
+                        "OfficialRating": "PG-13",
+                        "SeriesStatus": "Continuing",
+                        "ProductionYear": 2025,
+                        "RemoteTrailers": [{"Url": "https://example.invalid/trailer"}],
+                        "sErIeSoVeRvIeW": "Present",
+                        "ProviderIds": {"IMDb": "tt123", "Tmdb": "456"},
+                        "SeriesProviderIds": {"TVDB": "789"},
+                        "LockData": true,
+                        "CommunityRating": 8.5,
+                        "CriticRating": "75",
+                        "PremiereDate": "2025-02-03T04:05:06Z"
+                    }),
+                },
+                RemoteMediaItemUpsert {
+                    id: Uuid::new_v4().to_string(),
+                    name: "Non Matching Movie".to_string(),
+                    path: "provider://advanced-filters/other.mkv".to_string(),
+                    media_type: "Video".to_string(),
+                    collection_type: "movies".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: Some(1280),
+                    height: Some(720),
+                    media_streams: Vec::new(),
+                    metadata: json!({
+                        "SeriesStatus": "Ended",
+                        "ProductionYear": 2020,
+                        "CommunityRating": 5.0,
+                        "CriticRating": 40,
+                        "PremiereDate": "2020-01-01T00:00:00Z"
+                    }),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let threshold = OffsetDateTime::parse("2025-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let filters = [
+            MediaItemCatalogQuery {
+                official_ratings: vec!["pg-13".to_string()],
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                series_statuses: vec!["continuing".to_string()],
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                years: vec!["2025".to_string()],
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                has_trailer: Some(true),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                has_overview: Some(true),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                has_imdb_id: Some(true),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                has_tmdb_id: Some(true),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                has_tvdb_id: Some(true),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                has_official_rating: Some(true),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                is_locked: Some(true),
+                ..MediaItemCatalogQuery::default()
+            },
+            MediaItemCatalogQuery {
+                min_community_rating: Some(8.0),
+                max_community_rating: Some(9.0),
+                min_critic_rating: Some(70.0),
+                max_critic_rating: Some(80.0),
+                min_premiere_date: Some(threshold),
+                ..MediaItemCatalogQuery::default()
+            },
+        ];
+        for filter in filters {
+            let page = db
+                .media_item_catalog_page(&filter)
+                .await
+                .unwrap_or_else(|error| panic!("filter={filter:?}: {error:#}"));
+            assert_eq!(page.total_record_count, 1, "filter={filter:?}");
+            assert_eq!(page.items[0].item.id, matching_id, "filter={filter:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn sqlite_next_up_candidates_filter_played_and_unrelated_items_in_sql() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db.create_user("next-up-sqlite", None).await.unwrap();
@@ -18781,6 +19550,55 @@ mod tests {
         assert_eq!(page.series[0].name, "Example Show");
         assert_eq!(page.episodes.len(), 1);
         assert_eq!(page.episodes[0].item.id, episode_id);
+        let searched = db
+            .tv_series_catalog_search_page(
+                None,
+                0,
+                20,
+                TvSeriesCatalogNameFilter {
+                    search_term: Some("example".to_string()),
+                    ..TvSeriesCatalogNameFilter::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(searched.total_record_count, 1);
+        assert_eq!(searched.series.len(), 1);
+        assert_eq!(searched.series[0].name, "Example Show");
+        let letter_page = db
+            .tv_series_catalog_search_page(
+                None,
+                0,
+                20,
+                TvSeriesCatalogNameFilter {
+                    starts_with: Some("E".to_string()),
+                    starts_with_or_greater: Some("E".to_string()),
+                    less_than: Some("F".to_string()),
+                    ..TvSeriesCatalogNameFilter::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(letter_page.total_record_count, 1);
+        assert_eq!(letter_page.series[0].name, "Example Show");
+        let no_match = db
+            .tv_series_catalog_search_page(
+                None,
+                0,
+                20,
+                TvSeriesCatalogNameFilter {
+                    search_term: Some("missing".to_string()),
+                    ..TvSeriesCatalogNameFilter::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_match.total_record_count, 0);
+        assert!(no_match.series.is_empty());
+        assert!(no_match.episodes.is_empty());
         let empty = db
             .tv_series_catalog_page(None, 1, 1)
             .await
@@ -19453,6 +20271,9 @@ mod tests {
             2
         );
 
+        db.complete_remote_media_catalog_stage(&stage)
+            .await
+            .unwrap();
         let folders = db.publish_remote_media_catalog_stage(&stage).await.unwrap();
         assert_eq!(
             folders
@@ -19516,21 +20337,22 @@ mod tests {
     #[tokio::test]
     async fn sqlite_durable_remote_media_stage_rolls_back_late_publish_failure_and_retries() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
+        let specs = vec![
+            RemoteMediaLibraryStageSpec {
+                key: "series".to_string(),
+                library_name: "Retry Series".to_string(),
+                collection_type: "tvshows".to_string(),
+                source_location: "xtream://retry/series".to_string(),
+            },
+            RemoteMediaLibraryStageSpec {
+                key: "movies".to_string(),
+                library_name: "Retry Movies".to_string(),
+                collection_type: "movies".to_string(),
+                source_location: "xtream://retry/movies".to_string(),
+            },
+        ];
         let stage = db
-            .begin_remote_media_catalog_stage(vec![
-                RemoteMediaLibraryStageSpec {
-                    key: "series".to_string(),
-                    library_name: "Retry Series".to_string(),
-                    collection_type: "tvshows".to_string(),
-                    source_location: "xtream://retry/series".to_string(),
-                },
-                RemoteMediaLibraryStageSpec {
-                    key: "movies".to_string(),
-                    library_name: "Retry Movies".to_string(),
-                    collection_type: "movies".to_string(),
-                    source_location: "xtream://retry/movies".to_string(),
-                },
-            ])
+            .begin_remote_media_catalog_stage_for_revision(specs.clone(), "revision-a")
             .await
             .unwrap();
         let item = |path: &str, collection_type: &str| RemoteMediaItemUpsert {
@@ -19560,6 +20382,31 @@ mod tests {
         )
         .await
         .unwrap();
+        db.complete_remote_media_catalog_stage(&stage)
+            .await
+            .unwrap();
+        let ready = db
+            .ready_remote_media_catalog_stage(specs.clone(), "revision-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.stage, stage);
+        assert_eq!((ready.movie_count, ready.series_item_count), (1, 1));
+        assert!(
+            db.ready_remote_media_catalog_stage(specs.clone(), "revision-b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.append_remote_media_catalog_stage(
+                &stage,
+                "movies",
+                vec![item("xtream://retry/movies/late.mp4", "movies")],
+            )
+            .await
+            .is_err()
+        );
         sqlx::query(
             r#"
             CREATE TRIGGER fail_staged_series_publish
@@ -19586,6 +20433,24 @@ mod tests {
             .await
             .unwrap(),
             "open"
+        );
+        assert!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT ready_at FROM remote_media_catalog_stages WHERE id = ?1"
+            )
+            .bind(stage.id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            db.ready_remote_media_catalog_stage(specs, "revision-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .stage,
+            stage
         );
         sqlx::query("DROP TRIGGER fail_staged_series_publish")
             .execute(db.pool())
@@ -21056,6 +21921,29 @@ mod tests {
         // The parser retains only the explicit normalized structure, never ffprobe's formatted
         // binary dump.
         assert!(stream.get("extradata").is_none());
+    }
+
+    #[test]
+    fn merges_only_selected_stream_extradata_into_primary_probe() {
+        let mut primary = json!({
+            "streams": [
+                { "index": 0, "codec_name": "h264", "codec_type": "video" },
+                { "index": 2, "codec_name": "dvb_teletext", "codec_type": "subtitle" },
+                { "index": 3, "codec_name": "attachment", "codec_type": "attachment" }
+            ]
+        });
+        let supplemental = json!({
+            "streams": [
+                { "index": 2, "extradata": "00000000: 1001" },
+                { "index": 99, "extradata": "ignored" }
+            ]
+        });
+
+        assert!(super::ffprobe_has_dvb_teletext_stream(&primary));
+        super::merge_ffprobe_stream_extradata(&mut primary, &supplemental);
+
+        assert_eq!(primary["streams"][2].get("extradata"), None);
+        assert_eq!(primary["streams"][1]["extradata"], "00000000: 1001");
     }
 
     #[test]

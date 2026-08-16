@@ -6,6 +6,7 @@ mod auth;
 mod auth_handlers;
 mod auxiliary_ffmpeg_telemetry;
 mod backup;
+mod builtin_metadata;
 mod capabilities;
 mod configuration_service;
 mod dlna;
@@ -17,15 +18,19 @@ mod livetv_parsing;
 mod livetv_service;
 mod media_service;
 mod migration;
+mod musicbrainz;
+mod omdb;
 mod password_reset;
 mod plugin_service;
 mod session;
 mod session_service;
 mod state;
+mod studio_images;
 mod syncplay_types;
 mod system;
 mod system_service;
 mod task_service;
+mod tmdb;
 mod user_configuration;
 mod user_service;
 mod users;
@@ -142,8 +147,8 @@ use jellyrin_db::{
     NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
     ProviderSecretReference, QuickConnectSession, ResumeItemsPageQuery, SortDirection,
     SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
-    UpsertTranscodeSession, probe_remote_media_info_admitted,
+    TvSeriesCatalogNameFilter, UpsertActivePlaybackSession, UpsertActiveViewingSession,
+    UpsertPlaybackState, UpsertTranscodeSession, probe_remote_media_info_admitted,
     provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
     upcoming_media_item_premiere_date,
 };
@@ -181,7 +186,7 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, oneshot};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, oneshot, watch};
 use tokio_util::io::ReaderStream;
 use tower_http::{
     LatencyUnit,
@@ -225,6 +230,7 @@ const REMOTE_MEDIA_CHUNK_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const REMOTE_MEDIA_DNS_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const REMOTE_MEDIA_MAX_REDIRECTS: usize = 5;
 const LIVE_HLS_SESSION_REGISTRY_MAX_ENTRIES: usize = 4_096;
+const LIVE_TV_USER_DATA_CONFIGURATION_KEY: &str = "livetv-user-data";
 const HLS_SEGMENT_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const HLS_SEGMENT_WAIT_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
 const DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS: i64 = 15;
@@ -237,7 +243,9 @@ const MAX_HLS_SEEK_GENERATION_TIMEOUT_SECONDS: u64 = 900;
 const TRANSCODE_PROGRESS_PERSIST_INTERVAL: StdDuration = StdDuration::from_secs(3);
 const KEYED_LOCK_REGISTRY_MAX_ENTRIES: usize = 4_096;
 const KEYED_LOCK_PRUNE_INTERVAL: usize = 64;
-const XTREAM_REMOTE_PROBE_FAILED_RETRY_AFTER_SECONDS: i64 = 30 * 60;
+const XTREAM_REMOTE_PROBE_FAILED_RETRY_AFTER_SECONDS: i64 = 60;
+const XTREAM_VOD_INFO_VERSION: i64 = 1;
+const XTREAM_VOD_INFO_FAILED_RETRY_AFTER_SECONDS: i64 = 60;
 const DLNA_TRANSCODE_DEVICE_ID: &str = "dlna-upnp";
 const LIVE_TV_TIMER_SCHEDULER_INTERVAL_SECONDS: u64 = 1;
 /// Default page size for `/LiveTv/Channels` when the client omits `Limit`.
@@ -946,6 +954,7 @@ use jellyrin_core::{LIVE_TV_REMOTE_USER_AGENT, LIVE_TV_XTREAM_MAX_IMPORT_LIMIT};
 // Keyed by play_session_id; mirrors the VOD transcode session lifecycle but without
 // requiring a media_items DB row (live TV channels are not in the media_items table).
 static LIVE_HLS_SESSIONS: OnceLock<Mutex<HashMap<String, LiveHlsSessionEntry>>> = OnceLock::new();
+static LIVE_TV_USER_DATA_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 // Longer readiness timeout for live TV HLS (compared to VOD 5s) because an HTTP live
 // stream source may need a few extra seconds for ffmpeg to buffer the first segment.
@@ -1317,6 +1326,8 @@ pub fn router(state: AppState) -> Router {
         .route("/getutctime", get(time_sync_utc_time))
         .route("/Tmdb/ClientConfiguration", get(tmdb_client_configuration))
         .route("/tmdb/clientconfiguration", get(tmdb_client_configuration))
+        .route("/Metadata/Providers", get(metadata_providers))
+        .route("/metadata/providers", get(metadata_providers))
         .route("/System/Ping", get(ping))
         .route("/System/Ping", post(ping))
         .route("/system/ping", get(ping))
@@ -3880,6 +3891,14 @@ pub fn router(state: AppState) -> Router {
             post(mark_user_item_favorite).delete(unmark_user_item_favorite),
         )
         .route(
+            "/Users/{user_id}/FavoriteItems/{item_id}",
+            post(mark_user_item_favorite).delete(unmark_user_item_favorite),
+        )
+        .route(
+            "/users/{user_id}/favoriteitems/{item_id}",
+            post(mark_user_item_favorite).delete(unmark_user_item_favorite),
+        )
+        .route(
             "/UserLibrary/UserItems/{item_id}/Rating",
             post(update_authenticated_item_rating).delete(delete_authenticated_item_rating),
         )
@@ -4289,35 +4308,35 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/Image/Studios/{name}/Images/{image_type}",
-            get(named_placeholder_image).head(named_placeholder_image),
+            get(studio_image).head(studio_image),
         )
         .route(
             "/Studios/{name}/Images/{image_type}",
-            get(named_placeholder_image).head(named_placeholder_image),
+            get(studio_image).head(studio_image),
         )
         .route(
             "/image/studios/{name}/images/{image_type}",
-            get(named_placeholder_image).head(named_placeholder_image),
+            get(studio_image).head(studio_image),
         )
         .route(
             "/studios/{name}/images/{image_type}",
-            get(named_placeholder_image).head(named_placeholder_image),
+            get(studio_image).head(studio_image),
         )
         .route(
             "/Image/Studios/{name}/Images/{image_type}/{image_index}",
-            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+            get(studio_image_by_index).head(studio_image_by_index),
         )
         .route(
             "/Studios/{name}/Images/{image_type}/{image_index}",
-            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+            get(studio_image_by_index).head(studio_image_by_index),
         )
         .route(
             "/image/studios/{name}/images/{image_type}/{image_index}",
-            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+            get(studio_image_by_index).head(studio_image_by_index),
         )
         .route(
             "/studios/{name}/images/{image_type}/{image_index}",
-            get(named_placeholder_image_by_index).head(named_placeholder_image_by_index),
+            get(studio_image_by_index).head(studio_image_by_index),
         )
         .route(
             "/Image/Artists/{name}/Images/{image_type}/{image_index}",
@@ -14376,6 +14395,14 @@ async fn named_configuration(
                 .await?
                 .unwrap_or_else(default_metadata_configuration)
         }
+        builtin_metadata::CONFIGURATION_KEY => {
+            require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+            state
+                .db
+                .named_configuration(&key)
+                .await?
+                .unwrap_or_else(builtin_metadata::default_configuration)
+        }
         "xbmcmetadata" => {
             require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
             state
@@ -14448,6 +14475,10 @@ async fn update_named_configuration(
         "metadata" => (
             metadata_configuration_json(payload),
             "Metadata configuration updated",
+        ),
+        builtin_metadata::CONFIGURATION_KEY => (
+            builtin_metadata::normalize_configuration(payload),
+            "Metadata providers configuration updated",
         ),
         "xbmcmetadata" => (
             xbmc_metadata_configuration_json(payload),
@@ -14933,6 +14964,61 @@ fn public_branding_configuration_json(config: BrandingConfig) -> serde_json::Val
 
 async fn default_metadata_options() -> Json<serde_json::Value> {
     Json(default_metadata_options_payload())
+}
+
+async fn metadata_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let configuration = state
+        .db
+        .named_configuration(builtin_metadata::CONFIGURATION_KEY)
+        .await?
+        .unwrap_or_else(builtin_metadata::default_configuration);
+    let mut providers = builtin_metadata::registry_entries(
+        &configuration,
+        builtin_metadata::ProviderSecretAvailability::from_environment(),
+    );
+
+    for plugin in state.db.installed_plugins_json().await? {
+        let capabilities = plugin_string_array(plugin.get("Capabilities"));
+        if !capabilities.iter().any(|capability| {
+            capability.eq_ignore_ascii_case("MetadataProvider")
+                || capability.eq_ignore_ascii_case("ImageProvider")
+        }) {
+            continue;
+        }
+        let id = json_string_field(&plugin, "Id").unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let status = json_string_field(&plugin, "Status").unwrap_or_else(|| "Unknown".to_string());
+        providers.push(serde_json::json!({
+            "Id": id,
+            "Name": json_string_field(&plugin, "Name").unwrap_or_else(|| "External metadata provider".to_string()),
+            "Runtime": json_string_field(&plugin, "Runtime").unwrap_or_else(|| "ExternalProcess".to_string()),
+            "Status": status,
+            "Enabled": status.eq_ignore_ascii_case("Active"),
+            "Ready": status.eq_ignore_ascii_case("Active"),
+            "Priority": 1000,
+            "Capabilities": capabilities,
+            "ItemTypes": [],
+            "CanUninstall": true
+        }));
+    }
+    providers.sort_by(|left, right| {
+        json_i64_field(left, "Priority")
+            .unwrap_or(i64::MAX)
+            .cmp(&json_i64_field(right, "Priority").unwrap_or(i64::MAX))
+            .then_with(|| {
+                json_string_field(left, "Name")
+                    .unwrap_or_default()
+                    .cmp(&json_string_field(right, "Name").unwrap_or_default())
+            })
+    });
+    Ok(Json(providers))
 }
 
 fn default_metadata_options_payload() -> serde_json::Value {
@@ -15509,6 +15595,20 @@ const XTREAM_MEDIA_SYNC_TASK_ID: &str = "sync-xtream-media";
 const XTREAM_MEDIA_SYNC_TASK_KEY: &str = "SyncXtreamMedia";
 const SCHEDULED_TASK_TRIGGER_CONFIG_PREFIX: &str = "scheduled-task-triggers:";
 const STALE_TASK_HOURS: i64 = 24;
+const XTREAM_MEDIA_SYNC_STALE_MINUTES: i64 = 5;
+const XTREAM_MEDIA_SYNC_HEARTBEAT_SECONDS: u64 = 30;
+
+struct XtreamMediaSyncCancellation {
+    run_id: Uuid,
+    sender: watch::Sender<bool>,
+}
+
+static XTREAM_MEDIA_SYNC_CANCELLATION: OnceLock<StdMutex<Option<XtreamMediaSyncCancellation>>> =
+    OnceLock::new();
+
+fn xtream_media_sync_cancellation() -> &'static StdMutex<Option<XtreamMediaSyncCancellation>> {
+    XTREAM_MEDIA_SYNC_CANCELLATION.get_or_init(|| StdMutex::new(None))
+}
 
 async fn scheduled_tasks(
     State(state): State<AppState>,
@@ -15723,6 +15823,11 @@ async fn stop_scheduled_task(
         return Ok(StatusCode::NO_CONTENT);
     }
     if is_xtream_media_sync_task(&task_id) {
+        if let Ok(guard) = xtream_media_sync_cancellation().lock()
+            && let Some(cancellation) = guard.as_ref()
+        {
+            let _ = cancellation.sender.send(true);
+        }
         state
             .db
             .fail_current_task_run(XTREAM_MEDIA_SYNC_TASK_KEY, "Task run cancelled.")
@@ -15854,7 +15959,7 @@ async fn recover_stale_xtream_media_sync_runs(db: &Database) -> Result<(), ApiEr
     TaskService::new(db)
         .fail_stale(
             XTREAM_MEDIA_SYNC_TASK_KEY,
-            Duration::hours(STALE_TASK_HOURS),
+            Duration::minutes(XTREAM_MEDIA_SYNC_STALE_MINUTES),
             "Task run expired before completion.",
         )
         .await?;
@@ -17755,6 +17860,10 @@ fn quick_connect_json(session: &QuickConnectSession) -> serde_json::Value {
     serde_json::json!({
         "Secret": session.secret,
         "Code": session.code,
+        "DeviceId": session.device_id,
+        "DeviceName": session.device_name,
+        "AppName": session.client,
+        "AppVersion": session.version,
         "DateAdded": format_time_for_json(session.created_at),
         "DateUpdated": format_time_for_json(session.updated_at),
         "DateExpires": format_time_for_json(session.expires_at),
@@ -18553,9 +18662,15 @@ async fn live_tv_info() -> Json<serde_json::Value> {
 }
 
 async fn live_tv_guide_info() -> Json<serde_json::Value> {
+    let now = OffsetDateTime::now_utc();
     Json(serde_json::json!({
-        "StartDate": null,
-        "EndDate": null
+        // Jellyfin Web parses both values unconditionally before loading the
+        // channel/program pages. Null dates leave Android's WebView on an
+        // infinite spinner (`Cannot read property 'match' of null`). Keep the
+        // advertised window aligned with the fallback EPG generated for
+        // providers that expose channels but no programme guide.
+        "StartDate": format_time_for_json(now - Duration::hours(12)),
+        "EndDate": format_time_for_json(now + Duration::hours(12))
     }))
 }
 
@@ -20438,8 +20553,11 @@ fn live_tv_source_configuration(value: &serde_json::Value) -> serde_json::Value 
     normalized
 }
 
-async fn sync_all_configured_xtream_media(db: &Database) -> Result<serde_json::Value, ApiError> {
-    live_tv_xtream::sync_all_configured_xtream_media(db)
+async fn sync_all_configured_xtream_media(
+    db: &Database,
+    cancellation: watch::Receiver<bool>,
+) -> Result<serde_json::Value, ApiError> {
+    live_tv_xtream::sync_all_configured_xtream_media_with_cancellation(db, Some(cancellation))
         .await
         .map_err(|error| ApiError::internal(format!("Xtream media sync failed: {error}")))
 }
@@ -20470,8 +20588,40 @@ async fn start_xtream_media_sync_task(
     if let Some(session_id) = session_id.as_deref() {
         broadcast_scheduled_tasks_update(&db, session_id).await?;
     }
+    let (cancellation_sender, cancellation_receiver) = watch::channel(false);
+    {
+        let mut cancellation = xtream_media_sync_cancellation()
+            .lock()
+            .map_err(|_| ApiError::internal("Xtream media sync cancellation lock poisoned"))?;
+        *cancellation = Some(XtreamMediaSyncCancellation {
+            run_id: run.id,
+            sender: cancellation_sender,
+        });
+    }
     tokio::spawn(async move {
-        let result = sync_all_configured_xtream_media(&db).await;
+        let sync = sync_all_configured_xtream_media(&db, cancellation_receiver);
+        tokio::pin!(sync);
+        let started = std::time::Instant::now();
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(
+            XTREAM_MEDIA_SYNC_HEARTBEAT_SECONDS,
+        ));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let result = loop {
+            tokio::select! {
+                result = &mut sync => break result,
+                _ = heartbeat.tick() => {
+                    let _ = TaskService::new(&db)
+                        .update_progress(
+                            run.id,
+                            serde_json::json!({
+                                "Phase": "Synchronizing Xtream media",
+                                "ElapsedSeconds": started.elapsed().as_secs(),
+                            }),
+                        )
+                        .await;
+                }
+            }
+        };
         match result {
             Ok(result) => {
                 let _ = TaskService::new(&db).complete(run.id, result).await;
@@ -20480,6 +20630,13 @@ async fn start_xtream_media_sync_task(
                 let message = format!("{error:?}");
                 let _ = TaskService::new(&db).fail(run.id, &message).await;
             }
+        }
+        if let Ok(mut cancellation) = xtream_media_sync_cancellation().lock()
+            && cancellation
+                .as_ref()
+                .is_some_and(|active| active.run_id == run.id)
+        {
+            *cancellation = None;
         }
         if let Some(session_id) = session_id.as_deref() {
             let _ = broadcast_scheduled_tasks_update(&db, session_id).await;
@@ -20595,6 +20752,64 @@ async fn live_tv_channel_record_by_any_id(
     }))
 }
 
+async fn live_tv_channel_records_by_any_ids(
+    db: &Database,
+    channel_ids: &[String],
+) -> Result<Vec<LiveTvChannelRecord>, ApiError> {
+    let requested = channel_ids
+        .iter()
+        .map(|channel_id| channel_id.trim())
+        .filter(|channel_id| !channel_id.is_empty() && !channel_id.eq_ignore_ascii_case("null"))
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Android's guide requests programmes for up to 500 channel UUIDs at
+    // once. Resolving each UUID through `live_tv_channel_record_by_any_id`
+    // would fetch and scan the complete catalogue once per channel. Build one
+    // bounded catalogue snapshot and an O(1) lookup index instead.
+    let service = LiveTvService::new(db);
+    let total = service
+        .channel_count(&LiveTvChannelQuery::default())
+        .await?;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let page = service
+        .channel_page(LiveTvChannelQuery {
+            start_index: 0,
+            limit: Some(total.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
+            search_term: None,
+            category_ids: Vec::new(),
+        })
+        .await?;
+    let mut index = HashMap::<String, usize>::with_capacity(page.items.len() * 3);
+    for (position, record) in page.items.iter().enumerate() {
+        let public_id = live_tv_channel_public_id(&record.channel_id);
+        for id in [
+            record.channel_id.as_str(),
+            record.remote_id.as_str(),
+            public_id.as_str(),
+        ] {
+            index.insert(live_tv_lookup_id(id), position);
+        }
+    }
+
+    Ok(requested
+        .into_iter()
+        .filter_map(|channel_id| index.get(&live_tv_lookup_id(channel_id)).copied())
+        .map(|position| page.items[position].clone())
+        .collect())
+}
+
+fn live_tv_lookup_id(value: &str) -> String {
+    parse_jellyfin_uuid(value.trim()).map_or_else(
+        |_| value.trim().to_ascii_lowercase(),
+        |id| id.simple().to_string(),
+    )
+}
+
 async fn live_tv_channel_json_by_id(
     db: &Database,
     channel_id: &str,
@@ -20631,8 +20846,7 @@ async fn live_tv_channel_json_for_playable_item(
     if let Some(channel) = live_tv_channel_json_by_id(db, item_id).await? {
         return Ok(Some(channel));
     }
-    if looks_like_live_tv_program_id(item_id)
-        && let Some(program) = live_tv_program_by_id(db, item_id).await?
+    if let Some(program) = live_tv_program_by_id(db, item_id).await?
         && let Some(channel_id) = json_string_field(&program, "ChannelId")
     {
         return live_tv_channel_json_by_id(db, &channel_id).await;
@@ -21415,15 +21629,22 @@ async fn live_tv_config_source_contents(payload: &serde_json::Value) -> Option<S
 }
 
 fn live_tv_channel_public_id(channel_id: &str) -> String {
-    channel_id.to_string()
+    stable_jellyfin_uuid("LiveTvChannel", channel_id)
 }
 
 fn live_tv_playback_channel_public_id(channel_id: &str) -> String {
-    channel_id.to_string()
+    live_tv_channel_public_id(channel_id)
 }
 
 fn live_tv_fallback_program_public_id(channel_id: &str) -> String {
-    live_tv_stable_id("fallback-program", channel_id)
+    stable_jellyfin_uuid("LiveTvFallbackProgram", channel_id)
+}
+
+fn stable_jellyfin_uuid(kind: &str, value: &str) -> String {
+    let hex = stable_entity_id(kind, value);
+    Uuid::parse_str(&hex)
+        .expect("stable entity IDs are valid UUID hex")
+        .to_string()
 }
 
 async fn live_tv_tuner_host_types(
@@ -21950,6 +22171,25 @@ struct LiveTvChannelsQuery {
         alias = "tags"
     )]
     tags: Vec<String>,
+    #[serde(alias = "IsFavorite", alias = "isFavorite")]
+    is_favorite: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_csv_values",
+        alias = "Filters",
+        alias = "filters"
+    )]
+    filters: Vec<String>,
+}
+
+fn live_tv_favorite_filter(query: &LiveTvChannelsQuery) -> Option<bool> {
+    query.is_favorite.or_else(|| {
+        query
+            .filters
+            .iter()
+            .any(|filter| filter.eq_ignore_ascii_case("IsFavorite"))
+            .then_some(true)
+    })
 }
 
 async fn live_tv_channels(
@@ -21958,7 +22198,9 @@ async fn live_tv_channels(
     Query(query): Query<LiveTvChannelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let service = LiveTvService::new(&state.db);
-    require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let favorite_ids = live_tv_favorite_ids(&state.db, user.id).await?;
+    let favorite_filter = live_tv_favorite_filter(&query);
     // Cap explicit limits at 500, and apply a sane default page size when the
     // client omits Limit — otherwise a large channel list (thousands of items)
     // is returned and rendered in one shot, which is slow and floods the image
@@ -21970,20 +22212,43 @@ async fn live_tv_channels(
             .unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT),
     );
     let category_ids = live_tv_channel_category_filter(&state.db, &query).await?;
+    let requested_start_index = query.start_index.unwrap_or(0);
     let db_query = LiveTvChannelQuery {
-        start_index: query.start_index.unwrap_or(0),
-        limit,
+        start_index: favorite_filter.map_or(requested_start_index, |_| 0),
+        limit: if favorite_filter.is_some() {
+            None
+        } else {
+            limit
+        },
         search_term: query.search_term.clone(),
         category_ids,
     };
     let page = service.channel_page(db_query).await?;
     if page.total_record_count > 0 {
         let server_id = state.db.server_state().await?.server_id.to_string();
-        let items = page
+        let mut items = page
             .items
             .iter()
             .map(|record| live_tv_channel_record_to_json(record, &server_id))
             .collect::<Vec<_>>();
+        for item in &mut items {
+            apply_live_tv_favorite_state(item, &favorite_ids);
+        }
+        if let Some(is_favorite) = favorite_filter {
+            items.retain(|item| {
+                item.get("UserData")
+                    .and_then(|user_data| json_bool_field(user_data, "IsFavorite"))
+                    == Some(is_favorite)
+            });
+            let total = items.len();
+            let start_index = requested_start_index.min(total);
+            let items = items
+                .into_iter()
+                .skip(start_index)
+                .take(limit.unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT))
+                .collect();
+            return Ok(Json(query_result_with_total(items, total, start_index)));
+        }
         return Ok(Json(query_result_with_total(
             items,
             page.total_record_count,
@@ -21999,6 +22264,17 @@ async fn live_tv_channels(
     let mut channels = live_tv_channel_items(&config, &server_id);
     filter_channel_items_by_search(&mut channels, query.search_term.as_deref());
     filter_channel_items_by_category(&mut channels, &query);
+    for channel in &mut channels {
+        apply_live_tv_favorite_state(channel, &favorite_ids);
+    }
+    if let Some(is_favorite) = favorite_filter {
+        channels.retain(|channel| {
+            channel
+                .get("UserData")
+                .and_then(|user_data| json_bool_field(user_data, "IsFavorite"))
+                == Some(is_favorite)
+        });
+    }
     let total = channels.len();
     let start_index = query.start_index.unwrap_or(0).min(total);
     let items = if let Some(limit) = limit {
@@ -22108,8 +22384,10 @@ async fn live_tv_channel(
     Query(query): Query<AuthQuery>,
     Path(channel_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    if let Some(channel) = live_tv_channel_json_by_id(&state.db, &channel_id).await? {
+    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let favorite_ids = live_tv_favorite_ids(&state.db, user.id).await?;
+    if let Some(mut channel) = live_tv_channel_json_by_id(&state.db, &channel_id).await? {
+        apply_live_tv_favorite_state(&mut channel, &favorite_ids);
         return Ok(Json(channel));
     }
     let config = state
@@ -22118,13 +22396,16 @@ async fn live_tv_channel(
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let channel = live_tv_channel_items(&config, &server_id)
+    let mut channel = live_tv_channel_items(&config, &server_id)
         .into_iter()
         .find(|channel| {
             json_string_field(channel, "Id")
-                .is_some_and(|id| id.eq_ignore_ascii_case(channel_id.trim()))
+                .into_iter()
+                .chain(json_string_field(channel, "JellyrinChannelId"))
+                .any(|id| jellyfin_id_matches(&id, channel_id.trim()))
         })
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    apply_live_tv_favorite_state(&mut channel, &favorite_ids);
     Ok(Json(channel))
 }
 
@@ -22132,21 +22413,148 @@ async fn live_tv_channel_by_id(
     db: &Database,
     channel_id: &str,
 ) -> Result<serde_json::Value, ApiError> {
+    live_tv_channel_optional_by_id(db, channel_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))
+}
+
+async fn live_tv_channel_optional_by_id(
+    db: &Database,
+    channel_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
     if let Some(channel) = live_tv_channel_json_by_id(db, channel_id).await? {
-        return Ok(channel);
+        return Ok(Some(channel));
     }
     let config = db
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = db.server_state().await?.server_id.to_string();
-    live_tv_channel_items(&config, &server_id)
+    Ok(live_tv_channel_items(&config, &server_id)
         .into_iter()
         .find(|channel| {
             json_string_field(channel, "Id")
-                .is_some_and(|id| id.eq_ignore_ascii_case(channel_id.trim()))
-        })
-        .ok_or_else(|| ApiError::not_found("Live TV item not found"))
+                .into_iter()
+                .chain(json_string_field(channel, "JellyrinChannelId"))
+                .any(|id| jellyfin_id_matches(&id, channel_id.trim()))
+        }))
+}
+
+fn live_tv_user_data_write_lock() -> &'static Mutex<()> {
+    LIVE_TV_USER_DATA_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+async fn live_tv_favorite_ids(db: &Database, user_id: Uuid) -> Result<HashSet<String>, ApiError> {
+    let config = db
+        .named_configuration(LIVE_TV_USER_DATA_CONFIGURATION_KEY)
+        .await?
+        .unwrap_or_default();
+    Ok(config
+        .get("Favorites")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|favorites| favorites.get(&user_id.to_string()))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(live_tv_lookup_id)
+        .collect())
+}
+
+fn live_tv_channel_favorite_key(channel: &serde_json::Value) -> Option<String> {
+    json_string_field(channel, "Id").map(|id| live_tv_lookup_id(&id))
+}
+
+fn apply_live_tv_favorite_state(channel: &mut serde_json::Value, favorite_ids: &HashSet<String>) {
+    let is_favorite =
+        live_tv_channel_favorite_key(channel).is_some_and(|key| favorite_ids.contains(&key));
+    channel["IsFavorite"] = serde_json::json!(is_favorite);
+    if channel
+        .get("UserData")
+        .is_none_or(|value| !value.is_object())
+    {
+        channel["UserData"] = serde_json::json!({});
+    }
+    channel["UserData"]["IsFavorite"] = serde_json::json!(is_favorite);
+}
+
+fn live_tv_channel_user_data_json(
+    channel: &serde_json::Value,
+    is_favorite: bool,
+) -> Result<serde_json::Value, ApiError> {
+    let item_id = json_string_field(channel, "Id")
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    Ok(serde_json::json!({
+        "PlaybackPositionTicks": 0,
+        "PlayCount": 0,
+        "IsFavorite": is_favorite,
+        "Likes": null,
+        "Played": false,
+        "Key": item_id,
+        "ItemId": item_id,
+        "PlayedPercentage": null,
+        "LastPlayedDate": null,
+        "UnplayedItemCount": null,
+        "Rating": null
+    }))
+}
+
+async fn set_live_tv_channel_favorite_if_present(
+    db: &Database,
+    user_id: Uuid,
+    item_id: &str,
+    is_favorite: bool,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(channel) = live_tv_channel_optional_by_id(db, item_id).await? else {
+        return Ok(None);
+    };
+    let favorite_key = live_tv_channel_favorite_key(&channel)
+        .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    let _guard = live_tv_user_data_write_lock().lock().await;
+    let mut config = db
+        .named_configuration(LIVE_TV_USER_DATA_CONFIGURATION_KEY)
+        .await?
+        .unwrap_or_else(|| serde_json::json!({ "Favorites": {} }));
+    if config
+        .get("Favorites")
+        .is_none_or(|value| !value.is_object())
+    {
+        config["Favorites"] = serde_json::json!({});
+    }
+    let user_key = user_id.to_string();
+    let mut favorites = config["Favorites"]
+        .get(&user_key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(live_tv_lookup_id)
+        .collect::<HashSet<_>>();
+    if is_favorite {
+        favorites.insert(favorite_key);
+    } else {
+        favorites.remove(&favorite_key);
+    }
+    let mut favorites = favorites.into_iter().collect::<Vec<_>>();
+    favorites.sort_unstable();
+    config["Favorites"][user_key.as_str()] = serde_json::json!(favorites);
+    db.update_named_configuration(LIVE_TV_USER_DATA_CONFIGURATION_KEY, config)
+        .await?;
+    live_tv_channel_user_data_json(&channel, is_favorite).map(Some)
+}
+
+async fn live_tv_channel_user_data_if_present(
+    db: &Database,
+    user_id: Uuid,
+    item_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(channel) = live_tv_channel_optional_by_id(db, item_id).await? else {
+        return Ok(None);
+    };
+    let favorite_ids = live_tv_favorite_ids(db, user_id).await?;
+    let is_favorite =
+        live_tv_channel_favorite_key(&channel).is_some_and(|key| favorite_ids.contains(&key));
+    live_tv_channel_user_data_json(&channel, is_favorite).map(Some)
 }
 
 async fn live_tv_programs(
@@ -22375,7 +22783,9 @@ async fn live_tv_program_by_id(
     }
     Ok(programs.into_iter().find(|program| {
         json_string_field(program, "Id")
-            .is_some_and(|id| id.eq_ignore_ascii_case(program_id.trim()))
+            .into_iter()
+            .chain(json_string_field(program, "JellyrinProgramId"))
+            .any(|id| jellyfin_id_matches(&id, program_id.trim()))
     }))
 }
 
@@ -22407,11 +22817,14 @@ async fn live_tv_program_result(
             .collect::<Vec<_>>();
         if !channel_ids.is_empty() {
             programs.retain(|program| {
-                json_string_field(program, "ChannelId").is_some_and(|channel_id| {
-                    channel_ids
-                        .iter()
-                        .any(|requested| jellyfin_id_matches(requested, &channel_id))
-                })
+                json_string_field(program, "ChannelId")
+                    .into_iter()
+                    .chain(json_string_field(program, "JellyrinChannelId"))
+                    .any(|channel_id| {
+                        channel_ids
+                            .iter()
+                            .any(|requested| jellyfin_id_matches(requested, &channel_id))
+                    })
             });
         }
     }
@@ -22451,12 +22864,11 @@ async fn live_tv_program_result(
     }
     if programs.is_empty() {
         if !channel_ids.is_empty() {
-            let mut channels = Vec::new();
-            for channel_id in channel_ids {
-                if let Some(record) = live_tv_channel_record_by_any_id(db, channel_id).await? {
-                    channels.push(live_tv_channel_record_to_json(&record, &server_id));
-                }
-            }
+            let channels = live_tv_channel_records_by_any_ids(db, channel_ids)
+                .await?
+                .iter()
+                .map(|record| live_tv_channel_record_to_json(record, &server_id))
+                .collect::<Vec<_>>();
             if !channels.is_empty() {
                 programs = live_tv_fallback_program_items(&channels, &[], &server_id);
                 programs = filter_live_tv_programs(programs, filters);
@@ -24129,13 +24541,15 @@ fn live_tv_channel_item(
     let number = json_string_field(&base, "Number")
         .or_else(|| json_string_field(&base, "ChannelNumber"))
         .or_else(|| json_string_field(&base, "GuideNumber"));
-    let id = json_string_field(&base, "Id")
+    let raw_id = json_string_field(&base, "Id")
         .or_else(|| json_string_field(&base, "ChannelId"))
         .or_else(|| number.clone())
         .unwrap_or_else(|| format!("{tuner_id}-{}", index + 1));
+    let id = live_tv_channel_public_id(&raw_id);
 
     base["Id"] = serde_json::json!(id);
     base["ChannelId"] = base["Id"].clone();
+    base["JellyrinChannelId"] = serde_json::json!(raw_id);
     base["ServerId"] = serde_json::json!(server_id);
     base["Name"] = serde_json::json!(name);
     base["SortName"] = serde_json::json!(
@@ -24261,8 +24675,7 @@ fn live_tv_channel_playback_id(channel: &serde_json::Value) -> Option<String> {
 // Returns a stable UUID for a live TV channel, used as the item_id when registering a
 // transcode session in the database (which requires a Uuid, not a raw channel string).
 fn live_tv_channel_stable_uuid(channel_id: &str) -> Option<Uuid> {
-    let hex = stable_entity_id("LiveTvChannel", channel_id);
-    Uuid::parse_str(&hex).ok()
+    Uuid::parse_str(&live_tv_channel_public_id(channel_id)).ok()
 }
 
 // Returns true when a channel_id looks like an HDHomeRun channel (starts with "hdhr_") or
@@ -24373,9 +24786,8 @@ fn live_tv_channel_media_source_with_streams(
     let (supports_transcoding, transcoding_sub_protocol, transcoding_container, transcoding_url) =
         if is_remote {
             let play_session_id = live_tv_channel_hls_play_session_id(&playback_channel_id);
-            let url = format!(
-                "/Videos/{playback_channel_id}/master.m3u8?PlaySessionId={play_session_id}"
-            );
+            let url =
+                format!("/Videos/{public_channel_id}/master.m3u8?PlaySessionId={play_session_id}");
             (
                 serde_json::json!(true),
                 serde_json::json!("hls"),
@@ -24451,7 +24863,7 @@ fn live_tv_channel_media_source_with_streams(
         "Container": container,
         "Name": name,
         "IsRemote": is_remote,
-        "DirectStreamUrl": format!("/LiveTv/LiveStreamFiles/{playback_channel_id}/stream.{container}"),
+        "DirectStreamUrl": format!("/LiveTv/LiveStreamFiles/{public_channel_id}/stream.{container}"),
         "ETag": null,
         "RunTimeTicks": null,
         "ReadAtNativeFramerate": true,
@@ -24589,8 +25001,9 @@ fn live_tv_fallback_program_item(
     let channel_name = json_string_field(channel, "Name").unwrap_or_else(|| channel_id.clone());
     let channel_number = json_string_field(channel, "Number");
     let playback_channel_id = live_tv_playback_channel_public_id(&raw_channel_id);
+    let program_id = live_tv_fallback_program_public_id(&channel_id);
     let mut program = serde_json::json!({
-        "Id": live_tv_fallback_program_public_id(&channel_id),
+        "Id": program_id,
         "Name": channel_name,
         "SortName": channel_name,
         "Type": "Program",
@@ -24618,8 +25031,8 @@ fn live_tv_fallback_program_item(
             "PlayCount": 0,
             "IsFavorite": false,
             "Played": false,
-            "Key": channel_id,
-            "ItemId": channel_id
+            "Key": program_id,
+            "ItemId": program_id
         }
     });
     if let Some(image_url) = live_tv_image_url(channel) {
@@ -24769,31 +25182,39 @@ fn live_tv_program_item(
         .or(raw_name)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| format!("Program {}", index + 1));
-    let channel_id = json_string_field(&base, "ChannelId")
+    let raw_channel_id = json_string_field(&base, "ChannelId")
         .or_else(|| json_string_field(&base, "Channel"))
         .or_else(|| {
-            channels
-                .first()
-                .and_then(|channel| json_string_field(channel, "Id"))
+            channels.first().and_then(|channel| {
+                json_string_field(channel, "JellyrinChannelId")
+                    .or_else(|| json_string_field(channel, "Id"))
+            })
         })
         .unwrap_or_default();
-    let channel_name = channels
-        .iter()
-        .find(|channel| {
-            json_string_field(channel, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
-        })
-        .and_then(|channel| json_string_field(channel, "Name"));
-    let id = json_string_field(&base, "Id")
+    let matched_channel = channels.iter().find(|channel| {
+        json_string_field(channel, "Id")
+            .into_iter()
+            .chain(json_string_field(channel, "JellyrinChannelId"))
+            .any(|id| jellyfin_id_matches(&id, &raw_channel_id))
+    });
+    let channel_id = matched_channel
+        .and_then(|channel| json_string_field(channel, "Id"))
+        .unwrap_or_else(|| live_tv_channel_public_id(&raw_channel_id));
+    let channel_name = matched_channel.and_then(|channel| json_string_field(channel, "Name"));
+    let raw_id = json_string_field(&base, "Id")
         .or_else(|| json_string_field(&base, "ProgramId"))
         .unwrap_or_else(|| format!("{source_id}-program-{}", index + 1));
+    let id = stable_jellyfin_uuid("LiveTvProgram", &raw_id);
 
     base["Id"] = serde_json::json!(id);
+    base["JellyrinProgramId"] = serde_json::json!(raw_id);
     base["Name"] = serde_json::json!(name.clone());
     base["SortName"] = serde_json::json!(name);
     base["Type"] = serde_json::json!("Program");
     base["ServerId"] = serde_json::json!(server_id);
     base["MediaType"] = serde_json::json!("Video");
     base["ChannelId"] = serde_json::json!(channel_id);
+    base["JellyrinChannelId"] = serde_json::json!(raw_channel_id);
     base["ChannelName"] = channel_name
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null);
@@ -24822,7 +25243,7 @@ fn live_tv_program_item(
             .iter()
             .find(|channel| {
                 json_string_field(channel, "Id")
-                    .is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
+                    .is_some_and(|id| jellyfin_id_matches(&id, &channel_id))
             })
             .and_then(live_tv_image_url)
     {
@@ -24882,13 +25303,17 @@ fn live_tv_recording_item(
     let id = json_string_field(&item, "Id")
         .or_else(|| json_string_field(&item, "RecordingId"))
         .unwrap_or_else(|| format!("recording-{}", index + 1));
-    let channel_id = json_string_field(&item, "ChannelId").unwrap_or_default();
-    let channel_name = channels
-        .iter()
-        .find(|channel| {
-            json_string_field(channel, "Id").is_some_and(|id| id.eq_ignore_ascii_case(&channel_id))
-        })
-        .and_then(|channel| json_string_field(channel, "Name"));
+    let raw_channel_id = json_string_field(&item, "ChannelId").unwrap_or_default();
+    let matched_channel = channels.iter().find(|channel| {
+        json_string_field(channel, "Id")
+            .into_iter()
+            .chain(json_string_field(channel, "JellyrinChannelId"))
+            .any(|id| jellyfin_id_matches(&id, &raw_channel_id))
+    });
+    let channel_id = matched_channel
+        .and_then(|channel| json_string_field(channel, "Id"))
+        .unwrap_or_else(|| live_tv_channel_public_id(&raw_channel_id));
+    let channel_name = matched_channel.and_then(|channel| json_string_field(channel, "Name"));
 
     item["Id"] = serde_json::json!(id);
     item["Name"] = serde_json::json!(name.clone());
@@ -24897,6 +25322,7 @@ fn live_tv_recording_item(
     item["ServerId"] = serde_json::json!(server_id);
     item["MediaType"] = serde_json::json!("Video");
     item["ChannelId"] = serde_json::json!(channel_id);
+    item["JellyrinChannelId"] = serde_json::json!(raw_channel_id);
     item["ChannelName"] = channel_name
         .map(serde_json::Value::String)
         .unwrap_or(serde_json::Value::Null);
@@ -25068,6 +25494,8 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
             Some(id) if !id.is_empty() => id,
             _ => continue,
         };
+        let raw_program_id =
+            json_string_field(program, "JellyrinProgramId").unwrap_or_else(|| program_id.clone());
 
         // Window check: program EndDate must be >= now.
         let end_date = match json_string_field(program, "EndDate")
@@ -25094,7 +25522,9 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
         // Channel scope check.
         // Program ChannelId may be an XMLTV guide number (e.g. "4.1") while the series timer
         // ChannelId is the Jellyrin channel Id (e.g. "hdhr_4.1"). Accept both forms.
-        let program_channel_id = json_string_field(program, "ChannelId").unwrap_or_default();
+        let program_channel_id = json_string_field(program, "JellyrinChannelId")
+            .or_else(|| json_string_field(program, "ChannelId"))
+            .unwrap_or_default();
         // Resolve the effective channel Id for the child timer: prefer the series timer's
         // channel Id if it matches (so maybe_spawn can find the channel), else use the program's.
         let effective_channel_id = if let Some(ref scid) = series_channel_id {
@@ -25124,7 +25554,7 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
             }
         }
 
-        let child_id = series_timer_child_id(&series_timer_id, &program_id);
+        let child_id = series_timer_child_id(&series_timer_id, &raw_program_id);
         let start_date_val = program
             .get("StartDate")
             .cloned()
@@ -25143,6 +25573,7 @@ async fn materialize_series_timer_timers(state: &AppState, series_timer: &serde_
             "Id": child_id,
             "SeriesTimerId": series_timer_id,
             "ProgramId": program_id,
+            "JellyrinProgramId": raw_program_id,
             "ChannelId": channel_id_val,
             "Name": name_val,
             "StartDate": start_date_val,
@@ -28031,6 +28462,16 @@ fn special_user_views(server_id: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn special_user_view_by_id(item_id: &str, server_id: &str) -> Option<serde_json::Value> {
+    SPECIAL_USER_VIEWS
+        .iter()
+        .find_map(|(name, collection_type)| {
+            special_user_view_id(collection_type)
+                .eq_ignore_ascii_case(item_id)
+                .then(|| special_user_view_to_json(name, collection_type, server_id))
+        })
+}
+
 fn special_user_view_to_json(
     name: &str,
     collection_type: &str,
@@ -28528,22 +28969,7 @@ fn media_catalog_query_for_items(
         || query
             .start_index
             .is_some_and(|index| i64::try_from(index).is_err())
-        || !query.official_ratings.is_empty()
-        || !query.series_status.is_empty()
-        || !query.years.is_empty()
-        || query.has_trailer.is_some()
-        || query.has_overview.is_some()
-        || query.has_imdb_id.is_some()
-        || query.has_tmdb_id.is_some()
-        || query.has_tvdb_id.is_some()
-        || query.has_official_rating.is_some()
-        || query.is_locked.is_some()
-        || query.min_community_rating.is_some()
-        || query.max_community_rating.is_some()
-        || query.min_critic_rating.is_some()
-        || query.max_critic_rating.is_some()
-        || query.min_premiere_date.is_some()
-        || query.max_premiere_date.is_some()
+        || query.is_airing.is_some()
     {
         return Ok(None);
     }
@@ -28577,6 +29003,7 @@ fn media_catalog_query_for_items(
                 | "likes"
                 | "isresumable"
                 | "hassubtitles"
+                | "hastrailer"
         )
     }) {
         return Ok(None);
@@ -28628,6 +29055,12 @@ fn media_catalog_query_for_items(
             .any(|filter| filter == "hassubtitles")
             .then_some(true)
     });
+    let has_trailer = query.has_trailer.or_else(|| {
+        filters
+            .iter()
+            .any(|filter| filter == "hastrailer")
+            .then_some(true)
+    });
 
     Ok(Some(MediaItemCatalogQuery {
         start_index: query.start_index.unwrap_or(0),
@@ -28644,17 +29077,39 @@ fn media_catalog_query_for_items(
         person_ids,
         studio_ids,
         tags,
+        official_ratings: query.official_ratings.clone(),
+        series_statuses: query.series_status.clone(),
+        years: query.years.clone(),
         location_types: query.location_types.clone(),
         exclude_location_types: query.exclude_location_types.clone(),
         search_term: query.search_term.clone(),
         search_scope: MediaItemCatalogSearchScope::Name,
         has_subtitles,
+        has_trailer,
+        has_overview: query.has_overview,
+        has_imdb_id: query.has_imdb_id,
+        has_tmdb_id: query.has_tmdb_id,
+        has_tvdb_id: query.has_tvdb_id,
+        has_official_rating: query.has_official_rating,
+        is_locked: query.is_locked,
         is_hd: query.is_hd,
         is_4k: query.is_4k,
         min_width: query.min_width,
         max_width: query.max_width,
         min_height: query.min_height,
         max_height: query.max_height,
+        min_community_rating: query.min_community_rating,
+        max_community_rating: query.max_community_rating,
+        min_critic_rating: query.min_critic_rating,
+        max_critic_rating: query.max_critic_rating,
+        min_premiere_date: query
+            .min_premiere_date
+            .as_deref()
+            .and_then(parse_item_query_date),
+        max_premiere_date: query
+            .max_premiere_date
+            .as_deref()
+            .and_then(parse_item_query_date),
         is_missing: query.is_missing,
         is_unaired: query.is_unaired,
         is_folder,
@@ -28786,6 +29241,236 @@ async fn media_catalog_items_result(
     ))))
 }
 
+/// Serve Jellyfin Web/Android's library search without loading every episode into memory.
+///
+/// The clients request synthetic `Series` and persisted `Episode` items together. A homogeneous
+/// catalog page cannot represent that union, while the legacy fallback materializes the complete
+/// TV library and its metadata. Query both bounded projections and merge only their result pages.
+async fn mixed_series_episode_search_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    server_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let Some(search_term) = query
+        .search_term
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+    else {
+        return Ok(None);
+    };
+    let mut include_types = csv_values_lowercase(&query.include_item_types).unwrap_or_default();
+    include_types.sort_unstable();
+    include_types.dedup();
+    if include_types != ["episode", "series"] {
+        return Ok(None);
+    }
+
+    // Normalize the harmless flags emitted by Jellyfin Web before reusing the deliberately narrow
+    // simple-search contract. This keeps unsupported filters on the existing compatibility path.
+    let mut supported_query = query.clone();
+    supported_query.parent_id = None;
+    supported_query.include_item_types = vec!["Episode".to_string()];
+    if supported_query.is_missing == Some(false) {
+        supported_query.is_missing = None;
+    }
+    if !fast_name_search_query_is_simple(&supported_query) {
+        return Ok(None);
+    }
+
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query
+        .limit
+        .unwrap_or(25)
+        .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+    let fetch_limit = start_index
+        .saturating_add(limit)
+        .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+
+    let mut series_query = query.clone();
+    series_query.include_item_types = vec!["Series".to_string()];
+    series_query.search_term = Some(search_term.to_string());
+    series_query.start_index = Some(0);
+    series_query.limit = Some(fetch_limit);
+    if series_query.is_missing == Some(false) {
+        series_query.is_missing = None;
+    }
+    let series = tv_series_items_result(db, &series_query, user_id, server_id).await?;
+
+    let mut episode_query = query.clone();
+    episode_query.include_item_types = vec!["Episode".to_string()];
+    episode_query.search_term = Some(search_term.to_string());
+    episode_query.start_index = Some(0);
+    episode_query.limit = Some(fetch_limit);
+    let episodes = media_catalog_items_result(db, &episode_query, server_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("bounded episode search unexpectedly unavailable"))?;
+
+    let series_total = series
+        .0
+        .get("TotalRecordCount")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let episode_total = episodes
+        .0
+        .get("TotalRecordCount")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let mut items = series
+        .0
+        .get("Items")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    items.extend(
+        episodes
+            .0
+            .get("Items")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    sort_json_items(&mut items, query);
+
+    Ok(Some(Json(query_result_with_total(
+        items.into_iter().skip(start_index).take(limit).collect(),
+        series_total.saturating_add(episode_total),
+        start_index,
+    ))))
+}
+
+/// Serve Android TV's mixed random backdrop request without materializing the complete catalog.
+///
+/// Jellyfin Android TV asks for `Movie,Series` together. Movies are stored directly while Series
+/// are projected from episodes, so the ordinary homogeneous catalog page cannot answer that shape.
+/// Sample a bounded window from each projection and shuffle only that small result instead.
+async fn random_movie_series_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    server_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let Some(limit) = query.limit.filter(|limit| *limit > 0) else {
+        return Ok(None);
+    };
+    if query.start_index.unwrap_or(0) != 0
+        || query.parent_id.is_some()
+        || query.ids.is_some()
+        || query.season_id.is_some()
+        || query.series_id.is_some()
+        || !query.exclude_item_types.is_empty()
+        || query
+            .sort_by
+            .as_deref()
+            .is_none_or(|sort| !sort.eq_ignore_ascii_case("Random"))
+    {
+        return Ok(None);
+    }
+    let mut include_types = csv_values_lowercase(&query.include_item_types).unwrap_or_default();
+    include_types.sort_unstable();
+    include_types.dedup();
+    if include_types != ["movie", "series"] {
+        return Ok(None);
+    }
+
+    let limit = limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+    let mut movie_query = query.clone();
+    movie_query.include_item_types = vec!["Movie".to_string()];
+    movie_query.start_index = Some(0);
+    movie_query.limit = Some(0);
+    movie_query.sort_by = Some("SortName".to_string());
+    movie_query.sort_order = None;
+    let Some(movie_count_result) =
+        media_catalog_items_result(db, &movie_query, server_id, user_id).await?
+    else {
+        return Ok(None);
+    };
+    let movie_total = movie_count_result
+        .0
+        .get("TotalRecordCount")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+
+    let Some(series_count_page) = MediaCatalogStore::tv_series_catalog_page(db, None, 0, 0).await?
+    else {
+        return Ok(None);
+    };
+    let series_total = series_count_page.total_record_count;
+    let combined_total = movie_total.saturating_add(series_total);
+    if combined_total == 0 {
+        return Ok(Some(Json(query_result_with_total(Vec::new(), 0, 0))));
+    }
+
+    let mut movie_limit = limit.saturating_mul(movie_total) / combined_total;
+    let mut series_limit = limit.saturating_sub(movie_limit);
+    movie_limit = movie_limit.min(movie_total);
+    series_limit = series_limit.min(series_total);
+    let remaining = limit.saturating_sub(movie_limit.saturating_add(series_limit));
+    let movie_room = movie_total.saturating_sub(movie_limit);
+    let movie_fill = remaining.min(movie_room);
+    movie_limit += movie_fill;
+    series_limit += remaining
+        .saturating_sub(movie_fill)
+        .min(series_total - series_limit);
+
+    let mut random = OsRng;
+    let random_offset = |total: usize, page_size: usize, random: &mut OsRng| {
+        let positions = total.saturating_sub(page_size).saturating_add(1);
+        if positions <= 1 {
+            0
+        } else {
+            usize::try_from(random.next_u64() % positions as u64).unwrap_or(0)
+        }
+    };
+
+    movie_query.start_index = Some(random_offset(movie_total, movie_limit, &mut random));
+    movie_query.limit = Some(movie_limit);
+    let Some(movie_result) =
+        media_catalog_items_result(db, &movie_query, server_id, user_id).await?
+    else {
+        return Ok(None);
+    };
+    let mut items = movie_result
+        .0
+        .get("Items")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if series_limit > 0 {
+        let mut series_query = query.clone();
+        series_query.include_item_types = vec!["Series".to_string()];
+        series_query.start_index = Some(random_offset(series_total, series_limit, &mut random));
+        series_query.limit = Some(series_limit);
+        series_query.sort_by = None;
+        series_query.sort_order = None;
+        let series_result = tv_series_items_result(db, &series_query, user_id, server_id).await?;
+        items.extend(
+            series_result
+                .0
+                .get("Items")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+
+    // Fisher-Yates over at most 500 entries; no catalog-sized in-memory sort is involved.
+    for index in (1..items.len()).rev() {
+        let swap_with = usize::try_from(random.next_u64() % (index as u64 + 1)).unwrap_or(0);
+        items.swap(index, swap_with);
+    }
+    Ok(Some(Json(query_result_with_total(
+        items,
+        combined_total,
+        0,
+    ))))
+}
+
 async fn items_result(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -28817,6 +29502,17 @@ async fn items_result(
         || query_requests_only_item_type(&query, "TvChannel")
     {
         return live_tv_channel_items_result(&state.db, &query, &server_id).await;
+    }
+    if let Some(result) =
+        random_movie_series_items_result(&state.db, &query, &server_id, requested_user_id).await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) =
+        mixed_series_episode_search_items_result(&state.db, &query, &server_id, requested_user_id)
+            .await?
+    {
+        return Ok(result);
     }
     if let Some(result) =
         media_catalog_items_result(&state.db, &query, &server_id, requested_user_id).await?
@@ -28916,6 +29612,16 @@ async fn user_items_result(
     }
     if let Some(result) =
         media_catalog_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) = mixed_series_episode_search_items_result(
+        &state.db,
+        &query,
+        &server_id,
+        Some(requested_user_id),
+    )
+    .await?
     {
         return Ok(result);
     }
@@ -30820,6 +31526,9 @@ async fn item_detail(
     }
     let requested_id = parse_jellyfin_uuid(&item_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(view) = special_user_view_by_id(&item_id, &server_id) {
+        return Ok(Json(view));
+    }
     if let Some(folder) = state
         .db
         .virtual_folders()
@@ -30917,6 +31626,9 @@ async fn current_user_item_detail(
     }
     let requested_id = parse_jellyfin_uuid(&item_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(view) = special_user_view_by_id(&item_id, &server_id) {
+        return Ok(Json(view));
+    }
     if let Some(folder) = state
         .db
         .virtual_folders()
@@ -30933,12 +31645,20 @@ async fn current_user_item_detail(
         let child_count = state.db.media_list_items(list.id).await?.len();
         return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
     }
-    if let Ok(item) = media_item_by_id(&state.db, &item_id).await {
+    if let Ok(mut item) = media_item_by_id(&state.db, &item_id).await {
         let playback = state
             .db
             .playback_state_for_item(requested_user_id, item.id)
             .await?;
-        let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        // Android, Android TV and Jellyfin Web normally read the user-scoped detail route rather
+        // than `/Items/{id}`. Keep its Xtream contract identical so episode detail pages receive
+        // the real embedded audio/subtitle tracks instead of the two synthetic import streams.
+        if is_xtream_remote_media(Some(&metadata)) {
+            item = ensure_xtream_remote_media_info(&state, item, &mut metadata)
+                .await?
+                .item;
+        }
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -31004,6 +31724,9 @@ async fn user_item_detail(
     }
     let requested_id = parse_jellyfin_uuid(&item_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(view) = special_user_view_by_id(&item_id, &server_id) {
+        return Ok(Json(view));
+    }
     if let Some(folder) = state
         .db
         .virtual_folders()
@@ -31020,9 +31743,14 @@ async fn user_item_detail(
         let child_count = state.db.media_list_items(list.id).await?.len();
         return Ok(Json(media_list_to_json(&list, &server_id, child_count)));
     }
-    if let Ok(item) = media_item_by_id(&state.db, &item_id).await {
+    if let Ok(mut item) = media_item_by_id(&state.db, &item_id).await {
         let playback = state.db.playback_state_for_item(user_id, item.id).await?;
-        let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        if is_xtream_remote_media(Some(&metadata)) {
+            item = ensure_xtream_remote_media_info(&state, item, &mut metadata)
+                .await?
+                .item;
+        }
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -31525,11 +32253,14 @@ async fn apply_remote_item_search(
         return Err(ApiError::not_found("Remote search result not found"));
     };
     if let Some(series_name) = series_name_for_id(&state.db, &item_id).await? {
+        let payload = enrich_remote_search_result_from_builtin(&state.db, "Series", payload).await;
         apply_remote_series_search_result(&state, &series_name, payload).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
 
     let item = media_item_by_id(&state.db, &item_id).await?;
+    let payload =
+        enrich_remote_search_result_from_builtin(&state.db, media_item_type(&item), payload).await;
     let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
     merge_remote_search_result_metadata(&mut metadata, payload)?;
     state
@@ -31537,6 +32268,55 @@ async fn apply_remote_item_search(
         .update_media_item_metadata(item.id, metadata)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn enrich_remote_search_result_from_builtin(
+    db: &Database,
+    item_type: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let candidate = remote_search_candidate_payload(payload);
+    let tmdb_id = json_field_case_insensitive(&candidate, "ProviderIds")
+        .and_then(|ids| json_string_any_field(ids, &["Tmdb", "TMDb", "TheMovieDb"]));
+    let Some(tmdb_id) = tmdb_id else {
+        return candidate;
+    };
+    let configuration = match db
+        .named_configuration(builtin_metadata::CONFIGURATION_KEY)
+        .await
+    {
+        Ok(configuration) => configuration.unwrap_or_else(builtin_metadata::default_configuration),
+        Err(error) => {
+            tracing::warn!(%error, "metadata provider configuration was unavailable during apply");
+            return candidate;
+        }
+    };
+    if !builtin_metadata::provider_is_ready(
+        &configuration,
+        "tmdb",
+        builtin_metadata::ProviderSecretAvailability::from_environment(),
+    ) {
+        return candidate;
+    }
+    let provider_configuration = builtin_metadata::provider_configuration(&configuration, "tmdb")
+        .unwrap_or_else(|| serde_json::json!({}));
+    match tmdb::details(item_type, &tmdb_id, &provider_configuration).await {
+        Ok(Some(details)) => {
+            let mut enriched = candidate;
+            if let Err(error) = merge_item_metadata_update(&mut enriched, details) {
+                tracing::warn!(status = %error.status, "TheMovieDb details could not be merged");
+            }
+            enriched
+        }
+        Ok(None) => candidate,
+        Err(error) => {
+            tracing::warn!(
+                status = %error.status,
+                "TheMovieDb details were unavailable during apply"
+            );
+            candidate
+        }
+    }
 }
 
 async fn apply_remote_series_search_result(
@@ -31593,6 +32373,8 @@ fn series_metadata_from_remote_search_result(candidate: &serde_json::Value) -> s
             json_string_field(candidate, "ImageUrl")
                 .map(|url| format!("remote-primary-{}", stable_entity_id("RemoteImage", &url)))
         });
+    let backdrop_tag = json_string_field(candidate, "BackdropImageUrl")
+        .map(|url| format!("remote-backdrop-{}", stable_entity_id("RemoteImage", &url)));
     serde_json::json!({
         "SeriesName": json_string_field(candidate, "Name"),
         "SeriesOverview": json_string_field(candidate, "Overview"),
@@ -31611,6 +32393,9 @@ fn series_metadata_from_remote_search_result(candidate: &serde_json::Value) -> s
         "SeriesCommunityRating": json_f64_field(candidate, "CommunityRating"),
         "SeriesCriticRating": json_f64_field(candidate, "CriticRating"),
         "SeriesPrimaryImageTag": primary_tag,
+        "SeriesBackdropImageTag": backdrop_tag,
+        "SeriesPrimaryImageUrl": json_string_field(candidate, "PrimaryImageUrl").or_else(|| json_string_field(candidate, "ImageUrl")),
+        "SeriesBackdropImageUrl": json_string_field(candidate, "BackdropImageUrl"),
         "MetadataSource": json_string_field(candidate, "SearchProviderName").unwrap_or_else(|| "RemoteSearch".to_string())
     })
 }
@@ -31795,29 +32580,158 @@ async fn remote_search_local_results(
         _ => {}
     }
 
-    for result in plugin_metadata_provider_remote_search_results(db, item_type, &request).await? {
-        let name = result
-            .get("Name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        results.insert(
-            remote_search_result_key(
-                item_type,
-                &format!(
-                    "{}:{}",
-                    result
-                        .get("SearchProviderName")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Plugin"),
-                    name
-                ),
-            ),
-            result,
-        );
+    let builtin_configuration = db
+        .named_configuration(builtin_metadata::CONFIGURATION_KEY)
+        .await?
+        .unwrap_or_else(builtin_metadata::default_configuration);
+    let provider_policy = metadata_provider_policy(db, item_type, false).await?;
+    let plugins = db.installed_plugins_json().await?;
+    let mut provider_priorities = HashMap::new();
+    for provider in builtin_metadata::registry_entries(
+        &builtin_configuration,
+        builtin_metadata::ProviderSecretAvailability::from_environment(),
+    ) {
+        if let Some(name) = json_string_field(&provider, "Name") {
+            provider_priorities.insert(
+                name.to_ascii_lowercase(),
+                json_i64_field(&provider, "Priority").unwrap_or(1_000),
+            );
+        }
     }
+    for plugin in &plugins {
+        if let Some(name) = json_string_field(plugin, "Name") {
+            provider_priorities.insert(
+                name.to_ascii_lowercase(),
+                json_i64_field(plugin, "Priority").unwrap_or(1_000),
+            );
+        }
+    }
+    let mut ordered_results = results.into_values().collect::<Vec<_>>();
+    let mut provider_results = builtin_metadata_provider_remote_search_results(
+        &builtin_configuration,
+        &provider_policy,
+        item_type,
+        &request,
+    )
+    .await;
+    provider_results.extend(
+        plugin_metadata_provider_remote_search_results(
+            db,
+            &plugins,
+            &provider_policy,
+            item_type,
+            &request,
+        )
+        .await?,
+    );
+    provider_results.sort_by(|left, right| {
+        let left_name = json_string_field(left, "SearchProviderName").unwrap_or_default();
+        let right_name = json_string_field(right, "SearchProviderName").unwrap_or_default();
+        let left_priority = provider_priorities
+            .get(&left_name.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(1_000);
+        let right_priority = provider_priorities
+            .get(&right_name.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(1_000);
+        provider_policy.compare(&left_name, left_priority, &right_name, right_priority)
+    });
+    ordered_results.extend(provider_results);
+    Ok(ordered_results)
+}
 
-    Ok(results.into_values().collect())
+async fn metadata_provider_policy(
+    db: &Database,
+    item_type: &str,
+    image_provider: bool,
+) -> Result<builtin_metadata::ProviderPolicy, ApiError> {
+    let metadata_options =
+        metadata_options_or_default(db.system_configuration_payloads().await?.metadata_options);
+    Ok(builtin_metadata::ProviderPolicy::for_item_type(
+        &metadata_options,
+        item_type,
+        image_provider,
+    ))
+}
+
+async fn builtin_metadata_provider_remote_search_results(
+    configuration: &serde_json::Value,
+    policy: &builtin_metadata::ProviderPolicy,
+    item_type: &str,
+    request: &RemoteSearchRequest,
+) -> Vec<serde_json::Value> {
+    let secrets = builtin_metadata::ProviderSecretAvailability::from_environment();
+    let mut providers = builtin_metadata::registry_entries(configuration, secrets)
+        .into_iter()
+        .filter(|provider| {
+            let provider_id = json_string_field(provider, "Id").unwrap_or_default();
+            let provider_name = json_string_field(provider, "Name").unwrap_or_default();
+            provider["Ready"].as_bool() == Some(true)
+                && policy.allows(&provider_id, &provider_name)
+                && plugin_string_array(provider.get("Capabilities"))
+                    .iter()
+                    .any(|capability| capability.eq_ignore_ascii_case("MetadataProvider"))
+                && plugin_string_array(provider.get("ItemTypes"))
+                    .iter()
+                    .any(|supported| supported.eq_ignore_ascii_case(item_type))
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|left, right| {
+        policy.compare(
+            &json_string_field(left, "Name").unwrap_or_default(),
+            json_i64_field(left, "Priority").unwrap_or(1_000),
+            &json_string_field(right, "Name").unwrap_or_default(),
+            json_i64_field(right, "Priority").unwrap_or(1_000),
+        )
+    });
+
+    let mut results = Vec::new();
+    for provider in providers {
+        let provider_id = json_string_field(&provider, "Id").unwrap_or_default();
+        let provider_configuration =
+            builtin_metadata::provider_configuration(configuration, &provider_id)
+                .unwrap_or_else(|| serde_json::json!({}));
+        let response = match provider_id.as_str() {
+            "tmdb" => {
+                tmdb::remote_search(
+                    item_type,
+                    request.name.as_deref(),
+                    request.year,
+                    &provider_configuration,
+                )
+                .await
+            }
+            "omdb" => {
+                omdb::remote_search(
+                    item_type,
+                    request.name.as_deref(),
+                    request.year,
+                    &provider_configuration,
+                )
+                .await
+            }
+            "musicbrainz" => {
+                musicbrainz::remote_search(
+                    item_type,
+                    request.name.as_deref(),
+                    request.year,
+                    &provider_configuration,
+                )
+                .await
+            }
+            _ => continue,
+        };
+        match response {
+            Ok(provider_results) => results.extend(provider_results),
+            Err(error) => tracing::warn!(
+                provider = %provider_id,
+                status = %error.status,
+                "built-in metadata provider search was unavailable"
+            ),
+        }
+    }
+    results
 }
 
 fn all_effective_media_item_types() -> Vec<String> {
@@ -31853,17 +32767,36 @@ async fn media_items_and_metadata_by_effective_types(
 
 async fn plugin_metadata_provider_remote_search_results(
     db: &Database,
+    plugins: &[serde_json::Value],
+    policy: &builtin_metadata::ProviderPolicy,
     item_type: &str,
     request: &RemoteSearchRequest,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let mut results = Vec::new();
-    for plugin in db.installed_plugins_json().await? {
+    let mut plugins = plugins.to_vec();
+    plugins.sort_by(|left, right| {
+        policy.compare(
+            &json_string_field(left, "Name").unwrap_or_default(),
+            json_i64_field(left, "Priority").unwrap_or(1_000),
+            &json_string_field(right, "Name").unwrap_or_default(),
+            json_i64_field(right, "Priority").unwrap_or(1_000),
+        )
+    });
+    for plugin in plugins {
         if !plugin_is_active_metadata_provider(&plugin) {
             continue;
         }
+        let provider_id = json_string_field(&plugin, "Id").unwrap_or_default();
         let provider_name = json_string_field(&plugin, "Name").unwrap_or_else(|| {
-            json_string_field(&plugin, "Id").unwrap_or_else(|| "Plugin Metadata".to_string())
+            if provider_id.is_empty() {
+                "Plugin Metadata".to_string()
+            } else {
+                provider_id.clone()
+            }
         });
+        if !policy.allows(&provider_id, &provider_name) {
+            continue;
+        }
         let capability = invoke_installed_plugin_capability_via_runtime_host(
             db,
             &plugin,
@@ -31876,7 +32809,18 @@ async fn plugin_metadata_provider_remote_search_results(
                 }
             }),
         )
-        .await?;
+        .await;
+        let capability = match capability {
+            Ok(capability) => capability,
+            Err(error) => {
+                tracing::warn!(
+                    plugin = %json_string_field(&plugin, "Id").unwrap_or_default(),
+                    status = %error.status,
+                    "external metadata provider search was unavailable"
+                );
+                continue;
+            }
+        };
         let Some(capability) = capability else {
             continue;
         };
@@ -31904,10 +32848,29 @@ pub async fn enrich_metadata_from_plugins(
     item_type: &str,
     existing_metadata: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let plugins = db.installed_plugins_json().await.ok()?;
-    let mut best_enrichment: Option<serde_json::Value> = None;
+    let policy = metadata_provider_policy(db, item_type, false).await.ok()?;
+    let mut plugins = db.installed_plugins_json().await.ok()?;
+    plugins.sort_by(|left, right| {
+        policy.compare(
+            &json_string_field(left, "Name").unwrap_or_default(),
+            json_i64_field(left, "Priority").unwrap_or(1_000),
+            &json_string_field(right, "Name").unwrap_or_default(),
+            json_i64_field(right, "Priority").unwrap_or(1_000),
+        )
+    });
     for plugin in plugins {
         if !plugin_is_active_metadata_provider(&plugin) {
+            continue;
+        }
+        let provider_id = json_string_field(&plugin, "Id").unwrap_or_default();
+        let provider_name = json_string_field(&plugin, "Name").unwrap_or_else(|| {
+            if provider_id.is_empty() {
+                "Plugin Metadata".to_string()
+            } else {
+                provider_id.clone()
+            }
+        });
+        if !policy.allows(&provider_id, &provider_name) {
             continue;
         }
         let request = serde_json::json!({
@@ -31917,7 +32880,7 @@ pub async fn enrich_metadata_from_plugins(
                 "Year": existing_metadata.get("ProductionYear")
             }
         });
-        let capability = invoke_installed_plugin_capability_via_runtime_host(
+        let Some(capability) = invoke_installed_plugin_capability_via_runtime_host(
             db,
             &plugin,
             "MetadataProvider",
@@ -31925,7 +32888,9 @@ pub async fn enrich_metadata_from_plugins(
         )
         .await
         .ok()
-        .flatten()?;
+        .flatten() else {
+            continue;
+        };
         let values = capability
             .value
             .get("Items")
@@ -31997,13 +32962,11 @@ pub async fn enrich_metadata_from_plugins(
                 merged["ProviderIds"] = serde_json::json!(existing_ids);
             }
             // Track which plugin provided the enrichment
-            let plugin_id = json_string_field(&plugin, "Id").unwrap_or_default();
-            merged["MetadataProviderPlugin"] = serde_json::json!(plugin_id);
-            best_enrichment = Some(merged);
-            break; // Use first plugin's result
+            merged["MetadataProviderPlugin"] = serde_json::json!(provider_id);
+            return Some(merged);
         }
     }
-    best_enrichment
+    None
 }
 
 fn plugin_metadata_provider_result_values(
@@ -32438,6 +33401,21 @@ async fn update_item_user_data_inner(
     item_id: &str,
     body: Option<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if live_tv_channel_optional_by_id(db, item_id).await?.is_some() {
+        if let Some(is_favorite) =
+            json_value_bool_field(body.as_ref(), &["IsFavorite", "isFavorite"])
+        {
+            let user_data =
+                set_live_tv_channel_favorite_if_present(db, user_id, item_id, is_favorite)
+                    .await?
+                    .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+            return Ok(Json(user_data));
+        }
+        let user_data = live_tv_channel_user_data_if_present(db, user_id, item_id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+        return Ok(Json(user_data));
+    }
     let item = media_item_by_id(db, item_id).await?;
     let current = db.playback_state_for_item(user_id, item.id).await?;
     let played = json_value_bool_field(body.as_ref(), &["Played", "played"])
@@ -32486,6 +33464,9 @@ async fn item_user_data_json(
     user_id: Uuid,
     item_id: &str,
 ) -> Result<serde_json::Value, ApiError> {
+    if let Some(user_data) = live_tv_channel_user_data_if_present(db, user_id, item_id).await? {
+        return Ok(user_data);
+    }
     let item = media_item_by_id(db, item_id).await?;
     let playback = db.playback_state_for_item(user_id, item.id).await?;
     let item_id = item.id.simple().to_string();
@@ -32620,6 +33601,11 @@ async fn mark_authenticated_item_favorite(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(user_data) =
+        set_live_tv_channel_favorite_if_present(&state.db, user.id, &item_id, true).await?
+    {
+        return Ok(Json(user_data));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     SessionService::new(&state.db)
         .set_item_favorite(user.id, item.id, true)
@@ -32636,6 +33622,11 @@ async fn unmark_authenticated_item_favorite(
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    if let Some(user_data) =
+        set_live_tv_channel_favorite_if_present(&state.db, user.id, &item_id, false).await?
+    {
+        return Ok(Json(user_data));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     SessionService::new(&state.db)
         .set_item_favorite(user.id, item.id, false)
@@ -32674,6 +33665,12 @@ async fn user_item_favorite_inner(
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
+    if let Some(user_data) =
+        set_live_tv_channel_favorite_if_present(&state.db, requested_user_id, &item_id, is_favorite)
+            .await?
+    {
+        return Ok(Json(user_data));
+    }
     let item = media_item_by_id(&state.db, &item_id).await?;
     SessionService::new(&state.db)
         .set_item_favorite(requested_user_id, item.id, is_favorite)
@@ -32793,9 +33790,7 @@ async fn item_ancestors(
     let root = root_folder_json(&state.db).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let root_id = root["Id"].as_str().unwrap_or_default().to_string();
-    if looks_like_live_tv_program_id(&item_id)
-        && live_tv_program_by_id(&state.db, &item_id).await?.is_some()
-    {
+    if live_tv_program_by_id(&state.db, &item_id).await?.is_some() {
         let mut live_tv = special_user_view_to_json("Live TV", "livetv", &server_id);
         if let Some(object) = live_tv.as_object_mut() {
             object.insert("ParentId".to_string(), serde_json::json!(root_id));
@@ -33333,6 +34328,7 @@ struct PlaybackInfoOptions {
     direct_play_profiles: Option<Vec<DirectPlayProfileMatcher>>,
     transcoding_profiles: Option<Vec<TranscodingProfileMatcher>>,
     subtitle_profiles: Option<Vec<SubtitleProfileMatcher>>,
+    hls_subtitles_as_embedded: bool,
     codec_profiles: Vec<CodecProfileMatcher>,
 }
 
@@ -33574,6 +34570,7 @@ impl Default for PlaybackInfoOptions {
             direct_play_profiles: None,
             transcoding_profiles: None,
             subtitle_profiles: None,
+            hls_subtitles_as_embedded: false,
             codec_profiles: Vec::new(),
         }
     }
@@ -34215,9 +35212,7 @@ fn apply_android_remote_subtitle_hls_policy(
 ) {
     if !is_xtream_remote_media(metadata)
         || !client.eq_ignore_ascii_case("Jellyfin for Android")
-        || !options
-            .subtitle_stream_index
-            .is_some_and(|index| index >= 0)
+        || options.subtitle_stream_index.is_none_or(|index| index < 0)
     {
         return;
     }
@@ -34245,6 +35240,10 @@ fn apply_android_remote_subtitle_hls_policy(
         format: Some("webvtt".to_string()),
         method: Some("hls".to_string()),
     }]);
+    // The Android client's track selector has no branch for Jellyfin's `Hls` subtitle delivery
+    // method. The renditions are already part of our HLS master manifest, so expose them as
+    // embedded tracks to make every rendition selectable without creating a second sidecar input.
+    options.hls_subtitles_as_embedded = true;
 }
 
 fn live_tv_playback_info_response(
@@ -34314,12 +35313,8 @@ fn live_tv_playback_info_response(
             serde_json::json!(transcode_supported),
         );
         if transcode_supported {
-            let mut url = hls_master_url(
-                "Video",
-                &playback_channel_id,
-                &play_session_id,
-                access_token,
-            );
+            let mut url =
+                hls_master_url("Video", &public_channel_id, &play_session_id, access_token);
             if let Some(index) = selected_subtitle_stream_index {
                 url.push_str(&format!("&SubtitleStreamIndex={index}"));
             }
@@ -34519,11 +35514,20 @@ async fn playback_transcode_info_response(
         .map(InternalRemoteRelayLease::url)
         .unwrap_or(&item.path)
         .to_string();
+    // Keep the initially selected text subtitle in the same FFmpeg input as A/V. FFmpeg publishes
+    // it as the companion `main_vtt.m3u8` rendition, and subtitle_stream_response serves those
+    // already-produced segments through the ordinary subtitle URLs. This is particularly
+    // important for remote Xtream media: opening a second random-access reader while the video is
+    // already consuming the provider can block until Media3 abandons the subtitle request during
+    // resume. The HLS command's bounded interleave window prevents a sparse text track from holding
+    // back A/V segments. Other languages remain independent renditions and are extracted only when
+    // the user switches to them.
+    let ffmpeg_selection = selection.clone();
     let mut request = HlsTranscodeRequest::new(
         input_path,
         layout.media_playlist_path.to_string_lossy().to_string(),
         layout.segment_pattern_string(),
-        selection.clone(),
+        ffmpeg_selection,
     );
     request.start_position_ticks = options.start_position_ticks;
     align_hls_request_segment_timeline(&mut request);
@@ -34557,8 +35561,8 @@ async fn playback_transcode_info_response(
                 process_id: None,
                 status: "starting".to_string(),
                 progress_percent: None,
-                position_ticks: request.start_position_ticks,
-                start_position_ticks: request.start_position_ticks,
+                position_ticks: options.start_position_ticks,
+                start_position_ticks: options.start_position_ticks,
             },
         )
         .await?;
@@ -34804,6 +35808,12 @@ fn apply_hls_transcode_stream_contract(
         .get("IsRemote")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let selected_audio_stream_index = options.audio_stream_index.or_else(|| {
+        media_source
+            .get("MediaStreams")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|streams| default_audio_stream_index(streams))
+    });
     let selected_subtitle_stream_index = options
         .subtitle_stream_index
         .and_then(|index| (index >= 0).then_some(index));
@@ -34812,6 +35822,9 @@ fn apply_hls_transcode_stream_contract(
         .get_mut("MediaStreams")
         .and_then(serde_json::Value::as_array_mut)
     {
+        if options.hls_subtitles_as_embedded {
+            mark_unselected_hls_audio_streams_external(streams, selected_audio_stream_index);
+        }
         for stream in streams {
             let Some(stream) = stream.as_object_mut() else {
                 continue;
@@ -34930,7 +35943,6 @@ fn apply_hls_transcode_stream_contract(
                     if selected && !options.burn_in_subtitle {
                         stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
                         stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
-                        stream.insert("DisplayTitle".to_string(), serde_json::json!("WebVTT"));
                     }
                     let codec = stream
                         .get("Codec")
@@ -34946,9 +35958,16 @@ fn apply_hls_transcode_stream_contract(
                         stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
                         stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
                         let use_hls = !is_remote || selected_text_subtitle_prefers_hls(options);
+                        let hls_as_embedded = use_hls && options.hls_subtitles_as_embedded;
                         stream.insert(
                             "DeliveryMethod".to_string(),
-                            serde_json::json!(if use_hls { "Hls" } else { "External" }),
+                            serde_json::json!(if hls_as_embedded {
+                                "Embed"
+                            } else if use_hls {
+                                "Hls"
+                            } else {
+                                "External"
+                            }),
                         );
                         stream.insert(
                             "IsExternal".to_string(),
@@ -34956,24 +35975,60 @@ fn apply_hls_transcode_stream_contract(
                         );
                         stream.insert(
                             "SupportsExternalStream".to_string(),
-                            serde_json::json!(true),
+                            serde_json::json!(!hls_as_embedded),
                         );
-                        let delivery_url = if !use_hls {
-                            format!(
-                                "/Videos/{item_id}/{item_id}/Subtitles/{index}/Stream.vtt?PlaySessionId={play_session_id}&api_key={access_token}"
-                            )
+                        if hls_as_embedded {
+                            stream.remove("DeliveryUrl");
                         } else {
-                            format!(
-                                "/Videos/{item_id}/{item_id}/Subtitles/{index}/subtitles.m3u8?api_key={access_token}&segmentLength={}",
-                                DEFAULT_HLS_SEGMENT_TIME_SECONDS
-                            )
-                        };
-                        stream.insert("DeliveryUrl".to_string(), serde_json::json!(delivery_url));
+                            let delivery_url = if !use_hls {
+                                format!(
+                                    "/Videos/{item_id}/{item_id}/Subtitles/{index}/Stream.vtt?PlaySessionId={play_session_id}&api_key={access_token}"
+                                )
+                            } else {
+                                format!(
+                                    "/Videos/{item_id}/{item_id}/Subtitles/{index}/subtitles.m3u8?api_key={access_token}&segmentLength={}",
+                                    DEFAULT_HLS_SEGMENT_TIME_SECONDS
+                                )
+                            };
+                            stream
+                                .insert("DeliveryUrl".to_string(), serde_json::json!(delivery_url));
+                        }
                     }
                 }
                 _ => {}
             }
         }
+    }
+}
+
+// Jellyfin Android selects an embedded subtitle by counting every preceding MediaStream whose
+// `IsExternal` flag is false. An HLS transcode contains only the selected audio track, even when
+// the source advertises several audio streams. Leaving the omitted tracks marked as embedded
+// shifts every following subtitle group (for example, source subtitle 4 selects HLS subtitle 5).
+// Keep the selected audio embedded and describe the other source audio tracks as unavailable in
+// the current HLS output. Audio changes already restart transcoded playback, so the newly selected
+// source track becomes embedded in the replacement session.
+fn mark_unselected_hls_audio_streams_external(
+    streams: &mut [serde_json::Value],
+    selected_audio_stream_index: Option<i64>,
+) {
+    let Some(selected_audio_stream_index) = selected_audio_stream_index else {
+        return;
+    };
+    for stream in streams {
+        let Some(stream) = stream.as_object_mut() else {
+            continue;
+        };
+        let is_audio = stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Audio"));
+        if !is_audio {
+            continue;
+        }
+        let is_selected =
+            stream.get("Index").and_then(json_value_i64) == Some(selected_audio_stream_index);
+        stream.insert("IsExternal".to_string(), serde_json::json!(!is_selected));
     }
 }
 
@@ -38314,7 +39369,26 @@ async fn media_segments(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
+    let item = match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => item,
+        Err(error)
+            if error.status == StatusCode::NOT_FOUND
+                && live_tv_channel_json_for_playable_item(&state.db, &item_id)
+                    .await?
+                    .is_some() =>
+        {
+            let start_index =
+                query_string_value(raw_query.as_deref(), &["StartIndex", "startIndex"])
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+            return Ok(Json(query_result_with_total(
+                Vec::<serde_json::Value>::new(),
+                0,
+                start_index,
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     let include_segment_types = csv_values_lowercase(&query_string_values(
         raw_query.as_deref(),
         &["IncludeSegmentTypes", "includeSegmentTypes"],
@@ -38649,55 +39723,163 @@ fn render_video_hls_master_playlist(
     raw_query: Option<&str>,
     variant: HlsVariantInfo,
 ) -> String {
-    let Some(subtitle_stream_index) = session
+    let selected_subtitle_stream_index = session
         .subtitle_stream_index
-        .filter(|subtitle_stream_index| *subtitle_stream_index >= 0)
-    else {
+        .filter(|subtitle_stream_index| *subtitle_stream_index >= 0);
+    let streams = media_item_streams(&session.item);
+    if selected_subtitle_stream_is_image(&streams, selected_subtitle_stream_index) {
         return render_hls_master_playlist(&variant);
-    };
-    if selected_subtitle_stream_is_image(
-        &media_item_streams(&session.item),
-        Some(subtitle_stream_index),
-    ) {
+    }
+
+    if !streams.iter().any(hls_text_subtitle_stream) {
         return render_hls_master_playlist(&variant);
     }
 
     let subtitle_query = raw_query.map_or_else(
-        || format!("segmentLength={}", DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)),
-        |query| {
-            format!(
-                "{query}&segmentLength={}",
-                DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)
-            )
-        },
-    );
-    let subtitle_uri = append_query(
-        &format!("/Videos/{item_id}/{item_id}/Subtitles/{subtitle_stream_index}/subtitles.m3u8"),
-        Some(&subtitle_query),
+        || format!("segmentLength={DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS}"),
+        |query| format!("{query}&segmentLength={DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS}"),
     );
     let mut attributes = vec![format!("BANDWIDTH={}", variant.bandwidth)];
     if let Some((width, height)) = variant.resolution {
         attributes.push(format!("RESOLUTION={width}x{height}"));
     }
-    if let Some(codecs) = variant
-        .codecs
-        .as_deref()
-        .filter(|codecs| !codecs.is_empty())
-    {
-        attributes.push(format!("CODECS=\"{}\"", escape_hls_attribute(codecs)));
-    }
+    // Jellyfin Android maps embedded subtitles by absolute TrackGroup position. Media3 can add
+    // synthetic groups which are absent from Jellyfin's MediaStreams and shift every subtitle:
+    // chunkless preparation adds ID3 when CODECS is present, while MPEG-TS inspection may infer an
+    // in-band CEA-608 group unless the master explicitly declares that captions are absent. Keep
+    // both groups out of the selectable track list so MediaStream indices remain stable. Masters
+    // without subtitle renditions retain their ordinary CODECS attribute through
+    // render_hls_master_playlist.
+    attributes.push("CLOSED-CAPTIONS=NONE".to_string());
     attributes.push("SUBTITLES=\"subs\"".to_string());
 
-    format!(
-        "#EXTM3U\n\
-         #EXT-X-VERSION:3\n\
-         #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Subtitles\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI=\"{}\"\n\
-         #EXT-X-STREAM-INF:{}\n\
-         {}\n",
-        escape_hls_attribute(&subtitle_uri),
+    let mut playlist = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
+    for stream in streams
+        .iter()
+        .filter(|stream| hls_text_subtitle_stream(stream))
+    {
+        let Some(index) = stream.get("Index").and_then(json_value_i64) else {
+            continue;
+        };
+        let name = ["DisplayTitle", "Title", "Language"]
+            .into_iter()
+            .find_map(|field| json_string_field(stream, field))
+            .unwrap_or_else(|| format!("Subtitle {index}"));
+        // HLS requires NAME to be unique within one rendition group. Providers may expose two
+        // subtitle tracks with the same normalized language/title, while their stream indices
+        // remain stable and unambiguous.
+        let name = format!("{name} [{index}]");
+        let language = hls_unique_subtitle_language_tag(&streams, stream, index)
+            .map(|language| format!(",LANGUAGE=\"{}\"", escape_hls_attribute(&language)))
+            .unwrap_or_default();
+        let subtitle_uri = append_query(
+            &format!("/Videos/{item_id}/{item_id}/Subtitles/{index}/subtitles.m3u8"),
+            Some(&subtitle_query),
+        );
+        let forced = stream
+            .get("IsForced")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let is_default = selected_subtitle_stream_index == Some(index);
+        // AUTOSELECT on every rendition makes Media3 collapse tracks sharing a language and
+        // repeatedly choose the default one. Manual tracks remain selectable with AUTOSELECT=NO.
+        let autoselect = is_default || forced;
+        playlist.push_str(&format!(
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"{}\"{},DEFAULT={},AUTOSELECT={},FORCED={},URI=\"{}\"\n",
+            escape_hls_attribute(&name),
+            language,
+            if is_default { "YES" } else { "NO" },
+            if autoselect { "YES" } else { "NO" },
+            if forced { "YES" } else { "NO" },
+            escape_hls_attribute(&subtitle_uri),
+        ));
+    }
+    playlist.push_str(&format!(
+        "#EXT-X-STREAM-INF:{}\n{}\n",
         attributes.join(","),
         variant.uri
-    )
+    ));
+    playlist
+}
+
+fn hls_subtitle_language_tag(stream: &serde_json::Value) -> Option<String> {
+    let descriptor = ["DisplayTitle", "Title"]
+        .into_iter()
+        .filter_map(|field| json_string_field(stream, field))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+
+    // Preserve regional variants that Xtream commonly stores only in the display title. They
+    // must not both become generic `spa`, otherwise Media3 cannot distinguish the selected track.
+    if descriptor.contains("latin american")
+        || descriptor.contains("américa latina")
+        || descriptor.contains("latinoamérica")
+        || descriptor.contains("latinoamerica")
+    {
+        return Some("es-419".to_string());
+    }
+    if descriptor.contains("españa") || descriptor.contains("spain") {
+        return Some("es-ES".to_string());
+    }
+    if descriptor.contains("brazil") || descriptor.contains("brasil") {
+        return Some("pt-BR".to_string());
+    }
+    if descriptor.contains("english(us)")
+        || descriptor.contains("english (us)")
+        || descriptor.contains("united states")
+    {
+        return Some("en-US".to_string());
+    }
+    if descriptor.contains("france") {
+        return Some("fr-FR".to_string());
+    }
+
+    let language = json_string_field(stream, "Language")?;
+    let normalized = match language.trim().to_ascii_lowercase().as_str() {
+        "eng" => "en",
+        "spa" => "es",
+        "fra" | "fre" => "fr",
+        "por" => "pt",
+        "ara" => "ar",
+        "ita" => "it",
+        "deu" | "ger" => "de",
+        "rus" => "ru",
+        _ => return Some(language),
+    };
+    Some(normalized.to_string())
+}
+
+fn hls_unique_subtitle_language_tag(
+    streams: &[serde_json::Value],
+    stream: &serde_json::Value,
+    index: i64,
+) -> Option<String> {
+    let language = hls_subtitle_language_tag(stream)?;
+    let duplicate_count = streams
+        .iter()
+        .filter(|candidate| hls_text_subtitle_stream(candidate))
+        .filter(|candidate| hls_subtitle_language_tag(candidate).as_deref() == Some(&language))
+        .count();
+    if duplicate_count > 1 {
+        return Some(format!("{language}-x-jellyrin-{index}"));
+    }
+    Some(language)
+}
+
+fn hls_text_subtitle_stream(stream: &serde_json::Value) -> bool {
+    stream
+        .get("Type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+        && stream
+            .get("Index")
+            .and_then(json_value_i64)
+            .is_some_and(|index| index >= 0)
+        && stream
+            .get("Codec")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_text_subtitle_codec)
 }
 
 fn escape_hls_attribute(value: &str) -> String {
@@ -38874,14 +40056,16 @@ async fn hls_segment_response_for(
                 .await?
                 .ok_or_else(|| ApiError::not_found("HLS transcode session not found"))?;
             let should_generate =
-                should_generate_hls_segment_on_demand(&current_session, segment_id)
-                    || (!wait_for_hls_segment_ready(
+                if should_generate_hls_segment_on_demand(&current_session, segment_id) {
+                    true
+                } else {
+                    !wait_for_hls_segment_ready(
                         &segment_path,
                         &generation_layout.segment_path(segment_id.saturating_add(1)),
                         HLS_SEGMENT_WAIT_TIMEOUT,
                     )
                     .await?
-                        && should_generate_hls_segment_on_demand(&current_session, segment_id));
+                };
             if !should_generate {
                 return Ok(false);
             }
@@ -38912,6 +40096,9 @@ async fn hls_segment_response_for(
             HLS_SEGMENT_WAIT_TIMEOUT,
         )
         .await?;
+    }
+    if !segment_path.exists() {
+        return Err(ApiError::not_found("HLS segment not found"));
     }
     stream_path(
         segment_path,
@@ -38973,6 +40160,8 @@ async fn generate_missing_hls_segment(
     .max(1);
 
     let streams = media_item_streams(&session.item);
+    let burns_image_subtitle =
+        selected_subtitle_stream_is_image(&streams, session.subtitle_stream_index);
     let mut request = HlsTranscodeRequest::new(
         input_path.to_string(),
         layout
@@ -38984,7 +40173,11 @@ async fn generate_missing_hls_segment(
         TranscodeStreamSelection {
             video_stream_index: session.video_stream_index,
             audio_stream_index: session.audio_stream_index,
-            subtitle_stream_index: session.subtitle_stream_index,
+            subtitle_stream_index: if burns_image_subtitle {
+                session.subtitle_stream_index
+            } else {
+                Some(-1)
+            },
         },
     );
     request.start_position_ticks = segment_start_ticks;
@@ -38992,8 +40185,7 @@ async fn generate_missing_hls_segment(
     request.hls_start_number = Some(segment_id);
     request.output_ts_offset_ticks = Some(i64::from(segment_id) * hls_segment_ticks());
     request.include_video = true;
-    request.burn_in_subtitle =
-        selected_subtitle_stream_is_image(&streams, session.subtitle_stream_index);
+    request.burn_in_subtitle = burns_image_subtitle;
     let fallback_video_mode =
         if request.burn_in_subtitle || !hls_video_stream_copy_supported(&session.item) {
             HlsStreamMode::Encode
@@ -40746,7 +41938,7 @@ async fn subtitle_playlist(
     RawQuery(raw_query): RawQuery,
     Query(query): Query<SubtitlePlaylistQuery>,
 ) -> Result<axum::response::Response, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     if is_live_tv_channel_id(&item_id) {
         return live_tv_subtitle_playlist_response(
             &item_id,
@@ -40771,28 +41963,6 @@ async fn subtitle_playlist(
         .checked_mul(10_000_000)
         .ok_or_else(|| ApiError::bad_request("segmentLength is invalid"))?;
 
-    let start_position_ticks = if let Some(play_session_id) = query
-        .play_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        state
-            .db
-            .transcode_session_by_play_session_id(play_session_id)
-            .await?
-            .filter(|session| {
-                session.user_id == user.id
-                    && session.item.id == item.id
-                    && session.subtitle_stream_index == Some(index)
-            })
-            .map_or(0, |session| {
-                hls_effective_start_position_ticks(session.start_position_ticks, item.runtime_ticks)
-            })
-    } else {
-        0
-    };
-
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{segment_length}\n"));
@@ -40800,7 +41970,10 @@ async fn subtitle_playlist(
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
     playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
 
-    let mut position_ticks = start_position_ticks;
+    // Keep every subtitle rendition on the media's absolute timeline. Android retains its
+    // absolute playback position when a seek replaces the A/V transcode session; shortening this
+    // playlist to that session's start applies the seek twice and requests the wrong cue.
+    let mut position_ticks = 0;
     while position_ticks < runtime_ticks {
         let end_ticks = runtime_ticks.min(position_ticks.saturating_add(segment_length_ticks));
         let duration = (end_ticks - position_ticks) as f64 / 10_000_000.0;
@@ -41118,6 +42291,13 @@ fn empty_webvtt() -> Vec<u8> {
     b"WEBVTT\n\n".to_vec()
 }
 
+fn transcode_session_supplies_subtitle(
+    session_subtitle_stream_index: Option<i64>,
+    requested_index: i64,
+) -> bool {
+    session_subtitle_stream_index == Some(requested_index)
+}
+
 async fn subtitle_output_from_transcode_vtt_segment(
     state: &AppState,
     query: &SubtitleStreamQuery,
@@ -41140,34 +42320,41 @@ async fn subtitle_output_from_transcode_vtt_segment(
         return Ok(None);
     };
 
-    // A text-track switch reaches Stream.js before Web replaces the A/V session. Do not queue an
-    // auxiliary FFmpeg behind the active transcode: an empty response lets the client complete the
-    // switch, after which the replacement session produces sidecars for the newly selected track.
-    if session.subtitle_stream_index != Some(index) {
-        return Ok(Some(empty_webvtt()));
+    // Jellyfin Web does not replace the A/V session after an in-player text-track switch. Reuse an
+    // already-written legacy sidecar when present, but never wait for one: current A/V writers
+    // deliberately omit text subtitles so sparse cues cannot block video segment publication.
+    if !transcode_session_supplies_subtitle(session.subtitle_stream_index, index) {
+        return Ok(None);
     }
 
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
     let segment_id = hls_start_segment_number(start_position_ticks);
-    // The remote VOD first segment currently takes 6-8 seconds on staging while Web cancels VTT
-    // requests after roughly ten. Stay below the client deadline and never launch another FFmpeg.
-    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(8);
-    loop {
-        if let Some(segment_path) =
-            transcode_vtt_segment_path(&layout.session_dir, segment_id).await?
-        {
-            match tokio::fs::read(segment_path).await {
-                Ok(bytes) if !bytes.is_empty() => return Ok(Some(bytes)),
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+    transcode_vtt_segment_or_empty(&layout, segment_id).await
+}
+
+async fn transcode_vtt_segment_or_empty(
+    layout: &HlsTranscodeLayout,
+    segment_id: u32,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    if let Some(segment_path) = transcode_vtt_segment_path(&layout.session_dir, segment_id).await? {
+        match tokio::fs::read(segment_path).await {
+            Ok(bytes) if !bytes.is_empty() => return Ok(Some(bytes)),
+            Ok(_) => return Ok(Some(empty_webvtt())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(Some(empty_webvtt()));
-        }
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
     }
+
+    if layout.segment_path(segment_id).exists() {
+        // FFmpeg does not create a WebVTT file for an HLS interval with no cues. The matching A/V
+        // segment proves that the shared mux has already passed this interval, so absence is an
+        // intentional empty subtitle segment rather than a reason to open another remote Xtream
+        // reader. Returning an empty VTT also lets Media3 continue to the first interval that does
+        // contain dialogue.
+        return Ok(Some(empty_webvtt()));
+    }
+
+    Ok(None)
 }
 
 async fn transcode_vtt_segment_path(
@@ -41256,16 +42443,14 @@ async fn subtitle_output_from_transcode_vtt_segments(
     else {
         return Ok(None);
     };
-    if session.subtitle_stream_index != Some(index) {
-        return Ok(Some(empty_webvtt()));
+    if !transcode_session_supplies_subtitle(session.subtitle_stream_index, index) {
+        return Ok(None);
     }
 
     let layout = HlsTranscodeLayout::from_media_playlist_path(&session.output_path);
     let mut entries = match tokio::fs::read_dir(&layout.session_dir).await {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Some(empty_webvtt()));
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let mut paths = Vec::new();
@@ -41277,7 +42462,7 @@ async fn subtitle_output_from_transcode_vtt_segments(
     }
     paths.sort();
     if paths.is_empty() {
-        return Ok(Some(empty_webvtt()));
+        return Ok(None);
     }
 
     let mut combined = String::from("WEBVTT\n\n");
@@ -41407,6 +42592,11 @@ async fn subtitle_output_from_ffmpeg(
         .arg("error")
         .arg("-nostdin")
         .arg("-y");
+    let preserve_vtt_timeline =
+        format == "vtt" && (start_position_ticks > 0 || end_position_ticks.is_some());
+    if preserve_vtt_timeline {
+        command.arg("-copyts");
+    }
     if start_position_ticks > 0 {
         command
             .arg("-ss")
@@ -41416,10 +42606,16 @@ async fn subtitle_output_from_ffmpeg(
     if let Some(end_position_ticks) = end_position_ticks
         && end_position_ticks > start_position_ticks
     {
-        let duration_ticks = end_position_ticks.saturating_sub(start_position_ticks);
-        command
-            .arg("-t")
-            .arg(format_ticks_as_ffmpeg_seconds(duration_ticks));
+        if preserve_vtt_timeline {
+            command
+                .arg("-to")
+                .arg(format_ticks_as_ffmpeg_seconds(end_position_ticks));
+        } else {
+            let duration_ticks = end_position_ticks.saturating_sub(start_position_ticks);
+            command
+                .arg("-t")
+                .arg(format_ticks_as_ffmpeg_seconds(duration_ticks));
+        }
     }
     command
         .arg("-map")
@@ -41442,61 +42638,50 @@ async fn subtitle_output_from_ffmpeg(
         );
         return Err(ApiError::not_found("Subtitle stream not found"));
     }
-    if format == "vtt" && start_position_ticks > 0 {
-        return Ok(subtitle_offset_vtt_timestamps(
+    if preserve_vtt_timeline && let Some(end_position_ticks) = end_position_ticks {
+        return Ok(subtitle_vtt_cues_starting_in_window(
             output.stdout,
             start_position_ticks,
+            end_position_ticks,
         ));
     }
     Ok(output.stdout)
 }
 
-fn subtitle_offset_vtt_timestamps(output: Vec<u8>, offset_ticks: i64) -> Vec<u8> {
-    if offset_ticks <= 0 {
-        return output;
+/// Assign every WebVTT cue to exactly one HLS segment by its original start timestamp.
+///
+/// FFmpeg intentionally includes a cue that begins before a seek when it remains active at the
+/// seek point. Without this partition, extracting adjacent windows emits that cue twice and the
+/// Android renderer briefly draws two copies. `-copyts` keeps the original timestamp, allowing us
+/// to retain the cue only in the window where it starts; HLS keeps it active across the boundary.
+fn subtitle_vtt_cues_starting_in_window(
+    output: Vec<u8>,
+    start_position_ticks: i64,
+    end_position_ticks: i64,
+) -> Vec<u8> {
+    if end_position_ticks <= start_position_ticks {
+        return empty_webvtt();
     }
     let text = String::from_utf8_lossy(&output);
-    let mut rewritten = String::with_capacity(text.len());
-    for line in text.lines() {
-        if let Some((start, rest)) = line.split_once("-->") {
-            let end_and_settings = rest.trim_start();
-            let (end, settings) = end_and_settings
-                .split_once(char::is_whitespace)
-                .map_or((end_and_settings, ""), |(end, settings)| (end, settings));
-            if let (Some(start_ticks), Some(end_ticks)) = (
-                parse_vtt_timestamp_ticks(start.trim()),
-                parse_vtt_timestamp_ticks(end.trim()),
-            ) {
-                rewritten.push_str(&format_vtt_timestamp_ticks(
-                    start_ticks.saturating_add(offset_ticks),
-                ));
-                rewritten.push_str(" --> ");
-                rewritten.push_str(&format_vtt_timestamp_ticks(
-                    end_ticks.saturating_add(offset_ticks),
-                ));
-                if !settings.trim().is_empty() {
-                    rewritten.push(' ');
-                    rewritten.push_str(settings.trim());
-                }
-                rewritten.push('\n');
-                continue;
-            }
+    let normalized = text.replace("\r\n", "\n");
+    let mut filtered = String::from("WEBVTT\n\n");
+    for block in normalized.split("\n\n") {
+        let block = block.trim();
+        if block.is_empty() || block == "WEBVTT" || block.starts_with("X-TIMESTAMP-MAP=") {
+            continue;
         }
-        rewritten.push_str(line);
-        rewritten.push('\n');
+        let cue_start_ticks = block.lines().find_map(|line| {
+            let (start, _) = line.split_once("-->")?;
+            parse_vtt_timestamp_ticks(start.trim())
+        });
+        if cue_start_ticks.is_some_and(|cue_start_ticks| {
+            cue_start_ticks >= start_position_ticks && cue_start_ticks < end_position_ticks
+        }) {
+            filtered.push_str(block);
+            filtered.push_str("\n\n");
+        }
     }
-    rewritten.into_bytes()
-}
-
-fn format_vtt_timestamp_ticks(ticks: i64) -> String {
-    let total_millis = ticks.max(0) / 10_000;
-    let millis = total_millis % 1000;
-    let total_seconds = total_millis / 1000;
-    let seconds = total_seconds % 60;
-    let total_minutes = total_seconds / 60;
-    let minutes = total_minutes % 60;
-    let hours = total_minutes / 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+    filtered.into_bytes()
 }
 
 fn subtitle_add_vtt_time_map(output: Vec<u8>) -> Vec<u8> {
@@ -42125,9 +43310,13 @@ async fn active_hls_transcode_session_for(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("PlaySessionId is required"))?;
 
-    // D1a: Live TV channel branch. When item_id is not a standard Jellyfin UUID (e.g. "hdhr_4.1"),
-    // try to resolve it as a live TV channel. This branch does NOT relax validation for VOD items.
-    if is_live_tv_channel_id(item_id) {
+    // Live TV channels are exposed to Jellyfin clients through stable UUIDs even when their
+    // provider id is opaque (for example `xtream_2965`). Android consequently requests the HLS
+    // master with that public UUID. Resolve the item before assuming every UUID is library VOD;
+    // otherwise no live session is created and the native player receives a misleading 404.
+    // A failed UUID lookup still follows the ordinary, strictly validated VOD path below.
+    let live_tv_channel = live_tv_channel_by_id(&state.db, item_id).await.ok();
+    if is_live_tv_channel_id(item_id) || live_tv_channel.is_some() {
         return active_hls_transcode_session_for_live_tv(
             state,
             item_id,
@@ -42135,6 +43324,7 @@ async fn active_hls_transcode_session_for(
             query.subtitle_stream_index,
             media_type,
             user.id,
+            live_tv_channel,
         )
         .await;
     }
@@ -42173,12 +43363,16 @@ async fn active_hls_transcode_session_for_live_tv(
     subtitle_stream_index: Option<i64>,
     media_type: &str,
     user_id: Uuid,
+    channel: Option<serde_json::Value>,
 ) -> Result<TranscodeSession, ApiError> {
     if media_type != "Video" {
         return Err(ApiError::not_found("HLS transcode session not found"));
     }
 
-    let channel = live_tv_channel_by_id(&state.db, channel_id).await?;
+    let channel = match channel {
+        Some(channel) => channel,
+        None => live_tv_channel_by_id(&state.db, channel_id).await?,
+    };
     let channel = ensure_live_tv_stream_probe(state, channel).await?;
     let media_streams = channel
         .get("MediaStreams")
@@ -44325,6 +45519,8 @@ fn metadata_entity_json(
     let id = stable_entity_id(item_type, name);
     let image_tags = if item_type.eq_ignore_ascii_case("Person") {
         serde_json::json!({ "Primary": default_primary_image_tag(&id) })
+    } else if item_type.eq_ignore_ascii_case("Studio") {
+        serde_json::json!({ "Thumb": default_primary_image_tag(&id) })
     } else {
         serde_json::json!({})
     };
@@ -46013,26 +47209,12 @@ async fn stop_active_encoding(
         return Ok(StatusCode::OK);
     }
 
-    let session = service
-        .transcode_by_play_session(play_session_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Transcode session not found"))?;
+    let Some(session) = service.transcode_by_play_session(play_session_id).await? else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
     if session.user_id != user.id && !user.is_administrator {
         return Err(ApiError::forbidden("Transcode session access denied"));
     }
-    if let Some(query_device_id) = query
-        .device_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        && session
-            .device_id
-            .as_deref()
-            .is_some_and(|session_device_id| session_device_id != query_device_id)
-    {
-        return Err(ApiError::forbidden("Transcode session device mismatch"));
-    }
-
     let already_terminal = matches!(session.status.as_str(), "stopped" | "completed" | "failed");
     let stop_sender = transcode_stop_registry()
         .lock()
@@ -46284,14 +47466,7 @@ async fn authenticated_similar_items(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
-    if looks_like_live_tv_program_id(&item_id)
-        && live_tv_program_by_id(&state.db, &item_id).await?.is_some()
-    {
-        return Ok(Json(query_result(Vec::new())));
-    }
-    if parse_jellyfin_uuid(&item_id).is_err()
-        && live_tv_program_by_id(&state.db, &item_id).await?.is_some()
-    {
+    if live_tv_program_by_id(&state.db, &item_id).await?.is_some() {
         return Ok(Json(query_result(Vec::new())));
     }
 
@@ -48259,20 +49434,29 @@ async fn tv_series_items_result(
     };
     let mut catalog_query = query.clone();
     catalog_query.parent_id = None;
-    if query.search_term.is_none()
-        && query_requests_only_item_type(query, "Series")
-        && fast_name_search_query_is_simple(&catalog_query)
+    let mut simple_catalog_query = catalog_query.clone();
+    simple_catalog_query.name_starts_with = None;
+    simple_catalog_query.name_starts_with_or_greater = None;
+    simple_catalog_query.name_less_than = None;
+    if query_requests_only_item_type(query, "Series")
+        && fast_name_search_query_is_simple(&simple_catalog_query)
         && let Some(virtual_folder_id) = catalog_virtual_folder_id
-        && let Some(page) = MediaCatalogStore::tv_series_catalog_page(
-            db,
-            virtual_folder_id,
-            query.start_index.unwrap_or(0),
-            query
-                .limit
-                .unwrap_or(25)
-                .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
-        )
-        .await?
+        && let Some(page) = db
+            .tv_series_catalog_search_page(
+                virtual_folder_id,
+                query.start_index.unwrap_or(0),
+                query
+                    .limit
+                    .unwrap_or(25)
+                    .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
+                TvSeriesCatalogNameFilter {
+                    search_term: query.search_term.clone(),
+                    starts_with: query.name_starts_with.clone(),
+                    starts_with_or_greater: query.name_starts_with_or_greater.clone(),
+                    less_than: query.name_less_than.clone(),
+                },
+            )
+            .await?
     {
         // The page above is served either from the durable projection or, while that is unpublished,
         // from the bounded live grouping. Publishing it costs seconds, so it happens in the background
@@ -48928,14 +50112,11 @@ fn external_urls_from_provider_ids(provider_ids: &serde_json::Value) -> Vec<serd
 fn clean_tv_series_name_and_year(source_name: &str) -> (String, Option<i32>) {
     let source_name = source_name.trim();
     if let Some((prefix, suffix)) = source_name.split_once(" (")
-        && suffix.len() >= 5
+        && let Some(year) = suffix.get(..4)
+        && year.bytes().all(|byte| byte.is_ascii_digit())
+        && suffix.as_bytes().get(4) == Some(&b')')
     {
-        let year = &suffix[..4];
-        if year.chars().all(|character| character.is_ascii_digit())
-            && suffix.as_bytes().get(4) == Some(&b')')
-        {
-            return (prefix.trim().to_string(), year.parse::<i32>().ok());
-        }
+        return (prefix.trim().to_string(), year.parse::<i32>().ok());
     }
     (source_name.to_string(), None)
 }
@@ -51693,6 +52874,7 @@ async fn ensure_xtream_remote_media_info(
     metadata: &mut serde_json::Value,
 ) -> Result<ResolvedXtreamMedia, ApiError> {
     let db = &state.db;
+    ensure_xtream_vod_metadata(state, &item, metadata).await?;
     let mut resolved_source = resolve_xtream_remote_source_with_revision(db, metadata)
         .await?
         .ok_or_else(|| ApiError::service_unavailable("remote media source unavailable"))?;
@@ -51818,6 +53000,173 @@ async fn ensure_xtream_remote_media_info(
     Ok(ResolvedXtreamMedia {
         item: db.media_item_by_id(item.id).await?,
     })
+}
+
+fn xtream_vod_info_current(metadata: &serde_json::Value, source_revision: &str) -> bool {
+    let Some(marker) = metadata
+        .get("XtreamVodInfo")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if marker.get("Version").and_then(json_value_i64) != Some(XTREAM_VOD_INFO_VERSION)
+        || marker
+            .get("SourceRevision")
+            .and_then(serde_json::Value::as_str)
+            != Some(source_revision)
+    {
+        return false;
+    }
+    match marker
+        .get("Status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+    {
+        "Complete" => true,
+        "Failed" => marker
+            .get("DateLastFetched")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .is_some_and(|fetched| {
+                OffsetDateTime::now_utc()
+                    < fetched + Duration::seconds(XTREAM_VOD_INFO_FAILED_RETRY_AFTER_SECONDS)
+            }),
+        _ => false,
+    }
+}
+
+fn set_xtream_vod_info_marker(
+    metadata: &mut serde_json::Value,
+    source_revision: &str,
+    status: &str,
+) {
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "XtreamVodInfo".to_string(),
+        serde_json::json!({
+            "Version": XTREAM_VOD_INFO_VERSION,
+            "Status": status,
+            "SourceRevision": source_revision,
+            "DateLastFetched": format_time_for_json(OffsetDateTime::now_utc()),
+        }),
+    );
+}
+
+fn merge_xtream_vod_metadata(metadata: &mut serde_json::Value, enrichment: serde_json::Value) {
+    let Some(target) = metadata.as_object_mut() else {
+        return;
+    };
+    let Some(mut enrichment) = enrichment.as_object().cloned() else {
+        return;
+    };
+    if let Some(provider_ids) = enrichment
+        .remove("ProviderIds")
+        .and_then(|value| value.as_object().cloned())
+    {
+        let target_ids = target
+            .entry("ProviderIds".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(target_ids) = target_ids.as_object_mut() {
+            target_ids.extend(provider_ids);
+        }
+    }
+    for (key, value) in enrichment {
+        let meaningful = match &value {
+            serde_json::Value::Null => false,
+            serde_json::Value::String(value) => !value.trim().is_empty(),
+            serde_json::Value::Array(values) => !values.is_empty(),
+            serde_json::Value::Object(values) => !values.is_empty(),
+            _ => true,
+        };
+        if meaningful {
+            target.insert(key, value);
+        }
+    }
+}
+
+async fn ensure_xtream_vod_metadata(
+    state: &AppState,
+    item: &MediaItem,
+    metadata: &mut serde_json::Value,
+) -> Result<(), ApiError> {
+    let Some(reference_value) = xtream_remote_source_ref(metadata) else {
+        return Ok(());
+    };
+    let Some(reference) = live_tv_xtream::xtream_remote_source_ref(reference_value) else {
+        return Ok(());
+    };
+    if reference.kind != "vod" {
+        return Ok(());
+    }
+
+    let lock = xtream_probe_lock_for(item.id);
+    let _guard = lock.lock().await;
+    let mut fresh = state
+        .db
+        .media_item_metadata_by_item_ids(&HashSet::from([item.id]))
+        .await?
+        .into_iter()
+        .next()
+        .map(|metadata| metadata.payload)
+        .unwrap_or_else(|| metadata.clone());
+    let Some(fresh_reference_value) = xtream_remote_source_ref(&fresh) else {
+        return Ok(());
+    };
+    let Some(fresh_reference) = live_tv_xtream::xtream_remote_source_ref(fresh_reference_value)
+    else {
+        return Ok(());
+    };
+    if fresh_reference.kind != "vod" {
+        return Ok(());
+    }
+    let persisted_tuner_config = state
+        .db
+        .live_tv_tuner_configuration_by_id(&fresh_reference.tuner_id)
+        .await?
+        .ok_or_else(|| ApiError::service_unavailable("remote media tuner is unavailable"))?;
+    let tuner_config = state
+        .db
+        .resolve_provider_configuration(&persisted_tuner_config)
+        .await
+        .map_err(|_| {
+            ApiError::service_unavailable("remote media tuner credentials are unavailable")
+        })?;
+    let source_url =
+        live_tv_xtream::resolve_remote_source_ref(&tuner_config, fresh_reference_value)
+            .ok_or_else(|| {
+                ApiError::service_unavailable("remote media reference could not be resolved")
+            })?;
+    let source_revision =
+        resolved_xtream_remote_source_revision(&fresh, &tuner_config, &source_url)
+            .ok_or_else(|| ApiError::service_unavailable("remote media reference is invalid"))?;
+    if xtream_vod_info_current(&fresh, &source_revision) {
+        *metadata = fresh;
+        return Ok(());
+    }
+
+    match live_tv_xtream::fetch_vod_metadata_from_payload(&tuner_config, &fresh_reference.remote_id)
+        .await
+    {
+        Ok(enrichment) => {
+            merge_xtream_vod_metadata(&mut fresh, enrichment);
+            set_xtream_vod_info_marker(&mut fresh, &source_revision, "Complete");
+        }
+        Err(error) => {
+            tracing::warn!(
+                item_id = %item.id.simple(),
+                operation = error.operation(),
+                "Xtream VOD metadata enrichment failed"
+            );
+            set_xtream_vod_info_marker(&mut fresh, &source_revision, "Failed");
+        }
+    }
+    MediaService::new(&state.db)
+        .update_metadata(item.id, fresh.clone())
+        .await?;
+    *metadata = fresh;
+    Ok(())
 }
 
 fn xtream_remote_media_probe_current(metadata: &serde_json::Value, source_revision: &str) -> bool {
@@ -52145,15 +53494,8 @@ fn render_seekable_hls_media_playlist_for(
         return None;
     }
 
-    let start_position_ticks =
-        hls_effective_start_position_ticks(start_position_ticks, Some(runtime_ticks));
-    let remaining_ticks = runtime_ticks.saturating_sub(start_position_ticks);
-    if remaining_ticks <= 0 {
-        return None;
-    }
-
     let segment_ticks = hls_segment_ticks();
-    let segment_count = ((remaining_ticks + segment_ticks - 1) / segment_ticks).max(1);
+    let segment_count = ((runtime_ticks + segment_ticks - 1) / segment_ticks).max(1);
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
     playlist.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
@@ -52162,15 +53504,27 @@ fn render_seekable_hls_media_playlist_for(
         "#EXT-X-TARGETDURATION:{}\n",
         DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)
     ));
-    // Jellyfin clients add StartTimeTicks/segment_duration when resolving these paths. Keep the
-    // manifest relative even though FFmpeg and the segment handler use absolute file numbers.
+    let effective_start_ticks =
+        hls_effective_start_position_ticks(start_position_ticks, Some(runtime_ticks));
+    if effective_start_ticks > 0 {
+        let start_seconds = effective_start_ticks as f64 / 10_000_000.0;
+        // Media3 has to prepare an HLS source before the application-level seek is applied. Tell
+        // it where this playback session starts so it does not probe segment zero first and then
+        // discard the session as an unavailable source.
+        playlist.push_str(&format!(
+            "#EXT-X-START:TIME-OFFSET={start_seconds:.6},PRECISE=YES\n"
+        ));
+    }
+    // Android preserves the absolute player position while replacing an HLS session after seek.
+    // Expose the full timeline so 350 seconds resolves segment 116, not relative segment 116 plus
+    // the session's initial segment 116 (which incorrectly seeks to roughly 698 seconds).
     playlist.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
     for relative_segment_id in 0..segment_count {
         let Ok(relative_segment_id_u32) = u32::try_from(relative_segment_id) else {
             break;
         };
-        let segment_start_ticks = start_position_ticks + relative_segment_id * segment_ticks;
+        let segment_start_ticks = relative_segment_id * segment_ticks;
         let segment_length_ticks = (runtime_ticks - segment_start_ticks)
             .min(segment_ticks)
             .max(0);
@@ -52216,19 +53570,11 @@ fn hls_start_segment_number(start_position_ticks: i64) -> u32 {
 }
 
 fn hls_storage_segment_id(
-    start_position_ticks: i64,
-    runtime_ticks: Option<i64>,
+    _start_position_ticks: i64,
+    _runtime_ticks: Option<i64>,
     playlist_segment_id: u32,
 ) -> Option<u32> {
-    if runtime_ticks.is_some_and(|ticks| ticks > 0) {
-        hls_start_segment_number(hls_effective_start_position_ticks(
-            start_position_ticks,
-            runtime_ticks,
-        ))
-        .checked_add(playlist_segment_id)
-    } else {
-        Some(playlist_segment_id)
-    }
+    Some(playlist_segment_id)
 }
 
 fn align_hls_request_segment_timeline(request: &mut HlsTranscodeRequest) {
@@ -52236,19 +53582,19 @@ fn align_hls_request_segment_timeline(request: &mut HlsTranscodeRequest) {
     if initial_segment_id == 0 {
         return;
     }
+    let aligned_start_ticks = i64::from(initial_segment_id).saturating_mul(hls_segment_ticks());
     request.hls_start_number = Some(initial_segment_id);
-    request.output_ts_offset_ticks =
-        Some(i64::from(initial_segment_id).saturating_mul(hls_segment_ticks()));
+    request.output_ts_offset_ticks = Some(aligned_start_ticks);
+    // Start the source on the same absolute boundary advertised by the VOD playlist. Seeking the
+    // input to an exact resume point but labelling it with the earlier segment boundary made A/V
+    // lead WebVTT by the remainder of that segment (up to almost three seconds).
+    request.start_position_ticks = aligned_start_ticks;
 }
 
-fn hls_segment_start_position_ticks(start_position_ticks: i64, segment_id: u32) -> Option<i64> {
-    let initial_segment_id = hls_start_segment_number(start_position_ticks);
-    let relative_segment_id = segment_id.checked_sub(initial_segment_id)?;
-    Some(
-        start_position_ticks
-            .max(0)
-            .saturating_add(i64::from(relative_segment_id).saturating_mul(hls_segment_ticks())),
-    )
+fn hls_segment_start_position_ticks(_start_position_ticks: i64, segment_id: u32) -> Option<i64> {
+    // Every URI in the full VOD playlist is absolute. This also keeps on-demand A/V extraction on
+    // the same timeline as independently extracted WebVTT renditions.
+    Some(i64::from(segment_id).saturating_mul(hls_segment_ticks()))
 }
 
 fn hls_effective_start_position_ticks(
@@ -53674,6 +55020,76 @@ async fn named_placeholder_image_by_index(
     named_entity_image_or_placeholder(&state, &name, &image_type, image_index).await
 }
 
+async fn studio_image(
+    State(state): State<AppState>,
+    Path((name, image_type)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    studio_image_or_placeholder(&state, &name, &image_type, 0).await
+}
+
+async fn studio_image_by_index(
+    State(state): State<AppState>,
+    Path((name, image_type, image_index)): Path<(String, String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    let image_index = parse_image_index(&image_index)?;
+    studio_image_or_placeholder(&state, &name, &image_type, image_index).await
+}
+
+async fn studio_image_or_placeholder(
+    state: &AppState,
+    name: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<axum::response::Response, ApiError> {
+    if let Some(path) =
+        find_named_entity_representative_image(state, name, image_type, image_index).await?
+    {
+        return stored_image_response(path).await;
+    }
+    if image_index != 0 || !image_type.eq_ignore_ascii_case("Thumb") {
+        return Ok(placeholder_png_response());
+    }
+    let policy = metadata_provider_policy(&state.db, "Studio", true).await?;
+    if !policy.allows("studio-images", "Studio Images") {
+        return Ok(placeholder_png_response());
+    }
+    let configuration = state
+        .db
+        .named_configuration(builtin_metadata::CONFIGURATION_KEY)
+        .await?
+        .unwrap_or_else(builtin_metadata::default_configuration);
+    if !builtin_metadata::provider_is_ready(
+        &configuration,
+        "studio-images",
+        builtin_metadata::ProviderSecretAvailability::from_environment(),
+    ) {
+        return Ok(placeholder_png_response());
+    }
+    let image_url = match studio_images::image_url_for_studio(name).await {
+        Ok(Some(image_url)) => image_url,
+        Ok(None) => return Ok(placeholder_png_response()),
+        Err(error) => {
+            tracing::warn!(status = %error.status, "Studio Images lookup was unavailable");
+            return Ok(placeholder_png_response());
+        }
+    };
+    let (bytes, content_type) = match fetch_remote_image_payload(&image_url).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(status = %error.status, "Studio Images image was unavailable");
+            return Ok(placeholder_png_response());
+        }
+    };
+    Ok(Response::builder()
+        .header(
+            header::CONTENT_TYPE,
+            content_type.as_deref().unwrap_or("image/jpeg"),
+        )
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(bytes))
+        .expect("Studio Images response must be valid"))
+}
+
 async fn splashscreen_placeholder_image(
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, ApiError> {
@@ -53725,10 +55141,10 @@ async fn live_tv_item_for_image(
     db: &Database,
     item_id: &str,
 ) -> Result<Option<serde_json::Value>, ApiError> {
-    if looks_like_live_tv_program_id(item_id) {
-        return live_tv_program_by_id(db, item_id).await;
+    if let Some(channel) = live_tv_channel_json_by_id(db, item_id).await? {
+        return Ok(Some(channel));
     }
-    live_tv_channel_json_by_id(db, item_id).await
+    live_tv_program_by_id(db, item_id).await
 }
 
 fn live_tv_item_primary_image_info(item: &serde_json::Value) -> Option<serde_json::Value> {
@@ -54033,15 +55449,37 @@ async fn live_tv_item_image_response(
 async fn item_image_from_plugins(
     db: &Database,
     item_id: &str,
+    item_type: &str,
     image_type: &str,
 ) -> Result<Option<Response<Body>>, ApiError> {
-    let plugins = db.installed_plugins_json().await?;
+    let policy = metadata_provider_policy(db, item_type, true).await?;
+    let mut plugins = db.installed_plugins_json().await?;
+    plugins.sort_by(|left, right| {
+        policy.compare(
+            &json_string_field(left, "Name").unwrap_or_default(),
+            json_i64_field(left, "Priority").unwrap_or(1_000),
+            &json_string_field(right, "Name").unwrap_or_default(),
+            json_i64_field(right, "Priority").unwrap_or(1_000),
+        )
+    });
     for plugin in plugins {
         if !plugin_is_active_image_provider(&plugin) {
             continue;
         }
+        let provider_id = json_string_field(&plugin, "Id").unwrap_or_default();
+        let provider_name = json_string_field(&plugin, "Name").unwrap_or_else(|| {
+            if provider_id.is_empty() {
+                "Plugin Image Provider".to_string()
+            } else {
+                provider_id.clone()
+            }
+        });
+        if !policy.allows(&provider_id, &provider_name) {
+            continue;
+        }
         let request = serde_json::json!({
             "ItemId": item_id,
+            "ItemType": item_type,
             "ImageType": image_type,
         });
         let capability = match invoke_installed_plugin_capability_via_runtime_host(
@@ -54136,8 +55574,13 @@ async fn item_image_or_placeholder(
         }
         Err(error) => return Err(error),
     };
-    if let Some(response) =
-        remote_metadata_item_image_response(state, item_id, &item, image_type, image_index).await?
+    let image_policy = metadata_provider_policy(&state.db, media_item_type(&item), true).await?;
+    let metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    let metadata_image_provider = remote_image_provider_name(&metadata);
+    if image_policy.allows("", &metadata_image_provider)
+        && let Some(response) =
+            remote_metadata_item_image_response(state, item_id, &metadata, image_type, image_index)
+                .await?
     {
         return Ok(response);
     }
@@ -54145,7 +55588,9 @@ async fn item_image_or_placeholder(
         return stored_image_response(local_image).await;
     }
     // Try plugin ImageProvider as fallback
-    if let Some(plugin_image) = item_image_from_plugins(&state.db, item_id, image_type).await? {
+    if let Some(plugin_image) =
+        item_image_from_plugins(&state.db, item_id, media_item_type(&item), image_type).await?
+    {
         return Ok(plugin_image);
     }
     if let Some(generated_image) =
@@ -54397,15 +55842,14 @@ async fn find_generated_video_item_image(
 async fn remote_metadata_item_image_response(
     state: &AppState,
     item_id: &str,
-    item: &MediaItem,
+    metadata: &serde_json::Value,
     image_type: &str,
     image_index: usize,
 ) -> Result<Option<axum::response::Response>, ApiError> {
     if image_index != 0 {
         return Ok(None);
     }
-    let metadata = metadata_payload_for_item(&state.db, item.id).await?;
-    for image_url in metadata_remote_image_urls(&metadata, image_type) {
+    for image_url in metadata_remote_image_urls(metadata, image_type) {
         if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
             return stored_image_response(path).await.map(Some);
         }
@@ -54438,13 +55882,15 @@ async fn virtual_tv_item_image_response(
     if image_index != 0 {
         return Ok(None);
     }
-    let snapshot = match tv_episode_catalog_snapshot_for_series(&state.db, item_id).await? {
-        Some(snapshot) => snapshot,
-        None => match tv_episode_catalog_snapshot_for_season(&state.db, item_id).await? {
-            Some(snapshot) => snapshot,
-            None => return Ok(None),
-        },
-    };
+    let (snapshot, item_type) =
+        match tv_episode_catalog_snapshot_for_series(&state.db, item_id).await? {
+            Some(snapshot) => (snapshot, "Series"),
+            None => match tv_episode_catalog_snapshot_for_season(&state.db, item_id).await? {
+                Some(snapshot) => (snapshot, "Season"),
+                None => return Ok(None),
+            },
+        };
+    let policy = metadata_provider_policy(&state.db, item_type, true).await?;
     // Every episode repeats the same series artwork, so take the first fetchable url rather than
     // letting one episode with a missing value blank the whole series.
     let mut seen = HashSet::new();
@@ -54452,6 +55898,9 @@ async fn virtual_tv_item_image_response(
         let Some(metadata) = snapshot.metadata_by_item.get(&item.id) else {
             continue;
         };
+        if !policy.allows("", &remote_image_provider_name(metadata)) {
+            continue;
+        }
         for image_url in metadata_series_remote_image_urls(metadata, image_type) {
             if !seen.insert(image_url.clone()) {
                 continue;
@@ -55633,11 +57082,14 @@ async fn remote_image_candidates(
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let mut images = plugin_remote_image_candidates(db, item, requested_image_type).await?;
     let metadata = metadata_payload_for_item(db, item.id).await?;
-    images.extend(metadata_remote_image_candidates(
-        &item.id.simple().to_string(),
-        &metadata,
-        requested_image_type,
-    ));
+    let policy = metadata_provider_policy(db, media_item_type(item), true).await?;
+    if policy.allows("", &remote_image_provider_name(&metadata)) {
+        images.extend(metadata_remote_image_candidates(
+            &item.id.simple().to_string(),
+            &metadata,
+            requested_image_type,
+        ));
+    }
     let Some(item_dir) = media_item_path(item).parent() else {
         return Ok(images);
     };
@@ -55848,13 +57300,32 @@ async fn plugin_remote_image_candidates(
 ) -> Result<Vec<serde_json::Value>, ApiError> {
     let mut images = Vec::new();
     let requested_image_type = requested_image_type.map(canonical_image_type);
-    for plugin in db.installed_plugins_json().await? {
+    let item_type = media_item_type(item);
+    let policy = metadata_provider_policy(db, item_type, true).await?;
+    let mut plugins = db.installed_plugins_json().await?;
+    plugins.sort_by(|left, right| {
+        policy.compare(
+            &json_string_field(left, "Name").unwrap_or_default(),
+            json_i64_field(left, "Priority").unwrap_or(1_000),
+            &json_string_field(right, "Name").unwrap_or_default(),
+            json_i64_field(right, "Priority").unwrap_or(1_000),
+        )
+    });
+    for plugin in plugins {
         if !plugin_is_active_image_provider(&plugin) {
             continue;
         }
+        let provider_id = json_string_field(&plugin, "Id").unwrap_or_default();
         let provider_name = json_string_field(&plugin, "Name").unwrap_or_else(|| {
-            json_string_field(&plugin, "Id").unwrap_or_else(|| "Plugin Image Provider".to_string())
+            if provider_id.is_empty() {
+                "Plugin Image Provider".to_string()
+            } else {
+                provider_id.clone()
+            }
         });
+        if !policy.allows(&provider_id, &provider_name) {
+            continue;
+        }
         let capability = invoke_installed_plugin_capability_via_runtime_host(
             db,
             &plugin,
@@ -55862,7 +57333,7 @@ async fn plugin_remote_image_candidates(
             serde_json::json!({
                 "ItemId": item.id.simple().to_string(),
                 "ItemName": item.name,
-                "ItemType": media_item_type(item),
+                "ItemType": item_type,
                 "ImageType": requested_image_type.as_deref(),
             }),
         )
@@ -56561,7 +58032,7 @@ struct StopEncodingQuery {
     #[serde(alias = "PlaySessionId", alias = "playSessionId")]
     play_session_id: Option<String>,
     #[serde(alias = "DeviceId", alias = "deviceId")]
-    device_id: Option<String>,
+    _device_id: Option<String>,
 }
 
 fn startup_config_to_dto(config: StartupConfig) -> StartupConfigurationDto {
@@ -56707,35 +58178,35 @@ mod tests {
         apply_live_hls_ffmpeg_policy, apply_playback_output_constraints,
         await_package_install_cancelable, backup_restore_snapshot_json,
         cascade_delete_series_timer_timers, classify_transcode_command,
-        cleanup_hls_transcode_dir_in_root, cleanup_hls_transcode_files,
-        cleanup_orphan_hls_transcode_dirs, cleanup_terminal_hls_transcodes,
-        codec_condition_matches, codec_condition_property_value, default_audio_stream_index,
-        default_live_tv_configuration, default_subtitle_stream_index, default_user_configuration,
-        direct_play_profile_matches, encoding_configuration_json,
+        clean_tv_series_name_and_year, cleanup_hls_transcode_dir_in_root,
+        cleanup_hls_transcode_files, cleanup_orphan_hls_transcode_dirs,
+        cleanup_terminal_hls_transcodes, codec_condition_matches, codec_condition_property_value,
+        default_audio_stream_index, default_live_tv_configuration, default_subtitle_stream_index,
+        default_user_configuration, direct_play_profile_matches, encoding_configuration_json,
         enrich_media_streams_with_context, ensure_package_install_not_cancelled,
         external_id_infos_for_item_type, ffmpeg_job_allowed_for_mode, ffmpeg_listing_components,
         filter_package_list, format_time_for_json, generate_missing_hls_segment,
         get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
         hls_on_demand_generation_lock, hls_segment_start_position_ticks, hls_segment_ticks,
-        hls_start_segment_number, hls_storage_segment_id, hls_transcode_dedupe_key,
-        hls_transcode_session_input_path, internal_remote_relay_target, is_live_tv_channel_id,
-        json_string_field, json_value_i64, last_system_lifecycle_command,
+        hls_start_segment_number, hls_storage_segment_id, hls_subtitle_language_tag,
+        hls_transcode_dedupe_key, hls_transcode_session_input_path, internal_remote_relay_target,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
         live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
-        live_tv_channel_stable_uuid, live_tv_configuration_json,
-        live_tv_hls_transcoding_profile_supported, live_tv_m3u_channels_from_payload,
-        live_tv_playback_info_response, live_tv_recording_name,
+        live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_guide_info,
+        live_tv_hls_transcoding_profile_supported, live_tv_lookup_id,
+        live_tv_m3u_channels_from_payload, live_tv_playback_info_response, live_tv_recording_name,
         live_tv_xmltv_programs_from_payload, load_countries, load_cultures,
         materialize_series_timer_timers, media_item_by_id, media_item_streams,
-        metadata_editor_parental_rating_options, normalize_completed_remote_resume_position,
-        normalize_media_stream, package_infos_from_repositories, package_install_task_key,
-        paged_media_items, parse_authorization_token, parse_codec_condition, parse_ffmpeg_mode,
-        parse_jellyfin_uuid, parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels,
-        parse_live_tv_xmltv_programs, parse_media_browser_pairs, parse_playback_info_options,
-        playback_delivery_decision, playback_delivery_decision_with_ffmpeg_mode,
-        playback_hls_modes_from_dedupe_key, playback_hls_transcode_dedupe_key,
-        playback_hls_transcode_dedupe_key_with_output, playback_info_options_from_body,
-        playback_output_constraints_from_dedupe_key, playback_report_outcome,
-        plugin_configuration_from_runtime_host_path,
+        merge_xtream_vod_metadata, metadata_editor_parental_rating_options,
+        normalize_completed_remote_resume_position, normalize_media_stream,
+        package_infos_from_repositories, package_install_task_key, paged_media_items,
+        parse_authorization_token, parse_codec_condition, parse_ffmpeg_mode, parse_jellyfin_uuid,
+        parse_live_tv_hdhomerun_channels, parse_live_tv_m3u_channels, parse_live_tv_xmltv_programs,
+        parse_media_browser_pairs, parse_playback_info_options, playback_delivery_decision,
+        playback_delivery_decision_with_ffmpeg_mode, playback_hls_modes_from_dedupe_key,
+        playback_hls_transcode_dedupe_key, playback_hls_transcode_dedupe_key_with_output,
+        playback_info_options_from_body, playback_output_constraints_from_dedupe_key,
+        playback_report_outcome, plugin_configuration_from_runtime_host_path,
         plugin_configuration_pages_from_runtime_host_path, plugin_image_from_runtime_host_path,
         plugin_package_operation, plugin_packages_root, plugin_scheduled_task_id,
         reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup,
@@ -56744,8 +58215,9 @@ mod tests {
         run_due_live_tv_timers, run_startup_command_output, scan_all_library_items,
         selected_aac_output_channels, selected_text_subtitle_prefers_hls,
         selected_video_frame_rate_limit, series_timer_child_id,
-        set_xtream_remote_media_probe_metadata, spawn_hls_transcode_task, stable_entity_id,
-        subscribe_playback_events, subscribe_system_lifecycle_commands, subtitle_add_vtt_time_map,
+        set_xtream_remote_media_probe_metadata, set_xtream_vod_info_marker,
+        spawn_hls_transcode_task, stable_entity_id, subscribe_playback_events,
+        subscribe_system_lifecycle_commands, subtitle_add_vtt_time_map,
         subtitle_vtt_to_track_events_json, syncplay_cleanup_stale_participants, syncplay_groups,
         transcode_dedupe_lock, transcode_device_lock, transcode_session_is_superseded,
         transcode_temp_root, transcode_vtt_segment_path, trickplay_settings,
@@ -56753,6 +58225,7 @@ mod tests {
         update_plugin_configuration_via_runtime_host_path, validate_hls_cleanup_dir,
         validate_zip_entry_path, verify_plugin_package_checksum, with_live_tuner_leases,
         xtream_probe_lock_for, xtream_remote_media_probe_current, xtream_remote_source_revision,
+        xtream_vod_info_current,
     };
     use crate::Database;
     use crate::dlna;
@@ -56788,6 +58261,31 @@ mod tests {
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn live_tv_guide_info_exposes_a_parseable_ordered_utc_window() {
+        let body = live_tv_guide_info().await.0;
+        let start = body["StartDate"]
+            .as_str()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .expect("StartDate must be a valid RFC 3339 timestamp");
+        let end = body["EndDate"]
+            .as_str()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .expect("EndDate must be a valid RFC 3339 timestamp");
+
+        assert!(start < end);
+        assert_eq!(end - start, Duration::hours(24));
+    }
+
+    #[test]
+    fn live_tv_bulk_lookup_normalizes_android_uuid_forms() {
+        assert_eq!(
+            live_tv_lookup_id("12E4AA52-762D-DE5C-9D06-F6300D9F2C5B"),
+            "12e4aa52762dde5c9d06f6300d9f2c5b"
+        );
+        assert_eq!(live_tv_lookup_id("  XTREAM_42  "), "xtream_42");
+    }
     use uuid::Uuid;
 
     static SYNCPLAY_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -56880,6 +58378,29 @@ mod tests {
             .expect("central directory entry");
         archive[central + 4..central + 6].copy_from_slice(&0x0314_u16.to_le_bytes());
         archive[central + 38..central + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+    }
+
+    #[test]
+    fn xtream_vod_enrichment_merges_provider_ids_and_complete_marker_is_cacheable() {
+        let mut metadata = serde_json::json!({
+            "XtreamKind": "vod",
+            "ProviderIds": { "Xtream": "42" }
+        });
+        merge_xtream_vod_metadata(
+            &mut metadata,
+            serde_json::json!({
+                "Overview": "Movie synopsis",
+                "ProviderIds": { "Tmdb": "1234", "Imdb": "tt0123456" }
+            }),
+        );
+        set_xtream_vod_info_marker(&mut metadata, "revision-a", "Complete");
+
+        assert_eq!(metadata["Overview"], "Movie synopsis");
+        assert_eq!(metadata["ProviderIds"]["Xtream"], "42");
+        assert_eq!(metadata["ProviderIds"]["Tmdb"], "1234");
+        assert_eq!(metadata["ProviderIds"]["Imdb"], "tt0123456");
+        assert!(xtream_vod_info_current(&metadata, "revision-a"));
+        assert!(!xtream_vod_info_current(&metadata, "revision-b"));
     }
 
     #[test]
@@ -61974,6 +63495,13 @@ done
             ),
             Some("tok".to_string())
         );
+        let android_tv = parse_media_browser_pairs(
+            r#"MediaBrowser Client="Jellyfin+Android+TV+%28debug%29", Device="sdk_gphone_x86_64", DeviceId="abc", Version="0.19.9""#,
+        );
+        assert!(android_tv.contains(&(
+            "client".to_string(),
+            "Jellyfin Android TV (debug)".to_string()
+        )));
     }
 
     #[test]
@@ -62673,6 +64201,26 @@ done
             super::TvMazeCapacityError::TimedOut
         );
         assert_eq!(wait_queue.available_permits(), 1);
+    }
+
+    #[test]
+    fn series_name_year_cleanup_is_unicode_safe() {
+        assert_eq!(
+            clean_tv_series_name_and_year("Fringe (2008)"),
+            ("Fringe".to_string(), Some(2008))
+        );
+        assert_eq!(
+            clean_tv_series_name_and_year("Fargo (2014) extra"),
+            ("Fargo".to_string(), Some(2014))
+        );
+        assert_eq!(
+            clean_tv_series_name_and_year("Series ( Мажор )"),
+            ("Series ( Мажор )".to_string(), None)
+        );
+        assert_eq!(
+            clean_tv_series_name_and_year("Мажор (2024)"),
+            ("Мажор".to_string(), Some(2024))
+        );
     }
 
     #[test]
@@ -69403,7 +70951,13 @@ done
         assert_eq!(fallback_programs["TotalRecordCount"], 1);
         assert_eq!(fallback_programs["Items"].as_array().unwrap().len(), 1);
         assert_eq!(fallback_programs["Items"][0]["Type"], "Program");
-        assert_eq!(fallback_programs["Items"][0]["ChannelId"], "xtream_1");
+        let channel_1_id = super::live_tv_channel_public_id("xtream_1");
+        let channel_2_id = super::live_tv_channel_public_id("xtream_2");
+        assert_eq!(fallback_programs["Items"][0]["ChannelId"], channel_1_id);
+        assert_eq!(
+            fallback_programs["Items"][0]["JellyrinChannelId"],
+            "xtream_1"
+        );
         assert_eq!(fallback_programs["Items"][0]["ChannelName"], "News HD");
         assert_eq!(fallback_programs["Items"][0]["IsLive"], true);
         assert_eq!(fallback_programs["Items"][0]["IsNews"], true);
@@ -69427,7 +70981,7 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let movie_programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(movie_programs["TotalRecordCount"], 1);
-        assert_eq!(movie_programs["Items"][0]["ChannelId"], "xtream_2");
+        assert_eq!(movie_programs["Items"][0]["ChannelId"], channel_2_id);
         assert_eq!(movie_programs["Items"][0]["IsMovie"], true);
 
         for endpoint in [
@@ -69451,7 +71005,7 @@ done
             let program: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(program["Id"], fallback_program_id, "{endpoint}");
             assert_eq!(program["Type"], "Program", "{endpoint}");
-            assert_eq!(program["ChannelId"], "xtream_1", "{endpoint}");
+            assert_eq!(program["ChannelId"], channel_1_id, "{endpoint}");
         }
 
         let response = app
@@ -69635,6 +71189,10 @@ done
         )
         .await
         .unwrap();
+        let channel_1_id = super::live_tv_channel_public_id("xtream_1");
+        let channel_2_id = super::live_tv_channel_public_id("xtream_2");
+        let program_1_id = super::live_tv_fallback_program_public_id(&channel_1_id);
+        let program_2_id = super::live_tv_fallback_program_public_id(&channel_2_id);
         let app = router(AppState {
             db,
             web_dir: ".".into(),
@@ -69659,7 +71217,61 @@ done
         assert_eq!(channels["TotalRecordCount"], 2);
         assert_eq!(channels["StartIndex"], 1);
         assert_eq!(channels["Items"].as_array().unwrap().len(), 1);
-        assert_eq!(channels["Items"][0]["Id"], "xtream_2");
+        assert_eq!(channels["Items"][0]["Id"], channel_2_id);
+        assert_eq!(channels["Items"][0]["JellyrinChannelId"], "xtream_2");
+        assert!(parse_jellyfin_uuid(channels["Items"][0]["Id"].as_str().unwrap()).is_ok());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Users/{}/FavoriteItems/{channel_2_id}", user.id))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let favorite_user_data: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(favorite_user_data["IsFavorite"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Channels?Filters=IsFavorite&Limit=100")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let favorites: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(favorites["TotalRecordCount"], 1);
+        assert_eq!(favorites["Items"][0]["Id"], channel_2_id);
+        assert_eq!(favorites["Items"][0]["UserData"]["IsFavorite"], true);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Channels?IsFavorite=false&Limit=100")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let non_favorites: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(non_favorites["TotalRecordCount"], 1);
+        assert_eq!(non_favorites["Items"][0]["Id"], channel_1_id);
 
         let response = app
             .clone()
@@ -69791,7 +71403,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(programs["TotalRecordCount"], 2);
-        assert_eq!(programs["Items"][0]["Id"], "fallback-program-xtream-2");
+        assert_eq!(programs["Items"][0]["Id"], program_2_id);
+        assert!(parse_jellyfin_uuid(programs["Items"][0]["ChannelId"].as_str().unwrap()).is_ok());
 
         let response = app
             .clone()
@@ -69810,10 +71423,7 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let filtered_programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(filtered_programs["TotalRecordCount"], 1);
-        assert_eq!(
-            filtered_programs["Items"][0]["Id"],
-            "fallback-program-xtream-2"
-        );
+        assert_eq!(filtered_programs["Items"][0]["Id"], program_2_id);
 
         let response = app
             .clone()
@@ -69830,10 +71440,7 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let movie_programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(movie_programs["TotalRecordCount"], 1);
-        assert_eq!(
-            movie_programs["Items"][0]["Id"],
-            "fallback-program-xtream-2"
-        );
+        assert_eq!(movie_programs["Items"][0]["Id"], program_2_id);
         assert_eq!(movie_programs["Items"][0]["IsMovie"], true);
 
         let response = app
@@ -69851,7 +71458,7 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let news_programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(news_programs["TotalRecordCount"], 1);
-        assert_eq!(news_programs["Items"][0]["Id"], "fallback-program-xtream-1");
+        assert_eq!(news_programs["Items"][0]["Id"], program_1_id);
         assert_eq!(news_programs["Items"][0]["IsNews"], true);
 
         let response = app
@@ -69869,7 +71476,8 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let program: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(program["Type"], "Program");
-        assert_eq!(program["ChannelId"], "xtream_2");
+        assert_eq!(program["Id"], program_2_id);
+        assert_eq!(program["ChannelId"], channel_2_id);
 
         let response = app
             .clone()
@@ -69885,7 +71493,8 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let channel_detail: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(channel_detail["Id"], "xtream_2");
+        assert_eq!(channel_detail["Id"], channel_2_id);
+        assert_eq!(channel_detail["JellyrinChannelId"], "xtream_2");
         assert_eq!(channel_detail["Type"], "TvChannel");
         assert_eq!(
             channel_detail["MediaSources"][0]["SupportsDirectStream"],
@@ -69897,6 +71506,23 @@ done
                 .is_none()
         );
         assert_eq!(channel_detail["MediaSources"][0]["RequiresOpening"], false);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/MediaSegments/{channel_2_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let media_segments: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(media_segments["TotalRecordCount"], 0);
+        assert!(media_segments["Items"].as_array().unwrap().is_empty());
 
         for endpoint in [
             format!("/Items/xtream_2/PlaybackInfo?UserId={}", user.id),
@@ -69944,7 +71570,7 @@ done
                 playback_info["MediaSources"][0]["TranscodingUrl"]
                     .as_str()
                     .unwrap()
-                    .starts_with("/Videos/xtream_2/master.m3u8"),
+                    .starts_with(&format!("/Videos/{channel_2_id}/master.m3u8")),
                 "{endpoint}"
             );
         }
@@ -70689,7 +72315,11 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let options: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(options["TunerChannels"].as_array().unwrap().len(), 2);
-        assert_eq!(options["TunerChannels"][0]["Id"], "channel-1");
+        assert_eq!(
+            options["TunerChannels"][0]["Id"],
+            super::live_tv_channel_public_id("channel-1")
+        );
+        assert!(parse_jellyfin_uuid(options["TunerChannels"][0]["Id"].as_str().unwrap()).is_ok());
         assert!(options["ProviderChannels"].as_array().unwrap().is_empty());
         assert!(options["Mappings"].as_array().unwrap().is_empty());
         assert_eq!(options["ProviderName"], "xmltv");
@@ -70831,13 +72461,20 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let channels: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channels["TotalRecordCount"], 2);
-        assert_eq!(channels["Items"][0]["Id"], "channel-1");
+        assert_eq!(
+            channels["Items"][0]["Id"],
+            super::live_tv_channel_public_id("channel-1")
+        );
+        assert_eq!(channels["Items"][0]["JellyrinChannelId"], "channel-1");
         assert_eq!(channels["Items"][0]["Type"], "TvChannel");
         assert_eq!(channels["Items"][0]["TunerHostId"], "tuner-1");
         assert_eq!(channels["Items"][0]["MediaSources"][0]["Id"], "channel-1");
         assert_eq!(
             channels["Items"][0]["MediaSources"][0]["DirectStreamUrl"],
-            "/LiveTv/LiveStreamFiles/channel-1/stream.ts"
+            format!(
+                "/LiveTv/LiveStreamFiles/{}/stream.ts",
+                super::live_tv_channel_public_id("channel-1")
+            )
         );
 
         let response = app
@@ -71012,7 +72649,10 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let searched_channel_items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(searched_channel_items["TotalRecordCount"], 1);
-        assert_eq!(searched_channel_items["Items"][0]["Id"], "channel-1");
+        assert_eq!(
+            searched_channel_items["Items"][0]["Id"],
+            super::live_tv_channel_public_id("channel-1")
+        );
         assert_eq!(searched_channel_items["Items"][0]["ChannelId"], "livetv");
 
         let response = app
@@ -71048,7 +72688,10 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let latest_searched_channel_items: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(latest_searched_channel_items["TotalRecordCount"], 1);
-        assert_eq!(latest_searched_channel_items["Items"][0]["Id"], "channel-2");
+        assert_eq!(
+            latest_searched_channel_items["Items"][0]["Id"],
+            super::live_tv_channel_public_id("channel-2")
+        );
         assert_eq!(
             latest_searched_channel_items["Items"][0]["ChannelId"],
             "livetv"
@@ -71088,12 +72731,18 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let live_stream: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(live_stream["LiveStreamId"], "channel-1");
+        assert_eq!(
+            live_stream["LiveStreamId"],
+            super::live_tv_channel_public_id("channel-1")
+        );
         assert_eq!(live_stream["MediaSource"]["Id"], "channel-1");
         assert_eq!(live_stream["MediaSource"]["SupportsDirectPlay"], true);
         assert_eq!(
             live_stream["MediaSource"]["DirectStreamUrl"],
-            "/LiveTv/LiveStreamFiles/channel-1/stream.ts"
+            format!(
+                "/LiveTv/LiveStreamFiles/{}/stream.ts",
+                super::live_tv_channel_public_id("channel-1")
+            )
         );
 
         let response = app
@@ -71176,7 +72825,11 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let programs: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(programs["TotalRecordCount"], 1);
-        assert_eq!(programs["Items"][0]["Id"], "program-1");
+        assert_eq!(
+            programs["Items"][0]["Id"],
+            super::stable_jellyfin_uuid("LiveTvProgram", "program-1")
+        );
+        assert_eq!(programs["Items"][0]["JellyrinProgramId"], "program-1");
         assert_eq!(programs["Items"][0]["ChannelName"], "News HD");
 
         let response = app
@@ -71227,11 +72880,20 @@ done
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let program: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(program["Id"], "program-1", "{endpoint}");
+            assert_eq!(
+                program["Id"],
+                super::stable_jellyfin_uuid("LiveTvProgram", "program-1"),
+                "{endpoint}"
+            );
             assert_eq!(program["Name"], "Morning News", "{endpoint}");
             assert_eq!(program["Type"], "Program", "{endpoint}");
             assert_eq!(program["MediaType"], "Video", "{endpoint}");
-            assert_eq!(program["ChannelId"], "channel-1", "{endpoint}");
+            assert_eq!(
+                program["ChannelId"],
+                super::live_tv_channel_public_id("channel-1"),
+                "{endpoint}"
+            );
+            assert_eq!(program["JellyrinChannelId"], "channel-1", "{endpoint}");
             assert_eq!(program["ChannelName"], "News HD", "{endpoint}");
             assert_eq!(program["StartDate"], "2026-05-26T08:00:00Z", "{endpoint}");
             assert_eq!(program["EndDate"], "2026-05-26T09:00:00Z", "{endpoint}");
@@ -71284,14 +72946,19 @@ done
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let recommended: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(recommended["TotalRecordCount"], 2, "{endpoint}");
-            assert_eq!(recommended["Items"][0]["Id"], "program-1", "{endpoint}");
+            assert_eq!(
+                recommended["Items"][0]["Id"],
+                super::stable_jellyfin_uuid("LiveTvProgram", "program-1"),
+                "{endpoint}"
+            );
             assert_eq!(
                 recommended["Items"][0]["Name"], "Morning News",
                 "{endpoint}"
             );
             assert_eq!(recommended["Items"][0]["Type"], "Program", "{endpoint}");
             assert_eq!(
-                recommended["Items"][0]["ChannelId"], "channel-1",
+                recommended["Items"][0]["ChannelId"],
+                super::live_tv_channel_public_id("channel-1"),
                 "{endpoint}"
             );
             assert_eq!(
@@ -71373,7 +73040,12 @@ done
             assert_eq!(recording["Name"], "Morning News", "{endpoint}");
             assert_eq!(recording["Type"], "Recording", "{endpoint}");
             assert_eq!(recording["MediaType"], "Video", "{endpoint}");
-            assert_eq!(recording["ChannelId"], "channel-1", "{endpoint}");
+            assert_eq!(
+                recording["ChannelId"],
+                super::live_tv_channel_public_id("channel-1"),
+                "{endpoint}"
+            );
+            assert_eq!(recording["JellyrinChannelId"], "channel-1", "{endpoint}");
             assert_eq!(recording["ChannelName"], "News HD", "{endpoint}");
             assert_eq!(recording["Status"], "Completed", "{endpoint}");
             assert_eq!(recording["SeriesName"], "Morning News", "{endpoint}");
@@ -75146,7 +76818,11 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let channels: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channels["TotalRecordCount"], 1);
-        assert_eq!(channels["Items"][0]["Id"], "channel-1");
+        assert_eq!(
+            channels["Items"][0]["Id"],
+            super::live_tv_channel_public_id("channel-1")
+        );
+        assert_eq!(channels["Items"][0]["JellyrinChannelId"], "channel-1");
         assert_eq!(channels["Items"][0]["Name"], "News HD");
         assert_eq!(
             channels["Items"][0]["MediaSources"][0]["SupportsDirectPlay"],
@@ -75957,6 +77633,40 @@ done
         assert!(direct_url.starts_with("/LiveTv/LiveStreamFiles/xtream_opaque_42/"));
         assert!(transcode_url.starts_with("/Videos/xtream_opaque_42/master.m3u8?"));
         assert!(!media_source.to_string().contains("opaque-reference"));
+    }
+
+    #[test]
+    fn live_tv_opaque_channel_uses_public_uuid_in_client_urls() {
+        let public_id = super::live_tv_channel_public_id("xtream_opaque_42");
+        let channel = json!({
+            "Id": public_id,
+            "JellyrinChannelId": "xtream_opaque_42",
+            "Name": "Opaque News",
+            "ProviderType": "xtream",
+            "ProviderReference": "xtream:v1:opaque-reference"
+        });
+        let media_source = live_tv_channel_media_source(&channel).unwrap();
+        assert_eq!(media_source["Id"], "xtream_opaque_42");
+        assert!(
+            media_source["DirectStreamUrl"].as_str().is_some_and(
+                |url| url.starts_with(&format!("/LiveTv/LiveStreamFiles/{public_id}/"))
+            )
+        );
+        assert!(
+            media_source["TranscodingUrl"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(&format!("/Videos/{public_id}/")))
+        );
+
+        let playback =
+            live_tv_playback_info_response(&channel, "secret", PlaybackInfoOptions::default())
+                .unwrap()
+                .0;
+        assert!(
+            playback["MediaSources"][0]["TranscodingUrl"]
+                .as_str()
+                .is_some_and(|url| url.starts_with(&format!("/Videos/{public_id}/")))
+        );
     }
 
     #[test]
@@ -82243,6 +83953,42 @@ done
                 .iter()
                 .any(|item| { item["Id"] == parent_id && item["CollectionType"] == "movies" })
         );
+        for view in user_views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item["CollectionType"].as_str(),
+                    Some("boxsets" | "livetv" | "playlists")
+                )
+            })
+        {
+            let view_id = view["Id"].as_str().unwrap();
+            for endpoint in [
+                format!("/Items/{view_id}"),
+                format!("/UserLibrary/Items/{view_id}"),
+                format!("/Users/{user_id}/Items/{view_id}"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(endpoint)
+                            .header("X-Emby-Token", &api_key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let detail: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(detail["Id"], view["Id"]);
+                assert_eq!(detail["CollectionType"], view["CollectionType"]);
+                assert_eq!(detail["IsFolder"], true);
+            }
+        }
 
         let response = app
             .clone()
@@ -86056,6 +87802,124 @@ done
             .0;
         assert_eq!(scoped["TotalRecordCount"], 30);
         assert_eq!(scoped["Items"].as_array().unwrap().len(), 20);
+
+        let search_query = super::ItemsQuery {
+            include_item_types: vec!["Series".to_string()],
+            search_term: Some("series 2".to_string()),
+            limit: Some(25),
+            ..super::ItemsQuery::default()
+        };
+        let searched = super::tv_series_items_result(&db, &search_query, None, "server")
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(searched["TotalRecordCount"], 10);
+        assert_eq!(searched["Items"].as_array().unwrap().len(), 10);
+        assert!(searched["Items"].as_array().unwrap().iter().all(|item| {
+            item["Name"]
+                .as_str()
+                .is_some_and(|name| name.to_ascii_lowercase().contains("series 2"))
+        }));
+
+        let alphabet_page_query = super::ItemsQuery {
+            include_item_types: vec!["Series".to_string()],
+            name_starts_with_or_greater: Some("Series 1".to_string()),
+            name_less_than: Some("Series 2".to_string()),
+            start_index: Some(3),
+            limit: Some(4),
+            ..super::ItemsQuery::default()
+        };
+        let alphabet_page =
+            super::tv_series_items_result(&db, &alphabet_page_query, None, "server")
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(alphabet_page["TotalRecordCount"], 10);
+        assert_eq!(alphabet_page["StartIndex"], 3);
+        assert_eq!(alphabet_page["Items"].as_array().unwrap().len(), 4);
+        assert_eq!(alphabet_page["Items"][0]["Name"], "Series 13");
+        assert_eq!(alphabet_page["Items"][3]["Name"], "Series 16");
+
+        let prefix_query = super::ItemsQuery {
+            include_item_types: vec!["Series".to_string()],
+            name_starts_with: Some("Other".to_string()),
+            start_index: Some(0),
+            limit: Some(10),
+            ..super::ItemsQuery::default()
+        };
+        let prefix_page = super::tv_series_items_result(&db, &prefix_query, None, "server")
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(prefix_page["TotalRecordCount"], 1);
+        assert_eq!(prefix_page["Items"][0]["Name"], "Other Series");
+    }
+
+    #[tokio::test]
+    async fn android_tv_random_movie_series_showcase_uses_bounded_catalog_pages() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let movies = (0..4)
+            .map(|index| RemoteMediaItemUpsert {
+                id: Uuid::new_v4().simple().to_string(),
+                name: format!("Movie {index}"),
+                path: format!("provider://movies/{index}.mkv"),
+                media_type: "Video".to_string(),
+                collection_type: "movies".to_string(),
+                runtime_ticks: Some(10_000_000),
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({}),
+            })
+            .collect();
+        db.replace_remote_media_library_snapshot("Movies", "movies", "provider://movies", movies)
+            .await
+            .unwrap();
+        let episodes = (0..4)
+            .map(|index| {
+                let series_name = format!("Series {index}");
+                RemoteMediaItemUpsert {
+                    id: Uuid::new_v4().simple().to_string(),
+                    name: format!("{series_name} S01E01"),
+                    path: format!("provider://shows/{series_name}/S01E01.mkv"),
+                    media_type: "Video".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: Some(10_000_000),
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({
+                        "SeriesId": stable_entity_id("android-tv-random", &series_name),
+                        "SeriesName": series_name,
+                    }),
+                }
+            })
+            .collect();
+        db.replace_remote_media_library_snapshot("Shows", "tvshows", "provider://shows", episodes)
+            .await
+            .unwrap();
+
+        let query = super::parse_items_query(Some(
+            "maxOfficialRating=13&hasParentalRating=true&limit=4&recursive=true&includeItemTypes=Movie&includeItemTypes=Series&imageTypes=Backdrop&sortBy=Random&enableTotalRecordCount=true&enableImages=true",
+        ));
+        let response = super::random_movie_series_items_result(&db, &query, "server", None)
+            .await
+            .unwrap()
+            .expect("Android TV random showcase should use the bounded mixed path")
+            .0;
+        let items = response["Items"].as_array().unwrap();
+        assert_eq!(response["TotalRecordCount"], 8);
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items.iter().filter(|item| item["Type"] == "Movie").count(),
+            2
+        );
+        assert_eq!(
+            items.iter().filter(|item| item["Type"] == "Series").count(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -86161,6 +88025,31 @@ done
         .unwrap()
         .expect("bounded genre filters should use database paging");
         assert_eq!(genre_query.genre_ids, ["drama", "genre-id"]);
+        let advanced_filter_query = super::media_catalog_query_for_items(
+            &super::parse_items_query(Some(
+                "OfficialRatings=PG-13&SeriesStatus=Continuing&Years=2025&HasTrailer=true&HasOverview=true&HasImdbId=true&HasTmdbId=true&HasTvdbId=true&HasOfficialRating=true&IsLocked=true&MinCommunityRating=8&MaxCommunityRating=9&MinCriticRating=70&MaxCriticRating=80&MinPremiereDate=2025-01-01&MaxPremiereDate=2025-12-31&Filters=HasSubtitles,HasTrailer&Limit=10",
+            )),
+            Some(user.id),
+        )
+        .unwrap()
+        .expect("advanced metadata filters should use database paging");
+        assert_eq!(advanced_filter_query.official_ratings, ["PG-13"]);
+        assert_eq!(advanced_filter_query.series_statuses, ["Continuing"]);
+        assert_eq!(advanced_filter_query.years, ["2025"]);
+        assert_eq!(advanced_filter_query.has_subtitles, Some(true));
+        assert_eq!(advanced_filter_query.has_trailer, Some(true));
+        assert_eq!(advanced_filter_query.has_overview, Some(true));
+        assert_eq!(advanced_filter_query.has_imdb_id, Some(true));
+        assert_eq!(advanced_filter_query.has_tmdb_id, Some(true));
+        assert_eq!(advanced_filter_query.has_tvdb_id, Some(true));
+        assert_eq!(advanced_filter_query.has_official_rating, Some(true));
+        assert_eq!(advanced_filter_query.is_locked, Some(true));
+        assert_eq!(advanced_filter_query.min_community_rating, Some(8.0));
+        assert_eq!(advanced_filter_query.max_community_rating, Some(9.0));
+        assert_eq!(advanced_filter_query.min_critic_rating, Some(70.0));
+        assert_eq!(advanced_filter_query.max_critic_rating, Some(80.0));
+        assert!(advanced_filter_query.min_premiere_date.is_some());
+        assert!(advanced_filter_query.max_premiere_date.is_some());
         let metadata_selector_query = super::media_catalog_query_for_items(
             &super::parse_items_query(Some(
                 "PersonIds=Jane,person-id&StudioIds=HBO,studio-id&Tags=Featured,Archive&Limit=10",
@@ -86281,20 +88170,16 @@ done
                 .genre_ids,
             ["drama"]
         );
-        for complex_query in [
-            "IncludeItemTypes=Series&Limit=10",
-            "HasOverview=true&Limit=10",
-        ] {
-            assert!(
-                super::media_catalog_query_for_items(
-                    &super::parse_items_query(Some(complex_query)),
-                    Some(user.id)
-                )
-                .unwrap()
-                .is_none(),
-                "{complex_query} must retain the application-level fallback"
-            );
-        }
+        let series_query = "IncludeItemTypes=Series&Limit=10";
+        assert!(
+            super::media_catalog_query_for_items(
+                &super::parse_items_query(Some(series_query)),
+                Some(user.id)
+            )
+            .unwrap()
+            .is_none(),
+            "{series_query} must retain the synthetic Series path"
+        );
 
         let app = router(AppState {
             db,
@@ -89364,6 +91249,14 @@ done
             events["TrackEvents"][0]["Text"],
             "<b>WALT DISNEY\nPRESENTA</b>"
         );
+    }
+
+    #[test]
+    fn subtitle_switch_falls_back_when_active_transcode_maps_another_track() {
+        assert!(super::transcode_session_supplies_subtitle(Some(6), 6));
+        assert!(!super::transcode_session_supplies_subtitle(Some(-1), 6));
+        assert!(!super::transcode_session_supplies_subtitle(Some(5), 6));
+        assert!(!super::transcode_session_supplies_subtitle(None, 6));
     }
 
     #[tokio::test]
@@ -94373,23 +96266,6 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(transcode_dir.exists());
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::DELETE)
-                    .uri(
-                        "/Videos/ActiveEncodings?playSessionId=play-session-stop&deviceId=device-1",
-                    )
-                    .header("X-Emby-Token", &api_key)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!transcode_dir.exists());
 
@@ -94464,7 +96340,7 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -95138,7 +97014,7 @@ done
                 "Status": "Failed",
                 "SourceRevision": "revision-a",
                 "DateLastProbed": format_time_for_json(
-                    OffsetDateTime::now_utc() - Duration::minutes(31)
+                    OffsetDateTime::now_utc() - Duration::minutes(2)
                 )
             }
         });
@@ -95434,7 +97310,9 @@ done
                 media_streams: vec![
                     json!({ "Type": "Video", "Index": 0, "Codec": "h264" }),
                     json!({ "Type": "Audio", "Index": 1, "Codec": "aac", "IsDefault": true }),
-                    json!({ "Type": "Subtitle", "Index": 2, "Codec": "srt", "Language": "spa" }),
+                    json!({ "Type": "Subtitle", "Index": 2, "Codec": "srt", "Language": "eng", "DisplayTitle": "English - SRT" }),
+                    json!({ "Type": "Subtitle", "Index": 3, "Codec": "srt", "Language": "spa", "DisplayTitle": "Español (Latinoamérica) - SRT" }),
+                    json!({ "Type": "Subtitle", "Index": 4, "Codec": "srt", "Language": "spa", "DisplayTitle": "Español (España) - SRT" }),
                 ],
                 metadata: json!({
                     "Provider": "xtream",
@@ -95581,13 +97459,38 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let master = String::from_utf8(body.to_vec()).unwrap();
         assert!(master.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"));
+        assert!(master.contains("CLOSED-CAPTIONS=NONE"));
         assert!(master.contains("SUBTITLES=\"subs\""));
+        assert!(
+            !master.contains("CODECS="),
+            "subtitle masters must disable Media3 chunkless preparation: {master}"
+        );
         assert!(master.contains(&format!(
             "/Videos/{item_id}/{item_id}/Subtitles/2/subtitles.m3u8"
         )));
         assert!(master.contains(&format!(
+            "/Videos/{item_id}/{item_id}/Subtitles/3/subtitles.m3u8"
+        )));
+        assert!(master.contains(&format!(
+            "/Videos/{item_id}/{item_id}/Subtitles/4/subtitles.m3u8"
+        )));
+        assert!(
+            master.contains(
+                "NAME=\"English - srt [2]\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO"
+            ),
+            "{master}"
+        );
+        assert!(master.contains(
+            "NAME=\"Spanish; Castilian - srt [4]\",LANGUAGE=\"es-x-jellyrin-4\",DEFAULT=NO,AUTOSELECT=NO,FORCED=NO"
+        ), "{master}");
+        assert!(master.contains(
+            "NAME=\"Spanish; Castilian - srt [3]\",LANGUAGE=\"es-x-jellyrin-3\",DEFAULT=NO,AUTOSELECT=NO,FORCED=NO"
+        ), "{master}");
+        assert_eq!(master.matches("DEFAULT=YES").count(), 1);
+        assert_eq!(master.matches("#EXT-X-MEDIA:TYPE=SUBTITLES").count(), 3);
+        assert!(master.contains(&format!(
             "segmentLength={}",
-            jellyrin_core::DEFAULT_HLS_SEGMENT_TIME_SECONDS.max(1)
+            crate::DIRECT_HLS_SUBTITLE_SEGMENT_SECONDS
         )));
     }
 
@@ -96621,7 +98524,8 @@ done
         item.media_streams.push(json!({
             "Type": "Subtitle",
             "Index": 2,
-            "Codec": "subrip"
+            "Codec": "subrip",
+            "DisplayTitle": "English - SRT - Default"
         }));
         let hevc_subtitle_options = playback_info_options_from_body(&json!({
             "EnableDirectPlay": true,
@@ -96686,6 +98590,7 @@ done
         assert_eq!(android.video, HlsStreamMode::Copy);
         assert_eq!(android.audio, HlsStreamMode::Copy);
         assert!(selected_text_subtitle_prefers_hls(&android_options));
+        assert!(android_options.hls_subtitles_as_embedded);
         assert!(
             android_options
                 .transcoding_profiles
@@ -96709,14 +98614,11 @@ done
             &android,
         );
         let android_subtitle = &android_media_source["MediaStreams"][2];
-        assert_eq!(android_subtitle["DeliveryMethod"], "Hls");
+        assert_eq!(android_subtitle["DisplayTitle"], "English - SRT - Default");
+        assert_eq!(android_subtitle["DeliveryMethod"], "Embed");
         assert_eq!(android_subtitle["IsExternal"], false);
-        assert!(
-            android_subtitle["DeliveryUrl"]
-                .as_str()
-                .unwrap()
-                .contains("/Subtitles/2/subtitles.m3u8?")
-        );
+        assert_eq!(android_subtitle["SupportsExternalStream"], false);
+        assert!(android_subtitle.get("DeliveryUrl").is_none());
         let android_response = super::playback_transcode_session_info_response(
             json!({
                 "MediaSources": [{
@@ -96824,6 +98726,28 @@ done
     }
 
     #[test]
+    fn android_hls_movie_subtitles_ignore_audio_tracks_omitted_by_transcode() {
+        let mut streams = vec![
+            json!({ "Type": "Video", "Index": 0, "IsExternal": false }),
+            json!({ "Type": "Audio", "Index": 1, "Language": "fre", "IsExternal": false }),
+            json!({ "Type": "Audio", "Index": 2, "Language": "eng", "IsExternal": false }),
+            json!({ "Type": "Subtitle", "Index": 3, "Language": "ara", "IsExternal": false }),
+            json!({ "Type": "Subtitle", "Index": 4, "Language": "eng", "IsExternal": false }),
+            json!({ "Type": "Subtitle", "Index": 5, "Language": "fre", "IsExternal": false }),
+        ];
+
+        super::mark_unselected_hls_audio_streams_external(&mut streams, Some(1));
+
+        assert_eq!(streams[1]["IsExternal"], false);
+        assert_eq!(streams[2]["IsExternal"], true);
+        let english_embedded_index = streams[..4]
+            .iter()
+            .filter(|stream| stream["IsExternal"] != true)
+            .count();
+        assert_eq!(english_embedded_index, 3);
+    }
+
+    #[test]
     fn hls_effective_start_position_keeps_a_real_final_segment() {
         let segment_ticks = hls_segment_ticks();
         let runtime_ticks = 100_000_000;
@@ -96863,6 +98787,33 @@ done
         assert!(output.contains("40:34.404 --> 40:36.656"));
     }
 
+    #[test]
+    fn subtitle_hls_windows_assign_each_overlapping_cue_once() {
+        let ffmpeg_window = b"WEBVTT\n\n\
+00:14.000 --> 00:17.000\nBoundary cue\n\n\
+00:20.000 --> 00:22.000\nLater cue\n\n"
+            .to_vec();
+
+        let first = String::from_utf8(super::subtitle_vtt_cues_starting_in_window(
+            ffmpeg_window.clone(),
+            0,
+            150_000_000,
+        ))
+        .unwrap();
+        let second = String::from_utf8(super::subtitle_vtt_cues_starting_in_window(
+            ffmpeg_window,
+            150_000_000,
+            300_000_000,
+        ))
+        .unwrap();
+
+        assert!(first.contains("Boundary cue"));
+        assert!(!first.contains("Later cue"));
+        assert!(!second.contains("Boundary cue"));
+        assert!(second.contains("Later cue"));
+        assert!(second.starts_with("WEBVTT\n\n"));
+    }
+
     #[tokio::test]
     async fn subtitle_seek_resolves_ffmpeg_on_demand_vtt_playlist_uri() {
         let transcode_dir = tempfile::tempdir().unwrap();
@@ -96894,6 +98845,24 @@ done
         );
     }
 
+    #[tokio::test]
+    async fn selected_hls_subtitle_returns_empty_segment_without_second_extraction() {
+        let transcode_dir = tempfile::tempdir().unwrap();
+        let layout = HlsTranscodeLayout::new(transcode_dir.path(), "resume-session");
+        tokio::fs::create_dir_all(&layout.session_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(layout.segment_path(415), b"mpeg-ts")
+            .await
+            .unwrap();
+
+        let output = super::transcode_vtt_segment_or_empty(&layout, 415)
+            .await
+            .unwrap();
+
+        assert_eq!(output.as_deref(), Some(b"WEBVTT\n\n".as_slice()));
+    }
+
     #[test]
     fn hls_resume_uses_absolute_segment_numbers_without_double_counting_the_seek() {
         let start_position_ticks = 19_670_990_000;
@@ -96904,22 +98873,30 @@ done
         );
         assert_eq!(
             hls_segment_start_position_ticks(start_position_ticks, initial_segment_id),
-            Some(start_position_ticks)
+            Some(i64::from(initial_segment_id) * hls_segment_ticks())
         );
         assert_eq!(
             hls_segment_start_position_ticks(start_position_ticks, initial_segment_id + 2),
-            Some(start_position_ticks + 2 * hls_segment_ticks())
+            Some(i64::from(initial_segment_id + 2) * hls_segment_ticks())
         );
         assert_eq!(
             hls_segment_start_position_ticks(start_position_ticks, initial_segment_id - 1),
-            None
+            Some(i64::from(initial_segment_id - 1) * hls_segment_ticks())
         );
         assert_eq!(
-            hls_storage_segment_id(start_position_ticks, Some(47_560_430_000), 0),
+            hls_storage_segment_id(
+                start_position_ticks,
+                Some(47_560_430_000),
+                initial_segment_id
+            ),
             Some(initial_segment_id)
         );
         assert_eq!(
-            hls_storage_segment_id(start_position_ticks, Some(47_560_430_000), 2),
+            hls_storage_segment_id(
+                start_position_ticks,
+                Some(47_560_430_000),
+                initial_segment_id + 2
+            ),
             Some(initial_segment_id + 2)
         );
         assert_eq!(hls_storage_segment_id(0, None, 2), Some(2));
@@ -96934,6 +98911,10 @@ done
         align_hls_request_segment_timeline(&mut request);
         assert_eq!(request.hls_start_number, Some(initial_segment_id));
         assert_eq!(
+            request.start_position_ticks,
+            i64::from(initial_segment_id) * hls_segment_ticks()
+        );
+        assert_eq!(
             request.output_ts_offset_ticks,
             Some(i64::from(initial_segment_id) * hls_segment_ticks())
         );
@@ -96947,11 +98928,38 @@ done
         )
         .expect("seekable playlist");
         assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:0"));
-        let first_segment_uri = playlist
+        assert!(playlist.contains("#EXT-X-START:TIME-OFFSET=1967.099000,PRECISE=YES"));
+        let initial_segment_uri = playlist
             .lines()
-            .find(|line| !line.is_empty() && !line.starts_with('#'))
-            .expect("first segment URI");
-        assert!(first_segment_uri.starts_with("/Videos/movie-id/hls1/main/0.ts?"));
+            .find(|line| {
+                line.starts_with(&format!(
+                    "/Videos/movie-id/hls1/main/{initial_segment_id}.ts?"
+                ))
+            })
+            .expect("absolute seek segment URI");
+        assert!(initial_segment_uri.contains("runtimeTicks=19650000000"));
+    }
+
+    #[test]
+    fn hls_subtitle_language_preserves_spanish_regional_variants() {
+        assert_eq!(
+            hls_subtitle_language_tag(&json!({
+                "Type": "Subtitle",
+                "Language": "spa",
+                "DisplayTitle": "Spanish (Latin American) / Español (América Latina)"
+            }))
+            .as_deref(),
+            Some("es-419")
+        );
+        assert_eq!(
+            hls_subtitle_language_tag(&json!({
+                "Type": "Subtitle",
+                "Language": "spa",
+                "DisplayTitle": "Spanish / Español (España)"
+            }))
+            .as_deref(),
+            Some("es-ES")
+        );
     }
 
     #[test]
@@ -98806,6 +100814,10 @@ done
         let secret = initiated["Secret"].as_str().unwrap();
         let code = initiated["Code"].as_str().unwrap();
         assert_eq!(initiated["Authenticated"], false);
+        assert_eq!(initiated["DeviceId"], "quick-device");
+        assert_eq!(initiated["DeviceName"], "Firefox");
+        assert_eq!(initiated["AppName"], "Jellyfin Web");
+        assert_eq!(initiated["AppVersion"], "dev");
         assert_eq!(code.len(), 6);
 
         let response = app
@@ -98822,6 +100834,7 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let pending: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(pending["Authenticated"], false);
+        assert_eq!(pending["DeviceId"], "quick-device");
 
         let response = app
             .clone()
@@ -100291,6 +102304,8 @@ done
             assert_eq!(entity["ProviderIds"], json!({}));
             if item_type == "Person" {
                 assert!(entity["ImageTags"]["Primary"].as_str().is_some());
+            } else if item_type == "Studio" {
+                assert!(entity["ImageTags"]["Thumb"].as_str().is_some());
             } else {
                 assert_eq!(entity["ImageTags"], json!({}));
             }
@@ -101425,13 +103440,14 @@ done
                 local_address: "http://127.0.0.1:8097".to_string(),
             });
             let play_session_id = format!("legacy-hls-{}", uuid::Uuid::new_v4().simple());
+            let public_channel_id = crate::live_tv_channel_public_id("hdhr_7");
             let query = format!("PlaySessionId={play_session_id}&api_key={api_key}");
 
             let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/Videos/hdhr_7/master.m3u8?{query}"))
+                        .uri(format!("/Videos/{public_channel_id}/master.m3u8?{query}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -101449,7 +103465,7 @@ done
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/Videos/hdhr_7/main.m3u8?{query}"))
+                        .uri(format!("/Videos/{public_channel_id}/main.m3u8?{query}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -101460,7 +103476,7 @@ done
             let media_playlist = String::from_utf8_lossy(&body);
             let segment_uri = media_playlist
                 .lines()
-                .find(|line| line.contains("/Videos/hdhr_7/hls1/main/0.ts"))
+                .find(|line| line.contains(&format!("/Videos/{public_channel_id}/hls1/main/0.ts")))
                 .unwrap_or_else(|| panic!("media playlist has no first segment: {media_playlist}"));
 
             let response = app
@@ -102229,6 +104245,7 @@ done
                 None,
                 "Video",
                 uuid::Uuid::nil(),
+                None,
             )
             .await;
             assert!(
@@ -102384,7 +104401,11 @@ done
             child["IsSeries"], false,
             "child timer IsSeries must be false"
         );
-        assert_eq!(child["ProgramId"].as_str(), Some("prog-001"));
+        assert_eq!(
+            child["ProgramId"].as_str(),
+            Some(super::stable_jellyfin_uuid("LiveTvProgram", "prog-001").as_str())
+        );
+        assert_eq!(child["JellyrinProgramId"].as_str(), Some("prog-001"));
         assert_eq!(child["Name"].as_str(), Some("Serie Test"));
     }
 

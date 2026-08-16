@@ -37,8 +37,8 @@ use spec::{
 };
 use value::{TypedValue, parse_uuid};
 
-pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_130_001;
-pub const TARGET_SCHEMA_VERSION: i64 = 202_608_130_001;
+pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_140_001;
+pub const TARGET_SCHEMA_VERSION: i64 = 202_608_150_002;
 const MIN_POSTGRES_VERSION_NUM: i64 = 160_000;
 const MIGRATION_BATCH_ROWS: usize = 500;
 const TARGET_APPLICATION_LOCK_TIMEOUT: &str = "10s";
@@ -49,6 +49,7 @@ const CASE_INSENSITIVE_PLUGIN_ID_TABLES: &[&str] = &[
     "plugin_configurations",
     "plugin_permissions",
 ];
+// Recompile this one-shot binary whenever the embedded migration set changes.
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator =
     sqlx::migrate!("../jellyrin-db/migrations-postgres");
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../jellyrin-db/migrations");

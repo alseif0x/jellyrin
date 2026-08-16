@@ -25,6 +25,12 @@ services:
       - -c
       - maintenance_work_mem=64MB
       - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - wal_compression=on
+      - -c
       - log_min_duration_statement=500ms
       - -c
       - shared_preload_libraries=pg_stat_statements

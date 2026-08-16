@@ -391,13 +391,15 @@ fn insert_facet(
             display_value: display.to_string(),
             position: current_position,
             payload: payload.clone(),
-            aliases: BTreeSet::from([stable_id.clone()]),
+            aliases: BTreeSet::new(),
         });
-    facet.aliases.insert(stable_id);
     if let Some(imported_id) = imported_id.map(str::trim).filter(|id| !id.is_empty()) {
-        facet.aliases.insert(imported_id.to_ascii_lowercase());
+        let imported_id = imported_id.to_ascii_lowercase();
+        if imported_id != stable_id {
+            facet.aliases.insert(imported_id.clone());
+        }
         if kind == MediaItemFacetKind::Person
-            && let Ok(imported_uuid) = Uuid::parse_str(imported_id)
+            && let Ok(imported_uuid) = Uuid::parse_str(&imported_id)
         {
             facet.aliases.insert(imported_uuid.simple().to_string());
         }
@@ -533,11 +535,7 @@ mod tests {
         assert_eq!(jane.position, 0);
         assert_eq!(
             jane.aliases,
-            vec![
-                stable_entity_id("Person", "Jane Doe"),
-                "imported-person".to_string(),
-                "second-id".to_string(),
-            ]
+            vec!["imported-person".to_string(), "second-id".to_string()]
         );
         assert!(facets.iter().any(|facet| {
             facet.kind == MediaItemFacetKind::Tag && facet.display_value == "2026"

@@ -83,6 +83,10 @@ services:
       # The process listens on the container interface; Docker publishes it only on host loopback.
       JELLYRIN_HOST: "0.0.0.0"
       JELLYRIN_PORT: "8096"
+      # Bounded Xtream pipeline: category prefetchers feed globally shared detail workers.
+      JELLYRIN_XTREAM_SERIES_CATEGORY_CONCURRENCY: ${JELLYRIN_XTREAM_SERIES_CATEGORY_CONCURRENCY:-2}
+      JELLYRIN_XTREAM_SERIES_DETAIL_CONCURRENCY: ${JELLYRIN_XTREAM_SERIES_DETAIL_CONCURRENCY:-8}
+      JELLYRIN_XTREAM_VOD_DETAIL_CONCURRENCY: ${JELLYRIN_XTREAM_VOD_DETAIL_CONCURRENCY:-5}
     depends_on:
       postgres:
         condition: service_healthy

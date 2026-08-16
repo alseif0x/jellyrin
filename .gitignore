@@ -1,5 +1,6 @@
 /target/
 /.env
+/.runtime-secrets/
 /ops/jellyrin.env
 /ops/jellyrin-migrate.env
 /data/

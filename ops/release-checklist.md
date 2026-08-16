@@ -113,8 +113,10 @@
 - Copy `ops/compose.env.example` to `.env`, fill every database secret with
   an independently generated URL-safe value, and set the file to mode `0600`.
 - Copy `ops/jellyrin.env.example` to the ignored `ops/jellyrin.env` and review
-  the resource/transcode limits. Keep `JELLYRIN_MAX_FFMPEG_JOBS=1` on the
-  low-resource index/proxy node until measurements justify more concurrency.
+  the resource/transcode limits. Keep at least `JELLYRIN_MAX_FFMPEG_JOBS=2`
+  when embedded HLS subtitles are enabled: one slot serves A/V and the other
+  permits an in-player subtitle switch. Keep each per-lane cap at one on the
+  low-resource index/proxy node.
 - Keep `JELLYRIN_PUBLISH_ADDRESS=127.0.0.1`; an intentional LAN-facing DLNA
   deployment must use the separate host-network override and firewall review.
 - If enabling the provider-keyring overlay, make its host file `root:10001`
@@ -212,10 +214,10 @@
 - Verify cargo-audit used the locked RustSec revision, Trivy recorded current database metadata,
   and no vulnerability exception is expired or carried forward without a reviewed tracking issue.
 - Diff the newly shipped environment example against the installed environment
-  instead of reusing it blindly. Preserve `JELLYRIN_FFMPEG_MODE=remux-only` (or
-  `disabled`), the aggregate FFmpeg cap and the queue/per-lane limits unless
-  encode has been explicitly approved from measured client requirements and
-  host capacity.
+  instead of reusing it blindly. Preserve the aggregate FFmpeg cap and the
+  queue/per-lane limits. The default `JELLYRIN_FFMPEG_MODE=enabled` is required
+  for heterogeneous Android, Android TV and browser codecs; use `remux-only`
+  only for a measured direct-play-compatible client fleet.
 - Install the new binary or image.
 - For each published architecture, retain its own image/source SPDX and
   CycloneDX bundle. The native amd64 CI artifact does not attest arm64.

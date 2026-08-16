@@ -27,6 +27,7 @@ const DEFAULT_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_API_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_WORKER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+// Keep this declaration in the dependency graph whenever a new embedded migration is added.
 pub(crate) static POSTGRES_MIGRATOR: sqlx::migrate::Migrator =
     sqlx::migrate!("./migrations-postgres");
 

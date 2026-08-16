@@ -181,8 +181,50 @@ pub(crate) fn parse_media_browser_pairs(header: &str) -> Vec<(String, String)> {
             let (key, value) = part.trim().split_once('=')?;
             Some((
                 key.trim().to_ascii_lowercase(),
-                value.trim().trim_matches('"').to_string(),
+                decode_media_browser_value(value.trim().trim_matches('"')),
             ))
         })
         .collect()
+}
+
+fn decode_media_browser_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let Some(high) = hex_value(bytes[index + 1]) else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                    continue;
+                };
+                let Some(low) = hex_value(bytes[index + 2]) else {
+                    decoded.push(bytes[index]);
+                    index += 1;
+                    continue;
+                };
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
+}
+
+const fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }

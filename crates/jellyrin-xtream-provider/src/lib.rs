@@ -1,12 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     net::{IpAddr, Ipv4Addr},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose};
@@ -41,6 +41,7 @@ const XTREAM_MAX_CREDENTIAL_BYTES: usize = 4 * 1024;
 const XTREAM_MAX_CATALOG_BODY_BYTES: usize = 64 * 1024 * 1024;
 const XTREAM_MAX_CATEGORY_BODY_BYTES: usize = 8 * 1024 * 1024;
 const XTREAM_MAX_SERIES_INFO_BODY_BYTES: usize = 16 * 1024 * 1024;
+const XTREAM_MAX_VOD_INFO_BODY_BYTES: usize = 2 * 1024 * 1024;
 const XTREAM_MAX_EPG_BODY_BYTES: usize = 2 * 1024 * 1024;
 const XTREAM_MAX_CATEGORY_ITEMS: usize = 10_000;
 const XTREAM_MAX_SERIES_REQUESTS: usize = 100_000;
@@ -48,7 +49,51 @@ const XTREAM_MAX_EPISODES_PER_SERIES: usize = 10_000;
 const XTREAM_MAX_EPG_LISTINGS: usize = 256;
 const XTREAM_ARRAY_CHUNK_ITEMS: usize = 500;
 const XTREAM_SERIES_INFO_ATTEMPTS: usize = 4;
-const XTREAM_SERIES_DETAIL_CONCURRENCY: usize = 1;
+const XTREAM_VOD_INFO_ATTEMPTS: usize = 3;
+const XTREAM_VOD_DETAIL_CONCURRENCY_DEFAULT: usize = 5;
+const XTREAM_VOD_DETAIL_CONCURRENCY_MAX: usize = 16;
+const XTREAM_VOD_DETAIL_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const XTREAM_SERIES_CATEGORY_CONCURRENCY_DEFAULT: usize = 2;
+const XTREAM_SERIES_CATEGORY_CONCURRENCY_MAX: usize = 5;
+const XTREAM_SERIES_DETAIL_CONCURRENCY_DEFAULT: usize = 8;
+const XTREAM_SERIES_DETAIL_CONCURRENCY_MAX: usize = 32;
+
+fn bounded_concurrency_from_env(name: &str, default: usize, maximum: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(1, maximum))
+        .unwrap_or(default)
+}
+
+fn xtream_series_category_concurrency() -> usize {
+    bounded_concurrency_from_env(
+        "JELLYRIN_XTREAM_SERIES_CATEGORY_CONCURRENCY",
+        XTREAM_SERIES_CATEGORY_CONCURRENCY_DEFAULT,
+        XTREAM_SERIES_CATEGORY_CONCURRENCY_MAX,
+    )
+}
+
+fn xtream_series_detail_concurrency() -> usize {
+    bounded_concurrency_from_env(
+        "JELLYRIN_XTREAM_SERIES_DETAIL_CONCURRENCY",
+        XTREAM_SERIES_DETAIL_CONCURRENCY_DEFAULT,
+        XTREAM_SERIES_DETAIL_CONCURRENCY_MAX,
+    )
+}
+
+fn xtream_vod_detail_concurrency() -> usize {
+    bounded_concurrency_from_env(
+        "JELLYRIN_XTREAM_VOD_DETAIL_CONCURRENCY",
+        XTREAM_VOD_DETAIL_CONCURRENCY_DEFAULT,
+        XTREAM_VOD_DETAIL_CONCURRENCY_MAX,
+    )
+}
+
+fn xtream_vod_detail_limiter() -> &'static Arc<tokio::sync::Semaphore> {
+    static LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    LIMITER.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(xtream_vod_detail_concurrency())))
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum XtreamFetchError {
@@ -114,6 +159,7 @@ impl fmt::Display for XtreamImportError {
 
 impl std::error::Error for XtreamImportError {}
 
+#[derive(Clone)]
 struct ValidatedXtreamClient {
     base_url: reqwest::Url,
     client: HttpClient,
@@ -151,7 +197,11 @@ impl ValidatedXtreamClient {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(XTREAM_CONNECT_TIMEOUT)
             .timeout(XTREAM_MAX_REQUEST_TIMEOUT)
-            .pool_max_idle_per_host(2)
+            .pool_max_idle_per_host(
+                xtream_series_detail_concurrency()
+                    + xtream_series_category_concurrency()
+                    + xtream_vod_detail_concurrency(),
+            )
             .user_agent(LIVE_TV_REMOTE_USER_AGENT)
             .resolve_to_addrs(&host, &pinned)
             .build()
@@ -275,6 +325,52 @@ pub fn resolve_remote_source_ref(
         ),
         _ => None,
     }
+}
+
+/// Fetches and normalizes one Xtream VOD detail response. Callers persist the returned fields in
+/// their catalogue record, making PostgreSQL the durable cache and avoiding a detail request on
+/// subsequent item views. The global permit protects providers when several clients open movie
+/// pages concurrently; credentials remain confined to the validated request builder.
+pub async fn fetch_vod_metadata_from_payload(
+    tuner_config: &serde_json::Value,
+    stream_id: &str,
+) -> Result<serde_json::Value, XtreamImportError> {
+    if !valid_xtream_identifier(stream_id) {
+        return Err(XtreamImportError::new(
+            "VOD details",
+            XtreamFetchError::InvalidInput,
+        ));
+    }
+    let base_url = json_string_field(tuner_config, "Url")
+        .ok_or_else(|| XtreamImportError::new("VOD details", XtreamFetchError::InvalidInput))?;
+    let username = json_string_field(tuner_config, "Username")
+        .or_else(|| json_string_field(tuner_config, "UserName"))
+        .ok_or_else(|| XtreamImportError::new("VOD details", XtreamFetchError::InvalidInput))?;
+    let password = json_string_field(tuner_config, "Password")
+        .ok_or_else(|| XtreamImportError::new("VOD details", XtreamFetchError::InvalidInput))?;
+    let client = ValidatedXtreamClient::new(&base_url)
+        .await
+        .map_err(|error| XtreamImportError::new("VOD details", error))?;
+    let permit = tokio::time::timeout(
+        XTREAM_VOD_DETAIL_QUEUE_TIMEOUT,
+        Arc::clone(xtream_vod_detail_limiter()).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        XtreamImportError::new(
+            "VOD details",
+            XtreamFetchError::Request {
+                timeout: true,
+                connect: false,
+            },
+        )
+    })?
+    .map_err(|_| XtreamImportError::new("VOD details", XtreamFetchError::Client))?;
+    let detail = fetch_vod_info(&client, &username, &password, stream_id)
+        .await
+        .map_err(|error| XtreamImportError::new("VOD details", error));
+    drop(permit);
+    detail.map(|detail| normalized_vod_info_metadata(stream_id, &detail))
 }
 
 fn encoded_live_provider_reference(reference: &XtreamRemoteSourceRef) -> Option<String> {
@@ -981,6 +1077,48 @@ async fn fetch_series_info(
     }
 }
 
+async fn fetch_vod_info(
+    client: &ValidatedXtreamClient,
+    username: &str,
+    password: &str,
+    stream_id: &str,
+) -> Result<serde_json::Value, XtreamFetchError> {
+    let mut attempt = 0usize;
+    let result = loop {
+        attempt = attempt.saturating_add(1);
+        let result = fetch_xtream_json::<serde_json::Value>(
+            client,
+            username,
+            password,
+            "get_vod_info",
+            Duration::from_secs(15),
+            XTREAM_MAX_VOD_INFO_BODY_BYTES,
+            &[("vod_id", stream_id)],
+        )
+        .await;
+        if result
+            .as_ref()
+            .err()
+            .is_none_or(|error| !transient_xtream_fetch_error(*error))
+            || attempt >= XTREAM_VOD_INFO_ATTEMPTS
+        {
+            break result;
+        }
+        tokio::time::sleep(xtream_series_retry_delay(attempt)).await;
+    };
+    match result {
+        Ok(value) if valid_vod_info_shape(&value) => Ok(value),
+        Ok(_) => {
+            warn_xtream_fetch("get_vod_info", XtreamFetchError::InvalidCatalog);
+            Err(XtreamFetchError::InvalidCatalog)
+        }
+        Err(error) => {
+            warn_xtream_fetch("get_vod_info", error);
+            Err(error)
+        }
+    }
+}
+
 fn transient_xtream_fetch_error(error: XtreamFetchError) -> bool {
     matches!(
         error,
@@ -1113,6 +1251,142 @@ fn warn_xtream_fetch(action: &str, error: XtreamFetchError) {
 fn valid_series_info_shape(info: &serde_json::Value) -> bool {
     info.get("episodes")
         .is_some_and(|episodes| episodes.is_array() || episodes.is_object())
+}
+
+fn valid_vod_info_shape(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.get("info").is_some_and(serde_json::Value::is_object)
+            || object
+                .get("movie_data")
+                .is_some_and(serde_json::Value::is_object)
+    })
+}
+
+fn normalized_vod_info_metadata(stream_id: &str, value: &serde_json::Value) -> serde_json::Value {
+    let movie_data = value
+        .get("movie_data")
+        .filter(|value| value.is_object())
+        .unwrap_or(value);
+    let info = value
+        .get("info")
+        .filter(|value| value.is_object())
+        .unwrap_or(movie_data);
+    let mut metadata = serde_json::Map::new();
+
+    if let Some(overview) = json_string_field(info, "plot")
+        .or_else(|| json_string_field(info, "description"))
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert("Overview".to_string(), serde_json::json!(overview));
+    }
+    let release_date = json_string_field(info, "releasedate")
+        .or_else(|| json_string_field(info, "release_date"))
+        .or_else(|| json_string_field(info, "releaseDate"));
+    let production_year = xtream_i32(info, &["year", "release_year"]).or_else(|| {
+        release_date
+            .as_deref()
+            .and_then(|date| date.get(0..4))
+            .and_then(|year| year.parse::<i32>().ok())
+    });
+    if let Some(year) = production_year.filter(|year| (1870..=2200).contains(year)) {
+        metadata.insert("ProductionYear".to_string(), serde_json::json!(year));
+    }
+    if let Some(release_date) = release_date.filter(|value| !value.trim().is_empty()) {
+        metadata.insert("PremiereDate".to_string(), serde_json::json!(release_date));
+    }
+    if let Some(rating) = xtream_f64(info, &["rating", "rating_5based"])
+        .filter(|rating| rating.is_finite() && *rating >= 0.0)
+    {
+        metadata.insert("CommunityRating".to_string(), serde_json::json!(rating));
+    }
+    if let Some(official_rating) = json_string_field(info, "age")
+        .or_else(|| json_string_field(info, "mpaa_rating"))
+        .filter(|value| !value.trim().is_empty())
+    {
+        metadata.insert(
+            "OfficialRating".to_string(),
+            serde_json::json!(official_rating),
+        );
+    }
+    if let Some(genres) = json_string_list_field(info, "genre").filter(|values| !values.is_empty())
+    {
+        metadata.insert("Genres".to_string(), serde_json::json!(genres));
+    }
+    if let Some(studios) = json_string_list_field(info, "studio")
+        .or_else(|| json_string_list_field(info, "production"))
+        .filter(|values| !values.is_empty())
+    {
+        metadata.insert("Studios".to_string(), serde_json::json!(studios));
+    }
+
+    let mut people = Vec::new();
+    if let Some(directors) = json_string_list_field(info, "director") {
+        people.extend(
+            directors
+                .into_iter()
+                .map(|name| serde_json::json!({ "Name": name, "Type": "Director" })),
+        );
+    }
+    if let Some(cast) =
+        json_string_list_field(info, "cast").or_else(|| json_string_list_field(info, "actors"))
+    {
+        people.extend(
+            cast.into_iter()
+                .map(|name| serde_json::json!({ "Name": name, "Type": "Actor" })),
+        );
+    }
+    people.truncate(256);
+    if !people.is_empty() {
+        metadata.insert("People".to_string(), serde_json::Value::Array(people));
+    }
+
+    let image_url = json_string_field(info, "movie_image")
+        .or_else(|| json_string_field(info, "cover_big"))
+        .or_else(|| json_string_field(info, "cover"))
+        .and_then(|value| safe_xtream_image_url(&value));
+    if let Some(image_url) = image_url {
+        metadata.insert("ImageUrl".to_string(), serde_json::json!(image_url));
+        metadata.insert("PrimaryImageUrl".to_string(), serde_json::json!(image_url));
+    }
+    let backdrop_url = info
+        .get("backdrop_path")
+        .and_then(|value| match value {
+            serde_json::Value::Array(values) => values.iter().find_map(|value| value.as_str()),
+            serde_json::Value::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .and_then(safe_xtream_image_url);
+    if let Some(backdrop_url) = backdrop_url {
+        metadata.insert(
+            "BackdropImageUrl".to_string(),
+            serde_json::json!(backdrop_url),
+        );
+        metadata.insert(
+            "BackdropImageTag".to_string(),
+            serde_json::json!(stable_entity_id("xtream-vod-backdrop", stream_id)),
+        );
+    }
+
+    let mut provider_ids = serde_json::Map::new();
+    provider_ids.insert("Xtream".to_string(), serde_json::json!(stream_id));
+    if let Some(tmdb_id) = json_string_field(info, "tmdb_id")
+        .or_else(|| json_string_field(movie_data, "tmdb_id"))
+        .filter(|value| valid_xtream_identifier(value))
+    {
+        provider_ids.insert("Tmdb".to_string(), serde_json::json!(tmdb_id));
+    }
+    if let Some(imdb_id) = json_string_field(info, "imdb_id")
+        .or_else(|| json_string_field(info, "imdb"))
+        .or_else(|| json_string_field(movie_data, "imdb_id"))
+        .filter(|value| !value.trim().is_empty() && value.len() <= 64)
+    {
+        provider_ids.insert("Imdb".to_string(), serde_json::json!(imdb_id));
+    }
+    metadata.insert(
+        "ProviderIds".to_string(),
+        serde_json::Value::Object(provider_ids),
+    );
+    serde_json::Value::Object(metadata)
 }
 
 fn valid_series_episode_prefix(info: &serde_json::Value, limit: usize) -> bool {
@@ -2329,6 +2603,45 @@ fn xtream_media_library_specs(tuner_id: &str) -> Vec<RemoteMediaLibraryStageSpec
     ]
 }
 
+fn xtream_media_source_revision(
+    payload: &serde_json::Value,
+    tuner_id: &str,
+    base_url: &str,
+    username: &str,
+) -> String {
+    let sorted = |values: &HashSet<String>| {
+        let mut values = values.iter().cloned().collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    };
+    let vod = CategorySelection::from_payload(
+        payload,
+        &["VodCategoryIds", "MovieCategoryIds"],
+        &["ExcludeVodCategoryIds", "ExcludeMovieCategoryIds"],
+    );
+    let series = CategorySelection::from_payload(
+        payload,
+        &["SeriesCategoryIds"],
+        &["ExcludeSeriesCategoryIds"],
+    );
+    let revision = serde_json::json!({
+        "TunerId": tuner_id,
+        "BaseUrl": base_url.trim(),
+        "Account": stable_entity_id("xtream-account", username),
+        "VodInclude": sorted(&vod.include),
+        "VodExclude": sorted(&vod.exclude),
+        "SeriesInclude": sorted(&series.include),
+        "SeriesExclude": sorted(&series.exclude),
+        "MovieLimit": live_tv_u64_field(payload, "MovieLimit")
+            .or_else(|| live_tv_u64_field(payload, "VodLimit")),
+        "SeriesLimit": live_tv_u64_field(payload, "SeriesLimit")
+            .or_else(|| live_tv_u64_field(payload, "XtreamSeriesLimit")),
+        "EpisodeLimit": live_tv_u64_field(payload, "SeriesEpisodeLimit")
+            .or_else(|| live_tv_u64_field(payload, "XtreamSeriesEpisodeLimit")),
+    });
+    stable_entity_id("xtream-media-stage", &revision.to_string())
+}
+
 async fn append_staged_media_items<Database>(
     db: &Database,
     stage: &RemoteMediaCatalogStage,
@@ -2464,6 +2777,7 @@ struct XtreamSyncBodyByteLimits {
     catalog: usize,
     categories: usize,
     series_detail: usize,
+    vod_detail: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -2473,7 +2787,9 @@ struct XtreamMediaSyncLimits {
     max_inspected_items: usize,
     chunk_size_items: usize,
     stage_append_max_items: usize,
+    series_category_concurrency: usize,
     series_detail_concurrency: usize,
+    vod_detail_concurrency: usize,
 }
 
 impl Default for XtreamMediaSyncLimits {
@@ -2483,11 +2799,14 @@ impl Default for XtreamMediaSyncLimits {
                 catalog: XTREAM_MAX_CATALOG_BODY_BYTES,
                 categories: XTREAM_MAX_CATEGORY_BODY_BYTES,
                 series_detail: XTREAM_MAX_SERIES_INFO_BODY_BYTES,
+                vod_detail: XTREAM_MAX_VOD_INFO_BODY_BYTES,
             },
             max_inspected_items: REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS,
             chunk_size_items: XTREAM_ARRAY_CHUNK_ITEMS,
             stage_append_max_items: REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
-            series_detail_concurrency: XTREAM_SERIES_DETAIL_CONCURRENCY,
+            series_category_concurrency: xtream_series_category_concurrency(),
+            series_detail_concurrency: xtream_series_detail_concurrency(),
+            vod_detail_concurrency: xtream_vod_detail_concurrency(),
         }
     }
 }
@@ -2496,6 +2815,26 @@ impl Default for XtreamMediaSyncLimits {
 struct XtreamStagedMedia {
     stage: RemoteMediaCatalogStage,
     counts: XtreamMediaSyncCounts,
+}
+
+fn resumed_xtream_media_sync_counts(
+    movie_count: usize,
+    series_item_count: usize,
+) -> XtreamMediaSyncCounts {
+    XtreamMediaSyncCounts {
+        movies: XtreamMovieSyncCounts {
+            received: movie_count,
+            selected: movie_count,
+            staged: movie_count,
+            published: 0,
+        },
+        series: XtreamSeriesSyncCounts::default(),
+        episodes: XtreamEpisodeSyncCounts {
+            selected: series_item_count,
+            staged: series_item_count,
+            published: 0,
+        },
+    }
 }
 
 fn xtream_media_sync_result_json(counts: XtreamMediaSyncCounts) -> serde_json::Value {
@@ -2514,18 +2853,89 @@ struct XtreamSeriesStageProgress {
     received_series: usize,
     selected_series: usize,
     selected_episodes: usize,
+    prepared_episodes: usize,
     staged_episodes: usize,
     series_ids: HashSet<String>,
     item_ids: HashSet<String>,
     item_paths: HashSet<String>,
     skipped_series: usize,
     deduplicated_series: usize,
+    pending_stage_items: Vec<RemoteMediaItemUpsert>,
+}
+
+async fn flush_xtream_series_stage_items(
+    stage_sender: &tokio::sync::mpsc::Sender<Vec<RemoteMediaItemUpsert>>,
+    progress: &mut XtreamSeriesStageProgress,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if progress.pending_stage_items.is_empty() {
+        return Ok(());
+    }
+    let items = std::mem::take(&mut progress.pending_stage_items);
+    stage_sender.send(items).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "Xtream series stage writer stopped",
+        )
+    })?;
+    Ok(())
+}
+
+async fn write_xtream_series_stage_items<Database>(
+    db: &Database,
+    stage: &RemoteMediaCatalogStage,
+    mut receiver: tokio::sync::mpsc::Receiver<Vec<RemoteMediaItemUpsert>>,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
+where
+    Database: XtreamCatalogStore + Sync,
+{
+    let mut staged_episodes = 0usize;
+    while let Some(items) = receiver.recv().await {
+        staged_episodes = staged_episodes
+            .saturating_add(append_staged_media_items(db, stage, "series", items).await?);
+    }
+    Ok(staged_episodes)
+}
+
+type XtreamSeriesDetailOutput = (
+    serde_json::Value,
+    Result<serde_json::Value, XtreamFetchError>,
+);
+type XtreamSeriesDetailTasks = tokio::task::JoinSet<XtreamSeriesDetailOutput>;
+
+#[allow(clippy::too_many_arguments)]
+async fn append_next_xtream_series_detail(
+    client: &ValidatedXtreamClient,
+    username: &str,
+    password: &str,
+    tuner_id: &str,
+    categories: &[serde_json::Value],
+    episode_limit: usize,
+    stage_sender: &tokio::sync::mpsc::Sender<Vec<RemoteMediaItemUpsert>>,
+    pending: &mut XtreamSeriesDetailTasks,
+    progress: &mut XtreamSeriesStageProgress,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(result) = pending.join_next().await else {
+        return Ok(false);
+    };
+    let (series_item, info) = result?;
+    append_fetched_xtream_series(
+        client,
+        username,
+        password,
+        tuner_id,
+        categories,
+        episode_limit,
+        stage_sender,
+        series_item,
+        info,
+        progress,
+    )
+    .await?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn append_xtream_series_chunks<Database>(
-    db: &Database,
-    stage: &RemoteMediaCatalogStage,
+async fn append_xtream_series_chunks(
     client: &ValidatedXtreamClient,
     username: &str,
     password: &str,
@@ -2536,11 +2946,13 @@ async fn append_xtream_series_chunks<Database>(
     categories: &[serde_json::Value],
     series_limit: Option<usize>,
     episode_limit: usize,
+    detail_concurrency: usize,
+    stage_sender: &tokio::sync::mpsc::Sender<Vec<RemoteMediaItemUpsert>>,
+    pending: &mut XtreamSeriesDetailTasks,
     progress: &mut XtreamSeriesStageProgress,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    Database: XtreamCatalogStore + Sync,
-{
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let detail_username: Arc<str> = Arc::from(username);
+    let detail_password: Arc<str> = Arc::from(password);
     while let Some(chunk) = chunks.receiver.recv().await {
         for series_item in chunk {
             progress.received_series = progress.received_series.saturating_add(1);
@@ -2581,73 +2993,33 @@ where
                 continue;
             }
             progress.selected_series = progress.selected_series.saturating_add(1);
-            let info = match fetch_series_info(client, username, password, &series_id).await {
-                Ok(info) => info,
-                Err(
-                    XtreamFetchError::InvalidCatalog
-                    | XtreamFetchError::TooManyItems
-                    | XtreamFetchError::Http(reqwest::StatusCode::NOT_FOUND),
-                ) => {
-                    progress.skipped_series = progress.skipped_series.saturating_add(1);
-                    continue;
-                }
-                Err(error) if transient_xtream_fetch_error(error) => {
-                    progress.skipped_series = progress.skipped_series.saturating_add(1);
-                    continue;
-                }
-                Err(error) => return Err(XtreamImportError::new("series details", error).into()),
-            };
-            let selected_episode_count = series_episode_count(&info).min(episode_limit);
-            progress.selected_episodes = progress
-                .selected_episodes
-                .saturating_add(selected_episode_count);
-            if progress
-                .staged_episodes
-                .saturating_add(selected_episode_count)
-                > REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS
-            {
-                return Err(XtreamImportError::new(
-                    "series details",
-                    XtreamFetchError::TooManyItems,
+            if pending.len() >= detail_concurrency {
+                append_next_xtream_series_detail(
+                    client,
+                    username,
+                    password,
+                    tuner_id,
+                    categories,
+                    episode_limit,
+                    stage_sender,
+                    pending,
+                    progress,
                 )
-                .into());
+                .await?;
             }
-            if !valid_series_episode_prefix(&info, selected_episode_count)
-                || !xtream_episode_values(&info)
-                    .into_iter()
-                    .take(selected_episode_count)
-                    .all(|(_, episode)| {
-                        valid_xtream_series_episode_source(client, username, password, episode)
-                    })
-            {
-                progress.skipped_series = progress.skipped_series.saturating_add(1);
-                continue;
-            }
-            let items = parse_series_episodes(
-                tuner_id,
-                &series_item,
-                &info,
-                categories,
-                Some(selected_episode_count),
-            );
-            if items.len() != selected_episode_count
-                || !unique_remote_media_catalog(&items)
-                || items.iter().any(|item| {
-                    progress.item_ids.contains(&item.id) || progress.item_paths.contains(&item.path)
-                })
-            {
-                progress.skipped_series = progress.skipped_series.saturating_add(1);
-                continue;
-            }
-            progress
-                .item_ids
-                .extend(items.iter().map(|item| item.id.clone()));
-            progress
-                .item_paths
-                .extend(items.iter().map(|item| item.path.clone()));
-            progress.staged_episodes = progress
-                .staged_episodes
-                .saturating_add(append_staged_media_items(db, stage, "series", items).await?);
+            let detail_client = client.clone();
+            let detail_username = Arc::clone(&detail_username);
+            let detail_password = Arc::clone(&detail_password);
+            pending.spawn(async move {
+                let info = fetch_series_info(
+                    &detail_client,
+                    &detail_username,
+                    &detail_password,
+                    &series_id,
+                )
+                .await;
+                (series_item, info)
+            });
         }
     }
     chunks
@@ -2657,9 +3029,163 @@ where
     Ok(())
 }
 
-async fn stage_xtream_media_from_payload<Database>(
+#[allow(clippy::too_many_arguments)]
+async fn finish_xtream_series_details(
+    client: &ValidatedXtreamClient,
+    username: &str,
+    password: &str,
+    tuner_id: &str,
+    categories: &[serde_json::Value],
+    episode_limit: usize,
+    stage_sender: &tokio::sync::mpsc::Sender<Vec<RemoteMediaItemUpsert>>,
+    pending: &mut XtreamSeriesDetailTasks,
+    progress: &mut XtreamSeriesStageProgress,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    while append_next_xtream_series_detail(
+        client,
+        username,
+        password,
+        tuner_id,
+        categories,
+        episode_limit,
+        stage_sender,
+        pending,
+        progress,
+    )
+    .await?
+    {}
+    flush_xtream_series_stage_items(stage_sender, progress).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn append_fetched_xtream_series(
+    client: &ValidatedXtreamClient,
+    username: &str,
+    password: &str,
+    tuner_id: &str,
+    categories: &[serde_json::Value],
+    episode_limit: usize,
+    stage_sender: &tokio::sync::mpsc::Sender<Vec<RemoteMediaItemUpsert>>,
+    series_item: serde_json::Value,
+    info: Result<serde_json::Value, XtreamFetchError>,
+    progress: &mut XtreamSeriesStageProgress,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let info = match info {
+        Ok(info) => info,
+        Err(
+            XtreamFetchError::InvalidCatalog
+            | XtreamFetchError::TooManyItems
+            | XtreamFetchError::Http(reqwest::StatusCode::NOT_FOUND),
+        ) => {
+            progress.skipped_series = progress.skipped_series.saturating_add(1);
+            return Ok(());
+        }
+        // A transient provider failure is not evidence that the series is
+        // absent. Abort the atomic import after retries instead of publishing
+        // a silently incomplete catalogue.
+        Err(error) if transient_xtream_fetch_error(error) => {
+            return Err(XtreamImportError::new("series details", error).into());
+        }
+        Err(error) => return Err(XtreamImportError::new("series details", error).into()),
+    };
+    let selected_episode_count = series_episode_count(&info).min(episode_limit);
+    progress.selected_episodes = progress
+        .selected_episodes
+        .saturating_add(selected_episode_count);
+    if progress
+        .prepared_episodes
+        .saturating_add(selected_episode_count)
+        > REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS
+    {
+        return Err(
+            XtreamImportError::new("series details", XtreamFetchError::TooManyItems).into(),
+        );
+    }
+    if !valid_series_episode_prefix(&info, selected_episode_count)
+        || !xtream_episode_values(&info)
+            .into_iter()
+            .take(selected_episode_count)
+            .all(|(_, episode)| {
+                valid_xtream_series_episode_source(client, username, password, episode)
+            })
+    {
+        progress.skipped_series = progress.skipped_series.saturating_add(1);
+        return Ok(());
+    }
+    let items = parse_series_episodes(
+        tuner_id,
+        &series_item,
+        &info,
+        categories,
+        Some(selected_episode_count),
+    );
+    if items.len() != selected_episode_count
+        || !unique_remote_media_catalog(&items)
+        || items.iter().any(|item| {
+            progress.item_ids.contains(&item.id) || progress.item_paths.contains(&item.path)
+        })
+    {
+        progress.skipped_series = progress.skipped_series.saturating_add(1);
+        return Ok(());
+    }
+    progress
+        .item_ids
+        .extend(items.iter().map(|item| item.id.clone()));
+    progress
+        .item_paths
+        .extend(items.iter().map(|item| item.path.clone()));
+    progress.prepared_episodes = progress.prepared_episodes.saturating_add(items.len());
+    progress.pending_stage_items.extend(items);
+    if progress.pending_stage_items.len() >= REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS {
+        flush_xtream_series_stage_items(stage_sender, progress).await?;
+    }
+    Ok(())
+}
+
+fn spawn_xtream_series_category_fetch(
+    client: &ValidatedXtreamClient,
+    username: &str,
+    password: &str,
+    category_id: String,
+) -> tokio::task::JoinHandle<(String, Result<XtreamArrayChunks, XtreamFetchError>)> {
+    let client = client.clone();
+    let username: Arc<str> = Arc::from(username);
+    let password: Arc<str> = Arc::from(password);
+    tokio::spawn(async move {
+        let mut attempt = 0usize;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let query = [("category_id", category_id.as_str())];
+            let chunks = fetch_xtream_array_chunks(
+                &client,
+                &username,
+                &password,
+                XtreamArrayFetchOptions {
+                    action: "get_series",
+                    timeout: Duration::from_secs(45),
+                    max_bytes: XTREAM_MAX_CATALOG_BODY_BYTES,
+                    max_items: REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS,
+                    query: &query,
+                },
+            )
+            .await;
+            if chunks
+                .as_ref()
+                .err()
+                .is_none_or(|error| !transient_xtream_fetch_error(*error))
+                || attempt >= XTREAM_SERIES_INFO_ATTEMPTS
+            {
+                return (category_id, chunks);
+            }
+            tokio::time::sleep(xtream_series_retry_delay(attempt)).await;
+        }
+    })
+}
+
+async fn stage_xtream_media_from_payload_with_cancellation<Database>(
     db: &Database,
     payload: &serde_json::Value,
+    mut cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<Option<XtreamStagedMedia>, Box<dyn std::error::Error + Send + Sync>>
 where
     Database: XtreamCatalogStore + Sync,
@@ -2679,6 +3205,23 @@ where
     };
     if !valid_xtream_secret(&username) || !valid_xtream_secret(&password) {
         return Ok(None);
+    }
+    let library_specs = xtream_media_library_specs(&tuner_id);
+    let source_revision = xtream_media_source_revision(payload, &tuner_id, &base_url, &username);
+    if let Some(ready) = db
+        .ready_remote_media_catalog_stage(library_specs.clone(), &source_revision)
+        .await?
+    {
+        tracing::info!(
+            stage_id = ready.stage.id(),
+            movie_count = ready.movie_count,
+            series_item_count = ready.series_item_count,
+            "resuming complete Xtream media catalogue publication"
+        );
+        return Ok(Some(XtreamStagedMedia {
+            stage: ready.stage,
+            counts: resumed_xtream_media_sync_counts(ready.movie_count, ready.series_item_count),
+        }));
     }
     let client = ValidatedXtreamClient::new(&base_url)
         .await
@@ -2726,9 +3269,9 @@ where
     }
 
     let stage = db
-        .begin_remote_media_catalog_stage(xtream_media_library_specs(&tuner_id))
+        .begin_remote_media_catalog_stage_for_revision(library_specs, &source_revision)
         .await?;
-    let staged_result = async {
+    let staged_future = async {
         let mut counts = XtreamMediaSyncCounts::default();
         let vod_selection = CategorySelection::from_payload(
             payload,
@@ -2803,6 +3346,9 @@ where
             .or_else(|| live_tv_u64_field(payload, "XtreamSeriesEpisodeLimit"))
             .map(|value| bounded_usize(value, 1, XTREAM_MAX_EPISODES_PER_SERIES))
             .unwrap_or(XTREAM_MAX_EPISODES_PER_SERIES);
+        let series_sync_started = Instant::now();
+        let category_concurrency = xtream_series_category_concurrency();
+        let detail_concurrency = xtream_series_detail_concurrency();
         let series_chunks = fetch_xtream_array_chunks(
             &client,
             &username,
@@ -2816,81 +3362,125 @@ where
             },
         )
         .await;
-        let mut series_progress = XtreamSeriesStageProgress::default();
-        match series_chunks {
-            Ok(chunks) => {
-                append_xtream_series_chunks(
-                    db,
-                    &stage,
-                    &client,
-                    &username,
-                    &password,
-                    &tuner_id,
-                    chunks,
-                    &series_selection,
-                    None,
-                    &parsed_series_categories,
-                    series_limit,
-                    episode_limit,
-                    &mut series_progress,
-                )
-                .await?;
-            }
-            Err(XtreamFetchError::BodyTooLarge) => {
-                let category_ids = parsed_series_categories
-                    .iter()
-                    .filter_map(|category| json_string_field(category, "Id"))
-                    .filter(|category_id| series_selection.allows(Some(category_id)))
-                    .collect::<Vec<_>>();
-                if category_ids.is_empty() {
-                    return Err(XtreamImportError::new(
-                        "series catalogue",
-                        XtreamFetchError::BodyTooLarge,
-                    )
-                    .into());
-                }
-                tracing::info!(
-                    category_count = category_ids.len(),
-                    "Xtream series catalogue is using validated category chunks"
-                );
-                for category_id in category_ids {
-                    let query = [("category_id", category_id.as_str())];
-                    let chunks = fetch_xtream_array_chunks(
-                        &client,
-                        &username,
-                        &password,
-                        XtreamArrayFetchOptions {
-                            action: "get_series",
-                            timeout: Duration::from_secs(45),
-                            max_bytes: XTREAM_MAX_CATALOG_BODY_BYTES,
-                            max_items: REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS,
-                            query: &query,
-                        },
-                    )
-                    .await
-                    .map_err(|error| XtreamImportError::new("series catalogue category", error))?;
+        let (series_stage_sender, series_stage_receiver) = tokio::sync::mpsc::channel(4);
+        let series_producer = async {
+            let mut series_progress = XtreamSeriesStageProgress::default();
+            let mut pending_series_details = XtreamSeriesDetailTasks::new();
+            match series_chunks {
+                Ok(chunks) => {
                     append_xtream_series_chunks(
-                        db,
-                        &stage,
                         &client,
                         &username,
                         &password,
                         &tuner_id,
                         chunks,
                         &series_selection,
-                        Some(&category_id),
+                        None,
                         &parsed_series_categories,
                         series_limit,
                         episode_limit,
+                        detail_concurrency,
+                        &series_stage_sender,
+                        &mut pending_series_details,
                         &mut series_progress,
                     )
                     .await?;
                 }
+                Err(XtreamFetchError::BodyTooLarge) => {
+                    let category_ids = parsed_series_categories
+                        .iter()
+                        .filter_map(|category| json_string_field(category, "Id"))
+                        .filter(|category_id| series_selection.allows(Some(category_id)))
+                        .collect::<Vec<_>>();
+                    if category_ids.is_empty() {
+                        return Err(XtreamImportError::new(
+                            "series catalogue",
+                            XtreamFetchError::BodyTooLarge,
+                        )
+                        .into());
+                    }
+                    tracing::info!(
+                        category_count = category_ids.len(),
+                        category_concurrency,
+                        detail_concurrency,
+                        "Xtream series catalogue is using validated category chunks"
+                    );
+                    let mut category_ids = category_ids.into_iter();
+                    let mut category_fetches = VecDeque::new();
+                    for category_id in category_ids.by_ref().take(category_concurrency) {
+                        category_fetches.push_back(spawn_xtream_series_category_fetch(
+                            &client,
+                            &username,
+                            &password,
+                            category_id,
+                        ));
+                    }
+                    while let Some(fetch) = category_fetches.pop_front() {
+                        let (category_id, chunks) = fetch.await?;
+                        if let Some(next_category_id) = category_ids.next() {
+                            category_fetches.push_back(spawn_xtream_series_category_fetch(
+                                &client,
+                                &username,
+                                &password,
+                                next_category_id,
+                            ));
+                        }
+                        let chunks = chunks.map_err(|error| {
+                            XtreamImportError::new("series catalogue category", error)
+                        })?;
+                        append_xtream_series_chunks(
+                            &client,
+                            &username,
+                            &password,
+                            &tuner_id,
+                            chunks,
+                            &series_selection,
+                            Some(&category_id),
+                            &parsed_series_categories,
+                            series_limit,
+                            episode_limit,
+                            detail_concurrency,
+                            &series_stage_sender,
+                            &mut pending_series_details,
+                            &mut series_progress,
+                        )
+                        .await?;
+                    }
+                }
+                Err(error) => {
+                    return Err(XtreamImportError::new("series catalogue", error).into());
+                }
             }
-            Err(error) => {
-                return Err(XtreamImportError::new("series catalogue", error).into());
-            }
-        }
+            finish_xtream_series_details(
+                &client,
+                &username,
+                &password,
+                &tuner_id,
+                &parsed_series_categories,
+                episode_limit,
+                &series_stage_sender,
+                &mut pending_series_details,
+                &mut series_progress,
+            )
+            .await?;
+            drop(series_stage_sender);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(series_progress)
+        };
+        let series_writer = write_xtream_series_stage_items(db, &stage, series_stage_receiver);
+        let (mut series_progress, staged_episodes) =
+            tokio::try_join!(series_producer, series_writer)?;
+        series_progress.staged_episodes = staged_episodes;
+        let series_sync_elapsed = series_sync_started.elapsed();
+        tracing::info!(
+            stage_id = stage.id(),
+            elapsed_ms = series_sync_elapsed.as_millis(),
+            selected_series = series_progress.selected_series,
+            staged_episodes,
+            episodes_per_second = staged_episodes as f64 / series_sync_elapsed.as_secs_f64(),
+            category_concurrency,
+            detail_concurrency,
+            "Xtream series catalogue staging completed"
+        );
         counts.series = XtreamSeriesSyncCounts {
             received: series_progress.received_series,
             selected: series_progress.selected_series,
@@ -2903,11 +3493,41 @@ where
             published: 0,
         };
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(counts)
-    }
-    .await;
+    };
+    let staged_result = {
+        tokio::pin!(staged_future);
+        if let Some(cancellation) = cancellation.as_mut() {
+            if *cancellation.borrow() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Xtream media sync cancelled",
+                )
+                .into())
+            } else {
+                tokio::select! {
+                    result = &mut staged_future => result,
+                    _ = cancellation.changed() => Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "Xtream media sync cancelled",
+                    ).into()),
+                }
+            }
+        } else {
+            staged_future.as_mut().await
+        }
+    };
 
     match staged_result {
-        Ok(counts) => Ok(Some(XtreamStagedMedia { stage, counts })),
+        Ok(counts) => {
+            if let Err(error) = db.complete_remote_media_catalog_stage(&stage).await {
+                let _ = db.abort_remote_media_catalog_stage(&stage).await;
+                return Err(error.into());
+            }
+            Ok(Some(XtreamStagedMedia {
+                stage: stage.clone(),
+                counts,
+            }))
+        }
         Err(error) => {
             let _ = db.abort_remote_media_catalog_stage(&stage).await;
             Err(error)
@@ -2981,15 +3601,32 @@ async fn sync_xtream_media_counts_from_payload<Database>(
 where
     Database: XtreamCatalogStore + Sync,
 {
+    sync_xtream_media_counts_from_payload_with_cancellation(db, payload, None).await
+}
+
+async fn sync_xtream_media_counts_from_payload_with_cancellation<Database>(
+    db: &Database,
+    payload: &serde_json::Value,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<Option<XtreamMediaSyncCounts>, Box<dyn std::error::Error + Send + Sync>>
+where
+    Database: XtreamCatalogStore + Sync,
+{
     db.cleanup_abandoned_remote_media_catalog_stages(
         OffsetDateTime::now_utc() - time::Duration::hours(24),
     )
     .await?;
-    let Some(mut staged) = stage_xtream_media_from_payload(db, payload).await? else {
+    let Some(mut staged) =
+        stage_xtream_media_from_payload_with_cancellation(db, payload, cancellation).await?
+    else {
         return Ok(None);
     };
     if let Err(error) = db.publish_remote_media_catalog_stage(&staged.stage).await {
-        let _ = db.abort_remote_media_catalog_stage(&staged.stage).await;
+        tracing::warn!(
+            stage_id = staged.stage.id(),
+            %error,
+            "Xtream media catalogue publication failed; complete stage retained for retry"
+        );
         return Err(error.into());
     }
     staged.counts.mark_published();
@@ -3016,6 +3653,17 @@ pub async fn sync_all_configured_xtream_media<Database>(
 where
     Database: XtreamCatalogStore + Sync,
 {
+    sync_all_configured_xtream_media_with_cancellation(db, None).await
+}
+
+/// Sync all configured Xtream tuners and cooperatively abort an incomplete stage when requested.
+pub async fn sync_all_configured_xtream_media_with_cancellation<Database>(
+    db: &Database,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>
+where
+    Database: XtreamCatalogStore + Sync,
+{
     let tuners = db
         .live_tv_tuner_configurations_by_provider(XTREAM_PROVIDER_TYPE)
         .await?;
@@ -3023,7 +3671,13 @@ where
     let mut skipped_tuners = 0usize;
     let mut counts = XtreamMediaSyncCounts::default();
     for tuner in tuners {
-        match sync_xtream_media_counts_from_payload(db, &tuner).await? {
+        match sync_xtream_media_counts_from_payload_with_cancellation(
+            db,
+            &tuner,
+            cancellation.clone(),
+        )
+        .await?
+        {
             Some(tuner_counts) => {
                 synced_tuners += 1;
                 counts.saturating_add_assign(tuner_counts);
@@ -3073,12 +3727,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn series_stage_flushes_large_buffers_in_bounded_database_batches() {
+        let store = RecordingCatalogStore::default();
+        let stage =
+            RemoteMediaCatalogStage::try_from_id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let mut progress = XtreamSeriesStageProgress {
+            pending_stage_items: (0..=REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS)
+                .map(|index| RemoteMediaItemUpsert {
+                    id: stable_entity_id("xtream-batch-test", &index.to_string()),
+                    name: format!("Episode {index}"),
+                    path: format!("xtream://series/{index}.mp4"),
+                    media_type: "Video".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: serde_json::json!({"Type": "Episode"}),
+                })
+                .collect(),
+            ..XtreamSeriesStageProgress::default()
+        };
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        flush_xtream_series_stage_items(&sender, &mut progress)
+            .await
+            .unwrap();
+        drop(sender);
+        let staged_episodes = write_xtream_series_stage_items(&store, &stage, receiver)
+            .await
+            .unwrap();
+
+        assert!(progress.pending_stage_items.is_empty());
+        assert_eq!(
+            staged_episodes,
+            REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS + 1
+        );
+        assert_eq!(
+            *store.staged_appends.lock().unwrap(),
+            vec![
+                (
+                    "series".to_string(),
+                    REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
+                ),
+                ("series".to_string(), 1),
+            ]
+        );
+    }
+
     #[derive(Clone, Default)]
     struct RecordingCatalogStore {
         snapshots: std::sync::Arc<std::sync::Mutex<Vec<(String, String, usize)>>>,
         batch_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         staged_libraries: std::sync::Arc<std::sync::Mutex<Vec<RemoteMediaLibraryStageSpec>>>,
+        staged_source_revision: std::sync::Arc<std::sync::Mutex<String>>,
         staged_appends: std::sync::Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+        stage_ready: std::sync::Arc<AtomicBool>,
         stage_published: std::sync::Arc<AtomicBool>,
         stage_aborted: std::sync::Arc<AtomicBool>,
     }
@@ -3125,8 +3831,33 @@ mod tests {
         ) -> impl std::future::Future<Output = anyhow::Result<RemoteMediaCatalogStage>> + Send
         {
             let staged_libraries = Arc::clone(&self.staged_libraries);
+            let staged_source_revision = Arc::clone(&self.staged_source_revision);
+            let staged_appends = Arc::clone(&self.staged_appends);
+            let stage_ready = Arc::clone(&self.stage_ready);
             async move {
                 *staged_libraries.lock().unwrap() = libraries;
+                staged_source_revision.lock().unwrap().clear();
+                staged_appends.lock().unwrap().clear();
+                stage_ready.store(false, Ordering::Relaxed);
+                RemoteMediaCatalogStage::try_from_id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+            }
+        }
+
+        fn begin_remote_media_catalog_stage_for_revision<'a>(
+            &'a self,
+            libraries: Vec<RemoteMediaLibraryStageSpec>,
+            source_revision: &'a str,
+        ) -> impl std::future::Future<Output = anyhow::Result<RemoteMediaCatalogStage>> + Send + 'a
+        {
+            let staged_libraries = Arc::clone(&self.staged_libraries);
+            let staged_source_revision = Arc::clone(&self.staged_source_revision);
+            let staged_appends = Arc::clone(&self.staged_appends);
+            let stage_ready = Arc::clone(&self.stage_ready);
+            async move {
+                *staged_libraries.lock().unwrap() = libraries;
+                *staged_source_revision.lock().unwrap() = source_revision.to_string();
+                staged_appends.lock().unwrap().clear();
+                stage_ready.store(false, Ordering::Relaxed);
                 RemoteMediaCatalogStage::try_from_id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
             }
         }
@@ -3151,6 +3882,54 @@ mod tests {
             }
         }
 
+        fn complete_remote_media_catalog_stage<'a>(
+            &'a self,
+            _stage: &'a RemoteMediaCatalogStage,
+        ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send + 'a {
+            let stage_ready = Arc::clone(&self.stage_ready);
+            async move {
+                stage_ready.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        fn ready_remote_media_catalog_stage<'a>(
+            &'a self,
+            libraries: Vec<RemoteMediaLibraryStageSpec>,
+            source_revision: &'a str,
+        ) -> impl std::future::Future<
+            Output = anyhow::Result<Option<jellyrin_db::ReadyRemoteMediaCatalogStage>>,
+        > + Send
+        + 'a {
+            let staged_libraries = Arc::clone(&self.staged_libraries);
+            let staged_source_revision = Arc::clone(&self.staged_source_revision);
+            let staged_appends = Arc::clone(&self.staged_appends);
+            let stage_ready = Arc::clone(&self.stage_ready);
+            async move {
+                if !stage_ready.load(Ordering::Relaxed)
+                    || *staged_libraries.lock().unwrap() != libraries
+                    || *staged_source_revision.lock().unwrap() != source_revision
+                {
+                    return Ok(None);
+                }
+                let appends = staged_appends.lock().unwrap();
+                let count = |key: &str| {
+                    appends
+                        .iter()
+                        .filter(|(library_key, _)| library_key == key)
+                        .map(|(_, count)| *count)
+                        .sum()
+                };
+                Ok(Some(jellyrin_db::ReadyRemoteMediaCatalogStage {
+                    stage: RemoteMediaCatalogStage::try_from_id(
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    )?,
+                    movie_count: count("movies"),
+                    series_item_count: count("series"),
+                }))
+            }
+        }
+
         fn publish_remote_media_catalog_stage<'a>(
             &'a self,
             _stage: &'a RemoteMediaCatalogStage,
@@ -3158,8 +3937,10 @@ mod tests {
         + Send
         + 'a {
             let published = Arc::clone(&self.stage_published);
+            let stage_ready = Arc::clone(&self.stage_ready);
             async move {
                 published.store(true, Ordering::Relaxed);
+                stage_ready.store(false, Ordering::Relaxed);
                 Ok(Vec::new())
             }
         }
@@ -3286,7 +4067,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut series_200_requests = 0usize;
-            for _ in 0..13 {
+            for _ in 0..10 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 loop {
@@ -3328,7 +4109,7 @@ mod tests {
                 if request.contains("action=get_series_info") && request.contains("series_id=300") {
                     stream
                         .write_all(
-                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         )
                         .await
                         .unwrap();
@@ -3503,6 +4284,46 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn staged_sync_reuses_a_complete_matching_catalogue_without_provider_requests() {
+        let payload = serde_json::json!({
+            "Id": XTREAM_PRIMARY_TUNER_ID,
+            "Url": "http://127.0.0.1:9",
+            "Username": "account",
+            "Password": "secret",
+            "MovieLimit": 0,
+            "SeriesLimit": 0
+        });
+        let store = RecordingCatalogStore::default();
+        *store.staged_libraries.lock().unwrap() =
+            xtream_media_library_specs(XTREAM_PRIMARY_TUNER_ID);
+        *store.staged_source_revision.lock().unwrap() = xtream_media_source_revision(
+            &payload,
+            XTREAM_PRIMARY_TUNER_ID,
+            "http://127.0.0.1:9",
+            "account",
+        );
+        *store.staged_appends.lock().unwrap() = vec![
+            ("movies".to_string(), 36_007),
+            ("series".to_string(), 369_167),
+        ];
+        store.stage_ready.store(true, Ordering::Relaxed);
+
+        let result = sync_xtream_media_from_payload(&store, &payload)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result["MovieCount"], 36_007);
+        assert_eq!(result["SeriesEpisodeCount"], 369_167);
+        assert_eq!(result["Metrics"]["Movies"]["Published"], 36_007);
+        assert_eq!(result["Metrics"]["Episodes"]["Published"], 369_167);
+        assert!(store.stage_published.load(Ordering::Relaxed));
+        assert!(!store.stage_ready.load(Ordering::Relaxed));
+        assert!(store.staged_libraries.lock().unwrap().len() == 2);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn staged_sync_distinguishes_received_selected_staged_and_published_movies() {
         let _private_urls = PrivateProviderUrlsGuard::allow();
         let vod_streams = serde_json::to_vec(&serde_json::json!([
@@ -3627,7 +4448,11 @@ mod tests {
         );
         assert_eq!(
             result["Limits"]["SeriesDetailConcurrency"],
-            XTREAM_SERIES_DETAIL_CONCURRENCY
+            xtream_series_detail_concurrency()
+        );
+        assert_eq!(
+            result["Limits"]["SeriesCategoryConcurrency"],
+            xtream_series_category_concurrency()
         );
         assert_counts_only(&result["Metrics"]);
         assert_counts_only(&result["Limits"]);
@@ -3778,6 +4603,45 @@ mod tests {
         assert_eq!(
             items[0].metadata["PrimaryImageUrl"],
             "https://images.test/movie.png"
+        );
+    }
+
+    #[test]
+    fn vod_details_normalize_movie_metadata_without_persisting_private_artwork_urls() {
+        let metadata = normalized_vod_info_metadata(
+            "42",
+            &serde_json::json!({
+                "info": {
+                    "plot": "A complete movie synopsis.",
+                    "release_date": "2024-02-03",
+                    "rating": "7.6",
+                    "genre": "Drama, Adventure",
+                    "director": "Director One",
+                    "cast": "Actor One, Actor Two",
+                    "tmdb_id": "1234",
+                    "imdb_id": "tt0123456",
+                    "movie_image": "https://images.test/movie.jpg?token=secret",
+                    "backdrop_path": ["https://images.test/backdrop.jpg"]
+                }
+            }),
+        );
+
+        assert_eq!(metadata["Overview"], "A complete movie synopsis.");
+        assert_eq!(metadata["ProductionYear"], 2024);
+        assert_eq!(metadata["PremiereDate"], "2024-02-03");
+        assert_eq!(metadata["CommunityRating"], 7.6);
+        assert_eq!(
+            metadata["Genres"],
+            serde_json::json!(["Drama", "Adventure"])
+        );
+        assert_eq!(metadata["ProviderIds"]["Xtream"], "42");
+        assert_eq!(metadata["ProviderIds"]["Tmdb"], "1234");
+        assert_eq!(metadata["ProviderIds"]["Imdb"], "tt0123456");
+        assert_eq!(metadata["People"].as_array().map(Vec::len), Some(3));
+        assert!(metadata.get("ImageUrl").is_none());
+        assert_eq!(
+            metadata["BackdropImageUrl"],
+            "https://images.test/backdrop.jpg"
         );
     }
 
