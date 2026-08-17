@@ -855,6 +855,14 @@ pub struct TvSeriesCatalogNameFilter {
     pub less_than: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TvSeriesCatalogNamePatterns<'a> {
+    search: Option<&'a str>,
+    starts_with: Option<&'a str>,
+    lower_bound: Option<&'a str>,
+    upper_bound: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaItemCatalogCounts {
     pub movie_count: u64,
@@ -9321,6 +9329,12 @@ impl SqliteDatabase {
             .map(str::trim)
             .filter(|bound| !bound.is_empty())
             .map(str::to_ascii_lowercase);
+        let name_patterns = TvSeriesCatalogNamePatterns {
+            search: search_pattern.as_deref(),
+            starts_with: starts_with_pattern.as_deref(),
+            lower_bound: lower_bound.as_deref(),
+            upper_bound: upper_bound.as_deref(),
+        };
         let mut transaction = self.pool.begin().await?;
         let virtual_folder_ids =
             virtual_folder_id.map(|id| (id.simple().to_string(), id.to_string()));
@@ -9382,10 +9396,7 @@ impl SqliteDatabase {
                 virtual_folder_ids.as_ref(),
                 start_index,
                 limit,
-                search_pattern.as_deref(),
-                starts_with_pattern.as_deref(),
-                lower_bound.as_deref(),
-                upper_bound.as_deref(),
+                name_patterns,
             )
             .await?;
             transaction.commit().await?;
@@ -9505,10 +9516,7 @@ impl SqliteDatabase {
         virtual_folder_ids: Option<&(String, String)>,
         start_index: usize,
         limit: usize,
-        search_pattern: Option<&str>,
-        starts_with_pattern: Option<&str>,
-        lower_bound: Option<&str>,
-        upper_bound: Option<&str>,
+        name_patterns: TvSeriesCatalogNamePatterns<'_>,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let simple = virtual_folder_ids.map(|(simple, _)| simple.as_str());
         let dashed = virtual_folder_ids.map(|(_, dashed)| dashed.as_str());
@@ -9604,10 +9612,10 @@ impl SqliteDatabase {
         .bind(dashed)
         .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
-        .bind(search_pattern)
-        .bind(starts_with_pattern)
-        .bind(lower_bound)
-        .bind(upper_bound)
+        .bind(name_patterns.search)
+        .bind(name_patterns.starts_with)
+        .bind(name_patterns.lower_bound)
+        .bind(name_patterns.upper_bound)
         .fetch_all(&mut **tx)
         .await?;
         let Some(first) = grouped.first() else {

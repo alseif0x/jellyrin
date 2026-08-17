@@ -45,8 +45,19 @@ async function main() {
     check('docker-migrator-binary', dockerfile.includes('/usr/local/bin/jellyrin-migrate')),
     check('docker-runtime-ffmpeg', dockerfile.includes('ffmpeg') && dockerfile.includes('USER 10001:10001')),
     check('docker-stable-secret-reader-identity', dockerfile.includes('USER 10001:10001') && dockerfile.includes('--chown=10001:10001')),
-    check('docker-safe-ffmpeg-default', dockerfile.includes('JELLYRIN_FFMPEG_MODE=remux-only')),
-    check('docker-bounded-build-jobs', dockerfile.includes('ARG CARGO_BUILD_JOBS=2') && dockerfile.includes('CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} cargo build')),
+    check(
+      'docker-safe-ffmpeg-default',
+      dockerfile.includes('JELLYRIN_FFMPEG_MODE=enabled') &&
+        env.includes('JELLYRIN_MAX_FFMPEG_JOBS=2') &&
+        env.includes('JELLYRIN_MAX_VIDEO_TRANSCODES=1') &&
+        env.includes('JELLYRIN_MAX_AUDIO_TRANSCODES=1') &&
+        env.includes('JELLYRIN_MAX_REMUXES=1'),
+    ),
+    check(
+      'docker-bounded-build-jobs',
+      dockerfile.includes('ARG CARGO_BUILD_JOBS=1') &&
+        /CARGO_BUILD_JOBS=\$\{CARGO_BUILD_JOBS\}[\s\\]*cargo build --locked --release/.test(dockerfile),
+    ),
     check('docker-locked-base-images', dockerfile.includes('RUST_IMAGE=docker.io/library/rust:1.94.0-bookworm@sha256:') && dockerfile.includes('RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:') && dockerfile.includes('DISTROLESS_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:')),
     check('docker-locked-ffmpeg-source', dockerfile.includes('ARG DEBIAN_SNAPSHOT=') && dockerfile.includes('ARG FFMPEG_SOURCE_REVISION=') && dockerfile.includes('ARG FFMPEG_SOURCE_SHA256=') && dockerfile.includes('code.ffmpeg.org/FFmpeg/FFmpeg/archive/${FFMPEG_SOURCE_REVISION}.tar.gz') && dockerfile.includes('git -C /tmp/ffmpeg-source apply --reverse --check') && dockerfile.includes('sha256sum --check --strict') && dockerfile.includes('--disable-everything') && dockerfile.includes('COPY --from=ffmpeg-builder')),
     check(
@@ -83,7 +94,7 @@ async function main() {
     check('separate-postgres-credentials', migrationEnv.includes('DATABASE_URL=postgresql://jellyrin_migrator:') && !env.includes('jellyrin_migrator')),
     check('runtime-config-excludes-sqlite', !env.includes('DATABASE_URL=sqlite:') && !compose.includes('DATABASE_URL: sqlite:')),
     check('runtime-ffmpeg-default-fails-safe', api.includes('None | Some("remux-only") => Ok(FfmpegMode::RemuxOnly)')),
-    check('runtime-ffmpeg-aggregate-cap', env.includes('JELLYRIN_MAX_FFMPEG_JOBS=1') && env.includes('JELLYRIN_MAX_PROBE_JOBS=1') && env.includes('JELLYRIN_MAX_QUEUED_PROBES=8') && env.includes('JELLYRIN_PROBE_QUEUE_TIMEOUT_SECONDS=10') && env.includes('Aggregate cap shared by encode, remux, auxiliary FFmpeg and ffprobe lanes') && transcode.includes('"JELLYRIN_MAX_FFMPEG_JOBS"') && transcode.includes('"JELLYRIN_MAX_PROBE_JOBS"') && transcode.includes('MULTIMEDIA_PROCESS_COORDINATOR')),
+    check('runtime-ffmpeg-aggregate-cap', env.includes('JELLYRIN_MAX_FFMPEG_JOBS=2') && env.includes('JELLYRIN_MAX_PROBE_JOBS=1') && env.includes('JELLYRIN_MAX_QUEUED_PROBES=8') && env.includes('JELLYRIN_PROBE_QUEUE_TIMEOUT_SECONDS=10') && env.includes('Aggregate cap shared by encode, remux, auxiliary FFmpeg and ffprobe lanes') && transcode.includes('"JELLYRIN_MAX_FFMPEG_JOBS"') && transcode.includes('"JELLYRIN_MAX_PROBE_JOBS"') && transcode.includes('MULTIMEDIA_PROCESS_COORDINATOR')),
     check('runtime-transcode-disk-reservation', env.includes('JELLYRIN_TRANSCODE_RESERVATION_BYTES=67108864') && api.includes('"JELLYRIN_TRANSCODE_RESERVATION_BYTES"') && api.includes('reserve_transcode_disk_capacity()')),
     check('server-health-routes', api.includes('route("/healthz", get(health))') && api.includes('route("/readyz", get(ready))')),
     check('external-schema-migrations', migrator.includes('apply_schema(&args.target)') && server.includes('db.schema_health()')),
@@ -91,7 +102,7 @@ async function main() {
     check('production-server-excludes-sqlite', serverTree.code === 0 && !sqliteDependency.test(serverTree.stdout)),
     check('sqlite-confined-to-migrator', migratorTree.code === 0 && sqliteDependency.test(migratorTree.stdout)),
     check('release-checklist-fresh-upgrade-rollback', checklist.includes('## Fresh Install') && checklist.includes('## Upgrade') && checklist.includes('## Rollback')),
-    check('release-checklist-ffmpeg-safe-upgrade', checklist.includes('ffprobe -version') && checklist.includes('Preserve `JELLYRIN_FFMPEG_MODE=remux-only`')),
+    check('release-checklist-ffmpeg-safe-upgrade', checklist.includes('ffprobe -version') && checklist.includes('The default `JELLYRIN_FFMPEG_MODE=enabled`') && checklist.includes('use `remux-only`') && checklist.includes('only for a measured direct-play-compatible client fleet')),
     check('supply-chain-lock-present', supplyChainLock.includes('RUST_IMAGE=docker.io/library/rust:1.94.0-bookworm@sha256:') && supplyChainLock.includes('DISTROLESS_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:') && supplyChainLock.includes('SYFT_LINUX_AMD64_SHA256=') && supplyChainLock.includes('JELLYFIN_WEB_VERSION=10.11.11') && supplyChainLock.includes('JELLYFIN_WEB_COMMIT=35c0793ece3adbd247eab290ae1effab851f3d37') && supplyChainLock.includes('JELLYFIN_WEB_TARBALL_SHA256=1dd84a8bf4aaa90b12ca38e72e68a554826ab0ea28bb354bcc3212f579e0a337') && supplyChainLock.includes('JELLYFIN_WEB_SWIPER_VERSION=12.1.2') && supplyChainLock.includes('JELLYFIN_WEB_SWIPER_PATCH_COMMIT=3cb38a0ac319edfcbcd331e3818cc9f6dec3e334') && supplyChainLock.includes('JELLYFIN_WEB_SWIPER_PATCH_SHA256=76e80a084337162a24dba022760492fa52f102fbf88747ff895b7076fc17f4b4')),
     check('jellyfin-web-build-verified-atomic-untracked', jellyfinWebBuilder.includes('sha256sum --check --strict') && jellyfinWebBuilder.includes('commit/${JELLYFIN_WEB_SWIPER_PATCH_COMMIT}.patch') && jellyfinWebBuilder.includes('Swiper security patch must modify only package.json and package-lock.json') && jellyfinWebBuilder.includes('EXPECTED_SWIPER_VERSION') && jellyfinWebBuilder.includes('npm ci --omit=optional') && jellyfinWebBuilder.includes('node_modules/pdfjs-dist/node_modules/canvas') && jellyfinWebBuilder.includes('node_modules/@mapbox/node-pre-gyp') && jellyfinWebBuilder.includes('node_modules/tar') && jellyfinWebBuilder.includes('npm run build:production') && jellyfinWebBuilder.includes('refusing to overwrite existing Jellyfin Web output') && jellyfinWebBuilder.includes('mv -T') && gitignore.split(/\r?\n/).includes('/web/')),
     check('deployment-preflight-fail-closed', deploymentPreflight.includes('never reads env/key contents') && deploymentPreflight.includes('web output is missing regular index.html') && deploymentPreflight.includes('--require-provider-keyring') && deploymentPreflight.includes("stat -c '%a'") && deploymentPreflight.includes("stat -c '%u'") && deploymentPreflight.includes("stat -c '%g'")),

@@ -12,13 +12,11 @@ ARG FFMPEG_NVD_BASELINE_VERSION=8.1.2
 ARG FFMPEG_SOURCE_SHA256=2eb566ff9b41802220974bf9457da9bdbda078b1f56d1f008525b7b7cd71ca40
 ARG FFMPEG_BUILD_JOBS=2
 
-# Build the current upstream release without the very large optional desktop, hardware and codec
-# dependency closure pulled in by Debian's general-purpose ffmpeg package. Jellyrin's production
-# default is remux-only, so the image contains only the network, container and parser surface used
-# by the finite Jellyrin media contract. It contains no encoder, device or filter plugin. The AAC
-# decoder is the sole decoder: MPEG-TS does not carry the sample rate in its container metadata, so
-# FFmpeg must inspect an AAC frame before a stream-copy HLS mux can write a valid header.
-# External TLS and zlib are the only optional libraries enabled deliberately.
+# Build the current upstream release without the very large optional desktop and hardware closure
+# pulled in by Debian's general-purpose ffmpeg package. Jellyrin's production image enables its
+# bounded fallback lane for heterogeneous clients, so this build carries only the explicitly
+# enumerated codecs, muxers and filters used by that finite media contract. External TLS, zlib and
+# x264 are the only optional libraries enabled deliberately.
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources \
     && printf '%s\n' \
       'Types: deb' \

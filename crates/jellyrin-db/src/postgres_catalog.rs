@@ -27,8 +27,8 @@ use super::{
     REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, ReadyRemoteMediaCatalogStage,
     RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot,
     RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION,
-    TvSeriesCatalogKey, TvSeriesCatalogNameFilter, TvSeriesCatalogPage,
-    catalog_sync_duration_millis, encode_media_item_query_filter_position,
+    TvSeriesCatalogKey, TvSeriesCatalogNameFilter, TvSeriesCatalogNamePatterns,
+    TvSeriesCatalogPage, catalog_sync_duration_millis, encode_media_item_query_filter_position,
     extract_media_item_facets, extract_media_item_filter_selectors,
     extract_media_item_genre_selectors, extract_media_item_query_filter_projection,
     is_upcoming_media_item_entry, nonnegative_count, normalized_facet_query_values,
@@ -1849,6 +1849,12 @@ impl PostgresDatabase {
             .map(str::trim)
             .filter(|bound| !bound.is_empty())
             .map(str::to_ascii_lowercase);
+        let name_patterns = TvSeriesCatalogNamePatterns {
+            search: search_pattern.as_deref(),
+            starts_with: starts_with_pattern.as_deref(),
+            lower_bound: lower_bound.as_deref(),
+            upper_bound: upper_bound.as_deref(),
+        };
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *transaction)
@@ -1906,10 +1912,7 @@ impl PostgresDatabase {
                 virtual_folder_id,
                 start_index,
                 limit,
-                search_pattern.as_deref(),
-                starts_with_pattern.as_deref(),
-                lower_bound.as_deref(),
-                upper_bound.as_deref(),
+                name_patterns,
             )
             .await?;
             transaction.commit().await?;
@@ -2034,10 +2037,7 @@ impl PostgresDatabase {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
-        search_pattern: Option<&str>,
-        starts_with_pattern: Option<&str>,
-        lower_bound: Option<&str>,
-        upper_bound: Option<&str>,
+        name_patterns: TvSeriesCatalogNamePatterns<'_>,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let canonical: bool = sqlx::query_scalar(
             r#"
@@ -2130,10 +2130,10 @@ impl PostgresDatabase {
         .bind(virtual_folder_id)
         .bind(i64::try_from(limit.max(1))?)
         .bind(i64::try_from(start_index)?)
-        .bind(search_pattern)
-        .bind(starts_with_pattern)
-        .bind(lower_bound)
-        .bind(upper_bound)
+        .bind(name_patterns.search)
+        .bind(name_patterns.starts_with)
+        .bind(name_patterns.lower_bound)
+        .bind(name_patterns.upper_bound)
         .fetch_all(&mut **tx)
         .await?;
         let Some(first) = grouped.first() else {

@@ -22234,12 +22234,10 @@ async fn live_tv_channels(
     // client omits Limit — otherwise a large channel list (thousands of items)
     // is returned and rendered in one shot, which is slow and floods the image
     // endpoint with concurrent logo fetches.
-    let limit = Some(
-        query
-            .limit
-            .map(|limit| limit.min(LIVE_TV_CHANNELS_MAX_LIMIT))
-            .unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT),
-    );
+    let limit = query
+        .limit
+        .map(|limit| limit.min(LIVE_TV_CHANNELS_MAX_LIMIT))
+        .unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT);
     let category_ids = live_tv_channel_category_filter(&state.db, &query).await?;
     let requested_start_index = query.start_index.unwrap_or(0);
     let db_query = LiveTvChannelQuery {
@@ -22247,7 +22245,7 @@ async fn live_tv_channels(
         limit: if favorite_filter.is_some() {
             None
         } else {
-            limit
+            Some(limit)
         },
         search_term: query.search_term.clone(),
         category_ids,
@@ -22271,11 +22269,7 @@ async fn live_tv_channels(
             });
             let total = items.len();
             let start_index = requested_start_index.min(total);
-            let items = items
-                .into_iter()
-                .skip(start_index)
-                .take(limit.unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT))
-                .collect();
+            let items = items.into_iter().skip(start_index).take(limit).collect();
             return Ok(Json(query_result_with_total(items, total, start_index)));
         }
         return Ok(Json(query_result_with_total(
@@ -22306,11 +22300,7 @@ async fn live_tv_channels(
     }
     let total = channels.len();
     let start_index = query.start_index.unwrap_or(0).min(total);
-    let items = if let Some(limit) = limit {
-        channels.into_iter().skip(start_index).take(limit).collect()
-    } else {
-        channels.into_iter().skip(start_index).collect()
-    };
+    let items = channels.into_iter().skip(start_index).take(limit).collect();
     Ok(Json(query_result_with_total(items, total, start_index)))
 }
 
