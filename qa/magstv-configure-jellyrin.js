@@ -52,11 +52,13 @@ async function main() {
     return;
   }
 
-  const tuner = await requestJson('/LiveTv/TunerHosts', token, baseUrl, {
-    method: 'POST',
-    body: payload,
-  });
-  verifyPersistedTuner(tuner, payload);
+  const tuner = options.verifyOnly
+    ? null
+    : await requestJson('/LiveTv/TunerHosts', token, baseUrl, {
+      method: 'POST',
+      body: payload,
+    });
+  if (tuner) verifyPersistedTuner(tuner, payload);
 
   const liveTv = await getJson('/System/Configuration/livetv', token, baseUrl);
   const persisted = liveTv?.TunerHosts?.find((candidate) => candidate?.Id === payload.Id);
@@ -65,24 +67,36 @@ async function main() {
   }
   verifyPersistedTuner(persisted, payload);
 
-  const channels = await getJson('/LiveTv/Channels?Limit=500', token, baseUrl);
-  const tunerChannels = (Array.isArray(channels?.Items) ? channels.Items : [])
-    .filter((item) => item?.TunerHostId === payload.Id);
-  const importedCount = integerOrZero(tuner.PersistedChannelCount);
+  const tunerChannels = [];
+  let channelStartIndex = 0;
+  let totalChannelCount = 0;
+  do {
+    const channels = await getJson(
+      `/LiveTv/Channels?Limit=500&StartIndex=${channelStartIndex}`,
+      token,
+      baseUrl,
+    );
+    const pageItems = Array.isArray(channels?.Items) ? channels.Items : [];
+    tunerChannels.push(...pageItems.filter((item) => item?.TunerHostId === payload.Id));
+    totalChannelCount = integerOrZero(channels?.TotalRecordCount);
+    channelStartIndex += pageItems.length;
+    if (pageItems.length === 0) break;
+  } while (channelStartIndex < totalChannelCount);
+  const importedCount = integerOrZero((tuner || persisted).PersistedChannelCount);
   if (importedCount < 1 || tunerChannels.length < 1) {
     throw new SafeError('MAGSTV import completed without a verifiable indexed channel');
   }
 
   printResult({
     status: 'magstv-configured-and-indexed',
-    mode: 'configure',
+    mode: options.verifyOnly ? 'verify-only' : 'configure',
     tunerId: payload.Id,
     pluginId: PLUGIN_ID,
     authenticatedUserId: user.Id,
     providerRoute: 'resolved-inside-plugin',
-    storage: tuner.Storage,
+    storage: (tuner || persisted).Storage,
     importedChannelCount: importedCount,
-    importedCategoryCount: integerOrZero(tuner.PersistedCategoryCount),
+    importedCategoryCount: integerOrZero((tuner || persisted).PersistedCategoryCount),
     visibleTunerChannelsInProbePage: tunerChannels.length,
     firstChannelIds: tunerChannels.slice(0, 5).map((item) => item.Id),
     credentialsPersistedAsEncryptedReference: true,
@@ -91,17 +105,20 @@ async function main() {
 }
 
 function parseArgs(args) {
-  const known = new Set(['--dry-run', '--validate-only']);
+  const known = new Set(['--dry-run', '--validate-only', '--verify-only']);
   const unknown = args.filter((arg) => !known.has(arg));
   if (unknown.length > 0) {
     throw new SafeError(`Unknown option: ${unknown[0]}`);
   }
-  if (args.includes('--dry-run') && args.includes('--validate-only')) {
-    throw new SafeError('Choose either --dry-run or --validate-only');
+  const selectedModes = ['--dry-run', '--validate-only', '--verify-only']
+    .filter((mode) => args.includes(mode));
+  if (selectedModes.length > 1) {
+    throw new SafeError('Choose only one execution mode');
   }
   return {
     dryRun: args.includes('--dry-run'),
     validateOnly: args.includes('--validate-only'),
+    verifyOnly: args.includes('--verify-only'),
   };
 }
 
