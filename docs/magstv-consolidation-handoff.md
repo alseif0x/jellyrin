@@ -349,15 +349,29 @@ Trabajo pendiente derivado (en orden de coste):
      pública que el curl), mismo formato wire (origin-form, Host y Cookie
      exactos) — devuelve `400` y cierra conexión. El sobre `d=` es de un solo
      uso o lleva contador cifrado; no vale capturar y reutilizar.
+   - Nota: petición bien formada con recurso inválido → `404` (estado de la
+     cuenta de laboratorio desde el 2026-08-18 ~17:00 UTC; confirma que el
+     sobre construido por la app era válido aunque el media no se sirva).
 2. **Portar el protocolo SLB** (única vía restante): handshake
-   `/slb/v13/vod` (curve25519, nativo) + envoltura por petición (path
-   ofuscado + cookies `d/s/t`). El portal entrega direcciones y tokens de
-   gateway en `getSlbInfo` v15 (`SlbInfo`: `main_slb_addr`, `spared_slb_addr`,
-   `main_slb_token`, `spared_slb_token`, `dead_time_addr`). Los exports de
-   libsodium son visibles en `libranger-jni.so`
-   (`nghttp2_submit_request` @`0x88b604`, bridge JNI @`0x3c2bf8`). Estimación:
-   varios días de ingeniería inversa, con riesgo de rotación por el proveedor
-   (la app ya anuncia una versión 5.1).
+   `/slb/v13/vod` + envoltura por petición (decoy path + cookies `d/s/t`).
+   Estado al 2026-08-18 (spec completa en `/tmp/slbwork/SLB-PROTOCOL-SPEC.md`):
+   - **`sign_o3` RESUELTO y verificado byte a byte (7/7 vectores vivos)**:
+     MD5-variante @ `0x63d900` de `libranger-jni.so` (ronda 1 con función
+     booleana custom `(c&b)^(b|~d)` y palabras rotadas 10, varias K y pasos
+     custom) sobre `token=<t>&sign2_method=sign_o3&instance=0&start_moment=<ms>`
+     + secreto de 21 bytes (`"salt3333=4"` + `98 0d 0a 15 32 c9 c3 82 17 08
+     c0`). La implementación anterior del plugin era de una revisión vieja y
+     no valida contra esta app.
+   - Envoltura `d`: AES-CBC-128 (clave+IV constantes por sesión) + base64 de
+     alfabeto propietario de un bloque de cabeceras (App, App-Version,
+     Content-Auth firmada con sign2, Content-License del portal, Ranger-Id,
+     User-Agent, X-Buffer, uri real). Path GET = señuelo aleatorio.
+   - Cookies `s`/`t`: constantes entre sesiones y reinicios (emitidas por el
+     portal o por instalación). Respuestas media en claro (m3u8/MP2T).
+   - Pendiente: derivación de la clave/IV AES (candidata: X25519 con clave
+     pública de servidor estática + KDF en `SecHttpClient::Initialize`
+     @0x41c4a8), formato del handshake `/slb/v13/*`, y rol del ticket
+     Murmur3 (builder @0x399c24).
 
 ### 2. Conseguir una cuenta de prueba válida — COMPLETADO (2026-08-18)
 
