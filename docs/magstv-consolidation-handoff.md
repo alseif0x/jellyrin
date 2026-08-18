@@ -355,13 +355,21 @@ Trabajo pendiente derivado (en orden de coste):
 2. **Portar el protocolo SLB** (única vía restante): handshake
    `/slb/v13/vod` + envoltura por petición (decoy path + cookies `d/s/t`).
    Estado al 2026-08-18 (spec completa en `/tmp/slbwork/SLB-PROTOCOL-SPEC.md`):
-   - **`sign_o3` RESUELTO y verificado byte a byte (7/7 vectores vivos)**:
-     MD5-variante @ `0x63d900` de `libranger-jni.so` (ronda 1 con función
-     booleana custom `(c&b)^(b|~d)` y palabras rotadas 10, varias K y pasos
-     custom) sobre `token=<t>&sign2_method=sign_o3&instance=0&start_moment=<ms>`
-     + secreto de 21 bytes (`"salt3333=4"` + `98 0d 0a 15 32 c9 c3 82 17 08
-     c0`). La implementación anterior del plugin era de una revisión vieja y
-     no valida contra esta app.
+   - **`sign_o3` RESUELTO y verificado byte a byte** (12 vectores vivos —
+     7 capturas `signreq` + 5 `signpair` — más fuzz diferencial 200/200 contra
+     el emulador del asm y 5/5 contra la función nativa vía Frida): MD5 con la
+     primera ronda con palabras rotadas 10 posiciones (la construcción que el
+     plugin **ya implementaba**: la variante del plugin reproduce los vectores
+     en vivo — las supuestas «diferencias» detectadas en el asm de `0x63d900`
+     son equivalentes en la práctica; las primeras pruebas fallaban por
+     vectores mal emparejados entre sesiones, no por el algoritmo).
+     Lo que realmente faltaba era el **secreto de 21 bytes**, recuperado del
+     contexto de firma nativo: `"salt3333=4"` + `98 0d 0a 15 32 c9 c3 82 17
+     08 c0`. El plugin lo empaqueta ahora como constante de revisión
+     (`SignO3Signer::for_supported_revision`, con override por
+     `JELLYRIN_MAGSTV_SIGN_O3_SECRET_HEX`), con test de 5 vectores vivos.
+     **Conclusión clave: el playback nunca falló por la firma — falla por el
+     transporte SLB (sobre `d`/sesión), que sigue siendo el trabajo abierto.**
    - Envoltura `d`: AES-CBC-128 (clave+IV constantes por sesión) + base64 de
      alfabeto propietario de un bloque de cabeceras (App, App-Version,
      Content-Auth firmada con sign2, Content-License del portal, Ranger-Id,
