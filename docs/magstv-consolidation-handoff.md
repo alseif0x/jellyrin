@@ -333,15 +333,31 @@ La hipótesis original de `sign_o3` quedó **invalidada** por la captura Frida d
 
 Trabajo pendiente derivado (en orden de coste):
 
-1. **Extraer el host CDN real del handshake SLB** (captura de
-   `nghttp2_session_mem_recv` en `0x876d2c` de `libranger-jni.so`) y re-probar
-   plantillas directas `/live/0/<play_code>.ts|m3u8?<license>` con `Host` de
-   dominio vía el egress MX. Si existe acceso sin SLB, es la vía barata.
-2. **Portar el protocolo SLB** (handshake `/slb/v13/vod` curve25519 +
-   ofuscación de paths + cookies `d/s/t`) a un componente del plugin. Los
-   exports de libsodium son visibles en `libranger-jni.so`
+1. ~~**Extraer el host CDN real del handshake SLB**~~ — **DESCARTADO
+   (2026-08-18)**. La captura v18/v19 con hooks de socket crudo demuestra:
+   - No existe CDN directo: el 100 % del tráfico de media (playlists m3u8 y
+     segmentos `video/MP2T`, 392 respuestas en la muestra) sale del gateway
+     SLB. Los únicos otros hosts son auxiliares (notice API y un websocket),
+     y dos fronts Cloudflare (`bhoce.bjcerkalx.com`, `aluve.rdgqkfxio.com`)
+     que hablan **el mismo protocolo SLB** (mismas cookies `d/s/t`, paths
+     ofuscados) — son gateways alternativos, no un CDN abierto.
+   - Cada petición usa un path ofuscado **nuevo** incluso para re-pedir la
+     misma playlist a los 3 segundos: el sobre es por petición, no hay URL
+     estática ni dentro de una misma sesión.
+   - **Replay imposible**: reenviar una petición capturada segundos antes —
+     mismo egress MX (redroid 172.20.0.3 → sidecar 172.20.0.2 → misma IP
+     pública que el curl), mismo formato wire (origin-form, Host y Cookie
+     exactos) — devuelve `400` y cierra conexión. El sobre `d=` es de un solo
+     uso o lleva contador cifrado; no vale capturar y reutilizar.
+2. **Portar el protocolo SLB** (única vía restante): handshake
+   `/slb/v13/vod` (curve25519, nativo) + envoltura por petición (path
+   ofuscado + cookies `d/s/t`). El portal entrega direcciones y tokens de
+   gateway en `getSlbInfo` v15 (`SlbInfo`: `main_slb_addr`, `spared_slb_addr`,
+   `main_slb_token`, `spared_slb_token`, `dead_time_addr`). Los exports de
+   libsodium son visibles en `libranger-jni.so`
    (`nghttp2_submit_request` @`0x88b604`, bridge JNI @`0x3c2bf8`). Estimación:
-   varios días de ingeniería inversa, con riesgo de rotación por el proveedor.
+   varios días de ingeniería inversa, con riesgo de rotación por el proveedor
+   (la app ya anuncia una versión 5.1).
 
 ### 2. Conseguir una cuenta de prueba válida — COMPLETADO (2026-08-18)
 
