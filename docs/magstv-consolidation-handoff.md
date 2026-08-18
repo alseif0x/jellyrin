@@ -164,17 +164,23 @@ el paquete deberá actualizar su contrato o fallar de forma clara y cerrada.
 
 ## Límite actual entre Jellyrin y el plugin
 
-El manifiesto y el RPC publicados exponen únicamente `LiveTvProvider`. Aunque el
-proveedor ya dispone de `import_media` y `start_play_vod`, Jellyrin no tiene aún
-una capacidad externa equivalente para que un plugin importe y resuelva VOD.
+El core ya dispone de la capability provider-neutral `VodLibraryProvider`
+(implementada el 2026-08-17 sobre `main`, sin nombrear a MAGSTV):
 
-El SDK principal declara actualmente capacidades como `ScheduledTask`,
-`MetadataProvider`, `ImageProvider`, `ChannelProvider` y `LiveTvProvider`, pero no
-una capacidad de proveedor de biblioteca/VOD externo.
+- `jellyrin-plugin-sdk`: contrato `VodLibraryProviderRequest`/`VodMediaItem`/
+  `VodLibraryProviderResult`, acciones `ImportMedia` (paginada) y
+  `ResolvePlayback` (JIT), grants con el mismo vault scope que Live TV.
+- `jellyrin-api`: clasificación de frontera sensible extendida, import paginado
+  con los mismos límites que Live TV, saneado estricto de ítems, persistencia
+  atómica vía el staging de catálogo remoto (bibliotecas `movies`/`tvshows`),
+  y resolución JIT de playback con gate fail-closed `DirectProxy`+MPEG-TS.
+- Endpoint admin `POST /Plugins/{pluginId}/VodLibrary/Refresh` y encadenado del
+  import VOD tras el alta/refresh del tuner `plugin:<id>`.
 
-Para integrar películas y series correctamente hay que ampliar la frontera
-provider-neutral del core, no esconder VOD dentro de `LiveTvProvider` ni guardar
-URLs firmadas como paths de biblioteca.
+El plugin MAGSTV declara la capability en su manifiesto y expone
+`import_media` y `start_play_vod` a través del runtime. El resto del contrato
+(grants one-shot, referencias opacas, egress obligatorio) es idéntico al de
+Live TV.
 
 ## Laboratorio Android y VPN
 
@@ -293,82 +299,126 @@ La versión debe actualizarse de forma coherente en:
 - tag Git `v0.3.0`;
 - release privada de GitHub y sus artefactos.
 
+Además, antes de empaquetar hay que re-pinear las dependencias
+`jellyrin-core`/`jellyrin-plugin-rpc`/`jellyrin-plugin-sdk` del plugin a un git
+rev publicado del core que contenga el contrato `VodLibraryProvider` (hoy son
+path deps locales marcadas con `TODO(0.3.0)` en el `Cargo.toml` del plugin).
+
 ## Trabajo pendiente por prioridad
 
-### 1. Capturar la frontera real de `sign_o3`
+### 1. Frontera real de playback: relay SLB cifrado (sustituye a `sign_o3`)
 
-Conectar un hook Frida 16.6.6 a la app oficial y observar una llamada VOD:
+La hipótesis original de `sign_o3` quedó **invalidada** por la captura Frida del
+2026-08-18 sobre la app oficial 4.99.5 (`com.android.mgstv`, proceso "Xuper"):
 
-1. enganchar la construcción de requests de OkHttp/Retrofit y `java.net.URL`;
-2. enganchar `MessageDigest`, `Mac` y `SecretKeySpec`, filtrando la ventana VOD;
-3. enumerar módulos/exports nativos cargados por el reproductor;
-4. registrar únicamente estructura y datos necesarios, redactando token, sesión y
-   URL firmada;
-5. repetir una película y, después, un episodio;
-6. comparar el digest observado con `SignO3Signer` mediante un vector real;
-7. determinar si los 21 bytes son constantes de la revisión, se derivan de otra
-   identidad pública o llegan desde el portal.
+- La app **no envía `sign2` ni `sign_o3`** en ninguna petición del portal. El
+  body de `startPlayVOD` v10 es JSON plano (common params + bean) sin firma.
+- Versiones reales observadas: `startPlayLive` **v5**, `getLiveData` **v7**,
+  `startPlayVOD` v10, `getItemData` v4, `getSlbInfo` v15. El plugin usa v4/v6.
+- La app **nunca llama `startPlayLive`**: las licencias live llegan en
+  `getLiveData` → `live_address_list[].license`
+  (`app_id&tag=free&scheme=md5-01&media_code&expired&token=<32hex>`) junto a un
+  `play_code` (`cyx_<hex>_720p`, 22 chars, no es una URL).
+- **Todo el plano de datos va por un gateway SLB cifrado**:
+  `208.115.243.51:30111`, paths ofuscados, cookies `d=`/`s=`/`t=`, handshake
+  `/slb/v13/vod` con curve25519 implementado en nativo (`libranger-jni.so`).
+  El player apunta a un relay local `127.0.0.1:4xxxx` (`GET
+  /live/0/<play_code>.ts`) y ese relay traduce al gateway. Las respuestas HLS
+  (m3u8, segmentos `video/MP2T`) salen del gateway, no de un CDN directo.
+- Las peticiones de playback del portal llevan las cookies de sesión SLB:
+  hipótesis fuerte de que por eso devuelven `rc=1` a clientes sin esa sesión.
+  Confirmado en laboratorio: nuestro `startPlayLive` v4/v10 y fetch directo al
+  CDN con licencia válida fallan (rc=1 / HTTP 400) mientras la app oficial
+  reproduce live, película y episodio con la misma cuenta y el mismo egress.
 
-No se debe aceptar una coincidencia basada solo en longitud o en una cadena
-plausible. Hace falta un request real cuya firma pueda recalcularse exactamente.
+Trabajo pendiente derivado (en orden de coste):
 
-### 2. Conseguir una cuenta de prueba válida
+1. **Extraer el host CDN real del handshake SLB** (captura de
+   `nghttp2_session_mem_recv` en `0x876d2c` de `libranger-jni.so`) y re-probar
+   plantillas directas `/live/0/<play_code>.ts|m3u8?<license>` con `Host` de
+   dominio vía el egress MX. Si existe acceso sin SLB, es la vía barata.
+2. **Portar el protocolo SLB** (handshake `/slb/v13/vod` curve25519 +
+   ofuscación de paths + cookies `d/s/t`) a un componente del plugin. Los
+   exports de libsodium son visibles en `libranger-jni.so`
+   (`nghttp2_submit_request` @`0x88b604`, bridge JNI @`0x3c2bf8`). Estimación:
+   varios días de ingeniería inversa, con riesgo de rotación por el proveedor.
 
-La cuenta debe reproducir al menos un canal, una película y un episodio en la app
-oficial desde la misma salida mexicana. Esto separa los errores de autorización de
-los defectos del protocolo.
+### 2. Conseguir una cuenta de prueba válida — COMPLETADO (2026-08-18)
 
-La prueba debe registrar, sin secretos:
+Cuenta de operador validada en la app oficial 4.99.5 desde el egress MX
+(WireGuard `mx`, IP pública `79.127.180.3`):
 
-- revisión de la app;
-- tipo de contenido;
-- nombre/id opaco o redactado del contenido;
-- resultado y duración mínima reproducida;
-- hora UTC;
-- egress esperado;
-- hash del commit del plugin probado.
+- revisión de la app: 4.99.5 (`apkVersion` 49905; el login de esta cuenta
+  exige anunciarse como 49903, con 49905 el portal devuelve `portal200001`);
+- live: canal premium (vídeo real) reproducido;
+- película: reproducida;
+- episodio: reproducido, con subtítulos;
+- el login de la app exige el ID numérico de la cuenta (9 dígitos), no el
+  email; el portal lo devuelve como `user_id` en el login;
+- commit del plugin probado: árbol de trabajo pre-0.3.0 (capability VOD sin
+  commit en ese momento).
 
-### 3. Añadir una capacidad VOD provider-neutral a Jellyrin
+Conclusión: el fallo de reproducción del plugin es de protocolo (relay SLB),
+no de autorización de la cuenta.
 
-Diseñar la extensión mínima del SDK/RPC para un proveedor externo de biblioteca:
+### 3. Añadir una capacidad VOD provider-neutral a Jellyrin — COMPLETADO (2026-08-17)
 
-- capability nueva y versionada;
-- request de importación paginada;
-- modelos acotados para película, serie, temporada y episodio;
-- referencias opacas autenticadas;
-- persistencia atómica del snapshot;
-- request JIT de playback;
-- grant temporal de credenciales con la misma frontera de seguridad;
-- límites de páginas, elementos, bytes y tiempo;
-- redacción de licencias/URLs;
-- invalidación al rotar credenciales, permisos o versión del plugin.
+Implementado en `main` (pendiente de commit/push en el momento de esta nota):
 
-El core debe seguir siendo independiente de MAGSTV. Xtream puede servir como
-referencia de modelado del catálogo, pero no como motivo para acoplar el SDK a un
-proveedor concreto.
+- capability `VodLibraryProvider` versionada por el ABI RPC v1 existente;
+- importación paginada (`ImportMedia`) con los mismos límites que Live TV
+  (256 páginas, 100 000 ítems, 64 MiB agregados, tokens de continuación únicos);
+- modelos acotados `VodMediaItem` para película, serie y episodio (temporadas
+  aplanadas como en Xtream: `SeasonNumber`/`SeriesReference` inline);
+- referencias opacas obligatorias y saneado fail-closed;
+- persistencia atómica del snapshot vía el staging de catálogo remoto;
+- playback JIT (`ResolvePlayback`) con grant temporal y gate
+  `DirectProxy`+MPEG-TS;
+- canarios de credenciales, redacción y zeroization idénticos a Live TV;
+- invalidación al rotar credenciales/permisos/versión por la frontera sensible
+  compartida;
+- tests de contrato, saneado, paginación, grant, integración stdio y streaming.
 
-### 4. Exponer VOD en el runtime MAGSTV
+Nota: un plugin VOD-only (sin `LiveTvProvider`) aún no puede anclar
+credenciales porque el alta de secretos exige el flujo de tuner Live TV. El
+caso MAGSTV (ambas capabilities) está cubierto; ampliar ese gate queda como
+trabajo futuro si aparece un proveedor VOD-only.
 
-Una vez disponible la capacidad del core:
+### 4. Exponer VOD en el runtime MAGSTV — COMPLETADO (2026-08-17, pendiente de commit)
 
-- declarar la capability en manifest y runtime;
-- conectar `import_media` al RPC;
-- mapear películas, series, temporadas y episodios;
-- conectar `start_play_vod` a la resolución JIT;
-- seleccionar una variante reproducible;
-- integrar la firma verificada automáticamente;
-- mantener licencias y URLs fuera del catálogo y los logs;
-- añadir pruebas stdio del flujo completo.
+- capability declarada en `packaging/manifest.json` y en el runtime
+  (`MAGSTV_CAPABILITIES`, validación estricta del conjunto);
+- `ImportMedia` conectado a `import_media_with_timeout` con paginación de
+  snapshots en memoria (tokens `magstv-vod-page-v1-*`, un solo uso, TTL 3 min);
+- mapeo película/serie/episodio a `VodMediaItem` con referencias opacas HMAC;
+  episodios huérfanos o ítems sin referencia ruteable se excluyen fail-closed;
+- `ResolvePlayback` conectado a la cadena JIT existente (`startPlayVOD`),
+  exige variante `Vod` y fail-closed `MpegTs`+`DirectProxy`+egress;
+- el signer `sign_o3` sigue siendo obligatorio solo para el playback VOD: sin
+  secreto configurado el runtime falla cerrado (`ImportMedia` no lo necesita);
+- pruebas stdio del flujo de import y validación de grants añadidas;
+- `Cargo.toml` usa path deps locales al core (TODO(0.3.0): re-pinear a un git
+  rev publicado con el contrato VOD antes de empaquetar);
+- la integración automática de la firma verificada queda **superseded** por el
+  hallazgo de la tarea 1: la app 4.99.5 no firma las peticiones del portal; el
+  bloqueo real de playback es el relay SLB cifrado.
 
 ### 5. Ejecutar la matriz E2E
 
-La entrega requiere resultados positivos en esta matriz:
+La entrega completa requiere resultados positivos en esta matriz:
 
 | Flujo | Importación | Resolución JIT | Bytes reproducidos | Estado |
 | --- | --- | --- | --- | --- |
-| Canal Live | requerida | `startPlayLive` | MPEG-TS válido | pendiente con cuenta válida |
-| Película | requerida | `startPlayVOD` | media válida | pendiente |
-| Episodio | serie/temporada/episodio | `startPlayVOD` | media válida | pendiente |
+| Canal Live | OK (966 canales, 37 categorías) | `rc=1` del portal | — | **bloqueado por relay SLB** |
+| Película | OK | `rc=1` del portal | — | **bloqueado por relay SLB** |
+| Episodio | OK | `rc=1` del portal | — | **bloqueado por relay SLB** |
+
+La importación de catálogo (live + VOD) está verificada contra el portal real
+con la cuenta del operador vía el egress MX (2026-08-18). La resolución JIT
+falla con `rc=1` para los tres flujos porque el portal exige la sesión del
+relay SLB (tarea 1). El runtime falla cerrado y documentado: el error que
+cruza la frontera RPC es `ProviderFailed` sin filtrar URLs, licencias ni
+credenciales.
 
 Además deben probarse:
 
@@ -383,7 +433,13 @@ Además deben probarse:
 
 ### 6. Publicar `0.3.0`
 
-Solo después del E2E:
+`0.3.0` se publica con **alcance reducido acordado**: catálogo live + VOD
+funcionando y playback explícitamente documentado como no soportado contra la
+app/portal 4.99.5 (relay SLB, tarea 1). La decisión del operador (2026-08-18)
+es publicar este alcance y tratar el playback como trabajo separado; ver la
+nota de alcance en «Criterios de no publicación».
+
+Pasos:
 
 1. ejecutar format, Clippy y tests de ambos repositorios;
 2. construir dos veces el ZIP y comprobar reproducibilidad;
@@ -407,6 +463,18 @@ No etiquetar `0.3.0` como final si ocurre cualquiera de estas condiciones:
 - la prueba usa credenciales que la propia app oficial rechaza;
 - el ZIP, manifest, Cargo, repository JSON, tag o release discrepan en versión;
 - el artefacto publicado no coincide con el artefacto probado.
+
+**Nota de alcance aprobada para `0.3.0` (2026-08-18):** los criterios de
+playback (`sign_o3` y «película y episodio funcionando») se escribieron
+asumiendo que el contrato del portal era estable. La captura sobre 4.99.5
+demostró que el bloqueo ya no es de implementación sino de transporte: todo el
+plano de media va por el relay SLB cifrado y el portal rechaza (`rc=1`) a
+cualquier cliente sin sesión SLB, incluida la app con cuenta válida si se le
+quita el relay. El operador decidió publicar `0.3.0` con alcance de catálogo
+(live + VOD importan y se persisten correctamente) y playback fail-closed
+documentado, y mover los criterios de playback a la release que implemente el
+transporte SLB o un CDN directo verificado. Esos criterios siguen vigentes
+para esa release futura: no se relajan, se posponen.
 
 ## Comandos de verificación seguros
 
@@ -440,8 +508,10 @@ fixtures, a archivos `.env` versionados ni al historial del shell compartido.
 
 ## Siguiente acción recomendada
 
-La siguiente acción concreta es reemplazar el attach mínimo de Frida por un hook
-VOD filtrado, repetir `startPlayVOD` en la app oficial y obtener un vector real de
-firma. En paralelo lógico, pero no antes de definir el contrato, se puede preparar
-el diseño de la capability VOD del SDK. El cambio de versión a `0.3.0` debe ser el
-último tramo, no el primero.
+Las tareas 2, 3 y 4 están completadas; la tarea 1 identificó el bloqueo real
+(relay SLB cifrado, no `sign_o3`). La siguiente acción técnica es la vía
+barata de la tarea 1: extraer el host CDN real del handshake `/slb/v13/vod`
+(laboratorio Android + Frida) y re-probar acceso directo con la licencia de
+`getLiveData` v7. Si no existe acceso sin SLB, evaluar el port del protocolo
+SLB como proyecto separado. La publicación de `0.3.0` con alcance de catálogo
+procede en paralelo según la nota de alcance aprobada.
