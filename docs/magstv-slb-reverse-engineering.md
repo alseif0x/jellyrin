@@ -82,10 +82,14 @@ Cookie: d=<~1067 chars>; s=<46 chars>; t=<43 chars>
   cabeceras (~800 bytes). Clave e IV **constantes por sesión** (prefijo de
   cifrado común de 416 bytes entre peticiones lo demuestra). Origen de la
   clave/IV: pendiente (§6).
-- `s` (decodifica a 34 bytes) y `t` (32 bytes) son **constantes por cuenta e
-  instalación** (idénticas en capturas separadas por horas y reinicios) —
-  hipótesis fuerte: emitidas por el portal (`getSlbInfo` tokens) o por el
-  handshake, no derivadas de DH en runtime.
+- `s` (decodifica a 34 bytes) y `t` (32 bytes) son **constantes por PROCESO
+  de la app**, generadas en el Init nativo de cada proceso (corregido el
+  2026-08-18 tarde: dos procesos del mismo install tienen `s`/`t` distintas;
+  la constancia matinal era del mismo proceso longevo). La clave AES del
+  sobre es por tanto también por proceso, derivada en el Init nativo —
+  candidata: DH X25519 con la clave pública estática del servidor
+  (`SecHttpClient::Initialize`), aún no capturado en vivo (el único DH visto
+  es del módulo P2P).
 
 Bloque de cabeceras en claro (plaintext de `d`, plantilla verificada; CRLF):
 
@@ -183,6 +187,16 @@ Nuevos hechos verificados tras §1-6:
 - El único DH X25519 observado en runtime es del **módulo P2P**, no del canal
   media: la sesión media no se renegocia por proceso (material por
   instalación o derivado de identidad).
+- **El handshake `/slb/v10/live` quedó capturado** (2026-08-18 tarde, app con
+  datos borrados): POST h2 a `eijbs.gn5h3hxar2k.com` con `content-length:
+  640` y cookies `d/s/t` ya presentes (el sobre protege TODAS las peticiones,
+  incluidas portal y handshake — no hay bootstrap sin sobre). La secuencia de
+  primer arranque: `googleadservices` → `v8/active` → `getSlbInfo` →
+  `getColumnContents` → `/slb/v10/live` → `getLiveData`.
+- **Corrección**: `s`/`t` son por proceso (Init nativo), no por instalación.
+- El DH X25519 del canal media sigue sin capturarse: ocurre en el Init
+  nativo (primer segundo del proceso) y no usa el wrapper libsodium visible
+  en los hooks tardíos.
 
 ## 7. Metodología (para futuras revisiones)
 
