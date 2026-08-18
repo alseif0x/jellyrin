@@ -15,6 +15,9 @@ pub const CAPABILITY_METADATA_PROVIDER: &str = "MetadataProvider";
 pub const CAPABILITY_IMAGE_PROVIDER: &str = "ImageProvider";
 pub const CAPABILITY_CHANNEL_PROVIDER: &str = "ChannelProvider";
 pub const CAPABILITY_LIVE_TV_PROVIDER: &str = "LiveTvProvider";
+/// Capability implemented by plugins that import an on-demand media library (movies, series
+/// and episodes) and resolve ephemeral playback URLs for opaque catalog references.
+pub const CAPABILITY_VOD_LIBRARY_PROVIDER: &str = "VodLibraryProvider";
 /// Permission a plugin must request in its manifest, and an administrator must grant, before
 /// Jellyrin may issue ephemeral provider-secret grants to it.
 pub const PERMISSION_PROVIDER_SECRETS: &str = "ProviderSecrets";
@@ -661,6 +664,209 @@ impl LiveTvProviderResult {
     }
 }
 
+/// Secret grants for VOD library providers share the live TV vault scope: plugin id,
+/// configuration anchor (`tuner_id`), action and secret id/revision. The alias keeps the
+/// boundary types identical while giving VOD code a provider-neutral name.
+pub type VodLibraryProviderSecretGrant = LiveTvProviderSecretGrant;
+
+/// Playback context, delivery descriptor and result for VOD resolution reuse the live TV
+/// shapes: the delivery gate (direct proxy of MPEG-TS through the provider egress) is the
+/// same, and the signed URL must remain a `SensitiveUrl` that is never persisted or logged.
+pub type VodPlaybackContext = LiveTvPlaybackContext;
+pub type VodPlaybackDelivery = LiveTvPlaybackDelivery;
+pub type VodPlaybackResult = LiveTvPlaybackResult;
+
+/// Item kinds accepted in a [`VodMediaItem`].
+pub const VOD_ITEM_TYPE_MOVIE: &str = "Movie";
+pub const VOD_ITEM_TYPE_SERIES: &str = "Series";
+pub const VOD_ITEM_TYPE_EPISODE: &str = "Episode";
+
+/// One on-demand catalog item exported by a VOD library provider.
+///
+/// `provider_reference` must be an opaque, authenticated token minted by the plugin. It must
+/// never contain credentials, licenses or signed media URLs. Episodes carry their grouping
+/// inline (`series_reference`/`season_number`/`episode_number`); there is no separate season
+/// model because the server persists a flattened catalog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VodMediaItem {
+    pub item_type: String,
+    pub provider_reference: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production_year: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_ticks: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_rating: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub genres: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_number: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_number: Option<i32>,
+}
+
+impl VodMediaItem {
+    fn new(
+        item_type: &str,
+        provider_reference: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            item_type: item_type.to_string(),
+            provider_reference: provider_reference.into(),
+            name: name.into(),
+            overview: None,
+            image_url: None,
+            production_year: None,
+            runtime_ticks: None,
+            community_rating: None,
+            genres: Vec::new(),
+            series_reference: None,
+            series_name: None,
+            season_number: None,
+            episode_number: None,
+        }
+    }
+
+    pub fn movie(provider_reference: impl Into<String>, name: impl Into<String>) -> Self {
+        Self::new(VOD_ITEM_TYPE_MOVIE, provider_reference, name)
+    }
+
+    pub fn series(provider_reference: impl Into<String>, name: impl Into<String>) -> Self {
+        Self::new(VOD_ITEM_TYPE_SERIES, provider_reference, name)
+    }
+
+    pub fn episode(
+        provider_reference: impl Into<String>,
+        name: impl Into<String>,
+        series_reference: impl Into<String>,
+    ) -> Self {
+        let mut item = Self::new(VOD_ITEM_TYPE_EPISODE, provider_reference, name);
+        item.series_reference = Some(series_reference.into());
+        item
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VodLibraryProviderRequest {
+    pub action: String,
+    #[serde(default)]
+    pub provider_config: Value,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_grant: Option<VodLibraryProviderSecretGrant>,
+}
+
+impl std::fmt::Debug for VodLibraryProviderRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VodLibraryProviderRequest")
+            .field("action", &self.action)
+            .field("provider_config", &"[REDACTED]")
+            .field("arguments", &"[REDACTED]")
+            .field("secret_grant", &self.secret_grant)
+            .finish()
+    }
+}
+
+impl VodLibraryProviderRequest {
+    /// Imports one catalog page. The host paginates by sending back the continuation token
+    /// returned by the previous [`VodLibraryProviderResult`].
+    pub fn import_media(provider_config: Value) -> Self {
+        Self {
+            action: "ImportMedia".to_string(),
+            provider_config,
+            arguments: json!({}),
+            secret_grant: None,
+        }
+    }
+
+    pub fn with_continuation_token(mut self, continuation_token: impl Into<String>) -> Self {
+        if let Value::Object(object) = &mut self.arguments {
+            object.insert(
+                "ContinuationToken".to_string(),
+                Value::String(continuation_token.into()),
+            );
+        }
+        self
+    }
+
+    /// Requests an ephemeral playback URL for an opaque catalog reference. Credentials and
+    /// signed URLs must never be embedded in `provider_reference` or persisted by the server.
+    pub fn resolve_playback(
+        provider_config: Value,
+        provider_reference: impl Into<String>,
+        context: VodPlaybackContext,
+    ) -> Self {
+        let mut arguments =
+            serde_json::to_value(context).expect("VodPlaybackContext must serialize as an object");
+        if let Value::Object(object) = &mut arguments {
+            object.insert(
+                "ProviderReference".to_string(),
+                Value::String(provider_reference.into()),
+            );
+        }
+        Self {
+            action: "ResolvePlayback".to_string(),
+            provider_config,
+            arguments,
+            secret_grant: None,
+        }
+    }
+
+    pub fn with_secret_grant(mut self, secret_grant: VodLibraryProviderSecretGrant) -> Self {
+        self.secret_grant = Some(secret_grant);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VodLibraryProviderResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_items: Vec<VodMediaItem>,
+    /// Opaque token the host echoes back to fetch the next page; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub movie_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_count: Option<u64>,
+}
+
+impl VodLibraryProviderResult {
+    pub fn media_page(media_items: Vec<VodMediaItem>, continuation_token: Option<String>) -> Self {
+        Self {
+            media_items,
+            continuation_token,
+            movie_count: None,
+            series_count: None,
+            episode_count: None,
+        }
+    }
+
+    pub fn with_counts(mut self, movie_count: u64, series_count: u64, episode_count: u64) -> Self {
+        self.movie_count = Some(movie_count);
+        self.series_count = Some(series_count);
+        self.episode_count = Some(episode_count);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PluginManifest {
@@ -954,6 +1160,20 @@ impl CapabilityResponse {
         Self::executed(
             CAPABILITY_LIVE_TV_PROVIDER,
             serde_json::to_value(result).expect("LiveTvPlaybackResult must serialize"),
+        )
+    }
+
+    pub fn vod_library_provider(result: VodLibraryProviderResult) -> Self {
+        Self::executed(
+            CAPABILITY_VOD_LIBRARY_PROVIDER,
+            serde_json::to_value(result).expect("VodLibraryProviderResult must serialize"),
+        )
+    }
+
+    pub fn vod_playback(result: VodPlaybackResult) -> Self {
+        Self::executed(
+            CAPABILITY_VOD_LIBRARY_PROVIDER,
+            serde_json::to_value(result).expect("VodPlaybackResult must serialize"),
         )
     }
 
@@ -1267,5 +1487,140 @@ mod tests {
         assert_eq!(value["Items"][0]["Id"], "channel-fixture-1");
         assert_eq!(value["Items"][0]["Name"], "Fixture Channel");
         assert_eq!(value["TotalRecordCount"], 1);
+    }
+
+    #[test]
+    fn vod_import_request_carries_continuation_token_and_stays_wire_compatible() {
+        let request = VodLibraryProviderRequest::import_media(json!({
+            "Type": "plugin:magstv"
+        }))
+        .with_continuation_token("page-2");
+
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["Action"], "ImportMedia");
+        assert_eq!(wire["ProviderConfig"]["Type"], "plugin:magstv");
+        assert_eq!(wire["Arguments"]["ContinuationToken"], "page-2");
+        assert!(wire.get("SecretGrant").is_none());
+
+        let decoded: VodLibraryProviderRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.action, "ImportMedia");
+        assert_eq!(decoded.arguments["ContinuationToken"], "page-2");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+    }
+
+    #[test]
+    fn vod_resolve_playback_request_matches_live_tv_wire_shape() {
+        let request = VodLibraryProviderRequest::resolve_playback(
+            json!({"SecretReference": "provider/account-a"}),
+            "provider:v1:opaque.signature",
+            VodPlaybackContext {
+                egress_ip: Some("203.0.113.7".to_string()),
+                delivery_capabilities: LiveTvDeliveryCapabilities {
+                    direct_proxy: true,
+                    hls_remux: false,
+                },
+            },
+        );
+
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["Action"], "ResolvePlayback");
+        assert_eq!(
+            wire["Arguments"]["ProviderReference"],
+            "provider:v1:opaque.signature"
+        );
+        assert_eq!(wire["Arguments"]["EgressIp"], "203.0.113.7");
+        assert_eq!(
+            wire["Arguments"]["DeliveryCapabilities"]["DirectProxy"],
+            true
+        );
+    }
+
+    #[test]
+    fn vod_grant_reuses_live_tv_scope_and_redaction() {
+        let request = VodLibraryProviderRequest::import_media(json!({})).with_secret_grant(
+            VodLibraryProviderSecretGrant::new(
+                "magstv-plugin",
+                "tuner-a",
+                "ImportMedia",
+                SensitiveString::new("provider-user"),
+                SensitiveString::new("provider-password"),
+            )
+            .secret_reference("secret-a", 3),
+        );
+
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["SecretGrant"]["Action"], "ImportMedia");
+        assert_eq!(wire["SecretGrant"]["TunerId"], "tuner-a");
+
+        let debug = format!("{request:?}");
+        assert!(debug.contains("ImportMedia"));
+        assert!(!debug.contains("provider-user"));
+        assert!(!debug.contains("provider-password"));
+    }
+
+    #[test]
+    fn vod_media_item_builders_cover_movie_series_and_episode() {
+        let movie = VodMediaItem::movie("ref:movie-1", "Fixture Movie");
+        assert_eq!(movie.item_type, VOD_ITEM_TYPE_MOVIE);
+        assert!(movie.series_reference.is_none());
+
+        let series = VodMediaItem::series("ref:series-1", "Fixture Series");
+        assert_eq!(series.item_type, VOD_ITEM_TYPE_SERIES);
+
+        let mut episode = VodMediaItem::episode("ref:ep-1", "Pilot", "ref:series-1");
+        episode.series_name = Some("Fixture Series".to_string());
+        episode.season_number = Some(1);
+        episode.episode_number = Some(1);
+        assert_eq!(episode.item_type, VOD_ITEM_TYPE_EPISODE);
+        assert_eq!(episode.series_reference.as_deref(), Some("ref:series-1"));
+
+        let wire = serde_json::to_value(&episode).unwrap();
+        assert_eq!(wire["ItemType"], "Episode");
+        assert_eq!(wire["ProviderReference"], "ref:ep-1");
+        assert_eq!(wire["SeriesReference"], "ref:series-1");
+        assert_eq!(wire["SeasonNumber"], 1);
+        assert!(wire.get("Overview").is_none());
+    }
+
+    #[test]
+    fn vod_library_response_matches_host_capability_shape() {
+        let result = VodLibraryProviderResult::media_page(
+            vec![VodMediaItem::movie("ref:movie-1", "Fixture Movie")],
+            Some("page-2".to_string()),
+        )
+        .with_counts(1, 0, 0);
+        let value = CapabilityResponse::vod_library_provider(result).into_host_value();
+
+        assert_eq!(value["Status"], "Executed");
+        assert_eq!(value["Capability"], CAPABILITY_VOD_LIBRARY_PROVIDER);
+        assert_eq!(value["MediaItems"][0]["ItemType"], "Movie");
+        assert_eq!(value["MediaItems"][0]["ProviderReference"], "ref:movie-1");
+        assert_eq!(value["ContinuationToken"], "page-2");
+        assert_eq!(value["MovieCount"], 1);
+    }
+
+    #[test]
+    fn vod_playback_response_keeps_source_url_out_of_debug_output() {
+        let playback = VodPlaybackResult {
+            source_url: SensitiveUrl::new("https://cdn.invalid/vod?token=secret"),
+            expires_at: Some("2030-01-01T00:00:00Z".to_string()),
+            delivery: VodPlaybackDelivery {
+                container: "MpegTs".to_string(),
+                preferred: "DirectProxy".to_string(),
+                requires_provider_egress: true,
+                fallback: None,
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+            },
+            media_streams: Vec::new(),
+        };
+
+        let response = CapabilityResponse::vod_playback(playback);
+        let response_debug = format!("{response:?}");
+        assert!(!response_debug.contains("token=secret"));
+        let wire = response.into_host_value();
+        assert_eq!(wire["Capability"], CAPABILITY_VOD_LIBRARY_PROVIDER);
+        assert_eq!(wire["SourceUrl"], "https://cdn.invalid/vod?token=secret");
+        assert_eq!(wire["Delivery"]["Container"], "MpegTs");
     }
 }

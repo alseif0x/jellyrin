@@ -27,6 +27,16 @@ packages may implement channel, programme, media-sync, and playback-related
 actions behind that capability without adding their protocol, identifiers, or
 secrets to Jellyrin itself.
 
+The generic on-demand library boundary is the `VodLibraryProvider` capability.
+A provider package imports movies, series and episodes as bounded
+`VodMediaItem` values whose `ProviderReference` is an opaque,
+provider-authenticated token — never a URL — and resolves ephemeral playback
+URLs just in time through the `ResolvePlayback` action. Imported items are
+sanitised onto the SDK contract, persisted through the transactional remote
+media catalog staging, and never carry credentials, licenses or signed URLs.
+VOD playback reuses the live-TV delivery contract: only `DirectProxy` of
+MPEG-TS is accepted, fail-closed.
+
 ## External configuration pages
 
 An active `ExternalProcess` package may declare a root-level `.html` or `.htm`
@@ -46,10 +56,11 @@ or surface upstream error bodies.
 
 ## Provider secret grants
 
-Every `ExternalProcess` package exposing `LiveTvProvider` is classified as a
-sensitive-provider boundary, even when its manifest omits `ProviderSecrets`.
-The generic plugin-configuration endpoint therefore rejects provider
-credentials for all such packages; omitting the permission is not a bypass.
+Every `ExternalProcess` package exposing `LiveTvProvider` or
+`VodLibraryProvider` is classified as a sensitive-provider boundary, even when
+its manifest omits `ProviderSecrets`. The generic plugin-configuration endpoint
+therefore rejects provider credentials for all such packages; omitting the
+permission is not a bypass.
 `ProviderSecrets` is the explicit high-risk opt-in required to receive a grant:
 the package must request it in the manifest and an administrator must grant it.
 Jellyrin validates both sets, the external runtime, the canonical `plugin:<id>`
@@ -69,8 +80,9 @@ Every invocation containing `SecretGrant` uses a one-shot process; playback and
 generic secret calls use `provider-secret`, while paginated catalog import uses
 the isolated `catalog-import` lane and keeps that process only across its
 continuation pages. One import has a 120-second deadline, at most 256 pages,
-100,000 channels, 10,000 categories, 4 KiB continuation tokens, a 1 MiB RPC
-frame limit per page, and a 64 MiB aggregate encoded-JSON budget. The aggregate
+100,000 channels (or 100,000 VOD media items), 10,000 categories, 4 KiB
+continuation tokens, a 1 MiB RPC frame limit per page, and a 64 MiB aggregate
+encoded-JSON budget. The aggregate
 budget is a payload bound rather than an RSS guarantee because the in-memory
 JSON representation has overhead. No catalog or playback grant reaches a persistent host.
 Core reuses and explicitly scrubs one request value, zeroizes RPC byte
@@ -120,13 +132,20 @@ If an out-of-tree plugin exposes a missing general capability, extend the SDK
 with provider-neutral request and response types and validate it with a fake
 provider before changing the private implementation.
 
-A MAGSTV patch that consumes `SecretGrant`, validates its complete scope,
+The MAGSTV package consumes `SecretGrant`, validates its complete scope,
 removes the legacy `MAGSTV_SECRET_*` credential fallback and requires both
-`Network` and `ProviderSecrets` is now applied to the MAGSTV working tree and
-validated against the local core. It has not been published. Release remains
-blocked until the plugin pins a
+`Network` and `ProviderSecrets`. It now also declares `VodLibraryProvider` and
+serves paginated media imports and JIT VOD playback resolution through it.
+Release remains blocked until the plugin pins a
 published Jellyrin SDK/RPC commit, and the cross-repository matrix plus real
 credential E2E pass; a local path override is only a development aid.
+
+MAGSTV playback status (verified 2026-08-18 against provider app 4.99.5):
+catalogue import (live and VOD) works against the real portal, but every
+playback resolution is rejected (`rc=1`) because the provider moved its media
+plane behind an encrypted relay handshake implemented in a native library.
+The runtime therefore fails closed on `ResolvePlayback`; restoring playback is
+tracked as separate transport work in the consolidation handoff.
 
 `ExternalProcess` packages are native executables, not an OS sandbox. Package
 SHA-256, ABI checks, bounded extraction, an explicit environment allowlist, and

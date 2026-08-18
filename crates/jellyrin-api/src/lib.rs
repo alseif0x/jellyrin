@@ -145,10 +145,11 @@ use jellyrin_db::{
     MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
     MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
     NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
-    ProviderSecretReference, QuickConnectSession, ResumeItemsPageQuery, SortDirection,
-    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
-    TvSeriesCatalogNameFilter, UpsertActivePlaybackSession, UpsertActiveViewingSession,
-    UpsertPlaybackState, UpsertTranscodeSession, probe_remote_media_info_admitted,
+    ProviderSecretReference, QuickConnectSession, RemoteMediaItemUpsert,
+    RemoteMediaLibrarySnapshot, ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads,
+    TaskRun, TranscodeSession, TrickplayInfo, TvSeriesCatalogNameFilter,
+    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
+    UpsertTranscodeSession, probe_remote_media_info_admitted,
     provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
     upcoming_media_item_premiere_date,
 };
@@ -164,9 +165,11 @@ use jellyrin_plugin_rpc::{
     PluginRpcMethod, PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
 };
 use jellyrin_plugin_sdk::{
-    CAPABILITY_LIVE_TV_PROVIDER, LiveTvDeliveryCapabilities, LiveTvPlaybackContext,
-    LiveTvPlaybackDelivery, LiveTvPlaybackResult, LiveTvProviderRequest, LiveTvProviderSecretGrant,
-    PERMISSION_PROVIDER_SECRETS, SensitiveString, SensitiveUrl,
+    CAPABILITY_LIVE_TV_PROVIDER, CAPABILITY_VOD_LIBRARY_PROVIDER, LiveTvDeliveryCapabilities,
+    LiveTvPlaybackContext, LiveTvPlaybackDelivery, LiveTvPlaybackResult, LiveTvProviderRequest,
+    LiveTvProviderSecretGrant, PERMISSION_PROVIDER_SECRETS, SensitiveString, SensitiveUrl,
+    VOD_ITEM_TYPE_EPISODE, VOD_ITEM_TYPE_MOVIE, VOD_ITEM_TYPE_SERIES, VodLibraryProviderRequest,
+    VodMediaItem, VodPlaybackContext, VodPlaybackResult,
 };
 use jellyrin_transcode::{
     BoundedCommandOutputError, BoundedCommandOutputOptions,
@@ -271,6 +274,9 @@ const LIVE_TV_CONFIG_SOURCE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const LIVE_TV_CONFIG_MAX_PROGRAMS: usize = 250_000;
 const LIVE_TV_PROVIDER_CATALOG_MAX_CATEGORIES: usize = 10_000;
 const LIVE_TV_PROVIDER_CONTINUATION_TOKEN_MAX_BYTES: usize = 4 * 1024;
+/// VOD library imports share the live TV page/byte budgets; only the item counter differs.
+const VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES: usize = 256;
+const VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS: usize = 100_000;
 const HDHOMERUN_DISCOVERY_PORT: u16 = 65001;
 const HDHOMERUN_DISCOVERY_DURATION_MS: u64 = 3000;
 const HDHOMERUN_LEGACY_DEFAULT_TUNERS: usize = 2;
@@ -1640,6 +1646,14 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins/{plugin_id}/health", get(plugin_health))
         .route("/Plugins/{plugin_id}/Logs", get(plugin_logs))
         .route("/plugins/{plugin_id}/logs", get(plugin_logs))
+        .route(
+            "/Plugins/{plugin_id}/VodLibrary/Refresh",
+            post(refresh_vod_library_plugin),
+        )
+        .route(
+            "/plugins/{plugin_id}/vodlibrary/refresh",
+            post(refresh_vod_library_plugin),
+        )
         .route(
             "/Plugins/{plugin_id}/Permissions",
             get(plugin_permissions).post(update_plugin_permissions),
@@ -12363,6 +12377,269 @@ async fn invoke_live_tv_provider_catalog_via_runtime_host_path(
     result
 }
 
+#[derive(Debug)]
+struct VodPluginCatalogPages {
+    media_items: Vec<serde_json::Value>,
+    continuation_tokens: HashSet<String>,
+    page_count: usize,
+    accumulated_bytes: usize,
+    max_accumulated_bytes: usize,
+    movie_count: Option<u64>,
+    series_count: Option<u64>,
+    episode_count: Option<u64>,
+}
+
+impl Default for VodPluginCatalogPages {
+    fn default() -> Self {
+        Self::with_max_accumulated_bytes(LIVE_TV_PROVIDER_CATALOG_MAX_ACCUMULATED_BYTES)
+    }
+}
+
+impl VodPluginCatalogPages {
+    fn with_max_accumulated_bytes(max_accumulated_bytes: usize) -> Self {
+        Self {
+            media_items: Vec::new(),
+            continuation_tokens: HashSet::new(),
+            page_count: 0,
+            accumulated_bytes: 0,
+            max_accumulated_bytes,
+            movie_count: None,
+            series_count: None,
+            episode_count: None,
+        }
+    }
+
+    fn push(&mut self, value: serde_json::Value) -> Result<Option<String>, ApiError> {
+        if self.page_count >= VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES {
+            return Err(ApiError::internal(
+                "VOD library provider catalogue exceeded the page limit",
+            ));
+        }
+        let remaining_bytes = self
+            .max_accumulated_bytes
+            .saturating_sub(self.accumulated_bytes);
+        let page_bytes = live_tv_plugin_catalog_encoded_size(&value, remaining_bytes)?;
+
+        self.page_count += 1;
+        self.accumulated_bytes = self.accumulated_bytes.saturating_add(page_bytes);
+
+        let media_items = live_tv_plugin_catalog_array(&value, &["MediaItems"], "media items")?;
+        if media_items.len()
+            > VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS.saturating_sub(self.media_items.len())
+        {
+            return Err(ApiError::internal(
+                "VOD library provider catalogue exceeded the media item limit",
+            ));
+        }
+        self.media_items.extend(media_items);
+        if let Some(count) = vod_library_plugin_catalog_count(&value, "MovieCount")? {
+            self.movie_count = Some(count);
+        }
+        if let Some(count) = vod_library_plugin_catalog_count(&value, "SeriesCount")? {
+            self.series_count = Some(count);
+        }
+        if let Some(count) = vod_library_plugin_catalog_count(&value, "EpisodeCount")? {
+            self.episode_count = Some(count);
+        }
+
+        let continuation_token = live_tv_plugin_catalog_continuation_token(&value)?;
+        let has_more = match json_field_case_insensitive(&value, "HasMore") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Bool(value)) => Some(*value),
+            Some(_) => {
+                return Err(ApiError::internal(
+                    "VOD library provider catalogue returned an invalid continuation marker",
+                ));
+            }
+        };
+        if matches!(has_more, Some(true)) && continuation_token.is_none()
+            || matches!(has_more, Some(false)) && continuation_token.is_some()
+        {
+            return Err(ApiError::internal(
+                "VOD library provider catalogue returned inconsistent continuation state",
+            ));
+        }
+        let Some(continuation_token) = continuation_token else {
+            return Ok(None);
+        };
+        if self.page_count >= VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES {
+            return Err(ApiError::internal(
+                "VOD library provider catalogue exceeded the page limit",
+            ));
+        }
+        if !self.continuation_tokens.insert(continuation_token.clone()) {
+            return Err(ApiError::internal(
+                "VOD library provider catalogue repeated a continuation token",
+            ));
+        }
+        Ok(Some(continuation_token))
+    }
+
+    fn into_capability_result(self) -> CapabilityResult {
+        let mut value = serde_json::json!({ "MediaItems": self.media_items });
+        if let Some(object) = value.as_object_mut() {
+            for (field, count) in [
+                ("MovieCount", self.movie_count),
+                ("SeriesCount", self.series_count),
+                ("EpisodeCount", self.episode_count),
+            ] {
+                if let Some(count) = count {
+                    object.insert(field.to_string(), serde_json::json!(count));
+                }
+            }
+        }
+        CapabilityResult { value }
+    }
+}
+
+fn vod_library_plugin_catalog_count(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Option<u64>, ApiError> {
+    let Some(count) = json_field_case_insensitive(value, field) else {
+        return Ok(None);
+    };
+    match count {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(number) => number.as_u64().map(Some).ok_or_else(|| {
+            ApiError::internal("VOD library provider catalogue returned an invalid item count")
+        }),
+        _ => Err(ApiError::internal(
+            "VOD library provider catalogue returned an invalid item count",
+        )),
+    }
+}
+
+fn vod_library_provider_catalog_remaining(
+    deadline: tokio::time::Instant,
+) -> Result<StdDuration, ApiError> {
+    deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| ApiError::internal("VOD library provider catalogue import timed out"))
+}
+
+async fn collect_vod_library_provider_pages(
+    client: &mut PluginHostStdioClient,
+    plugin_id: &str,
+    capability: &str,
+    base_request: serde_json::Value,
+    deadline: tokio::time::Instant,
+) -> Result<Option<CapabilityResult>, ApiError> {
+    let mut pages = VodPluginCatalogPages::default();
+    let mut continuation_token = None;
+    let mut base_request = ZeroizingJsonValue(base_request);
+    loop {
+        set_live_tv_provider_catalog_request_page(
+            &mut base_request.0,
+            continuation_token.as_deref(),
+        )?;
+        let remaining = vod_library_provider_catalog_remaining(deadline)?;
+        let timeout_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let mut invoke = ZeroizingInvokeEnvelope(PluginRpcEnvelope::new(
+            format!(
+                "{plugin_id}:capability:{capability}:page:{}",
+                pages.page_count.saturating_add(1)
+            ),
+            PluginRpcMethod::InvokeCapability,
+            InvokeCapabilityRequest {
+                plugin_id: plugin_id.to_string(),
+                capability: capability.to_string(),
+                arguments: std::mem::take(&mut base_request.0),
+                timeout_ms,
+            },
+        ));
+        let response = client
+            .call::<_, CapabilityResult>(&invoke.0, remaining)
+            .await;
+        // Restore ownership before inspecting the result so every return path scrubs the
+        // one in-memory JSON copy that carried the short-lived provider grant.
+        base_request.0 = std::mem::take(&mut invoke.0.payload.arguments);
+        let response = response
+            .map_err(|_| ApiError::internal("VOD library provider catalogue import failed"))?;
+        let Some(mut result) = rpc_result(response)? else {
+            return Ok(None);
+        };
+        let canaries = live_tv_provider_secret_canaries(&base_request.0);
+        if json_contains_sensitive_canary(&result.value, &canaries) {
+            zeroize_json_value_strings(&mut result.value);
+            return Err(ApiError::internal(
+                "VOD library plugin provider returned forbidden credential material",
+            ));
+        }
+        continuation_token = pages.push(result.value)?;
+        if continuation_token.is_none() {
+            return Ok(Some(pages.into_capability_result()));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_vod_library_provider_via_runtime_host_path(
+    plugin: &serde_json::Value,
+    capability: &str,
+    base_request: serde_json::Value,
+    runtime: PluginRuntime,
+    runtime_name: &str,
+    error_prefix: &str,
+    host_path: PathBuf,
+    timeout: StdDuration,
+) -> Result<Option<CapabilityResult>, ApiError> {
+    let Some(plugin_id) = json_string_field(plugin, "Id") else {
+        return Ok(None);
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    if runtime == PluginRuntime::ExternalProcess {
+        let remaining = vod_library_provider_catalog_remaining(deadline)?;
+        let guard = tokio::time::timeout(
+            remaining,
+            locked_external_plugin_host_in_lane(plugin, host_path, "catalog-import"),
+        )
+        .await
+        .map_err(|_| ApiError::internal("VOD library provider catalogue import timed out"))??;
+        let mut host_lease = ExternalPluginHostLease::new(guard, true);
+        let result = match host_lease.host_mut() {
+            Some(host) => {
+                collect_vod_library_provider_pages(
+                    &mut host.client,
+                    &plugin_id,
+                    capability,
+                    base_request,
+                    deadline,
+                )
+                .await
+            }
+            None => Err(ApiError::internal("ExternalProcess host is unavailable")),
+        };
+        // The same isolated process serves every page, then releases all provider snapshot state.
+        host_lease.shutdown().await;
+        return result;
+    }
+
+    let remaining = vod_library_provider_catalog_remaining(deadline)?;
+    let loaded = tokio::time::timeout(
+        remaining,
+        load_plugin_runtime_host_with_path(plugin, runtime, runtime_name, error_prefix, host_path),
+    )
+    .await
+    .map_err(|_| ApiError::internal("VOD library provider catalogue import timed out"))??;
+    let Some((mut client, _version)) = loaded else {
+        return Ok(None);
+    };
+    let result = collect_vod_library_provider_pages(
+        &mut client,
+        &plugin_id,
+        capability,
+        base_request,
+        deadline,
+    )
+    .await;
+    let _ = client.shutdown().await;
+    result
+}
+
 fn is_external_catalog_import_call(capability: &str, arguments: &serde_json::Value) -> bool {
     capability.eq_ignore_ascii_case(CAPABILITY_LIVE_TV_PROVIDER)
         && ["Action", "Operation"].iter().any(|field| {
@@ -12413,6 +12690,23 @@ async fn plugin_logs(
             }))
         })
         .ok_or_else(|| ApiError::not_found("Plugin not found"))
+}
+
+async fn refresh_vod_library_plugin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuthQuery>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state.db, &headers, query.api_key.as_deref()).await?;
+    let counts = vod_library_plugin_media_import(&state.db, &plugin_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("VOD library plugin has no configured Live TV tuner"))?;
+    Ok(Json(serde_json::json!({
+        "MovieCount": counts.movie_count,
+        "SeriesCount": counts.series_count,
+        "EpisodeCount": counts.episode_count,
+    })))
 }
 
 async fn try_activate_rust_wasi_plugin(
@@ -19627,6 +19921,10 @@ fn plugin_may_receive_provider_secrets(plugin: &serde_json::Value) -> bool {
         && plugin_has_granted_permission(plugin, PERMISSION_PROVIDER_SECRETS)
 }
 
+/// Classifies external plugins whose capability contracts can receive provider credentials
+/// anchored to a `plugin:<id>` Live TV tuner. `VodLibraryProvider` shares that exact boundary:
+/// its imports reuse the tuner secret grant, so lanes, lifecycle locks and one-shot processes
+/// must apply identically even when the manifest omits `ProviderSecrets`.
 fn plugin_uses_live_tv_tuner_secret_boundary(plugin: &serde_json::Value) -> bool {
     json_string_field(plugin, "Runtime")
         .or_else(|| {
@@ -19641,7 +19939,10 @@ fn plugin_uses_live_tv_tuner_secret_boundary(plugin: &serde_json::Value) -> bool
             .any(|source| {
                 plugin_string_array(json_field_case_insensitive(source, "Capabilities"))
                     .iter()
-                    .any(|capability| capability.eq_ignore_ascii_case(CAPABILITY_LIVE_TV_PROVIDER))
+                    .any(|capability| {
+                        capability.eq_ignore_ascii_case(CAPABILITY_LIVE_TV_PROVIDER)
+                            || capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)
+                    })
             })
 }
 
@@ -20138,6 +20439,27 @@ async fn live_tv_plugin_provider_request(
     Ok(request)
 }
 
+/// Builds a `VodLibraryProviderRequest` for one `plugin:<id>` tuner. VOD provider credentials
+/// anchor to the same tuner as the live TV flow, so the binding, persisted configuration,
+/// namespace, permission and one-shot grant validation are exactly the live TV builder's; only
+/// the wire type changes.
+async fn vod_library_plugin_provider_request(
+    db: &Database,
+    plugin: &serde_json::Value,
+    tuner_configuration: &serde_json::Value,
+    action: &str,
+    arguments: serde_json::Value,
+) -> Result<VodLibraryProviderRequest, ApiError> {
+    let request =
+        live_tv_plugin_provider_request(db, plugin, tuner_configuration, action, arguments).await?;
+    Ok(VodLibraryProviderRequest {
+        action: request.action,
+        provider_config: request.tuner_config,
+        arguments: request.arguments,
+        secret_grant: request.secret_grant,
+    })
+}
+
 async fn live_tv_plugin_channel_provider_import(
     db: &Database,
     payload: &serde_json::Value,
@@ -20564,6 +20886,528 @@ async fn persist_live_tv_provider_import(
         ));
     }
     Ok(persisted)
+}
+
+fn vod_library_plugin_image_url_field(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Option<String>, ()> {
+    let Some(value) = json_field_case_insensitive(value, field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value.as_str().map(str::trim).ok_or(())?;
+    if value.is_empty() || value.len() > 2_048 || value.chars().any(char::is_control) {
+        return Err(());
+    }
+    let url = reqwest::Url::parse(value).map_err(|_| ())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(());
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn vod_library_plugin_i32_field(
+    value: &serde_json::Value,
+    field: &str,
+    range: std::ops::RangeInclusive<i32>,
+) -> Result<Option<i32>, ()> {
+    let Some(value) = json_field_case_insensitive(value, field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_i64()
+        .and_then(|number| i32::try_from(number).ok())
+        .filter(|number| range.contains(number))
+        .map(Some)
+        .ok_or(())
+}
+
+fn vod_library_plugin_runtime_ticks(value: &serde_json::Value) -> Result<Option<i64>, ()> {
+    let Some(value) = json_field_case_insensitive(value, "RuntimeTicks") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_i64()
+        .filter(|ticks| *ticks >= 0)
+        .map(Some)
+        .ok_or(())
+}
+
+fn vod_library_plugin_rating_field(value: &serde_json::Value) -> Result<Option<f64>, ()> {
+    let Some(value) = json_field_case_insensitive(value, "CommunityRating") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_f64()
+        .filter(|rating| rating.is_finite() && (0.0..=10.0).contains(rating))
+        .map(Some)
+        .ok_or(())
+}
+
+fn vod_library_plugin_genres(value: &serde_json::Value) -> Result<Vec<String>, ()> {
+    let Some(value) = json_field_case_insensitive(value, "Genres") else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let values = value.as_array().ok_or(())?;
+    if values.len() > 32 {
+        return Err(());
+    }
+    values
+        .iter()
+        .map(|genre| {
+            genre
+                .as_str()
+                .and_then(|genre| safe_live_tv_plugin_text(genre, 256))
+                .ok_or(())
+        })
+        .collect()
+}
+
+/// Projects one untrusted provider item onto the bounded `VodMediaItem` contract. Arbitrary
+/// provider fields never reach persistence, and any item carrying credential-shaped material is
+/// dropped instead of sanitized in place.
+fn vod_library_media_item_from_plugin(
+    plugin_id: &str,
+    tuner_id: &str,
+    index: usize,
+    item: &serde_json::Value,
+) -> Option<VodMediaItem> {
+    fn rejected(
+        plugin_id: &str,
+        tuner_id: &str,
+        index: usize,
+        reason: &str,
+    ) -> Option<VodMediaItem> {
+        tracing::debug!(
+            plugin_id,
+            tuner_id,
+            index,
+            reason,
+            "dropped VOD library provider media item"
+        );
+        None
+    }
+
+    if contains_plaintext_provider_secret(item) {
+        return rejected(plugin_id, tuner_id, index, "plaintext provider secret");
+    }
+    let item_type = json_field_case_insensitive(item, "ItemType")
+        .and_then(|value| value.as_str())
+        .map(str::trim)?;
+    let item_type = if item_type.eq_ignore_ascii_case(VOD_ITEM_TYPE_MOVIE) {
+        VOD_ITEM_TYPE_MOVIE
+    } else if item_type.eq_ignore_ascii_case(VOD_ITEM_TYPE_SERIES) {
+        VOD_ITEM_TYPE_SERIES
+    } else if item_type.eq_ignore_ascii_case(VOD_ITEM_TYPE_EPISODE) {
+        VOD_ITEM_TYPE_EPISODE
+    } else {
+        return rejected(plugin_id, tuner_id, index, "unknown item type");
+    };
+    let provider_reference = json_field_case_insensitive(item, "ProviderReference")
+        .and_then(|value| value.as_str())?
+        .to_string();
+    if !valid_live_tv_provider_reference(&provider_reference) {
+        return rejected(plugin_id, tuner_id, index, "invalid provider reference");
+    }
+    let name = safe_live_tv_plugin_string_field(item, "Name", 1_024).ok()??;
+    let overview = safe_live_tv_plugin_string_field(item, "Overview", 1_024).ok()?;
+    let image_url = vod_library_plugin_image_url_field(item, "ImageUrl").ok()?;
+    let production_year = vod_library_plugin_i32_field(item, "ProductionYear", 0..=9_999).ok()?;
+    let runtime_ticks = vod_library_plugin_runtime_ticks(item).ok()?;
+    let community_rating = vod_library_plugin_rating_field(item).ok()?;
+    let genres = vod_library_plugin_genres(item).ok()?;
+
+    let mut media_item = match item_type {
+        VOD_ITEM_TYPE_MOVIE => VodMediaItem::movie(provider_reference, name),
+        VOD_ITEM_TYPE_SERIES => VodMediaItem::series(provider_reference, name),
+        _ => VodMediaItem {
+            item_type: VOD_ITEM_TYPE_EPISODE.to_string(),
+            ..VodMediaItem::movie(provider_reference, name)
+        },
+    };
+    media_item.overview = overview;
+    media_item.image_url = image_url;
+    media_item.production_year = production_year;
+    media_item.runtime_ticks = runtime_ticks;
+    media_item.community_rating = community_rating;
+    media_item.genres = genres;
+    if media_item.item_type == VOD_ITEM_TYPE_EPISODE {
+        let series_reference = json_field_case_insensitive(item, "SeriesReference")
+            .and_then(|value| value.as_str())?;
+        if !valid_live_tv_provider_reference(series_reference) {
+            return rejected(plugin_id, tuner_id, index, "invalid series reference");
+        }
+        media_item.series_reference = Some(series_reference.to_string());
+        media_item.series_name =
+            safe_live_tv_plugin_string_field(item, "SeriesName", 1_024).ok()?;
+        media_item.season_number =
+            vod_library_plugin_i32_field(item, "SeasonNumber", 0..=10_000).ok()?;
+        media_item.episode_number =
+            vod_library_plugin_i32_field(item, "EpisodeNumber", 0..=1_000_000).ok()?;
+    }
+    Some(media_item)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VodLibraryPluginImportCounts {
+    movie_count: usize,
+    series_count: usize,
+    episode_count: usize,
+}
+
+fn vod_library_plugin_library_scope(plugin_name: &str) -> String {
+    let name = plugin_name.trim();
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        "Plugin".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn default_plugin_vod_media_streams() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "Codec": "h264",
+            "Language": null,
+            "DisplayTitle": "Video",
+            "IsInterlaced": false,
+            "IsDefault": true,
+            "IsForced": false,
+            "Type": "Video",
+            "Index": 0,
+            "IsExternal": false,
+            "SupportsExternalStream": false,
+        }),
+        serde_json::json!({
+            "Codec": "aac",
+            "Language": null,
+            "DisplayTitle": "Audio",
+            "IsInterlaced": false,
+            "Channels": 2,
+            "IsDefault": true,
+            "IsForced": false,
+            "Type": "Audio",
+            "Index": 1,
+            "IsExternal": false,
+        }),
+    ]
+}
+
+fn vod_library_media_item_upsert(
+    plugin_id: &str,
+    tuner_id: &str,
+    item: &VodMediaItem,
+    series_name: Option<&str>,
+    series_image_url: Option<&str>,
+) -> RemoteMediaItemUpsert {
+    let kind = match item.item_type.as_str() {
+        VOD_ITEM_TYPE_MOVIE => "movie",
+        VOD_ITEM_TYPE_EPISODE => "episode",
+        _ => "series",
+    };
+    let collection_type = if item.item_type == VOD_ITEM_TYPE_MOVIE {
+        "movies"
+    } else {
+        "tvshows"
+    };
+    let stable_key = format!("{plugin_id}:{tuner_id}:{kind}:{}", item.provider_reference);
+    // The persisted path is an opaque, non-URL routing token. Playback is resolved just-in-time
+    // from the ProviderReference, so no provider URL or credential ever becomes durable.
+    let path = format!(
+        "plugin-vod://{plugin_id}/{}",
+        stable_entity_id("plugin-vod-path", &stable_key)
+    );
+    let mut metadata = serde_json::json!({
+        "Provider": format!("plugin:{plugin_id}"),
+        "TunerId": tuner_id,
+        "ProviderReference": item.provider_reference,
+        "PluginVodKind": kind,
+        "Name": item.name,
+        "Genres": item.genres,
+    });
+    if let Some(overview) = item.overview.as_deref() {
+        metadata["Overview"] = serde_json::json!(overview);
+    }
+    if let Some(image_url) = item.image_url.as_deref() {
+        metadata["ImageUrl"] = serde_json::json!(image_url);
+        metadata["PrimaryImageUrl"] = serde_json::json!(image_url);
+    }
+    if let Some(year) = item.production_year {
+        metadata["ProductionYear"] = serde_json::json!(year);
+    }
+    if let Some(rating) = item.community_rating {
+        metadata["CommunityRating"] = serde_json::json!(rating);
+    }
+    if item.item_type == VOD_ITEM_TYPE_EPISODE {
+        let series_reference = item.series_reference.as_deref().unwrap_or_default();
+        let series_key = format!("{plugin_id}:{tuner_id}:{series_reference}");
+        metadata["SeriesReference"] = serde_json::json!(series_reference);
+        metadata["SeriesId"] =
+            serde_json::json!(stable_entity_id("plugin-vod-series", &series_key));
+        metadata["SeriesName"] = serde_json::json!(
+            item.series_name
+                .as_deref()
+                .or(series_name)
+                .unwrap_or(series_reference)
+        );
+        if let Some(season_number) = item.season_number {
+            metadata["SeasonId"] = serde_json::json!(stable_entity_id(
+                "plugin-vod-season",
+                &format!("{series_key}:{season_number}")
+            ));
+            metadata["ParentIndexNumber"] = serde_json::json!(season_number);
+        }
+        if let Some(episode_number) = item.episode_number {
+            metadata["IndexNumber"] = serde_json::json!(episode_number);
+        }
+        if let Some(series_image_url) = series_image_url {
+            metadata["SeriesImageUrl"] = serde_json::json!(series_image_url);
+        }
+    }
+    RemoteMediaItemUpsert {
+        id: stable_entity_id("plugin-vod-item", &stable_key),
+        name: item.name.clone(),
+        path,
+        media_type: "Video".to_string(),
+        collection_type: collection_type.to_string(),
+        runtime_ticks: item.runtime_ticks,
+        bitrate: None,
+        width: None,
+        height: None,
+        media_streams: default_plugin_vod_media_streams(),
+        metadata,
+    }
+}
+
+/// Publishes one complete VOD snapshot through the provider-neutral remote media catalogue
+/// contract. Movies land in a `movies` library; episodes land in a `tvshows` library carrying
+/// their series grouping inline (the flattened catalogue model has no series rows of its own, so
+/// `Series` entries only enrich their episodes). Both libraries publish in one transaction,
+/// including intentionally empty ones, so a shrunk provider catalogue never leaves stale rows.
+async fn persist_vod_library_provider_import(
+    db: &Database,
+    plugin_name: &str,
+    plugin_id: &str,
+    tuner_id: &str,
+    items: Vec<VodMediaItem>,
+) -> Result<VodLibraryPluginImportCounts, ApiError> {
+    let scope = vod_library_plugin_library_scope(plugin_name);
+    let mut series_index: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for item in &items {
+        if item.item_type == VOD_ITEM_TYPE_SERIES {
+            series_index.insert(
+                item.provider_reference.clone(),
+                (item.name.clone(), item.image_url.clone()),
+            );
+        }
+    }
+    let mut seen_references = HashSet::new();
+    let mut movies = Vec::new();
+    let mut episodes = Vec::new();
+    for item in &items {
+        if !seen_references.insert((item.item_type.as_str(), item.provider_reference.as_str())) {
+            continue;
+        }
+        match item.item_type.as_str() {
+            VOD_ITEM_TYPE_MOVIE => {
+                movies.push(vod_library_media_item_upsert(
+                    plugin_id, tuner_id, item, None, None,
+                ));
+            }
+            VOD_ITEM_TYPE_EPISODE => {
+                let series_entry = item
+                    .series_reference
+                    .as_deref()
+                    .and_then(|reference| series_index.get(reference));
+                episodes.push(vod_library_media_item_upsert(
+                    plugin_id,
+                    tuner_id,
+                    item,
+                    series_entry.map(|(name, _)| name.as_str()),
+                    series_entry.and_then(|(_, image_url)| image_url.as_deref()),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let counts = VodLibraryPluginImportCounts {
+        movie_count: movies.len(),
+        series_count: series_index.len(),
+        episode_count: episodes.len(),
+    };
+    db.replace_remote_media_library_snapshots(vec![
+        RemoteMediaLibrarySnapshot {
+            library_name: format!("{scope} Movies"),
+            collection_type: "movies".to_string(),
+            source_location: format!("plugin-vod://{plugin_id}/movies"),
+            items: movies,
+        },
+        RemoteMediaLibrarySnapshot {
+            library_name: format!("{scope} Series"),
+            collection_type: "tvshows".to_string(),
+            source_location: format!("plugin-vod://{plugin_id}/series"),
+            items: episodes,
+        },
+    ])
+    .await
+    .map_err(ApiError::from)?;
+    Ok(counts)
+}
+
+async fn vod_library_plugin_tuner_configuration(
+    db: &Database,
+    plugin_id: &str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(configuration) = db.named_configuration("livetv").await? else {
+        return Ok(None);
+    };
+    Ok(configuration
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|tuner| {
+            json_string_field(tuner, "Type").is_some_and(|tuner_type| {
+                live_tv_plugin_id_from_payload(tuner, &tuner_type)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(plugin_id))
+            })
+        })
+        .cloned())
+}
+
+/// Runs one complete `ImportMedia` exchange against an active `VodLibraryProvider` plugin and
+/// atomically republishes its two library snapshots. Returns `None` when the plugin has no
+/// configured `plugin:<id>` tuner yet.
+async fn vod_library_plugin_media_import(
+    db: &Database,
+    plugin_id: &str,
+) -> Result<Option<VodLibraryPluginImportCounts>, ApiError> {
+    let _admission_guard = external_plugin_host_admission_slot(plugin_id, "catalog-import")
+        .await
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::service_unavailable("VOD library provider is unavailable"))?;
+    let security_slot = external_plugin_security_slot(plugin_id).await;
+    let _security_guard = security_slot.read_owned().await;
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Err(ApiError::not_found("VOD library plugin not found"));
+    };
+    let uses_vod_library_provider = plugin_string_array(plugin.get("Capabilities"))
+        .iter()
+        .any(|capability| capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER));
+    if json_string_field(&plugin, "Status").as_deref() != Some("Active")
+        || !uses_vod_library_provider
+    {
+        return Err(ApiError::bad_request(
+            "VOD library plugin must be active and expose VodLibraryProvider",
+        ));
+    }
+    let Some(tuner) = vod_library_plugin_tuner_configuration(db, plugin_id).await? else {
+        return Ok(None);
+    };
+    let tuner_id = json_string_field(&tuner, "Id")
+        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
+    let request = vod_library_plugin_provider_request(
+        db,
+        &plugin,
+        &tuner,
+        "ImportMedia",
+        serde_json::json!({}),
+    )
+    .await?;
+    let arguments = serde_json::to_value(request)
+        .map_err(|_| ApiError::internal("invalid VOD library provider request"))?;
+    let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(&plugin)
+    else {
+        return Err(ApiError::internal(
+            "VOD library plugin runtime is unavailable",
+        ));
+    };
+    // A VOD catalogue import paginates exactly like a channel import: one deadline, one isolated
+    // `catalog-import` lane process, and credential canaries checked on every page.
+    let result = invoke_vod_library_provider_via_runtime_host_path(
+        &plugin,
+        CAPABILITY_VOD_LIBRARY_PROVIDER,
+        arguments,
+        runtime,
+        runtime_name,
+        error_prefix,
+        host_path,
+        LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
+    )
+    .await?
+    .ok_or_else(|| ApiError::internal("VOD library plugin runtime is unavailable"))?;
+    let mut seen_remote_items = 0usize;
+    let items = result
+        .value
+        .get("MediaItems")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let index = seen_remote_items;
+            seen_remote_items += 1;
+            vod_library_media_item_from_plugin(plugin_id, &tuner_id, index, item)
+        })
+        .collect::<Vec<_>>();
+    let plugin_name = json_string_field(&plugin, "Name").unwrap_or_else(|| plugin_id.to_string());
+    let counts =
+        persist_vod_library_provider_import(db, &plugin_name, plugin_id, &tuner_id, items).await?;
+    Ok(Some(counts))
+}
+
+/// Chains a VOD library refresh after a successful `plugin:<id>` tuner write. A failed VOD import
+/// never fails tuner provisioning: the channel snapshot is already committed and the VOD snapshot
+/// can be retried through the explicit refresh endpoint.
+async fn maybe_refresh_vod_library_for_tuner(state: &AppState, tuner: &serde_json::Value) {
+    let Some(tuner_type) = json_string_field(tuner, "Type") else {
+        return;
+    };
+    let Some(plugin_id) = live_tv_plugin_id_from_payload(tuner, &tuner_type) else {
+        return;
+    };
+    let declares_vod_library = match state.db.installed_plugin_json(&plugin_id).await {
+        Ok(Some(plugin)) => plugin_string_array(plugin.get("Capabilities"))
+            .iter()
+            .any(|capability| capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)),
+        _ => false,
+    };
+    if !declares_vod_library {
+        return;
+    }
+    match vod_library_plugin_media_import(&state.db, &plugin_id).await {
+        Ok(Some(counts)) => tracing::info!(
+            plugin_id,
+            movie_count = counts.movie_count,
+            series_count = counts.series_count,
+            episode_count = counts.episode_count,
+            "VOD library import completed after Live TV tuner refresh"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            plugin_id,
+            ?error,
+            "VOD library import failed after Live TV tuner refresh"
+        ),
+    }
 }
 
 fn live_tv_source_configuration(value: &serde_json::Value) -> serde_json::Value {
@@ -21921,6 +22765,11 @@ async fn add_live_tv_tuner_host(
         .await?;
     drop(provider_import_security_guard);
     drop(provider_import_admission_guard);
+    // A plugin tuner may also expose the VOD library capability; chain its import after the
+    // channel snapshot and public configuration have both committed. The import re-acquires its
+    // own lane permit and lifecycle read lock, so it must run after the lease guards above are
+    // dropped.
+    maybe_refresh_vod_library_for_tuner(&state, &payload).await;
     Ok(Json(payload))
 }
 
@@ -23539,6 +24388,177 @@ async fn resolve_opaque_live_tv_playback(
         if expires_at <= OffsetDateTime::now_utc() + Duration::seconds(2) {
             return Err(ApiError::service_unavailable(
                 "Live TV provider source has expired",
+            ));
+        }
+    }
+    Ok(playback)
+}
+
+/// Playback routing triple parsed from one persisted plugin-VOD metadata payload.
+struct PluginVodRemoteReference {
+    plugin_id: String,
+    tuner_id: String,
+    provider_reference: String,
+}
+
+/// Extracts the plugin-VOD routing triple from persisted item metadata. Returns `None` unless the
+/// metadata carries a `plugin:<id>` Provider, a tuner id and an opaque, URL-free provider
+/// reference. A payload carrying anything that looks like a plaintext provider secret is rejected
+/// outright so persisted metadata can never smuggle credentials into the playback path.
+fn plugin_vod_remote_reference(metadata: &serde_json::Value) -> Option<PluginVodRemoteReference> {
+    if contains_plaintext_provider_secret(metadata) {
+        return None;
+    }
+    let provider = json_string_field(metadata, "Provider")?;
+    let (route, plugin_id) = provider.split_once(':')?;
+    if !route.eq_ignore_ascii_case("plugin") || plugin_id.trim().is_empty() {
+        return None;
+    }
+    let tuner_id = json_string_field(metadata, "TunerId").filter(|id| !id.trim().is_empty())?;
+    let provider_reference = json_string_field(metadata, "ProviderReference")
+        .filter(|reference| valid_live_tv_provider_reference(reference))?;
+    Some(PluginVodRemoteReference {
+        plugin_id: plugin_id.trim().to_string(),
+        tuner_id,
+        provider_reference,
+    })
+}
+
+fn is_plugin_vod_remote_media(metadata: Option<&serde_json::Value>) -> bool {
+    metadata.and_then(plugin_vod_remote_reference).is_some()
+}
+
+/// Cheap path-prefix pre-filter for persisted plugin-VOD items; the metadata triple still has to
+/// parse before playback is attempted.
+fn is_plugin_vod_virtual_item(item: &MediaItem) -> bool {
+    item.path.starts_with("plugin-vod://")
+}
+
+/// Resolves playback for one persisted plugin-VOD media item just-in-time. The `plugin-vod://`
+/// path and its metadata only carry the opaque provider reference, so every stream asks the
+/// provider plugin for a fresh signed URL through a one-shot grant on the `provider-secret`
+/// lane. The signed URL is never logged or persisted: it returns as a `SensitiveUrl` that only
+/// the internal proxy may expose. VOD playback is limited to direct-proxy MPEG-TS delivery (no
+/// HLS remux); callers must enforce `opaque_live_tv_delivery_is_safe_for_direct_proxy`.
+async fn resolve_plugin_vod_playback(
+    db: &Database,
+    plugin_id: &str,
+    tuner_id: &str,
+    provider_reference: &str,
+) -> Result<VodPlaybackResult, ApiError> {
+    let _admission_guard = external_plugin_host_admission_slot(plugin_id, "provider-secret")
+        .await
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::service_unavailable("VOD library provider is unavailable"))?;
+    let security_slot = external_plugin_security_slot(plugin_id).await;
+    let _security_guard = security_slot.read_owned().await;
+    let persisted_tuner_config = db
+        .live_tv_tuner_configuration_by_id(tuner_id)
+        .await?
+        .ok_or_else(|| ApiError::service_unavailable("VOD provider tuner is unavailable"))?;
+    if contains_plaintext_provider_secret(&persisted_tuner_config) {
+        return Err(ApiError::service_unavailable(
+            "VOD provider tuner must use an external secret reference",
+        ));
+    }
+    let tuner_type = json_string_field(&persisted_tuner_config, "Type")
+        .ok_or_else(|| ApiError::service_unavailable("VOD provider tuner route is unavailable"))?;
+    if !live_tv_plugin_id_from_payload(&persisted_tuner_config, &tuner_type)
+        .is_some_and(|routed| routed.eq_ignore_ascii_case(plugin_id))
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider tuner binding is invalid",
+        ));
+    }
+    let plugin = db
+        .installed_plugin_json(plugin_id)
+        .await?
+        .filter(|plugin| {
+            json_string_field(plugin, "Status").as_deref() == Some("Active")
+                && plugin_string_array(plugin.get("Capabilities"))
+                    .iter()
+                    .any(|capability| {
+                        capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)
+                    })
+        })
+        .ok_or_else(|| ApiError::service_unavailable("VOD library provider is unavailable"))?;
+    let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(&plugin)
+    else {
+        return Err(ApiError::service_unavailable(
+            "VOD library provider runtime is unavailable",
+        ));
+    };
+    let context = VodPlaybackContext {
+        // This value belongs to the provider/sidecar configuration. Never substitute the
+        // viewer's ConnectInfo address: providers may sign against the outbound egress address.
+        egress_ip: json_string_field(&persisted_tuner_config, "EgressIp"),
+        delivery_capabilities: LiveTvDeliveryCapabilities {
+            direct_proxy: true,
+            hls_remux: false,
+        },
+    };
+    let mut request_arguments = serde_json::to_value(context)
+        .map_err(|_| ApiError::internal("invalid VOD playback context"))?;
+    request_arguments["ProviderReference"] =
+        serde_json::Value::String(provider_reference.to_string());
+    let request = vod_library_plugin_provider_request(
+        db,
+        &plugin,
+        &persisted_tuner_config,
+        "ResolvePlayback",
+        request_arguments,
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("VOD provider credentials are unavailable"))?;
+    let arguments = serde_json::to_value(request)
+        .map_err(|_| ApiError::internal("invalid VOD playback request"))?;
+    let result = invoke_plugin_capability_via_runtime_host_path_with_timeout(
+        &plugin,
+        CAPABILITY_VOD_LIBRARY_PROVIDER,
+        arguments,
+        runtime,
+        runtime_name,
+        error_prefix,
+        host_path,
+        StdDuration::from_secs(15),
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("VOD provider resolution failed"))?
+    .ok_or_else(|| ApiError::service_unavailable("VOD library provider runtime is unavailable"))?;
+    let result = ZeroizingJsonValue(result.value);
+
+    if result
+        .0
+        .get("Status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| !status.eq_ignore_ascii_case("Executed"))
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider rejected playback resolution",
+        ));
+    }
+    let playback_value = result
+        .0
+        .get("Playback")
+        .or_else(|| result.0.get("Result"))
+        .unwrap_or(&result.0);
+    let mut playback = VodPlaybackResult::deserialize(playback_value)
+        .map_err(|_| ApiError::service_unavailable("VOD provider response is invalid"))?;
+    // Same hygiene as opaque live playback: only the signed upstream URL and delivery contract
+    // are needed. Plugin-controlled media-stream objects are scrubbed and dropped so they can
+    // never become a second carrier for URLs or credentials.
+    playback
+        .media_streams
+        .iter_mut()
+        .for_each(zeroize_json_value_strings);
+    playback.media_streams.clear();
+    if let Some(expires_at) = playback.expires_at.as_deref() {
+        let expires_at = OffsetDateTime::parse(expires_at, &Rfc3339)
+            .map_err(|_| ApiError::service_unavailable("VOD provider expiry is invalid"))?;
+        if expires_at <= OffsetDateTime::now_utc() + Duration::seconds(2) {
+            return Err(ApiError::service_unavailable(
+                "VOD provider source has expired",
             ));
         }
     }
@@ -43695,6 +44715,48 @@ pub(crate) async fn stream_resolved_media_item(
         return stream_remote_media(&item, &source_url, headers, include_body).await;
     }
 
+    if is_plugin_vod_virtual_item(&item) {
+        let metadata_by_item =
+            media_metadata_by_item_id(&state.db, HashSet::from([item.id])).await?;
+        let metadata = metadata_by_item.get(&item.id);
+        if !is_plugin_vod_remote_media(metadata) {
+            return Err(ApiError::service_unavailable(
+                "VOD provider playback route is unavailable",
+            ));
+        }
+        let reference = metadata
+            .and_then(plugin_vod_remote_reference)
+            .ok_or_else(|| {
+                ApiError::service_unavailable("VOD provider playback route is unavailable")
+            })?;
+        let playback = resolve_plugin_vod_playback(
+            &state.db,
+            &reference.plugin_id,
+            &reference.tuner_id,
+            &reference.provider_reference,
+        )
+        .await?;
+        // Plugin-VOD playback is limited to direct-proxy MPEG-TS delivery: there is no HLS
+        // remux or transcode path for signed provider URLs, so any other delivery contract
+        // fails closed instead of leaking the URL into an unsupported pipeline.
+        if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
+            return Err(ApiError::service_unavailable(
+                "VOD provider did not authorize a safe direct stream",
+            ));
+        }
+        let mut response = stream_sensitive_remote_live(
+            playback.source_url,
+            headers,
+            playback.delivery.requires_provider_egress,
+            None,
+        )
+        .await?;
+        if !include_body {
+            *response.body_mut() = Body::empty();
+        }
+        return Ok(response);
+    }
+
     stream_media_item(item, headers, include_body).await
 }
 
@@ -43734,18 +44796,13 @@ async fn internal_remote_media_response(
     match target {
         InternalRemoteRelayTarget::MediaItem(item_id) => {
             let item = state.db.media_item_by_id(item_id).await?;
-            if !is_xtream_virtual_item(&item) {
+            if !is_xtream_virtual_item(&item) && !is_plugin_vod_virtual_item(&item) {
                 return Err(ApiError::not_found("remote media relay not found"));
             }
-            let metadata_by_item =
-                media_metadata_by_item_id(&state.db, HashSet::from([item.id])).await?;
-            let metadata = metadata_by_item.get(&item.id).ok_or_else(|| {
-                ApiError::service_unavailable("remote media metadata unavailable")
-            })?;
-            let source_url = resolve_xtream_remote_source(&state.db, metadata)
-                .await?
-                .ok_or_else(|| ApiError::service_unavailable("remote media source unavailable"))?;
-            stream_remote_media(&item, &source_url, headers, include_body).await
+            // Both virtual-item kinds share the library streaming pipeline: Xtream resolves its
+            // cached source URL; plugin-VOD resolves a fresh signed URL through the provider
+            // gate and the sensitive remote proxy.
+            stream_resolved_media_item(state, item, headers, include_body).await
         }
         InternalRemoteRelayTarget::LiveTvChannel(channel_id) => {
             let channel = live_tv_channel_by_id(&state.db, &channel_id).await?;
@@ -59091,6 +60148,901 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_vod_library_providers_use_the_tuner_secret_boundary() {
+        assert!(super::plugin_uses_live_tv_tuner_secret_boundary(&json!({
+            "Runtime": "ExternalProcess",
+            "Capabilities": [super::CAPABILITY_VOD_LIBRARY_PROVIDER],
+            "Manifest": { "Permissions": [] }
+        })));
+        assert!(super::plugin_uses_live_tv_tuner_secret_boundary(&json!({
+            "Runtime": "ExternalProcess",
+            "Manifest": { "Capabilities": ["vodlibraryprovider"] }
+        })));
+        assert!(!super::plugin_uses_live_tv_tuner_secret_boundary(&json!({
+            "Runtime": "RustWasi",
+            "Capabilities": [super::CAPABILITY_VOD_LIBRARY_PROVIDER],
+            "Manifest": { "Permissions": ["ProviderSecrets"] }
+        })));
+        assert!(!super::plugin_uses_live_tv_tuner_secret_boundary(&json!({
+            "Runtime": "ExternalProcess",
+            "Capabilities": ["ScheduledTask"]
+        })));
+    }
+
+    #[test]
+    fn vod_library_media_item_from_plugin_accepts_contract_items() {
+        let movie = super::vod_library_media_item_from_plugin(
+            "plugin-a",
+            "tuner-a",
+            0,
+            &json!({
+                "ItemType": "Movie",
+                "ProviderReference": "provider:v1:movie-1",
+                "Name": "Movie One",
+                "Overview": "A movie.",
+                "ImageUrl": "https://images.example.invalid/movie-1.jpg",
+                "ProductionYear": 2024,
+                "RuntimeTicks": 5_400_000_000i64,
+                "CommunityRating": 7.5,
+                "Genres": ["Drama"],
+                "UnexpectedProviderField": "dropped"
+            }),
+        )
+        .unwrap();
+        assert_eq!(movie.item_type, "Movie");
+        assert_eq!(movie.provider_reference, "provider:v1:movie-1");
+        assert_eq!(movie.name, "Movie One");
+        assert_eq!(movie.overview.as_deref(), Some("A movie."));
+        assert_eq!(movie.production_year, Some(2024));
+        assert_eq!(movie.runtime_ticks, Some(5_400_000_000));
+        assert_eq!(movie.community_rating, Some(7.5));
+        assert_eq!(movie.genres, vec!["Drama".to_string()]);
+        assert!(movie.series_reference.is_none());
+
+        let series = super::vod_library_media_item_from_plugin(
+            "plugin-a",
+            "tuner-a",
+            1,
+            &json!({
+                "ItemType": "series",
+                "ProviderReference": "provider:v1:series-1",
+                "Name": "Show One"
+            }),
+        )
+        .unwrap();
+        assert_eq!(series.item_type, "Series");
+
+        let episode = super::vod_library_media_item_from_plugin(
+            "plugin-a",
+            "tuner-a",
+            2,
+            &json!({
+                "ItemType": "Episode",
+                "ProviderReference": "provider:v1:episode-1",
+                "Name": "Pilot",
+                "SeriesReference": "provider:v1:series-1",
+                "SeriesName": "Show One",
+                "SeasonNumber": 1,
+                "EpisodeNumber": 1
+            }),
+        )
+        .unwrap();
+        assert_eq!(episode.item_type, "Episode");
+        assert_eq!(
+            episode.series_reference.as_deref(),
+            Some("provider:v1:series-1")
+        );
+        assert_eq!(episode.series_name.as_deref(), Some("Show One"));
+        assert_eq!(episode.season_number, Some(1));
+        assert_eq!(episode.episode_number, Some(1));
+    }
+
+    #[test]
+    fn vod_library_media_item_from_plugin_rejects_unsafe_items() {
+        let reject = |item: serde_json::Value| {
+            super::vod_library_media_item_from_plugin("plugin-a", "tuner-a", 0, &item).is_none()
+        };
+        // Credential-shaped fields anywhere in the item drop it entirely.
+        assert!(reject(json!({
+            "ItemType": "Movie",
+            "ProviderReference": "provider:v1:movie-1",
+            "Name": "Movie One",
+            "Password": "hunter2"
+        })));
+        assert!(reject(json!({
+            "ItemType": "Movie",
+            "ProviderReference": "provider:v1:movie-1",
+            "Name": "Movie One",
+            "ImageUrl": "https://user:pass@images.example.invalid/movie.jpg"
+        })));
+        // Provider references must stay opaque tokens, never URLs.
+        assert!(reject(json!({
+            "ItemType": "Movie",
+            "ProviderReference": "https://provider.invalid/movie?token=abc",
+            "Name": "Movie One"
+        })));
+        // Unknown item types, missing names and episode grouping violations are rejected.
+        assert!(reject(json!({
+            "ItemType": "Season",
+            "ProviderReference": "provider:v1:season-1",
+            "Name": "Season One"
+        })));
+        assert!(reject(json!({
+            "ItemType": "Movie",
+            "ProviderReference": "provider:v1:movie-1"
+        })));
+        assert!(reject(json!({
+            "ItemType": "Episode",
+            "ProviderReference": "provider:v1:episode-1",
+            "Name": "Pilot"
+        })));
+        assert!(reject(json!({
+            "ItemType": "Episode",
+            "ProviderReference": "provider:v1:episode-1",
+            "Name": "Pilot",
+            "SeriesReference": "https://provider.invalid/series/1"
+        })));
+    }
+
+    #[test]
+    fn vod_library_catalog_pages_accumulate_media_items() {
+        let mut pages = super::VodPluginCatalogPages::default();
+        assert_eq!(
+            pages
+                .push(json!({
+                    "MediaItems": [{ "ItemType": "Movie" }],
+                    "MovieCount": 2,
+                    "ContinuationToken": "vod-page-2",
+                    "HasMore": true
+                }))
+                .unwrap(),
+            Some("vod-page-2".to_string())
+        );
+        assert_eq!(
+            pages
+                .push(json!({
+                    "MediaItems": [{ "ItemType": "Episode" }],
+                    "EpisodeCount": 1
+                }))
+                .unwrap(),
+            None
+        );
+        let result = pages.into_capability_result();
+        assert_eq!(result.value["MediaItems"].as_array().unwrap().len(), 2);
+        assert_eq!(result.value["MovieCount"], 2);
+        assert_eq!(result.value["EpisodeCount"], 1);
+        assert!(result.value.get("SeriesCount").is_none());
+    }
+
+    #[test]
+    fn vod_library_catalog_pages_reject_invalid_continuations_and_limits() {
+        let mut repeated = super::VodPluginCatalogPages::default();
+        repeated
+            .push(json!({ "ContinuationToken": "same", "HasMore": true }))
+            .unwrap();
+        assert!(
+            repeated
+                .push(json!({ "ContinuationToken": "same", "HasMore": true }))
+                .is_err()
+        );
+
+        let mut missing = super::VodPluginCatalogPages::default();
+        assert!(missing.push(json!({ "HasMore": true })).is_err());
+        let mut contradictory = super::VodPluginCatalogPages::default();
+        assert!(
+            contradictory
+                .push(json!({ "ContinuationToken": "next", "HasMore": false }))
+                .is_err()
+        );
+        let mut invalid_count = super::VodPluginCatalogPages::default();
+        assert!(invalid_count.push(json!({ "MovieCount": -1 })).is_err());
+
+        let mut limited = super::VodPluginCatalogPages::default();
+        for page in 0..super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES - 1 {
+            limited
+                .push(json!({
+                    "ContinuationToken": format!("token-{page}"),
+                    "HasMore": true
+                }))
+                .unwrap();
+        }
+        limited.push(json!({ "MediaItems": [] })).unwrap();
+        assert!(limited.push(json!({ "MediaItems": [] })).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn vod_library_provider_request_redacts_config_and_scopes_grant() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let plugin_id = "44444444-5555-4666-8777-888888888888";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        let bin_dir = plugin_dir.join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await.unwrap();
+        let generated_host = fake_external_process_vod_host_script(tmp.path(), plugin_id).await;
+        let host_path = bin_dir.join("external-provider-runtime");
+        tokio::fs::copy(generated_host, &host_path).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&host_path).await.unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&host_path, permissions)
+            .await
+            .unwrap();
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "VOD Provider".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "ExternalProcess".to_string(),
+                target_abi: super::EXTERNAL_PROCESS_TARGET_ABI.to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "VOD Provider",
+                    "Runtime": "ExternalProcess"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "VOD Provider",
+                    "Version": "0.1.0",
+                    "Runtime": "ExternalProcess",
+                    "TargetAbi": super::EXTERNAL_PROCESS_TARGET_ABI,
+                    "Entrypoint": "bin/external-provider-runtime",
+                    "Capabilities": ["LiveTvProvider", "VodLibraryProvider"],
+                    "Permissions": ["ProviderSecrets"],
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    }
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        db.update_plugin_permissions_json(
+            plugin_id,
+            json!(["Network", "ProviderSecrets"]),
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            super::try_activate_external_process_plugin(&db, &plugin, Some(user.id))
+                .await
+                .unwrap()
+        );
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+
+        let tuner_type = format!("plugin:{plugin_id}");
+        let persisted = super::stage_live_tv_plugin_tuner_credentials(
+            &db,
+            json!({
+                "Id": "vod-tuner",
+                "Type": tuner_type,
+                "PluginId": plugin_id,
+                "FriendlyName": "VOD Tuner",
+                "Username": "vod-user",
+                "Password": "vod-pass"
+            }),
+            &format!("plugin:{plugin_id}"),
+        )
+        .await
+        .unwrap();
+        assert!(persisted.get("Username").is_none());
+        assert!(persisted.get("Password").is_none());
+
+        let request = super::vod_library_plugin_provider_request(
+            &db,
+            &plugin,
+            &persisted,
+            "ImportMedia",
+            json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(request.action, "ImportMedia");
+        assert_eq!(
+            super::json_string_field(&request.provider_config, "Id").as_deref(),
+            Some("vod-tuner")
+        );
+        assert!(request.provider_config.get("Username").is_none());
+        assert!(request.provider_config.get("Password").is_none());
+        assert!(
+            request
+                .provider_config
+                .get("JellyrinProviderSecretRef")
+                .is_none()
+        );
+        let grant = request.secret_grant.unwrap();
+        assert_eq!(grant.plugin_id, plugin_id);
+        assert_eq!(grant.tuner_id, "vod-tuner");
+        assert_eq!(grant.action, "ImportMedia");
+        assert!(grant.secret_id.is_some());
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn vod_library_import_chains_after_plugin_tuner_channel_import() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "55555555-6666-4777-8888-999999999999";
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugin");
+        let bin_dir = plugin_dir.join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await.unwrap();
+        let generated_host = fake_external_process_vod_host_script(tmp.path(), plugin_id).await;
+        let host_path = bin_dir.join("external-provider-runtime");
+        tokio::fs::copy(generated_host, &host_path).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&host_path).await.unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&host_path, permissions)
+            .await
+            .unwrap();
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "VOD Provider".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "ExternalProcess".to_string(),
+                target_abi: super::EXTERNAL_PROCESS_TARGET_ABI.to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "VOD Provider",
+                    "Runtime": "ExternalProcess"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "VOD Provider",
+                    "Version": "0.1.0",
+                    "Runtime": "ExternalProcess",
+                    "TargetAbi": super::EXTERNAL_PROCESS_TARGET_ABI,
+                    "Entrypoint": "bin/external-provider-runtime",
+                    "Capabilities": ["LiveTvProvider", "VodLibraryProvider"],
+                    "Permissions": ["ProviderSecrets"],
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    }
+                }),
+            },
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        db.update_plugin_permissions_json(
+            plugin_id,
+            json!(["Network", "ProviderSecrets"]),
+            Some(user.id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            super::try_activate_external_process_plugin(&db, &plugin, Some(user.id))
+                .await
+                .unwrap()
+        );
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/TunerHosts")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Type": format!("plugin:{plugin_id}"),
+                            "PluginId": plugin_id,
+                            "FriendlyName": "VOD Tuner",
+                            "Username": "vod-user",
+                            "Password": "vod-pass"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let tuner: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tuner["PersistedChannelCount"], 1);
+
+        // The chained VOD import published both provider-neutral libraries in one transaction.
+        let folders = db.virtual_folders().await.unwrap();
+        let movies = folders
+            .iter()
+            .find(|folder| folder.name == "VOD Provider Movies")
+            .expect("VOD movies library was not published");
+        assert_eq!(movies.collection_type.as_deref(), Some("movies"));
+        let series = folders
+            .iter()
+            .find(|folder| folder.name == "VOD Provider Series")
+            .expect("VOD series library was not published");
+        assert_eq!(series.collection_type.as_deref(), Some("tvshows"));
+        let movie_items = db
+            .media_items_for_virtual_folders(&[movies.id])
+            .await
+            .unwrap();
+        assert_eq!(movie_items.len(), 1);
+        assert_eq!(movie_items[0].name, "Movie One");
+        assert!(movie_items[0].path.starts_with("plugin-vod://"));
+        assert!(!movie_items[0].path.starts_with("http"));
+        let episode_items = db
+            .media_items_for_virtual_folders(&[series.id])
+            .await
+            .unwrap();
+        assert_eq!(episode_items.len(), 1);
+        assert_eq!(episode_items[0].name, "Pilot");
+
+        // The explicit admin refresh re-runs the same import and reports sanitized counts.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Plugins/{plugin_id}/VodLibrary/Refresh"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            counts,
+            json!({ "MovieCount": 1, "SeriesCount": 1, "EpisodeCount": 1 })
+        );
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[test]
+    fn plugin_vod_remote_reference_parses_and_rejects_unsafe_metadata() {
+        let metadata = json!({
+            "Provider": "plugin:44444444-5555-4666-8777-888888888888",
+            "TunerId": "vod-tuner",
+            "ProviderReference": "provider:v1:movie-1",
+            "PluginVodKind": "movie"
+        });
+        let reference = super::plugin_vod_remote_reference(&metadata)
+            .expect("valid plugin-VOD metadata must parse");
+        assert_eq!(reference.plugin_id, "44444444-5555-4666-8777-888888888888");
+        assert_eq!(reference.tuner_id, "vod-tuner");
+        assert_eq!(reference.provider_reference, "provider:v1:movie-1");
+        assert!(super::is_plugin_vod_remote_media(Some(&metadata)));
+
+        // Non-plugin providers, empty plugin ids, URL references and missing fields never route.
+        for rejected in [
+            json!({ "Provider": "xtream", "TunerId": "vod-tuner", "ProviderReference": "provider:v1:movie-1" }),
+            json!({ "Provider": "plugin:", "TunerId": "vod-tuner", "ProviderReference": "provider:v1:movie-1" }),
+            json!({ "Provider": "plugin:abc", "ProviderReference": "provider:v1:movie-1" }),
+            json!({ "Provider": "plugin:abc", "TunerId": "vod-tuner", "ProviderReference": "https://provider.invalid/movie.ts?token=abc" }),
+            json!({ "Provider": "plugin:abc", "TunerId": "vod-tuner" }),
+        ] {
+            assert!(
+                super::plugin_vod_remote_reference(&rejected).is_none(),
+                "{rejected}"
+            );
+            assert!(
+                !super::is_plugin_vod_remote_media(Some(&rejected)),
+                "{rejected}"
+            );
+        }
+
+        // Metadata carrying a plaintext provider secret is rejected outright.
+        let secret = json!({
+            "Provider": "plugin:abc",
+            "TunerId": "vod-tuner",
+            "ProviderReference": "provider:v1:movie-1",
+            "Password": "plaintext-secret"
+        });
+        assert!(super::plugin_vod_remote_reference(&secret).is_none());
+        assert!(!super::is_plugin_vod_remote_media(Some(&secret)));
+        assert!(!super::is_plugin_vod_remote_media(None));
+    }
+
+    #[cfg(unix)]
+    async fn start_fixed_ts_upstream(
+        payload: Vec<u8>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let payload = payload.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut scratch = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut scratch).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&scratch[..read]);
+                        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    if stream.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&payload).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), connections)
+    }
+
+    #[cfg(unix)]
+    async fn install_active_vod_playback_plugin(
+        db: &Database,
+        root: &std::path::Path,
+        plugin_id: &str,
+        user_id: Uuid,
+    ) {
+        let plugin_dir = root.join("plugin");
+        let bin_dir = plugin_dir.join("bin");
+        tokio::fs::create_dir_all(&bin_dir).await.unwrap();
+        let generated_host = fake_external_process_vod_playback_host_script(root, plugin_id).await;
+        let host_path = bin_dir.join("external-provider-runtime");
+        tokio::fs::copy(generated_host, &host_path).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&host_path).await.unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&host_path, permissions)
+            .await
+            .unwrap();
+
+        db.install_plugin_package(
+            InstallPluginPackage {
+                plugin_id: plugin_id.to_string(),
+                name: "VOD Provider".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: "ExternalProcess".to_string(),
+                target_abi: super::EXTERNAL_PROCESS_TARGET_ABI.to_string(),
+                package: json!({
+                    "Guid": plugin_id,
+                    "Name": "VOD Provider",
+                    "Runtime": "ExternalProcess"
+                }),
+                manifest: json!({
+                    "Guid": plugin_id,
+                    "Name": "VOD Provider",
+                    "Version": "0.1.0",
+                    "Runtime": "ExternalProcess",
+                    "TargetAbi": super::EXTERNAL_PROCESS_TARGET_ABI,
+                    "Entrypoint": "bin/external-provider-runtime",
+                    "Capabilities": ["LiveTvProvider", "VodLibraryProvider"],
+                    "Permissions": ["ProviderSecrets"],
+                    "Installation": {
+                        "InstallPath": plugin_dir.to_string_lossy()
+                    }
+                }),
+            },
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        db.update_plugin_permissions_json(
+            plugin_id,
+            json!(["Network", "ProviderSecrets"]),
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        let plugin = db.installed_plugin_json(plugin_id).await.unwrap().unwrap();
+        assert!(
+            super::try_activate_external_process_plugin(db, &plugin, Some(user_id))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Installs the playback-capable VOD fixture plugin, registers its `plugin:<id>` tuner with
+    /// staged credentials (which chains the channel and VOD imports) and returns the persisted
+    /// movie item id together with everything needed to drive HTTP requests.
+    #[cfg(unix)]
+    async fn prepare_vod_playback_environment(
+        plugin_id: &str,
+    ) -> (Database, tempfile::TempDir, String, Uuid) {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        install_active_vod_playback_plugin(&db, tmp.path(), plugin_id, user.id).await;
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/LiveTv/TunerHosts")
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "Id": "vod-tuner",
+                            "Type": format!("plugin:{plugin_id}"),
+                            "PluginId": plugin_id,
+                            "FriendlyName": "VOD Tuner",
+                            "Username": "vod-user",
+                            "Password": "vod-pass"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let folders = db.virtual_folders().await.unwrap();
+        let movies = folders
+            .iter()
+            .find(|folder| folder.name == "VOD Provider Movies")
+            .expect("VOD movies library was not published");
+        let items = db
+            .media_items_for_virtual_folders(&[movies.id])
+            .await
+            .unwrap();
+        let movie = items
+            .iter()
+            .find(|item| item.name == "Movie One")
+            .expect("imported plugin-VOD movie is missing");
+        assert!(movie.path.starts_with("plugin-vod://"));
+        (db, tmp, api_key, movie.id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_playback_resolves_signed_url_and_proxies_mpegts() {
+        use std::sync::atomic::Ordering;
+
+        let plugin_id = "66666666-7777-4888-9999-000000000001";
+        // Sync-byte-aligned TS packets: definitely not an HLS manifest.
+        let ts_payload = vec![0x47_u8; 188 * 4];
+        let (upstream_base, upstream_connections) =
+            start_fixed_ts_upstream(ts_payload.clone()).await;
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let signed_url = format!("{upstream_base}/vod/movie-1?token=signed-vod-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        // The resolver itself scrubs plugin-controlled media streams and never opens the
+        // upstream on its own.
+        let playback =
+            super::resolve_plugin_vod_playback(&db, plugin_id, "vod-tuner", "provider:v1:movie-1")
+                .await
+                .unwrap();
+        assert_eq!(playback.source_url.expose_secret(), signed_url);
+        assert!(
+            playback.media_streams.is_empty(),
+            "plugin media streams must be scrubbed and dropped"
+        );
+        assert!(super::opaque_live_tv_delivery_is_safe_for_direct_proxy(
+            &playback
+        ));
+        assert_eq!(
+            upstream_connections.load(Ordering::SeqCst),
+            0,
+            "resolution alone must not open the upstream"
+        );
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{}/stream.ts", movie_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp2t")
+        );
+        for value in response.headers().values() {
+            let value = value.to_str().unwrap_or("");
+            assert!(!value.contains("signed-vod-secret"));
+            assert!(!value.contains("vod-canary-token-0123456789"));
+        }
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), ts_payload.as_slice());
+        assert_eq!(upstream_connections.load(Ordering::SeqCst), 1);
+
+        // The ResolvePlayback invocation carried a one-shot grant scoped to the tuner/action.
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        let resolve = invokes
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line["Payload"]["Arguments"]["Action"] == "ResolvePlayback")
+            .expect("ResolvePlayback invocation was not recorded");
+        assert_eq!(resolve["Payload"]["Capability"], "VodLibraryProvider");
+        assert_eq!(
+            resolve["Payload"]["Arguments"]["Arguments"]["ProviderReference"],
+            "provider:v1:movie-1"
+        );
+        assert_eq!(
+            resolve["Payload"]["Arguments"]["SecretGrant"]["Action"],
+            "ResolvePlayback"
+        );
+        assert_eq!(
+            resolve["Payload"]["Arguments"]["SecretGrant"]["TunerId"],
+            "vod-tuner"
+        );
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_playback_rejects_unsafe_delivery_contract() {
+        use std::sync::atomic::Ordering;
+
+        let plugin_id = "66666666-7777-4888-9999-000000000002";
+        let ts_payload = vec![0x47_u8; 188 * 4];
+        let (upstream_base, upstream_connections) = start_fixed_ts_upstream(ts_payload).await;
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let signed_url = format!("{upstream_base}/vod/movie-1?token=signed-vod-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        // The plugin now answers ResolvePlayback with an HLS remux contract: the delivery gate
+        // must fail closed and the signed URL must never reach the client or the upstream.
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "hls")
+            .await
+            .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{}/stream.ts", movie_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("signed-vod-secret"));
+        assert!(!body.contains("vod-canary-token-0123456789"));
+        assert_eq!(
+            upstream_connections.load(Ordering::SeqCst),
+            0,
+            "an unsafe delivery contract must never reach the upstream"
+        );
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_playback_errors_never_expose_secrets() {
+        let plugin_id = "66666666-7777-4888-9999-000000000003";
+        let (db, tmp, _api_key, _movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let signed_url = "http://127.0.0.1:9/vod/movie-1?token=signed-vod-secret";
+        tokio::fs::write(tmp.path().join("vod-source-url"), signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        // Unknown tuner: the resolver fails before any plugin interaction.
+        let error = super::resolve_plugin_vod_playback(
+            &db,
+            plugin_id,
+            "missing-tuner",
+            "provider:v1:movie-1",
+        )
+        .await
+        .expect_err("an unknown tuner must fail closed");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let message = error.error.to_string();
+        for secret in [
+            "signed-vod-secret",
+            "vod-user",
+            "vod-pass",
+            "vod-canary-token-0123456789",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+
+        // Unknown provider reference: the plugin is invoked but its error surfaces sanitized.
+        let error =
+            super::resolve_plugin_vod_playback(&db, plugin_id, "vod-tuner", "provider:v1:unknown")
+                .await
+                .expect_err("the fixture rejects unknown provider references");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let message = error.error.to_string();
+        for secret in [
+            "signed-vod-secret",
+            "vod-user",
+            "vod-pass",
+            "vod-canary-token-0123456789",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn external_process_package_manifest_and_entrypoint_are_validated() {
@@ -62186,6 +64138,183 @@ done
         .replace(
             "__BLOCK_FILE__",
             &root.join("external-blocked").to_string_lossy(),
+        );
+        tokio::fs::write(&path, script).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&path, permissions)
+            .await
+            .unwrap();
+        path
+    }
+
+    async fn fake_external_process_vod_host_script(
+        root: &std::path::Path,
+        plugin_id: &str,
+    ) -> PathBuf {
+        let path = root.join("fake-external-process-vod-host.sh");
+        let script = r#"#!/bin/sh
+printf '%s\n' "$$" >> '__PID_FILE__'
+printf x >> '__START_FILE__'
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-external-vod","ServerVersion":"jellyrin-plugin-rpc-v1","MinimumCallTimeoutMs":100,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"__PLUGIN_ID__","Runtime":"ExternalProcess","RuntimeVersion":"jellyrin-plugin-rpc-v1","Status":"Healthy","Manifest":{"Name":"External VOD Provider"},"Capabilities":["LiveTvProvider","VodLibraryProvider"]}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"__PLUGIN_ID__","Runtime":"ExternalProcess","Status":"Healthy","Metrics":{"CapabilityCount":2}}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '%s\n' "$line" >> '__INVOKE_FILE__'
+      case "$line" in
+        *'"ContinuationToken":"vod-page-2"'*)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Episode","ProviderReference":"provider:v1:episode-1","Name":"Pilot","SeriesReference":"provider:v1:series-1","SeriesName":"Show One","SeasonNumber":1,"EpisodeNumber":1}],"EpisodeCount":1}}}\n' "$corr"
+          ;;
+        *'"Action":"ImportMedia"'*)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One"},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
+          ;;
+        *'"Action":"ImportChannels"'*)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Channels":[{"Id":"one","Name":"One","ProviderReference":"provider:v1:one"}],"Categories":[{"Id":"all","Name":"All"}]}}}\n' "$corr"
+          ;;
+        *)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed"}}}\n' "$corr"
+          ;;
+      esac
+      ;;
+    Shutdown)
+      printf x >> '__STOP_FILE__'
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#
+        .replace("__PLUGIN_ID__", plugin_id)
+        .replace(
+            "__START_FILE__",
+            &root.join("external-started").to_string_lossy(),
+        )
+        .replace(
+            "__STOP_FILE__",
+            &root.join("external-stopped").to_string_lossy(),
+        )
+        .replace(
+            "__INVOKE_FILE__",
+            &root.join("external-invokes").to_string_lossy(),
+        )
+        .replace(
+            "__PID_FILE__",
+            &root.join("external-pid").to_string_lossy(),
+        );
+        tokio::fs::write(&path, script).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&path, permissions)
+            .await
+            .unwrap();
+        path
+    }
+
+    /// Variant of the VOD stdio host that also resolves playback. The signed source URL and the
+    /// delivery mode are read from files at invocation time, so a test can point the plugin at a
+    /// live local upstream and flip the delivery contract between requests.
+    async fn fake_external_process_vod_playback_host_script(
+        root: &std::path::Path,
+        plugin_id: &str,
+    ) -> PathBuf {
+        let path = root.join("fake-external-process-vod-playback-host.sh");
+        let script = r#"#!/bin/sh
+printf '%s\n' "$$" >> '__PID_FILE__'
+printf x >> '__START_FILE__'
+while IFS= read -r line; do
+  corr="${line#*\"CorrelationId\":\"}"
+  corr="${corr%%\"*}"
+  method="${line#*\"Method\":\"}"
+  method="${method%%\"*}"
+  case "$method" in
+    Handshake)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"AcceptedProtocolVersion":1,"ServerName":"fake-external-vod","ServerVersion":"jellyrin-plugin-rpc-v1","MinimumCallTimeoutMs":100,"Capabilities":["LoadPlugin","Health","InvokeCapability"]}}\n' "$corr"
+      ;;
+    LoadPlugin)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"__PLUGIN_ID__","Runtime":"ExternalProcess","RuntimeVersion":"jellyrin-plugin-rpc-v1","Status":"Healthy","Manifest":{"Name":"External VOD Provider"},"Capabilities":["LiveTvProvider","VodLibraryProvider"]}}\n' "$corr"
+      ;;
+    Health)
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"PluginId":"__PLUGIN_ID__","Runtime":"ExternalProcess","Status":"Healthy","Metrics":{"CapabilityCount":2}}}\n' "$corr"
+      ;;
+    InvokeCapability)
+      printf '%s\n' "$line" >> '__INVOKE_FILE__'
+      case "$line" in
+        *'"Action":"ResolvePlayback"'*)
+          case "$line" in
+            *'"ProviderReference":"provider:v1:movie-1"'*|*'"ProviderReference":"provider:v1:episode-1"'*)
+              source_url="$(cat '__SOURCE_URL_FILE__')"
+              mode="$(cat '__MODE_FILE__')"
+              if [ "$mode" = "hls" ]; then
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Playback":{"SourceUrl":"%s","Delivery":{"Container":"hls","Preferred":"HlsRemux","RequiresProviderEgress":false},"MediaStreams":[{"Type":"Video","Url":"%s/stream-canary","Token":"vod-canary-token-0123456789"}]}}}}\n' "$corr" "$source_url" "$source_url"
+              else
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Playback":{"SourceUrl":"%s","ExpiresAt":"2099-01-01T00:00:00Z","Delivery":{"Container":"mpegts","Preferred":"DirectProxy","RequiresProviderEgress":false},"MediaStreams":[{"Type":"Video","Url":"%s/stream-canary","Token":"vod-canary-token-0123456789"}]}}}}\n' "$corr" "$source_url" "$source_url"
+              fi
+              ;;
+            *)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Failed","Error":"unknown provider reference"}}}\n' "$corr"
+              ;;
+          esac
+          ;;
+        *'"ContinuationToken":"vod-page-2"'*)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Episode","ProviderReference":"provider:v1:episode-1","Name":"Pilot","SeriesReference":"provider:v1:series-1","SeriesName":"Show One","SeasonNumber":1,"EpisodeNumber":1}],"EpisodeCount":1}}}\n' "$corr"
+          ;;
+        *'"Action":"ImportMedia"'*)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One"},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
+          ;;
+        *'"Action":"ImportChannels"'*)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Channels":[{"Id":"one","Name":"One","ProviderReference":"provider:v1:one"}],"Categories":[{"Id":"all","Name":"All"}]}}}\n' "$corr"
+          ;;
+        *)
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed"}}}\n' "$corr"
+          ;;
+      esac
+      ;;
+    Shutdown)
+      printf x >> '__STOP_FILE__'
+      printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Status":"Stopped"}}\n' "$corr"
+      exit 0
+      ;;
+  esac
+done
+"#
+        .replace("__PLUGIN_ID__", plugin_id)
+        .replace(
+            "__START_FILE__",
+            &root.join("external-started").to_string_lossy(),
+        )
+        .replace(
+            "__STOP_FILE__",
+            &root.join("external-stopped").to_string_lossy(),
+        )
+        .replace(
+            "__INVOKE_FILE__",
+            &root.join("external-invokes").to_string_lossy(),
+        )
+        .replace(
+            "__PID_FILE__",
+            &root.join("external-pid").to_string_lossy(),
+        )
+        .replace(
+            "__SOURCE_URL_FILE__",
+            &root.join("vod-source-url").to_string_lossy(),
+        )
+        .replace(
+            "__MODE_FILE__",
+            &root.join("vod-delivery-mode").to_string_lossy(),
         );
         tokio::fs::write(&path, script).await.unwrap();
         let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
