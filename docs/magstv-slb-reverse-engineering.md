@@ -155,6 +155,35 @@ para dns/stats/p2p (@ `0x63e71c`, distinta). No confundir.
 5. **Vigilancia de rotación**: la app anuncia v5.1; congelar la revisión
    soportada y preparar re-verificación de vectores al cambiar.
 
+## 6b. Actualización 2026-08-18 (tarde): el directorio SLB y el bootstrap
+
+Nuevos hechos verificados tras §1-6:
+
+- **El portal habla HTTP/2** (host `ftmrmy.jdfey0cd.com`), no el HTTP/1.1 que
+  usa nuestro provider; aun así responde a nuestro cliente (`rc=0` en login,
+  catálogo y `getSlbInfo`).
+- **`getSlbInfo` v15 funciona desde el provider** (rc=0 con `userToken` +
+  `userId` en el bean — sin ellos da `rc=1`), pero devuelve `cdn_list` vacía:
+  la respuesta real está personalizada por la **sesión SLB** (las peticiones
+  de la app van envueltas por `DoHttpSecP` con cookies `d/s/t`).
+- **El directorio SLB real** (capturado en el `SetEntries` Java→nativo): 8
+  entradas (`live`×3, `vod`×3, `record`, `short`) con tags `icdn`/`cf`/
+  `google`, dominios main/spare por entrada y un query string `auths` por
+  entrada con `session_id` (12 chars), `auth_id`, `media_encrypted=0`,
+  `client_ip`, `sign_type` (`cs`/`cfl`/`goog`), `group` (hex largo),
+  `ctrl_type=account`, `app_ver`, `dev_id`. El handshake del canal live va a
+  `dgggy78.dcoynuhet.com` (host `main_addr` de la entrada live/icdn).
+- **El bootstrap de sesión es el handshake `/slb/v10/live`** (HTTP/2, justo
+  después de `getSlbInfo`): es la raíz de la cadena — con sesión establecida,
+  el portal personaliza y el gateway acepta los sobres. Capturar su
+  request/response es el siguiente paso.
+- `SetEnv` lleva un `communication_key` (UUID) generado en Java por
+  instalación; no deriva la cookie `t` por las vías simples probadas
+  (sha256/md5 de communication_key, android_id, dev_id y combinaciones).
+- El único DH X25519 observado en runtime es del **módulo P2P**, no del canal
+  media: la sesión media no se renegocia por proceso (material por
+  instalación o derivado de identidad).
+
 ## 7. Metodología (para futuras revisiones)
 
 ### Laboratorio
