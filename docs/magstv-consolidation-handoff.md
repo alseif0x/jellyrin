@@ -299,10 +299,10 @@ La versión debe actualizarse de forma coherente en:
 - tag Git `v0.3.0`;
 - release privada de GitHub y sus artefactos.
 
-Además, antes de empaquetar hay que re-pinear las dependencias
-`jellyrin-core`/`jellyrin-plugin-rpc`/`jellyrin-plugin-sdk` del plugin a un git
-rev publicado del core que contenga el contrato `VodLibraryProvider` (hoy son
-path deps locales marcadas con `TODO(0.3.0)` en el `Cargo.toml` del plugin).
+Las dependencias `jellyrin-core`/`jellyrin-plugin-rpc`/`jellyrin-plugin-sdk`
+del plugin quedaron re-pineadas al git rev publicado
+`b05a75ba0b05e7c6e717277cec5dd976e4332540` del core, que contiene el contrato
+`VodLibraryProvider` (hecho el 2026-08-18 como parte del empaquetado 0.3.0).
 
 ## Trabajo pendiente por prioridad
 
@@ -397,8 +397,8 @@ trabajo futuro si aparece un proveedor VOD-only.
 - el signer `sign_o3` sigue siendo obligatorio solo para el playback VOD: sin
   secreto configurado el runtime falla cerrado (`ImportMedia` no lo necesita);
 - pruebas stdio del flujo de import y validación de grants añadidas;
-- `Cargo.toml` usa path deps locales al core (TODO(0.3.0): re-pinear a un git
-  rev publicado con el contrato VOD antes de empaquetar);
+- `Cargo.toml` pinea las deps del core al git rev publicado
+  `b05a75ba0b05e7c6e717277cec5dd976e4332540` (hecho en 0.3.0);
 - la integración automática de la firma verificada queda **superseded** por el
   hallazgo de la tarea 1: la app 4.99.5 no firma las peticiones del portal; el
   bloqueo real de playback es el relay SLB cifrado.
