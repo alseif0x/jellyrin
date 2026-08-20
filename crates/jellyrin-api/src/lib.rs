@@ -29830,6 +29830,12 @@ async fn live_tv_tuner_view_by_id(
 fn live_tv_tuner_view_to_json(tuner: &LiveTvTunerView, server_id: &str) -> serde_json::Value {
     let mut view = special_user_view_to_json(&tuner.name, "livetv", server_id);
     view["Id"] = serde_json::json!(tuner.view_id);
+    // Jellyfin Web honors this lower-case compatibility field before its generic Live TV route.
+    // Keep per-tuner views on the ordinary list controller so ParentId survives every page load.
+    view["url"] = serde_json::json!(format!(
+        "#/list?serverId={server_id}&parentId={}",
+        tuner.view_id
+    ));
     view["ChildCount"] = serde_json::json!(tuner.child_count);
     view["RecursiveItemCount"] = serde_json::json!(tuner.child_count);
     view["TunerHostId"] = serde_json::json!(tuner.tuner_id);
@@ -74055,11 +74061,17 @@ done
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let views: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(views["TotalRecordCount"], 5);
-        assert!(views["Items"].as_array().unwrap().iter().any(|view| {
-            view["Name"] == "Live TV"
-                && view["CollectionType"] == "livetv"
-                && view.get("TunerHostId").is_none()
-        }));
+        let global_live_tv_view = views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| {
+                view["Name"] == "Live TV"
+                    && view["CollectionType"] == "livetv"
+                    && view.get("TunerHostId").is_none()
+            })
+            .unwrap();
+        assert!(global_live_tv_view.get("url").is_none());
         let mags_view = views["Items"]
             .as_array()
             .unwrap()
@@ -74071,6 +74083,14 @@ done
         assert_eq!(mags_view["ChildCount"], 1);
         let mags_view_id = mags_view["Id"].as_str().unwrap().to_string();
         assert_eq!(mags_view_id, super::live_tv_tuner_view_id("magstv"));
+        assert_eq!(
+            mags_view["url"],
+            format!(
+                "#/list?serverId={}&parentId={mags_view_id}",
+                mags_view["ServerId"].as_str().unwrap()
+            )
+        );
+        assert!(!mags_view["url"].as_str().unwrap().contains("#/livetv"));
 
         for endpoint in [
             format!("/Items?ParentId={mags_view_id}&IncludeItemTypes=TvChannel&Limit=10"),
@@ -74116,6 +74136,7 @@ done
         assert_eq!(view["Name"], "Mags Live TV");
         assert_eq!(view["TunerHostId"], "magstv");
         assert_eq!(view["ChildCount"], 1);
+        assert_eq!(view["url"], mags_view["url"]);
 
         let response = app
             .oneshot(

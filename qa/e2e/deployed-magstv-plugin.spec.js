@@ -411,14 +411,71 @@ async function verifyHomeAndOpenViews(page, views) {
     await page.goto('/web/#/home', { waitUntil: 'domcontentloaded' });
     const link = page.locator('.homeLibraryButton').filter({ hasText: name }).first();
     await expect(link).toBeVisible({ timeout: 60_000 });
+    let scopedChannelsResponsePromise = null;
+    if (kind === 'liveTv') {
+      const href = await link.getAttribute('href');
+      expect(href, 'Mags Live TV link href').toBeTruthy();
+      expect(hashRoutePath(href), 'Mags Live TV route').toBe('/list');
+      expect(hashRouteParameter(href, 'parentId'), 'Mags Live TV route ParentId')
+        .toBe(views.liveTv.Id);
+      scopedChannelsResponsePromise = page.waitForResponse((response) => {
+        if (response.request().method() !== 'GET') return false;
+        const url = new URL(response.url());
+        return /\/Items$/i.test(url.pathname)
+          && searchParameterCaseInsensitive(url.searchParams, 'ParentId') === views.liveTv.Id;
+      }, { timeout: 60_000 });
+    }
     await link.click();
     await expect(page).not.toHaveURL(/\/web\/#\/home(?:$|\?)/, { timeout: 30_000 });
+    const firstRenderedItem = page.locator('.card, .listItem').first();
     await expect(
-      page.locator('.card, .listItem').first(),
+      firstRenderedItem,
       `${name} first rendered item`,
     ).toBeVisible({ timeout: 60_000 });
+    if (kind === 'liveTv') {
+      await expect(page).toHaveURL(/\/web\/#\/list\?/);
+      expect(hashRouteParameter(page.url(), 'parentId'), 'Mags Live TV loaded ParentId')
+        .toBe(views.liveTv.Id);
+
+      const scopedChannelsResponse = await scopedChannelsResponsePromise;
+      expect(scopedChannelsResponse.status(), 'Mags Live TV scoped /Items status').toBe(200);
+      const scopedChannels = normalizePage(await scopedChannelsResponse.json());
+      expect(scopedChannels.items.length, 'Mags Live TV scoped response items').toBeGreaterThan(0);
+      expect(
+        scopedChannels.items.every((item) => item.TunerHostId === TUNER_ID),
+        'Mags Live TV scoped response must contain only MAGSTV channels',
+      ).toBe(true);
+      const renderedIds = await page.locator('.card[data-id], .listItem[data-id]')
+        .evaluateAll((elements) => elements.map((element) => element.getAttribute('data-id')));
+      const scopedIds = new Set(scopedChannels.items.map((item) => item.Id));
+      expect(
+        renderedIds.some((id) => scopedIds.has(id)),
+        'Mags Live TV rendered cards must come from the scoped MAGSTV response',
+      ).toBe(true);
+    }
     expect(views[kind].Id).toBeTruthy();
   }
+}
+
+function hashRoutePath(url) {
+  const hash = new URL(url, 'https://jellyrin.invalid').hash;
+  const queryOffset = hash.indexOf('?');
+  return hash.slice(1, queryOffset < 0 ? undefined : queryOffset);
+}
+
+function hashRouteParameter(url, name) {
+  const hash = new URL(url, 'https://jellyrin.invalid').hash;
+  const queryOffset = hash.indexOf('?');
+  if (queryOffset < 0) return null;
+  return new URLSearchParams(hash.slice(queryOffset + 1)).get(name);
+}
+
+function searchParameterCaseInsensitive(searchParams, name) {
+  const normalizedName = name.toLowerCase();
+  for (const [key, value] of searchParams) {
+    if (key.toLowerCase() === normalizedName) return value;
+  }
+  return null;
 }
 
 async function probeFirstPlayable(items, probe, label) {
