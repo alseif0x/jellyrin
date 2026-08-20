@@ -144,14 +144,15 @@ use jellyrin_db::{
     MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetKind,
     MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
     MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
-    NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
-    ProviderSecretReference, QuickConnectSession, REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
-    RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibraryStageSpec,
-    ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
-    TrickplayInfo, TvSeriesCatalogNameFilter, UpsertActivePlaybackSession,
-    UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
-    probe_remote_media_info_admitted, provider_secret_namespace_for_configuration,
-    record_ffprobe_capacity_unavailable, upcoming_media_item_premiere_date,
+    NamedConfigurationPayload, PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD,
+    PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert, ProviderSecretReference,
+    QuickConnectSession, REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS, RemoteMediaCatalogStage,
+    RemoteMediaItemUpsert, RemoteMediaLibraryStageSpec, ResumeItemsPageQuery, SortDirection,
+    SystemConfigurationPayloads, TaskRun, TranscodeSession, TrickplayInfo,
+    TvSeriesCatalogNameFilter, UpsertActivePlaybackSession, UpsertActiveViewingSession,
+    UpsertPlaybackState, UpsertTranscodeSession, probe_remote_media_info_admitted,
+    provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
+    upcoming_media_item_premiere_date,
 };
 
 #[cfg(not(test))]
@@ -25587,9 +25588,74 @@ struct PluginVodResolvedMetadata {
 const PLUGIN_VOD_METADATA_CACHE_TTL_SECONDS: i64 = 24 * 60 * 60;
 const PLUGIN_VOD_MAX_RUNTIME_TICKS: i64 = 7 * 24 * 60 * 60 * 10_000_000;
 const PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD: &str = "PluginVodRuntimeResolvedAt";
+const PLUGIN_VOD_MEDIA_RUNTIME_PROBE_VERSION: i64 = 1;
+const PLUGIN_VOD_MEDIA_RUNTIME_MISSING_TTL_SECONDS: i64 = 6 * 60 * 60;
+const PLUGIN_VOD_MEDIA_RUNTIME_FAILED_TTL_SECONDS: i64 = 5 * 60;
 
 fn bounded_plugin_vod_runtime_ticks(runtime_ticks: Option<i64>) -> Option<i64> {
     runtime_ticks.filter(|ticks| (1..=PLUGIN_VOD_MAX_RUNTIME_TICKS).contains(ticks))
+}
+
+fn plugin_vod_media_runtime_probe_is_fresh(metadata: &serde_json::Value) -> bool {
+    let Some(marker) = json_field_case_insensitive(metadata, PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD)
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if marker
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("Version"))
+        .and_then(|(_, value)| value.as_i64())
+        != Some(PLUGIN_VOD_MEDIA_RUNTIME_PROBE_VERSION)
+    {
+        return false;
+    }
+    let Some(outcome) = marker
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("Outcome"))
+        .and_then(|(_, value)| value.as_str())
+    else {
+        return false;
+    };
+    let Some(resolved_at) = marker
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("ResolvedAt"))
+        .and_then(|(_, value)| value.as_i64())
+    else {
+        return false;
+    };
+    let ttl = if outcome.eq_ignore_ascii_case("Missing") {
+        PLUGIN_VOD_MEDIA_RUNTIME_MISSING_TTL_SECONDS
+    } else if outcome.eq_ignore_ascii_case("Failed") {
+        PLUGIN_VOD_MEDIA_RUNTIME_FAILED_TTL_SECONDS
+    } else {
+        return false;
+    };
+    let age = OffsetDateTime::now_utc()
+        .unix_timestamp()
+        .saturating_sub(resolved_at);
+    (0..ttl).contains(&age)
+}
+
+#[cfg(test)]
+fn set_plugin_vod_media_runtime_probe_marker(
+    metadata: &mut serde_json::Value,
+    outcome: &'static str,
+    resolved_at: i64,
+) {
+    metadata[PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD] =
+        plugin_vod_media_runtime_probe_marker(outcome, resolved_at);
+}
+
+fn plugin_vod_media_runtime_probe_marker(
+    outcome: &'static str,
+    resolved_at: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "Version": PLUGIN_VOD_MEDIA_RUNTIME_PROBE_VERSION,
+        "Outcome": outcome,
+        "ResolvedAt": resolved_at,
+    })
 }
 
 #[derive(Default)]
@@ -38565,12 +38631,23 @@ async fn playback_info_response(
         item = resolved.item;
     }
     if is_plugin_vod_virtual_item(&item) {
-        let reference = metadata
-            .as_ref()
-            .and_then(plugin_vod_remote_reference)
-            .ok_or_else(|| {
-                ApiError::service_unavailable("VOD provider playback route is unavailable")
-            })?;
+        let metadata = metadata.as_mut().ok_or_else(|| {
+            ApiError::service_unavailable("VOD provider playback route is unavailable")
+        })?;
+        if let Some(target) = plugin_vod_item_metadata_target(&item, metadata) {
+            match ensure_plugin_vod_metadata(state, &target).await {
+                Ok(resolved) => item.runtime_ticks = resolved.runtime_ticks,
+                Err(error) => tracing::warn!(
+                    status = %error.status(),
+                    "VOD metadata enrichment was unavailable before playback"
+                ),
+            }
+            *metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        }
+        item = ensure_plugin_vod_media_runtime(state, item, metadata).await?;
+        let reference = plugin_vod_remote_reference(metadata).ok_or_else(|| {
+            ApiError::service_unavailable("VOD provider playback route is unavailable")
+        })?;
         // Resolve once per PlaybackInfo request. The signed URL remains inside `playback` and is
         // dropped without ever entering the JSON response; only the validated delivery evidence
         // and safe track descriptors are applied to this ephemeral MediaItem clone.
@@ -56299,6 +56376,18 @@ fn is_xtream_remote_media(metadata: Option<&serde_json::Value>) -> bool {
 /// instead of all racing (thundering herd) before the first probe persists.
 static XTREAM_PROBE_LOCKS: std::sync::OnceLock<std::sync::Mutex<WeakKeyedLockRegistry<Uuid>>> =
     std::sync::OnceLock::new();
+static PLUGIN_VOD_RUNTIME_PROBE_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<WeakKeyedLockRegistry<Uuid>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+struct PluginVodRuntimeProbeAfterPublishHook {
+    reached: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+#[cfg(test)]
+static PLUGIN_VOD_RUNTIME_PROBE_AFTER_PUBLISH_HOOKS: OnceLock<
+    StdMutex<HashMap<Uuid, PluginVodRuntimeProbeAfterPublishHook>>,
+> = OnceLock::new();
 static LIVE_TV_PROBE_LOCKS: std::sync::OnceLock<std::sync::Mutex<WeakKeyedLockRegistry<String>>> =
     std::sync::OnceLock::new();
 static XTREAM_PROBE_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -56313,6 +56402,49 @@ fn xtream_probe_lock_for(item_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.lock_for(item_id)
+}
+
+fn plugin_vod_runtime_probe_lock_for(item_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let registry = PLUGIN_VOD_RUNTIME_PROBE_LOCKS.get_or_init(|| {
+        std::sync::Mutex::new(WeakKeyedLockRegistry::new(KEYED_LOCK_REGISTRY_MAX_ENTRIES))
+    });
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .lock_for(item_id)
+}
+
+#[cfg(test)]
+fn install_plugin_vod_runtime_probe_after_publish_hook(
+    item_id: Uuid,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (resume_tx, resume_rx) = oneshot::channel();
+    PLUGIN_VOD_RUNTIME_PROBE_AFTER_PUBLISH_HOOKS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            item_id,
+            PluginVodRuntimeProbeAfterPublishHook {
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+    (reached_rx, resume_tx)
+}
+
+#[cfg(test)]
+async fn plugin_vod_runtime_probe_after_publish_hook(item_id: Uuid) {
+    let hook = PLUGIN_VOD_RUNTIME_PROBE_AFTER_PUBLISH_HOOKS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&item_id);
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let _ = hook.resume.await;
+    }
 }
 
 fn live_tv_probe_lock_for(cache_key: String) -> std::sync::Arc<tokio::sync::Mutex<()>> {
@@ -56579,6 +56711,100 @@ fn internal_remote_relay_target(token: &str) -> Option<InternalRemoteRelayTarget
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     registry.retain(|_, entry| entry.expires_at > now);
     registry.get(token).map(|entry| entry.target.clone())
+}
+
+/// Recovers a finite runtime from the protected media only when catalogue and JIT metadata both
+/// omitted it. FFprobe receives an unguessable loopback URL; the relay resolves the provider URL
+/// inside Jellyrin for each bounded request, so signed addresses never enter argv, logs or the DB.
+async fn ensure_plugin_vod_media_runtime(
+    state: &AppState,
+    item: MediaItem,
+    metadata: &mut serde_json::Value,
+) -> Result<MediaItem, ApiError> {
+    if !matches!(media_item_type(&item), "Movie" | "Episode") {
+        return Ok(item);
+    }
+    if bounded_plugin_vod_runtime_ticks(item.runtime_ticks).is_some()
+        || plugin_vod_media_runtime_probe_is_fresh(metadata)
+    {
+        return Ok(item);
+    }
+
+    let lock = plugin_vod_runtime_probe_lock_for(item.id);
+    let _guard = lock.lock().await;
+    let mut current = state
+        .db
+        .media_item_by_id_visible(item.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("VOD metadata item is unavailable"))?;
+    let current_metadata = metadata_payload_for_item(&state.db, item.id).await?;
+    if bounded_plugin_vod_runtime_ticks(current.runtime_ticks).is_some()
+        || plugin_vod_media_runtime_probe_is_fresh(&current_metadata)
+    {
+        *metadata = current_metadata;
+        return Ok(current);
+    }
+
+    let remote_permit = match acquire_remote_probe_capacity_with_queue(
+        xtream_probe_limiter().clone(),
+        xtream_probe_wait_queue().clone(),
+        xtream_probe_queue_timeout(),
+    )
+    .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            record_ffprobe_capacity_unavailable();
+            return Ok(current);
+        }
+    };
+    let process_permit = match acquire_multimedia_probe().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            record_ffprobe_capacity_unavailable();
+            drop(remote_permit);
+            return Ok(current);
+        }
+    };
+    let relay = register_internal_remote_relay(
+        state,
+        InternalRemoteRelayTarget::MediaItem(item.id),
+        INTERNAL_REMOTE_RELAY_PROBE_TTL,
+    )?;
+    let media_info =
+        probe_remote_media_info_admitted(relay.url(), &item.media_type, process_permit).await;
+    drop(relay);
+    drop(remote_permit);
+
+    let runtime_ticks = bounded_plugin_vod_runtime_ticks(media_info.runtime_ticks);
+    let outcome = if runtime_ticks.is_some() {
+        "Complete"
+    } else if media_info.bitrate.is_some()
+        || media_info.width.is_some()
+        || media_info.height.is_some()
+        || !media_info.media_streams.is_empty()
+    {
+        "Missing"
+    } else {
+        "Failed"
+    };
+    let marker =
+        plugin_vod_media_runtime_probe_marker(outcome, OffsetDateTime::now_utc().unix_timestamp());
+    state
+        .db
+        .publish_plugin_vod_runtime_probe(current.id, runtime_ticks, marker)
+        .await?;
+    #[cfg(test)]
+    plugin_vod_runtime_probe_after_publish_hook(current.id).await;
+    let published = state
+        .db
+        .media_item_with_metadata_by_id_visible(current.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("VOD metadata item is unavailable"))?;
+    current = published.item;
+    *metadata = published.metadata;
+    tracing::info!(outcome, "plugin VOD bounded media runtime probe completed");
+    Ok(current)
 }
 
 fn xtream_remote_source_ref(metadata: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -62652,6 +62878,21 @@ mod tests {
             &metadata,
             super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD
         ));
+        super::set_plugin_vod_media_runtime_probe_marker(&mut metadata, "Missing", now);
+        assert!(super::plugin_vod_media_runtime_probe_is_fresh(&metadata));
+        super::set_plugin_vod_media_runtime_probe_marker(&mut metadata, "Failed", now);
+        assert!(super::plugin_vod_media_runtime_probe_is_fresh(&metadata));
+        super::set_plugin_vod_media_runtime_probe_marker(
+            &mut metadata,
+            "Failed",
+            now - super::PLUGIN_VOD_MEDIA_RUNTIME_FAILED_TTL_SECONDS,
+        );
+        assert!(!super::plugin_vod_media_runtime_probe_is_fresh(&metadata));
+        super::set_plugin_vod_media_runtime_probe_marker(&mut metadata, "Complete", now);
+        assert!(
+            !super::plugin_vod_media_runtime_probe_is_fresh(&metadata),
+            "a positive marker without persisted runtime must repair by probing again"
+        );
         // The mutator deliberately has no URL input and scrubs legacy provider artwork fields:
         // only safe copy/cache markers can reach DB or later item JSON.
         assert!(
@@ -64321,12 +64562,25 @@ mod tests {
             .await
             .unwrap()
             .expect("fixture movie remains visible");
-        let metadata = super::metadata_payload_for_item(&db, movie_id)
+        let mut metadata = super::metadata_payload_for_item(&db, movie_id)
             .await
             .unwrap();
+        let target = super::plugin_vod_item_metadata_target(&movie, &metadata)
+            .expect("fixture movie has an opaque provider reference");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        super::apply_safe_plugin_vod_resolution(
+            &mut metadata,
+            &target,
+            Some("Cached movie metadata"),
+            false,
+            now,
+        );
+        // Reproduce the real provider case: metadata resolution completed but omitted duration.
+        // PlaybackInfo must recover it through the opaque loopback media relay.
+        metadata[super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD] = json!(now);
         db.update_media_item_media_info_and_metadata(
             movie_id,
-            Some(50_000_000),
+            None,
             movie.bitrate,
             movie.width,
             movie.height,
@@ -64419,7 +64673,13 @@ mod tests {
         }
         let playback: Value = serde_json::from_slice(&body).unwrap();
         let source = &playback["MediaSources"][0];
-        assert_eq!(source["RunTimeTicks"], 50_000_000);
+        let runtime_ticks = source["RunTimeTicks"]
+            .as_i64()
+            .expect("bounded media probe must recover the finite runtime");
+        assert!(
+            (40_000_000..=60_000_000).contains(&runtime_ticks),
+            "unexpected generated TS runtime: {runtime_ticks}"
+        );
         assert_eq!(source["SupportsDirectPlay"], false);
         assert_eq!(source["SupportsTranscoding"], true);
         assert!(source.get("DirectStreamUrl").is_none());
@@ -64528,6 +64788,23 @@ mod tests {
         assert!(!persisted_session.contains("signed-vod-secret"));
         assert!(!persisted_session.contains(&upstream_base));
 
+        let persisted = db
+            .media_item_by_id_visible(movie_id)
+            .await
+            .unwrap()
+            .expect("fixture movie remains visible");
+        assert_eq!(persisted.runtime_ticks, Some(runtime_ticks));
+        let persisted_metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted_metadata[super::PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD]["Outcome"],
+            "Complete"
+        );
+        let persisted_text = serde_json::to_string(&persisted_metadata).unwrap();
+        assert!(!persisted_text.contains("signed-vod-secret"));
+        assert!(!persisted_text.contains(&upstream_base));
+
         let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
             .await
             .unwrap();
@@ -64560,6 +64837,332 @@ mod tests {
         })
         .await
         .expect("plugin VOD HLS process did not terminate after the finite fixture");
+
+        server.abort();
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_runtime_probe_atomically_preserves_concurrent_item_updates() {
+        let plugin_id = "66666666-7777-4888-9999-000000000025";
+        let (db, tmp, _api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let movie = db
+            .media_item_by_id_visible(movie_id)
+            .await
+            .unwrap()
+            .expect("fixture movie remains visible");
+        let mut metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        let target = super::plugin_vod_item_metadata_target(&movie, &metadata)
+            .expect("fixture movie has an opaque provider reference");
+        let provider_reference = metadata["ProviderReference"].clone();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        super::apply_safe_plugin_vod_resolution(
+            &mut metadata,
+            &target,
+            Some("Initial overview"),
+            false,
+            now,
+        );
+        metadata[super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD] = json!(now);
+        db.update_media_item_media_info_and_metadata(
+            movie_id,
+            None,
+            movie.bitrate,
+            movie.width,
+            movie.height,
+            movie.media_streams,
+            metadata,
+        )
+        .await
+        .unwrap();
+
+        let ts_path = tmp.path().join("runtime-race-input.ts");
+        generate_plugin_vod_hls_fixture(&ts_path).await;
+        let (upstream_base, probe_entered, release_probe) =
+            start_blocked_ts_upstream(tokio::fs::read(&ts_path).await.unwrap()).await;
+        let signed_url = format!("{upstream_base}/vod/race.ts?signature=race-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: format!("http://{address}"),
+        };
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let probe_item = db
+            .media_item_by_id_visible(movie_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut probe_metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        let probe_task = tokio::spawn(async move {
+            let item =
+                super::ensure_plugin_vod_media_runtime(&state, probe_item, &mut probe_metadata)
+                    .await
+                    .unwrap();
+            (item, probe_metadata)
+        });
+        tokio::time::timeout(StdDuration::from_secs(10), probe_entered.notified())
+            .await
+            .expect("runtime probe did not reach the blocked fixture");
+
+        let concurrent_runtime_ticks = 123_000_000;
+        let concurrent_streams = vec![
+            json!({ "Index": 0, "Type": "Video", "Codec": "hevc" }),
+            json!({ "Index": 7, "Type": "Audio", "Codec": "aac", "Language": "spa" }),
+        ];
+        let mut concurrent_metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        concurrent_metadata["Overview"] = json!("Concurrent overview");
+        concurrent_metadata["PrimaryImageTag"] = json!("concurrent-image-tag");
+        concurrent_metadata["ConcurrentSentinel"] = json!("preserve-me");
+        db.update_media_item_media_info_and_metadata(
+            movie_id,
+            Some(concurrent_runtime_ticks),
+            Some(9_999_999),
+            Some(3840),
+            Some(2160),
+            concurrent_streams.clone(),
+            concurrent_metadata,
+        )
+        .await
+        .unwrap();
+        let (after_publish_reached, resume_final_snapshot) =
+            super::install_plugin_vod_runtime_probe_after_publish_hook(movie_id);
+        release_probe.send(true).unwrap();
+
+        tokio::time::timeout(StdDuration::from_secs(10), after_publish_reached)
+            .await
+            .expect("runtime probe did not reach the post-publish window")
+            .unwrap();
+        let final_runtime_ticks = 234_000_000;
+        let final_streams = vec![
+            json!({ "Index": 0, "Type": "Video", "Codec": "av1" }),
+            json!({ "Index": 9, "Type": "Audio", "Codec": "opus", "Language": "eng" }),
+        ];
+        let mut final_metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        final_metadata["Overview"] = json!("Post-publish overview");
+        final_metadata["PrimaryImageTag"] = json!("post-publish-image-tag");
+        final_metadata["ConcurrentSentinel"] = json!("newest-row-version");
+        db.update_media_item_media_info_and_metadata(
+            movie_id,
+            Some(final_runtime_ticks),
+            Some(8_888_888),
+            Some(2560),
+            Some(1440),
+            final_streams.clone(),
+            final_metadata,
+        )
+        .await
+        .unwrap();
+        resume_final_snapshot.send(()).unwrap();
+
+        let (resolved_item, resolved_metadata) =
+            tokio::time::timeout(StdDuration::from_secs(10), probe_task)
+                .await
+                .expect("runtime probe did not finish")
+                .unwrap();
+        assert_eq!(resolved_item.runtime_ticks, Some(final_runtime_ticks));
+        assert_eq!(resolved_item.media_streams, final_streams);
+        assert_eq!(resolved_metadata["ProviderReference"], provider_reference);
+        assert_eq!(resolved_metadata["Overview"], "Post-publish overview");
+        assert_eq!(
+            resolved_metadata["PrimaryImageTag"],
+            "post-publish-image-tag"
+        );
+        assert_eq!(
+            resolved_metadata["ConcurrentSentinel"],
+            "newest-row-version"
+        );
+        assert!(
+            resolved_metadata[super::PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD]["Outcome"]
+                .as_str()
+                .is_some_and(|outcome| matches!(outcome, "Complete" | "Missing")),
+            "the finite fixture must produce a safe media probe marker"
+        );
+
+        let persisted = db
+            .media_item_by_id_visible(movie_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.runtime_ticks, Some(final_runtime_ticks));
+        assert_eq!(persisted.media_streams, final_streams);
+        let persisted_metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        assert_eq!(persisted_metadata, resolved_metadata);
+
+        server.abort();
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_missing_runtime_probe_is_negative_cached_and_keeps_event_fallback() {
+        use std::sync::atomic::Ordering;
+
+        let plugin_id = "66666666-7777-4888-9999-000000000024";
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let movie = db
+            .media_item_by_id_visible(movie_id)
+            .await
+            .unwrap()
+            .expect("fixture movie remains visible");
+        let mut metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        let target = super::plugin_vod_item_metadata_target(&movie, &metadata)
+            .expect("fixture movie has an opaque provider reference");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        super::apply_safe_plugin_vod_resolution(&mut metadata, &target, None, false, now);
+        metadata[super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD] = json!(now);
+        db.update_media_item_media_info_and_metadata(
+            movie_id,
+            None,
+            movie.bitrate,
+            movie.width,
+            movie.height,
+            movie.media_streams,
+            metadata,
+        )
+        .await
+        .unwrap();
+
+        // Sync bytes without PAT/PMT/PES are not a probeable media file, while remaining harmless
+        // to proxy if a native profile selects the direct route after the failed runtime probe.
+        let (upstream_base, upstream_connections) =
+            start_fixed_ts_upstream(vec![0x47_u8; 188 * 4]).await;
+        let signed_url = format!("{upstream_base}/vod/no-runtime.ts?signature=negative-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: format!("http://{address}"),
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let base = format!("http://{address}");
+        let profile = json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "ts,mpegts",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac"
+                }]
+            }
+        });
+        let client = reqwest::Client::new();
+        let mut connections_after_first = None;
+        for attempt in 0..2 {
+            let response = client
+                .post(format!("{base}/Items/{}/PlaybackInfo", movie_id.simple()))
+                .header("X-Emby-Token", &api_key)
+                .header(header::CONTENT_TYPE.as_str(), "application/json")
+                .body(profile.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = response.text().await.unwrap();
+            assert!(!text.contains("negative-secret"));
+            assert!(!text.contains(&upstream_base));
+            let playback: Value = serde_json::from_str(&text).unwrap();
+            assert!(playback["MediaSources"][0]["RunTimeTicks"].is_null());
+            assert_eq!(playback["MediaSources"][0]["CanSeek"], true);
+            assert_eq!(playback["MediaSources"][0]["IsInfiniteStream"], false);
+            assert!(super::hls_event_playlist_required(None));
+            if attempt == 0 {
+                let count = upstream_connections.load(Ordering::SeqCst);
+                assert!(count > 0);
+                connections_after_first = Some(count);
+            } else {
+                assert_eq!(
+                    upstream_connections.load(Ordering::SeqCst),
+                    connections_after_first.expect("first request must probe the fixture"),
+                    "fresh negative marker must suppress another provider media probe"
+                );
+            }
+        }
+        let after_second = upstream_connections.load(Ordering::SeqCst);
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert_eq!(
+            upstream_connections.load(Ordering::SeqCst),
+            after_second,
+            "fresh negative marker must suppress another provider media probe"
+        );
+        let persisted_metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted_metadata[super::PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD]["Outcome"],
+            "Failed"
+        );
+        assert!(super::plugin_vod_media_runtime_probe_is_fresh(
+            &persisted_metadata
+        ));
+        let persisted_text = serde_json::to_string(&persisted_metadata).unwrap();
+        assert!(!persisted_text.contains("negative-secret"));
+        assert!(!persisted_text.contains(&upstream_base));
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        {
+            let relay_registry = super::INTERNAL_REMOTE_RELAYS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                !relay_registry.values().any(|entry| {
+                    entry.target == super::InternalRemoteRelayTarget::MediaItem(movie_id)
+                }),
+                "the bounded probe relay lease must be removed after the request completes"
+            );
+        }
 
         server.abort();
         super::stop_external_plugin_host(plugin_id).await;
@@ -64900,6 +65503,63 @@ mod tests {
             }
         });
         (format!("http://{addr}"), connections)
+    }
+
+    #[cfg(unix)]
+    async fn start_blocked_ts_upstream(
+        payload: Vec<u8>,
+    ) -> (
+        String,
+        std::sync::Arc<tokio::sync::Notify>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let accept_entered = entered.clone();
+        let (release, _) = tokio::sync::watch::channel(false);
+        let accept_release = release.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let payload = payload.clone();
+                let entered = accept_entered.clone();
+                let mut release = accept_release.subscribe();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut scratch = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut scratch).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&scratch[..read]);
+                        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    entered.notify_one();
+                    while !*release.borrow() {
+                        if release.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    if stream.write_all(header.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&payload).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), entered, release)
     }
 
     #[cfg(unix)]

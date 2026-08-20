@@ -2623,6 +2623,46 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_command_output_cancellation_terminates_and_reaps_process_group() {
+        let root = tempfile::tempdir().unwrap();
+        let process_ids_path = root.path().join("cancelled-process-ids");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sh -c 'while :; do sleep 30; done' & child=$!; printf '%s %s' \"$$\" \"$child\" > \"$1\"; while :; do sleep 30; done",
+                "jellyrin-bounded-cancellation",
+            ])
+            .arg(&process_ids_path);
+
+        let task = tokio::spawn(run_bounded_command_output(
+            command,
+            BoundedCommandOutputOptions::new(Duration::from_secs(30), 1024, 1024),
+        ));
+        timeout(Duration::from_secs(3), async {
+            while !process_ids_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let process_ids = tokio::fs::read_to_string(process_ids_path)
+            .await
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse::<libc::pid_t>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(process_ids.len(), 2);
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        for process_id in process_ids {
+            wait_for_unix_process_exit(process_id).await;
+        }
+    }
+
     #[tokio::test]
     async fn transcode_process_streams_progress_and_waits_for_exit() {
         let command = FfmpegCommandSpec::new(

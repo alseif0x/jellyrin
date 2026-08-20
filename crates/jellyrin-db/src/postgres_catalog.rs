@@ -5163,6 +5163,39 @@ impl PostgresDatabase {
         result
     }
 
+    /// Reads the playable item and its metadata from one PostgreSQL statement so callers cannot
+    /// mix fields from different committed row versions.
+    pub async fn media_item_with_metadata_by_id_visible(
+        &self,
+        item_id: Uuid,
+    ) -> anyhow::Result<Option<MediaItemCatalogEntry>> {
+        let row = sqlx::query_as::<_, PostgresMediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams, item.metadata, item.created_at, item.updated_at,
+                   NULL::uuid AS playback_user_id,
+                   NULL::uuid AS playback_item_id,
+                   NULL::text AS playback_media_source_id,
+                   NULL::bigint AS playback_audio_stream_index,
+                   NULL::bigint AS playback_subtitle_stream_index,
+                   NULL::bigint AS playback_position_ticks,
+                   NULL::boolean AS playback_is_paused,
+                   NULL::boolean AS playback_played,
+                   NULL::boolean AS playback_is_favorite,
+                   NULL::double precision AS playback_rating,
+                   NULL::timestamptz AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.id = $1 AND item.missing_since IS NULL
+            "#,
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn delete_media_items(
         &self,
         item_ids: Vec<Uuid>,
@@ -5488,6 +5521,40 @@ impl PostgresDatabase {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Atomically publishes a plugin-VOD runtime probe without writing any stale item snapshot.
+    /// PostgreSQL reevaluates the conditional update against the latest locked row, so a positive
+    /// runtime committed by another writer wins while `jsonb_set` preserves all other metadata.
+    pub async fn publish_plugin_vod_runtime_probe(
+        &self,
+        item_id: Uuid,
+        candidate_runtime_ticks: Option<i64>,
+        marker: Value,
+    ) -> anyhow::Result<(Option<i64>, Value)> {
+        sqlx::query_as::<_, (Option<i64>, Value)>(
+            r#"
+            UPDATE media_items
+            SET runtime_ticks = CASE
+                    WHEN runtime_ticks > 0 THEN runtime_ticks
+                    ELSE $2
+                END,
+                metadata = jsonb_set(
+                    COALESCE(metadata, '{}'::jsonb),
+                    ARRAY['PluginVodMediaRuntimeProbe']::text[],
+                    $3,
+                    true
+                )
+            WHERE id = $1
+            RETURNING runtime_ticks, metadata
+            "#,
+        )
+        .bind(item_id)
+        .bind(candidate_runtime_ticks)
+        .bind(marker)
+        .fetch_optional(&self.worker_pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("media item not found"))
     }
 
     pub async fn update_media_item_metadata(

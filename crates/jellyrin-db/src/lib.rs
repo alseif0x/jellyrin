@@ -191,6 +191,7 @@ const DEFAULT_FFPROBE_TIMEOUT_SECONDS: u64 = 15;
 const MAX_FFPROBE_TIMEOUT_SECONDS: u64 = 120;
 const FFPROBE_STDOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const FFPROBE_STDERR_MAX_BYTES: usize = 1024 * 1024;
+pub const PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD: &str = "PluginVodMediaRuntimeProbe";
 
 #[derive(Clone)]
 #[cfg(any(test, feature = "sqlite"))]
@@ -12066,6 +12067,43 @@ impl SqliteDatabase {
         result
     }
 
+    /// Reads the playable item and its metadata from one SQLite statement so callers cannot mix
+    /// fields from different committed row versions.
+    pub async fn media_item_with_metadata_by_id_visible(
+        &self,
+        item_id: Uuid,
+    ) -> anyhow::Result<Option<MediaItemCatalogEntry>> {
+        let row = sqlx::query_as::<_, MediaItemCatalogRow>(
+            r#"
+            SELECT item.id, item.virtual_folder_id, item.name, item.path,
+                   item.media_type, item.collection_type, item.file_size,
+                   item.runtime_ticks, item.bitrate, item.width, item.height,
+                   item.media_streams_json, item.metadata_json,
+                   item.created_at, item.updated_at,
+                   CAST(NULL AS TEXT) AS playback_user_id,
+                   CAST(NULL AS TEXT) AS playback_item_id,
+                   CAST(NULL AS TEXT) AS playback_media_source_id,
+                   CAST(NULL AS INTEGER) AS playback_audio_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_subtitle_stream_index,
+                   CAST(NULL AS INTEGER) AS playback_position_ticks,
+                   CAST(NULL AS INTEGER) AS playback_is_paused,
+                   CAST(NULL AS INTEGER) AS playback_played,
+                   CAST(NULL AS INTEGER) AS playback_is_favorite,
+                   CAST(NULL AS REAL) AS playback_rating,
+                   CAST(NULL AS TEXT) AS playback_updated_at
+            FROM media_items AS item
+            WHERE item.id IN (?1, ?2) AND item.missing_since IS NULL
+            ORDER BY CASE WHEN item.id = ?1 THEN 0 ELSE 1 END
+            LIMIT 1
+            "#,
+        )
+        .bind(item_id.simple().to_string())
+        .bind(item_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     pub async fn delete_media_items(
         &self,
         item_ids: Vec<Uuid>,
@@ -12388,6 +12426,42 @@ impl SqliteDatabase {
         replace_sqlite_media_item_query_filter_projection_from_live(&mut tx, &item_id).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Atomically publishes a plugin-VOD runtime probe without writing any stale item snapshot.
+    /// A positive runtime already committed by another writer always wins; `json_set` merges the
+    /// marker into the current metadata document and leaves every other field untouched.
+    pub async fn publish_plugin_vod_runtime_probe(
+        &self,
+        item_id: Uuid,
+        candidate_runtime_ticks: Option<i64>,
+        marker: Value,
+    ) -> anyhow::Result<(Option<i64>, Value)> {
+        let item_id = self.media_item_storage_id(item_id).await?;
+        let marker_json = serde_json::to_string(&marker)?;
+        let row = sqlx::query_as::<_, (Option<i64>, String)>(
+            r#"
+            UPDATE media_items
+            SET runtime_ticks = CASE
+                    WHEN runtime_ticks > 0 THEN runtime_ticks
+                    ELSE ?2
+                END,
+                metadata_json = json_set(
+                    CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,
+                    '$.PluginVodMediaRuntimeProbe',
+                    json(?3)
+                )
+            WHERE id = ?1
+            RETURNING runtime_ticks, metadata_json
+            "#,
+        )
+        .bind(&item_id)
+        .bind(candidate_runtime_ticks)
+        .bind(marker_json)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("media item not found"))?;
+        Ok((row.0, serde_json::from_str(&row.1)?))
     }
 
     pub async fn update_media_item_metadata(
