@@ -105832,13 +105832,17 @@ done
             audio_stream_index: None,
             subtitle_stream_index: None,
         };
-        let dedupe_key = playback_hls_transcode_dedupe_key(
+        let dedupe_key = playback_hls_transcode_dedupe_key_with_output(
             user.id,
             &item,
             &selection,
             0,
             HlsStreamMode::Encode,
             HlsStreamMode::Copy,
+            PlaybackOutputConstraints {
+                video_bitrate: Some(super::MAX_VIDEO_TRANSCODE_BITRATE),
+                ..PlaybackOutputConstraints::default()
+            },
         );
 
         db.upsert_transcode_session(UpsertTranscodeSession {
