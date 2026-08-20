@@ -25729,29 +25729,12 @@ async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiE
             "VOD provider artwork is unavailable",
         ));
     }
-    let declared_content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .map(str::to_ascii_lowercase);
-    if declared_content_type.as_deref().is_some_and(|value| {
-        !matches!(
-            value,
-            "image/jpeg"
-                | "image/jpg"
-                | "image/png"
-                | "image/webp"
-                | "image/gif"
-                | "application/octet-stream"
-        )
-    }) {
-        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::UnsupportedContentType);
-        return Err(ApiError::service_unavailable(
-            "VOD provider artwork content type is invalid",
-        ));
-    }
+    let nonstandard_content_type = plugin_vod_artwork_content_type_is_nonstandard(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let bytes = match read_bounded_remote_image_body(response, IMAGE_UPLOAD_LIMIT_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -25764,25 +25747,411 @@ async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiE
             return Err(error);
         }
     };
+    validate_plugin_vod_image_payload(&bytes, nonstandard_content_type)?;
+    Ok(bytes)
+}
+
+fn plugin_vod_image_payload_len_is_allowed(length: usize) -> bool {
+    length <= IMAGE_UPLOAD_LIMIT_BYTES
+}
+
+fn plugin_vod_artwork_content_type_is_nonstandard(value: Option<&str>) -> bool {
+    value
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|value| {
+            ![
+                "image/jpeg",
+                "image/jpg",
+                "image/png",
+                "image/webp",
+                "image/gif",
+                "application/octet-stream",
+            ]
+            .iter()
+            .any(|candidate| value.eq_ignore_ascii_case(candidate))
+        })
+}
+
+fn complete_plugin_vod_raster_payload(bytes: &[u8], extension: &str) -> bool {
+    match extension {
+        "png" => complete_plugin_vod_png(bytes),
+        "jpg" => complete_plugin_vod_jpeg(bytes),
+        "gif" => complete_plugin_vod_gif(bytes),
+        "webp" => complete_plugin_vod_webp(bytes),
+        _ => false,
+    }
+}
+
+fn complete_plugin_vod_png(bytes: &[u8]) -> bool {
+    const SIGNATURE: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10];
+    if !bytes.starts_with(SIGNATURE) {
+        return false;
+    }
+    let mut offset = SIGNATURE.len();
+    let mut chunk_index = 0_usize;
+    let mut seen_idat = false;
+    let mut idat_finished = false;
+    while offset < bytes.len() {
+        let Some(type_end) = offset.checked_add(8) else {
+            return false;
+        };
+        if type_end > bytes.len() {
+            return false;
+        }
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let Some(data_end) = type_end.checked_add(length) else {
+            return false;
+        };
+        let Some(chunk_end) = data_end.checked_add(4) else {
+            return false;
+        };
+        if chunk_end > bytes.len() {
+            return false;
+        }
+        let chunk_type = &bytes[offset + 4..type_end];
+        let chunk_data = &bytes[type_end..data_end];
+        if !chunk_type.iter().all(u8::is_ascii_alphabetic) {
+            return false;
+        }
+        if chunk_index == 0 {
+            if chunk_type != b"IHDR" || length != 13 {
+                return false;
+            }
+            let valid_depth = matches!(
+                (chunk_data[9], chunk_data[8]),
+                (0, 1 | 2 | 4 | 8 | 16)
+                    | (2, 8 | 16)
+                    | (3, 1 | 2 | 4 | 8)
+                    | (4, 8 | 16)
+                    | (6, 8 | 16)
+            );
+            if !valid_depth
+                || chunk_data[10] != 0
+                || chunk_data[11] != 0
+                || !matches!(chunk_data[12], 0 | 1)
+            {
+                return false;
+            }
+        } else if chunk_type == b"IHDR" {
+            return false;
+        }
+        if chunk_type == b"IDAT" {
+            if chunk_index == 0 || idat_finished || chunk_data.is_empty() {
+                return false;
+            }
+            seen_idat = true;
+        } else if seen_idat {
+            idat_finished = true;
+        }
+        if chunk_type == b"IEND" {
+            return length == 0 && seen_idat && chunk_end == bytes.len();
+        }
+        offset = chunk_end;
+        chunk_index = chunk_index.saturating_add(1);
+    }
+    false
+}
+
+fn complete_plugin_vod_jpeg(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) {
+        return false;
+    }
+    let mut offset = 2_usize;
+    let mut in_scan = false;
+    let mut seen_sof = false;
+    let mut seen_sos = false;
+    let mut seen_entropy = false;
+    let mut seen_quantization_table = false;
+    let mut seen_coding_table = false;
+    loop {
+        let marker = if in_scan {
+            loop {
+                let Some(&byte) = bytes.get(offset) else {
+                    return false;
+                };
+                offset = offset.saturating_add(1);
+                if byte != 0xff {
+                    seen_entropy = true;
+                    continue;
+                }
+                while bytes.get(offset) == Some(&0xff) {
+                    offset = offset.saturating_add(1);
+                }
+                let Some(&marker) = bytes.get(offset) else {
+                    return false;
+                };
+                offset = offset.saturating_add(1);
+                if marker == 0x00 {
+                    seen_entropy = true;
+                    continue;
+                }
+                if (0xd0..=0xd7).contains(&marker) {
+                    continue;
+                }
+                in_scan = false;
+                break marker;
+            }
+        } else {
+            if bytes.get(offset) != Some(&0xff) {
+                return false;
+            }
+            while bytes.get(offset) == Some(&0xff) {
+                offset = offset.saturating_add(1);
+            }
+            let Some(&marker) = bytes.get(offset) else {
+                return false;
+            };
+            offset = offset.saturating_add(1);
+            marker
+        };
+        match marker {
+            0xd9 => return seen_sof && seen_sos && seen_entropy && offset == bytes.len(),
+            0x00 | 0x01 | 0xd0..=0xd8 => return false,
+            _ => {}
+        }
+        let Some(length_end) = offset.checked_add(2) else {
+            return false;
+        };
+        if length_end > bytes.len() {
+            return false;
+        }
+        let segment_length = usize::from(u16::from_be_bytes(
+            bytes[offset..length_end].try_into().unwrap(),
+        ));
+        if segment_length < 2 {
+            return false;
+        }
+        let Some(segment_end) = offset.checked_add(segment_length) else {
+            return false;
+        };
+        if segment_end > bytes.len() {
+            return false;
+        }
+        let segment = &bytes[length_end..segment_end];
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if seen_sof || segment.len() < 6 {
+                return false;
+            }
+            let components = usize::from(segment[5]);
+            if components == 0
+                || segment.len() != 6_usize.saturating_add(components.saturating_mul(3))
+                || !matches!(segment[0], 8 | 12 | 16)
+            {
+                return false;
+            }
+            seen_sof = true;
+        } else if marker == 0xdb {
+            seen_quantization_table = !segment.is_empty();
+        } else if matches!(marker, 0xc4 | 0xcc) {
+            seen_coding_table = !segment.is_empty();
+        } else if marker == 0xda {
+            if !seen_sof || !seen_quantization_table || !seen_coding_table || segment.is_empty() {
+                return false;
+            }
+            let components = usize::from(segment[0]);
+            if components == 0
+                || segment.len() != 4_usize.saturating_add(components.saturating_mul(2))
+            {
+                return false;
+            }
+            seen_sos = true;
+            in_scan = true;
+        }
+        offset = segment_end;
+    }
+}
+
+fn plugin_vod_gif_sub_blocks_end(bytes: &[u8], mut offset: usize) -> Option<usize> {
+    loop {
+        let length = usize::from(*bytes.get(offset)?);
+        offset = offset.checked_add(1)?;
+        if length == 0 {
+            return Some(offset);
+        }
+        offset = offset.checked_add(length)?;
+        if offset > bytes.len() {
+            return None;
+        }
+    }
+}
+
+fn complete_plugin_vod_gif(bytes: &[u8]) -> bool {
+    if bytes.len() < 14 || !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return false;
+    }
+    let packed = bytes[10];
+    let mut offset = 13_usize;
+    if packed & 0x80 != 0 {
+        let entries = 1_usize << (usize::from(packed & 0x07) + 1);
+        let Some(color_table_bytes) = entries.checked_mul(3) else {
+            return false;
+        };
+        let Some(next) = offset.checked_add(color_table_bytes) else {
+            return false;
+        };
+        if next > bytes.len() {
+            return false;
+        }
+        offset = next;
+    }
+    let mut seen_image = false;
+    loop {
+        let Some(&introducer) = bytes.get(offset) else {
+            return false;
+        };
+        offset = offset.saturating_add(1);
+        match introducer {
+            0x3b => return seen_image && offset == bytes.len(),
+            0x21 => {
+                if bytes.get(offset).is_none() {
+                    return false;
+                }
+                offset = offset.saturating_add(1);
+                let Some(next) = plugin_vod_gif_sub_blocks_end(bytes, offset) else {
+                    return false;
+                };
+                offset = next;
+            }
+            0x2c => {
+                let Some(descriptor_end) = offset.checked_add(9) else {
+                    return false;
+                };
+                if descriptor_end > bytes.len() {
+                    return false;
+                }
+                let image_packed = bytes[offset + 8];
+                offset = descriptor_end;
+                if image_packed & 0x80 != 0 {
+                    let entries = 1_usize << (usize::from(image_packed & 0x07) + 1);
+                    let Some(color_table_bytes) = entries.checked_mul(3) else {
+                        return false;
+                    };
+                    let Some(next) = offset.checked_add(color_table_bytes) else {
+                        return false;
+                    };
+                    if next > bytes.len() {
+                        return false;
+                    }
+                    offset = next;
+                }
+                let Some(&minimum_code_size) = bytes.get(offset) else {
+                    return false;
+                };
+                if !(2..=8).contains(&minimum_code_size) {
+                    return false;
+                }
+                offset = offset.saturating_add(1);
+                let Some(next) = plugin_vod_gif_sub_blocks_end(bytes, offset) else {
+                    return false;
+                };
+                offset = next;
+                seen_image = true;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn complete_plugin_vod_webp(bytes: &[u8]) -> bool {
+    if bytes.len() < 20 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return false;
+    }
+    let declared_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    if declared_size.checked_add(8) != Some(bytes.len()) {
+        return false;
+    }
+    let mut offset = 12_usize;
+    let mut seen_image_payload = false;
+    while offset < bytes.len() {
+        let Some(header_end) = offset.checked_add(8) else {
+            return false;
+        };
+        if header_end > bytes.len() {
+            return false;
+        }
+        let chunk_type = &bytes[offset..offset + 4];
+        if !matches!(
+            chunk_type,
+            b"VP8 " | b"VP8L" | b"VP8X" | b"ALPH" | b"ANIM" | b"ANMF" | b"ICCP" | b"EXIF" | b"XMP "
+        ) {
+            return false;
+        }
+        let chunk_length =
+            u32::from_le_bytes(bytes[offset + 4..header_end].try_into().unwrap()) as usize;
+        let Some(data_end) = header_end.checked_add(chunk_length) else {
+            return false;
+        };
+        let Some(chunk_end) = data_end.checked_add(chunk_length & 1) else {
+            return false;
+        };
+        if chunk_end > bytes.len() || (chunk_length & 1 == 1 && bytes[data_end] != 0) {
+            return false;
+        }
+        if matches!(chunk_type, b"VP8 " | b"VP8L" | b"ANMF") && chunk_length > 0 {
+            seen_image_payload = true;
+        }
+        offset = chunk_end;
+    }
+    offset == bytes.len() && seen_image_payload
+}
+
+fn validate_plugin_vod_image_payload(
+    bytes: &[u8],
+    nonstandard_content_type: bool,
+) -> Result<(), ApiError> {
+    if !plugin_vod_image_payload_len_is_allowed(bytes.len()) {
+        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::BodyTooLarge);
+        return Err(ApiError::bad_request("Remote image file is too large"));
+    }
     if bytes.is_empty() {
         log_plugin_vod_artwork_failure(PluginVodArtworkFailure::EmptyBody);
         return Err(ApiError::service_unavailable(
             "VOD provider artwork payload is invalid",
         ));
     }
-    if image_format_from_bytes(&bytes).extension == "bin" {
+    let format = image_format_from_bytes(bytes);
+    if format.extension == "bin" {
         log_plugin_vod_artwork_failure(PluginVodArtworkFailure::UnknownFormat);
         return Err(ApiError::service_unavailable(
             "VOD provider artwork payload is invalid",
         ));
     }
-    if !safe_remote_image_dimensions(&bytes) {
+    if !complete_plugin_vod_raster_payload(bytes, format.extension) {
+        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::MalformedRaster);
+        return Err(ApiError::service_unavailable(
+            "VOD provider artwork payload is invalid",
+        ));
+    }
+    if !safe_remote_image_dimensions(bytes) {
         log_plugin_vod_artwork_failure(PluginVodArtworkFailure::InvalidDimensions);
         return Err(ApiError::service_unavailable(
             "VOD provider artwork payload is invalid",
         ));
     }
-    Ok(bytes)
+    if nonstandard_content_type {
+        tracing::info!(
+            action = "ResolveArtwork",
+            phase = "content_type",
+            reason = "nonstandard_but_valid",
+            "VOD artwork accepted by payload signature"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25796,11 +26165,11 @@ enum PluginVodArtworkFailure {
     UpstreamClientError,
     UpstreamServerError,
     UpstreamOtherStatus,
-    UnsupportedContentType,
     BodyTooLarge,
     BodyInterrupted,
     EmptyBody,
     UnknownFormat,
+    MalformedRaster,
     InvalidDimensions,
     CacheWriteFailed,
 }
@@ -25817,11 +26186,11 @@ impl PluginVodArtworkFailure {
             Self::UpstreamClientError => ("upstream_status", "upstream_client_error"),
             Self::UpstreamServerError => ("upstream_status", "upstream_server_error"),
             Self::UpstreamOtherStatus => ("upstream_status", "upstream_other_status"),
-            Self::UnsupportedContentType => ("content_type", "unsupported_content_type"),
             Self::BodyTooLarge => ("body", "body_too_large"),
             Self::BodyInterrupted => ("body", "body_interrupted"),
             Self::EmptyBody => ("payload", "empty_body"),
             Self::UnknownFormat => ("payload", "unknown_format"),
+            Self::MalformedRaster => ("payload", "malformed_raster"),
             Self::InvalidDimensions => ("payload", "invalid_dimensions"),
             Self::CacheWriteFailed => ("cache_write", "cache_write_failed"),
         }
@@ -62877,14 +63246,14 @@ mod tests {
                 "upstream_server_error",
             ),
             (
-                super::PluginVodArtworkFailure::UnsupportedContentType,
-                "content_type",
-                "unsupported_content_type",
-            ),
-            (
                 super::PluginVodArtworkFailure::InvalidDimensions,
                 "payload",
                 "invalid_dimensions",
+            ),
+            (
+                super::PluginVodArtworkFailure::MalformedRaster,
+                "payload",
+                "malformed_raster",
             ),
             (
                 super::PluginVodArtworkFailure::CacheWriteFailed,
@@ -62896,6 +63265,173 @@ mod tests {
             assert_eq!(telemetry.action, "ResolveArtwork");
             assert_eq!(telemetry.phase, expected_phase);
             assert_eq!(telemetry.reason, expected_reason);
+        }
+    }
+
+    #[test]
+    fn plugin_vod_artwork_accepts_valid_magic_with_mislabelled_content_type() {
+        fn png() -> Vec<u8> {
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 0,
+                1, 0, 0, 5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+            ]
+        }
+
+        fn jpeg() -> Vec<u8> {
+            fn segment(bytes: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+                bytes.extend_from_slice(&[0xff, marker]);
+                bytes.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+                bytes.extend_from_slice(payload);
+            }
+
+            let mut bytes = vec![0xff, 0xd8];
+            let mut quantization = vec![0_u8];
+            quantization.extend(std::iter::repeat_n(1_u8, 64));
+            segment(&mut bytes, 0xdb, &quantization);
+            segment(&mut bytes, 0xc0, &[8, 0, 1, 0, 1, 1, 1, 0x11, 0]);
+            let mut coding_tables = vec![0_u8, 1];
+            coding_tables.extend(std::iter::repeat_n(0_u8, 15));
+            coding_tables.push(0);
+            coding_tables.extend_from_slice(&[0x10, 1]);
+            coding_tables.extend(std::iter::repeat_n(0_u8, 15));
+            coding_tables.push(0);
+            segment(&mut bytes, 0xc4, &coding_tables);
+            segment(&mut bytes, 0xda, &[1, 1, 0, 0, 63, 0]);
+            bytes.extend_from_slice(&[0x3f, 0xff, 0xd9]);
+            bytes
+        }
+
+        let nonstandard_content_type = super::plugin_vod_artwork_content_type_is_nonstandard(Some(
+            "text/plain; charset=binary",
+        ));
+        for bytes in [png(), jpeg()] {
+            super::validate_plugin_vod_image_payload(&bytes, nonstandard_content_type)
+                .expect("recognized image bytes must override a nonstandard declared type");
+        }
+        assert!(super::plugin_vod_artwork_content_type_is_nonstandard(Some(
+            "text/plain"
+        )));
+        assert!(!super::plugin_vod_artwork_content_type_is_nonstandard(
+            Some("IMAGE/JPEG; charset=binary")
+        ));
+        assert!(!super::plugin_vod_artwork_content_type_is_nonstandard(None));
+    }
+
+    #[test]
+    fn plugin_vod_artwork_rejects_markup_and_enforces_payload_limits() {
+        fn png() -> Vec<u8> {
+            vec![
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
+                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 0,
+                1, 0, 0, 5, 0, 1, 13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+            ]
+        }
+
+        fn jpeg() -> Vec<u8> {
+            fn segment(bytes: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+                bytes.extend_from_slice(&[0xff, marker]);
+                bytes.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+                bytes.extend_from_slice(payload);
+            }
+
+            let mut bytes = vec![0xff, 0xd8];
+            let mut quantization = vec![0_u8];
+            quantization.extend(std::iter::repeat_n(1_u8, 64));
+            segment(&mut bytes, 0xdb, &quantization);
+            segment(&mut bytes, 0xc0, &[8, 0, 1, 0, 1, 1, 1, 0x11, 0]);
+            let mut coding_tables = vec![0_u8, 1];
+            coding_tables.extend(std::iter::repeat_n(0_u8, 15));
+            coding_tables.push(0);
+            coding_tables.extend_from_slice(&[0x10, 1]);
+            coding_tables.extend(std::iter::repeat_n(0_u8, 15));
+            coding_tables.push(0);
+            segment(&mut bytes, 0xc4, &coding_tables);
+            segment(&mut bytes, 0xda, &[1, 1, 0, 0, 63, 0]);
+            bytes.extend_from_slice(&[0x3f, 0xff, 0xd9]);
+            bytes
+        }
+
+        for (bytes, declared_type) in [
+            (b"<html>not an image</html>".as_slice(), "text/html"),
+            (
+                b"<svg xmlns='http://www.w3.org/2000/svg'></svg>".as_slice(),
+                "image/svg+xml",
+            ),
+        ] {
+            let error = super::validate_plugin_vod_image_payload(
+                bytes,
+                super::plugin_vod_artwork_content_type_is_nonstandard(Some(declared_type)),
+            )
+            .expect_err("markup must not pass image magic validation");
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                error.error.to_string(),
+                "VOD provider artwork payload is invalid"
+            );
+        }
+
+        for (width, height) in [(0_u32, 1_u32), (16_385, 1), (10_001, 10_001)] {
+            let mut bytes = png();
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            let error = super::validate_plugin_vod_image_payload(&bytes, false)
+                .expect_err("unsafe dimensions must be rejected");
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        for mut bytes in [png(), jpeg()] {
+            bytes.truncate(bytes.len() - 2);
+            let error = super::validate_plugin_vod_image_payload(&bytes, true)
+                .expect_err("a truncated raster must be rejected");
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        for mut bytes in [png(), jpeg()] {
+            bytes.extend_from_slice(b"<svg>trailing markup</svg>");
+            let error = super::validate_plugin_vod_image_payload(&bytes, true)
+                .expect_err("trailing markup must not turn a raster into a polyglot");
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert!(super::plugin_vod_image_payload_len_is_allowed(
+            super::IMAGE_UPLOAD_LIMIT_BYTES
+        ));
+        assert!(!super::plugin_vod_image_payload_len_is_allowed(
+            super::IMAGE_UPLOAD_LIMIT_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn plugin_vod_artwork_structurally_validates_gif_and_webp() {
+        fn gif() -> Vec<u8> {
+            vec![
+                b'G', b'I', b'F', b'8', b'9', b'a', 1, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 255, 255, 255,
+                0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0, 0x3b,
+            ]
+        }
+
+        fn webp() -> Vec<u8> {
+            let mut bytes = b"RIFF".to_vec();
+            bytes.extend_from_slice(&22_u32.to_le_bytes());
+            bytes.extend_from_slice(b"WEBPVP8L");
+            bytes.extend_from_slice(&9_u32.to_le_bytes());
+            bytes.extend_from_slice(&[0x2f, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            bytes
+        }
+
+        for bytes in [gif(), webp()] {
+            super::validate_plugin_vod_image_payload(&bytes, true)
+                .expect("complete bounded raster containers must remain supported");
+        }
+        for mut bytes in [gif(), webp()] {
+            bytes.pop();
+            let error = super::validate_plugin_vod_image_payload(&bytes, false)
+                .expect_err("truncated raster containers must be rejected");
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        for mut bytes in [gif(), webp()] {
+            bytes.extend_from_slice(b"<html>trailing markup</html>");
+            let error = super::validate_plugin_vod_image_payload(&bytes, false)
+                .expect_err("raster containers with trailing markup must be rejected");
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
