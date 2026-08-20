@@ -151,6 +151,43 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
   });
 });
 
+test.describe('MAGSTV home view locator contract', () => {
+  test('selects the exact accessible links inside My Media only', async ({ page }) => {
+    await page.setContent(`
+      <nav aria-label="Media">
+        <a href="#/wrong-movies">Mags Movies</a>
+        <a href="#/wrong-series">Mags Series</a>
+        <a href="#/wrong-live">Mags Live TV</a>
+      </nav>
+      <main>
+        <section>
+          <h2>My Media</h2>
+          <div>
+            <a href="#/movies?topParentId=movies-view&amp;collectionType=movies">Mags Movies</a>
+            <a href="#/tv?topParentId=series-view&amp;collectionType=tvshows">Mags Series</a>
+            <a href="#/list?serverId=server&amp;parentId=live-view">Mags Live TV</a>
+          </div>
+        </section>
+        <section>
+          <h2>Continue Watching</h2>
+          <a href="#/wrong-later-movies">Mags Movies</a>
+        </section>
+      </main>
+    `);
+
+    const expectedHrefs = {
+      [REQUIRED_VIEWS.movies]: '#/movies?topParentId=movies-view&collectionType=movies',
+      [REQUIRED_VIEWS.series]: '#/tv?topParentId=series-view&collectionType=tvshows',
+      [REQUIRED_VIEWS.liveTv]: '#/list?serverId=server&parentId=live-view',
+    };
+    for (const [name, href] of Object.entries(expectedHrefs)) {
+      const link = myMediaViewLink(page, name);
+      await expect(link).toHaveCount(1);
+      await expect(link).toHaveAttribute('href', href);
+    }
+  });
+});
+
 function loadProviderCredentials() {
   const username = process.env.JELLYRIN_MAGSTV_USERNAME;
   const password = process.env.JELLYRIN_MAGSTV_PASSWORD;
@@ -400,16 +437,18 @@ function normalizePage(body) {
 
 async function verifyHomeAndOpenViews(page, views) {
   await page.goto('/web/#/home', { waitUntil: 'domcontentloaded' });
+  await expect(myMediaHeading(page)).toBeVisible({ timeout: 60_000 });
   for (const name of Object.values(REQUIRED_VIEWS)) {
-    await expect(
-      page.locator('.homeLibraryButton').filter({ hasText: name }).first(),
-      `${name} home section`,
-    ).toBeVisible({ timeout: 60_000 });
+    const link = myMediaViewLink(page, name);
+    await expect(link, `${name} home section`).toHaveCount(1, { timeout: 60_000 });
+    await expect(link, `${name} home section`).toBeVisible({ timeout: 60_000 });
   }
 
   for (const [kind, name] of Object.entries(REQUIRED_VIEWS)) {
     await page.goto('/web/#/home', { waitUntil: 'domcontentloaded' });
-    const link = page.locator('.homeLibraryButton').filter({ hasText: name }).first();
+    await expect(myMediaHeading(page)).toBeVisible({ timeout: 60_000 });
+    const link = myMediaViewLink(page, name);
+    await expect(link).toHaveCount(1, { timeout: 60_000 });
     await expect(link).toBeVisible({ timeout: 60_000 });
     let scopedChannelsResponsePromise = null;
     if (kind === 'liveTv') {
@@ -455,6 +494,15 @@ async function verifyHomeAndOpenViews(page, views) {
     }
     expect(views[kind].Id).toBeTruthy();
   }
+}
+
+function myMediaHeading(page) {
+  return page.getByRole('heading', { name: 'My Media', exact: true, level: 2 });
+}
+
+function myMediaViewLink(page, name) {
+  const section = myMediaHeading(page).locator('xpath=ancestor::*[.//a][1]');
+  return section.getByRole('link', { name, exact: true });
 }
 
 function hashRoutePath(url) {
