@@ -11,29 +11,30 @@ const REQUIRED_VIEWS = Object.freeze({
   liveTv: 'Mags Live TV',
 });
 
-const syncTimeoutMs = positiveIntegerEnvironment(
-  'JELLYRIN_E2E_MAGSTV_SYNC_TIMEOUT_MS',
-  4 * 60 * 60 * 1000,
+const catalogueTimeoutMs = positiveIntegerEnvironment(
+  'JELLYRIN_E2E_MAGSTV_VERIFY_TIMEOUT_MS',
+  positiveIntegerEnvironment('JELLYRIN_E2E_MAGSTV_SYNC_TIMEOUT_MS', 20 * 60 * 1000),
+);
+const catalogueCandidateLimit = positiveIntegerEnvironment(
+  'JELLYRIN_E2E_MAGSTV_CANDIDATE_LIMIT',
+  8,
 );
 const verifyOnly = process.env.JELLYRIN_E2E_MAGSTV_VERIFY_ONLY === '1';
 
-// Unlike ordinary deployed tests, every failure artifact is disabled here: a failure between
-// filling and submitting the form must not preserve even the account name in a screenshot.
+// Unlike ordinary deployed tests, every failure artifact is disabled here: authenticated
+// settings and playback responses must never be retained in a screenshot, video, or trace.
 test.use({ trace: 'off', video: 'off', screenshot: 'off' });
 
 test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => {
   test.skip(
     process.env.JELLYRIN_E2E_DEPLOYED !== '1'
-      || process.env.JELLYRIN_E2E_MAGSTV_QA !== '1',
-    'This opt-in suite changes the deployed MAGSTV tuner and contacts the real provider',
+      || process.env.JELLYRIN_E2E_MAGSTV_QA !== '1'
+      || !verifyOnly,
+    'This opt-in suite only verifies an already-published MAGSTV catalogue',
   );
 
-  test('configures or resumes, synchronizes all three views, and plays one item of each kind', async ({ page, request, baseURL }) => {
-    test.setTimeout(syncTimeoutMs + 20 * 60 * 1000);
-    if (verifyOnly && process.env.JELLYRIN_E2E_MAGSTV_CLICK_REFRESH === '1') {
-      throw new Error('JELLYRIN_E2E_MAGSTV_VERIFY_ONLY cannot be combined with JELLYRIN_E2E_MAGSTV_CLICK_REFRESH');
-    }
-    const providerCredentials = verifyOnly ? null : loadProviderCredentials();
+  test('verifies settings, three scoped views, metadata, artwork, tracks, and Web HLS without synchronizing', async ({ page, request, baseURL }) => {
+    test.setTimeout(catalogueTimeoutMs + 20 * 60 * 1000);
     const auth = await loadAdministratorAuthentication(request);
     const publicInfo = await getJson(request, '/System/Info/Public');
     const configurationPage = await discoverConfigurationPage(request, auth.AccessToken);
@@ -51,47 +52,12 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
     await expect(form.locator('#username')).toBeVisible();
     await expect(form.locator('#password')).toHaveAttribute('type', 'password');
     await expect(form).not.toContainText(/sign[_ -]?o3|secret[_ -]?hex|bootstrap|vpn/i);
-
-    let explicitRefreshCounts = null;
-    if (verifyOnly) {
-      // A timed-out Playwright process must be resumable without saving the account again or
-      // starting a second provider import. The existing encrypted reference is checked below.
-      await expect(form.locator('#username')).toHaveValue('');
-      await expect(form.locator('#password')).toHaveValue('');
-      console.log(JSON.stringify({ status: 'magstv-verify-only-resume' }));
-    } else {
-      await form.locator('#username').fill(providerCredentials.username);
-      await form.locator('#password').fill(providerCredentials.password);
-      const saveResponsePromise = page.waitForResponse(
-        (response) => response.request().method() === 'POST'
-          && new URL(response.url()).pathname.toLowerCase() === '/livetv/tunerhosts',
-        { timeout: syncTimeoutMs },
-      );
-      await form.locator('#saveButton').click();
-      const saveResponse = await saveResponsePromise;
-      expect(saveResponse.status(), 'MAGSTV tuner save/import status').toBe(200);
-
-      // The controller clears both fields before sending the request. This also keeps screenshots
-      // and DOM snapshots from retaining credentials if a later catalogue assertion fails.
-      await expect(form.locator('#username')).toHaveValue('');
-      await expect(form.locator('#password')).toHaveValue('');
-      await expect(form.locator('#status')).toHaveClass(/\bok\b/);
-      await expect(form.locator('#refreshButton')).toBeEnabled();
-
-      if (process.env.JELLYRIN_E2E_MAGSTV_CLICK_REFRESH === '1') {
-        const refreshResponsePromise = page.waitForResponse(
-          (response) => response.request().method() === 'POST'
-            && new URL(response.url()).pathname.toLowerCase()
-              === `/plugins/${PLUGIN_ID.toLowerCase()}/vodlibrary/refresh`,
-          { timeout: syncTimeoutMs },
-        );
-        await form.locator('#refreshButton').click();
-        const refreshResponse = await refreshResponsePromise;
-        expect(refreshResponse.status(), 'explicit MAGSTV VOD refresh status').toBe(200);
-        explicitRefreshCounts = await refreshResponse.json();
-        await expect(form.locator('#status')).toContainText('Catálogo actualizado');
-      }
-    }
+    // Verify-only is intentionally non-mutating: neither Save nor Refresh is clicked and no
+    // provider account value is loaded into this process or into the page DOM.
+    await expect(form.locator('#username')).toHaveValue('');
+    await expect(form.locator('#password')).toHaveValue('');
+    await expect(form.locator('#saveButton')).toBeVisible();
+    await expect(form.locator('#refreshButton')).toBeVisible();
 
     const persisted = await verifyEncryptedTunerConfiguration(request, auth.AccessToken);
     const minima = expectedCatalogueMinima();
@@ -99,37 +65,29 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
       request,
       auth,
       minima,
-      syncTimeoutMs,
+      catalogueTimeoutMs,
     );
     expect(snapshot.channels.total).toBe(Number(persisted.PersistedChannelCount));
 
-    if (explicitRefreshCounts) {
-      expect(snapshot.movies.total).toBe(Number(explicitRefreshCounts.MovieCount));
-      expect(snapshot.series.total).toBe(Number(explicitRefreshCounts.SeriesCount));
-      expect(snapshot.episodes.total).toBe(Number(explicitRefreshCounts.EpisodeCount));
-    }
-
     await verifyHomeAndOpenViews(page, snapshot.views);
 
-    const liveResult = await probeFirstPlayable(
-      snapshot.channels.items,
-      (channel) => probeLiveTvHls(request, baseURL, auth, channel),
-      'Mags Live TV',
-    );
     const movieResult = await probeFirstPlayable(
       snapshot.movies.items,
-      (movie) => probeVodStream(baseURL, auth, movie),
+      (movie) => probeVodWebExperience(request, baseURL, auth, movie, 'movie'),
       'Mags Movies',
     );
     const episodeResult = await probeFirstPlayable(
       snapshot.episodes.items,
-      (episode) => probeVodStream(baseURL, auth, episode),
+      (episode) => probeVodWebExperience(request, baseURL, auth, episode, 'episode'),
       'Mags Series episode',
     );
 
-    expect(liveResult.bytes).toBeGreaterThan(0);
-    expect(movieResult.bytes).toBeGreaterThan(0);
-    expect(episodeResult.bytes).toBeGreaterThan(0);
+    expect(movieResult.hlsSegmentBytes).toBeGreaterThan(0);
+    expect(episodeResult.hlsSegmentBytes).toBeGreaterThan(0);
+    expect(
+      browserFailures.catalogueMutations,
+      'verify-only browser session must not save or refresh the MAGSTV catalogue',
+    ).toEqual([]);
     expect(browserFailures.chunkErrors, 'Jellyfin Web chunk loading errors').toEqual([]);
     expect(browserFailures.pageErrors, 'Jellyfin Web page errors').toEqual([]);
 
@@ -142,11 +100,19 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
         episodes: snapshot.episodes.total,
       },
       playback: {
-        liveTvBytes: liveResult.bytes,
-        movieBytes: movieResult.bytes,
-        episodeBytes: episodeResult.bytes,
+        movieHlsSegmentBytes: movieResult.hlsSegmentBytes,
+        episodeHlsSegmentBytes: episodeResult.hlsSegmentBytes,
+        movieAudioTracks: movieResult.audioTracks,
+        episodeAudioTracks: episodeResult.audioTracks,
+        movieAudioLanguageTracks: movieResult.audioLanguageTracks,
+        episodeAudioLanguageTracks: episodeResult.audioLanguageTracks,
+        movieSubtitleTracks: movieResult.subtitleTracks,
+        episodeSubtitleTracks: episodeResult.subtitleTracks,
+        movieSubtitleVerified: movieResult.subtitleVerified,
+        episodeSubtitleVerified: episodeResult.subtitleVerified,
       },
       credentialsPersistedAsEncryptedReference: true,
+      catalogueMutationPerformed: false,
     }));
   });
 });
@@ -187,15 +153,6 @@ test.describe('MAGSTV home view locator contract', () => {
     }
   });
 });
-
-function loadProviderCredentials() {
-  const username = process.env.JELLYRIN_MAGSTV_USERNAME;
-  const password = process.env.JELLYRIN_MAGSTV_PASSWORD;
-  if (typeof username !== 'string' || !username.trim() || typeof password !== 'string' || !password) {
-    throw new Error('Set JELLYRIN_MAGSTV_USERNAME and JELLYRIN_MAGSTV_PASSWORD for the opt-in QA');
-  }
-  return { username: username.trim(), password };
-}
 
 async function loadAdministratorAuthentication(request) {
   const token = await loadAdministratorToken();
@@ -290,7 +247,15 @@ async function installBrowserSession(page, baseURL, publicInfo, auth) {
 }
 
 function monitorBrowserFailures(page) {
-  const failures = { chunkErrors: [], pageErrors: [] };
+  const failures = { catalogueMutations: [], chunkErrors: [], pageErrors: [] };
+  page.on('request', (request) => {
+    if (request.method() === 'GET' || request.method() === 'HEAD') return;
+    const path = new URL(request.url()).pathname.toLowerCase();
+    if (path === '/livetv/tunerhosts'
+      || path === `/plugins/${PLUGIN_ID}/vodlibrary/refresh`) {
+      failures.catalogueMutations.push(`${request.method()} ${path}`);
+    }
+  });
   page.on('response', (response) => {
     const url = response.url();
     if (response.status() >= 400 && /(?:chunk|bundle)\.js(?:\?|$)/i.test(url)) {
@@ -425,7 +390,8 @@ function itemsPath(userId, parentId, itemType) {
   return `/Items?UserId=${encodeURIComponent(userId)}`
     + `&ParentId=${encodeURIComponent(parentId)}`
     + `&Recursive=true&IncludeItemTypes=${encodeURIComponent(itemType)}`
-    + '&Fields=MediaSources,MediaStreams&StartIndex=0&Limit=5&SortBy=SortName';
+    + '&Fields=MediaSources,MediaStreams,Overview,PrimaryImageAspectRatio'
+    + `&StartIndex=0&Limit=${catalogueCandidateLimit}&SortBy=SortName`;
 }
 
 function normalizePage(body) {
@@ -528,125 +494,300 @@ function searchParameterCaseInsensitive(searchParams, name) {
 
 async function probeFirstPlayable(items, probe, label) {
   if (!items.length) throw new Error(`${label} has no candidate items`);
-  const failures = [];
-  for (const item of items.slice(0, 5)) {
+  const failures = new Map();
+  for (const item of items.slice(0, catalogueCandidateLimit)) {
     try {
       return await probe(item);
     } catch (error) {
-      failures.push(safeErrorReason(error));
+      const reason = safeErrorReason(error);
+      failures.set(reason, (failures.get(reason) || 0) + 1);
     }
   }
-  throw new Error(`${label} did not yield a playable item (${failures.join('; ')})`);
+  const summary = [...failures].map(([reason, count]) => `${reason} x${count}`).join('; ');
+  throw new Error(
+    `${label} did not yield a complete candidate within the bounded sample (${summary})`,
+  );
 }
 
-async function probeLiveTvHls(request, baseURL, auth, channel) {
-  const playback = await requestPlaybackInfo(request, auth, channel.Id, true);
-  const source = playback.MediaSources?.[0];
-  if (!source?.TranscodingUrl || !playback.PlaySessionId) {
-    throw new Error('Live TV PlaybackInfo did not return an HLS session');
-  }
-  let segmentBytes = 0;
+async function probeVodWebExperience(request, baseURL, auth, item, expectedType) {
+  const sessions = [];
   try {
-    const masterUrl = sameOriginUrl(baseURL, source.TranscodingUrl);
-    const masterText = await getTextWithRetry(request, masterUrl, 'live master playlist');
-    let mediaUrl = masterUrl;
-    let mediaText = masterText;
-    if (masterText.includes('#EXT-X-STREAM-INF')) {
-      const mediaReference = firstPlaylistReference(masterText);
-      if (!mediaReference) throw new Error('Live HLS master has no media playlist');
-      mediaUrl = new URL(mediaReference, masterUrl).toString();
-      mediaText = await getTextWithRetry(request, mediaUrl, 'live media playlist');
+    const detail = await getJson(
+      request,
+      `/Users/${encodeURIComponent(auth.User.Id)}/Items/${encodeURIComponent(item.Id)}`
+        + '?Fields=MediaSources,MediaStreams,Overview,PrimaryImageAspectRatio',
+      auth.AccessToken,
+    );
+    if (String(detail?.Type || '').toLowerCase() !== expectedType) {
+      throw new Error('VOD metadata type is invalid');
     }
-    const segmentReference = firstPlaylistReference(mediaText);
-    if (!segmentReference) throw new Error('Live HLS media playlist has no segment');
-    const segmentResponse = await request.get(new URL(segmentReference, mediaUrl).toString(), {
-      timeout: 45_000,
+    if (typeof detail?.Overview !== 'string' || !detail.Overview.trim()) {
+      throw new Error('VOD metadata overview is unavailable');
+    }
+    await verifyRealPrimaryArtwork(request, auth, detail.Id);
+
+    // This resolves safe stream descriptors without opening the media URL. Native MPEG-TS is
+    // only the discovery fallback; the actual Web request below must negotiate HLS.
+    const discovery = await requestPlaybackInfo(request, auth, detail.Id, {
+      enableDirectPlay: false,
+      enableDirectStream: true,
+      enableTranscoding: false,
+      subtitleStreamIndex: -1,
+      deviceProfile: nativeMpegTsDeviceProfile(),
     });
-    if (segmentResponse.status() !== 200) {
-      throw new Error(`Live HLS segment returned HTTP ${segmentResponse.status()}`);
+    const discoverySource = discovery.MediaSources?.[0];
+    sessions.push({ item: detail, playback: discovery, source: discoverySource, method: 'DirectStream' });
+    if (!discovery.PlaySessionId || !discoverySource) {
+      throw new Error('VOD PlaybackInfo track discovery is unavailable');
     }
-    segmentBytes = (await segmentResponse.body()).length;
-    if (segmentBytes < 1) throw new Error('Live HLS segment is empty');
-    return { bytes: segmentBytes };
+
+    const discoveryStreams = Array.isArray(discoverySource.MediaStreams)
+      ? discoverySource.MediaStreams
+      : [];
+    const audioStreams = selectableStreams(discoveryStreams, 'Audio');
+    if (audioStreams.length < 2) throw new Error('VOD alternative audio track is unavailable');
+    const audioLanguageTracks = verifyOptionalLanguages(audioStreams, 'audio');
+    if (!audioLanguageTracks) throw new Error('VOD audio language labels are unavailable');
+    const defaultAudioStreamIndex = Number(discoverySource.DefaultAudioStreamIndex);
+    if (!Number.isSafeInteger(defaultAudioStreamIndex)
+      || !audioStreams.some((stream) => Number(stream.Index) === defaultAudioStreamIndex)) {
+      throw new Error('VOD default audio track is unavailable');
+    }
+    const selectedAudio = selectNonDefaultStream(
+      audioStreams,
+      defaultAudioStreamIndex,
+    );
+    if (!selectedAudio?.Language) {
+      throw new Error('VOD alternative audio language label is unavailable');
+    }
+    const subtitleStreams = selectableStreams(discoveryStreams, 'Subtitle');
+    if (!subtitleStreams.length) throw new Error('VOD subtitle track is unavailable');
+    const subtitleLanguageTracks = verifyOptionalLanguages(subtitleStreams, 'subtitle');
+    if (!subtitleLanguageTracks) throw new Error('VOD subtitle language labels are unavailable');
+    const selectedSubtitle = subtitleStreams.find((stream) => stream.Language);
+
+    const playback = await requestPlaybackInfo(request, auth, detail.Id, {
+      enableDirectPlay: true,
+      enableDirectStream: true,
+      enableTranscoding: true,
+      audioStreamIndex: selectedAudio.Index,
+      subtitleStreamIndex: selectedSubtitle.Index,
+      deviceProfile: webHlsDeviceProfile(),
+    });
+    const source = playback.MediaSources?.[0];
+    sessions.push({ item: detail, playback, source, method: 'Transcode' });
+    if (!playback.PlaySessionId || !source) {
+      throw new Error('VOD Web PlaybackInfo is unavailable');
+    }
+    if (source.SupportsDirectPlay !== false
+      || source.SupportsTranscoding !== true
+      || source.TranscodingSubProtocol !== 'hls'
+      || source.DirectStreamUrl) {
+      throw new Error('VOD Web PlaybackInfo did not select HLS');
+    }
+    if (Number(source.DefaultAudioStreamIndex) !== Number(selectedAudio.Index)) {
+      throw new Error('VOD selected audio track was not preserved');
+    }
+    const selectedPlaybackAudio = selectableStreams(source.MediaStreams || [], 'Audio')
+      .find((stream) => Number(stream.Index) === Number(selectedAudio.Index));
+    if (!selectedPlaybackAudio
+      || (selectedAudio.Language
+        && selectedPlaybackAudio.Language !== selectedAudio.Language)) {
+      throw new Error('VOD selected audio language was not preserved');
+    }
+    if (!source.TranscodingUrl) throw new Error('VOD Web HLS URL is unavailable');
+
+    const hlsSegmentBytes = await probeVodHls(
+      request,
+      baseURL,
+      auth.AccessToken,
+      source.TranscodingUrl,
+    );
+
+    if (Number(source.DefaultSubtitleStreamIndex) !== Number(selectedSubtitle.Index)) {
+      throw new Error('VOD selected subtitle track was not preserved');
+    }
+    const selectedPlaybackSubtitle = selectableStreams(source.MediaStreams || [], 'Subtitle')
+      .find((stream) => Number(stream.Index) === Number(selectedSubtitle.Index));
+    if (!selectedPlaybackSubtitle
+      || selectedPlaybackSubtitle.Language !== selectedSubtitle.Language) {
+      throw new Error('VOD selected subtitle language was not preserved');
+    }
+    await verifyJitSubtitle(request, baseURL, auth.AccessToken, selectedPlaybackSubtitle);
+
+    return {
+      hlsSegmentBytes,
+      audioTracks: audioStreams.length,
+      audioLanguageTracks,
+      subtitleTracks: subtitleStreams.length,
+      subtitleLanguageTracks,
+      subtitleVerified: true,
+    };
   } finally {
-    await request.post('/Sessions/Playing/Stopped', {
+    await stopPlaybackSessions(request, auth, sessions);
+  }
+}
+
+function selectableStreams(streams, type) {
+  if (!Array.isArray(streams)) return [];
+  return streams.filter((stream) => (
+    stream?.Type === type
+      && Number.isSafeInteger(Number(stream.Index))
+      && Number(stream.Index) >= 0
+  ));
+}
+
+function verifyOptionalLanguages(streams, type) {
+  const withLanguage = streams.filter((stream) => stream.Language !== undefined);
+  if (withLanguage.some((stream) => (
+    typeof stream.Language !== 'string'
+      || !stream.Language.trim()
+      || stream.Language.length > 64
+  ))) {
+    throw new Error(`VOD ${type} language metadata is invalid`);
+  }
+  return withLanguage.length;
+}
+
+function selectNonDefaultStream(streams, defaultIndex) {
+  const alternatives = streams.filter(
+    (stream) => Number(stream.Index) !== Number(defaultIndex),
+  );
+  return alternatives.find((stream) => typeof stream.Language === 'string') || alternatives[0];
+}
+
+async function verifyRealPrimaryArtwork(request, auth, itemId) {
+  const response = await request.get(
+    `/Items/${encodeURIComponent(itemId)}/Images/Primary`,
+    {
       headers: { 'X-Emby-Token': auth.AccessToken },
-      data: {
-        ItemId: channel.Id,
-        MediaSourceId: source?.Id || channel.Id,
-        PlayMethod: 'Transcode',
-        PlaySessionId: playback.PlaySessionId,
-        PositionTicks: 0,
-        CanSeek: true,
-        IsPaused: false,
-      },
-      timeout: 15_000,
-    }).catch(() => {});
-    if (playback.PlaySessionId) {
-      await request.delete(
-        `/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playback.PlaySessionId)}&DeviceId=${DEVICE_ID}`,
-        { headers: { 'X-Emby-Token': auth.AccessToken }, timeout: 15_000 },
-      ).catch(() => {});
-    }
-  }
-}
-
-async function probeVodStream(baseURL, auth, item) {
-  const url = new URL(`/Videos/${encodeURIComponent(item.Id)}/stream.ts`, baseURL);
-  url.searchParams.set('Static', 'true');
-  url.searchParams.set('MediaSourceId', item.Id);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'X-Emby-Token': auth.AccessToken,
-        Range: 'bytes=0-1315',
-      },
-      redirect: 'error',
-      signal: controller.signal,
-    });
-    if (![200, 206].includes(response.status)) {
-      throw new Error(`VOD stream returned HTTP ${response.status}`);
-    }
-    const contentType = response.headers.get('content-type') || '';
-    if (!/(?:video|octet-stream)/i.test(contentType)) {
-      throw new Error(`VOD stream returned unexpected content type ${contentType || 'missing'}`);
-    }
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error('VOD stream has no response body');
-    const first = await reader.read();
-    await reader.cancel().catch(() => {});
-    const bytes = first.value?.byteLength || 0;
-    if (bytes < 1) throw new Error('VOD stream returned no media bytes');
-    return { bytes };
-  } finally {
-    clearTimeout(timeout);
-    controller.abort();
-  }
-}
-
-async function requestPlaybackInfo(request, auth, itemId, live) {
-  const response = await request.post(`/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
-    headers: { 'X-Emby-Token': auth.AccessToken },
-    data: {
-      UserId: auth.User.Id,
-      IsPlayback: true,
-      AutoOpenLiveStream: live,
-      EnableDirectPlay: true,
-      EnableDirectStream: true,
-      EnableTranscoding: true,
-      DeviceProfile: hlsDeviceProfile(),
+      timeout: 45_000,
     },
-    timeout: 45_000,
-  });
+  );
   if (response.status() !== 200) {
-    throw new Error(`PlaybackInfo returned HTTP ${response.status()}`);
+    throw new Error(`VOD artwork returned HTTP ${response.status()}`);
+  }
+  const contentType = response.headers()['content-type'] || '';
+  if (!contentType.toLowerCase().startsWith('image/')) {
+    throw new Error('VOD artwork content type is invalid');
+  }
+  const bytes = await response.body();
+  const dimensions = imageDimensions(bytes);
+  if (!dimensions || dimensions.width <= 1 || dimensions.height <= 1) {
+    throw new Error('VOD artwork is a placeholder or invalid image');
+  }
+}
+
+function imageDimensions(bytes) {
+  if (bytes.length >= 24
+    && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+  }
+  if (bytes.length >= 10 && ['GIF87a', 'GIF89a'].includes(bytes.subarray(0, 6).toString('ascii'))) {
+    return { width: bytes.readUInt16LE(6), height: bytes.readUInt16LE(8) };
+  }
+  if (bytes.length >= 30
+    && bytes.subarray(0, 4).toString('ascii') === 'RIFF'
+    && bytes.subarray(8, 12).toString('ascii') === 'WEBP') {
+    const chunk = bytes.subarray(12, 16).toString('ascii');
+    if (chunk === 'VP8X') {
+      return {
+        width: bytes.readUIntLE(24, 3) + 1,
+        height: bytes.readUIntLE(27, 3) + 1,
+      };
+    }
+    if (chunk === 'VP8 ' && bytes.subarray(23, 26).equals(Buffer.from([0x9d, 0x01, 0x2a]))) {
+      return {
+        width: bytes.readUInt16LE(26) & 0x3fff,
+        height: bytes.readUInt16LE(28) & 0x3fff,
+      };
+    }
+    if (chunk === 'VP8L' && bytes[20] === 0x2f) {
+      const packed = bytes.readUInt32LE(21);
+      return {
+        width: (packed & 0x3fff) + 1,
+        height: ((packed >>> 14) & 0x3fff) + 1,
+      };
+    }
+  }
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 4 <= bytes.length) {
+      if (bytes[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = bytes[offset + 1];
+      offset += 2;
+      if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (offset + 2 > bytes.length) return null;
+      const segmentLength = bytes.readUInt16BE(offset);
+      if (segmentLength < 2 || offset + segmentLength > bytes.length) return null;
+      if ([
+        0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
+        0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+      ].includes(marker) && segmentLength >= 7) {
+        return {
+          width: bytes.readUInt16BE(offset + 5),
+          height: bytes.readUInt16BE(offset + 3),
+        };
+      }
+      offset += segmentLength;
+    }
+  }
+  return null;
+}
+
+async function requestPlaybackInfo(request, auth, itemId, options) {
+  const data = {
+    UserId: auth.User.Id,
+    IsPlayback: true,
+    StartTimeTicks: 0,
+    EnableDirectPlay: options.enableDirectPlay,
+    EnableDirectStream: options.enableDirectStream,
+    EnableTranscoding: options.enableTranscoding,
+    DeviceProfile: options.deviceProfile,
+  };
+  if (Number.isSafeInteger(options.audioStreamIndex)) {
+    data.AudioStreamIndex = options.audioStreamIndex;
+  }
+  if (Number.isSafeInteger(options.subtitleStreamIndex)) {
+    data.SubtitleStreamIndex = options.subtitleStreamIndex;
+  }
+  const response = await request.post(
+    `/Items/${encodeURIComponent(itemId)}/PlaybackInfo?UserId=${encodeURIComponent(auth.User.Id)}`,
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Emby-Token': auth.AccessToken,
+      },
+      data,
+      timeout: 45_000,
+    },
+  );
+  if (response.status() !== 200) {
+    throw new Error(`VOD PlaybackInfo returned HTTP ${response.status()}`);
   }
   return response.json();
 }
 
-function hlsDeviceProfile() {
+function nativeMpegTsDeviceProfile() {
+  return {
+    Name: 'MAGSTV QA native MPEG-TS discovery',
+    DirectPlayProfiles: [{
+      Container: 'ts,mpegts',
+      Type: 'Video',
+      VideoCodec: 'h264,hevc,mpeg2video',
+      AudioCodec: 'aac,mp2,mp3,ac3,eac3',
+    }],
+    TranscodingProfiles: [],
+    ContainerProfiles: [],
+    CodecProfiles: [],
+    SubtitleProfiles: [{ Format: 'vtt', Method: 'External' }],
+  };
+}
+
+function webHlsDeviceProfile() {
   return {
     Name: 'Jellyfin Web',
     MaxStreamingBitrate: 120_000_000,
@@ -663,20 +804,110 @@ function hlsDeviceProfile() {
       Context: 'Streaming',
       EnableMpegtsM2TsMode: true,
       CopyTimestamps: true,
+      MinSegments: 1,
+      BreakOnNonKeyFrames: false,
     }],
     ContainerProfiles: [],
     CodecProfiles: [],
-    SubtitleProfiles: [],
+    SubtitleProfiles: [{ Format: 'vtt', Method: 'External' }],
   };
 }
 
-async function getTextWithRetry(request, url, label) {
+async function probeVodHls(request, baseURL, token, transcodingUrl) {
+  const masterUrl = sameOriginUrl(baseURL, transcodingUrl);
+  const masterText = await getPlaylistWithRetry(
+    request,
+    masterUrl,
+    token,
+    'VOD HLS master playlist',
+    true,
+  );
+  let mediaUrl = masterUrl;
+  let mediaText = masterText;
+  if (masterText.includes('#EXT-X-STREAM-INF')) {
+    const mediaReference = firstPlaylistReference(masterText);
+    if (!mediaReference) throw new Error('VOD HLS master playlist has no media reference');
+    mediaUrl = new URL(mediaReference, masterUrl).toString();
+    mediaText = await getPlaylistWithRetry(
+      request,
+      mediaUrl,
+      token,
+      'VOD HLS media playlist',
+      true,
+    );
+  }
+  const segmentReference = firstPlaylistReference(mediaText);
+  if (!segmentReference) throw new Error('VOD HLS media playlist has no segment');
+  const segmentUrl = sameOriginUrl(baseURL, new URL(segmentReference, mediaUrl).toString());
+  const segmentResponse = await request.get(segmentUrl, {
+    headers: { 'X-Emby-Token': token },
+    timeout: 45_000,
+  });
+  if (segmentResponse.status() !== 200) {
+    throw new Error(`VOD HLS segment returned HTTP ${segmentResponse.status()}`);
+  }
+  const bytes = await segmentResponse.body();
+  if (bytes.length < 188) throw new Error('VOD HLS segment is empty or truncated');
+  return bytes.length;
+}
+
+async function verifyJitSubtitle(request, baseURL, token, stream) {
+  if (stream.DeliveryMethod !== 'External'
+    || !['vtt', 'webvtt'].includes(String(stream.Codec || '').toLowerCase())
+    || !stream.DeliveryUrl) {
+    throw new Error('VOD selected subtitle is not externally selectable');
+  }
+  const url = sameOriginUrl(baseURL, stream.DeliveryUrl);
+  const response = await request.get(url, {
+    headers: { 'X-Emby-Token': token },
+    timeout: 45_000,
+  });
+  if (response.status() !== 200) {
+    throw new Error(`VOD subtitle returned HTTP ${response.status()}`);
+  }
+  const text = await response.text();
+  if (!text.startsWith('WEBVTT') || !text.includes('-->')) {
+    throw new Error('VOD subtitle has no WebVTT cue content');
+  }
+}
+
+async function stopPlaybackSessions(request, auth, sessions) {
+  for (const { item, playback, source, method } of sessions.reverse()) {
+    if (!playback?.PlaySessionId) continue;
+    await request.post('/Sessions/Playing/Stopped', {
+      headers: { 'X-Emby-Token': auth.AccessToken },
+      data: {
+        ItemId: item.Id,
+        MediaSourceId: source?.Id || item.Id,
+        PlayMethod: method,
+        PlaySessionId: playback.PlaySessionId,
+        PositionTicks: 0,
+        CanSeek: true,
+        IsPaused: false,
+      },
+      timeout: 15_000,
+    }).catch(() => {});
+    await request.delete(
+      `/Videos/ActiveEncodings?PlaySessionId=${encodeURIComponent(playback.PlaySessionId)}`,
+      { headers: { 'X-Emby-Token': auth.AccessToken }, timeout: 15_000 },
+    ).catch(() => {});
+  }
+}
+
+async function getPlaylistWithRetry(request, url, token, label, requireReference) {
   let lastStatus = 0;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const response = await request.get(url, { timeout: 30_000 });
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const response = await request.get(url, {
+      headers: { 'X-Emby-Token': token },
+      timeout: 45_000,
+    });
     lastStatus = response.status();
     const text = await response.text();
-    if (lastStatus === 200 && text.includes('#EXTM3U')) return text;
+    if (lastStatus === 200
+      && text.includes('#EXTM3U')
+      && (!requireReference || firstPlaylistReference(text))) {
+      return text;
+    }
     await delay(500);
   }
   throw new Error(`${label} did not become ready; final HTTP status ${lastStatus}`);
@@ -722,6 +953,18 @@ function positiveIntegerEnvironment(name, fallback) {
 function safeErrorReason(error) {
   const message = String(error?.message || error);
   const status = message.match(/HTTP \d{3}/i)?.[0];
+  const categorized = [
+    [/metadata|overview/i, 'metadata unavailable'],
+    [/artwork|image/i, 'artwork unavailable'],
+    [/audio/i, 'alternate audio/language unavailable'],
+    [/subtitle/i, 'subtitle/language unavailable'],
+    [/hls/i, 'Web HLS unavailable'],
+    [/PlaybackInfo/i, 'PlaybackInfo unavailable'],
+    [/external provider URL/i, 'unsafe playback URL rejected'],
+  ].find(([pattern]) => pattern.test(message));
+  if (categorized) {
+    return status ? `${categorized[1]} (${status.toUpperCase()})` : categorized[1];
+  }
   if (status) return status.toUpperCase();
   if (/timeout|timed out/i.test(message)) return 'timeout';
   if (/abort/i.test(message)) return 'aborted';
