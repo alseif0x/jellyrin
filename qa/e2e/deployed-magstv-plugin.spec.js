@@ -77,6 +77,11 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
     // Stop the rendered lists from issuing background image/catalogue requests while the three
     // playback probes run strictly one after another.
     await page.goto('about:blank');
+    const episodeCandidates = await firstEpisodesFromDistinctSeries(
+      request,
+      auth,
+      snapshot.series.items,
+    );
 
     const movieResult = await probeFirstPlayable(
       snapshot.movies.items,
@@ -84,7 +89,7 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
       'Mags Movies',
     );
     const episodeResult = await probeFirstPlayable(
-      snapshot.episodes.items,
+      episodeCandidates,
       (episode) => probeVodWebExperience(request, baseURL, auth, episode, 'episode'),
       'Mags Series episode',
     );
@@ -166,6 +171,53 @@ test.describe('MAGSTV home view locator contract', () => {
       await expect(link).toHaveCount(1);
       await expect(link).toHaveAttribute('href', href);
     }
+  });
+});
+
+test.describe('MAGSTV episode candidate sampling contract', () => {
+  test('selects at most one episode from each distinct series', async () => {
+    const calls = [];
+    const episodesBySeries = new Map([
+      ['series-a', { Id: 'episode-a', Type: 'Episode', SeriesId: 'series-a' }],
+      // A mismatched result must not be attributed to the requested series.
+      ['series-b', { Id: 'episode-b', Type: 'Episode', SeriesId: 'series-other' }],
+      ['series-c', { Id: 'episode-c', Type: 'Episode', SeriesId: 'series-c' }],
+    ]);
+    const request = {
+      async get(path, options) {
+        const url = new URL(path, 'https://jellyrin.invalid');
+        const seriesId = decodeURIComponent(url.pathname.split('/')[2]);
+        calls.push({ seriesId, options });
+        const episode = episodesBySeries.get(seriesId);
+        return {
+          status: () => 200,
+          json: async () => ({
+            Items: episode ? [episode] : [],
+            TotalRecordCount: episode ? 1 : 0,
+          }),
+        };
+      },
+    };
+    const auth = { AccessToken: 'fixture-token', User: { Id: 'fixture-user' } };
+
+    const candidates = await firstEpisodesFromDistinctSeries(request, auth, [
+      { Id: 'series-a' },
+      { Id: 'series-a' },
+      { Id: '' },
+      { Id: 'series-b' },
+      { Id: 'series-c' },
+    ]);
+
+    expect(calls.map((call) => call.seriesId)).toEqual(['series-a', 'series-b', 'series-c']);
+    expect(calls.every((call) => call.options.headers['X-Emby-Token'] === 'fixture-token')).toBe(true);
+    expect(candidates.map((episode) => episode.SeriesId)).toEqual(['series-a', 'series-c']);
+  });
+
+  test('reports audio-count and audio-language failures separately', () => {
+    expect(safeErrorReason(new Error('VOD alternative audio track is unavailable')))
+      .toBe('alternate audio track unavailable');
+    expect(safeErrorReason(new Error('VOD alternative audio language label is unavailable')))
+      .toBe('audio language/selection unavailable');
   });
 });
 
@@ -414,6 +466,60 @@ function normalizePage(body) {
     total: Number(body?.TotalRecordCount) || 0,
     items: Array.isArray(body?.Items) ? body.Items.filter((item) => item?.Id) : [],
   };
+}
+
+async function firstEpisodesFromDistinctSeries(request, auth, seriesItems) {
+  const distinctSeries = [];
+  const seenSeriesIds = new Set();
+  for (const series of Array.isArray(seriesItems) ? seriesItems : []) {
+    const seriesId = typeof series?.Id === 'string' ? series.Id.trim() : '';
+    if (!seriesId || seenSeriesIds.has(seriesId)) continue;
+    seenSeriesIds.add(seriesId);
+    distinctSeries.push({ Id: seriesId });
+    if (distinctSeries.length >= catalogueCandidateLimit) break;
+  }
+  if (!distinctSeries.length) {
+    throw new Error('Mags Series has no distinct series candidates');
+  }
+
+  const headers = { 'X-Emby-Token': auth.AccessToken };
+  const candidates = [];
+  let unavailableLookups = 0;
+  // Bound concurrent catalogue reads independently of the configurable candidate count.
+  // These calls select already-persisted rows and never invoke provider playback.
+  const lookupConcurrency = 4;
+  for (let offset = 0; offset < distinctSeries.length; offset += lookupConcurrency) {
+    const batch = distinctSeries.slice(offset, offset + lookupConcurrency);
+    const results = await Promise.all(batch.map(async (series) => {
+      try {
+        const response = await request.get(
+          `/Shows/${encodeURIComponent(series.Id)}/Episodes`
+            + `?UserId=${encodeURIComponent(auth.User.Id)}`
+            + '&Fields=SeriesId&StartIndex=0&Limit=1&SortBy=SortName',
+          { headers, timeout: 60_000 },
+        );
+        if (response.status() !== 200) return null;
+        const page = normalizePage(await response.json());
+        return page.items.find((episode) => (
+          String(episode?.Type || '').toLowerCase() === 'episode'
+            && episode.SeriesId === series.Id
+        )) || null;
+      } catch {
+        // The aggregate error below intentionally omits provider and catalogue identifiers.
+        return null;
+      }
+    }));
+    for (const episode of results) {
+      if (episode) candidates.push(episode);
+      else unavailableLookups += 1;
+    }
+  }
+  if (!candidates.length) {
+    throw new Error(
+      `Mags Series yielded no episode candidates across distinct series (${unavailableLookups} unavailable lookups)`,
+    );
+  }
+  return candidates.slice(0, catalogueCandidateLimit);
 }
 
 async function verifyHomeAndOpenViews(page, views) {
@@ -1101,6 +1207,8 @@ function safeErrorReason(error) {
     [/live tv|direct stream/i, 'Live TV stream unavailable'],
     [/metadata|overview/i, 'metadata unavailable'],
     [/artwork|image/i, 'artwork unavailable'],
+    [/alternative audio track/i, 'alternate audio track unavailable'],
+    [/audio language|selected audio/i, 'audio language/selection unavailable'],
     [/audio/i, 'alternate audio/language unavailable'],
     [/subtitle/i, 'subtitle/language unavailable'],
     [/hls/i, 'Web HLS unavailable'],
