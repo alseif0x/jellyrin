@@ -16,7 +16,9 @@ const syncTimeoutMs = positiveIntegerEnvironment(
   2 * 60 * 60 * 1000,
 );
 
-test.use({ trace: 'off', video: 'off' });
+// Unlike ordinary deployed tests, every failure artifact is disabled here: a failure between
+// filling and submitting the form must not preserve even the account name in a screenshot.
+test.use({ trace: 'off', video: 'off', screenshot: 'off' });
 
 test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => {
   test.skip(
