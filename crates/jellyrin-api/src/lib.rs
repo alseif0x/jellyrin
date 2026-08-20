@@ -29830,8 +29830,14 @@ async fn live_tv_tuner_view_by_id(
 fn live_tv_tuner_view_to_json(tuner: &LiveTvTunerView, server_id: &str) -> serde_json::Value {
     let mut view = special_user_view_to_json(&tuner.name, "livetv", server_id);
     view["Id"] = serde_json::json!(tuner.view_id);
-    // Jellyfin Web honors this lower-case compatibility field before its generic Live TV route.
-    // Keep per-tuner views on the ordinary list controller so ParentId survives every page load.
+    // Generated Jellyfin Web clients discard the non-schema `url` extension before routing and
+    // hard-code every `CollectionType=livetv` view to the global Live TV page. Advertise a
+    // per-tuner view as an ordinary collection folder so every client takes the standard list
+    // route and preserves this view id as ParentId. The global Live TV view keeps its canonical
+    // collection type and behaviour.
+    view.as_object_mut()
+        .expect("special user view must be an object")
+        .remove("CollectionType");
     view["url"] = serde_json::json!(format!(
         "#/list?serverId={server_id}&parentId={}",
         tuner.view_id
@@ -74079,7 +74085,9 @@ done
             .find(|view| view["TunerHostId"] == "magstv")
             .unwrap();
         assert_eq!(mags_view["Name"], "Mags Live TV");
-        assert_eq!(mags_view["CollectionType"], "livetv");
+        assert!(mags_view.get("CollectionType").is_none());
+        assert_eq!(mags_view["Type"], "CollectionFolder");
+        assert_eq!(mags_view["IsFolder"], true);
         assert_eq!(mags_view["ChildCount"], 1);
         let mags_view_id = mags_view["Id"].as_str().unwrap().to_string();
         assert_eq!(mags_view_id, super::live_tv_tuner_view_id("magstv"));
