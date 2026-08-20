@@ -58,6 +58,15 @@ async function main() {
   const cargoLock = await read('Cargo.lock');
   const lock = parseLock(lockText);
   const runtimeDockerfile = dockerfile.slice(dockerfile.lastIndexOf('FROM runtime-smoke'));
+  const supplyChainWorkflow = workflow.slice(workflow.indexOf('  supply-chain:'));
+  const supplyChainFfmpegInstall =
+    'sudo apt-get install --yes --no-install-recommends ffmpeg';
+  const supplyChainFfmpegInstallIndex = supplyChainWorkflow.indexOf(
+    supplyChainFfmpegInstall,
+  );
+  const supplyChainFfmpegSmokeIndex = supplyChainWorkflow.indexOf(
+    'qa/ffmpeg-remux-smoke.sh jellyrin:ci',
+  );
   const reviewedFfmpegCapabilities = {
     configured: {
       encoder: 'libx264,aac,mjpeg,subrip,webvtt',
@@ -418,12 +427,23 @@ async function main() {
     ),
     check(
       'ci-runs-minimal-ffmpeg-corpus',
-      workflow.includes('qa/ffmpeg-remux-smoke.sh jellyrin:ci') &&
+      supplyChainWorkflow.includes('Install FFmpeg smoke fixture dependency') &&
+        supplyChainWorkflow.includes('sudo apt-get update') &&
+        supplyChainFfmpegInstallIndex >= 0 &&
+        supplyChainFfmpegInstallIndex < supplyChainFfmpegSmokeIndex &&
         ffmpegSmoke.includes('source.mp4 source.mkv source.ts') &&
         ffmpegSmoke.includes('-show_format -show_streams -of json') &&
         ffmpegSmoke.includes('-c copy -f hls') &&
-        ffmpegSmoke.includes('[[ -z "${encoder_names}" ]]') &&
-        ffmpegSmoke.includes('[[ "${decoder_names}" == "aac" ]]'),
+        extractSingleQuotedAssignment(
+          ffmpegSmoke,
+          'reviewed_runtime_ffmpeg_encoders',
+        ) === reviewedFfmpegCapabilities.runtime.encoder &&
+        extractSingleQuotedAssignment(
+          ffmpegSmoke,
+          'reviewed_runtime_ffmpeg_decoders',
+        ) === reviewedFfmpegCapabilities.runtime.decoder &&
+        ffmpegSmoke.includes('"${encoder_names}" != "${expected_encoder_names}"') &&
+        ffmpegSmoke.includes('"${decoder_names}" != "${expected_decoder_names}"'),
     ),
     check(
       'ci-runs-distroless-runtime-smoke',

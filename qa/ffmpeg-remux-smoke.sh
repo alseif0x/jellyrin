@@ -67,14 +67,30 @@ done
 encoder_names="$(
     "${container_engine}" run --rm --entrypoint ffmpeg "${image_ref}" \
         -hide_banner -encoders 2>/dev/null \
-        | awk '$1 ~ /^[VAS]/ && length($1) == 6 && $2 != "=" { print $2 }'
+        | awk '$1 ~ /^[VAS]/ && length($1) == 6 && $2 != "=" { print $2 }' \
+        | LC_ALL=C sort -u
 )"
 decoder_names="$(
     "${container_engine}" run --rm --entrypoint ffmpeg "${image_ref}" \
         -hide_banner -decoders 2>/dev/null \
-        | awk '$1 ~ /^[VAS]/ && length($1) == 6 && $2 != "=" { print $2 }'
+        | awk '$1 ~ /^[VAS]/ && length($1) == 6 && $2 != "=" { print $2 }' \
+        | LC_ALL=C sort -u
 )"
-[[ -z "${encoder_names}" ]]
-[[ "${decoder_names}" == "aac" ]]
+reviewed_runtime_ffmpeg_encoders='aac,libx264,mjpeg,subrip,webvtt'
+reviewed_runtime_ffmpeg_decoders='aac,ac3,ass,av1,dvbsub,dvdsub,eac3,flac,h263,h264,hevc,mjpeg,mp3,mp3float,mpeg2video,mpeg4,opus,pgssub,srt,ssa,subrip,vc1,vorbis,vp8,vp9,webvtt,wmv3'
+expected_encoder_names="$(
+    printf '%s\n' "${reviewed_runtime_ffmpeg_encoders}" | tr ',' '\n' | LC_ALL=C sort
+)"
+expected_decoder_names="$(
+    printf '%s\n' "${reviewed_runtime_ffmpeg_decoders}" | tr ',' '\n' | LC_ALL=C sort
+)"
+if [[ "${encoder_names}" != "${expected_encoder_names}" ]]; then
+    echo "enabled image encoder allowlist drift in FFmpeg smoke test" >&2
+    exit 1
+fi
+if [[ "${decoder_names}" != "${expected_decoder_names}" ]]; then
+    echo "enabled image decoder allowlist drift in FFmpeg smoke test" >&2
+    exit 1
+fi
 
 printf 'verified minimal FFmpeg probe/remux corpus: %s\n' "${image_ref}"
