@@ -17,7 +17,7 @@ const validInput = {
 
 test('builds the fixed MAGSTV plugin route and bounded defaults', () => {
   const payload = buildPayload(validateConfig(validInput));
-  assert.equal(payload.Id, 'magstv-main');
+  assert.equal(payload.Id, 'magstv');
   assert.equal(payload.Type, `plugin:${PLUGIN_ID}`);
   assert.equal(payload.PluginId, PLUGIN_ID);
   assert.equal(payload.PageSize, 200);

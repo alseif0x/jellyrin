@@ -214,10 +214,10 @@ function validateConfig(config) {
 
 function buildPayload(config) {
   return {
-    Id: 'magstv-main',
+    Id: 'magstv',
     Type: `plugin:${PLUGIN_ID}`,
     PluginId: PLUGIN_ID,
-    FriendlyName: 'MAGSTV',
+    FriendlyName: 'Mags Live TV',
     Username: config.username,
     Password: config.password,
     PageSize: 200,
