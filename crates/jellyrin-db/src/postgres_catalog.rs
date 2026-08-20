@@ -1664,14 +1664,14 @@ impl PostgresDatabase {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    /// The same candidates restricted to one persisted `SeriesId`.
+    /// Episode candidates plus an explicit provider-series anchor, restricted to one persisted
+    /// `SeriesId`.
     ///
     /// Opening a series otherwise materializes every episode in the library just to keep the
     /// handful
     /// that belong to it. The partial index on `btrim(metadata->>'SeriesId')` makes this a direct
-    /// lookup, and the remaining predicates match `tv_series_lookup_candidates` exactly so the
-    /// result
-    /// is a strict subset of it.
+    /// lookup. The anchor lets a valid series with no episodes resolve its detail page without
+    /// adding a synthetic member to the episode projection.
     pub async fn tv_series_lookup_candidates_for_series(
         &self,
         series_id: &str,
@@ -1695,8 +1695,14 @@ impl PostgresDatabase {
                    NULL::timestamptz AS playback_updated_at
             FROM media_items AS item
             WHERE item.missing_since IS NULL
-              AND item.media_type = 'Video'
               AND lower(item.collection_type) = ANY(ARRAY['tvshows', 'tvshow', 'series']::text[])
+              AND (
+                    item.media_type = 'Video'
+                    OR (
+                        item.media_type = 'Series'
+                        AND lower(coalesce(item.metadata->>'PluginVodKind', '')) = 'series'
+                    )
+              )
               AND btrim(item.metadata->>'SeriesId') = $1
             ORDER BY lower(item.name), item.name
             "#,
@@ -2046,9 +2052,17 @@ impl PostgresDatabase {
                 SELECT 1
                 FROM media_items AS invalid
                 WHERE invalid.missing_since IS NULL
-                  AND invalid.media_type = 'Video'
                   AND lower(invalid.collection_type) = ANY(
                       ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                  AND (
+                        invalid.media_type = 'Video'
+                        OR (
+                            invalid.media_type = 'Series'
+                            AND lower(coalesce(
+                                invalid.metadata->>'PluginVodKind', ''
+                            )) = 'series'
+                        )
                   )
                   AND ($1::uuid IS NULL OR invalid.virtual_folder_id = $1)
                   AND (
@@ -2080,24 +2094,45 @@ impl PostgresDatabase {
         let requested_limit = limit;
         let grouped = sqlx::query_as::<_, (i64, bool, bool, bool, Option<String>, Option<String>)>(
             r#"
-            WITH grouped AS (
-                SELECT btrim(item.metadata->>'SeriesId') AS series_id,
-                       min(btrim(item.metadata->>'SeriesName')) AS series_name,
-                       max(btrim(item.metadata->>'SeriesName')) AS series_name_last,
-                       min(item.virtual_folder_id::text) AS folder_first,
-                       max(item.virtual_folder_id::text) AS folder_last,
-                       bool_or(lower(coalesce(folder.collection_type, '')) <> ALL(
+            WITH series_source AS (
+                SELECT item.virtual_folder_id,
+                       btrim(item.metadata->>'SeriesId') AS series_id,
+                       btrim(item.metadata->>'SeriesName') AS series_name,
+                       item.media_type = 'Series' AS is_anchor,
+                       lower(coalesce(folder.collection_type, '')) <> ALL(
                            ARRAY['tvshows', 'tvshow', 'series']::text[]
-                       )) AS foreign_folder
+                       ) AS foreign_folder
                 FROM media_items AS item
                 LEFT JOIN virtual_folders AS folder ON folder.id = item.virtual_folder_id
                 WHERE item.missing_since IS NULL
-                  AND item.media_type = 'Video'
                   AND lower(item.collection_type) = ANY(
                       ARRAY['tvshows', 'tvshow', 'series']::text[]
                   )
+                  AND (
+                        item.media_type = 'Video'
+                        OR (
+                            item.media_type = 'Series'
+                            AND lower(coalesce(
+                                item.metadata->>'PluginVodKind', ''
+                            )) = 'series'
+                        )
+                  )
                   AND ($1::uuid IS NULL OR item.virtual_folder_id = $1)
-                GROUP BY btrim(item.metadata->>'SeriesId')
+            ), grouped AS (
+                SELECT series_id,
+                       coalesce(
+                           min(series_name) FILTER (WHERE is_anchor),
+                           min(series_name)
+                       ) AS series_name,
+                       coalesce(
+                           min(series_name) FILTER (WHERE is_anchor),
+                           max(series_name)
+                       ) AS series_name_last,
+                       min(item.virtual_folder_id::text) AS folder_first,
+                       max(item.virtual_folder_id::text) AS folder_last,
+                       bool_or(foreign_folder) AS foreign_folder
+                FROM series_source AS item
+                GROUP BY series_id
             ), stats AS (
                 SELECT count(*) FILTER (
                            WHERE ($4::text IS NULL
@@ -2470,9 +2505,17 @@ impl PostgresDatabase {
                 FROM media_items AS invalid
                 WHERE invalid.virtual_folder_id = $1
                   AND invalid.missing_since IS NULL
-                  AND invalid.media_type = 'Video'
                   AND lower(invalid.collection_type) = ANY(
                       ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                  AND (
+                        invalid.media_type = 'Video'
+                        OR (
+                            invalid.media_type = 'Series'
+                            AND lower(coalesce(
+                                invalid.metadata->>'PluginVodKind', ''
+                            )) = 'series'
+                        )
                   )
                   AND (
                       NULLIF(btrim(invalid.metadata->>'SeriesId'), '') IS NULL
@@ -2484,12 +2527,26 @@ impl PostgresDatabase {
                 FROM media_items AS conflicting
                 WHERE conflicting.virtual_folder_id = $1
                   AND conflicting.missing_since IS NULL
-                  AND conflicting.media_type = 'Video'
                   AND lower(conflicting.collection_type) = ANY(
                       ARRAY['tvshows', 'tvshow', 'series']::text[]
                   )
+                  AND (
+                        conflicting.media_type = 'Video'
+                        OR (
+                            conflicting.media_type = 'Series'
+                            AND lower(coalesce(
+                                conflicting.metadata->>'PluginVodKind', ''
+                            )) = 'series'
+                        )
+                  )
                 GROUP BY btrim(conflicting.metadata->>'SeriesId')
-                HAVING count(DISTINCT btrim(conflicting.metadata->>'SeriesName')) > 1
+                HAVING count(*) FILTER (
+                           WHERE conflicting.media_type = 'Series'
+                             AND lower(coalesce(
+                                 conflicting.metadata->>'PluginVodKind', ''
+                             )) = 'series'
+                       ) = 0
+                   AND count(DISTINCT btrim(conflicting.metadata->>'SeriesName')) > 1
             )
             "#,
         )
@@ -2505,18 +2562,37 @@ impl PostgresDatabase {
             INSERT INTO media_item_tv_series (
                 virtual_folder_id, series_id, series_name, episode_count
             )
-            SELECT item.virtual_folder_id,
-                   btrim(item.metadata->>'SeriesId'),
-                   min(btrim(item.metadata->>'SeriesName')),
-                   count(*)
-            FROM media_items AS item
-            WHERE item.virtual_folder_id = $1
-              AND item.missing_since IS NULL
-              AND item.media_type = 'Video'
-              AND lower(item.collection_type) = ANY(
-                  ARRAY['tvshows', 'tvshow', 'series']::text[]
-              )
-            GROUP BY item.virtual_folder_id, btrim(item.metadata->>'SeriesId')
+            WITH series_source AS (
+                SELECT item.virtual_folder_id,
+                       btrim(item.metadata->>'SeriesId') AS series_id,
+                       btrim(item.metadata->>'SeriesName') AS series_name,
+                       item.media_type = 'Series' AS is_anchor,
+                       CASE WHEN item.media_type = 'Video' THEN 1 ELSE 0 END AS episode_count
+                FROM media_items AS item
+                WHERE item.virtual_folder_id = $1
+                  AND item.missing_since IS NULL
+                  AND lower(item.collection_type) = ANY(
+                      ARRAY['tvshows', 'tvshow', 'series']::text[]
+                  )
+                  AND (
+                        item.media_type = 'Video'
+                        OR (
+                            item.media_type = 'Series'
+                            AND lower(coalesce(
+                                item.metadata->>'PluginVodKind', ''
+                            )) = 'series'
+                        )
+                  )
+            )
+            SELECT virtual_folder_id,
+                   series_id,
+                   coalesce(
+                       min(series_name) FILTER (WHERE is_anchor),
+                       min(series_name)
+                   ),
+                   sum(episode_count)
+            FROM series_source
+            GROUP BY virtual_folder_id, series_id
             "#,
         )
         .bind(virtual_folder_id)
@@ -7270,6 +7346,122 @@ mod tests {
                 );
             }
             transaction.rollback().await?;
+            anyhow::Ok(())
+        }
+        .await;
+        test.cleanup().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_tv_series_projection_preserves_empty_series_anchors_without_duplicates() {
+        let Some(test) = IsolatedPostgres::create().await else {
+            return;
+        };
+        let result = async {
+            let populated_series_id = Uuid::new_v4();
+            let empty_series_id = Uuid::new_v4();
+            let episode_id = Uuid::new_v4();
+            let folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Anchored Shows",
+                    "tvshows",
+                    "plugin-vod://test/series",
+                    vec![
+                        remote_item(
+                            Uuid::new_v4(),
+                            "Populated",
+                            "plugin-vod://test/populated",
+                            "Series",
+                            "tvshows",
+                            json!({
+                                "PluginVodKind": "series",
+                                "SeriesId": populated_series_id.simple().to_string(),
+                                "SeriesName": "Populated"
+                            }),
+                        ),
+                        remote_item(
+                            episode_id,
+                            "Populated S01E01",
+                            "plugin-vod://test/populated-episode",
+                            "Video",
+                            "tvshows",
+                            json!({
+                                "SeriesId": populated_series_id.simple().to_string(),
+                                "SeriesName": "Provider Episode Alias"
+                            }),
+                        ),
+                        remote_item(
+                            Uuid::new_v4(),
+                            "Empty",
+                            "plugin-vod://test/empty",
+                            "Series",
+                            "tvshows",
+                            json!({
+                                "PluginVodKind": "series",
+                                "SeriesId": empty_series_id.simple().to_string(),
+                                "SeriesName": "Empty"
+                            }),
+                        ),
+                    ],
+                )
+                .await?;
+
+            let coverage = sqlx::query_as::<_, (i64, i64)>(
+                "SELECT episode_count, series_count FROM media_item_tv_series_coverage \
+                 WHERE virtual_folder_id = $1",
+            )
+            .bind(folder.id)
+            .fetch_one(&test.database.pool)
+            .await?;
+            assert_eq!(coverage, (1, 2));
+            let projected = test
+                .database
+                .tv_series_catalog_page(Some(folder.id), 0, 20)
+                .await?
+                .unwrap();
+            assert_eq!(projected.total_record_count, 2);
+            assert_eq!(projected.series.len(), 2);
+            assert_eq!(projected.episodes.len(), 1);
+            assert_eq!(projected.episodes[0].item.id, episode_id);
+            assert_eq!(
+                projected
+                    .series
+                    .iter()
+                    .find(|series| series.id == populated_series_id.simple().to_string())
+                    .unwrap()
+                    .name,
+                "Populated"
+            );
+
+            sqlx::query("DELETE FROM media_item_tv_series_coverage WHERE virtual_folder_id = $1")
+                .bind(folder.id)
+                .execute(&test.database.pool)
+                .await?;
+            let live = test
+                .database
+                .tv_series_catalog_page(Some(folder.id), 0, 20)
+                .await?
+                .context("anchors must also be visible before projection is republished")?;
+            assert_eq!(live.total_record_count, 2);
+            assert_eq!(live.series.len(), 2);
+            assert_eq!(live.episodes.len(), 1);
+            assert_eq!(
+                live.series
+                    .iter()
+                    .find(|series| series.id == populated_series_id.simple().to_string())
+                    .unwrap()
+                    .name,
+                "Populated"
+            );
+
+            let empty_candidates = test
+                .database
+                .tv_series_lookup_candidates_for_series(&empty_series_id.simple().to_string())
+                .await?;
+            assert_eq!(empty_candidates.len(), 1);
+            assert_eq!(empty_candidates[0].item.media_type, "Series");
             anyhow::Ok(())
         }
         .await;

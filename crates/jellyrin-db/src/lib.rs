@@ -99,7 +99,7 @@ use telemetry::{DatabaseOperation, DatabaseTelemetry};
 /// concrete until another backend has a complete native implementation and conformance suite.
 pub type ProductionDatabase = PostgresDatabase;
 
-const TV_SERIES_CATALOG_PROJECTION_VERSION: i32 = 2;
+const TV_SERIES_CATALOG_PROJECTION_VERSION: i32 = 3;
 const CATALOG_LOCK_RETRY_ATTEMPTS: usize = 6;
 const CATALOG_LOCK_RETRY_BASE_DELAY_MS: u64 = 25;
 const CATALOG_LOCK_RETRY_MAX_DELAY_MS: u64 = 400;
@@ -896,9 +896,10 @@ pub struct MediaItemCatalogPage {
     pub start_index: usize,
 }
 
-/// A bounded page of TV episodes belonging only to the requested synthetic Series page.
-/// `None` means at least one visible episode lacks a canonical persisted SeriesId/SeriesName, so
-/// callers must preserve the legacy path-derived grouping semantics.
+/// A bounded page of TV series keys and the episodes belonging to the requested page.
+/// Explicit provider series anchors may produce a key with no episode rows. `None` means at least
+/// one visible source row lacks a canonical persisted SeriesId/SeriesName, so callers must preserve
+/// the legacy path-derived grouping semantics.
 #[derive(Debug, Clone)]
 pub struct TvSeriesCatalogPage {
     pub series: Vec<TvSeriesCatalogKey>,
@@ -9211,13 +9212,13 @@ impl SqliteDatabase {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
-    /// The same candidates restricted to one persisted `SeriesId`.
+    /// Episode candidates plus an explicit provider-series anchor, restricted to one persisted
+    /// `SeriesId`.
     ///
     /// Opening a series otherwise materializes every episode in the library just to keep the
     /// handful
-    /// that belong to it. The remaining predicates match `tv_series_lookup_candidates` exactly so
-    /// the
-    /// result is a strict subset of it.
+    /// that belong to it. The anchor lets a valid series with no episodes resolve its detail page
+    /// without adding a synthetic member to the episode projection.
     pub async fn tv_series_lookup_candidates_for_series(
         &self,
         series_id: &str,
@@ -9242,8 +9243,16 @@ impl SqliteDatabase {
                    CAST(NULL AS TEXT) AS playback_updated_at
             FROM media_items AS item
             WHERE item.missing_since IS NULL
-              AND item.media_type = 'Video'
               AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+              AND (
+                    item.media_type = 'Video'
+                    OR (
+                        item.media_type = 'Series'
+                        AND lower(coalesce(
+                            json_extract(item.metadata_json, '$.PluginVodKind'), ''
+                        )) = 'series'
+                    )
+              )
               AND trim(json_extract(item.metadata_json, '$.SeriesId')) = ?1
             ORDER BY item.name COLLATE NOCASE
             "#,
@@ -9595,8 +9604,16 @@ impl SqliteDatabase {
                 SELECT 1
                 FROM media_items AS invalid
                 WHERE invalid.missing_since IS NULL
-                  AND invalid.media_type = 'Video'
                   AND lower(invalid.collection_type) IN ('tvshows', 'tvshow', 'series')
+                  AND (
+                        invalid.media_type = 'Video'
+                        OR (
+                            invalid.media_type = 'Series'
+                            AND lower(coalesce(json_extract(
+                                invalid.metadata_json, '$.PluginVodKind'
+                            ), '')) = 'series'
+                        )
+                  )
                   AND (?1 IS NULL OR invalid.virtual_folder_id IN (?1, ?2))
                   AND (
                       NULLIF(trim(json_extract(invalid.metadata_json, '$.SeriesId')), '') IS NULL
@@ -9625,25 +9642,45 @@ impl SqliteDatabase {
         let requested_limit = limit;
         let grouped = sqlx::query_as::<_, (i64, i64, i64, i64, Option<String>, Option<String>)>(
             r#"
-            WITH grouped AS (
-                SELECT trim(json_extract(item.metadata_json, '$.SeriesId')) AS series_id,
-                       min(trim(json_extract(item.metadata_json, '$.SeriesName'))) AS series_name,
-                       max(trim(json_extract(item.metadata_json, '$.SeriesName')))
-                           AS series_name_last,
-                       min(replace(item.virtual_folder_id, '-', '')) AS folder_first,
-                       max(replace(item.virtual_folder_id, '-', '')) AS folder_last,
-                       max(CASE
-                               WHEN lower(coalesce(folder.collection_type, ''))
-                                    IN ('tvshows', 'tvshow', 'series') THEN 0
-                               ELSE 1
-                           END) AS foreign_folder
+            WITH series_source AS (
+                SELECT item.virtual_folder_id,
+                       trim(json_extract(item.metadata_json, '$.SeriesId')) AS series_id,
+                       trim(json_extract(item.metadata_json, '$.SeriesName')) AS series_name,
+                       CASE WHEN item.media_type = 'Series' THEN 1 ELSE 0 END AS is_anchor,
+                       CASE
+                           WHEN lower(coalesce(folder.collection_type, ''))
+                                IN ('tvshows', 'tvshow', 'series') THEN 0
+                           ELSE 1
+                       END AS foreign_folder
                 FROM media_items AS item
                 LEFT JOIN virtual_folders AS folder ON folder.id = item.virtual_folder_id
                 WHERE item.missing_since IS NULL
-                  AND item.media_type = 'Video'
                   AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+                  AND (
+                        item.media_type = 'Video'
+                        OR (
+                            item.media_type = 'Series'
+                            AND lower(coalesce(json_extract(
+                                item.metadata_json, '$.PluginVodKind'
+                            ), '')) = 'series'
+                        )
+                  )
                   AND (?1 IS NULL OR item.virtual_folder_id IN (?1, ?2))
-                GROUP BY trim(json_extract(item.metadata_json, '$.SeriesId'))
+            ), grouped AS (
+                SELECT series_id,
+                       coalesce(
+                           min(CASE WHEN is_anchor = 1 THEN series_name END),
+                           min(series_name)
+                       ) AS series_name,
+                       coalesce(
+                           min(CASE WHEN is_anchor = 1 THEN series_name END),
+                           max(series_name)
+                       ) AS series_name_last,
+                       min(replace(item.virtual_folder_id, '-', '')) AS folder_first,
+                       max(replace(item.virtual_folder_id, '-', '')) AS folder_last,
+                       max(foreign_folder) AS foreign_folder
+                FROM series_source AS item
+                GROUP BY series_id
             ), stats AS (
                 SELECT coalesce(sum(CASE
                            WHEN (?5 IS NULL
@@ -9826,8 +9863,16 @@ impl SqliteDatabase {
                 FROM media_items AS invalid
                 WHERE invalid.virtual_folder_id = ?1
                   AND invalid.missing_since IS NULL
-                  AND invalid.media_type = 'Video'
                   AND lower(invalid.collection_type) IN ('tvshows', 'tvshow', 'series')
+                  AND (
+                        invalid.media_type = 'Video'
+                        OR (
+                            invalid.media_type = 'Series'
+                            AND lower(coalesce(json_extract(
+                                invalid.metadata_json, '$.PluginVodKind'
+                            ), '')) = 'series'
+                        )
+                  )
                   AND (
                       NULLIF(trim(json_extract(invalid.metadata_json, '$.SeriesId')), '') IS NULL
                       OR length(trim(json_extract(invalid.metadata_json, '$.SeriesId'))) <> 32
@@ -9841,12 +9886,27 @@ impl SqliteDatabase {
                 FROM media_items AS conflicting
                 WHERE conflicting.virtual_folder_id = ?1
                   AND conflicting.missing_since IS NULL
-                  AND conflicting.media_type = 'Video'
                   AND lower(conflicting.collection_type) IN ('tvshows', 'tvshow', 'series')
+                  AND (
+                        conflicting.media_type = 'Video'
+                        OR (
+                            conflicting.media_type = 'Series'
+                            AND lower(coalesce(json_extract(
+                                conflicting.metadata_json, '$.PluginVodKind'
+                            ), '')) = 'series'
+                        )
+                  )
                 GROUP BY trim(json_extract(conflicting.metadata_json, '$.SeriesId'))
-                HAVING count(DISTINCT trim(
-                    json_extract(conflicting.metadata_json, '$.SeriesName')
-                )) > 1
+                HAVING sum(CASE
+                           WHEN conflicting.media_type = 'Series'
+                            AND lower(coalesce(json_extract(
+                                conflicting.metadata_json, '$.PluginVodKind'
+                            ), '')) = 'series' THEN 1
+                           ELSE 0
+                       END) = 0
+                   AND count(DISTINCT trim(
+                       json_extract(conflicting.metadata_json, '$.SeriesName')
+                   )) > 1
             )
             "#,
         )
@@ -9862,17 +9922,35 @@ impl SqliteDatabase {
             INSERT INTO media_item_tv_series (
                 virtual_folder_id, series_id, series_name, episode_count
             )
-            SELECT item.virtual_folder_id,
-                   trim(json_extract(item.metadata_json, '$.SeriesId')),
-                   min(trim(json_extract(item.metadata_json, '$.SeriesName'))),
-                   count(*)
-            FROM media_items AS item
-            WHERE item.virtual_folder_id = ?1
-              AND item.missing_since IS NULL
-              AND item.media_type = 'Video'
-              AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
-            GROUP BY item.virtual_folder_id,
-                     trim(json_extract(item.metadata_json, '$.SeriesId'))
+            WITH series_source AS (
+                SELECT item.virtual_folder_id,
+                       trim(json_extract(item.metadata_json, '$.SeriesId')) AS series_id,
+                       trim(json_extract(item.metadata_json, '$.SeriesName')) AS series_name,
+                       CASE WHEN item.media_type = 'Series' THEN 1 ELSE 0 END AS is_anchor,
+                       CASE WHEN item.media_type = 'Video' THEN 1 ELSE 0 END AS episode_count
+                FROM media_items AS item
+                WHERE item.virtual_folder_id = ?1
+                  AND item.missing_since IS NULL
+                  AND lower(item.collection_type) IN ('tvshows', 'tvshow', 'series')
+                  AND (
+                        item.media_type = 'Video'
+                        OR (
+                            item.media_type = 'Series'
+                            AND lower(coalesce(json_extract(
+                                item.metadata_json, '$.PluginVodKind'
+                            ), '')) = 'series'
+                        )
+                  )
+            )
+            SELECT virtual_folder_id,
+                   series_id,
+                   coalesce(
+                       min(CASE WHEN is_anchor = 1 THEN series_name END),
+                       min(series_name)
+                   ),
+                   sum(episode_count)
+            FROM series_source
+            GROUP BY virtual_folder_id, series_id
             "#,
         )
         .bind(virtual_folder_id)
@@ -19721,6 +19799,125 @@ mod tests {
         assert_eq!(empty.total_record_count, 1);
         assert!(empty.series.is_empty());
         assert!(empty.episodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_tv_series_projection_preserves_empty_series_anchors_without_duplicates() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let populated_series_id = Uuid::new_v4();
+        let empty_series_id = Uuid::new_v4();
+        let item = |id: Uuid, name: &str, media_type: &str, metadata: serde_json::Value| {
+            RemoteMediaItemUpsert {
+                id: id.to_string(),
+                name: name.to_string(),
+                path: format!("plugin-vod://test/{id}"),
+                media_type: media_type.to_string(),
+                collection_type: "tvshows".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata,
+            }
+        };
+        let episode_id = Uuid::new_v4();
+        let folder = db
+            .replace_remote_media_library_snapshot(
+                "Anchored Shows",
+                "tvshows",
+                "plugin-vod://test/series",
+                vec![
+                    item(
+                        Uuid::new_v4(),
+                        "Populated",
+                        "Series",
+                        json!({
+                            "PluginVodKind": "series",
+                            "SeriesId": populated_series_id.simple().to_string(),
+                            "SeriesName": "Populated"
+                        }),
+                    ),
+                    item(
+                        episode_id,
+                        "Populated S01E01",
+                        "Video",
+                        json!({
+                            "SeriesId": populated_series_id.simple().to_string(),
+                            "SeriesName": "Provider Episode Alias"
+                        }),
+                    ),
+                    item(
+                        Uuid::new_v4(),
+                        "Empty",
+                        "Series",
+                        json!({
+                            "PluginVodKind": "series",
+                            "SeriesId": empty_series_id.simple().to_string(),
+                            "SeriesName": "Empty"
+                        }),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let coverage = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT episode_count, series_count FROM media_item_tv_series_coverage \
+             WHERE virtual_folder_id = ?1",
+        )
+        .bind(folder.id.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(coverage, (1, 2));
+        let projected = db
+            .tv_series_catalog_page(Some(folder.id), 0, 20)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected.total_record_count, 2);
+        assert_eq!(projected.series.len(), 2);
+        assert_eq!(projected.episodes.len(), 1);
+        assert_eq!(projected.episodes[0].item.id, episode_id);
+        assert_eq!(
+            projected
+                .series
+                .iter()
+                .find(|series| series.id == populated_series_id.simple().to_string())
+                .unwrap()
+                .name,
+            "Populated"
+        );
+
+        sqlx::query("DELETE FROM media_item_tv_series_coverage WHERE virtual_folder_id = ?1")
+            .bind(folder.id.to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let live = db
+            .tv_series_catalog_page(Some(folder.id), 0, 20)
+            .await
+            .unwrap()
+            .expect("anchors must also be visible before projection is republished");
+        assert_eq!(live.total_record_count, 2);
+        assert_eq!(live.series.len(), 2);
+        assert_eq!(live.episodes.len(), 1);
+        assert_eq!(
+            live.series
+                .iter()
+                .find(|series| series.id == populated_series_id.simple().to_string())
+                .unwrap()
+                .name,
+            "Populated"
+        );
+
+        let empty_candidates = db
+            .tv_series_lookup_candidates_for_series(&empty_series_id.simple().to_string())
+            .await
+            .unwrap();
+        assert_eq!(empty_candidates.len(), 1);
+        assert_eq!(empty_candidates[0].item.media_type, "Series");
     }
 
     #[tokio::test]

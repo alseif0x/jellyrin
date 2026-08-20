@@ -21167,6 +21167,13 @@ fn default_plugin_vod_media_streams() -> Vec<serde_json::Value> {
     ]
 }
 
+fn plugin_vod_series_id(plugin_id: &str, tuner_id: &str, series_reference: &str) -> String {
+    stable_entity_id(
+        "plugin-vod-series",
+        &format!("{plugin_id}:{tuner_id}:{series_reference}"),
+    )
+}
+
 fn vod_library_media_item_upsert(
     plugin_id: &str,
     tuner_id: &str,
@@ -21212,12 +21219,33 @@ fn vod_library_media_item_upsert(
     if let Some(rating) = item.community_rating {
         metadata["CommunityRating"] = serde_json::json!(rating);
     }
-    if item.item_type == VOD_ITEM_TYPE_EPISODE {
+    if item.item_type == VOD_ITEM_TYPE_SERIES {
+        let series_reference = item.provider_reference.as_str();
+        metadata["SeriesReference"] = serde_json::json!(series_reference);
+        metadata["SeriesId"] =
+            serde_json::json!(plugin_vod_series_id(plugin_id, tuner_id, series_reference));
+        metadata["SeriesName"] = serde_json::json!(item.name);
+        if let Some(overview) = item.overview.as_deref() {
+            metadata["SeriesOverview"] = serde_json::json!(overview);
+        }
+        if let Some(image_url) = item.image_url.as_deref() {
+            metadata["SeriesPrimaryImageUrl"] = serde_json::json!(image_url);
+        }
+        if let Some(year) = item.production_year {
+            metadata["SeriesProductionYear"] = serde_json::json!(year);
+        }
+        if let Some(rating) = item.community_rating {
+            metadata["SeriesCommunityRating"] = serde_json::json!(rating);
+        }
+        if !item.genres.is_empty() {
+            metadata["SeriesGenres"] = serde_json::json!(item.genres);
+        }
+    } else if item.item_type == VOD_ITEM_TYPE_EPISODE {
         let series_reference = item.series_reference.as_deref().unwrap_or_default();
         let series_key = format!("{plugin_id}:{tuner_id}:{series_reference}");
         metadata["SeriesReference"] = serde_json::json!(series_reference);
         metadata["SeriesId"] =
-            serde_json::json!(stable_entity_id("plugin-vod-series", &series_key));
+            serde_json::json!(plugin_vod_series_id(plugin_id, tuner_id, series_reference));
         metadata["SeriesName"] = serde_json::json!(
             item.series_name
                 .as_deref()
@@ -21238,17 +21266,22 @@ fn vod_library_media_item_upsert(
             metadata["SeriesImageUrl"] = serde_json::json!(series_image_url);
         }
     }
+    let is_series = item.item_type == VOD_ITEM_TYPE_SERIES;
     RemoteMediaItemUpsert {
         id: stable_entity_id("plugin-vod-item", &stable_key),
         name: item.name.clone(),
         path,
-        media_type: "Video".to_string(),
+        media_type: if is_series { "Series" } else { "Video" }.to_string(),
         collection_type: collection_type.to_string(),
         runtime_ticks: item.runtime_ticks,
         bitrate: None,
         width: None,
         height: None,
-        media_streams: default_plugin_vod_media_streams(),
+        media_streams: if is_series {
+            Vec::new()
+        } else {
+            default_plugin_vod_media_streams()
+        },
         metadata,
     }
 }
@@ -21327,17 +21360,27 @@ impl<'a> VodPluginCatalogStageWriter<'a> {
 
         // Index every series in this page before projecting its episodes. This preserves series
         // enrichment even when a provider emits a series row after its first episode in a page.
+        let mut new_series = Vec::new();
         for item in &items {
             if item.item_type == VOD_ITEM_TYPE_SERIES {
-                self.series_index.insert(
-                    item.provider_reference.clone(),
-                    (item.name.clone(), item.image_url.clone()),
-                );
+                match self.series_index.entry(item.provider_reference.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert((item.name.clone(), item.image_url.clone()));
+                        new_series.push(item.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
             }
         }
 
         let mut movies = Vec::new();
-        let mut episodes = Vec::new();
+        let mut series_items = new_series
+            .iter()
+            .map(|item| {
+                vod_library_media_item_upsert(self.plugin_id, self.tuner_id, item, None, None)
+            })
+            .collect::<Vec<_>>();
+        let mut episode_count = 0usize;
         for item in items {
             match item.item_type.as_str() {
                 VOD_ITEM_TYPE_MOVIE => {
@@ -21354,22 +21397,22 @@ impl<'a> VodPluginCatalogStageWriter<'a> {
                         .series_reference
                         .as_deref()
                         .and_then(|reference| self.series_index.get(reference));
-                    episodes.push(vod_library_media_item_upsert(
+                    series_items.push(vod_library_media_item_upsert(
                         self.plugin_id,
                         self.tuner_id,
                         &item,
                         series_entry.map(|(name, _)| name.as_str()),
                         series_entry.and_then(|(_, image_url)| image_url.as_deref()),
                     ));
+                    episode_count = episode_count.saturating_add(1);
                 }
                 _ => {}
             }
         }
 
         let movie_count = movies.len();
-        let episode_count = episodes.len();
         append_vod_library_stage_items(self.db, self.stage, "movies", movies).await?;
-        append_vod_library_stage_items(self.db, self.stage, "series", episodes).await?;
+        append_vod_library_stage_items(self.db, self.stage, "series", series_items).await?;
         self.counts.movie_count = self.counts.movie_count.saturating_add(movie_count);
         self.counts.series_count = self.series_index.len();
         self.counts.episode_count = self.counts.episode_count.saturating_add(episode_count);
@@ -50984,7 +51027,13 @@ async fn tv_series_items_result(
         let items = page
             .series
             .iter()
-            .filter_map(|series| grouped.remove(&series.id))
+            .map(|series| {
+                let mut summary = grouped
+                    .remove(&series.id)
+                    .unwrap_or_else(|| TvSeriesSummary::new(series.name.clone()));
+                summary.id.get_or_insert_with(|| series.id.clone());
+                summary
+            })
             .map(|summary| tv_series_json(server_id, summary))
             .collect::<Vec<_>>();
         return Ok(Json(query_result_with_total(
@@ -51185,6 +51234,18 @@ impl TvSeriesSummary {
         }
     }
 
+    fn add_series_anchor(&mut self, item: &MediaItem, metadata: &serde_json::Value) {
+        self.date_created = Some(
+            self.date_created
+                .map_or(item.created_at, |current| current.min(item.created_at)),
+        );
+        self.date_last_media_added = Some(
+            self.date_last_media_added
+                .map_or(item.updated_at, |current| current.max(item.updated_at)),
+        );
+        self.merge_episode_metadata(metadata);
+    }
+
     fn merge_episode_metadata(&mut self, metadata: &serde_json::Value) {
         if self.id.is_none() {
             self.id = canonical_metadata_uuid_from_json(metadata, &["SeriesId"]);
@@ -51370,7 +51431,7 @@ fn tv_series_json(server_id: &str, summary: TvSeriesSummary) -> serde_json::Valu
         "RecursiveItemCount": summary.episode_count,
         "CumulativeRunTimeTicks": (summary.runtime_ticks > 0).then_some(summary.runtime_ticks),
         "RunTimeTicks": (summary.runtime_ticks > 0 && summary.episode_count > 0)
-            .then_some(summary.runtime_ticks / summary.episode_count as i64),
+            .then(|| summary.runtime_ticks / summary.episode_count as i64),
         "SpecialFeatureCount": 0,
         "DisplayPreferencesId": stable_entity_id("DisplayPreferences", &series_id),
         "Status": null,
@@ -52593,9 +52654,19 @@ async fn tv_series_summary_by_id(
     let (items, metadata_by_item) = (snapshot.items, snapshot.metadata_by_item);
     let items = items
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), series_id))
+        .filter(|item| {
+            let metadata = metadata_by_item.get(&item.id);
+            tv_episode_matches_series(item, metadata, series_id)
+                || metadata.is_some_and(|metadata| {
+                    plugin_vod_series_anchor_matches(item, metadata, series_id)
+                })
+        })
         .collect::<Vec<_>>();
-    let item_ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
+    let item_ids = items
+        .iter()
+        .filter(|item| is_tv_episode(item))
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
     let playback_by_item = if let Some(user_id) = user_id {
         MediaCatalogStore::playback_states_for_items(db, user_id, &item_ids)
             .await?
@@ -52606,14 +52677,25 @@ async fn tv_series_summary_by_id(
         HashMap::new()
     };
     for item in items {
+        let metadata = metadata_by_item.get(&item.id);
+        if let Some(metadata) = metadata
+            && let Some((anchor_id, anchor_name)) = plugin_vod_series_anchor_info(&item, metadata)
+        {
+            let summary = grouped
+                .entry(anchor_id)
+                .or_insert_with(|| TvSeriesSummary::new(anchor_name));
+            summary.add_series_anchor(&item, metadata);
+            continue;
+        }
         let Some(info) = tv_episode_info(&item) else {
             continue;
         };
         let playback = playback_by_item.get(&item.id);
+        let key = tv_series_id_for_episode(&info, metadata);
         let summary = grouped
-            .entry(info.series_name.clone())
+            .entry(key)
             .or_insert_with(|| TvSeriesSummary::new(info.series_name.clone()));
-        summary.add_episode(&item, &info, metadata_by_item.get(&item.id), playback);
+        summary.add_episode(&item, &info, metadata, playback);
     }
     Ok(grouped.into_values().next())
 }
@@ -55695,6 +55777,38 @@ fn tv_episode_info(item: &MediaItem) -> Option<TvEpisodeInfo> {
     })
 }
 
+fn plugin_vod_series_anchor_info(
+    item: &MediaItem,
+    metadata: &serde_json::Value,
+) -> Option<(String, String)> {
+    if item.media_type != "Series"
+        || !item.collection_type.as_deref().is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "tvshows" | "tvshow" | "series"
+            )
+        })
+        || !first_metadata_value_from_json(metadata, &["PluginVodKind"])
+            .is_some_and(|kind| kind.eq_ignore_ascii_case(VOD_ITEM_TYPE_SERIES))
+    {
+        return None;
+    }
+    let series_id = canonical_metadata_uuid_from_json(metadata, &["SeriesId"])?;
+    let series_name = first_metadata_value_from_json(metadata, &["SeriesName"])
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| item.name.clone());
+    Some((series_id, series_name))
+}
+
+fn plugin_vod_series_anchor_matches(
+    item: &MediaItem,
+    metadata: &serde_json::Value,
+    series_id: &str,
+) -> bool {
+    plugin_vod_series_anchor_info(item, metadata)
+        .is_some_and(|(candidate_id, _)| jellyfin_id_matches(&candidate_id, series_id))
+}
+
 fn tv_episode_series_key(item: &MediaItem) -> String {
     core_tv_episode_series_key(item)
 }
@@ -55811,12 +55925,13 @@ fn tv_episode_catalog_snapshot_from_entries(
     }
 }
 
-/// Snapshot restricted to the episodes of one persisted series.
+/// Snapshot restricted to the episodes and optional provider anchor of one persisted series.
 ///
 /// Resolving a single Series id otherwise materializes every episode in the library, which exceeds
 /// the API statement timeout at library scale. Returns `None` when the id is not a canonical
 /// persisted `SeriesId` — the name-derived synthetic ids are hashes that only the full snapshot can
-/// resolve — and when no episode carries it, so both cases keep the caller's existing behaviour.
+/// resolve — and when no source row carries it, so both cases keep the caller's existing
+/// behaviour.
 async fn tv_episode_catalog_snapshot_for_series(
     db: &Database,
     series_id: &str,
@@ -55910,12 +56025,16 @@ fn series_name_for_id_from_snapshot(
     series_id: &str,
 ) -> Option<String> {
     snapshot.items.iter().find_map(|item| {
+        let metadata = snapshot.metadata_by_item.get(&item.id);
+        if let Some((anchor_id, anchor_name)) =
+            metadata.and_then(|metadata| plugin_vod_series_anchor_info(item, metadata))
+            && jellyfin_id_matches(&anchor_id, series_id)
+        {
+            return Some(anchor_name);
+        }
         let info = tv_episode_info(item)?;
-        jellyfin_id_matches(
-            &tv_series_id_for_episode(&info, snapshot.metadata_by_item.get(&item.id)),
-            series_id,
-        )
-        .then_some(info.series_name)
+        jellyfin_id_matches(&tv_series_id_for_episode(&info, metadata), series_id)
+            .then_some(info.series_name)
     })
 }
 
@@ -55942,16 +56061,11 @@ fn tv_series_summary_by_id_from_snapshot(
 }
 
 async fn series_name_for_id(db: &Database, series_id: &str) -> Result<Option<String>, ApiError> {
-    let candidates = MediaCatalogStore::tv_series_lookup_candidates(db).await?;
-    Ok(candidates.into_iter().find_map(|candidate| {
-        let item = candidate.item;
-        let info = tv_episode_info(&item)?;
-        jellyfin_id_matches(
-            &tv_series_id_for_episode(&info, Some(&candidate.metadata)),
-            series_id,
-        )
-        .then_some(info.series_name)
-    }))
+    let snapshot = match tv_episode_catalog_snapshot_for_series(db, series_id).await? {
+        Some(snapshot) => snapshot,
+        None => tv_episode_catalog_snapshot_without_canonical_series_id(db).await?,
+    };
+    Ok(series_name_for_id_from_snapshot(&snapshot, series_id))
 }
 
 #[derive(Debug)]
@@ -60829,25 +60943,44 @@ mod tests {
             "Name": "Show One",
             "ImageUrl": "https://images.example.invalid/show.jpg"
         }));
+        page.push(json!({
+            "ItemType": "Series",
+            "ProviderReference": "provider:v1:series-empty",
+            "Name": "Show Empty",
+            "Overview": "A series whose provider has not published any episodes.",
+            "ImageUrl": "https://images.example.invalid/empty.jpg",
+            "ProductionYear": 2026,
+            "CommunityRating": 8.5,
+            "Genres": ["Drama"]
+        }));
         writer.append_page(page).await.unwrap();
         // MAGSTV's episodes follow its series pages. The compact series index must therefore
         // enrich an episode received by a later RPC page.
         writer
-            .append_page(vec![json!({
-                "ItemType": "Episode",
-                "ProviderReference": "provider:v1:episode-1",
-                "Name": "Pilot",
-                "SeriesReference": "provider:v1:series-1",
-                "SeasonNumber": 1,
-                "EpisodeNumber": 1
-            })])
+            .append_page(vec![
+                // Providers may repeat a series at a page boundary. Its durable anchor must remain
+                // unique and the first validated catalogue row remains authoritative.
+                json!({
+                    "ItemType": "Series",
+                    "ProviderReference": "provider:v1:series-1",
+                    "Name": "Show One Repeated"
+                }),
+                json!({
+                    "ItemType": "Episode",
+                    "ProviderReference": "provider:v1:episode-1",
+                    "Name": "Pilot",
+                    "SeriesReference": "provider:v1:series-1",
+                    "SeasonNumber": 1,
+                    "EpisodeNumber": 1
+                }),
+            ])
             .await
             .unwrap();
         assert_eq!(
             writer.counts(),
             super::VodLibraryPluginImportCounts {
                 movie_count: super::REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS + 1,
-                series_count: 1,
+                series_count: 2,
                 episode_count: 1,
             }
         );
@@ -60878,7 +61011,57 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            1
+            3
+        );
+        let page = db
+            .tv_series_catalog_page(Some(series.id), 0, 20)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.total_record_count, 2);
+        assert_eq!(page.series.len(), 2);
+        assert_eq!(page.episodes.len(), 1);
+        assert_eq!(
+            page.series
+                .iter()
+                .find(|entry| entry.name == "Show One")
+                .unwrap()
+                .id,
+            super::plugin_vod_series_id(plugin_id, "vod-tuner", "provider:v1:series-1")
+        );
+        assert!(page.series.iter().any(|entry| entry.name == "Show Empty"));
+
+        let query = super::ItemsQuery {
+            parent_id: Some(series.id.simple().to_string()),
+            include_item_types: vec!["Series".to_string()],
+            limit: Some(20),
+            ..Default::default()
+        };
+        let response = super::tv_series_items_result(&db, &query, None, "server")
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response["TotalRecordCount"], 2);
+        let empty = response["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == "Show Empty")
+            .unwrap();
+        assert_eq!(empty["RecursiveItemCount"], 0);
+
+        let empty_series_id =
+            super::plugin_vod_series_id(plugin_id, "vod-tuner", "provider:v1:series-empty");
+        let empty_summary = super::tv_series_summary_by_id(&db, &empty_series_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty_summary.id(), empty_series_id);
+        assert_eq!(empty_summary.episode_count, 0);
+        assert_eq!(empty_summary.name, "Show Empty");
+        assert_eq!(
+            empty_summary.metadata["SeriesPrimaryImageUrl"],
+            "https://images.example.invalid/empty.jpg"
         );
     }
 
