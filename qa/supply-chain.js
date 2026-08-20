@@ -388,7 +388,8 @@ async function main() {
       vulnerabilityRenderer.includes("mode === 'rustsec-ids'") &&
         vulnerabilityRenderer.includes("mode === 'trivy-yaml'") &&
         vulnerabilityRenderer.includes("process.stdout.write('    purls:\\n')") &&
-        vulnerabilityRenderer.includes('entry.expires_on') &&
+        vulnerabilityRenderer.includes('trivyExpiration(entry.expires_on)') &&
+        vulnerabilityRenderer.includes('`${date}T23:59:59Z`') &&
         vulnerabilityRenderer.includes('entry.tracking_issue'),
     ),
     check(
