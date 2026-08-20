@@ -17,10 +17,10 @@ The current manifest digests were resolved from Docker Hub and the returned mani
 independently SHA-256 checked on 2026-08-08. FFmpeg revision
 `1e0279143db99d7324b17f9784b3229122269b38` is locked by archive SHA-256
 `2eb566ff9b41802220974bf9457da9bdbda078b1f56d1f008525b7b7cd71ca40`; it is compiled with
-`--disable-everything` and an explicit remux/probe capability set, without encoders and with AAC
-as its sole decoder. MPEG-TS requires inspection of an AAC frame to recover the sample rate before
-the HLS stream-copy muxer can write a valid header; Jellyrin still rejects every encode command in
-`remux-only` mode.
+`--disable-everything` and an explicit, bounded remux/transcode capability set. The production
+image runs with `JELLYRIN_FFMPEG_MODE=enabled`; its configured encoder, decoder and filter lists,
+plus the exact runtime capabilities FFmpeg selects implicitly, are all fail-closed SBOM gates.
+`remux-only` remains an operator-selected restricted mode that rejects every encode command.
 The input contract covers the allowlisted Xtream extensions plus MAGSTV MPEG-TS. HTTP(S), local
 file/pipe, UDP and encrypted-HLS (`crypto`) input are retained deliberately; outputs are restricted
 to HLS/MPEG-TS plus the MOV/MP4 muxer required by FFmpeg's HLS implementation at link time. Xtream rejects an
@@ -81,10 +81,11 @@ ops/scan-vulnerabilities.sh jellyrin:release vulnerability-artifacts
 ```
 
 The bundle contains SPDX JSON and CycloneDX JSON for the runtime image and Cargo dependency
-manifests, the exact Syft package inventory, FFmpeg source digest, build configuration, capability listings
-and FFmpeg/ffprobe versions, image inspection metadata, both release binaries, the public lock and
-checksums. It rejects a packaged `ffmpeg`, every encoder, any decoder other than AAC, or growth of
-the reviewed distroless package surface above 25 entries in the remux-only image. The
+manifests, the exact Syft package inventory, FFmpeg source digest, build configuration, capability
+listings, configured mode and FFmpeg/ffprobe versions, image inspection metadata, both release
+binaries, the public lock and checksums. It rejects a packaged `ffmpeg`, a mode other than
+`enabled`, any configured or runtime encoder/decoder/filter drift, or growth of the reviewed
+distroless package surface above 25 entries. The
 generator downloads Syft only after selecting
 the lock's amd64/arm64 checksum and refuses to overwrite an existing output directory.
 

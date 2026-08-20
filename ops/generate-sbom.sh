@@ -94,10 +94,66 @@ grep -Fq "ffmpeg version ${FFMPEG_SOURCE_VERSION}" "${output_dir}/ffmpeg-version
 grep -Fq "ffprobe version ${FFMPEG_SOURCE_VERSION}" "${output_dir}/ffprobe-version.txt"
 docker run --rm --entrypoint ffmpeg "${image_ref}" -hide_banner -buildconf \
     > "${output_dir}/ffmpeg-build-configuration.txt" 2>&1
-for listing in protocols demuxers muxers bsfs encoders decoders; do
+for listing in protocols demuxers muxers bsfs encoders decoders filters; do
     docker run --rm --entrypoint ffmpeg "${image_ref}" -hide_banner "-${listing}" \
         > "${output_dir}/ffmpeg-${listing}.txt" 2>&1
 done
+
+image_ffmpeg_mode="$(
+    docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${image_ref}" \
+        | sed -n 's/^JELLYRIN_FFMPEG_MODE=//p'
+)"
+if [[ "${image_ffmpeg_mode}" != "enabled" ]]; then
+    echo "release image FFmpeg mode drift: ${image_ffmpeg_mode:-<missing>}" >&2
+    exit 1
+fi
+printf '%s\n' "${image_ffmpeg_mode}" > "${output_dir}/ffmpeg-mode.txt"
+
+# The configured lists are the reviewed, human-authored capability contract. Check both the
+# Dockerfile and the resulting build configuration so neither source nor image can broaden it
+# independently. Runtime listings below separately pin dependencies selected implicitly by FFmpeg.
+reviewed_configured_ffmpeg_encoders='libx264,aac,mjpeg,subrip,webvtt'
+reviewed_configured_ffmpeg_decoders='h264,hevc,mpeg2video,mpeg4,vc1,wmv3,vp8,vp9,av1,mjpeg,aac,ac3,eac3,mp3,mp3float,flac,opus,vorbis,ass,dvbsub,dvdsub,mov_text,pgssub,srt,ssa,subrip,webvtt'
+reviewed_configured_ffmpeg_filters='anull,aresample,format,fps,overlay,scale'
+reviewed_runtime_ffmpeg_encoders='aac,libx264,mjpeg,subrip,webvtt'
+reviewed_runtime_ffmpeg_decoders='aac,ac3,ass,av1,dvbsub,dvdsub,eac3,flac,h263,h264,hevc,mjpeg,mp3,mp3float,mpeg2video,mpeg4,opus,pgssub,srt,ssa,subrip,vc1,vorbis,vp8,vp9,webvtt,wmv3'
+reviewed_runtime_ffmpeg_filters='abuffer,abuffersink,aformat,anull,aresample,atrim,buffer,buffersink,crop,format,fps,hflip,null,overlay,rotate,scale,transpose,trim,vflip'
+
+require_configure_allowlist() {
+    local source_label="$1"
+    local source_file="$2"
+    local capability="$3"
+    local expected="$4"
+    local matches=()
+    local actual
+
+    mapfile -t matches < <(grep -o -- "--enable-${capability}=[^[:space:]]*" "${source_file}" || true)
+    if [[ "${#matches[@]}" -ne 1 ]]; then
+        echo "${source_label} must declare exactly one --enable-${capability} allowlist" >&2
+        return 1
+    fi
+    actual="${matches[0]#*=}"
+    actual="${actual//\'/}"
+    actual="${actual//\"/}"
+    if [[ "${actual}" != "${expected}" ]]; then
+        echo "${source_label} ${capability} allowlist drift: ${actual:-<none>}" >&2
+        return 1
+    fi
+}
+
+for source_spec in \
+    "Dockerfile|${repo_root}/Dockerfile" \
+    "FFmpeg build configuration|${output_dir}/ffmpeg-build-configuration.txt"; do
+    source_label="${source_spec%%|*}"
+    source_file="${source_spec#*|}"
+    require_configure_allowlist \
+        "${source_label}" "${source_file}" encoder "${reviewed_configured_ffmpeg_encoders}"
+    require_configure_allowlist \
+        "${source_label}" "${source_file}" decoder "${reviewed_configured_ffmpeg_decoders}"
+    require_configure_allowlist \
+        "${source_label}" "${source_file}" filter "${reviewed_configured_ffmpeg_filters}"
+done
+
 grep -o -- '--enable-parser=[^[:space:]]*' "${output_dir}/ffmpeg-build-configuration.txt" \
     | sed 's/^--enable-parser=//' \
     | tr -d "'\"" \
@@ -110,20 +166,43 @@ expected_parsers="$(
         | LC_ALL=C sort
 )"
 if [[ "$(<"${output_dir}/ffmpeg-parsers.txt")" != "${expected_parsers}" ]]; then
-    echo "remux-only image parser allowlist drift" >&2
+    echo "FFmpeg parser allowlist drift" >&2
     exit 1
 fi
-if awk '$1 ~ /^[VAS]/ && length($1) == 6 && $2 != "=" { found=1 } END { exit !found }' \
-    "${output_dir}/ffmpeg-encoders.txt"; then
-    echo "remux-only image unexpectedly contains an encoder" >&2
+
+expected_runtime_encoders="$(
+    printf '%s\n' "${reviewed_runtime_ffmpeg_encoders}" | tr ',' '\n' | LC_ALL=C sort
+)"
+actual_encoders="$(
+    awk '$1 ~ /^[VAS]/ && length($1) == 6 && $2 != "=" { print $2 }' \
+        "${output_dir}/ffmpeg-encoders.txt" | LC_ALL=C sort -u
+)"
+if [[ "${actual_encoders}" != "${expected_runtime_encoders}" ]]; then
+    echo "enabled image encoder allowlist drift: ${actual_encoders//$'\n'/,}" >&2
     exit 1
 fi
+
+expected_runtime_decoders="$(
+    printf '%s\n' "${reviewed_runtime_ffmpeg_decoders}" | tr ',' '\n' | LC_ALL=C sort
+)"
 actual_decoders="$(
     awk '$1 ~ /^[VAS]/ && length($1) == 6 && $2 != "=" { print $2 }' \
         "${output_dir}/ffmpeg-decoders.txt" | LC_ALL=C sort -u
 )"
-if [[ "${actual_decoders}" != "aac" ]]; then
-    echo "remux-only image decoder allowlist drift: ${actual_decoders:-<none>}" >&2
+if [[ "${actual_decoders}" != "${expected_runtime_decoders}" ]]; then
+    echo "enabled image decoder allowlist drift: ${actual_decoders//$'\n'/,}" >&2
+    exit 1
+fi
+
+expected_runtime_filters="$(
+    printf '%s\n' "${reviewed_runtime_ffmpeg_filters}" | tr ',' '\n' | LC_ALL=C sort
+)"
+actual_filters="$(
+    awk 'length($1) == 2 && $1 !~ /[^.TS]/ && $2 != "=" { print $2 }' \
+        "${output_dir}/ffmpeg-filters.txt" | LC_ALL=C sort -u
+)"
+if [[ "${actual_filters}" != "${expected_runtime_filters}" ]]; then
+    echo "enabled image filter allowlist drift: ${actual_filters//$'\n'/,}" >&2
     exit 1
 fi
 image_revision="$(
@@ -144,7 +223,7 @@ jq -r '.packages[]? | select(.name != null and .versionInfo != null)
     | LC_ALL=C sort -u > "${output_dir}/runtime-packages.txt"
 if awk -F '\t' 'tolower($1) == "ffmpeg" { found=1 } END { exit !found }' \
     "${output_dir}/runtime-packages.txt"; then
-    echo "general-purpose packaged FFmpeg is present in the remux-only image" >&2
+    echo "general-purpose packaged FFmpeg is present in the release image" >&2
     exit 1
 fi
 if [[ "$(wc -l < "${output_dir}/runtime-packages.txt")" -gt 25 ]]; then
@@ -302,6 +381,8 @@ cp "${lock_file}" "${output_dir}/supply-chain.lock.env"
         ffmpeg-decoders.txt \
         ffmpeg-demuxers.txt \
         ffmpeg-encoders.txt \
+        ffmpeg-filters.txt \
+        ffmpeg-mode.txt \
         ffmpeg-muxers.txt \
         ffmpeg-parsers.txt \
         ffmpeg-protocols.txt \

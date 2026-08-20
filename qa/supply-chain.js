@@ -58,6 +58,31 @@ async function main() {
   const cargoLock = await read('Cargo.lock');
   const lock = parseLock(lockText);
   const runtimeDockerfile = dockerfile.slice(dockerfile.lastIndexOf('FROM runtime-smoke'));
+  const reviewedFfmpegCapabilities = {
+    configured: {
+      encoder: 'libx264,aac,mjpeg,subrip,webvtt',
+      decoder:
+        'h264,hevc,mpeg2video,mpeg4,vc1,wmv3,vp8,vp9,av1,mjpeg,aac,ac3,eac3,mp3,mp3float,flac,opus,vorbis,ass,dvbsub,dvdsub,mov_text,pgssub,srt,ssa,subrip,webvtt',
+      filter: 'anull,aresample,format,fps,overlay,scale',
+    },
+    runtime: {
+      encoder: 'aac,libx264,mjpeg,subrip,webvtt',
+      decoder:
+        'aac,ac3,ass,av1,dvbsub,dvdsub,eac3,flac,h263,h264,hevc,mjpeg,mp3,mp3float,mpeg2video,mpeg4,opus,pgssub,srt,ssa,subrip,vc1,vorbis,vp8,vp9,webvtt,wmv3',
+      filter:
+        'abuffer,abuffersink,aformat,anull,aresample,atrim,buffer,buffersink,crop,format,fps,hflip,null,overlay,rotate,scale,transpose,trim,vflip',
+    },
+  };
+  const ffmpegCapabilityPolicyIsValid = validateFfmpegCapabilityPolicy(
+    dockerfile,
+    generator,
+    reviewedFfmpegCapabilities,
+  );
+  const ffmpegCapabilityPolicySelfTest = validateFfmpegCapabilityPolicySelfTest(
+    dockerfile,
+    generator,
+    reviewedFfmpegCapabilities,
+  );
   const vulnerabilityExceptions = JSON.parse(vulnerabilityExceptionsText);
   const exceptionErrors = validateVulnerabilityExceptions(vulnerabilityExceptions);
   const exceptionValidatorSelfTest = validateExceptionValidator();
@@ -280,6 +305,10 @@ async function main() {
         workflow.includes(`actions/upload-artifact@${lock.ACTIONS_UPLOAD_ARTIFACT_SHA}`),
     ),
     check(
+      'docker-ffmpeg-enabled-capability-policy',
+      ffmpegCapabilityPolicyIsValid && ffmpegCapabilityPolicySelfTest,
+    ),
+    check(
       'ci-rust-toolchain-is-sha-pinned',
       rustToolchainUses.length > 0 &&
         rustToolchainSteps.length === rustToolchainUses.length &&
@@ -436,12 +465,17 @@ async function main() {
         generator.includes('FFmpeg source digest drift') &&
         generator.includes('general-purpose packaged FFmpeg is present') &&
         generator.includes('distroless runtime package surface drifted above its reviewed bound') &&
-        generator.includes('remux-only image decoder allowlist drift') &&
+        generator.includes('release image FFmpeg mode drift') &&
+        generator.includes('enabled image encoder allowlist drift') &&
+        generator.includes('enabled image decoder allowlist drift') &&
+        generator.includes('enabled image filter allowlist drift') &&
         generator.includes('ffmpeg-source.spdx.json') &&
         generator.includes('ffmpeg-source.cyclonedx.json') &&
         generator.includes("grep -o -- '--enable-parser=[^[:space:]]*'") &&
         generator.includes('ffmpeg-parsers.txt') &&
-        generator.includes('remux-only image parser allowlist drift') &&
+        generator.includes('FFmpeg parser allowlist drift') &&
+        generator.includes('ffmpeg-filters.txt') &&
+        generator.includes('ffmpeg-mode.txt') &&
         generator.includes('release image has no immutable VCS revision label') &&
         generator.includes('.name == "ffmpeg" and .versionInfo == $version') &&
         generator.includes('> SHA256SUMS') &&
@@ -512,6 +546,81 @@ function parseLock(text) {
 
 function nonEmpty(value) {
   return typeof value === 'string' && value.length > 0;
+}
+
+function validateFfmpegCapabilityPolicy(dockerfile, generator, reviewed) {
+  const configuredMatches = Object.entries(reviewed.configured).every(
+    ([capability, expected]) =>
+      extractSingleConfigureAllowlist(dockerfile, capability) === expected &&
+      extractSingleQuotedAssignment(
+        generator,
+        `reviewed_configured_ffmpeg_${capability}s`,
+      ) === expected,
+  );
+  const runtimeMatches = Object.entries(reviewed.runtime).every(
+    ([capability, expected]) =>
+      extractSingleQuotedAssignment(generator, `reviewed_runtime_ffmpeg_${capability}s`) ===
+      expected,
+  );
+  return (
+    configuredMatches &&
+    runtimeMatches &&
+    (dockerfile.match(/JELLYRIN_FFMPEG_MODE=enabled\b/g) || []).length === 1 &&
+    generator.includes('"${image_ffmpeg_mode}" != "enabled"') &&
+    generator.includes('Dockerfile|${repo_root}/Dockerfile') &&
+    generator.includes(
+      'FFmpeg build configuration|${output_dir}/ffmpeg-build-configuration.txt',
+    ) &&
+    generator.includes('"${actual}" != "${expected}"') &&
+    generator.includes('for listing in protocols demuxers muxers bsfs encoders decoders filters') &&
+    generator.includes('"${actual_encoders}" != "${expected_runtime_encoders}"') &&
+    generator.includes('"${actual_decoders}" != "${expected_runtime_decoders}"') &&
+    generator.includes('"${actual_filters}" != "${expected_runtime_filters}"') &&
+    generator.includes('enabled image encoder allowlist drift') &&
+    generator.includes('enabled image decoder allowlist drift') &&
+    generator.includes('enabled image filter allowlist drift')
+  );
+}
+
+function validateFfmpegCapabilityPolicySelfTest(dockerfile, generator, reviewed) {
+  const configuredEncoder = `--enable-encoder=${reviewed.configured.encoder}`;
+  const runtimeEncoder = `reviewed_runtime_ffmpeg_encoders='${reviewed.runtime.encoder}'`;
+  const broadenedDockerfile = dockerfile.replace(
+    configuredEncoder,
+    `${configuredEncoder},rawvideo`,
+  );
+  const broadenedGenerator = generator.replace(
+    runtimeEncoder,
+    `${runtimeEncoder.slice(0, -1)},rawvideo'`,
+  );
+  const changedModeDockerfile = dockerfile.replace(
+    'JELLYRIN_FFMPEG_MODE=enabled',
+    'JELLYRIN_FFMPEG_MODE=remux-only',
+  );
+  return (
+    broadenedDockerfile !== dockerfile &&
+    broadenedGenerator !== generator &&
+    changedModeDockerfile !== dockerfile &&
+    !validateFfmpegCapabilityPolicy(broadenedDockerfile, generator, reviewed) &&
+    !validateFfmpegCapabilityPolicy(dockerfile, broadenedGenerator, reviewed) &&
+    !validateFfmpegCapabilityPolicy(changedModeDockerfile, generator, reviewed)
+  );
+}
+
+function extractSingleConfigureAllowlist(source, capability) {
+  const matches = [
+    ...source.matchAll(new RegExp(`--enable-${capability}=([^\\s]+)`, 'g')),
+  ];
+  if (matches.length !== 1) {
+    return null;
+  }
+  return matches[0][1].replaceAll("'", '').replaceAll('"', '');
+}
+
+function extractSingleQuotedAssignment(source, name) {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matches = [...source.matchAll(new RegExp(`^${escapedName}='([^']*)'$`, 'gm'))];
+  return matches.length === 1 ? matches[0][1] : null;
 }
 
 function validateVulnerabilityExceptions(policy) {

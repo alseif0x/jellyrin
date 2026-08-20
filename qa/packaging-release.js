@@ -61,6 +61,17 @@ async function main() {
     check('docker-locked-base-images', dockerfile.includes('RUST_IMAGE=docker.io/library/rust:1.94.0-bookworm@sha256:') && dockerfile.includes('RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim@sha256:') && dockerfile.includes('DISTROLESS_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:')),
     check('docker-locked-ffmpeg-source', dockerfile.includes('ARG DEBIAN_SNAPSHOT=') && dockerfile.includes('ARG FFMPEG_SOURCE_REVISION=') && dockerfile.includes('ARG FFMPEG_SOURCE_SHA256=') && dockerfile.includes('code.ffmpeg.org/FFmpeg/FFmpeg/archive/${FFMPEG_SOURCE_REVISION}.tar.gz') && dockerfile.includes('git -C /tmp/ffmpeg-source apply --reverse --check') && dockerfile.includes('sha256sum --check --strict') && dockerfile.includes('--disable-everything') && dockerfile.includes('COPY --from=ffmpeg-builder')),
     check(
+      'docker-bounded-enabled-ffmpeg-capabilities',
+      dockerfile.includes('--enable-encoder=libx264,aac,mjpeg,subrip,webvtt') &&
+        dockerfile.includes('--enable-filter=anull,aresample,format,fps,overlay,scale') &&
+        sbomGenerator.includes('reviewed_configured_ffmpeg_decoders=') &&
+        sbomGenerator.includes('reviewed_runtime_ffmpeg_decoders=') &&
+        sbomGenerator.includes('release image FFmpeg mode drift') &&
+        sbomGenerator.includes('enabled image encoder allowlist drift') &&
+        sbomGenerator.includes('enabled image decoder allowlist drift') &&
+        sbomGenerator.includes('enabled image filter allowlist drift'),
+    ),
+    check(
       'docker-build-context-excludes-secrets',
       dockerignore.includes('**/.env') && dockerignore.includes('ops/*.env') && dockerignore.includes('*.pem') && dockerignore.includes('*.key'),
     ),
@@ -106,7 +117,14 @@ async function main() {
     check('supply-chain-lock-present', supplyChainLock.includes('RUST_IMAGE=docker.io/library/rust:1.94.0-bookworm@sha256:') && supplyChainLock.includes('DISTROLESS_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:') && supplyChainLock.includes('SYFT_LINUX_AMD64_SHA256=') && supplyChainLock.includes('JELLYFIN_WEB_VERSION=10.11.11') && supplyChainLock.includes('JELLYFIN_WEB_COMMIT=35c0793ece3adbd247eab290ae1effab851f3d37') && supplyChainLock.includes('JELLYFIN_WEB_TARBALL_SHA256=1dd84a8bf4aaa90b12ca38e72e68a554826ab0ea28bb354bcc3212f579e0a337') && supplyChainLock.includes('JELLYFIN_WEB_SWIPER_VERSION=12.1.2') && supplyChainLock.includes('JELLYFIN_WEB_SWIPER_PATCH_COMMIT=3cb38a0ac319edfcbcd331e3818cc9f6dec3e334') && supplyChainLock.includes('JELLYFIN_WEB_SWIPER_PATCH_SHA256=76e80a084337162a24dba022760492fa52f102fbf88747ff895b7076fc17f4b4')),
     check('jellyfin-web-build-verified-atomic-untracked', jellyfinWebBuilder.includes('sha256sum --check --strict') && jellyfinWebBuilder.includes('commit/${JELLYFIN_WEB_SWIPER_PATCH_COMMIT}.patch') && jellyfinWebBuilder.includes('Swiper security patch must modify only package.json and package-lock.json') && jellyfinWebBuilder.includes('EXPECTED_SWIPER_VERSION') && jellyfinWebBuilder.includes('npm ci --omit=optional') && jellyfinWebBuilder.includes('node_modules/pdfjs-dist/node_modules/canvas') && jellyfinWebBuilder.includes('node_modules/@mapbox/node-pre-gyp') && jellyfinWebBuilder.includes('node_modules/tar') && jellyfinWebBuilder.includes('npm run build:production') && jellyfinWebBuilder.includes('refusing to overwrite existing Jellyfin Web output') && jellyfinWebBuilder.includes('mv -T') && gitignore.split(/\r?\n/).includes('/web/')),
     check('deployment-preflight-fail-closed', deploymentPreflight.includes('never reads env/key contents') && deploymentPreflight.includes('web output is missing regular index.html') && deploymentPreflight.includes('--require-provider-keyring') && deploymentPreflight.includes("stat -c '%a'") && deploymentPreflight.includes("stat -c '%u'") && deploymentPreflight.includes("stat -c '%g'")),
-    check('sbom-generator-verifies-output', sbomGenerator.includes('jellyrin-image.spdx.json') && sbomGenerator.includes('jellyrin-source.cyclonedx.json') && sbomGenerator.includes('sha256sum --check --strict SHA256SUMS')),
+    check(
+      'sbom-generator-verifies-output',
+      sbomGenerator.includes('jellyrin-image.spdx.json') &&
+        sbomGenerator.includes('jellyrin-source.cyclonedx.json') &&
+        sbomGenerator.includes('ffmpeg-filters.txt') &&
+        sbomGenerator.includes('ffmpeg-mode.txt') &&
+        sbomGenerator.includes('sha256sum --check --strict SHA256SUMS'),
+    ),
     check('supply-chain-qa-and-ci', supplyChainQa.includes('ci-actions-are-commit-pinned') && ci.includes('node qa/supply-chain.js') && ci.includes('ops/generate-sbom.sh jellyrin:ci supply-chain-artifacts')),
     check('readme-release-entrypoint', readme.includes('## Release Packaging') && readme.includes('npm run qa:packaging-release')),
     check('jellyfin-web-hardening-documentation', readme.includes('Swiper 12.1.2') && readme.includes('canvas`/`node-pre-gyp`/`tar') && checklist.includes('--omit=optional') && checklist.includes('slideshow and comics')),
