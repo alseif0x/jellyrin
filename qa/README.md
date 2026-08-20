@@ -96,10 +96,30 @@ npm run test:e2e:magstv-plugin
 By default the gate requires at least 1,000 channels, 30,000 movies, 20,000 series, and 100,001
 episodes, preventing the former 10k/100k VOD truncation limits from passing. Override the four
 `JELLYRIN_E2E_MAGSTV_MIN_*` variables only when the provider's canonical `All` catalogue has
-legitimately changed. `JELLYRIN_E2E_MAGSTV_SYNC_TIMEOUT_MS` defaults to two hours. Set
+legitimately changed. `JELLYRIN_E2E_MAGSTV_SYNC_TIMEOUT_MS` defaults to four hours. Set
 `JELLYRIN_E2E_MAGSTV_CLICK_REFRESH=1` only when intentionally testing the explicit
 `Actualizar catálogo` action; the normal first-run path relies on `Guardar e indexar` so it does
 not start two concurrent full imports.
+
+If the Playwright process times out or is interrupted after `Guardar e indexar` has already
+succeeded, do not rerun the configuration path while that import may still be active. Resume the
+same gate without supplying provider credentials and without starting another import:
+
+```bash
+JELLYRIN_E2E_DEPLOYED=1 \
+JELLYRIN_E2E_MAGSTV_QA=1 \
+JELLYRIN_E2E_MAGSTV_VERIFY_ONLY=1 \
+JELLYRIN_E2E_NO_WEBSERVER=1 \
+JELLYRIN_E2E_BASE_URL=https://jellyrin.test.kode.live \
+JELLYRIN_E2E_API_TOKEN_FILE=/secure/path/jellyrin-admin-token \
+npm run test:e2e:magstv-plugin
+```
+
+The resume path loads the settings page read-only, verifies its two-field contract and the
+existing encrypted tuner reference, waits for the current staged catalogue to become complete,
+then opens all three views and runs the same live/movie/episode playback probes. It rejects
+`JELLYRIN_E2E_MAGSTV_CLICK_REFRESH=1` so a recovery run cannot accidentally enqueue another
+provider import.
 
 ## PostgreSQL Release Smokes
 

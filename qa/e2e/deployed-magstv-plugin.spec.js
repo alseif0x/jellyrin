@@ -13,8 +13,9 @@ const REQUIRED_VIEWS = Object.freeze({
 
 const syncTimeoutMs = positiveIntegerEnvironment(
   'JELLYRIN_E2E_MAGSTV_SYNC_TIMEOUT_MS',
-  2 * 60 * 60 * 1000,
+  4 * 60 * 60 * 1000,
 );
+const verifyOnly = process.env.JELLYRIN_E2E_MAGSTV_VERIFY_ONLY === '1';
 
 // Unlike ordinary deployed tests, every failure artifact is disabled here: a failure between
 // filling and submitting the form must not preserve even the account name in a screenshot.
@@ -27,9 +28,12 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
     'This opt-in suite changes the deployed MAGSTV tuner and contacts the real provider',
   );
 
-  test('configures only username/password, synchronizes all three views, and plays one item of each kind', async ({ page, request, baseURL }) => {
+  test('configures or resumes, synchronizes all three views, and plays one item of each kind', async ({ page, request, baseURL }) => {
     test.setTimeout(syncTimeoutMs + 20 * 60 * 1000);
-    const providerCredentials = loadProviderCredentials();
+    if (verifyOnly && process.env.JELLYRIN_E2E_MAGSTV_CLICK_REFRESH === '1') {
+      throw new Error('JELLYRIN_E2E_MAGSTV_VERIFY_ONLY cannot be combined with JELLYRIN_E2E_MAGSTV_CLICK_REFRESH');
+    }
+    const providerCredentials = verifyOnly ? null : loadProviderCredentials();
     const auth = await loadAdministratorAuthentication(request);
     const publicInfo = await getJson(request, '/System/Info/Public');
     const configurationPage = await discoverConfigurationPage(request, auth.AccessToken);
@@ -48,37 +52,45 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
     await expect(form.locator('#password')).toHaveAttribute('type', 'password');
     await expect(form).not.toContainText(/sign[_ -]?o3|secret[_ -]?hex|bootstrap|vpn/i);
 
-    await form.locator('#username').fill(providerCredentials.username);
-    await form.locator('#password').fill(providerCredentials.password);
-    const saveResponsePromise = page.waitForResponse(
-      (response) => response.request().method() === 'POST'
-        && new URL(response.url()).pathname.toLowerCase() === '/livetv/tunerhosts',
-      { timeout: syncTimeoutMs },
-    );
-    await form.locator('#saveButton').click();
-    const saveResponse = await saveResponsePromise;
-    expect(saveResponse.status(), 'MAGSTV tuner save/import status').toBe(200);
-
-    // The controller clears both fields before sending the request. This also keeps screenshots
-    // and DOM snapshots from retaining credentials if a later catalogue assertion fails.
-    await expect(form.locator('#username')).toHaveValue('');
-    await expect(form.locator('#password')).toHaveValue('');
-    await expect(form.locator('#status')).toHaveClass(/\bok\b/);
-    await expect(form.locator('#refreshButton')).toBeEnabled();
-
     let explicitRefreshCounts = null;
-    if (process.env.JELLYRIN_E2E_MAGSTV_CLICK_REFRESH === '1') {
-      const refreshResponsePromise = page.waitForResponse(
+    if (verifyOnly) {
+      // A timed-out Playwright process must be resumable without saving the account again or
+      // starting a second provider import. The existing encrypted reference is checked below.
+      await expect(form.locator('#username')).toHaveValue('');
+      await expect(form.locator('#password')).toHaveValue('');
+      console.log(JSON.stringify({ status: 'magstv-verify-only-resume' }));
+    } else {
+      await form.locator('#username').fill(providerCredentials.username);
+      await form.locator('#password').fill(providerCredentials.password);
+      const saveResponsePromise = page.waitForResponse(
         (response) => response.request().method() === 'POST'
-          && new URL(response.url()).pathname.toLowerCase()
-            === `/plugins/${PLUGIN_ID.toLowerCase()}/vodlibrary/refresh`,
+          && new URL(response.url()).pathname.toLowerCase() === '/livetv/tunerhosts',
         { timeout: syncTimeoutMs },
       );
-      await form.locator('#refreshButton').click();
-      const refreshResponse = await refreshResponsePromise;
-      expect(refreshResponse.status(), 'explicit MAGSTV VOD refresh status').toBe(200);
-      explicitRefreshCounts = await refreshResponse.json();
-      await expect(form.locator('#status')).toContainText('Catálogo actualizado');
+      await form.locator('#saveButton').click();
+      const saveResponse = await saveResponsePromise;
+      expect(saveResponse.status(), 'MAGSTV tuner save/import status').toBe(200);
+
+      // The controller clears both fields before sending the request. This also keeps screenshots
+      // and DOM snapshots from retaining credentials if a later catalogue assertion fails.
+      await expect(form.locator('#username')).toHaveValue('');
+      await expect(form.locator('#password')).toHaveValue('');
+      await expect(form.locator('#status')).toHaveClass(/\bok\b/);
+      await expect(form.locator('#refreshButton')).toBeEnabled();
+
+      if (process.env.JELLYRIN_E2E_MAGSTV_CLICK_REFRESH === '1') {
+        const refreshResponsePromise = page.waitForResponse(
+          (response) => response.request().method() === 'POST'
+            && new URL(response.url()).pathname.toLowerCase()
+              === `/plugins/${PLUGIN_ID.toLowerCase()}/vodlibrary/refresh`,
+          { timeout: syncTimeoutMs },
+        );
+        await form.locator('#refreshButton').click();
+        const refreshResponse = await refreshResponsePromise;
+        expect(refreshResponse.status(), 'explicit MAGSTV VOD refresh status').toBe(200);
+        explicitRefreshCounts = await refreshResponse.json();
+        await expect(form.locator('#status')).toContainText('Catálogo actualizado');
+      }
     }
 
     const persisted = await verifyEncryptedTunerConfiguration(request, auth.AccessToken);
