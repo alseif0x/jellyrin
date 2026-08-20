@@ -78,11 +78,10 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
     // playback probes run strictly one after another.
     await page.goto('about:blank');
 
-    const liveResult = await probeScopedLiveTvPlayback(
-      request,
-      baseURL,
-      auth,
-      snapshot.channels.items[0],
+    const liveResult = await probeFirstPlayable(
+      snapshot.channels.items,
+      (channel) => probeScopedLiveTvPlayback(request, baseURL, auth, channel),
+      'Mags Live TV',
     );
     const movieResult = await probeFirstPlayable(
       snapshot.movies.items,
@@ -526,9 +525,9 @@ async function probeFirstPlayable(items, probe, label) {
 }
 
 async function probeScopedLiveTvPlayback(request, baseURL, auth, channel) {
-  if (!channel?.Id) throw new Error('Mags Live TV scoped view has no first channel');
+  if (!channel?.Id) throw new Error('Mags Live TV scoped view has no candidate channel');
   if (channel.TunerHostId !== TUNER_ID) {
-    throw new Error('Mags Live TV first scoped channel belongs to another tuner');
+    throw new Error('Mags Live TV candidate channel belongs to another tuner');
   }
 
   const sessions = [];
