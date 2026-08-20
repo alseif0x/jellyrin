@@ -33024,6 +33024,9 @@ async fn latest_items(
         ensure_user_access(&auth_user, requested_user_id)?;
     }
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     let mut filtered_items = latest_items_candidates(&state.db, &query, requested_user_id).await?;
     filtered_items =
         apply_latest_user_configuration(&state.db, filtered_items, &query, requested_user_id)
@@ -33065,6 +33068,9 @@ async fn current_user_latest_items(
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     let mut filtered_items =
         latest_items_candidates(&state.db, &query, Some(requested_user_id)).await?;
     filtered_items =
@@ -33103,6 +33109,9 @@ async fn user_latest_items(
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     let mut filtered_items =
         latest_items_candidates(&state.db, &query, Some(requested_user_id)).await?;
     filtered_items =
@@ -33142,6 +33151,44 @@ async fn latest_items_candidates(
 
 fn latest_items_limit(query: &ItemsQuery) -> usize {
     query.limit.unwrap_or(20).min(100)
+}
+
+/// Keep synthetic Live TV views on the bounded channel repository path.
+///
+/// Per-tuner views intentionally omit `CollectionType` so Jellyfin Web routes them through the
+/// ordinary collection UI. That UI also asks `/Items/Latest` for the view. A synthetic parent is
+/// not a media-library folder, so letting the generic Latest fallback handle it would load and
+/// sort the complete media catalogue before discovering that no media item belongs to the view.
+async fn live_tv_latest_items_for_parent(
+    db: &Database,
+    query: &ItemsQuery,
+    server_id: &str,
+) -> Result<Option<Json<Vec<serde_json::Value>>>, ApiError> {
+    let Some(parent_id) = query.parent_id.as_deref() else {
+        return Ok(None);
+    };
+    let tuner = live_tv_tuner_view_by_id(db, parent_id).await?;
+    let tuner_id = if let Some(tuner) = tuner.as_ref() {
+        Some(tuner.tuner_id.as_str())
+    } else if special_user_view_collection_type_for_parent(Some(parent_id))
+        .is_some_and(|collection_type| collection_type.eq_ignore_ascii_case("livetv"))
+    {
+        None
+    } else {
+        return Ok(None);
+    };
+
+    let mut bounded_query = query.clone();
+    bounded_query.start_index = Some(0);
+    bounded_query.limit = Some(latest_items_limit(query));
+    let Json(mut page) =
+        live_tv_channel_items_result(db, &bounded_query, server_id, tuner_id).await?;
+    let items = page
+        .get_mut("Items")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .ok_or_else(|| ApiError::internal("Live TV latest page did not contain an item array"))?;
+    Ok(Some(Json(items)))
 }
 
 /// Answer Latest from the media-item repository, which applies every filter before its `LIMIT`.
@@ -77090,6 +77137,36 @@ done
             assert_eq!(channels["TotalRecordCount"], 1, "{endpoint}");
             assert_eq!(channels["Items"][0]["Name"], "Mags Channel", "{endpoint}");
             assert_eq!(channels["Items"][0]["TunerHostId"], "magstv", "{endpoint}");
+        }
+
+        for endpoint in [
+            format!(
+                "/Items/Latest?UserId={}&ParentId={mags_view_id}&Limit=10",
+                user.id
+            ),
+            format!("/UserLibrary/Items/Latest?ParentId={mags_view_id}&Limit=10"),
+            format!(
+                "/Users/{}/Items/Latest?ParentId={mags_view_id}&Limit=10",
+                user.id
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.clone())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let channels: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(channels.as_array().map(Vec::len), Some(1), "{endpoint}");
+            assert_eq!(channels[0]["Name"], "Mags Channel", "{endpoint}");
+            assert_eq!(channels[0]["TunerHostId"], "magstv", "{endpoint}");
         }
 
         let response = app
